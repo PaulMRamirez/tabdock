@@ -1,8 +1,10 @@
-// The same calls through each WebMCP runtime the M0 baseline measured: the
-// MCP-B polyfill 5.1 (string input, no consequentialHint), Chrome 153 and 154
-// (string input, string schemas) and Chrome 155 and 156 (object input). The
-// adapter detects the input form per page (ADR 0001) and applies ADR 0002's
-// option C, so a client sees the same results from all three.
+// The same calls through three of the WebMCP runtimes the M0 baseline
+// measured: the MCP-B polyfill 5.1 (string input, no consequentialHint),
+// Chrome 154 (string input, string schemas) and Chrome 156 (object input, the
+// debugging hint). Chrome 153 (which also drops consequentialHint) and Chrome
+// 155 (no debugging hint) have no profile of their own. The adapter detects the
+// input form per page (ADR 0001) and applies ADR 0002's option C, so a client
+// sees the same results from all three.
 
 import { DEFAULT_SIM_ORIGIN, RUNTIME_PROFILES } from '@tabdock/sim-page';
 import { untrustedHeader } from '@tabdock/protocol';
@@ -34,7 +36,7 @@ describe.each(RUNTIME_PROFILES)('runtime %s', (profile) => {
     const setValue = (
       tools.structured as { tools: { name: string; inputSchema: unknown }[] }
     ).tools.find((t) => t.name === 'set_value');
-    // Chrome 153 and 154 hand the adapter a JSON string; clients always get an object.
+    // On chrome-154 the adapter gets the schema as a JSON string; clients always get an object.
     expect(setValue?.inputSchema).toMatchObject({ type: 'object', required: ['value'] });
 
     const set = await callTool(alice, 'call_page_tool', {

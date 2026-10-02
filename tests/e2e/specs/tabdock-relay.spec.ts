@@ -9,10 +9,13 @@ import {
   connectMcp,
   dockState,
   errorCode,
+  scriptClickInWidget,
   startTabdock,
   waitForDock,
   waitForLink,
+  widgetButtonCentre,
   widgetText,
+  widgetVisible,
   type Tabdock,
 } from '../src/tabdock-harness.ts';
 
@@ -95,6 +98,13 @@ test('the widget shows the pairing code in a closed shadow root page script cann
   });
   expect(host).toEqual({ present: true, shadowRoot: null });
   expect(await widgetText(page, 'pairing-code')).toBe(code);
+  // Nobody is attached yet, so the panel opened by itself: the code shows without a click.
+  expect(await widgetVisible(page, 'pairing-code')).toBe(true);
+  // The badge still closes and reopens it.
+  await clickInWidget(page, { action: 'toggle' });
+  await expect.poll(() => widgetVisible(page, 'pairing-code')).toBe(false);
+  await clickInWidget(page, { action: 'toggle' });
+  await expect.poll(() => widgetVisible(page, 'pairing-code')).toBe(true);
   // The console guard in afterEach sees the adapter's own lines.
   expect(consoleLines.some((line) => line.includes('[tabdock] linked as page'))).toBe(true);
   await expect(page.locator('[data-role="status"]')).toHaveText(
@@ -107,9 +117,11 @@ test('pair by code, approve by clicking Allow as driver, then list and call tool
 }) => {
   const { pageId } = await openDemo(page);
   expect(await pairByClick(page)).toBe(pageId);
-  expect((await dockState(page))?.roster.map((a) => [a.userId, a.role])).toEqual([
-    ['alice', 'driver'],
-  ]);
+  // pair_page answers once the relay records the attachment; the roster frame
+  // reaches the page a moment later, so wait for it rather than read at once.
+  await expect
+    .poll(async () => (await dockState(page))?.roster.map((a) => [a.userId, a.role]))
+    .toEqual([['alice', 'driver']]);
 
   const tools = await waitForToolCount(pageId, 6);
   expect(tools.map((t) => t.name).sort()).toEqual([
@@ -156,6 +168,99 @@ test('pair by code, approve by clicking Allow as driver, then list and call tool
   });
   expect(missing.isError).toBe(true);
   expect(missing.text.split('\n', 1)[0]).toBe(untrustedHeader(origin, 'highlight_item'));
+});
+
+test('Deny on an attach request returns denied_by_operator and attaches nobody', async ({
+  page,
+}) => {
+  const { code } = await openDemo(page);
+  const pending = callTool(client, 'pair_page', { code });
+  const requestId = await waitForDock(page, (s) => s.pendingRequests[0]?.requestId);
+
+  // A script's click is not the operator's: the widget ignores events that are not trusted.
+  await scriptClickInWidget(page, { action: 'approve-driver', requestId });
+  expect((await dockState(page))?.pendingRequests.map((r) => r.requestId)).toEqual([requestId]);
+
+  await clickInWidget(page, { action: 'deny', requestId });
+  const denied = await pending;
+  expect(errorCode(denied), denied.text).toBe('denied_by_operator');
+  const state = await dockState(page);
+  expect(state?.pendingRequests).toEqual([]);
+  expect(state?.roster).toEqual([]);
+  const pages = await callTool(client, 'list_pages');
+  expect(pages.text).toMatch(/not attached to any page/);
+});
+
+test('Allow as observer attaches an observer, whose add_item returns role_denied', async ({
+  page,
+}) => {
+  const { pageId, code } = await openDemo(page);
+  const pending = callTool(client, 'pair_page', { code });
+  const requestId = await waitForDock(page, (s) => s.pendingRequests[0]?.requestId);
+  await clickInWidget(page, { action: 'approve-observer', requestId });
+  const paired = await pending;
+  expect(paired.isError, paired.text).toBe(false);
+  expect(paired.structured).toMatchObject({ page: pageId, role: 'observer' });
+  await expect
+    .poll(async () => (await dockState(page))?.roster.map((a) => [a.userId, a.role]))
+    .toEqual([['alice', 'observer']]);
+  await waitForToolCount(pageId, 6);
+
+  const added = await callTool(client, 'call_page_tool', {
+    page: pageId,
+    tool: 'add_item',
+    arguments: { label: 'Not allowed', x: 10, y: 10 },
+  });
+  expect(errorCode(added), added.text).toBe('role_denied');
+  await expect(page.locator('[data-role="view"]')).toHaveText(/3 items/);
+  // Reading is what an observer may do.
+  const view = await callTool(client, 'call_page_tool', { page: pageId, tool: 'get_view' });
+  expect(view.isError, view.text).toBe(false);
+});
+
+test('a prompt that arrives as the operator clicks cannot take a click meant for another', async ({
+  page,
+}) => {
+  const { code } = await openDemo(page);
+  const bob = await connectMcp(tabdock.relay, tabdock.users.bob, 'tabdock-playwright-bob');
+  try {
+    const aliceAsks = callTool(client, 'pair_page', { code });
+    const first = await waitForDock(page, (s) => s.pendingRequests[0]?.requestId);
+    // The operator aims at Allow as driver on Alice's prompt...
+    const aim = await widgetButtonCentre(page, { action: 'approve-driver', requestId: first });
+
+    // ...and Bob's request lands just before the click.
+    const nextCode = await waitForDock(page, (s) =>
+      s.pairing && s.pairing.code !== code ? s.pairing.code : null,
+    );
+    codesSeen.add(nextCode);
+    const bobAsks = callTool(bob, 'pair_page', { code: nextCode });
+    await page.waitForFunction(() => window.__tabdockDock?.state.pendingRequests.length === 2);
+    await page.mouse.click(aim.x, aim.y);
+
+    // Inside the arming window the click does nothing at all; in particular Bob is not approved.
+    const state = await dockState(page);
+    expect(state?.pendingRequests.map((r) => r.user.userId).sort()).toEqual(['alice', 'bob']);
+    expect(state?.roster).toEqual([]);
+    // New prompts go on top, so once armed the same spot is still Alice's button.
+    const again = await widgetButtonCentre(page, { action: 'approve-driver', requestId: first });
+    expect([Math.round(again.x), Math.round(again.y)]).toEqual([
+      Math.round(aim.x),
+      Math.round(aim.y),
+    ]);
+
+    await page.mouse.click(again.x, again.y);
+    const alice = await aliceAsks;
+    expect(alice.structured).toMatchObject({ role: 'driver' });
+    const second = state?.pendingRequests.find((r) => r.user.userId === 'bob')?.requestId ?? '';
+    await clickInWidget(page, { action: 'deny', requestId: second });
+    expect(errorCode(await bobAsks)).toBe('denied_by_operator');
+    await expect
+      .poll(async () => (await dockState(page))?.roster.map((a) => [a.userId, a.role]))
+      .toEqual([['alice', 'driver']]);
+  } finally {
+    await bob.close();
+  }
 });
 
 test('clear_board shows a confirm prompt on the page, and Deny returns denied_by_operator', async ({

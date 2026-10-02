@@ -9,9 +9,13 @@ import {
   type Caller,
   type ClientInfo,
   CLOSE_DETACH,
+  CLOSE_INVALID_FRAME_PAGE,
   CLOSE_REPLACED,
+  CLOSE_SILENT,
   encodeFrame,
+  IdSchema,
   IDLE_TIMEOUT_MS,
+  JsonObjectSchema,
   MAX_FRAME_BYTES,
   MAX_RESULT_CHARS,
   type PageErrorCode,
@@ -82,7 +86,11 @@ export interface StorageLike {
   removeItem(key: string): void;
 }
 
-/** navigator.locks fits. Holding a lock keeps Chrome from freezing the tab while it is linked. */
+/**
+ * navigator.locks fits. SPEC section 8 asks for a lock while linked: Chrome exempts pages
+ * holding a Web Lock from Energy Saver freezing, though whether an uncontested lock counts
+ * is measured in M3 (docs/notes/verified.md).
+ */
 export interface LocksLike {
   request(name: string, callback: (lock: unknown) => Promise<unknown>): Promise<unknown>;
 }
@@ -211,7 +219,7 @@ const OPEN = 1;
 const TOOLCHANGE_DEBOUNCE_MS = 25;
 
 /** A link that hears nothing for the relay's idle timeout plus this grace is treated as dead. */
-const SILENCE_GRACE_MS = 5000;
+export const SILENCE_GRACE_MS = 5000;
 
 /** Results are cut this far under the cap so the truncation marker fits under it too. */
 const MARKER_ROOM = 100;
@@ -223,6 +231,7 @@ const MAX_ERROR_CHARS = 2000;
 const MIN_FRAME_BYTES = 4096;
 
 const RESUME_KEY_PREFIX = 'tabdock:resume:';
+const GRANTS_KEY_PREFIX = 'tabdock:grants:';
 const LOCK_PREFIX = 'tabdock:';
 
 const POLYFILL_HINT =
@@ -233,11 +242,13 @@ const HINT_NOTICE =
   "This browser's WebMCP does not report consequentialHint, so every tool that is not read-only " +
   'is treated as consequential. List the consequential tools in policy.consequentialTools to fix this.';
 
-/** Close code the relay uses when a newer connection took over this page. */
+/**
+ * The standard close code for a malformed frame. Browsers refuse it from page
+ * code, so closeSocket falls back to the protocol's CLOSE_INVALID_FRAME_PAGE.
+ * A silent relay gets CLOSE_SILENT, never CLOSE_DETACH: the relay ends a
+ * session at once on CLOSE_DETACH, and a page that reconnects must resume.
+ */
 const CLOSE_INVALID_FRAME = 1008;
-/** Browsers refuse to send 1008 from page code, so they send this instead. */
-const CLOSE_INVALID_FRAME_BROWSER = 4008;
-const CLOSE_SILENT = 4000;
 
 type InvokeFrame = Extract<RelayFrame, { t: 'invoke' }>;
 type WelcomeFrame = Extract<RelayFrame, { t: 'welcome' }>;
@@ -285,6 +296,39 @@ const encoder = new TextEncoder();
 
 function byteLength(text: string): number {
   return encoder.encode(text).length;
+}
+
+/** Each UTF-16 code unit becomes at most 3 UTF-8 bytes, so only longer strings need counting. */
+function overByteLimit(text: string, limit: number): boolean {
+  if (text.length > limit) return true;
+  return text.length * 3 > limit && byteLength(text) > limit;
+}
+
+/**
+ * Reads the grants stored beside the resume token with the protocol's own
+ * schemas. Other code on the page shares that storage, so anything malformed
+ * reads as no grants at all rather than as a partial list.
+ */
+function parseGrants(text: string): { pageId: string; grants: [string, Role][] } | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  const record = JsonObjectSchema.safeParse(value);
+  if (!record.success) return null;
+  const pageId = IdSchema.safeParse(record.data.pageId);
+  const stored = JsonObjectSchema.safeParse(record.data.grants);
+  if (!pageId.success || !stored.success) return null;
+  const grants: [string, Role][] = [];
+  for (const [userId, role] of Object.entries(stored.data)) {
+    const user = IdSchema.safeParse(userId);
+    const granted = RoleSchema.safeParse(role);
+    if (!user.success || !granted.success) return null;
+    grants.push([user.data, granted.data]);
+  }
+  return { pageId: pageId.data, grants };
 }
 
 function errorParts(error: unknown): { name: string; message: string } {
@@ -372,6 +416,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   const timers = options.timers ?? defaultTimers;
   const random = options.random ?? Math.random;
   const resumeKey = `${RESUME_KEY_PREFIX}${options.relayUrl}`;
+  const grantsKey = `${GRANTS_KEY_PREFIX}${options.relayUrl}`;
 
   let state: DockState = Object.freeze({
     link: 'idle',
@@ -405,6 +450,14 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   let lock: { release: () => void } | null = null;
   const calls = new Map<string, CallRecord>();
   const requests = new Map<string, RequestRecord>();
+  /**
+   * The roles the operator granted on this page, by user id: the root of S5's
+   * second check. The relay's roster and the role an invoke claims can only
+   * lower them, so a relay cannot run a tool for someone nobody approved.
+   */
+  const grants = new Map<string, Role>();
+  /** The page session the grants belong to; they mean nothing on another. */
+  let grantsPage: string | null = null;
 
   function setState(patch: Partial<DockState>): void {
     state = Object.freeze({ ...state, ...patch });
@@ -433,6 +486,72 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     } catch (error) {
       log.warn(`could not store the resume token: ${describe(error)}`);
     }
+  }
+
+  // Grants sit beside the resume token so a reload inside the resume window keeps them.
+  function loadGrants(): void {
+    let text: string | null;
+    try {
+      text = options.storage?.getItem(grantsKey) ?? null;
+    } catch {
+      return;
+    }
+    if (text === null) return;
+    const stored = parseGrants(text);
+    if (!stored) {
+      log.warn('ignored stored grants that did not parse');
+      return;
+    }
+    grantsPage = stored.pageId;
+    for (const [userId, role] of stored.grants) grants.set(userId, role);
+  }
+
+  function saveGrants(): void {
+    try {
+      if (grants.size === 0 || grantsPage === null) {
+        options.storage?.removeItem(grantsKey);
+      } else {
+        const stored = { pageId: grantsPage, grants: Object.fromEntries(grants) };
+        options.storage?.setItem(grantsKey, JSON.stringify(stored));
+      }
+    } catch (error) {
+      log.warn(`could not store the operator's grants: ${describe(error)}`);
+    }
+  }
+
+  /**
+   * The operator's approvals and denials (and any later local role change)
+   * go through here, so storage always matches memory.
+   */
+  function setGrant(userId: string, role: Role | null): void {
+    if (role === null) grants.delete(userId);
+    else grants.set(userId, role);
+    saveGrants();
+  }
+
+  function clearGrants(): void {
+    grants.clear();
+    grantsPage = null;
+    saveGrants();
+  }
+
+  loadGrants();
+
+  /**
+   * S5, second check: the least privileged of the operator's grant, the
+   * relay's roster and the role the invoke claims. null means nobody approved
+   * this caller on this page. Under autoApprove 'observer' the relay attaches
+   * people without asking (S4), so a caller it lists counts as an observer.
+   */
+  function callerRole(caller: Caller): Role | null {
+    const listed = state.roster.find((attachment) => attachment.userId === caller.userId)?.role;
+    const granted =
+      grants.get(caller.userId) ??
+      (policy.autoApprove === 'observer' && listed !== undefined ? 'observer' : undefined);
+    if (granted === undefined) return null;
+    return granted === 'observer' || listed === 'observer' || caller.role === 'observer'
+      ? 'observer'
+      : 'driver';
   }
 
   function send(frame: PageFrameInput): boolean {
@@ -513,7 +632,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       // Browsers only let page code send 1000 or 3000 to 4999.
     }
     try {
-      sock.close(code === CLOSE_INVALID_FRAME ? CLOSE_INVALID_FRAME_BROWSER : 1000, reason);
+      sock.close(code === CLOSE_INVALID_FRAME ? CLOSE_INVALID_FRAME_PAGE : 1000, reason);
     } catch {
       // Already closing.
     }
@@ -540,7 +659,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       protocolError('a binary frame');
       return;
     }
-    if (data.length > MAX_FRAME_BYTES) {
+    // The cap is in bytes; a string's length counts UTF-16 code units, which undercounts.
+    if (overByteLimit(data, MAX_FRAME_BYTES)) {
       protocolError('an oversized frame');
       return;
     }
@@ -608,6 +728,10 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     welcomed = true;
     attempt = 0;
     writeToken(frame.resumeToken);
+    // A new session, or a different page, starts with nobody approved.
+    if (!frame.resumed || grantsPage !== frame.pageId) grants.clear();
+    grantsPage = frame.pageId;
+    saveGrants();
     frameLimit = Math.max(MIN_FRAME_BYTES, Math.min(MAX_FRAME_BYTES, frame.limits.maxFrameBytes));
     resultLimit = Math.max(
       MARKER_ROOM * 2,
@@ -680,13 +804,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     pollTimer = null;
     syncTimer = null;
     releaseLock();
-    for (const call of calls.values()) {
-      call.finished = true;
-      timers.clearTimeout(call.deadline);
-      call.controller.abort();
-      settleConfirmPromise(call, false);
-    }
-    calls.clear();
+    for (const call of [...calls.values()]) abandon(call, 'link lost');
     for (const record of requests.values()) {
       timers.clearTimeout(record.timer);
       record.port.abort();
@@ -858,17 +976,35 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     finish(call, { ok: false, code: 'cancelled', message: 'the call was cancelled' });
   }
 
+  /** S7 attribution; never the arguments, the result or the error text. */
+  function logCall(call: CallRecord, outcome: string): void {
+    const { caller, tool, callId } = call.frame;
+    log.info(`call ${callId} ${tool} by ${caller.displayName} (${caller.role}): ${outcome}`);
+  }
+
+  /**
+   * Ends a call on this side without a result frame: the relay answers its
+   * caller from how the link ended (page_asleep, or page_gone after
+   * CLOSE_DETACH). The handler's signal aborts and any late result is dropped.
+   */
+  function abandon(call: CallRecord, why: string): void {
+    if (call.finished) return;
+    call.finished = true;
+    timers.clearTimeout(call.deadline);
+    calls.delete(call.frame.callId);
+    call.controller.abort();
+    settleConfirmPromise(call, false);
+    logCall(call, why);
+  }
+
   function finish(call: CallRecord, outcome: Outcome): void {
     if (call.finished) return;
     call.finished = true;
     timers.clearTimeout(call.deadline);
     calls.delete(call.frame.callId);
     settleConfirmPromise(call, false);
-    const { caller, tool, callId } = call.frame;
-    // S7 attribution; never the arguments, the result or the error text.
-    log.info(
-      `call ${callId} ${tool} by ${caller.displayName} (${caller.role}): ${outcome.ok ? 'ok' : outcome.code}`,
-    );
+    const { callId } = call.frame;
+    logCall(call, outcome.ok ? 'ok' : outcome.code);
     if (outcome.ok) {
       send(resultFrame(callId, outcome.content));
     } else {
@@ -902,6 +1038,16 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     const { frame } = call;
     const snapshot = await readTools();
     if (isDone(call)) return;
+    // S5, second check, after the await so the roster is the newest one.
+    const role = callerRole(frame.caller);
+    if (role === null) {
+      finish(call, {
+        ok: false,
+        code: 'role_denied',
+        message: 'the operator has not approved this caller on this page',
+      });
+      return;
+    }
     if (!snapshot) {
       finish(call, { ok: false, code: 'tool_error', message: 'the page could not list its tools' });
       return;
@@ -911,11 +1057,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       finish(call, { ok: false, code: 'tool_not_found', message: `no tool named ${frame.tool}` });
       return;
     }
-    // S5, second check: the relay already enforced the role; a crafted invoke must still fail
-    // here. The stricter of the claimed role and the roster's wins.
-    const listed = state.roster.find((attachment) => attachment.userId === frame.caller.userId);
-    const observer = frame.caller.role === 'observer' || listed?.role === 'observer';
-    if (observer && tool.page.annotations?.readOnlyHint !== true) {
+    if (role === 'observer' && tool.page.annotations?.readOnlyHint !== true) {
       finish(call, {
         ok: false,
         code: 'role_denied',
@@ -1089,6 +1231,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     setState({
       pendingRequests: state.pendingRequests.filter((item) => item.requestId !== requestId),
     });
+    // A denial, including silence, also withdraws any earlier grant: the operator said no.
+    setGrant(record.request.user.userId, allow && role !== undefined ? role : null);
     const who = record.request.user.displayName;
     log.info(allow ? `allowed ${who} as ${String(role)}` : `denied ${who}`);
     return send({
@@ -1118,6 +1262,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     if (mode === 'detach' && isLinked()) {
       for (const requestId of [...requests.keys()]) decide(requestId, false);
       for (const call of [...calls.values()]) {
+        // S6: a prompt left unanswered is a denial.
         if (call.confirm) {
           finish(call, {
             ok: false,
@@ -1125,8 +1270,9 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
             message: 'the page detached',
           });
         } else {
-          call.controller.abort();
-          finish(call, { ok: false, code: 'cancelled', message: 'the page detached' });
+          // No result: closing with CLOSE_DETACH makes the relay fail the call with
+          // page_gone, which says what happened; 'cancelled' would read as a timeout.
+          abandon(call, 'page detached');
         }
       }
     }
@@ -1140,7 +1286,10 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       );
     }
     tearDownLink();
-    if (mode === 'detach') writeToken(null);
+    if (mode === 'detach') {
+      writeToken(null);
+      clearGrants();
+    }
     stopForGood(null);
   }
 

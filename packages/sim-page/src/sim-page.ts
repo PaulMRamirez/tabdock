@@ -12,6 +12,7 @@ import {
   type Logger,
   type SocketFactory,
   type StorageLike,
+  type Timers,
   type UiPort,
 } from '@tabdock/adapter/core';
 import type { PolicyInput } from '@tabdock/protocol';
@@ -71,6 +72,8 @@ export interface SimPageOptions {
   /** Receives the adapter's log lines as well as sim.logs. */
   logger?: Logger;
   adapterVersion?: string;
+  /** Timers for the adapter core; a test can shorten one, such as the silence watchdog. */
+  timers?: Timers;
 }
 
 export interface SimPage {
@@ -99,7 +102,11 @@ export interface SimPage {
    * boots, like a reload stuck behind a sleeping laptop.
    */
   reload(options?: { awayMs?: number }): Promise<void>;
-  /** A deliberate detach: pending prompts denied, socket closed with 1000, resume token dropped. */
+  /**
+   * A deliberate detach: pending prompts denied, socket closed with
+   * CLOSE_DETACH (4000) so the relay ends the session at once, resume token
+   * and grants dropped.
+   */
   close(): Promise<void>;
 }
 
@@ -196,6 +203,7 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
       ownWindow: context.window,
       adapterVersion: options.adapterVersion ?? '0.0.0-sim',
       logger,
+      timers: options.timers,
     });
     core.start();
     return { core, context };

@@ -165,6 +165,62 @@ function sameClient(a: ClientInfo, b: ClientInfo): boolean {
   return a.name === b.name && a.version === b.version;
 }
 
+/** A page's inputSchema longer than this once serialised, after its text is cut, is replaced (S9). */
+export const MAX_SCHEMA_CHARS = 8192;
+/**
+ * Deeper than any real input schema. JSON.stringify recurses, so a schema nested
+ * a few thousand levels deep would break every listing that serialises it.
+ */
+export const MAX_SCHEMA_DEPTH = 64;
+/** Schema keys whose string values are page-written prose, cut like tool descriptions (S10). */
+const SCHEMA_TEXT_KEYS = new Set(['description', 'title']);
+
+class SchemaTooDeep extends Error {}
+
+function cutSchemaText(value: unknown, depth: number): unknown {
+  if (depth > MAX_SCHEMA_DEPTH) throw new SchemaTooDeep();
+  if (Array.isArray(value)) return value.map((item) => cutSchemaText(item, depth + 1));
+  if (typeof value !== 'object' || value === null) return value;
+  // fromEntries defines own properties, so a "__proto__" key stays a plain key.
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [
+      key,
+      SCHEMA_TEXT_KEYS.has(key) && typeof item === 'string'
+        ? truncate(item, MAX_DESCRIPTION_CHARS).text
+        : cutSchemaText(item, depth + 1),
+    ]),
+  );
+}
+
+function removedSchema(why: string): JsonObject {
+  return { type: 'object', description: `[tabdock: schema removed, ${why}]` };
+}
+
+/**
+ * Page text in a schema is capped like a description (S10), and a schema too
+ * big or too deep to pass along is replaced by a stub that says so (S9).
+ */
+function cutSchema(schema: JsonObject): JsonObject {
+  let cut: JsonObject;
+  try {
+    cut = cutSchemaText(schema, 0) as JsonObject;
+  } catch (error) {
+    if (!(error instanceof SchemaTooDeep)) throw error;
+    return removedSchema(`nested more than ${String(MAX_SCHEMA_DEPTH)} levels deep`);
+  }
+  const size = JSON.stringify(cut).length;
+  return size > MAX_SCHEMA_CHARS ? removedSchema(`${String(size)} characters`) : cut;
+}
+
+/** Every page-written string in a tool is capped once, as it arrives, before any client sees it. */
+function cutTool(tool: PageTool): PageTool {
+  return {
+    ...tool,
+    description: truncate(tool.description, MAX_DESCRIPTION_CHARS).text,
+    inputSchema: cutSchema(tool.inputSchema),
+  };
+}
+
 export class PageHub {
   readonly #config: ResolvedConfig;
   readonly #store: RelayStore;
@@ -410,7 +466,7 @@ export class PageHub {
     for (const tool of frame.tools) {
       if (seen.has(tool.name)) continue;
       seen.add(tool.name);
-      tools.push(tool);
+      tools.push(cutTool(tool));
     }
     if (tools.length !== frame.tools.length) {
       this.#log.warn('page listed a tool name twice; kept the first', { pageId });
@@ -448,6 +504,10 @@ export class PageHub {
     if (!page) return;
     page.state = 'asleep';
     page.asleepAt = Date.now();
+    // Nobody can list or call an asleep page's tools, and the adapter sends them
+    // again after the welcome on resume, so they are not held (up to a 1 MB frame
+    // of them) for the whole resume window.
+    page.tools = [];
     this.#store.pages.put(page);
     this.#store.tickets.deleteForPage(pageId);
     this.#clearTimer(this.#pairingTimers, pageId);
@@ -767,8 +827,8 @@ export class PageHub {
         return {
           name: tool.name,
           ...(tool.title === undefined ? {} : { title: tool.title }),
-          // S10: page descriptions are capped before any client sees them.
-          description: truncate(tool.description, MAX_DESCRIPTION_CHARS).text,
+          // S10: the description and schema were already cut when the tools frame arrived (cutTool).
+          description: tool.description,
           inputSchema: tool.inputSchema,
           annotations,
           allowed: attachment.role === 'driver' || annotations.readOnlyHint === true,
@@ -908,27 +968,36 @@ export class PageHub {
     signal: AbortSignal,
   ): Promise<CallOutcome> {
     const started = Date.now();
-    const outcome = await this.#call(caller, pageId, tool, args, signal);
-    const auditOutcome: AuditOutcome =
-      outcome.kind === 'error'
-        ? outcome.code
-        : outcome.kind === 'invalid'
-          ? 'invalid_arguments'
-          : outcome.kind;
-    const record = {
-      at: started,
-      pageId,
-      origin: this.#store.pages.get(pageId)?.origin ?? null,
-      userId: caller.userId,
-      client: caller.client,
-      tool,
-      outcome: auditOutcome,
-      durationMs: Date.now() - started,
-    };
-    this.#store.audit.append(record);
-    // Arguments are never part of the record (S7), and the logger redacts them anyway.
-    this.#log.info('call', { audit: record });
-    return outcome;
+    let auditOutcome: AuditOutcome = 'relay_error';
+    try {
+      const outcome = await this.#call(caller, pageId, tool, args, signal);
+      auditOutcome =
+        outcome.kind === 'error'
+          ? outcome.code
+          : outcome.kind === 'invalid'
+            ? 'invalid_arguments'
+            : outcome.kind;
+      return outcome;
+    } catch (error) {
+      // The SDK still answers the client with an error result; the log keeps the cause.
+      this.#log.error('call failed inside the relay', { pageId, error });
+      throw error;
+    } finally {
+      // In finally, so every attempt leaves a record even when the relay itself fails (S7).
+      const record = {
+        at: started,
+        pageId,
+        origin: this.#store.pages.get(pageId)?.origin ?? null,
+        userId: caller.userId,
+        client: caller.client,
+        tool,
+        outcome: auditOutcome,
+        durationMs: Date.now() - started,
+      };
+      this.#store.audit.append(record);
+      // Arguments are never part of the record (S7), and the logger redacts them anyway.
+      this.#log.info('call', { audit: record });
+    }
   }
 
   #call(
@@ -958,20 +1027,29 @@ export class PageHub {
     }
 
     const callId = newId('cl');
-    const deadlineMs = this.#config.timings.callDeadlineMs;
-    const encoded = encodeFrame({
-      t: 'invoke',
-      callId,
-      tool: tool.name,
-      arguments: args,
-      caller: {
-        userId: caller.userId,
-        displayName: caller.displayName,
-        client: caller.client,
-        role: attachment.role,
-      },
-      deadlineMs,
-    });
+    const { callDeadlineMs: deadlineMs, callDeadlineGraceMs } = this.#config.timings;
+    let encoded: string;
+    try {
+      encoded = encodeFrame({
+        t: 'invoke',
+        callId,
+        tool: tool.name,
+        arguments: args,
+        caller: {
+          userId: caller.userId,
+          displayName: caller.displayName,
+          client: caller.client,
+          role: attachment.role,
+        },
+        deadlineMs,
+      });
+    } catch {
+      // JSON.stringify recurses: arguments nested a few thousand levels deep overflow the stack.
+      return Promise.resolve({
+        kind: 'invalid',
+        message: 'the arguments could not be encoded for the page link',
+      });
+    }
     // The adapter drops any frame over the cap by closing the socket, so an
     // oversized call must stop here rather than knock the page offline.
     if (Buffer.byteLength(encoded, 'utf8') > MAX_FRAME_BYTES) {
@@ -990,10 +1068,13 @@ export class PageHub {
         conn.inflight.delete(callId);
         resolve(outcome);
       };
+      // The page's deadline starts later, when the invoke arrives, and its answer
+      // then (denied_by_operator for an unanswered confirmation, S6) must reach
+      // the client; the grace keeps this timer from always winning that race.
       const timer = setTimeout(() => {
         this.#send(conn, { t: 'cancel', callId, reason: 'timeout' });
         finish(hubError('timeout', `the page did not answer within ${String(deadlineMs)} ms`));
-      }, deadlineMs);
+      }, deadlineMs + callDeadlineGraceMs);
       timer.unref();
       const onAbort = (): void => {
         this.#send(conn, { t: 'cancel', callId, reason: 'client' });

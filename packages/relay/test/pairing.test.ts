@@ -1,5 +1,6 @@
 import type { Client } from '@modelcontextprotocol/client';
-import { afterEach, describe, expect, it } from 'vitest';
+import { PAIRING_TTL_MS } from '@tabdock/protocol';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { connectPage, type TestPage, TOOLS } from './helpers/page-client.ts';
 import {
   ALICE,
@@ -70,6 +71,29 @@ describe('pair_page (A1.4, S3, S4)', () => {
     const outcome = await callTool(alice, 'pair_page', { code: old });
     expect(outcome).toMatchObject({ isError: true, text: EXPIRED });
     expect(opened.code).not.toBe(old);
+  });
+
+  it('refuses a code past its own expiresAt even when the rotation timer has not fired yet', async () => {
+    // The default lifetime, so the rotation timer stays far off and only the ticket's own check can refuse.
+    await setup({ timings: { pairingTtlMs: PAIRING_TTL_MS } });
+    const opened = await page();
+    const alice = await client();
+    const realNow = Date.now.bind(Date);
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + PAIRING_TTL_MS + 1000);
+    try {
+      expect(await callTool(alice, 'pair_page', { code: opened.code })).toMatchObject({
+        isError: true,
+        text: EXPIRED,
+      });
+    } finally {
+      clock.mockRestore();
+    }
+    await opened.sync();
+    expect(opened.all('attach_request')).toHaveLength(0);
+    // No rotation happened: the refusal came from expiresAt, not from a timer.
+    expect(opened.all('pairing')).toHaveLength(0);
+    // The same code still works on the real clock, so only its age refused it.
+    await pairAndApprove(alice, opened);
   });
 
   it('accepts the code as people retype it', async () => {

@@ -1,13 +1,26 @@
 // The operator's widget (SPEC.md section 8), kept thin: a badge and a panel in
-// a closed shadow root, so page scripts can neither read the pairing code nor
-// press Allow. Everything shown comes from the Dock handle, every relay- or
-// page-supplied string goes in through textContent, and nothing lands on window.
-// Buttons carry stable data-action attributes for browser tests.
+// a closed shadow root. Scripts that run after attach(), and other frames,
+// cannot read the pairing code or reach the buttons inside it. A page script
+// that runs before attach() could (by patching attachShadow, say), which is
+// acceptable because the page itself is trusted (SPEC.md section 1). As
+// defence in depth, buttons ignore events whose isTrusted is false, so a
+// script that does reach one still cannot press Allow. Everything shown comes
+// from the Dock handle, every relay- or page-supplied string goes in through
+// textContent, and nothing lands on window. Buttons carry stable data-action
+// attributes for browser tests.
 
 import type { Dock, DockState, LinkState, PendingConfirm, PendingRequest } from './core.ts';
 
 /** A valid custom element name needs no registration to host a shadow root, so nothing is defined globally. */
 const HOST_TAG = 'tabdock-dock';
+
+/**
+ * Prompt buttons ignore clicks for this long after the panel's layout changes
+ * (a prompt arriving or going, the roster or pairing block resizing), so a
+ * click aimed at one button never lands on another that just moved under the
+ * pointer. data-armed shows the state, for people and for browser tests.
+ */
+const ARM_DELAY_MS = 500;
 
 const LINK_LABELS: Record<LinkState, string> = {
   idle: 'Idle',
@@ -47,6 +60,7 @@ const STYLE = `
   font: inherit; cursor: pointer; }
 .action.primary { border-color: #1d4ed8; background: #1d4ed8; color: #fff; }
 .action:disabled { opacity: 0.5; cursor: default; }
+.action[data-armed='false'] { opacity: 0.6; cursor: default; }
 ul { margin: 2px 0 0; padding: 0; list-style: none; }
 li { padding: 2px 0; }
 @media (prefers-color-scheme: dark) {
@@ -91,11 +105,31 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     return node;
   }
 
-  function button(label: string, action: string, onClick: () => void, primary = false) {
+  /** Whether prompt buttons take clicks; see ARM_DELAY_MS. */
+  let armed = false;
+  let armTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /** prompt marks a button inside a prompt box, which only works while armed. */
+  function button(
+    label: string,
+    action: string,
+    onClick: () => void,
+    primary = false,
+    prompt = false,
+  ) {
     const node = element('button', primary ? 'action primary' : 'action', label);
     node.type = 'button';
     node.dataset.action = action;
-    node.addEventListener('click', onClick);
+    if (prompt) {
+      node.dataset.armed = String(armed);
+      node.setAttribute('aria-disabled', String(!armed));
+    }
+    node.addEventListener('click', (event) => {
+      // Page script can dispatch a click, but never a trusted one.
+      if (!event.isTrusted) return;
+      if (prompt && !armed) return;
+      onClick();
+    });
     return node;
   }
 
@@ -156,18 +190,31 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     }
     const buttons = element('div', 'buttons');
     buttons.append(
-      button('Allow as driver', 'approve-driver', () => {
-        dock.approve(request.requestId, 'driver');
-      }),
-      button('Allow as observer', 'approve-observer', () => {
-        dock.approve(request.requestId, 'observer');
-      }),
+      button(
+        'Allow as driver',
+        'approve-driver',
+        () => {
+          dock.approve(request.requestId, 'driver');
+        },
+        false,
+        true,
+      ),
+      button(
+        'Allow as observer',
+        'approve-observer',
+        () => {
+          dock.approve(request.requestId, 'observer');
+        },
+        false,
+        true,
+      ),
       button(
         'Deny',
         'deny',
         () => {
           dock.deny(request.requestId);
         },
+        true,
         true,
       ),
     );
@@ -182,15 +229,22 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     box.append(element('p', '', `${confirm.caller.displayName} wants to run ${confirm.tool}`));
     const buttons = element('div', 'buttons');
     buttons.append(
-      button('Allow', 'confirm-allow', () => {
-        dock.confirm(confirm.callId, true);
-      }),
+      button(
+        'Allow',
+        'confirm-allow',
+        () => {
+          dock.confirm(confirm.callId, true);
+        },
+        false,
+        true,
+      ),
       button(
         'Deny',
         'confirm-deny',
         () => {
           dock.confirm(confirm.callId, false);
         },
+        true,
         true,
       ),
     );
@@ -199,7 +253,11 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     return { element: box, countdown, expiresAt: confirm.expiresAt };
   }
 
-  /** Adds and removes prompt boxes by id, so a box under the operator's pointer is never rebuilt. */
+  /**
+   * Adds and removes prompt boxes by id, so a box under the operator's pointer
+   * is never rebuilt. New boxes go on top: the panel is pinned at the bottom of
+   * the screen, so the boxes already shown keep their place.
+   */
   function syncPrompts<T>(
     views: Map<string, PromptView>,
     items: readonly T[],
@@ -219,11 +277,33 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       if (views.has(id)) continue;
       const view = build(item);
       views.set(id, view);
-      prompts.append(view.element);
+      prompts.prepend(view.element);
       added = true;
     }
     return added;
   }
+
+  function setArmed(value: boolean): void {
+    armed = value;
+    for (const node of prompts.querySelectorAll('button')) {
+      node.dataset.armed = String(value);
+      node.setAttribute('aria-disabled', String(!value));
+    }
+  }
+
+  /** Disarms every prompt button now and arms them again once the layout has held still. */
+  function rearm(): void {
+    clearTimeout(armTimer);
+    setArmed(false);
+    armTimer = setTimeout(() => {
+      setArmed(true);
+    }, ARM_DELAY_MS);
+  }
+
+  /** What decides where the prompt buttons sit; when it changes, they may have moved. */
+  let layoutKey = '';
+  /** Whether the page was last waiting for its first attachment; see render. */
+  let awaitingFirst = false;
 
   function tick(): void {
     for (const view of requestViews.values()) {
@@ -280,6 +360,22 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     badge.classList.toggle('attention', waiting);
     // A new prompt opens the panel: the operator has a deadline to meet.
     if (newRequest || newConfirm) setOpen(true);
+    // The code is how anyone attaches, so show it without a click while nobody has.
+    // Only on the way in, so the badge can still close the panel.
+    const awaiting = state.link === 'linked' && state.pairing !== null && state.roster.length === 0;
+    if (awaiting && !awaitingFirst) setOpen(true);
+    awaitingFirst = awaiting;
+    const layout = [
+      [...requestViews.keys(), ...confirmViews.keys()].join(','),
+      state.roster.length,
+      pairing.hidden,
+      errorLine.hidden,
+      noticeLine.hidden,
+    ].join('|');
+    if (layout !== layoutKey) {
+      layoutKey = layout;
+      rearm();
+    }
     tick();
   }
 
@@ -292,6 +388,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     mounted = false;
     unsubscribe();
     clearInterval(interval);
+    clearTimeout(armTimer);
     host.remove();
   }
 

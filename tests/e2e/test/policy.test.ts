@@ -107,6 +107,34 @@ describe('consequential tools', () => {
     expect(allowed.structured).toEqual({ wiped: true });
     expect(sim.store.value).toBeNull();
   });
+
+  it('an unanswered prompt is a denial, and the client hears denied_by_operator, not timeout', async () => {
+    // A short page deadline; the relay keeps its default grace past it.
+    world = await startWorld({ timings: { callDeadlineMs: 400 } });
+    const sim = await world.page();
+    const alice = await world.client(world.alice);
+    const pageId = await attachAs(alice, sim, 'driver');
+    await waitForTools(alice, pageId, SIM_TOOL_COUNT);
+    await callTool(alice, 'call_page_tool', {
+      page: pageId,
+      tool: 'set_value',
+      arguments: { value: 'keep me' },
+    });
+
+    const pending = callTool(alice, 'call_page_tool', { page: pageId, tool: 'wipe' });
+    const prompted = await sim.waitFor((s) => s.pendingConfirms.length > 0);
+    expect(prompted.pendingConfirms[0]?.tool).toBe('wipe');
+    // Nobody answers the prompt.
+    const denied = await pending;
+    expect(errorCode(denied), denied.text).toBe('denied_by_operator');
+    expect(sim.state.pendingConfirms).toEqual([]);
+    expect(sim.store.calls.some((c) => c.tool === 'wipe')).toBe(false);
+    expect(sim.store.value).toBe('keep me');
+    expect(world.relay.audit.records().at(-1)).toMatchObject({
+      tool: 'wipe',
+      outcome: 'denied_by_operator',
+    });
+  });
 });
 
 describe('isolation between users (S13)', () => {

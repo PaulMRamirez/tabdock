@@ -9,8 +9,13 @@ const dock = attach({
   relay: 'ws://127.0.0.1:8787/page',
   policy: { consequentialTools: ['clear_board'] },
 });
-dock.on('state', (state) => console.log(state.link, state.pairing?.code));
+const status = document.querySelector('#tabdock-status');
+dock.on('state', (state) => {
+  if (status) status.textContent = `Tabdock: ${state.link}, ${state.roster.length} attached`;
+});
 ```
+
+The pairing code shows in the widget for the operator to read out; never log it, print it or send it anywhere else, and the same goes for resume tokens (SPEC.md section 9, S11). Anyone who sees a live code can ask to attach.
 
 `attach()` returns the only control handle (`approve`, `deny`, `confirm`, `rotatePairing`, `close`); with `ui: false` no widget is mounted and the handle answers prompts. Without a script, `pnpm --filter @tabdock/adapter build` writes `dist/tabdock-adapter.js`, which reads `data-relay`, `data-auto-approve`, `data-max-drivers`, `data-consequential` and `data-consequential-tools` from its own script tag.
 

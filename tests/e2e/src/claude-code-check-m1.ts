@@ -109,11 +109,16 @@ try {
 
   const called = (name: string) =>
     audit.some((r) => r.pageId === pageId && r.tool === name && r.outcome === 'ok');
+  // Proof that Claude Code itself made the calls, not some other client with the token.
+  // Its version varies by install, so only the name is checked.
+  const byClaudeCode = audit.some((r) => r.pageId === pageId && r.client?.name === 'claude-code');
+  if (!byClaudeCode) console.log('No audit record names the client claude-code.');
   const passed =
     operator.approved.length === 1 &&
     roster.some((a) => a.userId === 'alice' && a.role === 'driver') &&
     called('get_view') &&
     called('add_item') &&
+    byClaudeCode &&
     strip.some((line) => line.includes('get_view: read the view')) &&
     strip.some((line) => line.includes('add_item: added'));
   console.log(

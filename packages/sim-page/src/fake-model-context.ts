@@ -6,7 +6,10 @@
 
 /**
  * 'polyfill-5.1' is MCP-B's @mcp-b/webmcp-polyfill 5.1.0, 'chrome-154' native
- * WebMCP in Chrome 153 and 154, 'chrome-156' native WebMCP in Chrome 155 and 156.
+ * WebMCP in Chrome 154 and 'chrome-156' native WebMCP in Chrome 156. Neither
+ * Chrome profile fits its neighbour: Chrome 153 drops consequentialHint like
+ * the polyfill, and Chrome 155 takes object input but lacks the debugging hint
+ * (docs/notes/baseline.md).
  */
 export type RuntimeProfile = 'polyfill-5.1' | 'chrome-154' | 'chrome-156';
 

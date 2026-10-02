@@ -58,9 +58,11 @@ export interface AttachRequestRecord {
 
 /**
  * 'cancelled' is a call the MCP client itself abandoned; 'invalid_arguments'
- * never reached the page because it could not be forwarded.
+ * never reached the page because it could not be forwarded; 'relay_error' is a
+ * call the relay failed on its own (a bug), recorded so no attempt escapes S7.
  */
-export type AuditOutcome = 'ok' | 'tool_error' | 'invalid_arguments' | 'cancelled' | ErrorCode;
+export type AuditOutcome =
+  'ok' | 'tool_error' | 'invalid_arguments' | 'cancelled' | 'relay_error' | ErrorCode;
 
 /** One call_page_tool attempt (S7). Arguments are deliberately absent. */
 export interface AuditRecord {

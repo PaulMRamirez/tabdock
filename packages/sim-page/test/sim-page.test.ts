@@ -150,6 +150,20 @@ async function linked(options: Partial<Parameters<typeof startSimPage>[0]> = {})
   return { relay, sim, connection };
 }
 
+/** The operator approves Alice through the handle, as on a real page: the core refuses callers nobody approved (S5). */
+async function approveAlice(sim: SimPage, connection: Connection): Promise<void> {
+  send(connection, {
+    t: 'attach_request',
+    requestId: 'r-alice',
+    user: { userId: 'alice', displayName: 'Alice' },
+    via: 'code',
+    client: null,
+    expiresAt: Date.now() + 60_000,
+  });
+  await sim.waitFor((state) => state.pendingRequests.some((r) => r.requestId === 'r-alice'));
+  expect(sim.dock.approve('r-alice', 'driver')).toBe(true);
+}
+
 describe.each(RUNTIME_PROFILES)('the sim page as %s', (profile) => {
   it('links with an Origin header and the subprotocol, and shares its tools', async () => {
     const { relay, sim, connection } = await linked({ profile });
@@ -186,6 +200,7 @@ describe.each(RUNTIME_PROFILES)('the sim page as %s', (profile) => {
       // On the polyfill the hint is lost, so set_value needs the operator too (ADR 0002).
       operator: { askConfirm: () => true },
     });
+    await approveAlice(sim, connection);
     send(connection, {
       t: 'invoke',
       callId: 'c1',
@@ -256,6 +271,7 @@ describe('startSimPage', () => {
 
   it('cancels a running call and stops the handler on Chrome', async () => {
     const { sim, connection } = await linked({ profile: 'chrome-156' });
+    await approveAlice(sim, connection);
     send(connection, {
       t: 'invoke',
       callId: 'c1',
@@ -308,6 +324,7 @@ describe('startSimPage', () => {
 
   it('never logs the resume token, the pairing code or call arguments', async () => {
     const { sim, connection } = await linked();
+    await approveAlice(sim, connection);
     send(connection, {
       t: 'invoke',
       callId: 'c1',
@@ -316,9 +333,9 @@ describe('startSimPage', () => {
       caller: alice,
       deadlineMs: 5000,
     });
-    await frameOf(connection, 'result');
+    expect(await frameOf(connection, 'result')).toMatchObject({ ok: true });
     const logs = sim.logs.join('\n');
-    expect(logs).toContain('call c1 echo by Alice');
+    expect(logs).toContain('call c1 echo by Alice (driver): ok');
     for (const secret of ['token-1', 'ABCDE-FGHJK', 'argument-value-xyz']) {
       expect(logs).not.toContain(secret);
     }

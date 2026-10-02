@@ -1,5 +1,9 @@
 import {
+  CLOSE_DETACH,
+  CLOSE_INVALID_FRAME_PAGE,
+  CLOSE_SILENT,
   IDLE_TIMEOUT_MS,
+  MAX_FRAME_BYTES,
   MAX_RESULT_CHARS,
   RECONNECT_MAX_MS,
   RECONNECT_MIN_MS,
@@ -9,12 +13,16 @@ import { describe, expect, it } from 'vitest';
 import { backoffDelay, createAdapterCore, type LocksLike, type RuntimeTool } from '../src/core.ts';
 import {
   FRAME_WINDOW,
+  GRANTS_KEY,
   HANDLER_FAILED,
+  MapStorage,
   PAGE_WINDOW,
   RELAY_URL,
   RESUME_KEY,
   attachRequest,
+  attachment,
   flush,
+  grant,
   invoke,
   link,
   polyfillTools,
@@ -52,7 +60,7 @@ describe('linking', () => {
 
   it('stores the token from welcome, shows the pairing code, then sends its tools', async () => {
     const h = setup();
-    const socket = await link(h);
+    const socket = await link(h, {}, {});
     expect(h.storage.getItem(RESUME_KEY)).toBe('resume-1');
     expect(h.dock.state).toMatchObject({
       link: 'linked',
@@ -419,7 +427,8 @@ describe('cancel and deadline', () => {
 describe('roles and consequential tools', () => {
   it('refuses an observer a tool that is not read-only, without running it (S5)', async () => {
     const h = setup();
-    const socket = await link(h);
+    // Granted driver on the page, but an invoke that claims observer still lowers the role.
+    const socket = await link(h, {}, { eve: 'driver' });
     const observer = { userId: 'eve', displayName: 'Eve', client: null, role: 'observer' as const };
     socket.deliver(invoke('set_value', { caller: observer }));
     socket.deliver(invoke('get_value', { callId: 'call-2', caller: observer }));
@@ -450,6 +459,141 @@ describe('roles and consequential tools', () => {
     await flush();
     expect(results(socket)[0]?.error?.code).toBe('role_denied');
     expect(h.context.runs).toHaveLength(0);
+  });
+
+  describe("the operator's grants (S5, second check)", () => {
+    const bob = (role: 'driver' | 'observer' = 'driver') => ({
+      userId: 'bob',
+      displayName: 'Bob',
+      client: null,
+      role,
+    });
+    /** Outcomes in call id order; read-only calls finish later than refusals. */
+    const codes = (socket: Awaited<ReturnType<typeof link>>) =>
+      results(socket)
+        .sort((a, b) => a.callId.localeCompare(b.callId))
+        .map((frame) => frame.error?.code ?? 'ok');
+
+    it('refuses a caller nobody approved on the page, whatever role the relay claims', async () => {
+      const h = setup();
+      // The relay lists Mallory as a driver, but the operator never approved her.
+      const socket = await link(h, { roster: [attachment('mallory', 'driver')] }, {});
+      const mallory = { userId: 'mallory', displayName: 'Mallory', client: null, role: 'driver' };
+      const stranger = { ...mallory, userId: 'stranger', displayName: 'Stranger' };
+      socket.deliver(invoke('set_value', { caller: stranger as never }));
+      socket.deliver(invoke('get_value', { callId: 'call-2', caller: stranger as never }));
+      socket.deliver(invoke('set_value', { callId: 'call-3', caller: mallory as never }));
+      await flush();
+      expect(codes(socket)).toEqual(['role_denied', 'role_denied', 'role_denied']);
+      expect(results(socket)[0]?.error?.message).toBe(
+        'the operator has not approved this caller on this page',
+      );
+      expect(h.context.runs).toHaveLength(0);
+    });
+
+    it('never lets the roster or the invoke raise an observer to driver', async () => {
+      const h = setup();
+      const socket = await link(h, {}, { bob: 'observer' });
+      socket.deliver({ t: 'roster', attachments: [attachment('bob', 'driver')] });
+      socket.deliver(invoke('set_value', { caller: bob('driver') }));
+      socket.deliver(invoke('get_value', { callId: 'call-2', caller: bob('driver') }));
+      await flush();
+      expect(codes(socket)).toEqual(['role_denied', 'ok']);
+      expect(h.context.runs.map((run) => run.tool)).toEqual(['get_value']);
+    });
+
+    it('lets a denial, or silence, withdraw an earlier grant', async () => {
+      const h = setup();
+      const socket = await link(h, {}, { bob: 'driver' });
+      socket.deliver({
+        ...attachRequest(h.clock, 'req-2'),
+        user: { userId: 'bob', displayName: 'Bob' },
+      });
+      expect(h.dock.deny('req-2')).toBe(true);
+      socket.deliver(invoke('get_value', { caller: bob() }));
+      await flush();
+      expect(codes(socket)).toEqual(['role_denied']);
+    });
+
+    it('keeps grants across a reload inside the resume window and clears them on detach', async () => {
+      const first = setup();
+      await link(first, {}, { bob: 'driver' });
+      expect(JSON.parse(first.storage.getItem(GRANTS_KEY) ?? 'null')).toEqual({
+        pageId: 'page-1',
+        grants: { bob: 'driver' },
+      });
+      first.core.close('unload');
+
+      // The reloaded page resumes the same session, so Bob may still drive.
+      const reloaded = setup({ storage: first.storage });
+      const socket = await link(reloaded, { resumed: true, resumeToken: 'resume-2' }, {});
+      socket.deliver(invoke('set_value', { caller: bob() }));
+      await flush();
+      expect(codes(socket)).toEqual(['ok']);
+
+      reloaded.dock.close();
+      expect(first.storage.getItem(GRANTS_KEY)).toBeNull();
+      expect(first.storage.getItem(RESUME_KEY)).toBeNull();
+
+      // Nothing survives a detach, even if a relay claimed to resume the session.
+      const after = setup({ storage: first.storage });
+      const third = await link(after, { resumed: true }, {});
+      third.deliver(invoke('get_value', { caller: bob() }));
+      await flush();
+      expect(codes(third)).toEqual(['role_denied']);
+    });
+
+    it('starts a new page session, or another page, with nobody approved', async () => {
+      for (const overrides of [{ resumed: false }, { resumed: true, pageId: 'page-9' }]) {
+        const first = setup();
+        await link(first, {}, { bob: 'driver' });
+        first.core.close('unload');
+        const next = setup({ storage: first.storage });
+        const socket = await link(next, overrides, {});
+        socket.deliver(invoke('get_value', { caller: bob() }));
+        await flush();
+        expect(codes(socket)).toEqual(['role_denied']);
+        expect(first.storage.getItem(GRANTS_KEY)).toBeNull();
+      }
+    });
+
+    it('reads malformed stored grants as none', async () => {
+      const storage = new MapStorage();
+      storage.setItem(GRANTS_KEY, '{"pageId":"page-1","grants":{"bob":"admin","eve":"driver"}}');
+      const h = setup({ storage });
+      const socket = await link(h, { resumed: true }, {});
+      socket.deliver(invoke('get_value', { caller: { ...bob(), userId: 'eve' } }));
+      await flush();
+      expect(codes(socket)).toEqual(['role_denied']);
+      expect(h.logs).toContain('warn ignored stored grants that did not parse');
+    });
+
+    it("under autoApprove 'observer', lets a caller the relay lists read but not write", async () => {
+      const h = setup({ core: { policy: { autoApprove: 'observer' } } });
+      // The relay attached Carol without asking, as the policy allows (S4), and claims driver.
+      const socket = await link(h, { roster: [attachment('carol', 'driver')] }, {});
+      const carol = {
+        userId: 'carol',
+        displayName: 'Carol',
+        client: null,
+        role: 'driver' as const,
+      };
+      socket.deliver(invoke('get_value', { caller: carol }));
+      socket.deliver(invoke('set_value', { callId: 'call-2', caller: carol }));
+      // Someone the relay does not list gets nothing.
+      socket.deliver(
+        invoke('get_value', { callId: 'call-3', caller: { ...carol, userId: 'dave' } }),
+      );
+      await flush();
+      expect(codes(socket)).toEqual(['ok', 'role_denied', 'role_denied']);
+      expect(h.context.runs.map((run) => run.tool)).toEqual(['get_value']);
+
+      // An operator's own approval still counts in full.
+      grant(h, socket, 'carol', 'driver');
+      socket.deliver(invoke('set_value', { callId: 'call-4', caller: carol }));
+      await flush();
+      expect(codes(socket).at(-1)).toBe('ok');
+    });
   });
 
   it('asks before a consequential tool and runs it once the operator allows', async () => {
@@ -630,7 +774,7 @@ describe('attach requests', () => {
 
   it('rejects an approval without a valid role', async () => {
     const h = setup();
-    const socket = await link(h);
+    const socket = await link(h, {}, {});
     socket.deliver(attachRequest(h.clock));
     expect(h.dock.approve('req-1', 'admin' as never)).toBe(false);
     expect(h.dock.state.pendingRequests).toHaveLength(1);
@@ -718,15 +862,46 @@ describe('reconnecting', () => {
     const h = setup({ browserCloseRules: true });
     const socket = await link(h);
     socket.deliver('{"t":"welcome"}');
-    expect(socket.closedWith).toEqual({ code: 4008, reason: 'invalid frame' });
+    expect(socket.closedWith).toEqual({ code: CLOSE_INVALID_FRAME_PAGE, reason: 'invalid frame' });
+    expect(CLOSE_INVALID_FRAME_PAGE).toBe(4008);
   });
 
-  it('treats a silent relay as gone', async () => {
+  it('treats a silent relay as gone with CLOSE_SILENT, which keeps the session resumable', async () => {
     const h = setup();
     const socket = await link(h);
     await h.clock.advance(IDLE_TIMEOUT_MS + 5000);
-    expect(socket.closedWith?.code).toBe(4000);
+    // Never CLOSE_DETACH: the relay would end the session instead of letting the page resume.
+    expect(socket.closedWith).toEqual({ code: CLOSE_SILENT, reason: 'relay silent' });
+    expect(CLOSE_SILENT).toBe(4002);
+    expect(CLOSE_SILENT).not.toBe(CLOSE_DETACH);
     expect(h.dock.state.link).toBe('reconnecting');
+    expect(h.storage.getItem(RESUME_KEY)).toBe('resume-1');
+  });
+
+  it('counts the frame cap in UTF-8 bytes, not string length', async () => {
+    const h = setup();
+    const socket = await link(h);
+    // Under the cap in UTF-16 code units, over it in bytes: each é is two bytes.
+    const accented = JSON.stringify({ t: 'ping', pad: 'é'.repeat(600_000) });
+    expect(accented.length).toBeLessThan(MAX_FRAME_BYTES);
+    expect(new TextEncoder().encode(accented).length).toBeGreaterThan(MAX_FRAME_BYTES);
+    socket.deliver(accented);
+    expect(socket.framesOf('pong')).toHaveLength(0);
+    expect(socket.closedWith).toEqual({ code: 1008, reason: 'invalid frame' });
+    expect(h.logs).toContain('warn the relay sent an oversized frame; reconnecting');
+
+    await h.clock.advance(RECONNECT_MIN_MS);
+    const next = h.socket();
+    next.accept();
+    next.deliver(welcome(h.clock, { resumed: true }));
+    await flush();
+    // The same text in fewer bytes passes.
+    next.deliver(JSON.stringify({ t: 'ping', pad: 'é'.repeat(400_000) }));
+    expect(next.last()).toEqual({ t: 'pong' });
+    // And plain ASCII over the cap fails on the fast length check.
+    next.deliver(JSON.stringify({ t: 'ping', pad: 'x'.repeat(MAX_FRAME_BYTES) }));
+    expect(next.closedWith).toEqual({ code: 1008, reason: 'invalid frame' });
+    expect(next.framesOf('pong')).toHaveLength(1);
   });
 
   it('ignores frames other than welcome before welcome', async () => {
@@ -758,17 +933,31 @@ describe('reconnecting', () => {
 describe('closing', () => {
   it('detaches: denies pending prompts, closes with CLOSE_DETACH and forgets the token', async () => {
     const h = setup();
+    h.context.handlers.set('get_value', () => new Promise(() => undefined));
     const socket = await link(h);
     socket.deliver(attachRequest(h.clock));
     socket.deliver(invoke('wipe'));
+    socket.deliver(invoke('get_value', { callId: 'call-2' }));
     await flush();
     h.dock.close();
-    expect(socket.framesOf('attach_decision')).toEqual([
+    expect(socket.framesOf('attach_decision').filter((f) => f.requestId === 'req-1')).toEqual([
       { t: 'attach_decision', requestId: 'req-1', allow: false },
     ]);
-    expect(results(socket)[0]?.error?.code).toBe('denied_by_operator');
-    expect(socket.closedWith).toEqual({ code: 4000, reason: 'detached' });
+    // The unanswered prompt is a denial (S6). The running call gets no result at all:
+    // the relay fails it with page_gone on CLOSE_DETACH, where 'cancelled' read as timeout.
+    expect(results(socket)).toEqual([
+      {
+        t: 'result',
+        callId: 'call-1',
+        ok: false,
+        error: { code: 'denied_by_operator', message: 'the page detached' },
+      },
+    ]);
+    expect(h.context.runs.find((run) => run.tool === 'get_value')?.signal.aborted).toBe(true);
+    expect(h.logs).toContain('info call call-2 get_value by Alice (driver): page detached');
+    expect(socket.closedWith).toEqual({ code: CLOSE_DETACH, reason: 'detached' });
     expect(h.storage.getItem(RESUME_KEY)).toBeNull();
+    expect(h.storage.getItem(GRANTS_KEY)).toBeNull();
     expect(h.dock.state).toMatchObject({ link: 'closed', error: null });
     await h.clock.advance(60_000);
     expect(h.sockets).toHaveLength(1);

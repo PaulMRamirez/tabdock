@@ -2,7 +2,11 @@
 // sink that keeps every line, plus an MCP client that talks to it the way a
 // real one does: Streamable HTTP with a bearer header, through the official SDK.
 
-import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import {
+  Client,
+  type FetchLike,
+  StreamableHTTPClientTransport,
+} from '@modelcontextprotocol/client';
 import type { Role } from '@tabdock/protocol';
 import { expect } from 'vitest';
 import {
@@ -39,6 +43,7 @@ export const FAST_TIMINGS = {
   idleTimeoutMs: 10_000,
   helloTimeoutMs: 2000,
   callDeadlineMs: 3000,
+  callDeadlineGraceMs: 100,
   goneTombstoneMs: 5000,
 };
 
@@ -71,6 +76,8 @@ export interface ClientOptions {
   version?: string;
   /** Speak 2026-07-28, which names the client in every request's _meta. */
   modern?: boolean;
+  /** Stands in for fetch, so a test can send a body the SDK itself could never serialise. */
+  fetch?: FetchLike;
 }
 
 export async function connectClient(
@@ -80,6 +87,7 @@ export async function connectClient(
 ): Promise<Client> {
   const transport = new StreamableHTTPClientTransport(new URL(relay.mcpUrl), {
     requestInit: { headers: { Authorization: `Bearer ${user.token}` } },
+    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
   });
   const client = new Client(
     { name: options.name ?? 'relay-test', version: options.version ?? '1.0.0' },

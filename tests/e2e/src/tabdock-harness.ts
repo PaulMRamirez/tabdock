@@ -5,7 +5,7 @@
 
 import { randomBytes } from 'node:crypto';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
-import type { Page } from '@playwright/test';
+import type { CDPSession, Page } from '@playwright/test';
 import type { Dock, DockState, Role } from '@tabdock/adapter';
 import { startDemoServer, type DemoServer } from '@tabdock/demo/server';
 import { type ErrorCode, isErrorCode } from '@tabdock/protocol';
@@ -219,42 +219,112 @@ export interface WidgetTarget {
   callId?: string;
 }
 
-export async function clickInWidget(page: Page, target: WidgetTarget): Promise<void> {
+async function withCdp<T>(page: Page, run: (cdp: CDPSession) => Promise<T>): Promise<T> {
   const cdp = await page.context().newCDPSession(page);
   try {
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
-      const scope =
-        target.requestId !== undefined
-          ? findNode(root, (n) => attribute(n, 'data-request-id') === target.requestId)
-          : target.callId !== undefined
-            ? findNode(root, (n) => attribute(n, 'data-call-id') === target.callId)
-            : root;
-      const button = scope && findNode(scope, (n) => attribute(n, 'data-action') === target.action);
-      if (button) {
-        const { backendNodeId } = button;
-        await cdp.send('DOM.scrollIntoViewIfNeeded', { backendNodeId });
-        const { model } = await cdp.send('DOM.getBoxModel', { backendNodeId });
-        const [x1 = 0, y1 = 0, , , x3 = 0, y3 = 0] = model.content;
-        const x = (x1 + x3) / 2;
-        const y = (y1 + y3) / 2;
-        // Hit-test first, so a layout shift can never turn this into a click on another button.
-        const hit = await cdp.send('DOM.getNodeForLocation', {
-          x: Math.round(x),
-          y: Math.round(y),
-          ignorePointerEventsNone: true,
-        });
-        if (hit.backendNodeId === backendNodeId) {
-          await page.mouse.click(x, y);
-          return;
-        }
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    throw new Error(`no clickable ${target.action} button in the Tabdock widget`);
+    return await run(cdp);
   } finally {
     await cdp.detach();
   }
+}
+
+/**
+ * Waits until the target button exists, is armed and is what a click on its
+ * centre would hit, then returns that centre. Prompt buttons ignore clicks
+ * until data-armed turns true, half a second after the prompts last changed,
+ * so a prompt that slides under the pointer cannot take the click.
+ */
+async function armedButton(
+  cdp: CDPSession,
+  target: WidgetTarget,
+  timeoutMs: number,
+): Promise<{ backendNodeId: number; x: number; y: number }> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
+    const scope =
+      target.requestId !== undefined
+        ? findNode(root, (n) => attribute(n, 'data-request-id') === target.requestId)
+        : target.callId !== undefined
+          ? findNode(root, (n) => attribute(n, 'data-call-id') === target.callId)
+          : root;
+    const button = scope && findNode(scope, (n) => attribute(n, 'data-action') === target.action);
+    if (button && attribute(button, 'data-armed') !== 'false') {
+      const { backendNodeId } = button;
+      const centre = await cdp
+        .send('DOM.scrollIntoViewIfNeeded', { backendNodeId })
+        .then(() => cdp.send('DOM.getBoxModel', { backendNodeId }))
+        .then(({ model }) => {
+          const [x1 = 0, y1 = 0, , , x3 = 0, y3 = 0] = model.content;
+          return { x: (x1 + x3) / 2, y: (y1 + y3) / 2 };
+        })
+        // A button in a hidden panel has no box yet.
+        .catch(() => null);
+      if (centre) {
+        // Hit-test first, so a layout shift can never turn this into a click on another button.
+        const hit = await cdp.send('DOM.getNodeForLocation', {
+          x: Math.round(centre.x),
+          y: Math.round(centre.y),
+          ignorePointerEventsNone: true,
+        });
+        // The hit may be a label inside the button, such as the badge's text.
+        if (findNode(button, (n) => n.backendNodeId === hit.backendNodeId)) {
+          return { backendNodeId, ...centre };
+        }
+      }
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`no clickable ${target.action} button in the Tabdock widget`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+/** Where a click on the target button would land, once it is armed and uncovered. */
+export async function widgetButtonCentre(
+  page: Page,
+  target: WidgetTarget,
+  timeoutMs = 5000,
+): Promise<{ x: number; y: number }> {
+  return withCdp(page, async (cdp) => {
+    const { x, y } = await armedButton(cdp, target, timeoutMs);
+    return { x, y };
+  });
+}
+
+/** A real mouse click on the target button, as the operator would make it. */
+export async function clickInWidget(page: Page, target: WidgetTarget): Promise<void> {
+  const { x, y } = await widgetButtonCentre(page, target);
+  await page.mouse.click(x, y);
+}
+
+/**
+ * A script's click on the target button (HTMLElement.click(), so isTrusted is
+ * false), as hostile page script would try it if it could reach the button.
+ */
+export async function scriptClickInWidget(page: Page, target: WidgetTarget): Promise<void> {
+  await withCdp(page, async (cdp) => {
+    const { backendNodeId } = await armedButton(cdp, target, 5000);
+    const { object } = await cdp.send('DOM.resolveNode', { backendNodeId });
+    if (object.objectId === undefined) throw new Error('could not resolve the widget button');
+    await cdp.send('Runtime.callFunctionOn', {
+      objectId: object.objectId,
+      functionDeclaration: 'function () { this.click(); }',
+    });
+  });
+}
+
+/** Whether the widget element with this data-role is rendered, that is, the operator can see it. */
+export async function widgetVisible(page: Page, role: string): Promise<boolean> {
+  return withCdp(page, async (cdp) => {
+    const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
+    const node = findNode(root, (n) => attribute(n, 'data-role') === role);
+    if (!node) return false;
+    return cdp
+      .send('DOM.getBoxModel', { backendNodeId: node.backendNodeId })
+      .then(() => true)
+      .catch(() => false);
+  });
 }
 
 /** The text of the widget element with this data-role, read through the DevTools protocol. */

@@ -14,6 +14,7 @@ import {
   parsePageFrame,
   type PageFrame,
   type RelayFrame,
+  type Role,
 } from '@tabdock/protocol';
 import {
   createAdapterCore,
@@ -29,6 +30,7 @@ import {
 
 export const RELAY_URL = 'ws://relay.test/page';
 export const RESUME_KEY = `tabdock:resume:${RELAY_URL}`;
+export const GRANTS_KEY = `tabdock:grants:${RELAY_URL}`;
 export const PAGE_WINDOW = { label: 'page window' };
 export const FRAME_WINDOW = { label: 'iframe window' };
 export const HANDLER_FAILED =
@@ -300,11 +302,13 @@ export function setup(
     tools?: RuntimeTool[];
     core?: Partial<CoreOptions>;
     browserCloseRules?: boolean;
+    /** sessionStorage shared with an earlier harness, to play a page reload. */
+    storage?: MapStorage;
   } = {},
 ): Harness {
   const clock = new ManualClock();
   const context = new TestContext(options.tools ?? chromeTools());
-  const storage = new MapStorage();
+  const storage = options.storage ?? new MapStorage();
   const sockets: FakeSocket[] = [];
   const logs: string[] = [];
   const core = createAdapterCore({
@@ -369,17 +373,49 @@ export function welcome(clock: ManualClock, overrides: Partial<WelcomeFrame> = {
   };
 }
 
-/** Starts the core, accepts its socket and welcomes it. */
+/**
+ * Starts the core, accepts its socket and welcomes it, then has the operator
+ * approve each user in `grants` through the Dock, the way a real attachment
+ * starts. Alice, the default caller of invoke(), is a driver unless a test
+ * says otherwise; pass {} for a page nobody has approved.
+ */
 export async function link(
   harness: Harness,
   overrides: Partial<WelcomeFrame> = {},
+  grants: Record<string, Role> = { alice: 'driver' },
 ): Promise<FakeSocket> {
   harness.core.start();
   const socket = harness.socket();
   socket.accept();
   socket.deliver(welcome(harness.clock, overrides));
   await flush();
+  for (const [userId, role] of Object.entries(grants)) {
+    grant(harness, socket, userId, role);
+  }
   return socket;
+}
+
+/** An attach request for userId that the operator approves as role through the Dock. */
+export function grant(harness: Harness, socket: FakeSocket, userId: string, role: Role): void {
+  const requestId = `grant-${userId}`;
+  socket.deliver({
+    ...attachRequest(harness.clock, requestId),
+    user: { userId, displayName: userId.charAt(0).toUpperCase() + userId.slice(1) },
+  });
+  if (!harness.dock.approve(requestId, role)) throw new Error(`could not approve ${userId}`);
+}
+
+/** A roster entry as the relay would send it. */
+export function attachment(userId: string, role: Role, grantedAt = 0) {
+  return {
+    userId,
+    displayName: userId.charAt(0).toUpperCase() + userId.slice(1),
+    role,
+    grantedAt,
+    lastUsedAt: null,
+    expiresAt: null,
+    clients: [],
+  };
 }
 
 export function invoke(

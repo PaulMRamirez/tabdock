@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage } from 'node:http';
+import { DEFAULT_CALL_DEADLINE_MS } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
 import { isLoopbackHost, resolveConfig } from '../src/config.ts';
 import {
@@ -147,6 +148,15 @@ describe('origin policy (S1, S2)', () => {
       /pairAttemptsPerUser/,
     );
     expect(resolveConfig({ auth, timings: { pairWaitMs: 1234 } }).timings.pairWaitMs).toBe(1234);
+  });
+
+  it("waits a 2 s grace past the page's call deadline by default", () => {
+    const { timings } = resolveConfig({ auth });
+    expect(timings.callDeadlineMs).toBe(DEFAULT_CALL_DEADLINE_MS);
+    expect(timings.callDeadlineGraceMs).toBe(2000);
+    expect(() => resolveConfig({ auth, timings: { callDeadlineGraceMs: -1 } })).toThrow(
+      /callDeadlineGraceMs/,
+    );
   });
 });
 

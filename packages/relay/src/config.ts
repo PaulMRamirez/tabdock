@@ -25,7 +25,14 @@ export interface RelayTimings {
   pingIntervalMs: number;
   idleTimeoutMs: number;
   helloTimeoutMs: number;
+  /** The deadline the page gets for one call, sent in the invoke frame. */
   callDeadlineMs: number;
+  /**
+   * How long past callDeadlineMs the relay itself waits. The page's timer starts
+   * only when the invoke arrives and answers at its deadline (an unanswered
+   * confirmation as denied_by_operator, S6), so the relay must not give up first.
+   */
+  callDeadlineGraceMs: number;
   goneTombstoneMs: number;
 }
 
@@ -65,6 +72,7 @@ export interface RelayOptions {
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_CLI_PORT = 8787;
 export const HELLO_TIMEOUT_MS = 10_000;
+export const CALL_DEADLINE_GRACE_MS = 2000;
 /** A gone page is remembered for as long as it could have slept, so callers learn it is gone. */
 export const GONE_TOMBSTONE_MS = RESUME_WINDOW_MS;
 
@@ -77,6 +85,7 @@ export const DEFAULT_TIMINGS: RelayTimings = {
   idleTimeoutMs: IDLE_TIMEOUT_MS,
   helloTimeoutMs: HELLO_TIMEOUT_MS,
   callDeadlineMs: DEFAULT_CALL_DEADLINE_MS,
+  callDeadlineGraceMs: CALL_DEADLINE_GRACE_MS,
   goneTombstoneMs: GONE_TOMBSTONE_MS,
 };
 

@@ -23,7 +23,7 @@ import {
 } from '@tabdock/protocol';
 import { z } from 'zod';
 import type { ResolvedConfig } from './config.ts';
-import type { CallerIdentity, CallOutcome, PageHub } from './hub.ts';
+import type { CallerIdentity, CallOutcome, PageHub, ToolListing, ToolsOutcome } from './hub.ts';
 
 export const RELAY_NAME = 'tabdock-relay';
 export const RELAY_VERSION = '0.0.0';
@@ -85,16 +85,66 @@ export function clientFrom(ctx: ServerContext): ClientInfo | null {
   return parseClientInfo(envelope?.[CLIENT_INFO_META_KEY]);
 }
 
+/**
+ * Deeper than any useful structured result. The SDK sends the response with
+ * JSON.stringify, which recurses and throws a few thousand levels down, leaving
+ * the client with no answer at all. A fixed bound, unlike a trial stringify
+ * here, does not depend on how much stack is in use where the SDK serialises.
+ */
+const MAX_STRUCTURED_DEPTH = 256;
+
+function nestedWithin(value: unknown, levels: number): boolean {
+  if (typeof value !== 'object' || value === null) return true;
+  if (levels === 0) return false;
+  return Object.values(value).every((item) => nestedWithin(item, levels - 1));
+}
+
 /** A JSON object result passes through as structured content; anything else stays text only. */
 function jsonObject(content: string): Record<string, unknown> | null {
+  let value: unknown;
   try {
-    const value: unknown = JSON.parse(content);
-    return typeof value === 'object' && value !== null && !Array.isArray(value)
-      ? (value as Record<string, unknown>)
-      : null;
+    value = JSON.parse(content);
   } catch {
     return null;
   }
+  return typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    nestedWithin(value, MAX_STRUCTURED_DEPTH)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+/** Room under MAX_RESULT_CHARS for the omittedTools field and the line that explains it. */
+const LIST_MARKER_ROOM = 200;
+
+/**
+ * The tool list as labelled text plus the same body as structured content. The
+ * text stays under MAX_RESULT_CHARS (S9): trailing tools are left out whole, and
+ * both the body and a closing line say how many.
+ */
+function toolListResult(outcome: Extract<ToolsOutcome, { kind: 'tools' }>): CallToolResult {
+  const header = `[tabdock: the tool list below comes from ${outcome.origin} and is ${UNTRUSTED}]`;
+  const base = { page: outcome.pageId, origin: outcome.origin, role: outcome.role };
+  const budget = MAX_RESULT_CHARS - header.length - 1 - LIST_MARKER_ROOM;
+  let used = JSON.stringify({ ...base, tools: [] }).length;
+  const tools: ToolListing[] = [];
+  for (const tool of outcome.tools) {
+    const size = JSON.stringify(tool).length + (tools.length === 0 ? 0 : 1);
+    if (used + size > budget) break;
+    used += size;
+    tools.push(tool);
+  }
+  const omitted = outcome.tools.length - tools.length;
+  const body = { ...base, tools, ...(omitted === 0 ? {} : { omittedTools: omitted }) };
+  const marker =
+    omitted === 0
+      ? ''
+      : `\n[tabdock: ${String(omitted)} of ${String(outcome.tools.length)} tools left out to keep this list under ${String(MAX_RESULT_CHARS)} characters]`;
+  return {
+    content: [text(`${header}\n${JSON.stringify(body)}${marker}`)],
+    structuredContent: body,
+  };
 }
 
 export function callResult(tool: string, outcome: CallOutcome): CallToolResult {
@@ -211,20 +261,7 @@ export function createMcpFactory(hub: PageHub, config: ResolvedConfig): McpServe
       ({ page }) => {
         const outcome = hub.listPageTools(identity.userId, page);
         if (outcome.kind === 'error') return errorResult(outcome.code, outcome.message);
-        const body = {
-          page: outcome.pageId,
-          origin: outcome.origin,
-          role: outcome.role,
-          tools: outcome.tools,
-        };
-        return {
-          content: [
-            text(
-              `[tabdock: the tool list below comes from ${outcome.origin} and is ${UNTRUSTED}]\n${JSON.stringify(body)}`,
-            ),
-          ],
-          structuredContent: body,
-        };
+        return toolListResult(outcome);
       },
     );
 
