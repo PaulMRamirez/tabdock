@@ -756,7 +756,7 @@ describe('reconnecting', () => {
 });
 
 describe('closing', () => {
-  it('detaches: denies pending prompts, closes with 1000 and forgets the token', async () => {
+  it('detaches: denies pending prompts, closes with CLOSE_DETACH and forgets the token', async () => {
     const h = setup();
     const socket = await link(h);
     socket.deliver(attachRequest(h.clock));
@@ -767,7 +767,7 @@ describe('closing', () => {
       { t: 'attach_decision', requestId: 'req-1', allow: false },
     ]);
     expect(results(socket)[0]?.error?.code).toBe('denied_by_operator');
-    expect(socket.closedWith).toEqual({ code: 1000, reason: 'detached' });
+    expect(socket.closedWith).toEqual({ code: 4000, reason: 'detached' });
     expect(h.storage.getItem(RESUME_KEY)).toBeNull();
     expect(h.dock.state).toMatchObject({ link: 'closed', error: null });
     await h.clock.advance(60_000);

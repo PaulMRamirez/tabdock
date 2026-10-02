@@ -6,6 +6,8 @@
 import {
   type AttachmentView,
   type ClientInfo,
+  CLOSE_DETACH,
+  CLOSE_REPLACED,
   encodeFrame,
   type ErrorCode,
   type JsonObject,
@@ -119,7 +121,7 @@ interface Conn {
 const CLOSE_POLICY = 1008;
 const CLOSE_GOING_AWAY = 1001;
 /** A newer socket resumed this page's session. */
-export const CLOSE_RESUMED_ELSEWHERE = 4001;
+export const CLOSE_RESUMED_ELSEWHERE = CLOSE_REPLACED;
 const CLOSE_GRACE_MS = 2000;
 const MAX_ROSTER_CLIENTS = 20;
 
@@ -215,8 +217,8 @@ export class PageHub {
     ws.on('message', (data, isBinary) => {
       this.#onMessage(conn, data, isBinary);
     });
-    ws.on('close', () => {
-      this.#onClose(conn);
+    ws.on('close', (code) => {
+      this.#onClose(conn, code);
     });
     ws.on('error', (error) => {
       this.#log.warn('page socket error', { pageId: conn.pageId, error });
@@ -418,15 +420,27 @@ export class PageHub {
     this.#log.debug('page tools updated', { pageId, toolCount: tools.length });
   }
 
-  #onClose(conn: Conn): void {
+  #onClose(conn: Conn, code: number): void {
     this.#conns.delete(conn);
     this.#clearConnTimers(conn);
-    this.#failInflight(conn, hubError('page_asleep', 'the page disconnected before it answered'));
+    const detached = code === CLOSE_DETACH;
+    this.#failInflight(
+      conn,
+      detached
+        ? hubError('page_gone', 'the page detached before it answered')
+        : hubError('page_asleep', 'the page disconnected before it answered'),
+    );
     const pageId = conn.pageId;
     // A socket replaced by a resumed one no longer speaks for its page.
     if (pageId === null || this.#live.get(pageId) !== conn) return;
     this.#live.delete(pageId);
-    if (!this.#closed) this.#sleep(pageId);
+    if (this.#closed) return;
+    this.#sleep(pageId);
+    // A deliberate detach will not come back, so skip the resume window.
+    if (detached) {
+      this.#log.info('page detached', { pageId });
+      this.#gone(pageId);
+    }
   }
 
   #sleep(pageId: string): void {

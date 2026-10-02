@@ -58,6 +58,7 @@ const buildOptions = {
   outfile: join(distDir, 'main.js'),
   sourcemap: true,
   logLevel: 'warning',
+  define: { __TABDOCK_E2E_HOOK__: 'false' },
 } satisfies esbuild.BuildOptions;
 
 /**
@@ -87,6 +88,8 @@ export async function startDemoServer(
   let bundle = new Map<string, Uint8Array>();
   const ctx = await esbuild.context({
     ...buildOptions,
+    // Only the local dev and test server may offer the ?e2e hook; see src/main.ts.
+    define: { __TABDOCK_E2E_HOOK__: 'true' },
     write: false,
     plugins: [
       {

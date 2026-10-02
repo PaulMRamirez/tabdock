@@ -1,6 +1,7 @@
 import { request } from 'node:http';
 import type { Client } from '@modelcontextprotocol/client';
 import {
+  CLOSE_DETACH,
   MAX_DESCRIPTION_CHARS,
   MAX_FRAME_BYTES,
   MAX_RESULT_CHARS,
@@ -671,6 +672,25 @@ describe('page lifecycle (A1.3)', () => {
     expect((await callTool(alice, 'list_page_tools', { page: opened.pageId })).text).toMatch(
       /^page_asleep: /,
     );
+  });
+
+  it('a deliberate detach (CLOSE_DETACH) ends the session at once instead of sleeping', async () => {
+    await setup();
+    const opened = await page();
+    const alice = await client();
+    await pairAndApprove(alice, opened, 'driver');
+    const token = opened.welcome?.resumeToken ?? '';
+    const pending = callTool(alice, 'call_page_tool', { page: opened.pageId, tool: 'get_view' });
+    await opened.next('invoke');
+    opened.ws.close(CLOSE_DETACH, 'detached');
+    await opened.closed;
+    expect((await pending).text).toMatch(/^page_gone: /);
+    expect((await callTool(alice, 'list_pages')).structured).toMatchObject({
+      pages: [{ page: opened.pageId, state: 'gone' }],
+    });
+    // The detached session cannot be resumed with its old token.
+    const back = await page({ resumeToken: token });
+    expect(back.welcome?.resumed).toBe(false);
   });
 
   it('a reload inside the resume window keeps attachments and rotates the token', async () => {

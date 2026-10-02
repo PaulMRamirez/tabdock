@@ -5,6 +5,12 @@ import { relayFromQuery } from './relay.ts';
 import { type BoardUi, mountBoard } from './render.ts';
 import { createTools } from './tools.ts';
 
+/**
+ * Set by esbuild: true when the dev and test server bundles the page, false in
+ * the static build, so the ?e2e test hook below cannot exist on a hosted copy.
+ */
+declare const __TABDOCK_E2E_HOOK__: boolean;
+
 declare global {
   interface Window {
     /** Present only with ?e2e; see attachToRelay. */
@@ -80,7 +86,7 @@ function attachToRelay(params: URLSearchParams, ui: BoardUi, registered: string)
   // ?e2e puts the control handle on window so a script can read the pairing
   // code and answer prompts. The adapter never offers this; only the code that
   // called attach() holds the handle, and a real page keeps it to itself.
-  if (params.has('e2e')) window.__tabdockDock = dock;
+  if (__TABDOCK_E2E_HOOK__ && params.has('e2e')) window.__tabdockDock = dock;
 }
 
 function requiredElement(selector: string): HTMLElement {

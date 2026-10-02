@@ -7,16 +7,17 @@ import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import {
   ATTACH_REQUEST_TTL_MS,
+  CLOSE_DETACH,
+  encodeFrame,
   IDLE_TIMEOUT_MS,
   MAX_DESCRIPTION_CHARS,
   MAX_FRAME_BYTES,
   MAX_RESULT_CHARS,
-  PING_INTERVAL_MS,
-  RESUME_WINDOW_MS,
-  encodeFrame,
-  parsePageFrame,
   type PageFrame,
+  parsePageFrame,
+  PING_INTERVAL_MS,
   type RelayFrame,
+  RESUME_WINDOW_MS,
 } from '@tabdock/protocol';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
@@ -289,11 +290,11 @@ describe('startSimPage', () => {
     expect(sim.connections).toBe(2);
   });
 
-  it('detaches on close: 1000 and no token left behind', async () => {
+  it('detaches on close: CLOSE_DETACH and no token left behind', async () => {
     const { relay, sim, connection } = await linked();
     await sim.close();
     await vi.waitFor(() => {
-      expect(connection.closed?.code).toBe(1000);
+      expect(connection.closed?.code).toBe(CLOSE_DETACH);
     });
     expect(sim.storage.getItem(`tabdock:resume:${relay.url}`)).toBeNull();
     expect(sim.state.link).toBe('closed');

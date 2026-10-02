@@ -49,3 +49,13 @@ export const TOOL_POLL_MS = 2000;
 /** Reconnect backoff bounds for the adapter. */
 export const RECONNECT_MIN_MS = 500;
 export const RECONNECT_MAX_MS = 30_000;
+
+/**
+ * Close codes on the page link beyond the standard ones (1001 idle or shutdown,
+ * 1008 malformed frame, 1009 frame too large). Browsers let page code send only
+ * 1000 and 3000 to 4999, so the page's own code sits in that range.
+ */
+/** The page detached on purpose; the relay ends its session at once instead of keeping it asleep. */
+export const CLOSE_DETACH = 4000;
+/** A newer socket resumed this page's session; the old socket must not reconnect. */
+export const CLOSE_REPLACED = 4001;

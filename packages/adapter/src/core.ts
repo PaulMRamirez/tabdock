@@ -5,30 +5,32 @@
 
 import {
   ATTACH_REQUEST_TTL_MS,
+  type AttachmentView,
+  type Caller,
+  type ClientInfo,
+  CLOSE_DETACH,
+  CLOSE_REPLACED,
   encodeFrame,
   IDLE_TIMEOUT_MS,
   MAX_FRAME_BYTES,
   MAX_RESULT_CHARS,
+  type PageErrorCode,
+  type PageFrameInput,
   PageFrameSchema,
+  type PageTool,
+  type Pairing,
   parseRelayFrame,
+  type PolicyInput,
   PolicySchema,
   PROTOCOL_VERSION,
   RECONNECT_MAX_MS,
   RECONNECT_MIN_MS,
+  type RelayFrame,
+  type Role,
   RoleSchema,
   SUBPROTOCOL,
   TOOL_POLL_MS,
   truncate,
-  type AttachmentView,
-  type Caller,
-  type ClientInfo,
-  type PageErrorCode,
-  type PageFrameInput,
-  type PageTool,
-  type Pairing,
-  type PolicyInput,
-  type RelayFrame,
-  type Role,
   type User,
 } from '@tabdock/protocol';
 import {
@@ -189,7 +191,7 @@ export interface Dock {
 
 /**
  * 'detach' is a deliberate goodbye: pending prompts are denied, the socket
- * closes with 1000 and the resume token is forgotten. 'unload' is what a page
+ * closes with CLOSE_DETACH and the resume token is forgotten. 'unload' is what a page
  * reload looks like to the relay: the socket goes away (1001) and the token
  * stays, so the next page load resumes.
  */
@@ -232,7 +234,6 @@ const HINT_NOTICE =
   'is treated as consequential. List the consequential tools in policy.consequentialTools to fix this.';
 
 /** Close code the relay uses when a newer connection took over this page. */
-const CLOSE_REPLACED = 4001;
 const CLOSE_INVALID_FRAME = 1008;
 /** Browsers refuse to send 1008 from page code, so they send this instead. */
 const CLOSE_INVALID_FRAME_BROWSER = 4008;
@@ -1132,7 +1133,11 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     const sock = socket;
     socket = null;
     if (sock) {
-      closeSocket(sock, mode === 'detach' ? 1000 : 1001, mode === 'detach' ? 'detached' : 'unload');
+      closeSocket(
+        sock,
+        mode === 'detach' ? CLOSE_DETACH : 1001,
+        mode === 'detach' ? 'detached' : 'unload',
+      );
     }
     tearDownLink();
     if (mode === 'detach') writeToken(null);
