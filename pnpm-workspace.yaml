@@ -1,0 +1,9 @@
+packages:
+  - packages/*
+  - apps/*
+  - tests/*
+
+# pnpm blocks dependency build scripts unless they are allowed here. allowBuilds
+# works from pnpm 10.26; the older onlyBuiltDependencies fails on pnpm 11 and 12.
+allowBuilds:
+  esbuild: true

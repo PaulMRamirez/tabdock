@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # Pinned to the commits CI resolved for v6 and v7 on 2 October 2026.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+      # Corepack ships with Node 22 and installs the pnpm version named in packageManager,
+      # so no third-party action is needed (pnpm/setup only installs pnpm 11 and later).
+      - run: corepack enable pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+      - name: Install Chromium for Playwright
+        run: pnpm --filter @tabdock/e2e exec playwright install --with-deps chromium
+      - run: pnpm test:e2e
+      - run: pnpm demo:m0

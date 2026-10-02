@@ -1,0 +1,24 @@
+{
+  "name": "@tabdock/demo",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A small visual, stateful page whose tools are registered through WebMCP.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    "./server": "./scripts/server.ts"
+  },
+  "scripts": {
+    "build": "node scripts/server.ts --build",
+    "dev": "node scripts/server.ts",
+    "typecheck": "tsc -p tsconfig.json && tsc -p scripts/tsconfig.json"
+  },
+  "dependencies": {
+    "@mcp-b/webmcp-polyfill": "5.1.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@mcp-b/webmcp-local-relay": "5.1.0",
+    "esbuild": "0.28.2"
+  }
+}

@@ -1,0 +1,12 @@
+# The owner's source-of-truth files stay byte-for-byte as written.
+CLAUDE.md
+SPEC.md
+LICENSE
+NOTICE
+pnpm-lock.yaml
+dist/
+coverage/
+test-results/
+playwright-report/
+# Machine-written measurement output, kept as evidence.
+docs/notes/baseline.raw*.json

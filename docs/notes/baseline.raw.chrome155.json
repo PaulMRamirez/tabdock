@@ -1,0 +1,266 @@
+{
+  "measuredAt": "2026-10-02T18:51:43.168Z",
+  "node": "v22.22.0",
+  "browserVersion": "155.0.8059.12",
+  "page": {
+    "runtime": {
+      "documentModelContext": true,
+      "navigatorAliasIsSame": false,
+      "executeToolPresent": true,
+      "contextConstructor": "ModelContext"
+    },
+    "getTools": {
+      "ms": 0.9,
+      "names": [
+        "add_item",
+        "clear_board",
+        "get_view",
+        "highlight_item",
+        "list_items",
+        "move_view"
+      ],
+      "sample": {
+        "annotations": {
+          "consequentialHint": true,
+          "readOnlyHint": false,
+          "untrustedContentHint": false
+        },
+        "description": "Remove every item from the board. This cannot be undone.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        },
+        "name": "clear_board",
+        "origin": "http://127.0.0.1:33199",
+        "title": "Clear board",
+        "window": "[Window]"
+      }
+    },
+    "registration": {
+      "registerResolvedMs": 0.3,
+      "toolchangeAfterRegisterMs": 0.3,
+      "eventBeforeResolve": true,
+      "eventType": "toolchange",
+      "eventDetail": null,
+      "unregisterToolchangeMs": 0.5,
+      "burstOfFiveEvents": 5,
+      "duplicateName": {
+        "label": "duplicate name",
+        "ok": false,
+        "kind": "InvalidStateError",
+        "value": "Duplicate tool name",
+        "ms": 0.2
+      },
+      "annotationsRoundTrip": {
+        "consequentialHint": true,
+        "readOnlyHint": true,
+        "untrustedContentHint": true
+      }
+    },
+    "inputMode": "object",
+    "execute": [
+      {
+        "label": "args as JSON string",
+        "ok": false,
+        "kind": "TypeError",
+        "value": "Failed to execute 'executeTool' on 'ModelContext': invalid input object: value is not an object",
+        "ms": 0.2
+      },
+      {
+        "label": "args as object",
+        "ok": true,
+        "kind": "string",
+        "value": "{\"n\":1}",
+        "ms": 0.3
+      },
+      {
+        "label": "args omitted",
+        "ok": true,
+        "kind": "string",
+        "value": "{}",
+        "ms": 0.2
+      },
+      {
+        "label": "args violate inputSchema (n is a string)",
+        "ok": true,
+        "kind": "string",
+        "value": "{\"n\":\"one\"}",
+        "ms": 0.4
+      },
+      {
+        "label": "tool passed by name only",
+        "ok": false,
+        "kind": "TypeError",
+        "value": "Failed to execute 'executeTool' on 'ModelContext': Failed to read the 'description' property from 'RegisteredTool': Required member is undefined.",
+        "ms": 0
+      },
+      {
+        "label": "handler throws (highlight unknown id)",
+        "ok": false,
+        "kind": "UnknownError",
+        "value": "Tool was executed but the invocation failed. For example, the script function threw an error",
+        "ms": 15.6
+      },
+      {
+        "label": "returns string",
+        "ok": true,
+        "kind": "string",
+        "value": "plain text",
+        "ms": 0.6
+      },
+      {
+        "label": "returns number",
+        "ok": true,
+        "kind": "string",
+        "value": "42",
+        "ms": 0.4
+      },
+      {
+        "label": "returns undefined",
+        "ok": true,
+        "kind": "string",
+        "value": "undefined",
+        "ms": 0.2
+      },
+      {
+        "label": "returns MCP CallToolResult",
+        "ok": true,
+        "kind": "string",
+        "value": "{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}",
+        "ms": 0.3
+      }
+    ],
+    "abort": {
+      "rejection": {
+        "label": "abort after 100 ms",
+        "ok": false,
+        "kind": "AbortError",
+        "value": "signal is aborted without reason",
+        "ms": 100.4
+      },
+      "handlerSawAbort": true,
+      "handlerSignalReason": "AbortError: signal is aborted without reason",
+      "handlerSecondArg": "object with keys [signal], signal is an AbortSignal"
+    }
+  },
+  "relay": {
+    "toolsVisibleAfterLoadMs": 245,
+    "serverInfo": {
+      "name": "webmcp-local-relay",
+      "version": "0.0.0"
+    },
+    "serverCapabilities": {
+      "tools": {
+        "listChanged": true
+      }
+    },
+    "listedTools": [
+      {
+        "name": "webmcp_list_sources",
+        "annotations": {
+          "readOnlyHint": true,
+          "idempotentHint": true
+        }
+      },
+      {
+        "name": "webmcp_list_tools",
+        "annotations": {
+          "readOnlyHint": true,
+          "idempotentHint": true
+        }
+      },
+      {
+        "name": "webmcp_open_page",
+        "annotations": {
+          "readOnlyHint": false
+        }
+      },
+      {
+        "name": "add_item",
+        "annotations": {
+          "readOnlyHint": false
+        }
+      },
+      {
+        "name": "clear_board",
+        "annotations": {
+          "readOnlyHint": false
+        }
+      },
+      {
+        "name": "get_view",
+        "annotations": {
+          "readOnlyHint": true
+        }
+      },
+      {
+        "name": "highlight_item",
+        "annotations": {
+          "readOnlyHint": false
+        }
+      },
+      {
+        "name": "list_items",
+        "annotations": {
+          "readOnlyHint": true
+        }
+      },
+      {
+        "name": "move_view",
+        "annotations": {
+          "readOnlyHint": false
+        }
+      }
+    ],
+    "clearBoardAsListed": {
+      "name": "clear_board",
+      "title": "Clear board",
+      "description": "[WebMCP 903eb48b-dede-475c-87c0-c47288eefab1 • Tabdock demo board] Remove every item from the board. This cannot be undone.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false
+      }
+    },
+    "callSample": {
+      "content": [
+        {
+          "type": "text",
+          "text": "Failed to execute 'executeTool' on 'ModelContext': invalid input object: value is not an object"
+        }
+      ],
+      "isError": true
+    },
+    "errorSample": {
+      "content": [
+        {
+          "type": "text",
+          "text": "Failed to execute 'executeTool' on 'ModelContext': invalid input object: value is not an object"
+        }
+      ],
+      "isError": true
+    },
+    "badArgsSample": {
+      "content": [
+        {
+          "type": "text",
+          "text": "Input validation error: Invalid arguments for tool move_view: data must have required property 'y', data/x must be number"
+        }
+      ],
+      "isError": true
+    },
+    "getViewRoundTripMs": {
+      "n": 0,
+      "failed": 50,
+      "p50": null,
+      "p95": null,
+      "max": null
+    },
+    "lateToolListChangedMs": 22,
+    "lateToolVisibleMs": 25
+  }
+}

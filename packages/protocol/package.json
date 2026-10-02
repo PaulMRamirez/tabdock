@@ -1,0 +1,14 @@
+{
+  "name": "@tabdock/protocol",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Page link message types and zod schemas shared by the Tabdock relay and adapter.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  }
+}
