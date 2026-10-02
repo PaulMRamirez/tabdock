@@ -2,10 +2,13 @@
 // local relay as a stdio MCP server, and an MCP client built on the official SDK.
 // The client stands in for Claude Code; docs/checklists/M0.md covers the real one.
 
+import { mkdtemp, rm } from 'node:fs/promises';
 import { createServer } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/client';
-import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
+import { getDefaultEnvironment, StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { chromium, type Browser, type Page } from '@playwright/test';
 import { startDemoServer, type DemoServer } from '@tabdock/demo/server';
 
@@ -56,53 +59,73 @@ export interface BaselineOptions {
   onRelayLog?: (line: string) => void;
 }
 
-export async function startBaseline(options: BaselineOptions = {}): Promise<Baseline> {
-  const demo = await startDemoServer();
-  const relayPort = await freePort();
-  const pageOrigin = new URL(demo.url).origin;
-
-  // Restricting the widget origin is the relay's recommended setting; its default is '*'.
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [RELAY_CLI, '--port', String(relayPort), '--widget-origin', pageOrigin],
-    stderr: 'pipe',
-  });
-  if (options.onRelayLog) {
-    const log = options.onRelayLog;
-    transport.stderr?.on('data', (chunk: Buffer) => {
-      for (const line of chunk.toString('utf8').split('\n')) if (line.trim()) log(line);
-    });
-  }
-  const client = new Client({ name: 'tabdock-m0-baseline', version: '0.0.0' });
-  if (options.onToolListChanged) {
-    const notify = options.onToolListChanged;
-    client.setNotificationHandler('notifications/tools/list_changed', () => {
-      notify();
-    });
-  }
-  await client.connect(transport);
-
-  const browser = await launchChromium(options.headless ?? true);
-  const page = await browser.newPage();
-  const started = performance.now();
-  await page.goto(`${demo.url}?mcpb=${relayPort}`);
-  await page.waitForSelector('html[data-tools="ready"]');
-  await waitForTools(client, DEMO_TOOL_NAMES);
-  const toolsVisibleAfterMs = Math.round(performance.now() - started);
-
+/**
+ * A throwaway HOME for relay processes. The relay caches its port in
+ * ~/.webmcp/relay-port.json and joins any relay it finds on 9333 to 9348, so a
+ * test must neither write to the owner's home nor pick up a relay running there.
+ */
+export async function relayHome(): Promise<{
+  env: Record<string, string>;
+  remove: () => Promise<void>;
+}> {
+  const home = await mkdtemp(join(tmpdir(), 'tabdock-relay-home-'));
   return {
-    demo,
-    relayPort,
-    client,
-    browser,
-    page,
-    toolsVisibleAfterMs,
-    close: async () => {
-      await browser.close();
-      await client.close();
-      await demo.close();
-    },
+    env: { ...getDefaultEnvironment(), HOME: home },
+    remove: () => rm(home, { recursive: true, force: true }),
   };
+}
+
+export async function startBaseline(options: BaselineOptions = {}): Promise<Baseline> {
+  // Everything opened so far, closed in reverse if a later step fails.
+  const cleanups: (() => Promise<unknown>)[] = [];
+  const closeAll = async () => {
+    for (const cleanup of cleanups.reverse()) await cleanup().catch(() => undefined);
+  };
+  try {
+    const demo = await startDemoServer();
+    cleanups.push(demo.close);
+    const relayPort = await freePort();
+    const pageOrigin = new URL(demo.url).origin;
+    const home = await relayHome();
+    cleanups.push(home.remove);
+
+    // Restricting the widget origin is the relay's recommended setting; its default is '*'.
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [RELAY_CLI, '--port', String(relayPort), '--widget-origin', pageOrigin],
+      env: home.env,
+      stderr: 'pipe',
+    });
+    if (options.onRelayLog) {
+      const log = options.onRelayLog;
+      transport.stderr?.on('data', (chunk: Buffer) => {
+        for (const line of chunk.toString('utf8').split('\n')) if (line.trim()) log(line);
+      });
+    }
+    const client = new Client({ name: 'tabdock-m0-baseline', version: '0.0.0' });
+    if (options.onToolListChanged) {
+      const notify = options.onToolListChanged;
+      client.setNotificationHandler('notifications/tools/list_changed', () => {
+        notify();
+      });
+    }
+    cleanups.push(() => client.close());
+    await client.connect(transport);
+
+    const browser = await launchChromium(options.headless ?? true);
+    cleanups.push(() => browser.close());
+    const page = await browser.newPage();
+    const started = performance.now();
+    await page.goto(`${demo.url}?mcpb=${String(relayPort)}`);
+    await page.waitForSelector('html[data-tools="ready"]');
+    await waitForTools(client, DEMO_TOOL_NAMES);
+    const toolsVisibleAfterMs = Math.round(performance.now() - started);
+
+    return { demo, relayPort, client, browser, page, toolsVisibleAfterMs, close: closeAll };
+  } catch (error) {
+    await closeAll();
+    throw error;
+  }
 }
 
 /**

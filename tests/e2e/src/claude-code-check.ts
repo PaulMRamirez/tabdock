@@ -10,13 +10,14 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { RELAY_CLI, startBaseline } from './harness.ts';
+import { RELAY_CLI, relayHome, startBaseline } from './harness.ts';
 
 const LABEL = 'Claude was here';
 const SERVER = 'webmcp_relay';
 
 const baseline = await startBaseline();
 const dir = await mkdtemp(join(tmpdir(), 'tabdock-a02-'));
+const home = await relayHome();
 try {
   const origin = new URL(baseline.demo.url).origin;
   const configPath = join(dir, 'mcp.json');
@@ -27,6 +28,7 @@ try {
         [SERVER]: {
           command: process.execPath,
           args: [RELAY_CLI, '--port', String(baseline.relayPort), '--widget-origin', origin],
+          env: { HOME: home.env.HOME },
         },
       },
     }),
@@ -75,6 +77,7 @@ try {
   process.exitCode = passed && parsed.is_error !== true ? 0 : 1;
 } finally {
   await baseline.close();
+  await home.remove();
   await rm(dir, { recursive: true, force: true });
 }
 

@@ -6,7 +6,7 @@ Status: **M0, scaffold and baseline.** The demo page and the measurements of tod
 
 ## Quick start
 
-Node 22.13 or later and pnpm 10.
+Node 22.18 or later (it runs TypeScript files directly) and pnpm 10.
 
 ```sh
 pnpm install
