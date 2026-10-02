@@ -1,7 +1,10 @@
 // The page hub: every page socket, pairing ticket, attach request, attachment
-// and in-flight call passes through here. The MCP side (mcp.ts) asks questions
-// on behalf of an authenticated user; every answer is computed from that user's
-// own attachments, so an unknown page and someone else's page look the same (S13).
+// and call passes through here. The MCP side (mcp.ts) asks questions on behalf
+// of an authenticated user; every answer is computed from that user's own
+// attachments, so an unknown page and someone else's page look the same (S13).
+// Mutating calls wait in a per-page queue and run one at a time in arrival
+// order (SPEC section 5); read-only calls go straight to the page. The section 9
+// limits and attachment idle expiry follow ADR 0009, argument checks ADR 0008.
 
 import {
   type AttachmentView,
@@ -47,6 +50,7 @@ import type {
   PageState,
   RelayStore,
 } from './store.ts';
+import { type CheckArguments, compileArgumentCheck } from './validate.ts';
 
 type FrameOf<T extends PageFrame['t']> = Extract<PageFrame, { t: T }>;
 
@@ -99,9 +103,42 @@ export type CallOutcome =
 
 export type DetachOutcome = { kind: 'detached'; pageId: string } | HubError;
 
-interface InflightCall {
-  userId: string;
+/** Why a page socket was refused before it was upgraded. */
+export interface SocketRefusal {
+  status: 429 | 503;
+  message: string;
+}
+
+/** One call_page_tool call from arrival until it settles. */
+interface PendingCall {
+  callId: string;
+  pageId: string;
+  caller: CallerIdentity;
+  toolName: string;
+  args: JsonObject;
+  mutating: boolean;
+  /** Its deadline counts from here, however long it waits in the queue. */
+  arrivedAt: number;
+  /** Whether it waited behind another call; one that went straight out keeps its whole deadline. */
+  waited: boolean;
+  /** The socket its invoke went out on; null while it waits in the queue. */
+  conn: Conn | null;
+  timer: NodeJS.Timeout | null;
+  done: boolean;
   settle: (outcome: CallOutcome) => void;
+}
+
+/** A page's mutating calls: at most one on the page, the rest waiting in arrival order. */
+interface PageQueue {
+  running: PendingCall | null;
+  waiting: PendingCall[];
+}
+
+interface ArgCheckEntry {
+  /** null when the schema cannot be checked; calls then go on unchecked. */
+  check: CheckArguments | null;
+  /** Whether a check that failed to run has been logged, so it is logged once. */
+  warned: boolean;
 }
 
 interface Conn {
@@ -113,7 +150,8 @@ interface Conn {
   helloTimer: NodeJS.Timeout | null;
   pingTimer: NodeJS.Timeout | null;
   idleTimer: NodeJS.Timeout | null;
-  inflight: Map<string, InflightCall>;
+  /** Calls whose invoke went out on this socket and that have not settled yet. */
+  inflight: Map<string, PendingCall>;
 }
 
 const CLOSE_POLICY = 1008;
@@ -122,6 +160,12 @@ const CLOSE_GOING_AWAY = 1001;
 export const CLOSE_RESUMED_ELSEWHERE = CLOSE_REPLACED;
 const CLOSE_GRACE_MS = 2000;
 const MAX_ROSTER_CLIENTS = 20;
+/**
+ * Each call moves its attachment's expiresAt, but the roster carrying it is
+ * re-sent at most this often for that alone: a client calling fast must not
+ * keep the operator's roster rows moving under their pointer.
+ */
+export const EXPIRY_ROSTER_REFRESH_MS = 60_000;
 
 /**
  * Page error codes become SPEC section 7 codes. tool_error is not here: it
@@ -151,6 +195,26 @@ function hubError(code: ErrorCode, message: string): HubError {
 
 function notAttached(pageId: string): HubError {
   return hubError('not_attached', `you are not attached to page ${pageId}`);
+}
+
+/** "8 hours", "30 minutes", "300 ms": the unit that divides evenly, for messages. */
+export function formatDuration(ms: number): string {
+  for (const [size, unit] of [
+    [3_600_000, 'hour'],
+    [60_000, 'minute'],
+    [1000, 'second'],
+  ] as const) {
+    if (ms % size === 0) {
+      const count = ms / size;
+      return `${String(count)} ${unit}${count === 1 ? '' : 's'}`;
+    }
+  }
+  return `${String(ms)} ms`;
+}
+
+function attachmentKey(pageId: string, userId: string): string {
+  // Both are ids of letters, digits, '_' and '-', so a space cannot be ambiguous.
+  return `${pageId} ${userId}`;
 }
 
 function rawToText(data: RawData): string {
@@ -279,26 +343,74 @@ export class PageHub {
   readonly #log: Logger;
   readonly #conns = new Set<Conn>();
   readonly #live = new Map<string, Conn>();
+  /** Open page sockets per remote address, for pageSocketsPerAddress. */
+  readonly #socketsByAddress = new Map<string, number>();
   readonly #pairingTimers = new Map<string, NodeJS.Timeout>();
   /** asleep to gone, then gone to forgotten. */
   readonly #lifecycleTimers = new Map<string, NodeJS.Timeout>();
   readonly #requestTimers = new Map<string, NodeJS.Timeout>();
+  /** One per attachment, keyed by attachmentKey: fires when it has gone unused for attachmentIdleMs. */
+  readonly #expiryTimers = new Map<string, NodeJS.Timeout>();
   /** Every pair_page waiting on a request, by requestId: a retry or a second device joins the first. */
   readonly #pairWaiters = new Map<string, Set<(outcome: PairOutcome) => void>>();
+  readonly #queues = new Map<string, PageQueue>();
+  /** Pages whose queue is being advanced right now, so a settle inside it does not advance it again. */
+  readonly #pumping = new Set<string>();
+  /** Argument checks per page and tool, compiled from the page's own schemas (ADR 0008). */
+  readonly #argChecks = new Map<string, Map<string, ArgCheckEntry>>();
+  /** When each page last got a roster, for EXPIRY_ROSTER_REFRESH_MS. */
+  readonly #rosterSentAt = new Map<string, number>();
   readonly #userLimiter: SlidingWindowLimiter;
   readonly #addressLimiter: SlidingWindowLimiter;
+  readonly #callLimiter: SlidingWindowLimiter;
   #closed = false;
 
   constructor(config: ResolvedConfig, store: RelayStore, log: Logger) {
     this.#config = config;
     this.#store = store;
     this.#log = log;
-    const { pairAttemptsPerUser, pairAttemptsPerAddress, windowMs } = config.rateLimits;
+    const { pairAttemptsPerUser, pairAttemptsPerAddress, callsPerUserPerPage, windowMs } =
+      config.rateLimits;
     this.#userLimiter = new SlidingWindowLimiter(pairAttemptsPerUser, windowMs);
     this.#addressLimiter = new SlidingWindowLimiter(pairAttemptsPerAddress, windowMs);
+    this.#callLimiter = new SlidingWindowLimiter(callsPerUserPerPage, windowMs);
   }
 
   // Page side
+
+  /**
+   * Whether one more page socket from this address fits, asked before the
+   * upgrade so a refusal is a plain HTTP status. When the relay holds as many
+   * page sessions as it may, the page asleep longest becomes gone to make room,
+   * as it would at the end of its resume window; with none asleep, the socket is
+   * refused. ws completes the upgrade in the same turn, so acceptSocket counts
+   * this socket before any other upgrade is asked about.
+   */
+  admitSocket(address: string): SocketRefusal | null {
+    const { pageSocketsPerAddress, pageSessions } = this.#config.limits;
+    if ((this.#socketsByAddress.get(address) ?? 0) >= pageSocketsPerAddress) {
+      this.#log.warn('page socket refused: too many from one address', { address });
+      return { status: 429, message: 'Too many page sockets from this address' };
+    }
+    const asleep = this.#store.pages.all().filter((page) => page.state === 'asleep');
+    if (this.#conns.size + asleep.length >= pageSessions) {
+      const oldest = asleep.reduce<PageRecord | undefined>(
+        (first, page) => (first && (first.asleepAt ?? 0) <= (page.asleepAt ?? 0) ? first : page),
+        undefined,
+      );
+      if (!oldest) {
+        this.#log.warn('page socket refused: the relay holds the most page sessions allowed', {
+          address,
+        });
+        return { status: 503, message: 'The relay holds as many pages as it can; try again later' };
+      }
+      this.#log.info('ended the page asleep longest to make room for a new one', {
+        pageId: oldest.pageId,
+      });
+      this.#gone(oldest.pageId);
+    }
+    return null;
+  }
 
   /** Takes a socket that already passed the origin and subprotocol checks. */
   acceptSocket(ws: WebSocket, origin: string, address: string): void {
@@ -318,6 +430,7 @@ export class PageHub {
       inflight: new Map(),
     };
     this.#conns.add(conn);
+    this.#socketsByAddress.set(address, (this.#socketsByAddress.get(address) ?? 0) + 1);
     conn.helloTimer = setTimeout(() => {
       this.#log.info('closing page socket: no hello in time', { origin, address });
       this.#closeSocket(conn, CLOSE_POLICY, 'hello timeout');
@@ -384,7 +497,7 @@ export class PageHub {
         this.#setRole(pageId, frame);
         return;
       case 'revoke':
-        this.#revoke(conn, pageId, frame);
+        this.#revoke(pageId, frame);
         return;
       case 'rotate_pairing':
         this.#rotateTicket(pageId, 'asked by page');
@@ -428,7 +541,8 @@ export class PageHub {
       const previous = this.#live.get(page.pageId);
       if (previous && previous !== conn) {
         this.#live.delete(page.pageId);
-        this.#failInflight(
+        this.#failPageCalls(
+          page.pageId,
           previous,
           hubError('page_asleep', 'the page reloaded before it answered'),
         );
@@ -442,6 +556,7 @@ export class PageHub {
       // tell list_pages callers the page is ready while calls still wait.
       page.tools = [];
       page.toolsPending = true;
+      this.#argChecks.delete(page.pageId);
       page.title = frame.title;
       page.url = frame.url;
       page.adapterVersion = frame.adapterVersion;
@@ -486,6 +601,7 @@ export class PageHub {
       roster: this.#roster(page.pageId),
       limits: this.#limits(),
     });
+    this.#rosterSentAt.set(page.pageId, now);
     this.#startHeartbeat(conn);
     this.#log.info('page connected', { pageId: page.pageId, origin: page.origin, resumed });
   }
@@ -522,10 +638,22 @@ export class PageHub {
     // WebMCP itself refuses duplicate names, so a duplicate is a page bug: keep the first.
     const seen = new Set<string>();
     const tools: PageTool[] = [];
+    const previous = this.#argChecks.get(pageId);
+    const checks = new Map<string, ArgCheckEntry>();
     for (const tool of frame.tools) {
       if (seen.has(tool.name)) continue;
       seen.add(tool.name);
       tools.push(cutTool(tool));
+      // From the page's own schema, not the cut copy, so a long enum value still matches.
+      const check = compileArgumentCheck(tool.name, tool.inputSchema);
+      if (check === null && previous?.get(tool.name)?.check !== null) {
+        // Never the schema or the validator's message: both are page text.
+        this.#log.warn('a tool schema cannot be checked; calls to it go to the page unchecked', {
+          pageId,
+          tool: tool.name,
+        });
+      }
+      checks.set(tool.name, { check, warned: false });
     }
     if (tools.length !== frame.tools.length) {
       this.#log.warn('page listed a tool name twice; kept the first', { pageId });
@@ -533,22 +661,27 @@ export class PageHub {
     page.tools = tools;
     page.toolsPending = false;
     this.#store.pages.put(page);
+    this.#argChecks.set(pageId, checks);
     this.#log.debug('page tools updated', { pageId, toolCount: tools.length });
   }
 
   #onClose(conn: Conn, code: number): void {
     this.#conns.delete(conn);
+    const sockets = (this.#socketsByAddress.get(conn.address) ?? 1) - 1;
+    if (sockets > 0) this.#socketsByAddress.set(conn.address, sockets);
+    else this.#socketsByAddress.delete(conn.address);
     this.#clearConnTimers(conn);
     const detached = code === CLOSE_DETACH;
-    this.#failInflight(
-      conn,
-      detached
-        ? hubError('page_gone', 'the page detached before it answered')
-        : hubError('page_asleep', 'the page disconnected before it answered'),
-    );
+    const outcome = detached
+      ? hubError('page_gone', 'the page detached before it answered')
+      : hubError('page_asleep', 'the page disconnected before it answered');
     const pageId = conn.pageId;
-    // A socket replaced by a resumed one no longer speaks for its page.
-    if (pageId === null || this.#live.get(pageId) !== conn) return;
+    // A socket replaced by a resumed one no longer speaks for its page or its queue.
+    if (pageId === null || this.#live.get(pageId) !== conn) {
+      this.#failInflight(conn, outcome);
+      return;
+    }
+    this.#failPageCalls(pageId, conn, outcome);
     this.#live.delete(pageId);
     if (this.#closed) return;
     this.#sleep(pageId);
@@ -568,6 +701,7 @@ export class PageHub {
     // again after the welcome on resume, so they are not held (up to a 1 MB frame
     // of them) for the whole resume window.
     page.tools = [];
+    this.#argChecks.delete(pageId);
     this.#store.pages.put(page);
     this.#store.tickets.deleteForPage(pageId);
     this.#clearTimer(this.#pairingTimers, pageId);
@@ -594,13 +728,18 @@ export class PageHub {
     const page = this.#store.pages.get(pageId);
     if (page?.state !== 'asleep') return;
     const attachments = this.#store.attachments.listForPage(pageId);
-    for (const attachment of attachments) this.#store.attachments.delete(pageId, attachment.userId);
+    for (const attachment of attachments) {
+      this.#store.attachments.delete(pageId, attachment.userId);
+      this.#clearTimer(this.#expiryTimers, attachmentKey(pageId, attachment.userId));
+    }
     page.state = 'gone';
     page.goneAt = Date.now();
     page.resumeTokenHash = '';
     page.tools = [];
     page.formerAttachments = attachments.map(({ userId, role }) => ({ userId, role }));
     this.#store.pages.put(page);
+    this.#argChecks.delete(pageId);
+    this.#rosterSentAt.delete(pageId);
     this.#setTimer(this.#lifecycleTimers, pageId, this.#config.timings.goneTombstoneMs, () => {
       this.#store.pages.delete(pageId);
       this.#log.debug('gone page forgotten', { pageId });
@@ -642,6 +781,18 @@ export class PageHub {
 
   // Attachments
 
+  /** Whether the page already holds as many users as it may (S9). */
+  #pageFull(pageId: string): boolean {
+    return this.#store.attachments.listForPage(pageId).length >= this.#config.limits.usersPerPage;
+  }
+
+  #pageFullError(when: string): HubError {
+    return hubError(
+      'page_busy',
+      `the page ${when} ${String(this.#config.limits.usersPerPage)} users attached, the most it allows; its operator can revoke someone to make room`,
+    );
+  }
+
   #decision(pageId: string, frame: FrameOf<'attach_decision'>): void {
     const request = this.#store.requests.get(frame.requestId);
     // A page may only answer its own requests; anything else is stale or forged.
@@ -656,6 +807,14 @@ export class PageHub {
         code: 'denied_by_operator',
         message: 'the page operator denied the attach request',
       });
+      return;
+    }
+    if (!this.#store.attachments.get(pageId, request.userId) && this.#pageFull(pageId)) {
+      this.#log.info('approval refused: the page filled up while the operator decided', {
+        pageId,
+        userId: request.userId,
+      });
+      this.#endRequest(request.requestId, this.#pageFullError('filled up meanwhile and has'));
       return;
     }
     const attachment = this.#grant(request, frame.role ?? 'observer');
@@ -675,17 +834,19 @@ export class PageHub {
   ): AttachmentRecord {
     const existing = this.#store.attachments.get(request.pageId, request.userId);
     if (existing) return existing;
+    const now = Date.now();
     const attachment: AttachmentRecord = {
       pageId: request.pageId,
       userId: request.userId,
       displayName: request.displayName,
       role: this.#cappedRole(request.pageId, request.userId, wanted),
-      grantedAt: Date.now(),
+      grantedAt: now,
       lastUsedAt: null,
-      expiresAt: null,
+      expiresAt: now + this.#config.timings.attachmentIdleMs,
       clients: request.client ? [request.client] : [],
     };
     this.#store.attachments.put(attachment);
+    this.#armExpiry(attachment);
     this.#log.info('attached', {
       pageId: attachment.pageId,
       userId: attachment.userId,
@@ -725,7 +886,7 @@ export class PageHub {
     this.#sendRoster(pageId);
   }
 
-  #revoke(conn: Conn, pageId: string, frame: FrameOf<'revoke'>): void {
+  #revoke(pageId: string, frame: FrameOf<'revoke'>): void {
     const targets =
       frame.userId === '*'
         ? this.#store.attachments.listForPage(pageId)
@@ -734,9 +895,8 @@ export class PageHub {
           );
     const users = new Set(targets.map((attachment) => attachment.userId));
     if (frame.userId !== '*') users.add(frame.userId);
-    for (const attachment of targets) this.#store.attachments.delete(pageId, attachment.userId);
-    // Revocation is immediate (S8): calls already on the page are cancelled now.
-    this.#cancelCallsOf(conn, users, 'revoked', 'the page operator revoked your attachment');
+    // Revocation is immediate (S8): calls on the page are cancelled now, queued ones dropped.
+    this.#endAttachments(pageId, users, 'revoked', 'the page operator revoked your attachment');
     for (const request of this.#store.requests.listForPage(pageId)) {
       if (frame.userId === '*' || users.has(request.userId)) {
         this.#endRequest(request.requestId, {
@@ -748,6 +908,68 @@ export class PageHub {
     }
     this.#log.info('attachments revoked', { pageId, count: targets.length });
     this.#sendRoster(pageId);
+  }
+
+  /**
+   * Deletes these users' attachments to a page and ends their calls: a call on
+   * the page gets a cancel frame, a queued one never reaches it, and both
+   * answer not_attached with `message`. The client's own MCP session is left
+   * alone, so it hears the answer rather than waiting on a closed stream.
+   */
+  #endAttachments(
+    pageId: string,
+    users: ReadonlySet<string>,
+    reason: 'revoked' | 'client',
+    message: string,
+  ): void {
+    for (const userId of users) {
+      this.#store.attachments.delete(pageId, userId);
+      this.#clearTimer(this.#expiryTimers, attachmentKey(pageId, userId));
+    }
+    const outcome = hubError('not_attached', message);
+    // Queued calls first, so a running one settling does not hand the page a call that is ending.
+    for (const call of [...(this.#queues.get(pageId)?.waiting ?? [])]) {
+      if (users.has(call.caller.userId)) call.settle(outcome);
+    }
+    const conn = this.#live.get(pageId);
+    for (const call of [...(conn?.inflight.values() ?? [])]) {
+      if (!users.has(call.caller.userId)) continue;
+      if (conn) this.#send(conn, { t: 'cancel', callId: call.callId, reason });
+      call.settle(outcome);
+    }
+  }
+
+  #armExpiry(attachment: AttachmentRecord): void {
+    const { pageId, userId, expiresAt } = attachment;
+    const key = attachmentKey(pageId, userId);
+    if (expiresAt === null) {
+      this.#clearTimer(this.#expiryTimers, key);
+      return;
+    }
+    this.#setTimer(this.#expiryTimers, key, Math.max(0, expiresAt - Date.now()), () => {
+      this.#expireIfDue(pageId, userId);
+    });
+  }
+
+  /** Ends an attachment past its expiresAt like a revoke, without an audit record. True if it ended. */
+  #expireIfDue(pageId: string, userId: string): boolean {
+    const attachment = this.#store.attachments.get(pageId, userId);
+    if (!attachment || attachment.expiresAt === null) return false;
+    if (attachment.expiresAt > Date.now()) {
+      // The timer ran early or a call moved the expiry meanwhile.
+      this.#armExpiry(attachment);
+      return false;
+    }
+    const idle = formatDuration(this.#config.timings.attachmentIdleMs);
+    this.#endAttachments(
+      pageId,
+      new Set([userId]),
+      'revoked',
+      `your attachment expired after ${idle} without a call; pair again to use the page`,
+    );
+    this.#log.info('attachment expired', { pageId, userId });
+    this.#sendRoster(pageId);
+    return true;
   }
 
   #roster(pageId: string): AttachmentView[] {
@@ -764,7 +986,9 @@ export class PageHub {
 
   #sendRoster(pageId: string): void {
     const conn = this.#live.get(pageId);
-    if (conn) this.#send(conn, { t: 'roster', attachments: this.#roster(pageId) });
+    if (!conn) return;
+    this.#send(conn, { t: 'roster', attachments: this.#roster(pageId) });
+    this.#rosterSentAt.set(pageId, Date.now());
   }
 
   #endRequest(requestId: string, outcome: PairOutcome): void {
@@ -799,17 +1023,10 @@ export class PageHub {
     call.settle(PAGE_ERRORS[error.code]);
   }
 
-  #cancelCallsOf(
-    conn: Conn,
-    users: ReadonlySet<string>,
-    reason: 'revoked' | 'client',
-    message: string,
-  ): void {
-    for (const [callId, call] of [...conn.inflight]) {
-      if (!users.has(call.userId)) continue;
-      this.#send(conn, { t: 'cancel', callId, reason });
-      call.settle(hubError('not_attached', message));
-    }
+  /** Every call of this page ends with `outcome`: the queued ones first, then those on `conn`. */
+  #failPageCalls(pageId: string, conn: Conn, outcome: CallOutcome): void {
+    for (const call of [...(this.#queues.get(pageId)?.waiting ?? [])]) call.settle(outcome);
+    this.#failInflight(conn, outcome);
   }
 
   #failInflight(conn: Conn, outcome: CallOutcome): void {
@@ -821,6 +1038,7 @@ export class PageHub {
   listPages(userId: string): PageListing[] {
     const listings: PageListing[] = [];
     for (const attachment of this.#store.attachments.listForUser(userId)) {
+      if (this.#expireIfDue(attachment.pageId, userId)) continue;
       const page = this.#store.pages.get(attachment.pageId);
       if (!page) continue;
       listings.push({
@@ -852,6 +1070,8 @@ export class PageHub {
     userId: string,
     pageId: string,
   ): { kind: 'ok'; page: PageRecord; attachment: AttachmentRecord; conn: Conn } | HubError {
+    // An expiry timer may run late; an attachment past its time is over either way.
+    this.#expireIfDue(pageId, userId);
     const attachment = this.#store.attachments.get(pageId, userId);
     const page = this.#store.pages.get(pageId);
     if (attachment && page) {
@@ -931,6 +1151,7 @@ export class PageHub {
     // Single use: the matched code dies here and the page gets a fresh one.
     this.#rotateTicket(page.pageId, 'used');
 
+    this.#expireIfDue(page.pageId, caller.userId);
     const existing = this.#store.attachments.get(page.pageId, caller.userId);
     if (existing) {
       this.#touchClients(existing, caller.client);
@@ -949,20 +1170,11 @@ export class PageHub {
       displayName: caller.displayName,
       client: caller.client,
     };
-    if (page.policy.autoApprove === 'observer') {
-      const attachment = this.#grant(request, 'observer');
-      return {
-        kind: 'attached',
-        pageId: page.pageId,
-        origin: page.origin,
-        role: attachment.role,
-        existing: false,
-      };
-    }
 
     // One person has at most one request per page. A retry after the wait ran
     // out, or the same person on a second device, waits on the request the
-    // operator already sees, so the page never gets duplicates to answer.
+    // operator already sees, so the page never gets duplicates to answer. A
+    // page that fills up meanwhile is caught when the operator approves.
     const pending = this.#store.requests
       .listForPage(page.pageId)
       .find((candidate) => candidate.userId === caller.userId);
@@ -973,6 +1185,26 @@ export class PageHub {
         requestId: pending.requestId,
       });
       return this.#waitForDecision(pending, signal);
+    }
+
+    // S9: a full page is refused before its operator is asked anything.
+    if (this.#pageFull(page.pageId)) {
+      this.#log.info('pairing refused: the page holds the most users allowed', {
+        pageId: page.pageId,
+        userId: caller.userId,
+      });
+      return this.#pageFullError('already has');
+    }
+
+    if (page.policy.autoApprove === 'observer') {
+      const attachment = this.#grant(request, 'observer');
+      return {
+        kind: 'attached',
+        pageId: page.pageId,
+        origin: page.origin,
+        role: attachment.role,
+        existing: false,
+      };
     }
 
     const { attachRequestTtlMs } = this.#config.timings;
@@ -1081,6 +1313,12 @@ export class PageHub {
     }
   }
 
+  /**
+   * Everything a call must pass on arrival, in order: access, the rate limit
+   * (so a refused call still counts and nobody spins on invalid calls for free),
+   * the tool, the role, the frame size and the arguments. A mutating call then
+   * joins its page's queue; a read-only one goes to the page at once.
+   */
   #call(
     caller: CallerIdentity,
     pageId: string,
@@ -1088,9 +1326,25 @@ export class PageHub {
     args: JsonObject,
     signal: AbortSignal,
   ): Promise<CallOutcome> {
+    const arrivedAt = Date.now();
     const access = this.#access(caller.userId, pageId);
     if (access.kind === 'error') return Promise.resolve(access);
-    const { page, attachment, conn } = access;
+    const { page, attachment } = access;
+
+    const rateKey = attachmentKey(pageId, caller.userId);
+    if (!this.#callLimiter.allows(rateKey, arrivedAt)) {
+      this.#log.warn('call rate limited', { pageId, userId: caller.userId });
+      const { callsPerUserPerPage, windowMs } = this.#config.rateLimits;
+      return Promise.resolve(
+        hubError(
+          'rate_limited',
+          `more than ${String(callsPerUserPerPage)} calls to this page in ${formatDuration(windowMs)}; wait and try again`,
+        ),
+      );
+    }
+    this.#callLimiter.record(rateKey, arrivedAt);
+    this.#touchAttachment(attachment, caller.client, arrivedAt);
+
     const tool = page.tools.find((candidate) => candidate.name === toolName);
     if (!tool) {
       return Promise.resolve(
@@ -1108,72 +1362,267 @@ export class PageHub {
     }
 
     const callId = newId('cl');
-    const { callDeadlineMs: deadlineMs, callDeadlineGraceMs } = this.#config.timings;
-    let encoded: string;
-    try {
-      encoded = encodeFrame({
-        t: 'invoke',
+    const call: PendingCall = {
+      callId,
+      pageId,
+      caller,
+      toolName: tool.name,
+      args,
+      mutating: tool.annotations?.readOnlyHint !== true,
+      arrivedAt,
+      waited: false,
+      conn: null,
+      timer: null,
+      done: false,
+      settle: () => undefined,
+    };
+    // Checked before anything waits: the size cannot grow later, as the role and deadline only shrink.
+    const encoded = this.#encodeInvoke(call, attachment.role, this.#config.timings.callDeadlineMs);
+    if (encoded.kind === 'error') return Promise.resolve(encoded);
+    const argumentError = this.#checkArguments(pageId, tool.name, args);
+    if (argumentError) return Promise.resolve(argumentError);
+
+    if (call.mutating) {
+      const waiting = this.#queues.get(pageId)?.waiting.length ?? 0;
+      if (waiting >= this.#config.limits.queueDepth) {
+        this.#log.warn('call refused: the page queue is full', { pageId, userId: caller.userId });
+        return Promise.resolve(
+          hubError(
+            'page_busy',
+            `${String(waiting)} calls that change the page are already waiting their turn; try again shortly`,
+          ),
+        );
+      }
+    }
+
+    return new Promise((resolve) => {
+      const onAbort = (): void => {
+        // A queued call simply leaves the queue; the page never heard of it.
+        if (call.conn) this.#send(call.conn, { t: 'cancel', callId, reason: 'client' });
+        call.settle({ kind: 'cancelled' });
+      };
+      call.settle = (outcome) => {
+        if (call.done) return;
+        call.done = true;
+        if (call.timer) clearTimeout(call.timer);
+        signal.removeEventListener('abort', onAbort);
+        this.#detachCall(call);
+        resolve(outcome);
+      };
+      if (signal.aborted) {
+        call.settle({ kind: 'cancelled' });
+        return;
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
+      this.#armCallTimer(call);
+      if (!call.mutating) {
+        this.#dispatch(call);
+        return;
+      }
+      let queue = this.#queues.get(pageId);
+      if (!queue) {
+        queue = { running: null, waiting: [] };
+        this.#queues.set(pageId, queue);
+      }
+      queue.waiting.push(call);
+      this.#log.debug('call queued', {
+        pageId,
+        userId: caller.userId,
         callId,
-        tool: tool.name,
-        arguments: args,
+        ahead: queue.waiting.length - 1 + (queue.running ? 1 : 0),
+      });
+      this.#pump(pageId);
+      if (!call.done && call.conn === null) call.waited = true;
+    });
+  }
+
+  /** The invoke frame for a call, or invalid_arguments when it cannot be sent at all. */
+  #encodeInvoke(
+    call: PendingCall,
+    role: Role,
+    deadlineMs: number,
+  ): { kind: 'frame'; text: string } | HubError {
+    let text: string;
+    try {
+      text = encodeFrame({
+        t: 'invoke',
+        callId: call.callId,
+        tool: call.toolName,
+        arguments: call.args,
         caller: {
-          userId: caller.userId,
-          displayName: caller.displayName,
-          client: caller.client,
-          role: attachment.role,
+          userId: call.caller.userId,
+          displayName: call.caller.displayName,
+          client: call.caller.client,
+          role,
         },
         deadlineMs,
       });
     } catch {
       // JSON.stringify recurses: arguments nested a few thousand levels deep overflow the stack.
-      return Promise.resolve(
-        hubError('invalid_arguments', 'the arguments could not be encoded for the page link'),
-      );
+      return hubError('invalid_arguments', 'the arguments could not be encoded for the page link');
     }
     // The adapter drops any frame over the cap by closing the socket, so an
     // oversized call must stop here rather than knock the page offline.
-    if (Buffer.byteLength(encoded, 'utf8') > MAX_FRAME_BYTES) {
-      return Promise.resolve(
-        hubError(
-          'invalid_arguments',
-          `the arguments are too large to forward; one page link frame carries at most ${String(MAX_FRAME_BYTES)} bytes`,
-        ),
+    if (Buffer.byteLength(text, 'utf8') > MAX_FRAME_BYTES) {
+      return hubError(
+        'invalid_arguments',
+        `the arguments are too large to forward; one page link frame carries at most ${String(MAX_FRAME_BYTES)} bytes`,
       );
     }
-    attachment.lastUsedAt = Date.now();
-    this.#touchClients(attachment, caller.client);
-
-    return new Promise((resolve) => {
-      const finish = (outcome: CallOutcome): void => {
-        clearTimeout(timer);
-        signal.removeEventListener('abort', onAbort);
-        conn.inflight.delete(callId);
-        resolve(outcome);
-      };
-      // The page's deadline starts later, when the invoke arrives, and its answer
-      // then (denied_by_operator for an unanswered confirmation, S6) must reach
-      // the client; the grace keeps this timer from always winning that race.
-      const timer = setTimeout(() => {
-        this.#send(conn, { t: 'cancel', callId, reason: 'timeout' });
-        finish(hubError('timeout', `the page did not answer within ${String(deadlineMs)} ms`));
-      }, deadlineMs + callDeadlineGraceMs);
-      timer.unref();
-      const onAbort = (): void => {
-        this.#send(conn, { t: 'cancel', callId, reason: 'client' });
-        finish({ kind: 'cancelled' });
-      };
-      conn.inflight.set(callId, { userId: caller.userId, settle: finish });
-      if (signal.aborted) {
-        onAbort();
-        return;
-      }
-      signal.addEventListener('abort', onAbort, { once: true });
-      conn.ws.send(encoded);
-    });
+    return { kind: 'frame', text };
   }
 
-  /** Records the calling client on the attachment, newest first; a new client changes the roster. */
-  #touchClients(attachment: AttachmentRecord, client: ClientInfo | null): void {
+  /** ADR 0008: null when the arguments pass, or when the tool's schema cannot be checked. */
+  #checkArguments(pageId: string, toolName: string, args: JsonObject): HubError | null {
+    const entry = this.#argChecks.get(pageId)?.get(toolName);
+    if (!entry?.check) return null;
+    const result = entry.check(args);
+    if (result.kind === 'invalid') return hubError('invalid_arguments', result.message);
+    if (result.kind === 'unchecked' && !entry.warned) {
+      entry.warned = true;
+      this.#log.warn(
+        'an argument check failed to run; calls it fails on go to the page unchecked',
+        {
+          pageId,
+          tool: toolName,
+        },
+      );
+    }
+    return null;
+  }
+
+  /**
+   * A queued call's timer ends it at its deadline, since the page never saw it.
+   * Once its invoke is out, the timer waits the grace as well, so the page's own
+   * answer at its deadline (denied_by_operator for an unanswered prompt, S6)
+   * reaches the client. Both count from arrival.
+   */
+  #armCallTimer(call: PendingCall): void {
+    const { callDeadlineMs, callDeadlineGraceMs } = this.#config.timings;
+    if (call.timer) clearTimeout(call.timer);
+    const due = call.arrivedAt + callDeadlineMs + (call.conn ? callDeadlineGraceMs : 0);
+    call.timer = setTimeout(
+      () => {
+        if (call.conn) {
+          this.#send(call.conn, { t: 'cancel', callId: call.callId, reason: 'timeout' });
+          call.settle(
+            hubError('timeout', `the page did not answer within ${String(callDeadlineMs)} ms`),
+          );
+        } else {
+          call.settle(this.#queuedTooLong());
+        }
+      },
+      Math.max(0, due - Date.now()),
+    );
+    call.timer.unref();
+  }
+
+  #queuedTooLong(): HubError {
+    return hubError(
+      'timeout',
+      `the call waited ${String(this.#config.timings.callDeadlineMs)} ms behind other calls that change the page and never ran`,
+    );
+  }
+
+  /**
+   * Sends a call to its page, checking again what may have changed while it
+   * waited: the attachment, the page, the tool and the role. True if it went out.
+   */
+  #dispatch(call: PendingCall): boolean {
+    const access = this.#access(call.caller.userId, call.pageId);
+    if (access.kind === 'error') {
+      call.settle(access);
+      return false;
+    }
+    const { page, attachment, conn } = access;
+    const tool = page.tools.find((candidate) => candidate.name === call.toolName);
+    if (!tool) {
+      call.settle(
+        hubError('tool_not_found', `page ${call.pageId} has no tool named ${call.toolName}`),
+      );
+      return false;
+    }
+    if (attachment.role === 'observer' && tool.annotations?.readOnlyHint !== true) {
+      call.settle(
+        hubError(
+          'role_denied',
+          `you are an observer on this page now, and ${call.toolName} is not marked read-only`,
+        ),
+      );
+      return false;
+    }
+    const { callDeadlineMs } = this.#config.timings;
+    const remaining = call.waited ? callDeadlineMs - (Date.now() - call.arrivedAt) : callDeadlineMs;
+    if (remaining <= 0) {
+      call.settle(this.#queuedTooLong());
+      return false;
+    }
+    const encoded = this.#encodeInvoke(call, attachment.role, remaining);
+    if (encoded.kind === 'error') {
+      call.settle(encoded);
+      return false;
+    }
+    call.conn = conn;
+    conn.inflight.set(call.callId, call);
+    this.#armCallTimer(call);
+    conn.ws.send(encoded.text);
+    return true;
+  }
+
+  /** Starts the next queued call of a page if none of its mutating calls is on the page. */
+  #pump(pageId: string): void {
+    const queue = this.#queues.get(pageId);
+    if (!queue || this.#pumping.has(pageId)) return;
+    this.#pumping.add(pageId);
+    try {
+      let next = queue.running ? undefined : queue.waiting.shift();
+      while (next) {
+        queue.running = next;
+        if (this.#dispatch(next)) break;
+        // Refused at the front, it settled and freed the queue for the call behind it.
+        next = queue.waiting.shift();
+      }
+    } finally {
+      this.#pumping.delete(pageId);
+    }
+    if (!queue.running && queue.waiting.length === 0 && this.#queues.get(pageId) === queue) {
+      this.#queues.delete(pageId);
+    }
+  }
+
+  /** Takes a settled call out of its socket's in-flight set and its page's queue. */
+  #detachCall(call: PendingCall): void {
+    call.conn?.inflight.delete(call.callId);
+    const queue = this.#queues.get(call.pageId);
+    if (!queue) return;
+    const at = queue.waiting.indexOf(call);
+    if (at !== -1) queue.waiting.splice(at, 1);
+    if (queue.running === call) queue.running = null;
+    this.#pump(call.pageId);
+  }
+
+  /**
+   * Every call moves its attachment's expiry (ADR 0009) and records the calling
+   * client. The roster goes out when a client is new, or when the expiry it
+   * shows has fallen behind by a refresh step.
+   */
+  #touchAttachment(attachment: AttachmentRecord, client: ClientInfo | null, now: number): void {
+    attachment.lastUsedAt = now;
+    attachment.expiresAt = now + this.#config.timings.attachmentIdleMs;
+    this.#armExpiry(attachment);
+    const step = Math.min(
+      EXPIRY_ROSTER_REFRESH_MS,
+      Math.ceil(this.#config.timings.attachmentIdleMs / 10),
+    );
+    const stale = now - (this.#rosterSentAt.get(attachment.pageId) ?? 0) >= step;
+    if (!this.#touchClients(attachment, client) && stale) this.#sendRoster(attachment.pageId);
+  }
+
+  /**
+   * Records the calling client on the attachment, newest first. A new client
+   * changes the roster, which is then sent; returns whether it was.
+   */
+  #touchClients(attachment: AttachmentRecord, client: ClientInfo | null): boolean {
     let changed = false;
     if (client) {
       const index = attachment.clients.findIndex((seen) => sameClient(seen, client));
@@ -1184,16 +1633,14 @@ export class PageHub {
     }
     this.#store.attachments.put(attachment);
     if (changed) this.#sendRoster(attachment.pageId);
+    return changed;
   }
 
   detachPage(userId: string, pageId: string): DetachOutcome {
+    this.#expireIfDue(pageId, userId);
     const attachment = this.#store.attachments.get(pageId, userId);
     if (attachment) {
-      this.#store.attachments.delete(pageId, userId);
-      const conn = this.#live.get(pageId);
-      if (conn) {
-        this.#cancelCallsOf(conn, new Set([userId]), 'client', 'you detached from this page');
-      }
+      this.#endAttachments(pageId, new Set([userId]), 'client', 'you detached from this page');
       this.#sendRoster(pageId);
       this.#log.info('detached', { pageId, userId });
       return { kind: 'detached', pageId };
@@ -1257,18 +1704,22 @@ export class PageHub {
     map.delete(key);
   }
 
-  /** Cancels everything in flight, closes every page socket and stops every timer. */
+  /** Cancels everything in flight or queued, closes every page socket and stops every timer. */
   async shutdown(): Promise<void> {
     this.#closed = true;
     for (const waiter of [...this.#pairWaiters.values()].flatMap((waiters) => [...waiters])) {
       waiter(hubError('timeout', 'the relay is shutting down'));
+    }
+    const shuttingDown = hubError('page_asleep', 'the relay is shutting down');
+    for (const queue of [...this.#queues.values()]) {
+      for (const call of [...queue.waiting]) call.settle(shuttingDown);
     }
     const closing: Promise<void>[] = [];
     for (const conn of [...this.#conns]) {
       for (const callId of [...conn.inflight.keys()]) {
         this.#send(conn, { t: 'cancel', callId, reason: 'shutdown' });
       }
-      this.#failInflight(conn, hubError('page_asleep', 'the relay is shutting down'));
+      this.#failInflight(conn, shuttingDown);
       if (conn.ws.readyState === conn.ws.CLOSED) continue;
       closing.push(
         new Promise((resolve) => {
@@ -1279,7 +1730,12 @@ export class PageHub {
       );
       this.#closeSocket(conn, CLOSE_GOING_AWAY, 'relay shutting down', 500);
     }
-    for (const map of [this.#pairingTimers, this.#lifecycleTimers, this.#requestTimers]) {
+    for (const map of [
+      this.#pairingTimers,
+      this.#lifecycleTimers,
+      this.#requestTimers,
+      this.#expiryTimers,
+    ]) {
       for (const timer of map.values()) clearTimeout(timer);
       map.clear();
     }

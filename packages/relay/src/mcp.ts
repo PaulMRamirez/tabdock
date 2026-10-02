@@ -1,14 +1,16 @@
-// The five fixed MCP tools (SPEC section 7). The SDK's factory runs once per
-// HTTP request, so each request gets a fresh McpServer bound to the user the
-// auth plugin found. Tool descriptions are fixed relay text: no page-supplied
-// string is ever merged into them (S10).
+// The five fixed MCP tools (SPEC section 7). The factory builds one McpServer
+// per 2026-07-28 request, and one per 2025-era session (sessions.ts). Every
+// handler reads who is calling from the request itself, not from the factory,
+// and refuses a request from anyone but the user the server was built for.
+// Tool descriptions are fixed relay text: no page-supplied string is ever
+// merged into them (S10).
 
 import {
   type AuthInfo,
   CLIENT_INFO_META_KEY,
   type CallToolResult,
   McpServer,
-  type McpServerFactory,
+  type McpRequestContext,
   type ServerContext,
 } from '@modelcontextprotocol/server';
 import {
@@ -77,11 +79,17 @@ function parseClientInfo(raw: unknown): ClientInfo | null {
 }
 
 /**
- * 2026-07-28 clients name themselves in every request's _meta. A 2025-era
- * client served statelessly said its name only in an initialize request that
- * a different server instance answered, so attribution is null (ADR 0005).
+ * Which client is calling. A 2025-era session's server keeps the name its
+ * client gave in initialize, and the SDK fills the same accessor from the
+ * envelope of each 2026-07-28 request, which names the client in its _meta too.
+ * Either way the client says it about itself, so it is capped and attribution
+ * only.
  */
-export function clientFrom(ctx: ServerContext): ClientInfo | null {
+export function clientFrom(server: McpServer, ctx: ServerContext): ClientInfo | null {
+  // Deprecated for 2026-07-28 code, and still the documented way to read what a 2025 session's client said in initialize.
+  // eslint-disable-next-line @typescript-eslint/no-deprecated
+  const declared = parseClientInfo(server.server.getClientVersion());
+  if (declared) return declared;
   const envelope = ctx.mcpReq.envelope as Record<string, unknown> | undefined;
   return parseClientInfo(envelope?.[CLIENT_INFO_META_KEY]);
 }
@@ -189,17 +197,38 @@ function identityFrom(authInfo: AuthInfo | undefined): Omit<CallerIdentity, 'cli
   };
 }
 
-export function createMcpFactory(hub: PageHub, config: ResolvedConfig): McpServerFactory {
+/** The authenticated user behind a request, or null when it carries none. */
+export function userIdOf(authInfo: AuthInfo | undefined): string | null {
+  const extra = AuthExtraSchema.safeParse(authInfo?.extra);
+  return extra.success ? extra.data.userId : null;
+}
+
+export function createMcpFactory(
+  hub: PageHub,
+  config: ResolvedConfig,
+): (ctx: McpRequestContext) => McpServer {
   const waitSeconds = Math.round(config.timings.pairWaitMs / 1000);
   return ({ authInfo }) => {
-    const identity = identityFrom(authInfo);
+    const owner = identityFrom(authInfo).userId;
     const server = new McpServer(
       { name: RELAY_NAME, version: RELAY_VERSION },
       { instructions: INSTRUCTIONS },
     );
+    /**
+     * From this request's own auth, with the per-request address. sessions.ts
+     * already answers 404 to anyone but a session's owner; this refuses again,
+     * so a session reached some other way still cannot act for its owner.
+     */
+    const identityOf = (ctx: ServerContext): Omit<CallerIdentity, 'client'> => {
+      const identity = identityFrom(ctx.http?.authInfo ?? authInfo);
+      if (identity.userId !== owner) {
+        throw new Error('MCP request from a user other than the one this server serves');
+      }
+      return identity;
+    };
     const caller = (ctx: ServerContext): CallerIdentity => ({
-      ...identity,
-      client: clientFrom(ctx),
+      ...identityOf(ctx),
+      client: clientFrom(server, ctx),
     });
 
     server.registerTool(
@@ -210,8 +239,8 @@ export function createMcpFactory(hub: PageHub, config: ResolvedConfig): McpServe
         inputSchema: z.object({}),
         annotations: { readOnlyHint: true, openWorldHint: false },
       },
-      () => {
-        const pages = hub.listPages(identity.userId);
+      (_args, ctx) => {
+        const pages = hub.listPages(identityOf(ctx).userId);
         const summary =
           pages.length === 0
             ? 'You are not attached to any page. Ask the page operator for the pairing code on their page and call pair_page.'
@@ -258,8 +287,8 @@ export function createMcpFactory(hub: PageHub, config: ResolvedConfig): McpServe
         annotations: { readOnlyHint: true, openWorldHint: true },
         _meta: MAX_RESULT_SIZE_META,
       },
-      ({ page }) => {
-        const outcome = hub.listPageTools(identity.userId, page);
+      ({ page }, ctx) => {
+        const outcome = hub.listPageTools(identityOf(ctx).userId, page);
         if (outcome.kind === 'error') return errorResult(outcome.code, outcome.message);
         return toolListResult(outcome);
       },
@@ -296,8 +325,8 @@ export function createMcpFactory(hub: PageHub, config: ResolvedConfig): McpServe
         inputSchema: z.object({ page: PageArg }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
       },
-      ({ page }) => {
-        const outcome = hub.detachPage(identity.userId, page);
+      ({ page }, ctx) => {
+        const outcome = hub.detachPage(identityOf(ctx).userId, page);
         if (outcome.kind === 'error') return errorResult(outcome.code, outcome.message);
         return {
           content: [text(`Detached from page ${outcome.pageId}.`)],

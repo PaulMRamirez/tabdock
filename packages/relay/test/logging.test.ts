@@ -8,6 +8,7 @@ import {
   callTool,
   connectClient,
   pairAndApprove,
+  sessionIdOf,
   startRelay,
   type TestRelay,
 } from './helpers/relay.ts';
@@ -120,6 +121,9 @@ describe('secrets never reach the logs (S11)', () => {
     back.send({ t: 'rotate_pairing' });
     await back.next('pairing');
     await callTool(alice, 'list_page_tools', { page: back.pageId });
+    // Bob is a 2025-era client, so he holds an MCP session; its id stays out of the logs too.
+    const bobSession = sessionIdOf(bob) ?? '';
+    expect(bobSession).not.toBe('');
     await current.close();
     current = undefined;
 
@@ -143,6 +147,7 @@ describe('secrets never reach the logs (S11)', () => {
       BOB.token,
       badToken,
       marker,
+      bobSession,
     ];
     const all = lines.join('\n');
     expect(lines.length).toBeGreaterThan(15);
