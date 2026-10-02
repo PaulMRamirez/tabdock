@@ -93,8 +93,6 @@ export type CallOutcome =
   | { kind: 'ok'; origin: string; content: string }
   /** The page's handler failed; its message is page-supplied text. */
   | { kind: 'tool_error'; origin: string; message: string }
-  /** The arguments cannot be forwarded at all. */
-  | { kind: 'invalid'; message: string }
   /** The MCP client abandoned the call. */
   | { kind: 'cancelled' }
   | HubError;
@@ -1059,12 +1057,7 @@ export class PageHub {
     let auditOutcome: AuditOutcome = 'relay_error';
     try {
       const outcome = await this.#call(caller, pageId, tool, args, signal);
-      auditOutcome =
-        outcome.kind === 'error'
-          ? outcome.code
-          : outcome.kind === 'invalid'
-            ? 'invalid_arguments'
-            : outcome.kind;
+      auditOutcome = outcome.kind === 'error' ? outcome.code : outcome.kind;
       return outcome;
     } catch (error) {
       // The SDK still answers the client with an error result; the log keeps the cause.
@@ -1133,18 +1126,19 @@ export class PageHub {
       });
     } catch {
       // JSON.stringify recurses: arguments nested a few thousand levels deep overflow the stack.
-      return Promise.resolve({
-        kind: 'invalid',
-        message: 'the arguments could not be encoded for the page link',
-      });
+      return Promise.resolve(
+        hubError('invalid_arguments', 'the arguments could not be encoded for the page link'),
+      );
     }
     // The adapter drops any frame over the cap by closing the socket, so an
     // oversized call must stop here rather than knock the page offline.
     if (Buffer.byteLength(encoded, 'utf8') > MAX_FRAME_BYTES) {
-      return Promise.resolve({
-        kind: 'invalid',
-        message: `the arguments are too large to forward; one page link frame carries at most ${String(MAX_FRAME_BYTES)} bytes`,
-      });
+      return Promise.resolve(
+        hubError(
+          'invalid_arguments',
+          `the arguments are too large to forward; one page link frame carries at most ${String(MAX_FRAME_BYTES)} bytes`,
+        ),
+      );
     }
     attachment.lastUsedAt = Date.now();
     this.#touchClients(attachment, caller.client);

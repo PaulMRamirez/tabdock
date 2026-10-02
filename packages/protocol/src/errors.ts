@@ -10,6 +10,7 @@ export const ERROR_CODES = [
   'page_busy',
   'pairing_expired',
   'rate_limited',
+  'invalid_arguments',
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];

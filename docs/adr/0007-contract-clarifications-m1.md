@@ -1,6 +1,6 @@
 # 0007: Contract clarifications from M1
 
-Status: Proposed, 2 October 2026. Changes SPEC sections 5, 6 and 7 if accepted.
+Status: Accepted by the owner with option A, 2 October 2026. Changes SPEC sections 5, 6 and 7.
 
 ## Context
 
@@ -18,10 +18,10 @@ Building and reviewing M1 turned up five places where the spec is silent or loos
 
 **Argument errors (section 7).** Arguments the relay will not forward (too large for the 1 MB frame now, failing the tool's `inputSchema` from M2) need an error the client can recognise. Two options:
 
-A. Add `invalid_arguments` to the section 7 codes, so these errors read `invalid_arguments: ...` like every other Tabdock error. Recommended: clients and tests match on the leading code, and the audit already records the outcome under that name.
+A. Add `invalid_arguments` to the section 7 codes, so these errors read `invalid_arguments: ...` like every other Tabdock error. Recommended, and chosen: clients and tests match on the leading code, and the audit already records the outcome under that name.
 
 B. Use the MCP SDK's own `Input validation error: ...` wording, which is what a client gets when it calls a fixed tool with bad parameters, and keep the section 7 list unchanged.
 
 ## Consequences
 
-The spec matches the wire and the error texts clients actually see. With option A, section 7 gains one code and M2's argument validation reuses it.
+The spec matches the wire and the error texts clients actually see. Section 7 gains `invalid_arguments`, which the relay already returns for arguments too large for one frame, and M2's argument validation reuses it.

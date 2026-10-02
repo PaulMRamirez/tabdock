@@ -169,8 +169,6 @@ export function callResult(tool: string, outcome: CallOutcome): CallToolResult {
         ],
         isError: true,
       };
-    case 'invalid':
-      return { content: [text(`Input validation error: ${outcome.message}`)], isError: true };
     case 'cancelled':
       return errorResult('timeout', 'the call was cancelled');
     case 'error':

@@ -675,7 +675,7 @@ describe('untrusted page content (S10, S9)', () => {
       arguments: { label: 'z'.repeat(MAX_FRAME_BYTES) },
     });
     expect(result.isError).toBe(true);
-    expect(result.text).toMatch(/^Input validation error: the arguments are too large/);
+    expect(result.text).toMatch(/^invalid_arguments: the arguments are too large/);
     expect(opened.all('invoke')).toHaveLength(0);
     expect(
       (await callTool(alice, 'call_page_tool', { page: opened.pageId, tool: 'get_view' })).isError,
@@ -723,7 +723,7 @@ describe('untrusted page content (S10, S9)', () => {
     });
     expect(result).toMatchObject({
       isError: true,
-      text: 'Input validation error: the arguments could not be encoded for the page link',
+      text: 'invalid_arguments: the arguments could not be encoded for the page link',
     });
     expect(opened.all('invoke')).toHaveLength(0);
     expect(relay.audit.records().map((record) => [record.tool, record.outcome])).toEqual([

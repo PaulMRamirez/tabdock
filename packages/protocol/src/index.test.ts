@@ -47,8 +47,8 @@ describe('protocol constants', () => {
   });
 
   it('recognise exactly the ten error codes from SPEC.md section 7', () => {
-    expect(ERROR_CODES).toHaveLength(10);
-    expect(new Set(ERROR_CODES).size).toBe(10);
+    expect(ERROR_CODES).toHaveLength(11);
+    expect(new Set(ERROR_CODES).size).toBe(11);
     expect(isErrorCode('page_gone')).toBe(true);
     expect(isErrorCode('PAGE_GONE')).toBe(false);
     expect(isErrorCode('')).toBe(false);
