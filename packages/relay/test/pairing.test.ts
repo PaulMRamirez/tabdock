@@ -127,10 +127,11 @@ describe('pair_page (A1.4, S3, S4)', () => {
     const alice = await client();
     const pending = callTool(alice, 'pair_page', { code: opened.code });
     const request = await opened.next('attach_request');
+    // A 2025-era client is named from its session's initialize (M2).
     expect(request).toMatchObject({
       user: { userId: 'alice', displayName: 'Alice' },
       via: 'code',
-      client: null,
+      client: { name: 'relay-test', version: '1.0.0' },
     });
     expect(request.requestId).toMatch(/^rq_/);
     expect(request.expiresAt).toBeGreaterThan(Date.now());
@@ -153,8 +154,11 @@ describe('pair_page (A1.4, S3, S4)', () => {
     });
     const roster = await opened.next('roster');
     expect(roster.attachments).toMatchObject([
-      { userId: 'alice', displayName: 'Alice', role: 'driver', lastUsedAt: null, expiresAt: null },
+      { userId: 'alice', displayName: 'Alice', role: 'driver', lastUsedAt: null },
     ]);
+    // Unused, an attachment expires 8 hours after its grant (ADR 0009).
+    const [granted] = roster.attachments;
+    expect(granted?.expiresAt).toBe((granted?.grantedAt ?? 0) + 8 * 60 * 60_000);
   });
 
   it('an approval without a role attaches as observer', async () => {

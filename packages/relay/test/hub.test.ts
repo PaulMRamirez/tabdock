@@ -1,7 +1,6 @@
-// PageHub on its own, behind a bare WebSocketServer, for paths the MCP route
-// cannot reach yet: the stateless /mcp route does not pass a client's abort
-// on to pair_page (M2's sessionful route will), so the waiter sets are driven
-// here with AbortSignals directly.
+// PageHub on its own, behind a bare WebSocketServer, driving the pair_page
+// waiter sets with AbortSignals directly: exact control over which joiner stops
+// waiting when. cancel.test.ts covers a real client's abort through /mcp.
 
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
