@@ -13,3 +13,9 @@ The relay uses the SDK's `CfWorkerJsonSchemaValidator` and never Ajv for page sc
 ## Consequences
 
 Clients get a clear error for wrong arguments before the page sees them, and no page schema can make the relay run a regex. The relay's check is looser than the page's schema wherever regexes are involved; the page still receives the raw arguments and can check them itself.
+
+## Notes after the build
+
+The validator's own `format` checks run regexes too, and its `url` check backtracks exponentially on input a client controls (`http://` and 28 letters took 950 ms; 100 KB never finished), while every other format stayed at 10 ms or less on 100 KB. The relay's copy therefore drops `format` as well. Keeping the check from rejecting what the page's schema accepts took more loosening than the decision lists: `not` is dropped, `if`, `then` and `else` go together, `oneOf` becomes `anyOf`, `maxContains` goes, `unevaluatedProperties` and `unevaluatedItems` go everywhere once anything they depend on was removed, and a `$ref` counts as loosened once anything was. A unit test checks these against the validator run on the page's original schema. The validator's own error text quotes schema values (enum entries, constants, required names), so the relay keeps only error locations that name keys in the caller's own arguments and maps the rule to fixed wording.
+
+A client can sometimes make the validator throw on purpose (a key holding a lone surrogate, for one), which skips the check for that call, as decided. The relay's check is therefore advisory: pages must still check their own arguments, which the M4 threat model will say.
