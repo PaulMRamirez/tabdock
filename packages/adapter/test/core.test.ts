@@ -175,6 +175,23 @@ describe('tool sync', () => {
     expect(socket.framesOf('tools')).toHaveLength(3);
   });
 
+  it('says it has no tools when getTools() fails after a welcome, and sends them once it reads', async () => {
+    const h = setup();
+    const getTools = h.context.getTools.bind(h.context);
+    let failing = true;
+    h.context.getTools = () => (failing ? Promise.reject(new Error('runtime busy')) : getTools());
+    const socket = await link(h);
+    // An empty list ends the relay's wait for a resumed page's tools.
+    expect(socket.framesOf('tools').map((frame) => frame.tools)).toEqual([[]]);
+    await h.clock.advance(TOOL_POLL_MS * 2);
+    expect(socket.framesOf('tools')).toHaveLength(1);
+
+    failing = false;
+    await h.clock.advance(TOOL_POLL_MS);
+    expect(socket.framesOf('tools')).toHaveLength(2);
+    expect(socket.framesOf('tools')[1]?.tools.length).toBeGreaterThan(0);
+  });
+
   it('parses string schemas, keeps only known boolean hints and skips malformed tools', async () => {
     const h = setup({
       tools: [
@@ -544,6 +561,23 @@ describe('roles and consequential tools', () => {
       await flush();
       expect(codes(socket)).toEqual(['role_denied']);
       expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: 'observer' } });
+    });
+
+    it('lets a later approval replace one the relay ignored, before the user is listed', async () => {
+      const h = setup();
+      const socket = await link(h, {}, {});
+      // Approved as observer just as the request expired: the relay drops the
+      // decision and never lists Bob.
+      socket.deliver(attachRequest(h.clock, 'req-1'));
+      expect(h.dock.approve('req-1', 'observer')).toBe(true);
+      // Bob pairs again and the operator approves him as driver this time.
+      socket.deliver(attachRequest(h.clock, 'req-2'));
+      expect(h.dock.approve('req-2', 'driver')).toBe(true);
+      socket.deliver({ t: 'roster', attachments: [attachment('bob', 'driver')] });
+      socket.deliver(invoke('set_value', { caller: bob() }));
+      await flush();
+      expect(codes(socket)).toEqual(['ok']);
+      expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: 'driver' } });
     });
 
     it('leaves a user whose first request the operator denied with no grant', async () => {

@@ -523,6 +523,49 @@ describe('untrusted page content (S10, S9)', () => {
     expect(JSON.stringify(after)).not.toContain('IGNORE PREVIOUS');
   });
 
+  it('treats keys as keywords only where they are keywords: names and data pass as written', async () => {
+    await setup();
+    const alice = await client();
+    // Keys called title or description where they name properties or definitions,
+    // and objects inside enum, const, default and examples, are not prose
+    // keywords: none of them is replaced or removed.
+    const inputSchema = {
+      type: 'object',
+      $defs: {
+        title: { type: 'string', title: 'A title definition' },
+        description: { type: 'object', properties: { enum: { const: 'x' } } },
+      },
+      definitions: { default: { type: 'number', default: 3 } },
+      properties: {
+        description: { type: 'string', description: 'the description field' },
+        title: { $ref: '#/$defs/title' },
+        enum: { type: 'string', enum: ['a', 'b'] },
+        const: { type: 'object', properties: { title: { type: 'string' } } },
+        choice: { enum: [{ description: 5 }, { title: ['x'] }] },
+        fixed: { const: { title: { nested: true } } },
+        dep: { type: 'object', default: { description: 7 } },
+        // Where title is a keyword, a value that is not a string is replaced.
+        count: { type: 'number', title: 42 },
+      },
+      patternProperties: { '^title$': { type: 'string' } },
+      dependencies: { dep: ['title'], description: { properties: { title: { type: 'string' } } } },
+      examples: [{ title: { nested: true }, description: 5 }],
+    };
+    const opened = await page({
+      tools: [{ name: 'keyed', description: 'Keyword names as data.', inputSchema }],
+    });
+    await pairAndApprove(alice, opened);
+    const listed = await callTool(alice, 'list_page_tools', { page: opened.pageId });
+    const [tool] = (listed.structured as { tools: ListedTool[] }).tools;
+    expect(tool?.inputSchema).toEqual({
+      ...inputSchema,
+      properties: {
+        ...inputSchema.properties,
+        count: { type: 'number', title: '[tabdock: non-string title removed]' },
+      },
+    });
+  });
+
   it('removes a schema nested thousands of levels deep, and the listing still works', async () => {
     await setup();
     const opened = await page({ tools: [READ_TOOL] });

@@ -21,8 +21,10 @@ const HOST_TAG = 'tabdock-dock';
  * than guessed at: the relay controls text that can shift it (a roster name
  * that wraps, a longer pairing code, an error), and the panel can scroll.
  * Boxes are timed one by one, so prompts arriving on top, which move nothing
- * below them, never keep an older prompt disarmed. data-armed shows the
- * state, for people and for browser tests.
+ * below them, never keep an older prompt disarmed. A tab coming back into
+ * view, or its window into focus, restarts every box's wait, since the
+ * operator is seeing the boxes afresh. data-armed shows the state, for people
+ * and for browser tests.
  */
 const ARM_DELAY_MS = 500;
 
@@ -420,8 +422,25 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     tick();
   }
 
+  /**
+   * A tab coming back into view, or its window into focus, is a new sight of
+   * every box, so each waits again before taking a click: a box that armed
+   * while the operator was elsewhere must not take the first click on return.
+   */
+  function rearmAll(): void {
+    for (const view of [...requestViews.values(), ...confirmViews.values()]) {
+      restartArming(view);
+    }
+  }
+  const onVisibility = (): void => {
+    if (doc.visibilityState === 'visible') rearmAll();
+  };
+  const win = doc.defaultView;
+
   const unsubscribe = dock.on('state', render);
   const interval = setInterval(tick, 1000);
+  doc.addEventListener('visibilitychange', onVisibility);
+  win?.addEventListener('focus', rearmAll);
   let mounted = true;
 
   function unmount(): void {
@@ -429,6 +448,8 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     mounted = false;
     unsubscribe();
     clearInterval(interval);
+    doc.removeEventListener('visibilitychange', onVisibility);
+    win?.removeEventListener('focus', rearmAll);
     for (const view of [...requestViews.values(), ...confirmViews.values()]) {
       clearTimeout(view.timer);
     }

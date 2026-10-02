@@ -250,6 +250,55 @@ test('prompts arriving every 300 ms leave the oldest one armed on its own schedu
     .toEqual([{ t: 'attach_decision', requestId: 'req-1', allow: true, role: 'observer' }]);
 });
 
+test('a prompt that armed while the tab was hidden waits again when the tab is shown', async ({
+  page,
+}) => {
+  const relay = await openWithFakeRelay(page);
+  // Headless tabs never hide, so the test stands in for the browser's visibility state.
+  await page.evaluate(() => {
+    let visibility: DocumentVisibilityState = 'hidden';
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      get: () => visibility,
+    });
+    Object.defineProperty(document, 'hidden', {
+      configurable: true,
+      get: () => visibility === 'hidden',
+    });
+    (window as unknown as { showTab: () => void }).showTab = () => {
+      visibility = 'visible';
+      document.dispatchEvent(new Event('visibilitychange'));
+    };
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  relay.send(attachRequest('req-bg', 'mallory'));
+  await waitForDock(page, (state) => state.pendingRequests.length === 1);
+  const target = { action: 'approve-driver', requestId: 'req-bg' };
+  await page.clock.runFor(ARM_DELAY_MS * 3);
+  expect((await widgetButtonNow(page, target))?.armed).toBe(true);
+
+  await pauseClock(page);
+  await page.evaluate(() => {
+    (window as unknown as { showTab: () => void }).showTab();
+  });
+  const shown = await widgetButtonNow(page, target);
+  expect(shown?.armed).toBe(false);
+  // The first click on return lands nowhere.
+  await page.mouse.click(shown?.x ?? 0, shown?.y ?? 0);
+  await page.clock.runFor(ARM_DELAY_MS);
+  expect(decisions(relay)).toEqual([]);
+
+  // Focus alone restarts the wait as well.
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+  expect((await widgetButtonNow(page, target))?.armed).toBe(false);
+  await page.clock.runFor(ARM_DELAY_MS);
+  expect((await widgetButtonNow(page, target))?.armed).toBe(true);
+  await page.mouse.click(shown?.x ?? 0, shown?.y ?? 0);
+  await expect
+    .poll(() => decisions(relay))
+    .toEqual([{ t: 'attach_decision', requestId: 'req-bg', allow: true, role: 'driver' }]);
+});
+
 test('the panel opens by itself once on the way in, so a resumed link leaves it closed', async ({
   page,
 }) => {

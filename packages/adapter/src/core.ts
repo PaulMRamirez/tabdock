@@ -940,7 +940,14 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   async function syncOnce(): Promise<void> {
     if (!isLinked()) return;
     const snapshot = await readTools();
-    if (!snapshot || !isLinked()) return;
+    if (!isLinked()) return;
+    if (!snapshot) {
+      // The relay holds a resumed page's calls until its first tools frame, so
+      // a page that cannot read its tools says it has none rather than nothing;
+      // the next poll that reads them sends the real list.
+      if (lastToolsKey === null && send({ t: 'tools', tools: [] })) lastToolsKey = '[]';
+      return;
+    }
     const tools = fitTools(snapshot.tools.map((tool) => tool.page));
     const key = JSON.stringify(tools);
     if (key === lastToolsKey) return;
@@ -1262,11 +1269,15 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       pendingRequests: state.pendingRequests.filter((item) => item.requestId !== requestId),
     });
     // The first approval wins, as on the relay, which keeps an existing
-    // attachment as it is (role changes are set_role's job, from M2). A denial,
-    // or silence, answers only this request: it leaves an existing grant alone,
+    // attachment as it is (role changes are set_role's job, from M2). It wins
+    // only while the roster lists the user: a grant for a user the relay never
+    // attached came from an approval it ignored (one that crossed the request's
+    // expiry), so this approval is the one the relay will apply. A denial, or
+    // silence, answers only this request: it leaves an existing grant alone,
     // since the relay keeps that user attached; withdrawing access is revoke's job.
     const { userId } = record.request.user;
-    if (allow && role !== undefined && !grants.has(userId)) setGrant(userId, role);
+    const listed = state.roster.some((attachment) => attachment.userId === userId);
+    if (allow && role !== undefined && (!listed || !grants.has(userId))) setGrant(userId, role);
     const who = record.request.user.displayName;
     log.info(allow ? `allowed ${who} as ${String(role)}` : `denied ${who}`);
     return send({
