@@ -12,7 +12,11 @@ const sim = await startSimPage({
 });
 const { pairing } = await sim.waitFor((state) => state.link === 'linked');
 // ... pair a client with pairing.code, call tools ...
-await sim.reload(); // a browser reload: same storage, so the page resumes
+sim.setRole('bob', 'observer'); // the operator's roster controls and pause switch
+sim.revoke('*');
+sim.pause(true); // every new call gets page_busy until sim.pause(false)
+console.log(sim.activity); // the last 50 calls, newest first
+await sim.reload(); // a browser reload: same storage, so the page resumes (and stays paused)
 await sim.reload({ awayMs: 5000 }); // the same, with the tab gone for 5 s first
 await sim.close();
 ```

@@ -211,12 +211,18 @@ function findNode(node: DomNode, match: (node: DomNode) => boolean): DomNode | n
 }
 
 export interface WidgetTarget {
-  /** A data-action value: approve-driver, approve-observer, deny, confirm-allow, confirm-deny, rotate, toggle. */
+  /**
+   * A data-action value: approve-driver, approve-observer, deny, confirm-allow,
+   * confirm-deny, rotate, toggle; make-driver, make-observer and revoke in a
+   * roster row; revoke-all; pause or resume.
+   */
   action: string;
   /** Narrows to the prompt box for one attach request. */
   requestId?: string;
   /** Narrows to the prompt box for one consequential call. */
   callId?: string;
+  /** Narrows to one user's roster row. */
+  userId?: string;
 }
 
 async function withCdp<T>(page: Page, run: (cdp: CDPSession) => Promise<T>): Promise<T> {
@@ -235,7 +241,9 @@ async function findButton(cdp: CDPSession, target: WidgetTarget): Promise<DomNod
       ? findNode(root, (n) => attribute(n, 'data-request-id') === target.requestId)
       : target.callId !== undefined
         ? findNode(root, (n) => attribute(n, 'data-call-id') === target.callId)
-        : root;
+        : target.userId !== undefined
+          ? findNode(root, (n) => attribute(n, 'data-user-id') === target.userId)
+          : root;
   return scope && findNode(scope, (n) => attribute(n, 'data-action') === target.action);
 }
 

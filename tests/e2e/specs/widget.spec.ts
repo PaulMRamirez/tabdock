@@ -12,14 +12,18 @@ import {
   PING_INTERVAL_MS,
   type RelayFrame,
   RESUME_WINDOW_MS,
+  type Role,
 } from '@tabdock/protocol';
 import {
+  approveThroughHandle,
   clickInWidget,
   demoPageUrl,
   dockState,
+  scriptClickInWidget,
   waitForDock,
   widgetButtonCentre,
   widgetButtonNow,
+  widgetText,
   widgetVisible,
 } from '../src/tabdock-harness.ts';
 
@@ -66,11 +70,11 @@ interface FakeRelay {
   drop(): Promise<void>;
 }
 
-function attachment(userId: string, displayName: string): AttachmentView {
+function attachment(userId: string, displayName: string, role: Role = 'driver'): AttachmentView {
   return {
     userId,
     displayName,
-    role: 'driver',
+    role,
     grantedAt: Date.now(),
     lastUsedAt: null,
     expiresAt: null,
@@ -323,4 +327,208 @@ test('the panel opens by itself once on the way in, so a resumed link leaves it 
   expect(await widgetVisible(page, 'pairing-code')).toBe(false);
   relay.send({ t: 'roster', attachments: [] });
   await expect.poll(() => widgetVisible(page, 'pairing-code')).toBe(true);
+});
+
+// M2: the roster's role switch and Revoke, Revoke all, the activity log and
+// the pause switch. Roster rows and the pause control are armed boxes like
+// the prompts, since Make driver and Resume grant access.
+
+function framesOf<T extends PageFrame['t']>(relay: FakeRelay, type: T) {
+  return relay.frames.filter((frame): frame is Extract<PageFrame, { t: T }> => frame.t === type);
+}
+
+function invokeFrame(
+  callId: string,
+  tool: string,
+  client: { name: string; version: string } | null = null,
+): RelayFrame {
+  return {
+    t: 'invoke',
+    callId,
+    tool,
+    arguments: {},
+    caller: { userId: 'alice', displayName: 'Alice', client, role: 'driver' },
+    deadlineMs: 45_000,
+  };
+}
+
+test('Make driver and Make observer send set_role for that row', async ({ page }) => {
+  const relay = await openWithFakeRelay(page);
+  relay.send({
+    t: 'roster',
+    attachments: [attachment('alice', 'Alice'), attachment('bob', 'Bob', 'observer')],
+  });
+  await clickInWidget(page, { action: 'make-driver', userId: 'bob' });
+  await expect
+    .poll(() => framesOf(relay, 'set_role'))
+    .toEqual([{ t: 'set_role', userId: 'bob', role: 'driver' }]);
+
+  // The relay applies it, so Bob's switch now offers the way back.
+  relay.send({
+    t: 'roster',
+    attachments: [attachment('alice', 'Alice'), attachment('bob', 'Bob')],
+  });
+  await clickInWidget(page, { action: 'make-observer', userId: 'bob' });
+  await expect
+    .poll(() => framesOf(relay, 'set_role'))
+    .toEqual([
+      { t: 'set_role', userId: 'bob', role: 'driver' },
+      { t: 'set_role', userId: 'bob', role: 'observer' },
+    ]);
+});
+
+test('Revoke ends one attachment and Revoke all ends every one', async ({ page }) => {
+  const relay = await openWithFakeRelay(page);
+  relay.send({
+    t: 'roster',
+    attachments: [attachment('alice', 'Alice'), attachment('bob', 'Bob')],
+  });
+  await clickInWidget(page, { action: 'revoke', userId: 'bob' });
+  await expect.poll(() => framesOf(relay, 'revoke')).toEqual([{ t: 'revoke', userId: 'bob' }]);
+
+  relay.send({ t: 'roster', attachments: [attachment('alice', 'Alice')] });
+  await waitForDock(page, (state) => state.roster.length === 1);
+  await clickInWidget(page, { action: 'revoke-all' });
+  await expect
+    .poll(() => framesOf(relay, 'revoke'))
+    .toEqual([
+      { t: 'revoke', userId: 'bob' },
+      { t: 'revoke', userId: '*' },
+    ]);
+
+  // With nobody attached there is nothing to revoke, so the control goes.
+  relay.send({ t: 'roster', attachments: [] });
+  await expect.poll(() => widgetButtonNow(page, { action: 'revoke-all' })).toBeNull();
+});
+
+test('a roster row that moves disarms its buttons until it holds still', async ({ page }) => {
+  const relay = await openWithFakeRelay(page);
+  relay.send({
+    t: 'roster',
+    attachments: [attachment('bob', 'Bob', 'observer'), attachment('carol', 'Carol')],
+  });
+  const target = { action: 'make-driver', userId: 'bob' };
+  const before = await widgetButtonCentre(page, target);
+
+  await pauseClock(page);
+  // Carol's row, below Bob's, grows when the relay renames her to something
+  // that wraps; the panel is pinned at the bottom, so Bob's row moves up.
+  const longName = `Carol ${'with a display name long enough to wrap '.repeat(2)}`.trim();
+  relay.send({
+    t: 'roster',
+    attachments: [attachment('bob', 'Bob', 'observer'), attachment('carol', longName)],
+  });
+  await waitForDock(page, (state) => state.roster[1]?.displayName === longName);
+  const moved = await widgetButtonNow(page, target);
+  expect(moved?.armed).toBe(false);
+  expect(moved?.y ?? before.y).toBeLessThan(before.y);
+
+  // A click where Make driver now sits does nothing, and restarts the wait.
+  await page.mouse.click(moved?.x ?? 0, moved?.y ?? 0);
+  expect((await dockState(page))?.roster.map((entry) => entry.role)).toEqual([
+    'observer',
+    'driver',
+  ]);
+  await page.clock.runFor(ARM_DELAY_MS - 100);
+  expect((await widgetButtonNow(page, target))?.armed).toBe(false);
+  await page.clock.runFor(100);
+  expect((await widgetButtonNow(page, target))?.armed).toBe(true);
+  expect(framesOf(relay, 'set_role')).toEqual([]);
+
+  await page.mouse.click(moved?.x ?? 0, moved?.y ?? 0);
+  await expect
+    .poll(() => framesOf(relay, 'set_role'))
+    .toEqual([{ t: 'set_role', userId: 'bob', role: 'driver' }]);
+});
+
+test('a role switch the relay flips under the pointer waits again, though nothing moved', async ({
+  page,
+}) => {
+  const relay = await openWithFakeRelay(page);
+  relay.send({ t: 'roster', attachments: [attachment('bob', 'Bob')] });
+  const aimed = await widgetButtonCentre(page, { action: 'make-observer', userId: 'bob' });
+
+  await pauseClock(page);
+  // The relay says Bob is an observer now, so the button under the pointer would grant driver.
+  relay.send({ t: 'roster', attachments: [attachment('bob', 'Bob', 'observer')] });
+  await waitForDock(page, (state) => state.roster[0]?.role === 'observer');
+  const flipped = await widgetButtonNow(page, { action: 'make-driver', userId: 'bob' });
+  expect(flipped?.armed).toBe(false);
+  await page.mouse.click(aimed.x, aimed.y);
+  await page.clock.runFor(ARM_DELAY_MS);
+  expect(framesOf(relay, 'set_role')).toEqual([]);
+});
+
+test('the activity log names the user, client, tool and outcome of each call', async ({ page }) => {
+  const relay = await openWithFakeRelay(page);
+  relay.send(attachRequest('req-alice', 'alice'));
+  await waitForDock(page, (state) => state.pendingRequests.length === 1);
+  expect(await approveThroughHandle(page, 'req-alice', 'driver')).toBe(true);
+  relay.send({ t: 'roster', attachments: [attachment('alice', 'Alice')] });
+  await waitForDock(page, (state) => state.roster.length === 1);
+
+  const client = { name: 'test-client', version: '1.2.3' };
+  relay.send(invokeFrame('call-1', 'get_view', client));
+  await expect.poll(() => framesOf(relay, 'result').map((frame) => frame.ok)).toEqual([true]);
+  relay.send(invokeFrame('call-2', 'no_such_tool'));
+  await expect.poll(() => framesOf(relay, 'result')).toHaveLength(2);
+
+  const text = (await widgetText(page, 'activity')) ?? '';
+  const newer = text.indexOf('Alice: no_such_tool, tool_not_found');
+  const older = text.search(/Alice via test-client 1\.2\.3: get_view, ok in \d+ ms/);
+  // Newest first.
+  expect(newer).toBeGreaterThanOrEqual(0);
+  expect(older).toBeGreaterThan(newer);
+  expect((await dockState(page))?.activity.map((entry) => entry.outcome)).toEqual([
+    'tool_not_found',
+    'ok',
+  ]);
+});
+
+test('pause answers calls with page_busy, shows on the badge, and holds across a reload', async ({
+  page,
+}) => {
+  const relay = await openWithFakeRelay(page);
+  expect(await widgetVisible(page, 'badge-paused')).toBe(false);
+  await clickInWidget(page, { action: 'pause' });
+  await waitForDock(page, (state) => state.paused);
+  expect(await widgetVisible(page, 'badge-paused')).toBe(true);
+
+  relay.send(invokeFrame('call-1', 'get_view'));
+  await expect
+    .poll(() => framesOf(relay, 'result'))
+    .toEqual([
+      {
+        t: 'result',
+        callId: 'call-1',
+        ok: false,
+        error: {
+          code: 'page_busy',
+          message: expect.stringContaining('paused') as unknown as string,
+        },
+      },
+    ]);
+
+  // A reload must not quietly resume.
+  await page.reload();
+  await page.waitForSelector('html[data-tools="ready"]');
+  await waitForDock(page, (state) => relay.connections === 2 && state.link === 'linked');
+  expect((await dockState(page))?.paused).toBe(true);
+  expect(await widgetVisible(page, 'badge-paused')).toBe(true);
+  relay.send(invokeFrame('call-2', 'get_view'));
+  await expect
+    .poll(() => framesOf(relay, 'result').map((frame) => frame.error?.code))
+    .toEqual(['page_busy', 'page_busy']);
+
+  // Page script cannot press Resume; only the operator's own click lifts the pause.
+  await scriptClickInWidget(page, { action: 'resume' });
+  expect((await dockState(page))?.paused).toBe(true);
+  await clickInWidget(page, { action: 'resume' });
+  await waitForDock(page, (state) => !state.paused);
+  expect(await widgetVisible(page, 'badge-paused')).toBe(false);
+  // Running calls again: this caller lost its approval with the reload, so the role check answers.
+  relay.send(invokeFrame('call-3', 'get_view'));
+  await expect
+    .poll(() => framesOf(relay, 'result').map((frame) => frame.error?.code))
+    .toEqual(['page_busy', 'page_busy', 'role_denied']);
 });

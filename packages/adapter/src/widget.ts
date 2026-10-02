@@ -9,22 +9,33 @@
 // textContent, and nothing lands on window. Buttons carry stable data-action
 // attributes for browser tests.
 
-import type { Dock, DockState, LinkState, PendingConfirm, PendingRequest } from './core.ts';
+import type { AttachmentView, Role } from '@tabdock/protocol';
+import type {
+  ActivityEntry,
+  Dock,
+  DockState,
+  LinkState,
+  PendingConfirm,
+  PendingRequest,
+} from './core.ts';
 
 /** A valid custom element name needs no registration to host a shadow root, so nothing is defined globally. */
 const HOST_TAG = 'tabdock-dock';
 
 /**
- * A prompt box's buttons ignore clicks until the box has held still this long
- * since it appeared or last moved, so a click aimed at one button never lands
- * on another that just slid under the pointer. Each box is measured rather
- * than guessed at: the relay controls text that can shift it (a roster name
- * that wraps, a longer pairing code, an error), and the panel can scroll.
- * Boxes are timed one by one, so prompts arriving on top, which move nothing
- * below them, never keep an older prompt disarmed. A tab coming back into
- * view, or its window into focus, restarts every box's wait, since the
- * operator is seeing the boxes afresh. data-armed shows the state, for people
- * and for browser tests.
+ * A box's buttons ignore clicks until the box has held still this long since
+ * it appeared or last moved, so a click aimed at one button never lands on
+ * another that just slid under the pointer. Prompts are boxes, and so are
+ * roster rows and the pause control, since Make driver and Resume grant
+ * access as surely as Allow does. Each box is measured rather than guessed
+ * at: the relay controls text that can shift it (a roster name that wraps, a
+ * longer pairing code, an error), and the panel can scroll. Boxes are timed
+ * one by one, so prompts arriving on top, which move nothing below them,
+ * never keep an older prompt disarmed. A box whose buttons change meaning
+ * (a role switch that flips, Pause turning into Resume) waits again too. A
+ * tab coming back into view, or its window into focus, restarts every box's
+ * wait, since the operator is seeing the boxes afresh. data-armed shows the
+ * state, for people and for browser tests.
  */
 const ARM_DELAY_MS = 500;
 
@@ -51,8 +62,12 @@ const STYLE = `
 .dot.connecting, .dot.reconnecting { background: #d97706; }
 .dot.closed { background: #dc2626; }
 .count { min-width: 20px; padding: 0 6px; border-radius: 10px; background: #e5e7eb; text-align: center; }
-.panel { width: 300px; max-width: calc(100vw - 32px); max-height: 70vh; overflow: auto; padding: 12px;
-  border-radius: 12px; border: 1px solid #cbd5e1; background: #fff; box-shadow: 0 6px 24px rgb(0 0 0 / 0.2); }
+.tag { padding: 0 6px; border-radius: 10px; background: #b91c1c; color: #fff; font-size: 11px;
+  letter-spacing: 0.04em; text-transform: uppercase; }
+/* Only as tall as its content, up to just above the badge: a panel that scrolls moves every box in it. */
+.panel { width: 360px; max-width: calc(100vw - 32px); max-height: calc(100vh - 88px); overflow: auto; padding: 12px;
+  border-radius: 12px; border: 1px solid #cbd5e1; background: #fff; box-shadow: 0 6px 24px rgb(0 0 0 / 0.2);
+  overflow-wrap: anywhere; }
 .label { margin: 10px 0 2px; font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; color: #6b7280; }
 .code { font: 600 26px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 0.08em;
   user-select: all; }
@@ -62,22 +77,34 @@ const STYLE = `
 .prompt { margin: 0 0 8px; padding: 8px; border: 1px solid #d97706; border-radius: 8px; background: #fffbeb; }
 .prompt p { margin: 0 0 4px; }
 .buttons { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 4px; }
-.action { padding: 4px 10px; border-radius: 6px; border: 1px solid #9ca3af; background: #f9fafb; color: inherit;
+.action { padding: 4px 8px; border-radius: 6px; border: 1px solid #9ca3af; background: #f9fafb; color: inherit;
   font: inherit; cursor: pointer; }
 .action.primary { border-color: #1d4ed8; background: #1d4ed8; color: #fff; }
 .action:disabled { opacity: 0.5; cursor: default; }
 .action[data-armed='false'] { opacity: 0.6; cursor: default; }
-ul { margin: 2px 0 0; padding: 0; list-style: none; }
+ul, ol { margin: 2px 0 0; padding: 0; list-style: none; }
 li { padding: 2px 0; }
+.row { margin: 0 0 6px; padding: 6px 8px; border: 1px solid #e5e7eb; border-radius: 8px; }
+.row p { margin: 0; }
+.row .buttons { margin: 4px 0 0; }
+.who { font-weight: 600; }
+.activity { height: 6.5em; overflow-y: auto; padding: 2px 6px; border: 1px solid #e5e7eb; border-radius: 6px;
+  font-size: 12px; }
+.activity li { padding: 1px 0; }
+.activity [data-outcome='running'] { color: #92400e; }
+.pause { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 10px 0 0;
+  padding: 6px 8px; border: 1px solid #e5e7eb; border-radius: 8px; }
+.pause.paused { border-color: #b91c1c; }
 @media (prefers-color-scheme: dark) {
   :host { color: #e5e7eb; }
   .badge, .panel { background: #111827; border-color: #374151; }
   .count { background: #374151; }
   .prompt { background: #3b2a06; }
+  .row, .activity, .pause { border-color: #374151; }
   .action { background: #1f2937; border-color: #4b5563; }
   .muted, .label { color: #9ca3af; }
   .error { color: #fca5a5; }
-  .notice { color: #fcd34d; }
+  .notice, .activity [data-outcome='running'] { color: #fcd34d; }
 }
 `;
 
@@ -88,14 +115,36 @@ interface BoxRect {
   readonly height: number;
 }
 
-interface PromptView {
+/** A box whose buttons take a click only once it has held still; see ARM_DELAY_MS. */
+interface ArmedBox {
   readonly element: HTMLElement;
-  readonly countdown: HTMLElement;
-  readonly expiresAt: number;
   /** Where the box was when it appeared or last moved; null until first measured. */
   rect: BoxRect | null;
   armed: boolean;
   timer: ReturnType<typeof setTimeout> | undefined;
+}
+
+interface PromptView extends ArmedBox {
+  readonly countdown: HTMLElement;
+  readonly expiresAt: number;
+}
+
+interface RowView extends ArmedBox {
+  readonly who: HTMLElement;
+  readonly clients: HTMLElement;
+  readonly expiry: HTMLElement;
+  roleSwitch: HTMLButtonElement;
+  /** What the row says apart from its expiry; when it changes, the row waits again. */
+  key: string;
+  role: Role;
+  expiresAt: number | null;
+}
+
+interface PauseView extends ArmedBox {
+  readonly text: HTMLElement;
+  toggle: HTMLButtonElement;
+  /** null until the first render. */
+  paused: boolean | null;
 }
 
 function measure(box: HTMLElement): BoxRect {
@@ -121,6 +170,23 @@ function clockText(seconds: number): string {
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
 }
 
+/** Relative and coarse: the relay's clock can differ from this one, and minutes are what the operator needs. */
+function expiryText(expiresAt: number | null): string {
+  if (expiresAt === null) return 'No expiry set';
+  const minutes = Math.ceil((expiresAt - Date.now()) / 60_000);
+  if (minutes <= 0) return 'Expiring now';
+  if (minutes < 60) return `Expires in ${minutes} min`;
+  return `Expires in ${Math.floor(minutes / 60)} h ${minutes % 60} min`;
+}
+
+function clientText(client: { name: string; version: string }): string {
+  return `${client.name} ${client.version}`.trim();
+}
+
+function timeText(epochMs: number): string {
+  return new Date(epochMs).toLocaleTimeString([], { hour12: false });
+}
+
 /** Mounts the widget for one Dock and returns a function that removes it. */
 export function mountWidget(dock: Dock, doc: Document = document): () => void {
   const host = doc.createElement(HOST_TAG);
@@ -137,8 +203,11 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     return node;
   }
 
+  /** Every armed box on show: prompts, roster rows and the pause control. */
+  const boxes = new Set<ArmedBox>();
   const requestViews = new Map<string, PromptView>();
   const confirmViews = new Map<string, PromptView>();
+  const rowViews = new Map<string, RowView>();
 
   function button(label: string, action: string, onClick: () => void, primary = false) {
     const node = element('button', primary ? 'action primary' : 'action', label);
@@ -152,36 +221,46 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     return node;
   }
 
-  function setArmed(view: PromptView, value: boolean): void {
-    view.armed = value;
-    for (const node of view.element.querySelectorAll('button')) {
+  function setArmed(box: ArmedBox, value: boolean): void {
+    box.armed = value;
+    for (const node of box.element.querySelectorAll('button')) {
       node.dataset.armed = String(value);
       node.setAttribute('aria-disabled', String(!value));
     }
   }
 
   /** Records where the box is now and disarms it until it has stayed there for ARM_DELAY_MS. */
-  function restartArming(view: PromptView): void {
-    clearTimeout(view.timer);
-    view.rect = measure(view.element);
-    setArmed(view, false);
-    view.timer = setTimeout(() => {
+  function restartArming(box: ArmedBox): void {
+    clearTimeout(box.timer);
+    box.rect = measure(box.element);
+    setArmed(box, false);
+    box.timer = setTimeout(() => {
       // A move nobody noticed in between starts the wait again.
-      if (sameRect(view.rect, measure(view.element))) setArmed(view, true);
-      else restartArming(view);
+      if (sameRect(box.rect, measure(box.element))) setArmed(box, true);
+      else restartArming(box);
     }, ARM_DELAY_MS);
   }
 
   /** Restarts the wait of every box that is new or no longer where it was. */
   function checkMoves(): void {
-    for (const view of [...requestViews.values(), ...confirmViews.values()]) {
-      if (!sameRect(view.rect, measure(view.element))) restartArming(view);
+    for (const box of boxes) {
+      if (!sameRect(box.rect, measure(box.element))) restartArming(box);
     }
   }
 
-  /** A button inside a prompt box, which only takes a click while its box is armed. */
-  function promptButton(
-    view: PromptView,
+  function newBox(element: HTMLElement): ArmedBox {
+    return { element, rect: null, armed: false, timer: undefined };
+  }
+
+  function dropBox(box: ArmedBox): void {
+    clearTimeout(box.timer);
+    box.element.remove();
+    boxes.delete(box);
+  }
+
+  /** A button inside an armed box, which only takes a click while its box is armed. */
+  function boxButton(
+    box: ArmedBox,
     label: string,
     action: string,
     onClick: () => void,
@@ -192,28 +271,21 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       action,
       () => {
         // Checked again here, as a shift may land between the last check and the click.
-        if (!view.armed || !sameRect(view.rect, measure(view.element))) {
-          restartArming(view);
+        if (!box.armed || !sameRect(box.rect, measure(box.element))) {
+          restartArming(box);
           return;
         }
         onClick();
       },
       primary,
     );
-    node.dataset.armed = String(view.armed);
-    node.setAttribute('aria-disabled', String(!view.armed));
+    node.dataset.armed = String(box.armed);
+    node.setAttribute('aria-disabled', String(!box.armed));
     return node;
   }
 
-  function newView(box: HTMLElement, expiresAt: number): PromptView {
-    return {
-      element: box,
-      countdown: element('p', 'muted'),
-      expiresAt,
-      rect: null,
-      armed: false,
-      timer: undefined,
-    };
+  function newPrompt(box: HTMLElement, expiresAt: number): PromptView {
+    return { ...newBox(box), countdown: element('p', 'muted'), expiresAt };
   }
 
   const style = element('style');
@@ -237,19 +309,51 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   pairing.append(element('div', 'label', 'Pairing code'), code, expiry, rotate);
 
   const roster = element('ul');
+  roster.dataset.role = 'roster';
+  const nobody = element('p', 'muted', 'Nobody yet');
+  // Revoking only takes access away, so it is not held back like the boxes.
+  const revokeAll = button('Revoke all', 'revoke-all', () => {
+    dock.revoke('*');
+  });
   const rosterBlock = element('div');
-  rosterBlock.append(element('div', 'label', 'Attached'), roster);
-  panel.append(errorLine, noticeLine, prompts, pairing, rosterBlock);
+  rosterBlock.append(element('div', 'label', 'Attached'), roster, nobody, revokeAll);
+
+  // A fixed height, so new calls never move the boxes around it.
+  const activity = element('ol', 'activity');
+  activity.dataset.role = 'activity';
+  activity.setAttribute('aria-label', 'Recent calls, newest first');
+  const activityBlock = element('div');
+  activityBlock.append(element('div', 'label', 'Activity'), activity);
+
+  // Last in the panel, beside the badge, where other changes move it least.
+  const pauseBox = element('div', 'pause');
+  pauseBox.dataset.role = 'pause-box';
+  const pauseView: PauseView = {
+    ...newBox(pauseBox),
+    text: element('span'),
+    toggle: element('button'),
+    paused: null,
+  };
+  pauseView.toggle = boxButton(pauseView, 'Pause', 'pause', () => {
+    // What the button says now: Pause when running, Resume when paused.
+    dock.pause(pauseView.paused !== true);
+  });
+  pauseBox.append(pauseView.text, pauseView.toggle);
+  boxes.add(pauseView);
+
+  panel.append(errorLine, noticeLine, prompts, pairing, rosterBlock, activityBlock, pauseBox);
 
   const dot = element('span', 'dot');
   const count = element('span', 'count', '0');
+  const pausedTag = element('span', 'tag', 'Paused');
+  pausedTag.dataset.role = 'badge-paused';
   const badge = button('', 'toggle', () => {
     // hidden can also be 'until-found', which still means closed.
     setOpen(panel.hidden !== false);
   });
   badge.className = 'badge';
   badge.setAttribute('aria-expanded', 'false');
-  badge.append(dot, element('span', '', 'Tabdock'), count);
+  badge.append(dot, element('span', '', 'Tabdock'), count, pausedTag);
 
   const wrap = element('div', 'wrap');
   wrap.append(panel, badge);
@@ -268,18 +372,18 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const via = request.via === 'qr' ? 'QR code' : 'code';
     box.append(element('p', '', `${request.user.displayName} wants to attach via ${via}`));
     if (request.client) {
-      box.append(element('p', 'muted', `Client: ${request.client.name} ${request.client.version}`));
+      box.append(element('p', 'muted', `Client: ${clientText(request.client)}`));
     }
-    const view = newView(box, request.expiresAt);
+    const view = newPrompt(box, request.expiresAt);
     const buttons = element('div', 'buttons');
     buttons.append(
-      promptButton(view, 'Allow as driver', 'approve-driver', () => {
+      boxButton(view, 'Allow as driver', 'approve-driver', () => {
         dock.approve(request.requestId, 'driver');
       }),
-      promptButton(view, 'Allow as observer', 'approve-observer', () => {
+      boxButton(view, 'Allow as observer', 'approve-observer', () => {
         dock.approve(request.requestId, 'observer');
       }),
-      promptButton(
+      boxButton(
         view,
         'Deny',
         'deny',
@@ -297,13 +401,13 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const box = element('div', 'prompt');
     box.dataset.callId = confirm.callId;
     box.append(element('p', '', `${confirm.caller.displayName} wants to run ${confirm.tool}`));
-    const view = newView(box, confirm.expiresAt);
+    const view = newPrompt(box, confirm.expiresAt);
     const buttons = element('div', 'buttons');
     buttons.append(
-      promptButton(view, 'Allow', 'confirm-allow', () => {
+      boxButton(view, 'Allow', 'confirm-allow', () => {
         dock.confirm(confirm.callId, true);
       }),
-      promptButton(
+      boxButton(
         view,
         'Deny',
         'confirm-deny',
@@ -332,8 +436,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const live = new Set(items.map(key));
     for (const [id, view] of views) {
       if (!live.has(id)) {
-        clearTimeout(view.timer);
-        view.element.remove();
+        dropBox(view);
         views.delete(id);
       }
     }
@@ -342,22 +445,130 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       if (views.has(id)) continue;
       const view = build(item);
       views.set(id, view);
+      boxes.add(view);
       prompts.prepend(view.element);
       added = true;
     }
     return added;
   }
 
+  function rowView(userId: string): RowView {
+    const box = element('li', 'row');
+    box.dataset.userId = userId;
+    const view: RowView = {
+      ...newBox(box),
+      who: element('p', 'who'),
+      clients: element('p', 'muted'),
+      expiry: element('p', 'muted'),
+      roleSwitch: element('button'),
+      key: '',
+      role: 'observer',
+      expiresAt: null,
+    };
+    view.roleSwitch = boxButton(view, 'Make driver', 'make-driver', () => {
+      // view.role is what the button says, since both change together in updateRow.
+      dock.setRole(userId, view.role === 'driver' ? 'observer' : 'driver');
+    });
+    const buttons = element('div', 'buttons');
+    buttons.append(
+      view.roleSwitch,
+      boxButton(view, 'Revoke', 'revoke', () => {
+        dock.revoke(userId);
+      }),
+    );
+    box.append(view.who, view.clients, view.expiry, buttons);
+    return view;
+  }
+
+  function updateRow(view: RowView, attachment: AttachmentView): void {
+    view.expiresAt = attachment.expiresAt;
+    const clients = attachment.clients.map(clientText).join(', ');
+    const key = JSON.stringify([attachment.displayName, attachment.role, clients]);
+    if (key === view.key) return;
+    const isNew = view.key === '';
+    view.key = key;
+    view.role = attachment.role;
+    view.who.textContent = `${attachment.displayName} (${attachment.role})`;
+    view.clients.textContent = clients === '' ? 'No client seen yet' : `Clients: ${clients}`;
+    const promote = attachment.role !== 'driver';
+    view.roleSwitch.textContent = promote ? 'Make driver' : 'Make observer';
+    view.roleSwitch.dataset.action = promote ? 'make-driver' : 'make-observer';
+    // The role switch may now do the opposite of what the operator was reaching for.
+    if (!isNew) restartArming(view);
+  }
+
+  /** Rows are kept by user id and only reordered when the relay's order changes, like prompts. */
+  function syncRows(attachments: readonly AttachmentView[], linked: boolean): void {
+    const live = new Set(attachments.map((attachment) => attachment.userId));
+    for (const [userId, view] of rowViews) {
+      if (!live.has(userId)) {
+        dropBox(view);
+        rowViews.delete(userId);
+      }
+    }
+    const ordered = attachments.map((attachment) => {
+      let view = rowViews.get(attachment.userId);
+      if (!view) {
+        view = rowView(attachment.userId);
+        rowViews.set(attachment.userId, view);
+        boxes.add(view);
+      }
+      updateRow(view, attachment);
+      // Role changes need the relay; revoking works offline and is sent on resume.
+      view.roleSwitch.disabled = !linked;
+      return view.element;
+    });
+    const current = [...roster.children];
+    if (current.length !== ordered.length || current.some((node, i) => node !== ordered[i])) {
+      roster.replaceChildren(...ordered);
+    }
+    nobody.hidden = attachments.length > 0;
+    revokeAll.hidden = attachments.length === 0;
+  }
+
+  function updatePause(paused: boolean): void {
+    pausedTag.hidden = !paused;
+    badge.dataset.paused = String(paused);
+    if (pauseView.paused === paused) return;
+    const isNew = pauseView.paused === null;
+    pauseView.paused = paused;
+    pauseBox.classList.toggle('paused', paused);
+    pauseView.text.textContent = paused
+      ? 'Paused: every call is refused'
+      : 'Calls run as they come';
+    pauseView.toggle.textContent = paused ? 'Resume' : 'Pause';
+    pauseView.toggle.dataset.action = paused ? 'resume' : 'pause';
+    // Resume grants access again, so a switch that just flipped waits like a new box.
+    if (!isNew) restartArming(pauseView);
+  }
+
+  function entryLine(entry: ActivityEntry): HTMLElement {
+    const line = element('li');
+    line.dataset.activityId = entry.callId;
+    line.dataset.outcome = entry.outcome;
+    const via = entry.client ? ` via ${clientText(entry.client)}` : '';
+    const took = entry.durationMs === null ? '' : ` in ${entry.durationMs} ms`;
+    line.textContent = `${timeText(entry.time)} ${entry.user.displayName}${via}: ${entry.tool}, ${entry.outcome}${took}`;
+    return line;
+  }
+
+  let shownActivity: readonly ActivityEntry[] | null = null;
+
+  function renderActivity(entries: readonly ActivityEntry[]): void {
+    if (entries === shownActivity) return;
+    shownActivity = entries;
+    activity.replaceChildren(...entries.map(entryLine));
+    if (entries.length === 0) activity.append(element('li', 'muted', 'No calls yet'));
+  }
+
   /** Whether the panel has opened by itself to show the code since anyone was last attached; see render. */
   let codeShown = false;
 
   function tick(): void {
-    for (const view of requestViews.values()) {
+    for (const view of [...requestViews.values(), ...confirmViews.values()]) {
       view.countdown.textContent = `Denied automatically in ${secondsLeft(view.expiresAt)} s`;
     }
-    for (const view of confirmViews.values()) {
-      view.countdown.textContent = `Denied automatically in ${secondsLeft(view.expiresAt)} s`;
-    }
+    for (const view of rowViews.values()) view.expiry.textContent = expiryText(view.expiresAt);
     const current = dock.state.pairing;
     if (current) {
       const left = secondsLeft(current.expiresAt);
@@ -374,7 +585,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       return;
     }
     dot.className = `dot ${state.link}`;
-    badge.title = `Tabdock: ${LINK_LABELS[state.link]}`;
+    badge.title = `Tabdock: ${LINK_LABELS[state.link]}${state.paused ? ', paused' : ''}`;
     count.textContent = String(state.roster.length);
     errorLine.textContent = state.error ?? '';
     errorLine.hidden = state.error === null;
@@ -385,12 +596,9 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     code.textContent = state.pairing?.code ?? '';
     rotate.disabled = state.link !== 'linked';
 
-    roster.replaceChildren(
-      ...state.roster.map((attachment) =>
-        element('li', '', `${attachment.displayName} (${attachment.role})`),
-      ),
-    );
-    if (state.roster.length === 0) roster.append(element('li', 'muted', 'Nobody yet'));
+    syncRows(state.roster, state.link === 'linked');
+    renderActivity(state.activity);
+    updatePause(state.paused);
 
     const newRequest = syncPrompts(
       requestViews,
@@ -428,9 +636,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
    * while the operator was elsewhere must not take the first click on return.
    */
   function rearmAll(): void {
-    for (const view of [...requestViews.values(), ...confirmViews.values()]) {
-      restartArming(view);
-    }
+    for (const box of boxes) restartArming(box);
   }
   const onVisibility = (): void => {
     if (doc.visibilityState === 'visible') rearmAll();
@@ -450,9 +656,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     clearInterval(interval);
     doc.removeEventListener('visibilitychange', onVisibility);
     win?.removeEventListener('focus', rearmAll);
-    for (const view of [...requestViews.values(), ...confirmViews.values()]) {
-      clearTimeout(view.timer);
-    }
+    for (const box of boxes) clearTimeout(box.timer);
     host.remove();
   }
 
