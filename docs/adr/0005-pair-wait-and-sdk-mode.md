@@ -1,6 +1,6 @@
 # 0005: How long pair_page waits, and how the relay speaks MCP in M1
 
-Status: Proposed, 2 October 2026. Refines SPEC section 7 if accepted.
+Status: Accepted by the owner, 2 October 2026. SPEC section 7 updated.
 
 ## Context
 
