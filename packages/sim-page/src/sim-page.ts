@@ -93,8 +93,12 @@ export interface SimPage {
   readonly lastClose: { code: number; reason: string } | null;
   /** Resolves with the first state, current or later, that matches; rejects after timeoutMs (5000). */
   waitFor(predicate: (state: DockState) => boolean, timeoutMs?: number): Promise<DockState>;
-  /** A browser reload: no detach, socket closed as going away, a fresh page on the same storage. */
-  reload(): Promise<void>;
+  /**
+   * A browser reload: no detach, socket closed as going away, a fresh page on
+   * the same storage. awayMs keeps the tab gone that long before the fresh page
+   * boots, like a reload stuck behind a sleeping laptop.
+   */
+  reload(options?: { awayMs?: number }): Promise<void>;
   /** A deliberate detach: pending prompts denied, socket closed with 1000, resume token dropped. */
   close(): Promise<void>;
 }
@@ -245,11 +249,13 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
         }, timeoutMs);
       });
     },
-    async reload() {
+    async reload(reloadOptions = {}) {
       const closing = socket;
       current.core.close('unload');
       await waitClosed(closing);
       socket = null;
+      const awayMs = reloadOptions.awayMs ?? 0;
+      if (awayMs > 0) await new Promise((resolve) => setTimeout(resolve, awayMs));
       current = await boot();
     },
     async close() {

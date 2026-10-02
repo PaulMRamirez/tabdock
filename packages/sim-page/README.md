@@ -13,6 +13,7 @@ const sim = await startSimPage({
 const { pairing } = await sim.waitFor((state) => state.link === 'linked');
 // ... pair a client with pairing.code, call tools ...
 await sim.reload(); // a browser reload: same storage, so the page resumes
+await sim.reload({ awayMs: 5000 }); // the same, with the tab gone for 5 s first
 await sim.close();
 ```
 
