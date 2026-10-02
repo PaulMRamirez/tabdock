@@ -1,10 +1,12 @@
 // startSimPage: the real adapter core running in Node against a
 // FakeModelContext, linked to a relay over a `ws` client that sends an Origin
 // header the way a browser does. Relay tests drive it like a tab: an operator
-// answers prompts (scripted, or through the Dock handle), and reload() drops
-// the socket without a goodbye and boots a fresh page on the same storage.
+// answers prompts (scripted, or through the Dock handle), uses the roster
+// controls and the pause switch, and reload() drops the socket without a
+// goodbye and boots a fresh page on the same storage.
 
 import {
+  type ActivityEntry,
   createAdapterCore,
   type AdapterCore,
   type Dock,
@@ -15,7 +17,7 @@ import {
   type Timers,
   type UiPort,
 } from '@tabdock/adapter/core';
-import type { PolicyInput } from '@tabdock/protocol';
+import type { PolicyInput, Role } from '@tabdock/protocol';
 import { WebSocket } from 'ws';
 import { createDefaultTools, createSimStore, type SimStore } from './default-tools.ts';
 import {
@@ -94,6 +96,14 @@ export interface SimPage {
   readonly lastSocketError: string | null;
   /** The last close the relay sent, or null. */
   readonly lastClose: { code: number; reason: string } | null;
+  /** The current page's activity log, newest first; a reload starts a fresh one, as in a browser. */
+  readonly activity: readonly ActivityEntry[];
+  /** The operator's role switch on the current page (Dock.setRole). */
+  setRole(userId: string, role: Role): boolean;
+  /** The operator's Revoke, or Revoke all with '*' (Dock.revoke). */
+  revoke(userId: string): boolean;
+  /** The operator's pause switch (Dock.pause); it survives reload(), as the adapter stores it. */
+  pause(paused: boolean): void;
   /** Resolves with the first state, current or later, that matches; rejects after timeoutMs (5000). */
   waitFor(predicate: (state: DockState) => boolean, timeoutMs?: number): Promise<DockState>;
   /**
@@ -235,6 +245,18 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
     },
     get lastClose() {
       return lastClose;
+    },
+    get activity() {
+      return current.core.dock.state.activity;
+    },
+    setRole(userId, role) {
+      return current.core.dock.setRole(userId, role);
+    },
+    revoke(userId) {
+      return current.core.dock.revoke(userId);
+    },
+    pause(paused) {
+      current.core.dock.pause(paused);
     },
     waitFor(predicate, timeoutMs = 5000) {
       const dock = current.core.dock;

@@ -39,7 +39,9 @@ import {
 } from '@tabdock/protocol';
 import {
   isConsequential,
+  isReadOnly,
   needsHintNotice,
+  type NormalisedTool,
   normaliseTools,
   type RuntimeTool,
   type ToolSnapshot,
@@ -173,6 +175,25 @@ export interface PendingConfirm {
   readonly expiresAt: number;
 }
 
+/** How a call ended, as the page activity log shows it; 'running' until it does. */
+export type ActivityOutcome = 'running' | 'ok' | PageErrorCode;
+
+/**
+ * One call in the page activity log (S7): who asked, through which client,
+ * for which tool, and how it ended. Never the arguments or the result.
+ */
+export interface ActivityEntry {
+  readonly callId: string;
+  /** Local epoch milliseconds at which the invoke arrived. */
+  readonly time: number;
+  readonly user: User;
+  readonly client: ClientInfo | null;
+  readonly tool: string;
+  readonly outcome: ActivityOutcome;
+  /** Milliseconds from arrival to the end; null while the call runs. */
+  readonly durationMs: number | null;
+}
+
 export interface DockState {
   readonly link: LinkState;
   readonly pageId: string | null;
@@ -184,6 +205,10 @@ export interface DockState {
   readonly notice: string | null;
   /** Why the link is not working, when it is not. */
   readonly error: string | null;
+  /** While true, every new call is answered page_busy; calls already running finish. */
+  readonly paused: boolean;
+  /** The last ACTIVITY_LIMIT calls, newest first. */
+  readonly activity: readonly ActivityEntry[];
 }
 
 /** The only control handle. Each method returns false when there was nothing to act on. */
@@ -194,6 +219,16 @@ export interface Dock {
   deny(requestId: string): boolean;
   confirm(callId: string, allow: boolean): boolean;
   rotatePairing(): boolean;
+  /**
+   * The operator's role switch, for a user the roster lists. The relay may
+   * still hold a new driver at maxDrivers; the page runs calls under the
+   * lesser of this choice and the relay's roster either way.
+   */
+  setRole(userId: string, role: Role): boolean;
+  /** Ends one user's attachment, or everyone's with '*' (S8). */
+  revoke(userId: string): boolean;
+  /** Pauses or resumes calls on this page. Only false resumes, and the choice survives a reload. */
+  pause(paused: boolean): void;
   close(): void;
 }
 
@@ -221,6 +256,16 @@ const TOOLCHANGE_DEBOUNCE_MS = 25;
 /** A link that hears nothing for the relay's idle timeout plus this grace is treated as dead. */
 export const SILENCE_GRACE_MS = 5000;
 
+/** The page activity log keeps this many calls (SPEC section 8). */
+export const ACTIVITY_LIMIT = 50;
+
+/**
+ * Writes the page holds waiting at once, ADR 0009's per-page queue default.
+ * The relay sends one write at a time, so only a relay that floods the page
+ * gets here; past it, writes are answered page_busy rather than piling up.
+ */
+export const MAX_WAITING_WRITES = 32;
+
 /** Results are cut this far under the cap so the truncation marker fits under it too. */
 const MARKER_ROOM = 100;
 
@@ -232,6 +277,7 @@ const MIN_FRAME_BYTES = 4096;
 
 const RESUME_KEY_PREFIX = 'tabdock:resume:';
 const GRANTS_KEY_PREFIX = 'tabdock:grants:';
+const PAUSED_KEY_PREFIX = 'tabdock:paused:';
 const LOCK_PREFIX = 'tabdock:';
 
 const POLYFILL_HINT =
@@ -255,16 +301,44 @@ type WelcomeFrame = Extract<RelayFrame, { t: 'welcome' }>;
 type AttachRequestFrame = Extract<RelayFrame, { t: 'attach_request' }>;
 
 type Outcome = { ok: true; content: string } | { ok: false; code: PageErrorCode; message: string };
+type Refusal = Extract<Outcome, { ok: false }>;
+
+const PAUSED: Refusal = {
+  ok: false,
+  code: 'page_busy',
+  message: 'the operator paused this page, so it runs no calls for now',
+};
+
+const REVOKED_MESSAGE = 'the operator revoked this caller';
+
+/**
+ * admitting: reading the tool list to learn whether the tool writes.
+ * queued: a write waiting for the writes that arrived before it.
+ * checking: cleared to go, perhaps waiting on the operator's confirmation.
+ * running: the page's handler has started, so a pause lets it finish.
+ */
+type CallStage = 'admitting' | 'queued' | 'checking' | 'running';
 
 interface CallRecord {
   readonly frame: InvokeFrame;
+  /** Arrival order, which the write queue keeps. */
+  readonly seq: number;
   /** Local epoch milliseconds of the call's deadline. */
   readonly deadlineAt: number;
   readonly controller: AbortController;
+  /** The call's line in the activity log while it runs; settling replaces it. */
+  readonly entry: ActivityEntry;
+  stage: CallStage;
   finished: boolean;
   deadline: unknown;
   /** Set while the call waits for the operator's confirmation. */
   confirm: { readonly resolve: (allow: boolean) => void; readonly port: AbortController } | null;
+}
+
+type Checked = { ok: true; tool: NormalisedTool } | { ok: false; refusal: Refusal };
+
+function refuse(code: PageErrorCode, message: string): Checked {
+  return { ok: false, refusal: { ok: false, code, message } };
 }
 
 interface RequestRecord {
@@ -417,6 +491,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   const random = options.random ?? Math.random;
   const resumeKey = `${RESUME_KEY_PREFIX}${options.relayUrl}`;
   const grantsKey = `${GRANTS_KEY_PREFIX}${options.relayUrl}`;
+  const pausedKey = `${PAUSED_KEY_PREFIX}${options.relayUrl}`;
 
   let state: DockState = Object.freeze({
     link: 'idle',
@@ -427,6 +502,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     pendingConfirms: [],
     notice: null,
     error: null,
+    paused: readPaused(),
+    activity: [],
   });
   const listeners = new Set<(state: DockState) => void>();
 
@@ -458,6 +535,22 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   const grants = new Map<string, Role>();
   /** The page session the grants belong to; they mean nothing on another. */
   let grantsPage: string | null = null;
+  /**
+   * Users the operator revoked whom the relay's roster still lists, because
+   * the revoke has not reached it yet (or was sent while the link was down).
+   * They get nothing, even under autoApprove 'observer', until the roster
+   * drops them; a resumed link sends their revoke again.
+   */
+  const revoked = new Set<string>();
+  /**
+   * Writes wait here in arrival order and run one at a time, whatever a relay
+   * sends (SPEC section 5): two writes from one relay, or a relay that lost
+   * its own queue, must not interleave on the page. Read-only calls skip it.
+   */
+  const queue: CallRecord[] = [];
+  /** The write now holding the page, from its last check until it settles. */
+  let writing: CallRecord | null = null;
+  let nextSeq = 0;
 
   function setState(patch: Partial<DockState>): void {
     state = Object.freeze({ ...state, ...patch });
@@ -544,6 +637,28 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   loadGrants();
 
   /**
+   * The pause sits beside the grants so a reload does not quietly resume a
+   * paused page. It is not tied to a page session: only the operator lifts
+   * it. Any stored value reads as paused, so a damaged entry fails safe.
+   */
+  function readPaused(): boolean {
+    try {
+      return (options.storage?.getItem(pausedKey) ?? null) !== null;
+    } catch {
+      return false;
+    }
+  }
+
+  function writePaused(paused: boolean): void {
+    try {
+      if (paused) options.storage?.setItem(pausedKey, 'true');
+      else options.storage?.removeItem(pausedKey);
+    } catch (error) {
+      log.warn(`could not store the pause: ${describe(error)}`);
+    }
+  }
+
+  /**
    * S5, second check: the least privileged of the operator's grant, the
    * relay's roster and the role the invoke claims. null means nobody approved
    * this caller on this page, or the relay no longer lists them as attached:
@@ -553,6 +668,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    * a caller it lists counts as an observer.
    */
   function callerRole(caller: Caller): Role | null {
+    if (revoked.has(caller.userId)) return null;
     const listed = state.roster.find((attachment) => attachment.userId === caller.userId)?.role;
     if (listed === undefined) return null;
     const granted =
@@ -741,10 +857,13 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     // resumed one keeps the grants of users the relay still lists; the relay
     // drops attach requests when a link ends, so no approval is in flight here.
     const listed = new Set(frame.roster.map((attachment) => attachment.userId));
+    const samePage = frame.resumed && grantsPage === frame.pageId;
     for (const userId of [...grants.keys()]) {
-      if (!frame.resumed || grantsPage !== frame.pageId || !listed.has(userId)) {
-        grants.delete(userId);
-      }
+      if (!samePage || !listed.has(userId)) grants.delete(userId);
+    }
+    // A revoke the relay never applied is sent again below; on a new session it has nothing to end.
+    for (const userId of [...revoked]) {
+      if (!samePage || !listed.has(userId)) revoked.delete(userId);
     }
     grantsPage = frame.pageId;
     saveGrants();
@@ -764,6 +883,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       error: null,
     });
     log.info(frame.resumed ? `resumed page ${frame.pageId}` : `linked as page ${frame.pageId}`);
+    for (const userId of revoked) send({ t: 'revoke', userId });
     takeLock(frame.pageId);
     lastToolsKey = null;
     void syncTools();
@@ -781,6 +901,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     pruneGrants(
       state.roster.map((attachment) => attachment.userId).filter((userId) => !listed.has(userId)),
     );
+    // The relay has applied a revoke once it stops listing the user.
+    for (const userId of [...revoked]) if (!listed.has(userId)) revoked.delete(userId);
     setState({ roster: attachments });
   }
 
@@ -976,19 +1098,38 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       log.warn(`ignored a repeated invoke for call ${frame.callId}`);
       return;
     }
+    const now = clock();
+    const { userId, displayName, client } = frame.caller;
+    const entry: ActivityEntry = Object.freeze({
+      callId: frame.callId,
+      time: now,
+      user: Object.freeze({ userId, displayName }),
+      client: client === null ? null : Object.freeze({ ...client }),
+      tool: frame.tool,
+      outcome: 'running',
+      durationMs: null,
+    });
     const call: CallRecord = {
       frame,
-      deadlineAt: clock() + frame.deadlineMs,
+      seq: nextSeq++,
+      deadlineAt: now + frame.deadlineMs,
       controller: new AbortController(),
+      entry,
+      stage: 'admitting',
       finished: false,
       deadline: null,
       confirm: null,
     };
     calls.set(frame.callId, call);
+    setState({ activity: [entry, ...state.activity].slice(0, ACTIVITY_LIMIT) });
     call.deadline = timers.setTimeout(() => {
       onDeadline(call);
     }, frame.deadlineMs);
-    void runCall(call);
+    if (state.paused) {
+      finish(call, PAUSED);
+      return;
+    }
+    void admit(call);
   }
 
   function onDeadline(call: CallRecord): void {
@@ -1019,6 +1160,29 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     log.info(`call ${callId} ${tool} by ${caller.displayName} (${caller.role}): ${outcome}`);
   }
 
+  /** Replaces the call's running line in the activity log with how it ended. */
+  function settleEntry(call: CallRecord, outcome: ActivityOutcome): void {
+    const index = state.activity.indexOf(call.entry);
+    // Gone when fifty newer calls have pushed it out.
+    if (index === -1) return;
+    const activity = [...state.activity];
+    activity[index] = Object.freeze({
+      ...call.entry,
+      outcome,
+      durationMs: Math.max(0, clock() - call.entry.time),
+    });
+    setState({ activity });
+  }
+
+  /** Takes a settled call off the books and lets the next write have the page. */
+  function release(call: CallRecord): void {
+    calls.delete(call.frame.callId);
+    const queued = queue.indexOf(call);
+    if (queued !== -1) queue.splice(queued, 1);
+    if (writing === call) writing = null;
+    pump();
+  }
+
   /**
    * Ends a call on this side without a result frame: the relay answers its
    * caller from how the link ended (page_asleep, or page_gone after
@@ -1028,17 +1192,18 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     if (call.finished) return;
     call.finished = true;
     timers.clearTimeout(call.deadline);
-    calls.delete(call.frame.callId);
     call.controller.abort();
     settleConfirmPromise(call, false);
     logCall(call, why);
+    // The log's outcomes are the page's own, and from here the call was cancelled.
+    settleEntry(call, 'cancelled');
+    release(call);
   }
 
   function finish(call: CallRecord, outcome: Outcome): void {
     if (call.finished) return;
     call.finished = true;
     timers.clearTimeout(call.deadline);
-    calls.delete(call.frame.callId);
     settleConfirmPromise(call, false);
     const { callId } = call.frame;
     logCall(call, outcome.ok ? 'ok' : outcome.code);
@@ -1052,6 +1217,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         error: { code: outcome.code, message: outcome.message.slice(0, MAX_ERROR_CHARS) },
       });
     }
+    settleEntry(call, outcome.ok ? 'ok' : outcome.code);
+    release(call);
   }
 
   /** Cuts the text to the result limit, then further if JSON escaping or UTF-8 still overflow the frame. */
@@ -1066,42 +1233,101 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     }
   }
 
-  // A function, not an inline test: a cancel or deadline can finish the call while runCall awaits.
+  // A function, not an inline test: a cancel or deadline can finish the call while an await is pending.
   function isDone(call: CallRecord): boolean {
     return call.finished;
   }
 
-  async function runCall(call: CallRecord): Promise<void> {
-    const { frame } = call;
-    const snapshot = await readTools();
-    if (isDone(call)) return;
-    // S5, second check, after the await so the roster is the newest one.
+  /**
+   * S5, second check: the caller's role on this page, then the tool. It runs
+   * when a call arrives and again when a write reaches the front of the
+   * queue, since the roster, the grants and the tools may have changed while
+   * it waited.
+   */
+  function check(frame: InvokeFrame, snapshot: ToolSnapshot | null): Checked {
     const role = callerRole(frame.caller);
     if (role === null) {
-      finish(call, {
-        ok: false,
-        code: 'role_denied',
-        message: 'the operator has not approved this caller on this page',
-      });
-      return;
+      return refuse('role_denied', 'the operator has not approved this caller on this page');
     }
-    if (!snapshot) {
-      finish(call, { ok: false, code: 'tool_error', message: 'the page could not list its tools' });
-      return;
-    }
+    if (!snapshot) return refuse('tool_error', 'the page could not list its tools');
     const tool = snapshot.byName.get(frame.tool);
-    if (!tool) {
-      finish(call, { ok: false, code: 'tool_not_found', message: `no tool named ${frame.tool}` });
+    if (!tool) return refuse('tool_not_found', `no tool named ${frame.tool}`);
+    if (role === 'observer' && !isReadOnly(tool.page)) {
+      return refuse('role_denied', 'observers may only run read-only tools');
+    }
+    return { ok: true, tool };
+  }
+
+  /**
+   * Reads the tools to learn whether the call writes. A refusal goes back at
+   * once, so nobody waits in the queue only to be turned away; a read runs
+   * now, beside whatever else is running; a write joins the queue.
+   */
+  async function admit(call: CallRecord): Promise<void> {
+    const snapshot = await readTools();
+    if (isDone(call)) return;
+    const checked = check(call.frame, snapshot);
+    if (!checked.ok) {
+      finish(call, checked.refusal);
       return;
     }
-    if (role === 'observer' && tool.page.annotations?.readOnlyHint !== true) {
+    if (snapshot && isReadOnly(checked.tool.page)) {
+      call.stage = 'checking';
+      // This call may be the earlier arrival a queued write was waiting on.
+      pump();
+      await proceed(call, checked.tool, snapshot);
+      return;
+    }
+    if (queue.length >= MAX_WAITING_WRITES) {
       finish(call, {
         ok: false,
-        code: 'role_denied',
-        message: 'observers may only run read-only tools',
+        code: 'page_busy',
+        message: 'too many writes are already waiting on this page',
       });
       return;
     }
+    call.stage = 'queued';
+    const later = queue.findIndex((other) => other.seq > call.seq);
+    if (later === -1) queue.push(call);
+    else queue.splice(later, 0, call);
+    pump();
+  }
+
+  /** Gives the page to the oldest queued write once nothing else is writing. */
+  function pump(): void {
+    // A pause answers every queued write itself, so none should start meanwhile.
+    if (writing !== null || state.paused || !isLinked()) return;
+    const next = queue[0];
+    if (!next) return;
+    // An earlier arrival still reading the tool list may turn out to be a write that goes first.
+    for (const call of calls.values()) {
+      if (call.stage === 'admitting' && call.seq < next.seq) return;
+    }
+    queue.shift();
+    writing = next;
+    next.stage = 'checking';
+    void runWrite(next);
+  }
+
+  async function runWrite(call: CallRecord): Promise<void> {
+    const snapshot = await readTools();
+    if (isDone(call)) return;
+    const checked = check(call.frame, snapshot);
+    if (!checked.ok) {
+      finish(call, checked.refusal);
+      return;
+    }
+    // check() refuses a missing snapshot, so this only narrows the type.
+    if (snapshot) await proceed(call, checked.tool, snapshot);
+  }
+
+  /** Consequential policy and the operator's confirmation, then the handler. */
+  async function proceed(
+    call: CallRecord,
+    tool: NormalisedTool,
+    snapshot: ToolSnapshot,
+  ): Promise<void> {
+    const { frame } = call;
     if (isConsequential(tool.page, snapshot.hintSupport, policy, pageListedTools)) {
       if (policy.consequential === 'deny') {
         finish(call, {
@@ -1122,8 +1348,15 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
           });
           return;
         }
+        // The operator may have lowered this caller's role while the prompt was up.
+        const again = check(frame, snapshot);
+        if (!again.ok) {
+          finish(call, again.refusal);
+          return;
+        }
       }
     }
+    call.stage = 'running';
     let value: unknown;
     try {
       value = await execute(tool.runtime, frame.arguments, call.controller.signal);
@@ -1277,6 +1510,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     // since the relay keeps that user attached; withdrawing access is revoke's job.
     const { userId } = record.request.user;
     const listed = state.roster.some((attachment) => attachment.userId === userId);
+    // An approval after a revoke lets the user back in; the relay applies the two in that order too.
+    if (allow) revoked.delete(userId);
     if (allow && role !== undefined && (!listed || !grants.has(userId))) setGrant(userId, role);
     const who = record.request.user.displayName;
     log.info(allow ? `allowed ${who} as ${String(role)}` : `denied ${who}`);
@@ -1286,6 +1521,75 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       allow,
       ...(allow && role !== undefined ? { role } : {}),
     });
+  }
+
+  // Operator controls
+
+  /**
+   * The operator's own decision, so it becomes the grant before the frame
+   * goes out: a demotion holds on the page at once, even if the relay is slow
+   * to apply it or never does, and a promotion takes effect once the relay's
+   * roster agrees (it may refuse a driver over maxDrivers).
+   */
+  function setRole(userId: string, role: Role): boolean {
+    if (!RoleSchema.safeParse(role).success) {
+      log.warn('ignored a role change without a valid role');
+      return false;
+    }
+    const attachment = state.roster.find((entry) => entry.userId === userId);
+    if (!attachment || revoked.has(userId) || !isLinked()) return false;
+    setGrant(userId, role);
+    log.info(`set ${attachment.displayName} to ${role}`);
+    return send({ t: 'set_role', userId, role });
+  }
+
+  /**
+   * S8 on the page's side: the grant goes at once (stored copy too), so no
+   * call of theirs runs here again whatever the relay does next. The revoke
+   * frame goes first, so the relay answers their calls with not_attached
+   * before any result below reaches it; their pending requests and prompts
+   * are denied, and their calls in flight are cancelled.
+   */
+  function revoke(target: string): boolean {
+    const everyone = target === '*';
+    if (closed || (!everyone && !IdSchema.safeParse(target).success)) return false;
+    const hits = (userId: string): boolean => everyone || userId === target;
+    const listed = state.roster.map((attachment) => attachment.userId).filter(hits);
+    const granted = [...grants.keys()].filter(hits);
+    const asking = [...requests.values()].filter((record) => hits(record.request.user.userId));
+    const running = [...calls.values()].filter((call) => hits(call.frame.caller.userId));
+    if (listed.length + granted.length + asking.length + running.length === 0) return false;
+    for (const userId of listed) revoked.add(userId);
+    for (const userId of granted) grants.delete(userId);
+    saveGrants();
+    log.info(everyone ? 'the operator revoked everyone' : `the operator revoked ${target}`);
+    // While the link is down, the next welcome sends it for anyone still listed.
+    if (isLinked()) send({ t: 'revoke', userId: target });
+    for (const record of asking) decide(record.request.requestId, false);
+    for (const call of running) {
+      if (call.confirm) {
+        finish(call, { ok: false, code: 'denied_by_operator', message: REVOKED_MESSAGE });
+      } else {
+        call.controller.abort();
+        finish(call, { ok: false, code: 'cancelled', message: REVOKED_MESSAGE });
+      }
+    }
+    return true;
+  }
+
+  /** Calls already in the page's hands finish; every other call, now or later, is answered page_busy. */
+  function pause(paused: boolean): void {
+    writePaused(paused);
+    if (paused === state.paused) return;
+    setState({ paused });
+    log.info(paused ? 'the operator paused calls' : 'the operator resumed calls');
+    if (!paused) {
+      pump();
+      return;
+    }
+    for (const call of [...calls.values()]) {
+      if (call.stage !== 'running') finish(call, PAUSED);
+    }
   }
 
   // Public surface
@@ -1354,6 +1658,12 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     // Strictly true: a script passing the string 'false' must not allow a consequential call.
     confirm: (callId: string, allow: boolean) => confirmCall(callId, (allow as unknown) === true),
     rotatePairing: () => isLinked() && send({ t: 'rotate_pairing' }),
+    setRole: (userId: string, role: Role) => setRole(userId, role),
+    revoke: (userId: string) => revoke(userId),
+    // Only false resumes: resuming lets calls run again, so a script's 'false' or 0 keeps the pause.
+    pause: (paused: boolean) => {
+      pause((paused as unknown) !== false);
+    },
     close: () => {
       close('detach');
     },

@@ -14,6 +14,8 @@ import { ADAPTER_VERSION } from './version.ts';
 import { mountWidget } from './widget.ts';
 
 export type {
+  ActivityEntry,
+  ActivityOutcome,
   AttachAnswer,
   Dock,
   DockState,

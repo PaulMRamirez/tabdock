@@ -172,6 +172,15 @@ export function normaliseTools(list: readonly RuntimeTool[], ownWindow: unknown)
 }
 
 /**
+ * Only the page's own readOnlyHint makes a tool read-only. Everything else
+ * counts as a write: observers may not run it (S5), and writes run one at a
+ * time (SPEC section 5).
+ */
+export function isReadOnly(tool: PageTool): boolean {
+  return tool.annotations?.readOnlyHint === true;
+}
+
+/**
  * ADR 0002 option C. A tool is consequential when its hint or the page's list
  * says so. When the runtime evidently drops the hint and the page gave no list,
  * every tool that is not read-only counts, so S6 fails safe.
@@ -184,7 +193,7 @@ export function isConsequential(
 ): boolean {
   if (tool.annotations?.consequentialHint === true) return true;
   if (policy.consequentialTools.includes(tool.name)) return true;
-  return hintSupport === 'missing' && !pageListedTools && tool.annotations?.readOnlyHint !== true;
+  return hintSupport === 'missing' && !pageListedTools && !isReadOnly(tool);
 }
 
 /** True when the hint fallback is what decides, so the operator should be told how to fix it. */

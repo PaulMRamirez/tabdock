@@ -360,3 +360,74 @@ describe('startSimPage', () => {
     }
   });
 });
+
+describe("the sim page's operator controls", () => {
+  it('records calls in the activity log and sends set_role and revoke', async () => {
+    const { sim, connection } = await linked();
+    await approveAlice(sim, connection);
+    send(connection, {
+      t: 'invoke',
+      callId: 'c1',
+      tool: 'get_value',
+      arguments: {},
+      caller: { ...alice, client: { name: 'claude-code', version: '2.1.287' } },
+      deadlineMs: 5000,
+    });
+    expect(await frameOf(connection, 'result')).toMatchObject({ callId: 'c1', ok: true });
+    expect(sim.activity).toMatchObject([
+      {
+        callId: 'c1',
+        user: { userId: 'alice', displayName: 'Alice' },
+        client: { name: 'claude-code', version: '2.1.287' },
+        tool: 'get_value',
+        outcome: 'ok',
+      },
+    ]);
+
+    expect(sim.setRole('alice', 'observer')).toBe(true);
+    expect(await frameOf(connection, 'set_role')).toEqual({
+      t: 'set_role',
+      userId: 'alice',
+      role: 'observer',
+    });
+    expect(sim.revoke('alice')).toBe(true);
+    expect(await frameOf(connection, 'revoke')).toEqual({ t: 'revoke', userId: 'alice' });
+  });
+
+  it('pauses with page_busy and stays paused across a reload', async () => {
+    const { relay, sim, connection } = await linked();
+    await approveAlice(sim, connection);
+    sim.pause(true);
+    send(connection, {
+      t: 'invoke',
+      callId: 'c1',
+      tool: 'get_value',
+      arguments: {},
+      caller: alice,
+      deadlineMs: 5000,
+    });
+    expect(await frameOf(connection, 'result')).toMatchObject({
+      callId: 'c1',
+      ok: false,
+      error: { code: 'page_busy' },
+    });
+
+    await sim.reload();
+    const second = await relay.connection(1);
+    await frameOf(second, 'hello');
+    send(second, welcome('token-2', true));
+    await sim.waitFor((state) => state.link === 'linked');
+    expect(sim.state.paused).toBe(true);
+    send(second, {
+      t: 'invoke',
+      callId: 'c2',
+      tool: 'get_value',
+      arguments: {},
+      caller: alice,
+      deadlineMs: 5000,
+    });
+    expect(await frameOf(second, 'result')).toMatchObject({ error: { code: 'page_busy' } });
+    sim.pause(false);
+    expect(sim.state.paused).toBe(false);
+  });
+});

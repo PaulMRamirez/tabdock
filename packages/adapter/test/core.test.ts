@@ -825,8 +825,13 @@ describe('roles and consequential tools', () => {
     socket.deliver(invoke('wipe', { callId: 'call-2' }));
     socket.deliver(invoke('get_value', { callId: 'call-3' }));
     await flush();
-    expect(h.dock.state.pendingConfirms.map((item) => item.tool)).toEqual(['set_value', 'wipe']);
+    // Both writes are consequential; the second waits its turn behind the first's prompt (M2).
+    expect(h.dock.state.pendingConfirms.map((item) => item.tool)).toEqual(['set_value']);
     expect(results(socket).map((frame) => frame.callId)).toEqual(['call-3']);
+    expect(h.dock.confirm('call-1', true)).toBe(true);
+    await flush();
+    expect(h.dock.state.pendingConfirms.map((item) => item.tool)).toEqual(['wipe']);
+    expect(results(socket).map((frame) => frame.callId)).toEqual(['call-3', 'call-1']);
   });
 
   describe('ADR 0002 option C, where the runtime drops consequentialHint', () => {
