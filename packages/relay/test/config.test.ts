@@ -1,0 +1,297 @@
+import { createServer, type IncomingMessage } from 'node:http';
+import { DEFAULT_CALL_DEADLINE_MS } from '@tabdock/protocol';
+import { describe, expect, it } from 'vitest';
+import { isLoopbackHost, resolveConfig } from '../src/config.ts';
+import {
+  createDevTokenAuth,
+  createRelay,
+  DEFAULT_CLI_PORT,
+  loadConfigFromEnv,
+  MIN_DEV_TOKEN_LENGTH,
+  parseDevTokens,
+} from '../src/index.ts';
+
+const TOKEN = 'k'.repeat(MIN_DEV_TOKEN_LENGTH);
+const auth = createDevTokenAuth([{ userId: 'alice', displayName: 'Alice', token: TOKEN }]);
+const quiet = (): void => {
+  // Swallow log lines.
+};
+
+/** Some sandboxes have no IPv6 loopback at all. */
+const hasIpv6Loopback = await new Promise<boolean>((resolve) => {
+  const probe = createServer();
+  probe.once('error', () => {
+    resolve(false);
+  });
+  probe.listen(0, '::1', () => {
+    probe.close(() => {
+      resolve(true);
+    });
+  });
+});
+
+function requestWith(authorization?: string): IncomingMessage {
+  return {
+    headers: authorization === undefined ? {} : { authorization },
+  } as unknown as IncomingMessage;
+}
+
+describe('host binding (S12)', () => {
+  it.each(['0.0.0.0', '::', '192.168.1.20', '10.0.0.1', '127.0.0.2', 'relay.example', ''])(
+    'refuses %j and says TLS arrives in M4',
+    (host) => {
+      expect(() => resolveConfig({ auth, host })).toThrow(/loopback.*TLS arrives in M4/);
+    },
+  );
+
+  it.each(['127.0.0.1', 'localhost', '::1', '[::1]', 'LOCALHOST'])('accepts %s', (host) => {
+    expect(isLoopbackHost(host)).toBe(true);
+    expect(resolveConfig({ auth, host }).host).toBe(host);
+  });
+
+  it('refuses before listening, and defaults to 127.0.0.1 on a free port', async () => {
+    await expect(createRelay({ auth, host: '0.0.0.0', logSink: quiet })).rejects.toThrow(/M4/);
+    const relay = await createRelay({ auth, logSink: quiet });
+    try {
+      expect(relay.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+      expect(relay.pageUrl).toBe(`${relay.url.replace('http:', 'ws:')}/page`);
+      expect(relay.mcpUrl).toBe(`${relay.url}/mcp`);
+      const health = await fetch(`${relay.url}/healthz`);
+      expect(health.status).toBe(200);
+      expect(await health.text()).toBe('ok');
+    } finally {
+      await relay.close();
+    }
+  });
+
+  it('rejects cleanly when the port is taken', async () => {
+    const first = await createRelay({ auth, logSink: quiet });
+    try {
+      const port = Number(new URL(first.url).port);
+      await expect(createRelay({ auth, port, logSink: quiet })).rejects.toThrow(/EADDRINUSE/);
+    } finally {
+      await first.close();
+    }
+  });
+
+  it.skipIf(!hasIpv6Loopback)('binds IPv6 loopback with a bracketed URL', async () => {
+    const relay = await createRelay({ auth, host: '::1', logSink: quiet });
+    try {
+      expect(relay.url).toMatch(/^http:\/\/\[::1\]:\d+$/);
+    } finally {
+      await relay.close();
+    }
+  });
+});
+
+describe('origin policy (S1, S2)', () => {
+  it('production refuses to start without an explicit, non-empty list', () => {
+    expect(() => resolveConfig({ auth, env: 'production' })).toThrow(/allowedOrigins/);
+    expect(() => resolveConfig({ auth, env: 'production', allowedOrigins: [] })).toThrow(/empty/);
+    expect(
+      resolveConfig({ auth, env: 'production', allowedOrigins: ['https://app.example'] }).env,
+    ).toBe('production');
+  });
+
+  it('allowMissingOrigin is development only', () => {
+    expect(() =>
+      resolveConfig({
+        auth,
+        env: 'production',
+        allowedOrigins: ['https://app.example'],
+        allowMissingOrigin: true,
+      }),
+    ).toThrow(/development flag/);
+    expect(resolveConfig({ auth, allowMissingOrigin: true }).allowMissingOrigin).toBe(true);
+    expect(resolveConfig({ auth }).allowMissingOrigin).toBe(false);
+  });
+
+  it('dev default allows only http and https on localhost, 127.0.0.1 and [::1], at any port', () => {
+    const { isOriginAllowed } = resolveConfig({ auth });
+    for (const origin of [
+      'http://localhost:5173',
+      'https://localhost',
+      'http://127.0.0.1:1',
+      'https://127.0.0.1:8443',
+      'http://[::1]:3000',
+    ]) {
+      expect(isOriginAllowed(origin), origin).toBe(true);
+    }
+    for (const origin of [
+      'https://evil.example',
+      'http://localhost.evil.example',
+      'http://127.0.0.2:5173',
+      'file://',
+      'null',
+      'chrome-extension://abc',
+      'http://localhost:5173/path',
+      'HTTP://LOCALHOST:5173',
+      '',
+    ]) {
+      expect(isOriginAllowed(origin), origin).toBe(false);
+    }
+  });
+
+  it('an explicit list replaces the dev default and must hold real origins', () => {
+    const { isOriginAllowed } = resolveConfig({ auth, allowedOrigins: ['https://app.example'] });
+    expect(isOriginAllowed('https://app.example')).toBe(true);
+    expect(isOriginAllowed('http://localhost:5173')).toBe(false);
+    expect(() => resolveConfig({ auth, allowedOrigins: ['app.example'] })).toThrow(/not an origin/);
+    expect(() => resolveConfig({ auth, allowedOrigins: ['https://app.example/x'] })).toThrow(
+      /not an origin/,
+    );
+  });
+
+  it('rejects bad timings and rate limits', () => {
+    expect(() => resolveConfig({ auth, timings: { pairWaitMs: 0 } })).toThrow(/pairWaitMs/);
+    expect(() => resolveConfig({ auth, rateLimits: { pairAttemptsPerUser: 1.5 } })).toThrow(
+      /pairAttemptsPerUser/,
+    );
+    expect(resolveConfig({ auth, timings: { pairWaitMs: 1234 } }).timings.pairWaitMs).toBe(1234);
+  });
+
+  it("waits a 2 s grace past the page's call deadline by default", () => {
+    const { timings } = resolveConfig({ auth });
+    expect(timings.callDeadlineMs).toBe(DEFAULT_CALL_DEADLINE_MS);
+    expect(timings.callDeadlineGraceMs).toBe(2000);
+    expect(() => resolveConfig({ auth, timings: { callDeadlineGraceMs: -1 } })).toThrow(
+      /callDeadlineGraceMs/,
+    );
+  });
+});
+
+describe('loadConfigFromEnv', () => {
+  const tokens = `alice=${TOKEN},bob=${'b'.repeat(30)}`;
+
+  it('reads every variable, with port 8787 by default', () => {
+    const options = loadConfigFromEnv({ TABDOCK_DEV_TOKENS: tokens });
+    expect(options.port).toBe(DEFAULT_CLI_PORT);
+    expect(options.host).toBeUndefined();
+    expect(options.env).toBe('development');
+    expect(options.allowedOrigins).toBeUndefined();
+    expect(options.allowMissingOrigin).toBe(false);
+    expect(options.auth.name).toBe('dev-token');
+
+    const full = loadConfigFromEnv({
+      TABDOCK_DEV_TOKENS: tokens,
+      TABDOCK_HOST: '::1',
+      TABDOCK_PORT: '0',
+      TABDOCK_ENV: 'production',
+      TABDOCK_ALLOWED_ORIGINS: ' https://a.example , https://b.example ,',
+      TABDOCK_DEV_ALLOW_NO_ORIGIN: 'true',
+    });
+    expect(full).toMatchObject({
+      host: '::1',
+      port: 0,
+      env: 'production',
+      allowedOrigins: ['https://a.example', 'https://b.example'],
+      allowMissingOrigin: true,
+    });
+  });
+
+  it('names the bad variable and never echoes a token', () => {
+    expect(() => loadConfigFromEnv({})).toThrow(/TABDOCK_DEV_TOKENS/);
+    expect(() => loadConfigFromEnv({ TABDOCK_DEV_TOKENS: tokens, TABDOCK_PORT: 'x' })).toThrow(
+      /TABDOCK_PORT/,
+    );
+    expect(() => loadConfigFromEnv({ TABDOCK_DEV_TOKENS: tokens, TABDOCK_PORT: '70000' })).toThrow(
+      /TABDOCK_PORT/,
+    );
+    expect(() => loadConfigFromEnv({ TABDOCK_DEV_TOKENS: tokens, TABDOCK_ENV: 'prod' })).toThrow(
+      /TABDOCK_ENV/,
+    );
+    expect(() =>
+      loadConfigFromEnv({ TABDOCK_DEV_TOKENS: tokens, TABDOCK_DEV_ALLOW_NO_ORIGIN: 'yes' }),
+    ).toThrow(/TABDOCK_DEV_ALLOW_NO_ORIGIN/);
+    const short = 'short-secret-value';
+    let message = '';
+    try {
+      loadConfigFromEnv({ TABDOCK_DEV_TOKENS: `alice=${short}` });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toMatch(/alice.*shorter than 24/);
+    expect(message).not.toContain(short);
+  });
+
+  it('production from env still needs origins, and the host check still applies', async () => {
+    const options = loadConfigFromEnv({ TABDOCK_DEV_TOKENS: tokens, TABDOCK_ENV: 'production' });
+    await expect(createRelay({ ...options, logSink: quiet })).rejects.toThrow(/allowedOrigins/);
+    const open = loadConfigFromEnv({ TABDOCK_DEV_TOKENS: tokens, TABDOCK_HOST: '0.0.0.0' });
+    await expect(createRelay({ ...open, logSink: quiet })).rejects.toThrow(/M4/);
+  });
+});
+
+describe('parseDevTokens', () => {
+  it('parses user=token pairs, splitting on the first = only', () => {
+    expect(parseDevTokens(' alice=abc== , bob=x=y ,')).toEqual([
+      { userId: 'alice', displayName: 'alice', token: 'abc==' },
+      { userId: 'bob', displayName: 'bob', token: 'x=y' },
+    ]);
+  });
+
+  it.each(['', ',', 'alice', 'alice=', '=token', 'al ice=token', 'alice=a,bob'])(
+    'refuses %j without echoing it',
+    (value) => {
+      let message = '';
+      try {
+        parseDevTokens(value);
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toMatch(/TABDOCK_DEV_TOKENS/);
+      if (value.includes('token')) expect(message).not.toContain('token=');
+    },
+  );
+});
+
+describe('dev-token auth', () => {
+  it('refuses short, duplicate and shared tokens at construction', () => {
+    expect(() =>
+      createDevTokenAuth([{ userId: 'alice', displayName: 'Alice', token: 'x'.repeat(23) }]),
+    ).toThrow(/shorter than 24/);
+    expect(() =>
+      createDevTokenAuth([
+        { userId: 'alice', displayName: 'Alice', token: TOKEN },
+        { userId: 'alice', displayName: 'Alice again', token: `${TOKEN}2` },
+      ]),
+    ).toThrow(/listed twice/);
+    expect(() =>
+      createDevTokenAuth([
+        { userId: 'alice', displayName: 'Alice', token: TOKEN },
+        { userId: 'bob', displayName: 'Bob', token: TOKEN },
+      ]),
+    ).toThrow(/share a token/);
+    expect(() =>
+      createDevTokenAuth([{ userId: 'alice', displayName: 'Alice', token: `${TOKEN} x` }]),
+    ).toThrow(/printable/);
+    expect(() => createDevTokenAuth([])).toThrow(/at least one/);
+  });
+
+  it('reads Authorization: Bearer <token> and nothing else', async () => {
+    const two = createDevTokenAuth([
+      { userId: 'alice', displayName: 'Alice', token: TOKEN },
+      { userId: 'bob', displayName: 'Bob', token: 'b'.repeat(40) },
+    ]);
+    expect(await two.authenticate(requestWith(`Bearer ${TOKEN}`))).toEqual({
+      userId: 'alice',
+      displayName: 'Alice',
+    });
+    expect(await two.authenticate(requestWith(`bearer ${'b'.repeat(40)}`))).toEqual({
+      userId: 'bob',
+      displayName: 'Bob',
+    });
+    for (const header of [
+      undefined,
+      '',
+      TOKEN,
+      `Basic ${TOKEN}`,
+      `Bearer ${TOKEN}x`,
+      `Bearer ${TOKEN.slice(1)}`,
+      `Bearer ${TOKEN} extra`,
+      `Bearer ${'k'.repeat(5000)}`,
+    ]) {
+      expect(await two.authenticate(requestWith(header)), String(header)).toBeNull();
+    }
+  });
+});

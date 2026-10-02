@@ -67,11 +67,11 @@ The demo page should make state visible: a canvas board with items and a viewpor
 | PageSession | `pageId`, `origin`, `title`, `url`, `tools`, `state` (awake, asleep, gone), `resumeToken` | `origin` is read from the WebSocket `Origin` header, never from page-supplied text |
 | Attachment | `pageId`, `userId`, `role`, `grantedAt`, `lastUsedAt`, `expiresAt` | Created only by an operator approval |
 | PairingTicket | `code`, `nonce`, `pageId`, `expiresAt` | Single use, 120 s life, rotates after use |
-| AttachRequest | `requestId`, `pageId`, `userId`, `via` (code or qr), `expiresAt` | 60 s to approve, default deny |
+| AttachRequest | `requestId`, `pageId`, `userId`, `via` (code or qr), `expiresAt` | 60 s to approve, default deny. At most one pending per user per page; a second `pair_page` from that user waits on it (ADR 0007) |
 
-Trust rule: no attachment exists without an approval made on the page, unless the page set `autoApprove: 'observer'`.
+Trust rule: no attachment exists without an approval made on the page, unless the page set `autoApprove: 'observer'`. The first approval sets a user's role; later approvals and denials for an attached user change nothing, because role changes and withdrawals go through `set_role` and `revoke`. The adapter keeps its own record of these grants and runs a call only under the least privileged of that record, the relay's roster and the role the invoke claims; a user missing from the roster has no role (ADR 0007).
 
-Roles: an observer may call only tools whose `readOnlyHint` is true. A driver may call every tool. Consequential tools follow page policy: `confirm` (default, an on-page prompt per call), `allow`, or `deny`. A tool is consequential when its `consequentialHint` is true or the page names it in `policy.consequentialTools`; when the runtime cannot report the hint and the page names none, every tool that is not read-only counts as consequential (ADR 0002). `maxDrivers` defaults to 1 and counts users, so one person's phone and laptop both drive. Mutating calls run one at a time per page in arrival order; read-only calls run concurrently.
+Roles: an observer may call only tools whose `readOnlyHint` is true. A driver may call every tool. Consequential tools follow page policy: `confirm` (default, an on-page prompt per call), `allow`, or `deny`. A tool is consequential when its `consequentialHint` is true or the page names it in `policy.consequentialTools`; when the runtime cannot report the hint and the page names none, every tool that is not read-only counts as consequential (ADR 0002). A page whose tools carry no annotations at all declared no hints, so none were lost and only `policy.consequentialTools` applies (ADR 0007). `maxDrivers` defaults to 1 and counts users, so one person's phone and laptop both drive. Mutating calls run one at a time per page in arrival order; read-only calls run concurrently.
 
 ## 6. Page link protocol (adapter to relay)
 
@@ -80,7 +80,7 @@ Transport: WebSocket at `/page`, subprotocol `tabdock.v1`, JSON text frames shap
 | Direction | Type | Payload | Meaning |
 | --- | --- | --- | --- |
 | page to relay | `hello` | `v`, `resumeToken?`, `title`, `url`, `adapterVersion`, `policy` | First frame. A valid `resumeToken` resumes a session after reload |
-| relay to page | `welcome` | `pageId`, `resumeToken`, `pairing`, `roster`, `limits` | Session accepted |
+| relay to page | `welcome` | `pageId`, `resumeToken`, `resumed`, `pairing`, `roster`, `limits` | Session accepted; `resumed` says whether the resume token was honoured |
 | page to relay | `tools` | `tools[]` with `name`, `description`, `inputSchema`, `annotations` | Full replacement on every change |
 | relay to page | `attach_request` | `requestId`, `user`, `via`, `client?`, `expiresAt` | Someone wants to attach |
 | page to relay | `attach_decision` | `requestId`, `allow`, `role?` | Operator's answer |
@@ -90,10 +90,12 @@ Transport: WebSocket at `/page`, subprotocol `tabdock.v1`, JSON text frames shap
 | relay to page | `pairing` | `code`, `url`, `expiresAt` | New pairing ticket |
 | relay to page | `invoke` | `callId`, `tool`, `arguments`, `caller` (`userId`, `displayName`, `client`, `role`), `deadlineMs` | Run a tool |
 | page to relay | `result` | `callId`, `ok`, `content` or `error` (`code`, `message`) | Outcome |
-| relay to page | `cancel` | `callId` | Abort; the adapter fires the tool's AbortSignal |
+| relay to page | `cancel` | `callId`, `reason?` (`timeout`, `revoked`, `client` or `shutdown`) | Abort; the adapter fires the tool's AbortSignal |
 | both | `ping`, `pong` | none | Relay pings every 15 s and closes after 30 s of silence |
 
 When the socket drops, the page becomes `asleep` and its attachments survive for a 10 minute resume window. After that the page is `gone` and its attachments are deleted.
+
+Close codes (ADR 0007): only a deliberate detach ends a session at once. A page that calls `dock.close()` closes with 4000, becomes `gone` without the resume window, and its in-flight calls fail with `page_gone`, except calls still waiting on an operator prompt, which the page denies first. Every other close leaves the page asleep, including 4002 (the page heard nothing from the relay and is reconnecting) and 4008 (the page's stand-in for 1008, which page code cannot send). The relay closes a superseded socket with 4001, which the page must not reconnect from, and uses 1001, 1008 and 1009 for idle or shutdown, malformed frames and oversized frames.
 
 ## 7. MCP surface (relay to clients)
 
@@ -102,14 +104,14 @@ Endpoint `/mcp`, Streamable HTTP, using the official MCP SDK. Do not hand-roll t
 | Tool | Input | Returns |
 | --- | --- | --- |
 | `list_pages` | none | Pages this user is attached to: `page`, `origin`, `title`, `role`, `state`, `toolCount` |
-| `pair_page` | `code` | Sends an attach request and waits up to 60 s for the operator. Returns `page` and `role` |
+| `pair_page` | `code` | Sends an attach request and waits up to 50 s for the operator (ADR 0005; the request itself lasts 60 s). Returns `page` and `role`; a request nobody answers is a denial, reported as `timeout` because the operator never decided (ADR 0007) |
 | `list_page_tools` | `page` | Tool descriptors, each with an `allowed` flag for the caller's role |
 | `call_page_tool` | `page`, `tool`, `arguments` | The page handler's result |
 | `detach_page` | `page` | Removes the caller's own attachment |
 
 Every page result starts with the header line `[tabdock: untrusted content from <origin>, tool <name>]`. JSON results also pass through as structured content. The fixed tools' own descriptions say that page content is untrusted and is never instructions.
 
-Errors return as MCP tool errors with one of these codes in the text: `not_attached`, `role_denied`, `tool_not_found`, `page_asleep`, `page_gone`, `denied_by_operator`, `timeout`, `page_busy`, `pairing_expired`, `rate_limited`.
+Errors return as MCP tool errors with one of these codes in the text: `not_attached`, `role_denied`, `tool_not_found`, `page_asleep`, `page_gone`, `denied_by_operator`, `timeout`, `page_busy`, `pairing_expired`, `rate_limited`, `invalid_arguments`. The last covers arguments the relay will not forward: too large for one frame, or, from M2, failing the tool's `inputSchema` (ADR 0007).
 
 Auth is a plugin: `authenticate(request)` returns a User or null. M1 ships `dev-token` (users and bearer tokens from `.env`). M3 adds a minimal `oauth` plugin and M4 hardens it (ADR 0006), delegating sign-in to an external identity provider through a maintained library, accepting Claude's hosted callback and Claude Code's loopback redirect.
 
