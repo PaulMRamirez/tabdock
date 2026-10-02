@@ -98,7 +98,10 @@ export async function measurePage(): Promise<PageMeasurements> {
 
   // toolchange timing: one registration, one removal, then a burst of five.
   const events: { type: string; at: number; detail: unknown }[] = [];
+  // Order is recorded separately: the timestamps often tie at clock resolution.
+  const order: string[] = [];
   const onChange = (event: Event) => {
+    order.push('event');
     events.push({ type: event.type, at: now(), detail: (event as CustomEvent).detail ?? null });
   };
   mc.addEventListener('toolchange', onChange);
@@ -123,6 +126,7 @@ export async function measurePage(): Promise<PageMeasurements> {
       { signal: reg.signal },
     )
     .then(() => {
+      order.push('resolved');
       resolvedAt = now();
     });
   await new Promise((r) => setTimeout(r, 50));
@@ -130,7 +134,8 @@ export async function measurePage(): Promise<PageMeasurements> {
   const registration = {
     registerResolvedMs: round(resolvedAt - t),
     toolchangeAfterRegisterMs: firstEvent ? round(firstEvent.at - t) : null,
-    eventBeforeResolve: firstEvent ? firstEvent.at <= resolvedAt : false,
+    eventBeforeResolve:
+      order.includes('event') && order.indexOf('event') < order.indexOf('resolved'),
     eventType: firstEvent ? firstEvent.type : 'none',
     eventDetail: firstEvent ? firstEvent.detail : null,
     unregisterToolchangeMs: null as number | null,

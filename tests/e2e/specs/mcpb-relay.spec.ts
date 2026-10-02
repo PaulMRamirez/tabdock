@@ -69,6 +69,13 @@ test('the relay ignores a page whose origin is not on its widget allowlist', asy
   await other.close();
 });
 
+test('the demo server forbids framing by other origins', async () => {
+  // Deterministic half of the check below: the headers that stop the injection.
+  const response = await fetch(new URL('vendor/webmcp-local-relay/widget.html', baseline.demo.url));
+  expect(response.headers.get('content-security-policy')).toContain("frame-ancestors 'self'");
+  expect(response.headers.get('x-frame-options')).toBe('SAMEORIGIN');
+});
+
 test('a page on another origin cannot frame the vendored widget to inject tools', async () => {
   // The attack the frame-ancestors header stops: a foreign page frames the demo
   // origin's copy of widget.html, which would then connect with the allowed Origin

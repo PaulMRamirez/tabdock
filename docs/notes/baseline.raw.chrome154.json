@@ -1,5 +1,5 @@
 {
-  "measuredAt": "2026-10-02T18:22:54.589Z",
+  "measuredAt": "2026-10-02T18:51:40.070Z",
   "node": "v22.22.0",
   "browserVersion": "154.0.8037.92",
   "page": {
@@ -10,7 +10,7 @@
       "contextConstructor": "ModelContext"
     },
     "getTools": {
-      "ms": 1.4,
+      "ms": 1.2,
       "names": [
         "add_item",
         "clear_board",
@@ -28,25 +28,25 @@
         "description": "Remove every item from the board. This cannot be undone.",
         "inputSchema": "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
         "name": "clear_board",
-        "origin": "http://127.0.0.1:42509",
+        "origin": "http://127.0.0.1:44791",
         "title": "Clear board",
         "window": "[Window]"
       }
     },
     "registration": {
-      "registerResolvedMs": 2.1,
-      "toolchangeAfterRegisterMs": 2.1,
+      "registerResolvedMs": 0.6,
+      "toolchangeAfterRegisterMs": 0.6,
       "eventBeforeResolve": true,
       "eventType": "toolchange",
       "eventDetail": null,
-      "unregisterToolchangeMs": 0.6,
+      "unregisterToolchangeMs": 0.5,
       "burstOfFiveEvents": 5,
       "duplicateName": {
         "label": "duplicate name",
         "ok": false,
         "kind": "InvalidStateError",
         "value": "Duplicate tool name",
-        "ms": 0.2
+        "ms": 0.1
       },
       "annotationsRoundTrip": {
         "consequentialHint": true,
@@ -61,7 +61,7 @@
         "ok": true,
         "kind": "string",
         "value": "{\"n\":1}",
-        "ms": 0.8
+        "ms": 0.5
       },
       {
         "label": "args as object",
@@ -82,42 +82,42 @@
         "ok": true,
         "kind": "string",
         "value": "{\"n\":\"one\"}",
-        "ms": 0.6
+        "ms": 0.4
       },
       {
         "label": "tool passed by name only",
         "ok": false,
         "kind": "TypeError",
         "value": "Failed to execute 'executeTool' on 'ModelContext': Failed to read the 'description' property from 'RegisteredTool': Required member is undefined.",
-        "ms": 0.2
+        "ms": 0.1
       },
       {
         "label": "handler throws (highlight unknown id)",
         "ok": false,
         "kind": "UnknownError",
         "value": "Tool was executed but the invocation failed. For example, the script function threw an error",
-        "ms": 17.8
+        "ms": 15.1
       },
       {
         "label": "returns string",
         "ok": true,
         "kind": "string",
         "value": "plain text",
-        "ms": 0.2
+        "ms": 0.3
       },
       {
         "label": "returns number",
         "ok": true,
         "kind": "string",
         "value": "42",
-        "ms": 0.7
+        "ms": 0.3
       },
       {
         "label": "returns undefined",
         "ok": true,
         "kind": "string",
         "value": "undefined",
-        "ms": 0.3
+        "ms": 0.4
       },
       {
         "label": "returns MCP CallToolResult",
@@ -141,7 +141,7 @@
     }
   },
   "relay": {
-    "toolsVisibleAfterLoadMs": 283,
+    "toolsVisibleAfterLoadMs": 225,
     "serverInfo": {
       "name": "webmcp-local-relay",
       "version": "0.0.0"
@@ -212,7 +212,7 @@
     "clearBoardAsListed": {
       "name": "clear_board",
       "title": "Clear board",
-      "description": "[WebMCP 78ff0241-37e8-42ea-9662-1899b26118c7 • Tabdock demo board] Remove every item from the board. This cannot be undone.",
+      "description": "[WebMCP 8895ae22-649f-4eec-ae96-70fac57364c1 • Tabdock demo board] Remove every item from the board. This cannot be undone.",
       "inputSchema": {
         "type": "object",
         "properties": {},
@@ -264,11 +264,11 @@
     "getViewRoundTripMs": {
       "n": 50,
       "failed": 0,
-      "p50": 3,
-      "p95": 4.6,
-      "max": 5.2
+      "p50": 2.6,
+      "p95": 3.9,
+      "max": 4.2
     },
     "lateToolListChangedMs": 24,
-    "lateToolVisibleMs": 25
+    "lateToolVisibleMs": 29
   }
 }

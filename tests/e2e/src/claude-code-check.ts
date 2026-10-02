@@ -28,7 +28,7 @@ try {
         [SERVER]: {
           command: process.execPath,
           args: [RELAY_CLI, '--port', String(baseline.relayPort), '--widget-origin', origin],
-          env: { HOME: home.env.HOME },
+          env: { HOME: home.env.HOME ?? '', USERPROFILE: home.env.USERPROFILE ?? '' },
         },
       },
     }),
@@ -45,15 +45,23 @@ try {
   ].join('\n');
 
   console.log(`Running claude -p with MCP-B's relay on port ${String(baseline.relayPort)}...`);
-  const output = await run('claude', [
+  // Run from the temp directory so the repo's own CLAUDE.md and settings stay out of the session.
+  const output = await run(dir, 'claude', [
     '-p',
     prompt,
     '--mcp-config',
     configPath,
     '--strict-mcp-config',
-    // Only the tools the prompt needs; clear_board and the relay's own tools stay unapproved.
+    // Only the tools the prompt needs; the rest are denied outright, and dontAsk
+    // refuses anything else instead of prompting, whatever the owner's settings say.
     '--allowedTools',
     ['get_view', 'add_item', 'highlight_item'].map((tool) => `mcp__${SERVER}__${tool}`).join(','),
+    '--disallowedTools',
+    ['clear_board', 'move_view', 'list_items', 'webmcp_open_page']
+      .map((tool) => `mcp__${SERVER}__${tool}`)
+      .join(','),
+    '--permission-mode',
+    'dontAsk',
     '--max-turns',
     '12',
     '--output-format',
@@ -82,9 +90,9 @@ try {
   await rm(dir, { recursive: true, force: true });
 }
 
-function run(command: string, args: string[]): Promise<string> {
+function run(cwd: string, command: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'inherit'] });
+    const child = spawn(command, args, { cwd, stdio: ['ignore', 'pipe', 'inherit'] });
     let stdout = '';
     child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString('utf8')));
     child.on('error', reject);

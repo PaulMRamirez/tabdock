@@ -60,14 +60,16 @@ const buildOptions = {
   logLevel: 'warning',
 } satisfies esbuild.BuildOptions;
 
-/** Static build for hosting elsewhere (GitHub Pages in M5). */
+/**
+ * Static build for hosting elsewhere (GitHub Pages in M5). It leaves out MCP-B's
+ * vendored files: a static host cannot send frame-ancestors, and a frameable
+ * widget.html is exactly the injection the dev server's headers prevent.
+ */
 export async function buildDemo(): Promise<void> {
   await rm(distDir, { recursive: true, force: true });
   await esbuild.build(buildOptions);
-  await mkdir(join(distDir, 'vendor/webmcp-local-relay'), { recursive: true });
-  for (const [path, { file }] of Object.entries(STATIC_FILES)) {
-    if (path !== '/') await copyFile(file, join(distDir, path));
-  }
+  await mkdir(distDir, { recursive: true });
+  await copyFile(join(appDir, 'index.html'), join(distDir, 'index.html'));
 }
 
 export interface DemoServer {
@@ -91,7 +93,8 @@ export async function startDemoServer(
         name: 'keep-in-memory',
         setup(build) {
           build.onEnd((result) => {
-            if (!result.outputFiles) return;
+            // A failed watch rebuild keeps serving the last good bundle.
+            if (result.errors.length > 0 || !result.outputFiles) return;
             const next = new Map<string, Uint8Array>();
             for (const out of result.outputFiles) {
               next.set(`/${out.path.slice(distDir.length + 1)}`, out.contents);
@@ -106,7 +109,16 @@ export async function startDemoServer(
   if (options.watch) await ctx.watch();
 
   const server = createServer((request, response) => {
-    const path = new URL(request.url ?? '/', 'http://localhost').pathname;
+    // Any page can make the browser send odd request targets here (an <img src>
+    // is enough), so parse defensively: a throw in this handler would kill pnpm dev.
+    const raw = request.url ?? '/';
+    const parsed =
+      raw.startsWith('/') && !raw.startsWith('//') ? URL.parse(raw, 'http://localhost') : null;
+    if (!parsed) {
+      send(response, 400, 'text/plain; charset=utf-8', 'Bad request');
+      return;
+    }
+    const path = parsed.pathname;
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       send(response, 405, 'text/plain; charset=utf-8', 'Method not allowed');
       return;

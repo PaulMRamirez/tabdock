@@ -3,7 +3,6 @@
 // The client stands in for Claude Code; docs/checklists/M0.md covers the real one.
 
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -62,9 +61,10 @@ export interface BaselineOptions {
 }
 
 /**
- * A throwaway HOME for relay processes. The relay caches its port in
- * ~/.webmcp/relay-port.json and joins any relay it finds on 9333 to 9348, so a
- * test must neither write to the owner's home nor pick up a relay running there.
+ * A throwaway home for relay processes. The relay caches its port in
+ * ~/.webmcp/relay-port.json, and tests must not write into the owner's home.
+ * (The explicit --port is what keeps a test relay from joining one already
+ * running on 9333 to 9348.)
  */
 export async function relayHome(): Promise<{
   env: Record<string, string>;
@@ -72,7 +72,7 @@ export async function relayHome(): Promise<{
 }> {
   const home = await mkdtemp(join(tmpdir(), 'tabdock-relay-home-'));
   return {
-    env: { ...getDefaultEnvironment(), HOME: home },
+    env: { ...getDefaultEnvironment(), HOME: home, USERPROFILE: home },
     remove: () => rm(home, { recursive: true, force: true }),
   };
 }
@@ -120,7 +120,8 @@ export async function startBaseline(options: BaselineOptions = {}): Promise<Base
     const started = performance.now();
     await page.goto(`${demo.url}?mcpb=${String(relayPort)}`);
     await page.waitForSelector('html[data-tools="ready"]');
-    await waitForTools(client, DEMO_TOOL_NAMES);
+    // Fine polling, so the figure measures the relay rather than this loop.
+    await waitForTools(client, DEMO_TOOL_NAMES, 20_000, 5);
     const toolsVisibleAfterMs = Math.round(performance.now() - started);
 
     return { demo, relayPort, client, browser, page, toolsVisibleAfterMs, close: closeAll };
@@ -135,30 +136,44 @@ export async function startBaseline(options: BaselineOptions = {}): Promise<Base
  * installed Playwright. The WebMCPTesting feature turns on native WebMCP in
  * Chrome 146 and later; older builds ignore it and the polyfill takes over.
  */
-export function launchChromium(headless: boolean): Promise<Browser> {
+export async function launchChromium(headless: boolean): Promise<Browser> {
   const executablePath = process.env.CHROMIUM_EXECUTABLE;
-  if (!executablePath) ensurePlaywrightChromium();
-  return chromium.launch({
-    headless,
-    args: ['--enable-features=WebMCPTesting'],
-    ...(executablePath ? { executablePath } : {}),
-  });
+  const launch = () =>
+    chromium.launch({
+      headless,
+      args: ['--enable-features=WebMCPTesting'],
+      ...(executablePath ? { executablePath } : {}),
+    });
+  try {
+    return await launch();
+  } catch (error) {
+    if (executablePath || !isMissingBrowser(error)) throw error;
+    installPlaywrightChromium();
+    return launch();
+  }
 }
 
-/**
- * Downloads Playwright's Chromium on first use, so demos and tests run from a
- * fresh clone with one command. A no-op when the browser is already present.
- */
-export function ensurePlaywrightChromium(): void {
-  if (existsSync(chromium.executablePath())) return;
+/** Makes sure Playwright's own Chromium can launch, installing it once if it is missing. */
+export async function ensurePlaywrightChromium(): Promise<void> {
+  const browser = await launchChromium(true);
+  await browser.close();
+}
+
+function isMissingBrowser(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("Executable doesn't exist");
+}
+
+/** Downloads the browser on first use, so demos and tests run from a fresh clone with one command. */
+function installPlaywrightChromium(): void {
   console.log('Playwright Chromium is missing; installing it once (about 150 MB)...');
   const result = spawnSync('pnpm', ['exec', 'playwright', 'install', 'chromium'], {
     cwd: fileURLToPath(new URL('..', import.meta.url)),
     stdio: 'inherit',
+    shell: process.platform === 'win32',
   });
   if (result.status !== 0) {
     throw new Error(
-      'Could not install Chromium; run: pnpm --filter @tabdock/e2e exec playwright install chromium',
+      `Could not install Chromium (${result.error?.message ?? `exit ${String(result.status)}`}); run: pnpm --filter @tabdock/e2e exec playwright install chromium`,
     );
   }
 }

@@ -1,5 +1,5 @@
 {
-  "measuredAt": "2026-10-02T18:22:57.927Z",
+  "measuredAt": "2026-10-02T18:51:43.168Z",
   "node": "v22.22.0",
   "browserVersion": "155.0.8059.12",
   "page": {
@@ -32,25 +32,25 @@
           "additionalProperties": false
         },
         "name": "clear_board",
-        "origin": "http://127.0.0.1:40519",
+        "origin": "http://127.0.0.1:33199",
         "title": "Clear board",
         "window": "[Window]"
       }
     },
     "registration": {
-      "registerResolvedMs": 0.4,
-      "toolchangeAfterRegisterMs": 0.4,
+      "registerResolvedMs": 0.3,
+      "toolchangeAfterRegisterMs": 0.3,
       "eventBeforeResolve": true,
       "eventType": "toolchange",
       "eventDetail": null,
-      "unregisterToolchangeMs": 0.7,
+      "unregisterToolchangeMs": 0.5,
       "burstOfFiveEvents": 5,
       "duplicateName": {
         "label": "duplicate name",
         "ok": false,
         "kind": "InvalidStateError",
         "value": "Duplicate tool name",
-        "ms": 0.1
+        "ms": 0.2
       },
       "annotationsRoundTrip": {
         "consequentialHint": true,
@@ -65,56 +65,56 @@
         "ok": false,
         "kind": "TypeError",
         "value": "Failed to execute 'executeTool' on 'ModelContext': invalid input object: value is not an object",
-        "ms": 0.1
+        "ms": 0.2
       },
       {
         "label": "args as object",
         "ok": true,
         "kind": "string",
         "value": "{\"n\":1}",
-        "ms": 0.5
+        "ms": 0.3
       },
       {
         "label": "args omitted",
         "ok": true,
         "kind": "string",
         "value": "{}",
-        "ms": 0.4
+        "ms": 0.2
       },
       {
         "label": "args violate inputSchema (n is a string)",
         "ok": true,
         "kind": "string",
         "value": "{\"n\":\"one\"}",
-        "ms": 0.8
+        "ms": 0.4
       },
       {
         "label": "tool passed by name only",
         "ok": false,
         "kind": "TypeError",
         "value": "Failed to execute 'executeTool' on 'ModelContext': Failed to read the 'description' property from 'RegisteredTool': Required member is undefined.",
-        "ms": 0.1
+        "ms": 0
       },
       {
         "label": "handler throws (highlight unknown id)",
         "ok": false,
         "kind": "UnknownError",
         "value": "Tool was executed but the invocation failed. For example, the script function threw an error",
-        "ms": 11.4
+        "ms": 15.6
       },
       {
         "label": "returns string",
         "ok": true,
         "kind": "string",
         "value": "plain text",
-        "ms": 0.4
+        "ms": 0.6
       },
       {
         "label": "returns number",
         "ok": true,
         "kind": "string",
         "value": "42",
-        "ms": 0.3
+        "ms": 0.4
       },
       {
         "label": "returns undefined",
@@ -128,7 +128,7 @@
         "ok": true,
         "kind": "string",
         "value": "{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}",
-        "ms": 0.2
+        "ms": 0.3
       }
     ],
     "abort": {
@@ -137,7 +137,7 @@
         "ok": false,
         "kind": "AbortError",
         "value": "signal is aborted without reason",
-        "ms": 100.5
+        "ms": 100.4
       },
       "handlerSawAbort": true,
       "handlerSignalReason": "AbortError: signal is aborted without reason",
@@ -145,7 +145,7 @@
     }
   },
   "relay": {
-    "toolsVisibleAfterLoadMs": 269,
+    "toolsVisibleAfterLoadMs": 245,
     "serverInfo": {
       "name": "webmcp-local-relay",
       "version": "0.0.0"
@@ -216,7 +216,7 @@
     "clearBoardAsListed": {
       "name": "clear_board",
       "title": "Clear board",
-      "description": "[WebMCP 283059be-e597-421d-9e8c-e565fc3fb8b3 • Tabdock demo board] Remove every item from the board. This cannot be undone.",
+      "description": "[WebMCP 903eb48b-dede-475c-87c0-c47288eefab1 • Tabdock demo board] Remove every item from the board. This cannot be undone.",
       "inputSchema": {
         "type": "object",
         "properties": {},
@@ -260,7 +260,7 @@
       "p95": null,
       "max": null
     },
-    "lateToolListChangedMs": 23,
+    "lateToolListChangedMs": 22,
     "lateToolVisibleMs": 25
   }
 }
