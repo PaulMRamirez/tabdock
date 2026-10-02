@@ -2,6 +2,8 @@
 // local relay as a stdio MCP server, and an MCP client built on the official SDK.
 // The client stands in for Claude Code; docs/checklists/M0.md covers the real one.
 
+import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -135,6 +137,7 @@ export async function startBaseline(options: BaselineOptions = {}): Promise<Base
  */
 export function launchChromium(headless: boolean): Promise<Browser> {
   const executablePath = process.env.CHROMIUM_EXECUTABLE;
+  if (!executablePath) ensurePlaywrightChromium();
   return chromium.launch({
     headless,
     args: ['--enable-features=WebMCPTesting'],
@@ -142,11 +145,30 @@ export function launchChromium(headless: boolean): Promise<Browser> {
   });
 }
 
+/**
+ * Downloads Playwright's Chromium on first use, so demos and tests run from a
+ * fresh clone with one command. A no-op when the browser is already present.
+ */
+export function ensurePlaywrightChromium(): void {
+  if (existsSync(chromium.executablePath())) return;
+  console.log('Playwright Chromium is missing; installing it once (about 150 MB)...');
+  const result = spawnSync('pnpm', ['exec', 'playwright', 'install', 'chromium'], {
+    cwd: fileURLToPath(new URL('..', import.meta.url)),
+    stdio: 'inherit',
+  });
+  if (result.status !== 0) {
+    throw new Error(
+      'Could not install Chromium; run: pnpm --filter @tabdock/e2e exec playwright install chromium',
+    );
+  }
+}
+
 /** Polls the relay until every named tool is listed. The SDK caches lists, so each poll refreshes. */
 export async function waitForTools(
   client: Client,
   names: readonly string[],
   timeoutMs = 20_000,
+  pollMs = 100,
 ): Promise<string[]> {
   const deadline = performance.now() + timeoutMs;
   let listed: string[] = [];
@@ -154,7 +176,7 @@ export async function waitForTools(
     const { tools } = await client.listTools(undefined, { cacheMode: 'refresh' });
     listed = tools.map((t) => t.name);
     if (names.every((name) => listed.includes(name))) return listed;
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
   throw new Error(
     `Relay listed [${listed.join(', ')}], still missing some of [${names.join(', ')}]`,

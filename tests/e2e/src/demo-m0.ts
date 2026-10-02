@@ -48,15 +48,20 @@ try {
     say(`   ${tool.name.padEnd(20)} ${readOnly}`);
   }
 
-  const steps: [string, Record<string, unknown>][] = [
-    ['get_view', {}],
-    ['add_item', { label: 'Hello from MCP', x: 160, y: -120, color: 'purple' }],
-    ['highlight_item', { id: 'item-4' }],
-    ['move_view', { x: 80, y: -60, zoom: 1.5 }],
-    ['list_items', { visibleOnly: true }],
-    ['highlight_item', { id: 'item-999' }],
+  // Each step says whether it should succeed, so a broken chain fails the demo
+  // (CI runs it) instead of printing errors and exiting 0.
+  let newItemId = '';
+  const steps: [string, () => Record<string, unknown>, 'ok' | 'error'][] = [
+    ['get_view', () => ({}), 'ok'],
+    ['add_item', () => ({ label: 'Hello from MCP', x: 160, y: -120, color: 'purple' }), 'ok'],
+    ['highlight_item', () => ({ id: newItemId }), 'ok'],
+    ['move_view', () => ({ x: 80, y: -60, zoom: 1.5 }), 'ok'],
+    ['list_items', () => ({ visibleOnly: true }), 'ok'],
+    ['highlight_item', () => ({ id: 'item-999' }), 'error'],
   ];
-  for (const [name, args] of steps) {
+  let unexpected = 0;
+  for (const [name, makeArgs, expected] of steps) {
+    const args = makeArgs();
     say(`\ntools/call ${name}`);
     show('arguments ', args);
     const started = performance.now();
@@ -64,9 +69,15 @@ try {
     const ms = Math.round(performance.now() - started);
     if (result.isError) {
       const text = (result.content as { text?: string }[])[0]?.text ?? '';
-      show(`error (${ms} ms)`, text);
+      show(`error (${String(ms)} ms)`, text);
     } else {
-      show(`result (${ms} ms)`, result.structuredContent ?? result.content);
+      show(`result (${String(ms)} ms)`, result.structuredContent ?? result.content);
+      const item = (result.structuredContent as { item?: { id?: string } } | undefined)?.item;
+      if (name === 'add_item' && item?.id) newItemId = item.id;
+    }
+    if ((result.isError ? 'error' : 'ok') !== expected) {
+      unexpected++;
+      say(`   UNEXPECTED: expected ${expected}`);
     }
   }
 
@@ -85,6 +96,10 @@ try {
   if (headed) {
     say('\nBrowser stays open for 30 s so you can pan and zoom the board.');
     await new Promise((resolve) => setTimeout(resolve, 30_000));
+  }
+  if (unexpected > 0) {
+    say(`\n${String(unexpected)} step(s) did not behave as expected.`);
+    process.exitCode = 1;
   }
 } finally {
   await baseline.close();

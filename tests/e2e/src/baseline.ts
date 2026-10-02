@@ -49,11 +49,14 @@ async function measureThroughRelay() {
     const badArgsSample = await client.callTool({ name: 'move_view', arguments: { x: 'left' } });
 
     // Round trips for a read-only call, MCP client to page handler and back.
+    // Failed calls (every call on runtimes the relay cannot drive) are counted, not timed.
     const timings: number[] = [];
+    let failedCalls = 0;
     for (let i = 0; i < 50; i++) {
       const start = performance.now();
-      await client.callTool({ name: 'get_view', arguments: {} });
-      timings.push(performance.now() - start);
+      const result = await client.callTool({ name: 'get_view', arguments: {} });
+      if (result.isError) failedCalls++;
+      else timings.push(performance.now() - start);
     }
     timings.sort((a, b) => a - b);
 
@@ -73,7 +76,8 @@ async function measureThroughRelay() {
         execute: () => 'late',
       });
     });
-    await waitForTools(client, ['late_tool'], 10_000);
+    // Fine polling, so the visibility time measures the relay rather than this loop.
+    await waitForTools(client, ['late_tool'], 10_000, 5);
     const visibleMs = performance.now() - start;
     const firstChange = changes[0];
 
@@ -88,6 +92,7 @@ async function measureThroughRelay() {
       badArgsSample,
       getViewRoundTripMs: {
         n: timings.length,
+        failed: failedCalls,
         p50: Math.round(percentile(timings, 50) * 10) / 10,
         p95: Math.round(percentile(timings, 95) * 10) / 10,
         max: Math.round((timings.at(-1) ?? Number.NaN) * 10) / 10,

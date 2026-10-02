@@ -51,8 +51,9 @@ try {
     '--mcp-config',
     configPath,
     '--strict-mcp-config',
+    // Only the tools the prompt needs; clear_board and the relay's own tools stay unapproved.
     '--allowedTools',
-    `mcp__${SERVER}`,
+    ['get_view', 'add_item', 'highlight_item'].map((tool) => `mcp__${SERVER}__${tool}`).join(','),
     '--max-turns',
     '12',
     '--output-format',

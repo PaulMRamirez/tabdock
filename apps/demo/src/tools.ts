@@ -8,7 +8,7 @@ import type { ModelContextTool, ToolAnnotations, ToolExecuteOptions } from './we
 export interface ToolCall {
   tool: string;
   ok: boolean;
-  /** One line for the on-page activity strip; never includes arguments verbatim. */
+  /** One line for the on-page activity strip. It may name an item id but never copies the arguments object. */
   summary: string;
   at: Date;
 }
@@ -129,7 +129,8 @@ export const TOOL_FACTORIES: readonly ToolFactory[] = [
     title: 'Highlight item',
     description:
       'Turn the highlight ring on an item on or off. Highlighting is on unless highlighted is false.',
-    annotations: MUTATING,
+    // The returned item carries a label another caller wrote.
+    annotations: { ...MUTATING, untrustedContentHint: true },
     input: z.strictObject({
       id: z
         .string()

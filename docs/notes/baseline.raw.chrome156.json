@@ -1,5 +1,5 @@
 {
-  "measuredAt": "2026-10-02T17:37:01.161Z",
+  "measuredAt": "2026-10-02T18:23:01.315Z",
   "node": "v22.22.0",
   "browserVersion": "156.0.8078.5",
   "page": {
@@ -10,8 +10,15 @@
       "contextConstructor": "ModelContext"
     },
     "getTools": {
-      "ms": 0.9,
-      "names": ["add_item", "clear_board", "get_view", "highlight_item", "list_items", "move_view"],
+      "ms": 1.1,
+      "names": [
+        "add_item",
+        "clear_board",
+        "get_view",
+        "highlight_item",
+        "list_items",
+        "move_view"
+      ],
       "sample": {
         "annotations": {
           "consequentialHint": true,
@@ -26,18 +33,18 @@
           "additionalProperties": false
         },
         "name": "clear_board",
-        "origin": "http://127.0.0.1:36095",
+        "origin": "http://127.0.0.1:42213",
         "title": "Clear board",
         "window": "[Window]"
       }
     },
     "registration": {
-      "registerResolvedMs": 0.3,
-      "toolchangeAfterRegisterMs": 0.3,
+      "registerResolvedMs": 2.4,
+      "toolchangeAfterRegisterMs": 2.4,
       "eventBeforeResolve": true,
       "eventType": "toolchange",
       "eventDetail": null,
-      "unregisterToolchangeMs": 0.5,
+      "unregisterToolchangeMs": 0.6,
       "burstOfFiveEvents": 5,
       "duplicateName": {
         "label": "duplicate name",
@@ -67,63 +74,63 @@
         "ok": true,
         "kind": "string",
         "value": "{\"n\":1}",
-        "ms": 0.5
+        "ms": 0.7
       },
       {
         "label": "args omitted",
         "ok": true,
         "kind": "string",
         "value": "{}",
-        "ms": 0.4
+        "ms": 0.9
       },
       {
         "label": "args violate inputSchema (n is a string)",
         "ok": true,
         "kind": "string",
         "value": "{\"n\":\"one\"}",
-        "ms": 0.5
+        "ms": 0.6
       },
       {
         "label": "tool passed by name only",
         "ok": false,
         "kind": "TypeError",
         "value": "Failed to execute 'executeTool' on 'ModelContext': Failed to read the 'description' property from 'RegisteredTool': Required member is undefined.",
-        "ms": 0.3
+        "ms": 0.2
       },
       {
         "label": "handler throws (highlight unknown id)",
         "ok": false,
         "kind": "UnknownError",
         "value": "Tool was executed but the invocation failed. For example, the script function threw an error",
-        "ms": 11.4
+        "ms": 18.3
       },
       {
         "label": "returns string",
         "ok": true,
         "kind": "string",
         "value": "plain text",
-        "ms": 0.4
+        "ms": 0.6
       },
       {
         "label": "returns number",
         "ok": true,
         "kind": "string",
         "value": "42",
-        "ms": 0.4
+        "ms": 0.6
       },
       {
         "label": "returns undefined",
         "ok": true,
         "kind": "string",
         "value": "undefined",
-        "ms": 0.5
+        "ms": 0.6
       },
       {
         "label": "returns MCP CallToolResult",
         "ok": true,
         "kind": "string",
         "value": "{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}",
-        "ms": 0.2
+        "ms": 0.7
       }
     ],
     "abort": {
@@ -132,7 +139,7 @@
         "ok": false,
         "kind": "AbortError",
         "value": "signal is aborted without reason",
-        "ms": 100.4
+        "ms": 100.5
       },
       "handlerSawAbort": true,
       "handlerSignalReason": "AbortError: signal is aborted without reason",
@@ -140,7 +147,7 @@
     }
   },
   "relay": {
-    "toolsVisibleAfterLoadMs": 390,
+    "toolsVisibleAfterLoadMs": 295,
     "serverInfo": {
       "name": "webmcp-local-relay",
       "version": "0.0.0"
@@ -211,7 +218,7 @@
     "clearBoardAsListed": {
       "name": "clear_board",
       "title": "Clear board",
-      "description": "[WebMCP 13a3cb30-2835-41cd-9f1a-7ada803331d2 • Tabdock demo board] Remove every item from the board. This cannot be undone.",
+      "description": "[WebMCP 3bc51444-cac4-40a3-840a-0b3a1d58535e • Tabdock demo board] Remove every item from the board. This cannot be undone.",
       "inputSchema": {
         "type": "object",
         "properties": {},
@@ -249,12 +256,13 @@
       "isError": true
     },
     "getViewRoundTripMs": {
-      "n": 50,
-      "p50": 2.1,
-      "p95": 3.3,
-      "max": 3.7
+      "n": 0,
+      "failed": 50,
+      "p50": null,
+      "p95": null,
+      "max": null
     },
-    "lateToolListChangedMs": 23,
-    "lateToolVisibleMs": 107
+    "lateToolListChangedMs": 24,
+    "lateToolVisibleMs": 29
   }
 }

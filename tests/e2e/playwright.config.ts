@@ -4,6 +4,7 @@ const executablePath = process.env.CHROMIUM_EXECUTABLE;
 
 export default defineConfig({
   testDir: 'specs',
+  globalSetup: './src/global-setup.ts',
   // Each spec starts its own demo server and relay on free ports, but the
   // sandbox and CI runners are small, so keep the browser count low.
   workers: 2,

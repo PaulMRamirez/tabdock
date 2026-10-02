@@ -4,7 +4,7 @@ Status: Proposed, 2 October 2026. Changes SPEC sections 3, 6 and 8 and the readi
 
 ## Context
 
-SPEC section 3 records `executeTool(tool, argsObject, {signal})`. The M0 baseline (`docs/notes/baseline.md`) measured three runtimes that disagree. Chrome 153 and 154 and the MCP-B polyfill 5.1.0 take the input as a JSON string and reject an object; Chrome 155 and later take an object and reject a string. Chrome 155 reaches Stable on 6 October 2026, while MCP-B's stable line stays on strings until its 6.0 beta ships. `getTools()` returns `inputSchema` as a string on Chrome 153 and 154. Every runtime returns the tool's result as a string. Native Chrome hides a handler's error message behind a fixed `UnknownError` text. The polyfill 5.1.0 never passes the handler an `AbortSignal`, so cancelling a call there stops the caller waiting but does not stop the handler.
+SPEC section 3 records `executeTool(tool, argsObject, {signal})`. The M0 baseline (`docs/notes/baseline.md`, raw files beside it) measured five runtimes that disagree. Chrome 153 and 154 and the MCP-B polyfill 5.1.0 take the input as a JSON string and reject an object; Chrome 155 and later take an object and reject a string. Chrome 155 reaches Stable on 6 October 2026, while MCP-B's stable line stays on strings until its 6.0 release (in beta since 1 October, per `docs/notes/verified.md`). `getTools()` returns `inputSchema` as a string on Chrome 153 and 154. Every runtime returns the tool's result as a string. Native Chrome hides a handler's error message behind a fixed `UnknownError` text. The polyfill 5.1.0 never passes the handler an `AbortSignal`, so cancelling a call there stops the caller waiting but does not stop the handler.
 
 ## Decision
 

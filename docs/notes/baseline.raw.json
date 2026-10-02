@@ -1,5 +1,5 @@
 {
-  "measuredAt": "2026-10-02T17:36:53.436Z",
+  "measuredAt": "2026-10-02T18:22:47.691Z",
   "node": "v22.22.0",
   "browserVersion": "141.0.7390.37",
   "page": {
@@ -10,8 +10,15 @@
       "contextConstructor": "ModelContext"
     },
     "getTools": {
-      "ms": 0.7,
-      "names": ["add_item", "clear_board", "get_view", "highlight_item", "list_items", "move_view"],
+      "ms": 1.1,
+      "names": [
+        "add_item",
+        "clear_board",
+        "get_view",
+        "highlight_item",
+        "list_items",
+        "move_view"
+      ],
       "sample": {
         "name": "clear_board",
         "title": "Clear board",
@@ -21,7 +28,7 @@
           "properties": {},
           "additionalProperties": false
         },
-        "origin": "http://127.0.0.1:43161",
+        "origin": "http://127.0.0.1:46673",
         "window": "[Window]",
         "annotations": {
           "readOnlyHint": false,
@@ -30,19 +37,19 @@
       }
     },
     "registration": {
-      "registerResolvedMs": 0.1,
-      "toolchangeAfterRegisterMs": 0.1,
+      "registerResolvedMs": 0.2,
+      "toolchangeAfterRegisterMs": 0.2,
       "eventBeforeResolve": true,
       "eventType": "toolchange",
       "eventDetail": null,
-      "unregisterToolchangeMs": 4.3,
+      "unregisterToolchangeMs": 4.4,
       "burstOfFiveEvents": 5,
       "duplicateName": {
         "label": "duplicate name",
         "ok": false,
         "kind": "InvalidStateError",
         "value": "Tool already registered: baseline_probe",
-        "ms": 0.3
+        "ms": 0.4
       },
       "annotationsRoundTrip": {
         "readOnlyHint": true,
@@ -63,21 +70,21 @@
         "ok": false,
         "kind": "UnknownError",
         "value": "Failed to parse input arguments",
-        "ms": 0
+        "ms": 0.1
       },
       {
         "label": "args omitted",
         "ok": false,
         "kind": "UnknownError",
         "value": "Failed to parse input arguments",
-        "ms": 0.2
+        "ms": 0
       },
       {
         "label": "args violate inputSchema (n is a string)",
         "ok": true,
         "kind": "string",
         "value": "{\"n\":\"one\"}",
-        "ms": 0
+        "ms": 0.2
       },
       {
         "label": "tool passed by name only",
@@ -91,7 +98,7 @@
         "ok": false,
         "kind": "UnknownError",
         "value": "Tool was executed but the invocation failed. For example, the script function threw an error: No item with id item-999",
-        "ms": 13
+        "ms": 20.3
       },
       {
         "label": "returns string",
@@ -119,7 +126,7 @@
         "ok": true,
         "kind": "string",
         "value": "{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}",
-        "ms": 0.1
+        "ms": 0.2
       }
     ],
     "abort": {
@@ -128,7 +135,7 @@
         "ok": false,
         "kind": "AbortError",
         "value": "signal is aborted without reason",
-        "ms": 100.5
+        "ms": 100.6
       },
       "handlerSawAbort": false,
       "handlerSignalReason": "none",
@@ -136,7 +143,7 @@
     }
   },
   "relay": {
-    "toolsVisibleAfterLoadMs": 352,
+    "toolsVisibleAfterLoadMs": 226,
     "serverInfo": {
       "name": "webmcp-local-relay",
       "version": "0.0.0"
@@ -207,7 +214,7 @@
     "clearBoardAsListed": {
       "name": "clear_board",
       "title": "Clear board",
-      "description": "[WebMCP e90e1bfc-3446-45d7-8309-335575895bf5 • Tabdock demo board] Remove every item from the board. This cannot be undone.",
+      "description": "[WebMCP ae1b75c1-d17e-4b91-a5d9-71f25deea993 • Tabdock demo board] Remove every item from the board. This cannot be undone.",
       "inputSchema": {
         "type": "object",
         "properties": {},
@@ -230,7 +237,11 @@
         "zoom": 1,
         "width": 960,
         "height": 432,
-        "visibleItemIds": ["item-1", "item-2", "item-3"]
+        "visibleItemIds": [
+          "item-1",
+          "item-2",
+          "item-3"
+        ]
       },
       "isError": false
     },
@@ -254,11 +265,12 @@
     },
     "getViewRoundTripMs": {
       "n": 50,
-      "p50": 2.4,
-      "p95": 6.2,
-      "max": 9.1
+      "failed": 0,
+      "p50": 2.2,
+      "p95": 4.1,
+      "max": 4.9
     },
     "lateToolListChangedMs": 24,
-    "lateToolVisibleMs": 111
+    "lateToolVisibleMs": 30
   }
 }

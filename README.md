@@ -14,8 +14,7 @@ pnpm test        # unit tests, no browser needed
 pnpm lint
 pnpm typecheck
 pnpm dev         # demo board at http://127.0.0.1:5173/
-pnpm --filter @tabdock/e2e exec playwright install chromium   # once, for the next two
-pnpm test:e2e    # browser tests through MCP-B's local relay
+pnpm test:e2e    # browser tests through MCP-B's local relay (fetches Chromium on first run)
 pnpm demo:m0     # the M0 baseline, narrated
 ```
 

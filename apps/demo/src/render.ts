@@ -113,23 +113,27 @@ export function mountBoard(root: HTMLElement, board: Board): BoardUi {
   new ResizeObserver(resize).observe(canvas);
   resize();
 
-  let drag: { x: number; y: number } | null = null;
+  // Pan with one pointer at a time; a second finger would otherwise make the view jump.
+  let drag: { id: number; x: number; y: number } | null = null;
   canvas.addEventListener('pointerdown', (event) => {
-    drag = { x: event.clientX, y: event.clientY };
+    if (drag) return;
+    drag = { id: event.pointerId, x: event.clientX, y: event.clientY };
     canvas.setPointerCapture(event.pointerId);
   });
   canvas.addEventListener('pointermove', (event) => {
-    if (!drag) return;
+    if (drag?.id !== event.pointerId) return;
     const { view } = latest;
     board.moveView({
       x: view.x - (event.clientX - drag.x) / view.zoom,
       y: view.y - (event.clientY - drag.y) / view.zoom,
     });
-    drag = { x: event.clientX, y: event.clientY };
+    drag = { id: event.pointerId, x: event.clientX, y: event.clientY };
   });
-  canvas.addEventListener('pointerup', () => {
-    drag = null;
-  });
+  const endDrag = (event: PointerEvent) => {
+    if (drag?.id === event.pointerId) drag = null;
+  };
+  canvas.addEventListener('pointerup', endDrag);
+  canvas.addEventListener('pointercancel', endDrag);
   canvas.addEventListener(
     'wheel',
     (event) => {

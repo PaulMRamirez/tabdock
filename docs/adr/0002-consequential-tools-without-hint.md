@@ -4,11 +4,11 @@ Status: Proposed, 2 October 2026. Needs the owner's choice before M2. Changes SP
 
 ## Context
 
-S6 says consequential tools prompt on the page by default, and SPEC section 5 identifies them by `consequentialHint`. The M0 baseline found that the MCP-B polyfill 5.1.0 and Chrome 153 drop that hint: `getTools()` returns `clear_board` without it, so an adapter that trusts the hint would run the demo's one consequential tool with no prompt. Chrome 154 and later and MCP-B's 6.0 beta keep it. The runtime's annotations object tells us which case we are in: when hints are present but `consequentialHint` is absent, the runtime does not support it.
+S6 says consequential tools prompt on the page by default, but the spec never says how a tool is classed as consequential; section 3 lists `consequentialHint` among the WebMCP annotations, and the natural reading is to trust it. The M0 baseline measured that the MCP-B polyfill 5.1.0 and Chrome 153 drop that hint: `getTools()` returns `clear_board` without it, so an adapter that trusts the hint would run the demo's one consequential tool with no prompt. Chrome 154 to 156 keep it, and so does MCP-B's 6.0 beta according to the checks in `docs/notes/verified.md`. The runtime's annotations object tells us which case we are in: when hints are present but `consequentialHint` is absent, the runtime does not support it.
 
 ## Options
 
-A. Trust the hint only, as the spec reads today. Simple, but on the affected runtimes S6 silently fails open.
+A. Trust the hint only, the natural reading of the spec today. Simple, but on the affected runtimes S6 silently fails open.
 
 B. When the runtime cannot report the hint, treat every tool that is not read-only as consequential. Safe, but on the polyfill every `add_item` prompts the operator, which makes the demo and most real pages tiresome.
 

@@ -24,7 +24,7 @@ describe('demo tools', () => {
       ['list_items', { readOnlyHint: true, untrustedContentHint: true }],
       ['add_item', { readOnlyHint: false }],
       ['move_view', { readOnlyHint: false }],
-      ['highlight_item', { readOnlyHint: false }],
+      ['highlight_item', { readOnlyHint: false, untrustedContentHint: true }],
       ['clear_board', { readOnlyHint: false, consequentialHint: true }],
     ]);
   });
