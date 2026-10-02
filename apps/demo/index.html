@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tabdock demo board</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: system-ui, sans-serif;
+        color: #212529;
+        background: #f8f9fa;
+      }
+      body {
+        margin: 0;
+        padding: 16px;
+      }
+      #board {
+        max-width: 960px;
+        margin: 0 auto;
+        display: grid;
+        gap: 8px;
+      }
+      h1 {
+        font-size: 1.2rem;
+        margin: 0;
+      }
+      canvas {
+        width: 100%;
+        height: min(60vh, 520px);
+        background: #fff;
+        border: 1px solid #dee2e6;
+        border-radius: 8px;
+        touch-action: none;
+        cursor: grab;
+      }
+      .meta {
+        font-size: 0.85rem;
+        color: #495057;
+      }
+      ol {
+        margin: 0;
+        padding-left: 1.2rem;
+        font-size: 0.85rem;
+        font-family: ui-monospace, monospace;
+      }
+      li.error {
+        color: #c92a2a;
+      }
+    </style>
+  </head>
+  <body>
+    <main id="board">
+      <h1>Tabdock demo board</h1>
+      <p class="meta" data-role="status">Loading tools...</p>
+      <canvas aria-label="Board with items; drag to pan, scroll to zoom"></canvas>
+      <p class="meta" data-role="view"></p>
+      <section>
+        <h2 class="meta">Recent tool calls</h2>
+        <ol data-role="log" aria-live="polite"></ol>
+      </section>
+    </main>
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>

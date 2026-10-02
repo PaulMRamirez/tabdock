@@ -1,0 +1,8 @@
+packages:
+  - packages/*
+  - apps/*
+  - tests/*
+
+# pnpm 10 blocks dependency build scripts unless they are listed here.
+onlyBuiltDependencies:
+  - esbuild
