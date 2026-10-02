@@ -15,3 +15,7 @@ M1 mounts the SDK's `createMcpHandler` in its default mode, which serves both th
 ## Consequences
 
 Pairing works in Claude Code without raising its timeout, at the cost of an operator having 50 s instead of 60 s before the client stops waiting. Until M2 the roster shows users but not always which of their clients called.
+
+## Notes after M1
+
+Claude Code 2.1.287 turned out to speak the 2026-07-28 revision (it probes `server/discover`), so the relay names it on every request; the A1.2 check asserts it. Hosted Claude's revision is still unmeasured (M3). One more limit of the stateless mode: a 2025-era client's `notifications/cancelled` arrives as a separate request that cannot reach the running call, so the page runs that call to completion or to its deadline and the audit records the page's outcome. M2's sessionful route wires cancellation through.

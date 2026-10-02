@@ -65,7 +65,7 @@ process.stdout.write(
     '',
     'Add the relay to Claude Code with a token from TABDOCK_DEV_TOKENS:',
     `  claude mcp add --transport http tabdock ${relay.mcpUrl} --header "Authorization: Bearer <your token>"`,
-    'then ask it to pair with the code the board shows, and approve the request on the page.',
+    'then ask it to pair with the code in the Tabdock widget, and approve the request on the page.',
     'Relay logs follow as JSON lines; Ctrl-C stops both.',
     '',
   ].join('\n'),

@@ -50,12 +50,17 @@ export const TOOL_POLL_MS = 2000;
 export const RECONNECT_MIN_MS = 500;
 export const RECONNECT_MAX_MS = 30_000;
 
-/**
- * Close codes on the page link beyond the standard ones (1001 idle or shutdown,
- * 1008 malformed frame, 1009 frame too large). Browsers let page code send only
- * 1000 and 3000 to 4999, so the page's own code sits in that range.
- */
+// Close codes on the page link. The standard ones in use: 1001 (relay idle
+// timeout or shutdown), 1008 (malformed frame), 1009 (frame too large). Browsers
+// let page code send only 1000 and 3000 to 4999, so codes a page sends sit in the
+// 4000 range. Only CLOSE_DETACH ends a session at once; every other close leaves
+// the page asleep for the resume window (SPEC section 6, ADR 0007).
+
 /** The page detached on purpose; the relay ends its session at once instead of keeping it asleep. */
 export const CLOSE_DETACH = 4000;
 /** A newer socket resumed this page's session; the old socket must not reconnect. */
 export const CLOSE_REPLACED = 4001;
+/** The page heard nothing from the relay for too long and is reconnecting; its session stays resumable. */
+export const CLOSE_SILENT = 4002;
+/** The page received a malformed frame: the browser's stand-in for 1008, which page code cannot send. */
+export const CLOSE_INVALID_FRAME_PAGE = 4008;

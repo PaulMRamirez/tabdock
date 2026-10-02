@@ -49,8 +49,8 @@ export type PageTool = z.infer<typeof PageToolSchema>;
 
 /**
  * Page policy, sent in hello. consequentialTools is ADR 0002's option C
- * (provisional until the owner decides): tools the page declares consequential
- * even when the runtime drops consequentialHint.
+ * (accepted): tools the page declares consequential even when the runtime drops
+ * consequentialHint.
  */
 export const PolicySchema = z.object({
   autoApprove: z.enum(['none', 'observer']).default('none'),
