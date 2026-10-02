@@ -1,5 +1,7 @@
 # @tabdock/relay
 
-The Node service at the centre of Tabdock: a WebSocket endpoint at `/page` that pages dial out to, a Streamable HTTP MCP endpoint at `/mcp` for clients, pairing, auth plugins and the audit log (SPEC.md sections 4, 6 and 7). It only routes calls; it never runs page tools itself.
+The Node service at the centre of Tabdock (SPEC.md sections 4 to 7). Pages dial out to a WebSocket at `/page`; MCP clients reach the five fixed tools at `/mcp` over Streamable HTTP through the official MCP SDK v2; `/healthz` answers `ok`. The relay only routes calls and never runs page tools itself.
 
-Arrives in M1. Until then this directory holds only this note.
+Run it with `node packages/relay/src/main.ts` (or `pnpm --filter @tabdock/relay start`). It loads the repo-root `.env` when present and reads `TABDOCK_DEV_TOKENS` (required, `alice=<token>,bob=<token>`, tokens of 24 or more characters), `TABDOCK_HOST` (loopback only until M4 brings TLS), `TABDOCK_PORT` (default 8787), `TABDOCK_ENV` (`development` or `production`), `TABDOCK_ALLOWED_ORIGINS` (comma list; required in production; in development the default is http and https on localhost, 127.0.0.1 and [::1]) and `TABDOCK_DEV_ALLOW_NO_ORIGIN` (development only, lets a page socket without an Origin header in). It prints its URLs on stdout and JSON log lines on stderr, never a token or a code.
+
+In code, `createRelay(options)` starts one on a chosen or free port and returns its URLs, its audit log and `close()`. The layout: `relay.ts` (HTTP, upgrade checks, MCP mount), `hub.ts` (page sessions, pairing, attachments, calls), `mcp.ts` (the five tools), `store.ts` (storage interfaces and in-memory implementations), `auth.ts` (the auth plugin interface and dev-token), `secrets.ts` (ids, codes, digests), `config.ts`, `log.ts` and `rate-limit.ts`. Tests in `test/` drive it with a hand-written page client over `ws` and the SDK's own MCP client.
