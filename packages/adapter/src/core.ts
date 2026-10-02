@@ -519,14 +519,20 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     }
   }
 
-  /**
-   * The operator's approvals and denials (and any later local role change)
-   * go through here, so storage always matches memory.
-   */
-  function setGrant(userId: string, role: Role | null): void {
-    if (role === null) grants.delete(userId);
-    else grants.set(userId, role);
+  /** The operator's approvals go through here, so storage always matches memory. */
+  function setGrant(userId: string, role: Role): void {
+    grants.set(userId, role);
     saveGrants();
+  }
+
+  /**
+   * Withdraws the grants of users who are no longer attached, so coming back
+   * takes a fresh approval, as it does on the relay.
+   */
+  function pruneGrants(userIds: Iterable<string>): void {
+    let changed = false;
+    for (const userId of userIds) changed = grants.delete(userId) || changed;
+    if (changed) saveGrants();
   }
 
   function clearGrants(): void {
@@ -540,14 +546,17 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   /**
    * S5, second check: the least privileged of the operator's grant, the
    * relay's roster and the role the invoke claims. null means nobody approved
-   * this caller on this page. Under autoApprove 'observer' the relay attaches
-   * people without asking (S4), so a caller it lists counts as an observer.
+   * this caller on this page, or the relay no longer lists them as attached:
+   * the relay sends the roster before any call it routes, so a caller missing
+   * from it is one whose attachment ended, whatever grant is left. Under
+   * autoApprove 'observer' the relay attaches people without asking (S4), so
+   * a caller it lists counts as an observer.
    */
   function callerRole(caller: Caller): Role | null {
     const listed = state.roster.find((attachment) => attachment.userId === caller.userId)?.role;
+    if (listed === undefined) return null;
     const granted =
-      grants.get(caller.userId) ??
-      (policy.autoApprove === 'observer' && listed !== undefined ? 'observer' : undefined);
+      grants.get(caller.userId) ?? (policy.autoApprove === 'observer' ? 'observer' : undefined);
     if (granted === undefined) return null;
     return granted === 'observer' || listed === 'observer' || caller.role === 'observer'
       ? 'observer'
@@ -700,7 +709,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         onAttachRequest(frame);
         return;
       case 'roster':
-        setState({ roster: frame.attachments });
+        onRoster(frame.attachments);
         return;
       case 'pairing':
         setState({
@@ -728,8 +737,15 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     welcomed = true;
     attempt = 0;
     writeToken(frame.resumeToken);
-    // A new session, or a different page, starts with nobody approved.
-    if (!frame.resumed || grantsPage !== frame.pageId) grants.clear();
+    // A new session, or a different page, starts with nobody approved. A
+    // resumed one keeps the grants of users the relay still lists; the relay
+    // drops attach requests when a link ends, so no approval is in flight here.
+    const listed = new Set(frame.roster.map((attachment) => attachment.userId));
+    for (const userId of [...grants.keys()]) {
+      if (!frame.resumed || grantsPage !== frame.pageId || !listed.has(userId)) {
+        grants.delete(userId);
+      }
+    }
     grantsPage = frame.pageId;
     saveGrants();
     frameLimit = Math.max(MIN_FRAME_BYTES, Math.min(MAX_FRAME_BYTES, frame.limits.maxFrameBytes));
@@ -752,6 +768,20 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     lastToolsKey = null;
     void syncTools();
     schedulePoll();
+  }
+
+  /**
+   * Users the previous roster listed and this one leaves out have detached or
+   * been revoked, so their grants go (stored ones too). Users it never listed
+   * keep theirs: a roster sent for another reason can cross an approval the
+   * relay has not applied yet, and callerRole refuses them until it does.
+   */
+  function onRoster(attachments: readonly AttachmentView[]): void {
+    const listed = new Set(attachments.map((attachment) => attachment.userId));
+    pruneGrants(
+      state.roster.map((attachment) => attachment.userId).filter((userId) => !listed.has(userId)),
+    );
+    setState({ roster: attachments });
   }
 
   function onClose(code: number, reason: string): void {
@@ -1231,8 +1261,12 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     setState({
       pendingRequests: state.pendingRequests.filter((item) => item.requestId !== requestId),
     });
-    // A denial, including silence, also withdraws any earlier grant: the operator said no.
-    setGrant(record.request.user.userId, allow && role !== undefined ? role : null);
+    // The first approval wins, as on the relay, which keeps an existing
+    // attachment as it is (role changes are set_role's job, from M2). A denial,
+    // or silence, answers only this request: it leaves an existing grant alone,
+    // since the relay keeps that user attached; withdrawing access is revoke's job.
+    const { userId } = record.request.user;
+    if (allow && role !== undefined && !grants.has(userId)) setGrant(userId, role);
     const who = record.request.user.displayName;
     log.info(allow ? `allowed ${who} as ${String(role)}` : `denied ${who}`);
     return send({

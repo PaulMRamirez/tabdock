@@ -17,6 +17,12 @@ export interface PageRecord {
   adapterVersion: string;
   policy: Policy;
   tools: PageTool[];
+  /**
+   * True from a resume until the adapter's first tools frame: until then the
+   * relay cannot tell a missing tool from one not listed yet, so calls answer
+   * page_asleep (try again) instead of tool_not_found. tools is empty meanwhile.
+   */
+  toolsPending: boolean;
   state: PageState;
   /** SHA-256 of the current resume token, hex. Empty once the page is gone. */
   resumeTokenHash: string;

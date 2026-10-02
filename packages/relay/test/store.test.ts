@@ -15,6 +15,7 @@ function pageRecord(pageId: string, resumeTokenHash: string): PageRecord {
       consequentialTools: [],
     },
     tools: [],
+    toolsPending: false,
     state: 'awake',
     resumeTokenHash,
     connectedAt: 0,

@@ -220,6 +220,64 @@ describe('pair_page (A1.4, S3, S4)', () => {
     });
   });
 
+  it('a second device of the same user waits on the pending request, and one approval answers both', async () => {
+    await setup();
+    const opened = await page();
+    const laptop = await client();
+    const phone = await client(ALICE);
+    const used = opened.code;
+    const first = callTool(laptop, 'pair_page', { code: used });
+    const request = await opened.next('attach_request');
+    const fresh = (await opened.next('pairing')).code;
+    // The same code again is spent, so it adds nothing to the page.
+    expect(await callTool(phone, 'pair_page', { code: used })).toMatchObject({
+      isError: true,
+      text: EXPIRED,
+    });
+    // A fresh code is used up too, but joins the request the operator already sees.
+    const second = callTool(phone, 'pair_page', { code: fresh });
+    await opened.next('pairing');
+    await opened.sync();
+    expect(opened.all('attach_request')).toHaveLength(1);
+    opened.send({
+      t: 'attach_decision',
+      requestId: request.requestId,
+      allow: true,
+      role: 'driver',
+    });
+    const answers = await Promise.all([first, second]);
+    for (const answer of answers) {
+      expect(answer.isError, answer.text).toBe(false);
+      expect(answer.structured).toEqual({
+        page: opened.pageId,
+        origin: 'http://localhost:5173',
+        role: 'driver',
+      });
+    }
+    await opened.sync();
+    expect(opened.all('attach_request')).toHaveLength(1);
+    expect(opened.all('roster').at(-1)?.attachments).toMatchObject([{ userId: 'alice' }]);
+  });
+
+  it('a retry after the wait ran out waits on the same request instead of sending another', async () => {
+    await setup({ timings: { pairWaitMs: 500, attachRequestTtlMs: 5000 } });
+    const opened = await page();
+    const alice = await client();
+    const first = await callTool(alice, 'pair_page', { code: opened.code });
+    expect(first.text).toMatch(/^timeout: the operator has not answered yet/);
+    const request = await opened.next('attach_request');
+    await opened.next('pairing');
+    const retry = callTool(alice, 'pair_page', { code: opened.code });
+    await opened.next('pairing');
+    await opened.sync();
+    expect(opened.all('attach_request')).toHaveLength(1);
+    opened.send({ t: 'attach_decision', requestId: request.requestId, allow: false });
+    expect(await retry).toMatchObject({
+      isError: true,
+      text: 'denied_by_operator: the page operator denied the attach request',
+    });
+  });
+
   it('silence past the request lifetime means deny, and a late decision is ignored', async () => {
     await setup({ timings: { pairWaitMs: 2000, attachRequestTtlMs: 150 } });
     const opened = await page();

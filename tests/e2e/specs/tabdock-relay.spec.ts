@@ -14,6 +14,7 @@ import {
   waitForDock,
   waitForLink,
   widgetButtonCentre,
+  widgetButtonNow,
   widgetText,
   widgetVisible,
   type Tabdock,
@@ -236,23 +237,23 @@ test('a prompt that arrives as the operator clicks cannot take a click meant for
     codesSeen.add(nextCode);
     const bobAsks = callTool(bob, 'pair_page', { code: nextCode });
     await page.waitForFunction(() => window.__tabdockDock?.state.pendingRequests.length === 2);
-    await page.mouse.click(aim.x, aim.y);
-
-    // Inside the arming window the click does nothing at all; in particular Bob is not approved.
-    const state = await dockState(page);
-    expect(state?.pendingRequests.map((r) => r.user.userId).sort()).toEqual(['alice', 'bob']);
-    expect(state?.roster).toEqual([]);
-    // New prompts go on top, so once armed the same spot is still Alice's button.
-    const again = await widgetButtonCentre(page, { action: 'approve-driver', requestId: first });
-    expect([Math.round(again.x), Math.round(again.y)]).toEqual([
+    const second =
+      (await dockState(page))?.pendingRequests.find((r) => r.user.userId === 'bob')?.requestId ??
+      '';
+    // New prompts go on top, so Alice's button has not moved and stays armed:
+    // each box waits only after it appears or moves itself.
+    const now = await widgetButtonNow(page, { action: 'approve-driver', requestId: first });
+    expect(now?.armed).toBe(true);
+    expect([Math.round(now?.x ?? 0), Math.round(now?.y ?? 0)]).toEqual([
       Math.round(aim.x),
       Math.round(aim.y),
     ]);
+    await page.mouse.click(aim.x, aim.y);
 
-    await page.mouse.click(again.x, again.y);
+    // The click lands where it was aimed: Alice is approved, and Bob is not.
     const alice = await aliceAsks;
     expect(alice.structured).toMatchObject({ role: 'driver' });
-    const second = state?.pendingRequests.find((r) => r.user.userId === 'bob')?.requestId ?? '';
+    expect((await dockState(page))?.pendingRequests.map((r) => r.requestId)).toEqual([second]);
     await clickInWidget(page, { action: 'deny', requestId: second });
     expect(errorCode(await bobAsks)).toBe('denied_by_operator');
     await expect

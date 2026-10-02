@@ -15,10 +15,14 @@ import type { Dock, DockState, LinkState, PendingConfirm, PendingRequest } from 
 const HOST_TAG = 'tabdock-dock';
 
 /**
- * Prompt buttons ignore clicks for this long after the panel's layout changes
- * (a prompt arriving or going, the roster or pairing block resizing), so a
- * click aimed at one button never lands on another that just moved under the
- * pointer. data-armed shows the state, for people and for browser tests.
+ * A prompt box's buttons ignore clicks until the box has held still this long
+ * since it appeared or last moved, so a click aimed at one button never lands
+ * on another that just slid under the pointer. Each box is measured rather
+ * than guessed at: the relay controls text that can shift it (a roster name
+ * that wraps, a longer pairing code, an error), and the panel can scroll.
+ * Boxes are timed one by one, so prompts arriving on top, which move nothing
+ * below them, never keep an older prompt disarmed. data-armed shows the
+ * state, for people and for browser tests.
  */
 const ARM_DELAY_MS = 500;
 
@@ -75,10 +79,36 @@ li { padding: 2px 0; }
 }
 `;
 
+interface BoxRect {
+  readonly top: number;
+  readonly left: number;
+  readonly width: number;
+  readonly height: number;
+}
+
 interface PromptView {
   readonly element: HTMLElement;
   readonly countdown: HTMLElement;
   readonly expiresAt: number;
+  /** Where the box was when it appeared or last moved; null until first measured. */
+  rect: BoxRect | null;
+  armed: boolean;
+  timer: ReturnType<typeof setTimeout> | undefined;
+}
+
+function measure(box: HTMLElement): BoxRect {
+  const { top, left, width, height } = box.getBoundingClientRect();
+  return { top, left, width, height };
+}
+
+function sameRect(a: BoxRect | null, b: BoxRect): boolean {
+  return (
+    a !== null &&
+    a.top === b.top &&
+    a.left === b.left &&
+    a.width === b.width &&
+    a.height === b.height
+  );
 }
 
 function secondsLeft(expiresAt: number): number {
@@ -105,32 +135,83 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     return node;
   }
 
-  /** Whether prompt buttons take clicks; see ARM_DELAY_MS. */
-  let armed = false;
-  let armTimer: ReturnType<typeof setTimeout> | undefined;
+  const requestViews = new Map<string, PromptView>();
+  const confirmViews = new Map<string, PromptView>();
 
-  /** prompt marks a button inside a prompt box, which only works while armed. */
-  function button(
+  function button(label: string, action: string, onClick: () => void, primary = false) {
+    const node = element('button', primary ? 'action primary' : 'action', label);
+    node.type = 'button';
+    node.dataset.action = action;
+    node.addEventListener('click', (event) => {
+      // Page script can dispatch a click, but never a trusted one.
+      if (!event.isTrusted) return;
+      onClick();
+    });
+    return node;
+  }
+
+  function setArmed(view: PromptView, value: boolean): void {
+    view.armed = value;
+    for (const node of view.element.querySelectorAll('button')) {
+      node.dataset.armed = String(value);
+      node.setAttribute('aria-disabled', String(!value));
+    }
+  }
+
+  /** Records where the box is now and disarms it until it has stayed there for ARM_DELAY_MS. */
+  function restartArming(view: PromptView): void {
+    clearTimeout(view.timer);
+    view.rect = measure(view.element);
+    setArmed(view, false);
+    view.timer = setTimeout(() => {
+      // A move nobody noticed in between starts the wait again.
+      if (sameRect(view.rect, measure(view.element))) setArmed(view, true);
+      else restartArming(view);
+    }, ARM_DELAY_MS);
+  }
+
+  /** Restarts the wait of every box that is new or no longer where it was. */
+  function checkMoves(): void {
+    for (const view of [...requestViews.values(), ...confirmViews.values()]) {
+      if (!sameRect(view.rect, measure(view.element))) restartArming(view);
+    }
+  }
+
+  /** A button inside a prompt box, which only takes a click while its box is armed. */
+  function promptButton(
+    view: PromptView,
     label: string,
     action: string,
     onClick: () => void,
     primary = false,
-    prompt = false,
   ) {
-    const node = element('button', primary ? 'action primary' : 'action', label);
-    node.type = 'button';
-    node.dataset.action = action;
-    if (prompt) {
-      node.dataset.armed = String(armed);
-      node.setAttribute('aria-disabled', String(!armed));
-    }
-    node.addEventListener('click', (event) => {
-      // Page script can dispatch a click, but never a trusted one.
-      if (!event.isTrusted) return;
-      if (prompt && !armed) return;
-      onClick();
-    });
+    const node = button(
+      label,
+      action,
+      () => {
+        // Checked again here, as a shift may land between the last check and the click.
+        if (!view.armed || !sameRect(view.rect, measure(view.element))) {
+          restartArming(view);
+          return;
+        }
+        onClick();
+      },
+      primary,
+    );
+    node.dataset.armed = String(view.armed);
+    node.setAttribute('aria-disabled', String(!view.armed));
     return node;
+  }
+
+  function newView(box: HTMLElement, expiresAt: number): PromptView {
+    return {
+      element: box,
+      countdown: element('p', 'muted'),
+      expiresAt,
+      rect: null,
+      armed: false,
+      timer: undefined,
+    };
   }
 
   const style = element('style');
@@ -172,12 +253,11 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   wrap.append(panel, badge);
   root.append(style, wrap);
 
-  const requestViews = new Map<string, PromptView>();
-  const confirmViews = new Map<string, PromptView>();
-
   function setOpen(open: boolean): void {
     panel.hidden = !open;
     badge.setAttribute('aria-expanded', String(open));
+    // Opening moves every box from nowhere onto the screen, so each waits from now.
+    checkMoves();
   }
 
   function requestView(request: PendingRequest): PromptView {
@@ -188,75 +268,57 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     if (request.client) {
       box.append(element('p', 'muted', `Client: ${request.client.name} ${request.client.version}`));
     }
+    const view = newView(box, request.expiresAt);
     const buttons = element('div', 'buttons');
     buttons.append(
-      button(
-        'Allow as driver',
-        'approve-driver',
-        () => {
-          dock.approve(request.requestId, 'driver');
-        },
-        false,
-        true,
-      ),
-      button(
-        'Allow as observer',
-        'approve-observer',
-        () => {
-          dock.approve(request.requestId, 'observer');
-        },
-        false,
-        true,
-      ),
-      button(
+      promptButton(view, 'Allow as driver', 'approve-driver', () => {
+        dock.approve(request.requestId, 'driver');
+      }),
+      promptButton(view, 'Allow as observer', 'approve-observer', () => {
+        dock.approve(request.requestId, 'observer');
+      }),
+      promptButton(
+        view,
         'Deny',
         'deny',
         () => {
           dock.deny(request.requestId);
         },
         true,
-        true,
       ),
     );
-    const countdown = element('p', 'muted');
-    box.append(buttons, countdown);
-    return { element: box, countdown, expiresAt: request.expiresAt };
+    box.append(buttons, view.countdown);
+    return view;
   }
 
   function confirmView(confirm: PendingConfirm): PromptView {
     const box = element('div', 'prompt');
     box.dataset.callId = confirm.callId;
     box.append(element('p', '', `${confirm.caller.displayName} wants to run ${confirm.tool}`));
+    const view = newView(box, confirm.expiresAt);
     const buttons = element('div', 'buttons');
     buttons.append(
-      button(
-        'Allow',
-        'confirm-allow',
-        () => {
-          dock.confirm(confirm.callId, true);
-        },
-        false,
-        true,
-      ),
-      button(
+      promptButton(view, 'Allow', 'confirm-allow', () => {
+        dock.confirm(confirm.callId, true);
+      }),
+      promptButton(
+        view,
         'Deny',
         'confirm-deny',
         () => {
           dock.confirm(confirm.callId, false);
         },
         true,
-        true,
       ),
     );
-    const countdown = element('p', 'muted');
-    box.append(buttons, countdown);
-    return { element: box, countdown, expiresAt: confirm.expiresAt };
+    box.append(buttons, view.countdown);
+    return view;
   }
 
   /**
    * Adds and removes prompt boxes by id, so a box under the operator's pointer
    * is never rebuilt. New boxes go on top: the panel is pinned at the bottom of
-   * the screen, so the boxes already shown keep their place.
+   * the screen, so the boxes already shown keep their place (and stay armed).
    */
   function syncPrompts<T>(
     views: Map<string, PromptView>,
@@ -268,6 +330,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const live = new Set(items.map(key));
     for (const [id, view] of views) {
       if (!live.has(id)) {
+        clearTimeout(view.timer);
         view.element.remove();
         views.delete(id);
       }
@@ -283,27 +346,8 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     return added;
   }
 
-  function setArmed(value: boolean): void {
-    armed = value;
-    for (const node of prompts.querySelectorAll('button')) {
-      node.dataset.armed = String(value);
-      node.setAttribute('aria-disabled', String(!value));
-    }
-  }
-
-  /** Disarms every prompt button now and arms them again once the layout has held still. */
-  function rearm(): void {
-    clearTimeout(armTimer);
-    setArmed(false);
-    armTimer = setTimeout(() => {
-      setArmed(true);
-    }, ARM_DELAY_MS);
-  }
-
-  /** What decides where the prompt buttons sit; when it changes, they may have moved. */
-  let layoutKey = '';
-  /** Whether the page was last waiting for its first attachment; see render. */
-  let awaitingFirst = false;
+  /** Whether the panel has opened by itself to show the code since anyone was last attached; see render. */
+  let codeShown = false;
 
   function tick(): void {
     for (const view of requestViews.values()) {
@@ -318,6 +362,8 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       expiry.textContent =
         left > 0 ? `Expires in ${clockText(left)}` : 'Expired, waiting for a new code';
     }
+    // Catches shifts no state change caused, such as a resized window or a scrolled panel.
+    checkMoves();
   }
 
   function render(state: DockState): void {
@@ -361,21 +407,16 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     // A new prompt opens the panel: the operator has a deadline to meet.
     if (newRequest || newConfirm) setOpen(true);
     // The code is how anyone attaches, so show it without a click while nobody has.
-    // Only on the way in, so the badge can still close the panel.
-    const awaiting = state.link === 'linked' && state.pairing !== null && state.roster.length === 0;
-    if (awaiting && !awaitingFirst) setOpen(true);
-    awaitingFirst = awaiting;
-    const layout = [
-      [...requestViews.keys(), ...confirmViews.keys()].join(','),
-      state.roster.length,
-      pairing.hidden,
-      errorLine.hidden,
-      noticeLine.hidden,
-    ].join('|');
-    if (layout !== layoutKey) {
-      layoutKey = layout;
-      rearm();
+    // Only once on the way in, so the badge can still close the panel: a link that
+    // drops and resumes with nobody attached leaves the panel as the operator left it.
+    // Once someone has attached, the next time nobody is counts as a new way in.
+    if (state.roster.length > 0) {
+      codeShown = false;
+    } else if (state.link === 'linked' && state.pairing !== null && !codeShown) {
+      codeShown = true;
+      setOpen(true);
     }
+    // After every change the relay or the page made above, which may have moved the boxes.
     tick();
   }
 
@@ -388,7 +429,9 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     mounted = false;
     unsubscribe();
     clearInterval(interval);
-    clearTimeout(armTimer);
+    for (const view of [...requestViews.values(), ...confirmViews.values()]) {
+      clearTimeout(view.timer);
+    }
     host.remove();
   }
 

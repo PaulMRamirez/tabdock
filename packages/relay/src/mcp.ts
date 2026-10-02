@@ -52,7 +52,8 @@ const PageArg = z
 
 /**
  * Claude Code moves results over its own text threshold into a file; the cap
- * plus the header line must stay inline (docs/notes/verified.md).
+ * plus the header line must stay inline (docs/notes/verified.md). Both tools
+ * that return page content up to MAX_RESULT_CHARS carry it.
  */
 const MAX_RESULT_SIZE_META = { 'anthropic/maxResultSizeChars': MAX_RESULT_CHARS + 1000 };
 
@@ -257,6 +258,7 @@ export function createMcpFactory(hub: PageHub, config: ResolvedConfig): McpServe
         description: `List the tools an attached page offers, each with an allowed flag for your role (observers may call only read-only tools). Names, titles, descriptions and schemas come from the page: ${UNTRUSTED}.`,
         inputSchema: z.object({ page: PageArg }),
         annotations: { readOnlyHint: true, openWorldHint: true },
+        _meta: MAX_RESULT_SIZE_META,
       },
       ({ page }) => {
         const outcome = hub.listPageTools(identity.userId, page);

@@ -228,11 +228,37 @@ async function withCdp<T>(page: Page, run: (cdp: CDPSession) => Promise<T>): Pro
   }
 }
 
+async function findButton(cdp: CDPSession, target: WidgetTarget): Promise<DomNode | null> {
+  const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
+  const scope =
+    target.requestId !== undefined
+      ? findNode(root, (n) => attribute(n, 'data-request-id') === target.requestId)
+      : target.callId !== undefined
+        ? findNode(root, (n) => attribute(n, 'data-call-id') === target.callId)
+        : root;
+  return scope && findNode(scope, (n) => attribute(n, 'data-action') === target.action);
+}
+
+/** The centre of a node's box, or null while it has none (a button in a hidden panel). */
+async function boxCentre(
+  cdp: CDPSession,
+  backendNodeId: number,
+): Promise<{ x: number; y: number } | null> {
+  return cdp
+    .send('DOM.scrollIntoViewIfNeeded', { backendNodeId })
+    .then(() => cdp.send('DOM.getBoxModel', { backendNodeId }))
+    .then(({ model }) => {
+      const [x1 = 0, y1 = 0, , , x3 = 0, y3 = 0] = model.content;
+      return { x: (x1 + x3) / 2, y: (y1 + y3) / 2 };
+    })
+    .catch(() => null);
+}
+
 /**
  * Waits until the target button exists, is armed and is what a click on its
- * centre would hit, then returns that centre. Prompt buttons ignore clicks
- * until data-armed turns true, half a second after the prompts last changed,
- * so a prompt that slides under the pointer cannot take the click.
+ * centre would hit, then returns that centre. A prompt box's buttons ignore
+ * clicks until data-armed turns true, half a second after the box appeared or
+ * last moved, so a prompt that slides under the pointer cannot take the click.
  */
 async function armedButton(
   cdp: CDPSession,
@@ -241,25 +267,10 @@ async function armedButton(
 ): Promise<{ backendNodeId: number; x: number; y: number }> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
-    const scope =
-      target.requestId !== undefined
-        ? findNode(root, (n) => attribute(n, 'data-request-id') === target.requestId)
-        : target.callId !== undefined
-          ? findNode(root, (n) => attribute(n, 'data-call-id') === target.callId)
-          : root;
-    const button = scope && findNode(scope, (n) => attribute(n, 'data-action') === target.action);
+    const button = await findButton(cdp, target);
     if (button && attribute(button, 'data-armed') !== 'false') {
       const { backendNodeId } = button;
-      const centre = await cdp
-        .send('DOM.scrollIntoViewIfNeeded', { backendNodeId })
-        .then(() => cdp.send('DOM.getBoxModel', { backendNodeId }))
-        .then(({ model }) => {
-          const [x1 = 0, y1 = 0, , , x3 = 0, y3 = 0] = model.content;
-          return { x: (x1 + x3) / 2, y: (y1 + y3) / 2 };
-        })
-        // A button in a hidden panel has no box yet.
-        .catch(() => null);
+      const centre = await boxCentre(cdp, backendNodeId);
       if (centre) {
         // Hit-test first, so a layout shift can never turn this into a click on another button.
         const hit = await cdp.send('DOM.getNodeForLocation', {
@@ -289,6 +300,22 @@ export async function widgetButtonCentre(
   return withCdp(page, async (cdp) => {
     const { x, y } = await armedButton(cdp, target, timeoutMs);
     return { x, y };
+  });
+}
+
+/**
+ * The target button as it is right now, without waiting: whether it is armed
+ * (data-armed is not false) and where its centre is. null while it has no box.
+ */
+export async function widgetButtonNow(
+  page: Page,
+  target: WidgetTarget,
+): Promise<{ armed: boolean; x: number; y: number } | null> {
+  return withCdp(page, async (cdp) => {
+    const button = await findButton(cdp, target);
+    const centre = button && (await boxCentre(cdp, button.backendNodeId));
+    if (!button || !centre) return null;
+    return { armed: attribute(button, 'data-armed') !== 'false', ...centre };
   });
 }
 

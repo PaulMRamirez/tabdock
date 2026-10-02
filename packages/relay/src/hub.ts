@@ -172,24 +172,72 @@ export const MAX_SCHEMA_CHARS = 8192;
  * a few thousand levels deep would break every listing that serialises it.
  */
 export const MAX_SCHEMA_DEPTH = 64;
-/** Schema keys whose string values are page-written prose, cut like tool descriptions (S10). */
+/**
+ * Schema keywords that clients show as prose. A string there is cut like any
+ * other; anything else is replaced, because an array or object there would put
+ * several capped strings into what a client shows as one description (S10).
+ */
 const SCHEMA_TEXT_KEYS = new Set(['description', 'title']);
+/**
+ * Keywords whose value maps names (property names, definition names, patterns)
+ * to schemas: a "title" key in there is a property called title, not prose, and
+ * must keep its schema.
+ */
+const SCHEMA_NAME_MAP_KEYS = new Set([
+  'properties',
+  'patternProperties',
+  '$defs',
+  'definitions',
+  'dependentSchemas',
+  'dependentRequired',
+  'dependencies',
+]);
+/** Keywords whose value is instance data, where keys mean nothing to JSON Schema. */
+const SCHEMA_DATA_KEYS = new Set(['enum', 'const', 'default', 'examples']);
+
+/** What a value is to JSON Schema, so keyword rules apply only where keys are keywords. */
+type SchemaPosition = 'schema' | 'names' | 'data';
 
 class SchemaTooDeep extends Error {}
+class SchemaKeyTooLong extends Error {}
 
-function cutSchemaText(value: unknown, depth: number): unknown {
+/**
+ * Every string anywhere in a schema is page text: enum values, defaults,
+ * examples, patterns and comments reach the model as surely as descriptions do,
+ * so all of them are cut to the description cap (S10).
+ */
+function cutSchemaText(value: unknown, depth: number, position: SchemaPosition): unknown {
   if (depth > MAX_SCHEMA_DEPTH) throw new SchemaTooDeep();
-  if (Array.isArray(value)) return value.map((item) => cutSchemaText(item, depth + 1));
+  if (typeof value === 'string') return truncate(value, MAX_DESCRIPTION_CHARS).text;
+  if (Array.isArray(value)) return value.map((item) => cutSchemaText(item, depth + 1, position));
   if (typeof value !== 'object' || value === null) return value;
   // fromEntries defines own properties, so a "__proto__" key stays a plain key.
   return Object.fromEntries(
-    Object.entries(value).map(([key, item]) => [
-      key,
-      SCHEMA_TEXT_KEYS.has(key) && typeof item === 'string'
-        ? truncate(item, MAX_DESCRIPTION_CHARS).text
-        : cutSchemaText(item, depth + 1),
-    ]),
+    Object.entries(value).map(([key, item]) => {
+      // A key cannot be cut without changing what it names, so a long one removes the schema.
+      if (key.length > MAX_DESCRIPTION_CHARS) throw new SchemaKeyTooLong();
+      return [key, cutSchemaEntry(key, item, depth + 1, position)];
+    }),
   );
+}
+
+function cutSchemaEntry(
+  key: string,
+  item: unknown,
+  depth: number,
+  position: SchemaPosition,
+): unknown {
+  if (position === 'names') return cutSchemaText(item, depth, 'schema');
+  if (position === 'data') return cutSchemaText(item, depth, 'data');
+  if (SCHEMA_TEXT_KEYS.has(key) && typeof item !== 'string') {
+    return `[tabdock: non-string ${key} removed]`;
+  }
+  const next = SCHEMA_NAME_MAP_KEYS.has(key)
+    ? 'names'
+    : SCHEMA_DATA_KEYS.has(key)
+      ? 'data'
+      : 'schema';
+  return cutSchemaText(item, depth, next);
 }
 
 function removedSchema(why: string): JsonObject {
@@ -198,15 +246,21 @@ function removedSchema(why: string): JsonObject {
 
 /**
  * Page text in a schema is capped like a description (S10), and a schema too
- * big or too deep to pass along is replaced by a stub that says so (S9).
+ * big or too deep to pass along, or with a key too long to pass, is replaced by
+ * a stub that says so (S9).
  */
 function cutSchema(schema: JsonObject): JsonObject {
   let cut: JsonObject;
   try {
-    cut = cutSchemaText(schema, 0) as JsonObject;
+    cut = cutSchemaText(schema, 0, 'schema') as JsonObject;
   } catch (error) {
-    if (!(error instanceof SchemaTooDeep)) throw error;
-    return removedSchema(`nested more than ${String(MAX_SCHEMA_DEPTH)} levels deep`);
+    if (error instanceof SchemaTooDeep) {
+      return removedSchema(`nested more than ${String(MAX_SCHEMA_DEPTH)} levels deep`);
+    }
+    if (error instanceof SchemaKeyTooLong) {
+      return removedSchema(`a key longer than ${String(MAX_DESCRIPTION_CHARS)} characters`);
+    }
+    throw error;
   }
   const size = JSON.stringify(cut).length;
   return size > MAX_SCHEMA_CHARS ? removedSchema(`${String(size)} characters`) : cut;
@@ -231,7 +285,8 @@ export class PageHub {
   /** asleep to gone, then gone to forgotten. */
   readonly #lifecycleTimers = new Map<string, NodeJS.Timeout>();
   readonly #requestTimers = new Map<string, NodeJS.Timeout>();
-  readonly #pairWaiters = new Map<string, (outcome: PairOutcome) => void>();
+  /** Every pair_page waiting on a request, by requestId: a retry or a second device joins the first. */
+  readonly #pairWaiters = new Map<string, Set<(outcome: PairOutcome) => void>>();
   readonly #userLimiter: SlidingWindowLimiter;
   readonly #addressLimiter: SlidingWindowLimiter;
   #closed = false;
@@ -384,6 +439,11 @@ export class PageHub {
         this.#dropRequests(page.pageId);
       }
       this.#clearTimer(this.#lifecycleTimers, page.pageId);
+      // The adapter lists its tools again right after the welcome. Until then any
+      // held here belong to a replaced socket, and a toolCount from them would
+      // tell list_pages callers the page is ready while calls still wait.
+      page.tools = [];
+      page.toolsPending = true;
       page.title = frame.title;
       page.url = frame.url;
       page.adapterVersion = frame.adapterVersion;
@@ -399,6 +459,7 @@ export class PageHub {
         adapterVersion: frame.adapterVersion,
         policy: frame.policy,
         tools: [],
+        toolsPending: false,
         state: 'awake',
         resumeTokenHash: '',
         connectedAt: now,
@@ -472,6 +533,7 @@ export class PageHub {
       this.#log.warn('page listed a tool name twice; kept the first', { pageId });
     }
     page.tools = tools;
+    page.toolsPending = false;
     this.#store.pages.put(page);
     this.#log.debug('page tools updated', { pageId, toolCount: tools.length });
   }
@@ -710,7 +772,7 @@ export class PageHub {
   #endRequest(requestId: string, outcome: PairOutcome): void {
     this.#store.requests.delete(requestId);
     this.#clearTimer(this.#requestTimers, requestId);
-    this.#pairWaiters.get(requestId)?.(outcome);
+    for (const waiter of [...(this.#pairWaiters.get(requestId) ?? [])]) waiter(outcome);
   }
 
   // Calls
@@ -797,6 +859,12 @@ export class PageHub {
     if (attachment && page) {
       const conn = this.#live.get(pageId);
       if (page.state === 'awake' && conn && !conn.closing) {
+        if (page.toolsPending) {
+          return hubError(
+            'page_asleep',
+            'the page is reconnecting and its tools are not listed yet; try again in a moment',
+          );
+        }
         return { kind: 'ok', page, attachment, conn };
       }
       return hubError(
@@ -894,6 +962,21 @@ export class PageHub {
       };
     }
 
+    // One person has at most one request per page. A retry after the wait ran
+    // out, or the same person on a second device, waits on the request the
+    // operator already sees, so the page never gets duplicates to answer.
+    const pending = this.#store.requests
+      .listForPage(page.pageId)
+      .find((candidate) => candidate.userId === caller.userId);
+    if (pending) {
+      this.#log.info('pair_page joined a pending attach request', {
+        pageId: pending.pageId,
+        userId: pending.userId,
+        requestId: pending.requestId,
+      });
+      return this.#waitForDecision(pending, signal);
+    }
+
     const { attachRequestTtlMs } = this.#config.timings;
     const record: AttachRequestRecord = {
       ...request,
@@ -934,9 +1017,9 @@ export class PageHub {
       const finish = (outcome: PairOutcome): void => {
         clearTimeout(timer);
         signal.removeEventListener('abort', onAbort);
-        if (this.#pairWaiters.get(record.requestId) === finish) {
-          this.#pairWaiters.delete(record.requestId);
-        }
+        const waiters = this.#pairWaiters.get(record.requestId);
+        waiters?.delete(finish);
+        if (waiters?.size === 0) this.#pairWaiters.delete(record.requestId);
         resolve(outcome);
       };
       // Past the wait the request stays open (ADR 0005): a late approval still attaches.
@@ -954,7 +1037,12 @@ export class PageHub {
           hubError('timeout', 'the client stopped waiting; the request stays open on the page'),
         );
       };
-      this.#pairWaiters.set(record.requestId, finish);
+      let waiters = this.#pairWaiters.get(record.requestId);
+      if (!waiters) {
+        waiters = new Set();
+        this.#pairWaiters.set(record.requestId, waiters);
+      }
+      waiters.add(finish);
       if (signal.aborted) onAbort();
       else signal.addEventListener('abort', onAbort, { once: true });
     });
@@ -1178,7 +1266,7 @@ export class PageHub {
   /** Cancels everything in flight, closes every page socket and stops every timer. */
   async shutdown(): Promise<void> {
     this.#closed = true;
-    for (const waiter of [...this.#pairWaiters.values()]) {
+    for (const waiter of [...this.#pairWaiters.values()].flatMap((waiters) => [...waiters])) {
       waiter(hubError('timeout', 'the relay is shutting down'));
     }
     const closing: Promise<void>[] = [];

@@ -377,7 +377,9 @@ export function welcome(clock: ManualClock, overrides: Partial<WelcomeFrame> = {
  * Starts the core, accepts its socket and welcomes it, then has the operator
  * approve each user in `grants` through the Dock, the way a real attachment
  * starts. Alice, the default caller of invoke(), is a driver unless a test
- * says otherwise; pass {} for a page nobody has approved.
+ * says otherwise; pass {} for a page nobody has approved. The welcome roster
+ * lists every granted user, after any the overrides list, because the adapter
+ * runs nothing for a caller the relay does not list as attached.
  */
 export async function link(
   harness: Harness,
@@ -387,7 +389,11 @@ export async function link(
   harness.core.start();
   const socket = harness.socket();
   socket.accept();
-  socket.deliver(welcome(harness.clock, overrides));
+  const roster = [...(overrides.roster ?? [])];
+  for (const [userId, role] of Object.entries(grants)) {
+    if (!roster.some((entry) => entry.userId === userId)) roster.push(attachment(userId, role));
+  }
+  socket.deliver(welcome(harness.clock, { ...overrides, roster }));
   await flush();
   for (const [userId, role] of Object.entries(grants)) {
     grant(harness, socket, userId, role);

@@ -502,17 +502,99 @@ describe('roles and consequential tools', () => {
       expect(h.context.runs.map((run) => run.tool)).toEqual(['get_value']);
     });
 
-    it('lets a denial, or silence, withdraw an earlier grant', async () => {
+    // The relay keeps a user's first attachment whatever a later request from
+    // them gets, so the grant must too, or every call of theirs fails.
+    const storedGrants = (h: ReturnType<typeof setup>) =>
+      JSON.parse(h.storage.getItem(GRANTS_KEY) ?? 'null') as unknown;
+
+    it('keeps an existing grant when the operator denies a second request from the user', async () => {
       const h = setup();
       const socket = await link(h, {}, { bob: 'driver' });
-      socket.deliver({
-        ...attachRequest(h.clock, 'req-2'),
-        user: { userId: 'bob', displayName: 'Bob' },
-      });
+      socket.deliver(attachRequest(h.clock, 'req-2'));
       expect(h.dock.deny('req-2')).toBe(true);
+      socket.deliver(invoke('set_value', { caller: bob() }));
+      await flush();
+      expect(codes(socket)).toEqual(['ok']);
+      expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: 'driver' } });
+    });
+
+    it('keeps an existing grant when a second request from the user goes unanswered', async () => {
+      const h = setup();
+      // A relay this quiet would otherwise count as gone before the minute is up.
+      const socket = await link(
+        h,
+        { limits: { ...welcome(h.clock).limits, idleTimeoutMs: 600_000 } },
+        { bob: 'driver' },
+      );
+      socket.deliver(attachRequest(h.clock, 'req-2'));
+      await h.clock.advance(60_000);
+      expect(socket.last()).toEqual({ t: 'attach_decision', requestId: 'req-2', allow: false });
+      socket.deliver(invoke('set_value', { caller: bob() }));
+      await flush();
+      expect(codes(socket)).toEqual(['ok']);
+      expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: 'driver' } });
+    });
+
+    it('keeps the first role when a second request from the user is approved as another', async () => {
+      const h = setup();
+      const socket = await link(h, {}, { bob: 'observer' });
+      socket.deliver(attachRequest(h.clock, 'req-2'));
+      expect(h.dock.approve('req-2', 'driver')).toBe(true);
+      socket.deliver(invoke('set_value', { caller: bob() }));
+      await flush();
+      expect(codes(socket)).toEqual(['role_denied']);
+      expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: 'observer' } });
+    });
+
+    it('leaves a user whose first request the operator denied with no grant', async () => {
+      const h = setup();
+      // The relay lists Bob anyway; only an approval on the page counts.
+      const socket = await link(h, { roster: [attachment('bob', 'driver')] }, {});
+      socket.deliver(attachRequest(h.clock));
+      expect(h.dock.deny('req-1')).toBe(true);
       socket.deliver(invoke('get_value', { caller: bob() }));
       await flush();
       expect(codes(socket)).toEqual(['role_denied']);
+      expect(h.storage.getItem(GRANTS_KEY)).toBeNull();
+    });
+
+    it('drops the grant of a user the roster stops listing, so coming back needs a new approval', async () => {
+      const h = setup();
+      const socket = await link(h);
+      // Alice detached (detach_page), so the relay's next roster leaves her out.
+      socket.deliver({ t: 'roster', attachments: [] });
+      expect(h.storage.getItem(GRANTS_KEY)).toBeNull();
+      socket.deliver(invoke('set_value'));
+      await flush();
+      // A relay that lists her again without asking the operator gets nothing either.
+      socket.deliver({ t: 'roster', attachments: [attachment('alice', 'driver')] });
+      socket.deliver(invoke('set_value', { callId: 'call-2' }));
+      await flush();
+      expect(codes(socket)).toEqual(['role_denied', 'role_denied']);
+      expect(h.context.runs).toHaveLength(0);
+
+      grant(h, socket, 'alice', 'driver');
+      socket.deliver(invoke('set_value', { callId: 'call-3' }));
+      await flush();
+      expect(codes(socket)).toEqual(['role_denied', 'role_denied', 'ok']);
+    });
+
+    it('runs nothing for a granted caller the relay does not list, and keeps a fresh grant', async () => {
+      const h = setup();
+      const socket = await link(h, {}, {});
+      grant(h, socket, 'alice', 'driver');
+      // A roster sent for another reason crosses the approval on the wire.
+      socket.deliver({ t: 'roster', attachments: [attachment('bob', 'observer')] });
+      socket.deliver(invoke('set_value'));
+      await flush();
+      // Then the relay applies the approval and lists her.
+      socket.deliver({
+        t: 'roster',
+        attachments: [attachment('bob', 'observer'), attachment('alice', 'driver')],
+      });
+      socket.deliver(invoke('set_value', { callId: 'call-2' }));
+      await flush();
+      expect(codes(socket)).toEqual(['role_denied', 'ok']);
     });
 
     it('keeps grants across a reload inside the resume window and clears them on detach', async () => {
@@ -526,7 +608,11 @@ describe('roles and consequential tools', () => {
 
       // The reloaded page resumes the same session, so Bob may still drive.
       const reloaded = setup({ storage: first.storage });
-      const socket = await link(reloaded, { resumed: true, resumeToken: 'resume-2' }, {});
+      const socket = await link(
+        reloaded,
+        { resumed: true, resumeToken: 'resume-2', roster: [attachment('bob', 'driver')] },
+        {},
+      );
       socket.deliver(invoke('set_value', { caller: bob() }));
       await flush();
       expect(codes(socket)).toEqual(['ok']);
@@ -537,14 +623,42 @@ describe('roles and consequential tools', () => {
 
       // Nothing survives a detach, even if a relay claimed to resume the session.
       const after = setup({ storage: first.storage });
-      const third = await link(after, { resumed: true }, {});
+      const third = await link(after, { resumed: true, roster: [attachment('bob', 'driver')] }, {});
       third.deliver(invoke('get_value', { caller: bob() }));
       await flush();
       expect(codes(third)).toEqual(['role_denied']);
     });
 
+    it('resumes without the grant of a user the relay dropped while the page was away', async () => {
+      const first = setup();
+      await link(first, {}, { bob: 'driver', carol: 'observer' });
+      first.core.close('unload');
+      // Bob detached during the resume window, so the welcome lists Carol only.
+      const reloaded = setup({ storage: first.storage });
+      const socket = await link(
+        reloaded,
+        { resumed: true, roster: [attachment('carol', 'observer')] },
+        {},
+      );
+      expect(JSON.parse(first.storage.getItem(GRANTS_KEY) ?? 'null')).toEqual({
+        pageId: 'page-1',
+        grants: { carol: 'observer' },
+      });
+      socket.deliver({
+        t: 'roster',
+        attachments: [attachment('carol', 'observer'), attachment('bob', 'driver')],
+      });
+      socket.deliver(invoke('get_value', { caller: bob() }));
+      await flush();
+      expect(codes(socket)).toEqual(['role_denied']);
+    });
+
     it('starts a new page session, or another page, with nobody approved', async () => {
-      for (const overrides of [{ resumed: false }, { resumed: true, pageId: 'page-9' }]) {
+      const listed = { roster: [attachment('bob', 'driver')] };
+      for (const overrides of [
+        { ...listed, resumed: false },
+        { ...listed, resumed: true, pageId: 'page-9' },
+      ]) {
         const first = setup();
         await link(first, {}, { bob: 'driver' });
         first.core.close('unload');
@@ -561,7 +675,11 @@ describe('roles and consequential tools', () => {
       const storage = new MapStorage();
       storage.setItem(GRANTS_KEY, '{"pageId":"page-1","grants":{"bob":"admin","eve":"driver"}}');
       const h = setup({ storage });
-      const socket = await link(h, { resumed: true }, {});
+      const socket = await link(
+        h,
+        { resumed: true, roster: [attachment('bob', 'driver'), attachment('eve', 'driver')] },
+        {},
+      );
       socket.deliver(invoke('get_value', { caller: { ...bob(), userId: 'eve' } }));
       await flush();
       expect(codes(socket)).toEqual(['role_denied']);

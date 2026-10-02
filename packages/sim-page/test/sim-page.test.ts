@@ -150,7 +150,11 @@ async function linked(options: Partial<Parameters<typeof startSimPage>[0]> = {})
   return { relay, sim, connection };
 }
 
-/** The operator approves Alice through the handle, as on a real page: the core refuses callers nobody approved (S5). */
+/**
+ * The operator approves Alice through the handle and the relay lists her, as
+ * on a real page: the core refuses callers nobody approved, and callers the
+ * relay does not list as attached (S5).
+ */
 async function approveAlice(sim: SimPage, connection: Connection): Promise<void> {
   send(connection, {
     t: 'attach_request',
@@ -162,6 +166,21 @@ async function approveAlice(sim: SimPage, connection: Connection): Promise<void>
   });
   await sim.waitFor((state) => state.pendingRequests.some((r) => r.requestId === 'r-alice'));
   expect(sim.dock.approve('r-alice', 'driver')).toBe(true);
+  send(connection, {
+    t: 'roster',
+    attachments: [
+      {
+        userId: 'alice',
+        displayName: 'Alice',
+        role: 'driver',
+        grantedAt: Date.now(),
+        lastUsedAt: null,
+        expiresAt: null,
+        clients: [],
+      },
+    ],
+  });
+  await sim.waitFor((state) => state.roster.some((a) => a.userId === 'alice'));
 }
 
 describe.each(RUNTIME_PROFILES)('the sim page as %s', (profile) => {
