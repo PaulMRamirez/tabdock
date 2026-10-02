@@ -1,0 +1,22 @@
+{
+  "name": "@tabdock/adapter",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Tabdock page adapter: links a page's WebMCP tools to a Tabdock relay.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./core": "./src/core.ts"
+  },
+  "scripts": {
+    "build": "node scripts/build.ts",
+    "typecheck": "tsc -p tsconfig.json && tsc -p scripts/tsconfig.json"
+  },
+  "dependencies": {
+    "@tabdock/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

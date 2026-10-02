@@ -15,7 +15,8 @@
   },
   "dependencies": {
     "@mcp-b/webmcp-polyfill": "5.1.0",
-    "zod": "4.6.5"
+    "zod": "4.6.5",
+    "@tabdock/adapter": "workspace:*"
   },
   "devDependencies": {
     "@mcp-b/webmcp-local-relay": "5.1.0",

@@ -1,0 +1,22 @@
+{
+  "name": "@tabdock/sim-page",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A Node stand-in for a browser page running the Tabdock adapter, for automated tests.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@tabdock/adapter": "workspace:*",
+    "@tabdock/protocol": "workspace:*",
+    "ws": "8.22.0"
+  },
+  "devDependencies": {
+    "@types/ws": "8.18.2"
+  }
+}

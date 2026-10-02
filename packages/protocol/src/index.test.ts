@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
   ERROR_CODES,
+  formatError,
   isErrorCode,
   MAX_FRAME_BYTES,
   MAX_RESULT_CHARS,
   SUBPROTOCOL,
+  truncate,
+  untrustedHeader,
 } from './index.ts';
 
 describe('protocol constants', () => {
@@ -20,5 +23,25 @@ describe('protocol constants', () => {
     expect(isErrorCode('page_gone')).toBe(true);
     expect(isErrorCode('PAGE_GONE')).toBe(false);
     expect(isErrorCode('')).toBe(false);
+  });
+});
+
+describe('result helpers', () => {
+  it('formats errors code first', () => {
+    expect(formatError('not_attached', 'no such page')).toBe('not_attached: no such page');
+  });
+
+  it('labels page content with its origin and tool', () => {
+    expect(untrustedHeader('http://127.0.0.1:5173', 'get_view')).toBe(
+      '[tabdock: untrusted content from http://127.0.0.1:5173, tool get_view]',
+    );
+  });
+
+  it('truncates with a visible marker and leaves short text alone', () => {
+    expect(truncate('short', 10)).toEqual({ text: 'short', truncated: false });
+    const cut = truncate('x'.repeat(25), 10);
+    expect(cut.truncated).toBe(true);
+    expect(cut.text.startsWith('x'.repeat(10))).toBe(true);
+    expect(cut.text).toContain('15 of 25 characters removed');
   });
 });
