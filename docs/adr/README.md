@@ -11,3 +11,5 @@ Short records of decisions that change or refine `SPEC.md`, or that a future con
 | [0005](0005-pair-wait-and-sdk-mode.md)           | How long pair_page waits, and how the relay speaks MCP in M1 | Accepted |
 | [0006](0006-oauth-in-m3.md)                      | Sign in through OAuth from M3                                | Accepted |
 | [0007](0007-contract-clarifications-m1.md)       | Contract clarifications from M1                              | Accepted |
+| [0008](0008-argument-validation.md)              | Checking call arguments at the relay                         | Accepted |
+| [0009](0009-sessions-limits-expiry.md)           | MCP sessions, section 9 limits and idle expiry in M2         | Accepted |
