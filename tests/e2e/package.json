@@ -11,6 +11,7 @@
     "baseline": "node src/baseline.ts",
     "typecheck": "tsc -p tsconfig.json",
     "check:claude-code": "node src/claude-code-check.ts",
+    "check:claude-code:m1": "node src/claude-code-check-m1.ts",
     "demo:m1": "node src/demo-m1.ts"
   },
   "devDependencies": {

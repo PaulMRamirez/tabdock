@@ -92,7 +92,9 @@ try {
   }
 
   say('\nclear_board is left uncalled on purpose: it is the consequential tool, and');
-  say('MCP-B passes it through with no prompt. Tabdock adds the on-page confirmation in M2.');
+  say(
+    "MCP-B passes it through with no prompt; Tabdock's adapter asks the operator (pnpm demo:m1).",
+  );
   if (headed) {
     say('\nBrowser stays open for 30 s so you can pan and zoom the board.');
     await new Promise((resolve) => setTimeout(resolve, 30_000));

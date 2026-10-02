@@ -13,9 +13,11 @@ pnpm install
 pnpm test        # unit tests, no browser needed
 pnpm lint
 pnpm typecheck
-pnpm dev         # demo board at http://127.0.0.1:5173/
-pnpm test:e2e    # browser tests through MCP-B's local relay (fetches Chromium on first run)
-pnpm demo:m0     # the M0 baseline, narrated
+pnpm dev         # relay and demo board together; needs TABDOCK_DEV_TOKENS in .env (see .env.example)
+pnpm dev:demo    # the demo board alone at http://127.0.0.1:5173/
+pnpm test:e2e    # browser tests (fetches Chromium on first run)
+pnpm demo:m0     # the M0 baseline through MCP-B's local relay, narrated
+pnpm demo:m1     # an MCP client pairs with the demo board through the Tabdock relay, narrated
 ```
 
 ## Layout

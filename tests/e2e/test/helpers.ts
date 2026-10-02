@@ -133,7 +133,9 @@ export async function pairThroughOperator(
   const request = state.pendingRequests[0];
   if (!request) throw new Error('no attach request reached the page');
   const answered =
-    answer === 'deny' ? sim.dock.deny(request.requestId) : sim.dock.approve(request.requestId, answer);
+    answer === 'deny'
+      ? sim.dock.deny(request.requestId)
+      : sim.dock.approve(request.requestId, answer);
   expect(answered).toBe(true);
   return { outcome: await pending, requestId: request.requestId };
 }
