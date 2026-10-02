@@ -20,13 +20,12 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      # Pinned to the commit GitHub's Node.js guide uses; reads the version from packageManager.
-      # (pnpm/setup only installs pnpm 11 and later, and this repo is on pnpm 10.)
-      - uses: pnpm/action-setup@0609f0983b7a228f052f81ef4c3d6510cae254ad
       - uses: actions/setup-node@v7
         with:
           node-version-file: .nvmrc
-          cache: pnpm
+      # Corepack ships with Node 22 and installs the pnpm version named in packageManager,
+      # so no third-party action is needed (pnpm/setup only installs pnpm 11 and later).
+      - run: corepack enable pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm typecheck
