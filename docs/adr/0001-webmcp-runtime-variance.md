@@ -1,6 +1,6 @@
 # 0001: Tolerate WebMCP runtime differences in the adapter
 
-Status: Proposed, 2 October 2026. Changes SPEC sections 3, 6 and 8 and the reading of S8 if accepted.
+Status: Accepted by the owner, 2 October 2026. SPEC sections 3 and 8 updated.
 
 ## Context
 

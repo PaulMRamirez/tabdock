@@ -1,6 +1,6 @@
 # 0004: Refresh SPEC section 3 with the facts verified on 2 October
 
-Status: Proposed, 2 October 2026. Rewrites rows of SPEC section 3 if accepted; no other section changes.
+Status: Accepted by the owner, 2 October 2026. SPEC section 3 updated.
 
 ## Context
 

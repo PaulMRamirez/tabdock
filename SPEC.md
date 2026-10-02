@@ -32,15 +32,15 @@ These standards and packages are moving. Check current docs before coding agains
 
 | Fact | Where it came from |
 | --- | --- |
-| WebMCP is a Chrome origin trial. The API is `document.modelContext` with `registerTool`, `getTools`, `executeTool(tool, argsObject, {signal})` and a `toolchange` event. Annotations: `readOnlyHint`, `consequentialHint`, `untrustedContentHint` | developer.chrome.com/docs/ai/webmcp/imperative-api |
-| MCP-B ships a polyfill and runtime. Versions: `@mcp-b/global` 5.1.0, `@mcp-b/webmcp-polyfill` 5.1.0, `@mcp-b/webmcp-ts-sdk` 5.1.0, `@mcp-b/webmcp-local-relay` 5.1.0, `webmcp-types` 0.1.10 | npm registry, docs.mcp-b.ai |
-| MCP revision 2026-07-28 is stateless: no initialize handshake, no session id, client info in `_meta` on every request, `server/discover`, multi round trip via `input_required`, `ttlMs` on list results | blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate |
-| MCP SDK packages: `@modelcontextprotocol/server` 2.2.0 and `@modelcontextprotocol/client` 2.2.0 (v2 line), `@modelcontextprotocol/sdk` 1.31.0 (v1 line) | npm registry |
-| Claude reaches custom connectors from Anthropic's cloud on every client. It supports Streamable HTTP, OAuth or fixed request headers or no auth, tools, prompts and resources. No resource subscriptions or sampling. Hosted limits: 240 s per tool call, about 150,000 characters per result | support.claude.com article 11175166, claude.com/docs/connectors/building |
-| Claude Code supports `list_changed` and HTTP servers with custom headers | code.claude.com/docs/en/mcp |
-| Other versions: `ws` 8.22.0, `hono` 4.13.12, `qrcode-generator` 2.0.4, Node 22 | npm registry |
+| WebMCP is a Chrome origin trial (M149 to M156, extension to M162 requested). The API is `document.modelContext`, in secure contexts only, with `registerTool`, `getTools`, `executeTool(tool, input, {signal})` and a `toolchange` event. `input` is a JSON string on Chrome 153 and 154 and MCP-B 5.x and an object on Chrome 155+ and MCP-B 6; the result is always a string. `getTools()` entries carry `window` and `origin` and include same-origin iframe tools. Annotations: `readOnlyHint`, `consequentialHint`, `untrustedContentHint`, `debugging`; Chrome 153 and MCP-B 5.1.0 drop `consequentialHint` | developer.chrome.com/docs/ai/webmcp/imperative-api, webmachinelearning.github.io/webmcp, `docs/notes/baseline.md` |
+| MCP-B ships a polyfill and runtime. `latest` is 5.1.0 for `@mcp-b/global`, `@mcp-b/webmcp-polyfill`, `@mcp-b/webmcp-ts-sdk` and `@mcp-b/webmcp-local-relay`; 6.0 is in beta and docs.mcp-b.ai already describes it. `webmcp-types` 0.1.10 is the WebML Community Group's types package, not MCP-B's | npm registry, docs.mcp-b.ai |
+| MCP revision 2026-07-28 is final and stateless: no initialize handshake, no session id, `server/discover`, multi round trip via `input_required`, `ttlMs` with `cacheScope` on list results. Client info in `_meta` is a SHOULD and unauthenticated; `list_changed` travels only over a client-opened `subscriptions/listen` stream | blog.modelcontextprotocol.io/posts/2026-07-28/ |
+| MCP SDK packages: `@modelcontextprotocol/server`, `client` and `core` 2.3.0 with `@modelcontextprotocol/node` 2.1.1 (v2 line, serves 2026-07-28 and 2025-era clients), `@modelcontextprotocol/sdk` 1.32.0 (v1 line, 2025-era only) | npm registry |
+| Claude reaches custom connectors from Anthropic's cloud (160.79.104.0/21, IPv4) on every client. It supports Streamable HTTP, OAuth, fixed request headers (a beta for a limited set of organizations) or no auth, tools, prompts and resources. No resource subscriptions, sampling or draft capabilities. Hosted limits: 240 s per tool call, about 150,000 characters per result | support.claude.com article 11175166, claude.com/docs/connectors/building |
+| Claude Code supports `list_changed` and HTTP servers with custom headers. It fails an HTTP tool call after 60 s without a first byte and caps results at 25,000 tokens unless the server says otherwise | code.claude.com/docs/en/mcp |
+| Other versions: `ws` 8.22.0, `hono` 4.13.12, `qrcode-generator` 2.0.4, Node 22.18 or later (it runs `.ts` files directly) | npm registry, nodejs.org |
 
-Unverified and to be measured in M3: whether hosted Claude (web, desktop, mobile) refreshes a changing tool list during a conversation.
+Rows refreshed by ADR 0004 from `docs/notes/verified.md`. Unverified and to be measured in M3: whether hosted Claude (web, desktop, mobile) refreshes a changing tool list during a conversation.
 
 ## 4. Architecture and repo layout
 
@@ -71,7 +71,7 @@ The demo page should make state visible: a canvas board with items and a viewpor
 
 Trust rule: no attachment exists without an approval made on the page, unless the page set `autoApprove: 'observer'`.
 
-Roles: an observer may call only tools whose `readOnlyHint` is true. A driver may call every tool. Consequential tools follow page policy: `confirm` (default, an on-page prompt per call), `allow`, or `deny`. `maxDrivers` defaults to 1 and counts users, so one person's phone and laptop both drive. Mutating calls run one at a time per page in arrival order; read-only calls run concurrently.
+Roles: an observer may call only tools whose `readOnlyHint` is true. A driver may call every tool. Consequential tools follow page policy: `confirm` (default, an on-page prompt per call), `allow`, or `deny`. A tool is consequential when its `consequentialHint` is true or the page names it in `policy.consequentialTools`; when the runtime cannot report the hint and the page names none, every tool that is not read-only counts as consequential (ADR 0002). `maxDrivers` defaults to 1 and counts users, so one person's phone and laptop both drive. Mutating calls run one at a time per page in arrival order; read-only calls run concurrently.
 
 ## 6. Page link protocol (adapter to relay)
 
@@ -111,7 +111,7 @@ Every page result starts with the header line `[tabdock: untrusted content from 
 
 Errors return as MCP tool errors with one of these codes in the text: `not_attached`, `role_denied`, `tool_not_found`, `page_asleep`, `page_gone`, `denied_by_operator`, `timeout`, `page_busy`, `pairing_expired`, `rate_limited`.
 
-Auth is a plugin: `authenticate(request)` returns a User or null. M1 ships `dev-token` (users and bearer tokens from `.env`). M4 adds `oauth`, delegating sign-in to an external identity provider through a maintained library, accepting Claude's hosted callback and Claude Code's loopback redirect.
+Auth is a plugin: `authenticate(request)` returns a User or null. M1 ships `dev-token` (users and bearer tokens from `.env`). M3 adds a minimal `oauth` plugin and M4 hardens it (ADR 0006), delegating sign-in to an external identity provider through a maintained library, accepting Claude's hosted callback and Claude Code's loopback redirect.
 
 M5 adds first-class page tools named `<alias>__<tool>`, described with an origin prefix capped at 500 characters, with a short `ttlMs` and `list_changed` for session-based clients, behind a config flag. The fixed tools always remain.
 
@@ -121,11 +121,11 @@ M5 adds first-class page tools named `<alias>__<tool>`, described with an origin
 import { attach } from '@tabdock/adapter';
 const dock = attach({
   relay: 'wss://relay.example/page',
-  policy: { autoApprove: 'none', maxDrivers: 1, consequential: 'confirm' },
+  policy: { autoApprove: 'none', maxDrivers: 1, consequential: 'confirm', consequentialTools: [] },
 });
 ```
 
-A script-tag build reads the same options from data attributes. The adapter never registers tools. It reads `document.modelContext` through `getTools`, listens for `toolchange` with a 2 s poll as fallback, and runs calls with `executeTool`. If `document.modelContext` is missing it logs how to add a polyfill and stays idle.
+A script-tag build reads the same options from data attributes. The adapter never registers tools. It reads `document.modelContext` through `getTools`, listens for `toolchange` with a 2 s poll as fallback, and runs calls with `executeTool`, detecting per page whether the runtime wants its input as a JSON string or an object (ADR 0001). If `document.modelContext` is missing it logs how to add a polyfill and stays idle.
 
 The widget lives in a closed shadow root: a badge with link state and attached count, and a panel with the pairing code and QR, the roster with role switch and revoke, an activity log of the last 50 calls, and a pause switch. Attach prompts and consequential-call prompts default to deny on timeout. Only the code that called `attach()` holds the control handle.
 
@@ -169,13 +169,13 @@ Each milestone ends with green tests, a demo command (`pnpm demo:mN`), an explai
 4. A2.4 Revoke cancels an in-flight call and blocks the next one.
 5. A2.5 A consequential tool prompts on the page, and deny returns `denied_by_operator`.
 
-**M3 Phone (public URL).** Public HTTPS through a tunnel or a small host, the QR web flow at `/pair`, a Claude custom connector using a request-header token, and the spike measurements.
+**M3 Phone (public URL).** Public HTTPS through a tunnel or a small host, the QR web flow at `/pair`, a Claude custom connector signing in through the minimal OAuth plugin (ADR 0006), and the spike measurements.
 1. A3.1 Claude mobile attaches to a page on the laptop and calls tools (manual).
 2. A3.2 QR pairing works from the phone's browser (manual).
 3. A3.3 `docs/notes/spike.md` records: round trip p50 and p95 over 50 calls; whether hosted Claude sees tool list changes mid-chat; tab survival for 60 minutes in the background, under Energy Saver, and across laptop sleep; time from scan to first call.
 4. A3.4 A go or no-go note against the gate: conversational latency, fixed tools working on mobile, an hour of background survival.
 
-**M4 Real sign-in and hardening (cloud host).** OAuth plugin, origin allowlist, rate limits, persistent audit log, container image, deploy guide, threat model document.
+**M4 Real sign-in and hardening (cloud host).** OAuth plugin hardened for production, origin allowlist, rate limits, persistent audit log, container image, deploy guide, threat model document.
 1. A4.1 Tests for S1 to S13 pass.
 2. A4.2 The connector works with OAuth sign-in on Claude web and mobile (manual).
 3. A4.3 A second reviewer pass, by a separate agent, finds no unaddressed high-severity issue.

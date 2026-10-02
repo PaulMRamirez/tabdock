@@ -1,6 +1,6 @@
 # 0002: Consequential tools when the runtime drops the hint
 
-Status: Proposed, 2 October 2026. Needs the owner's choice before M2. Changes SPEC section 8 (attach options) if accepted.
+Status: Accepted by the owner (option C), 2 October 2026. SPEC sections 5 and 8 updated.
 
 ## Context
 
