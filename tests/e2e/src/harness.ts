@@ -106,12 +106,17 @@ export async function startBaseline(options: BaselineOptions = {}): Promise<Base
 }
 
 /**
- * Uses CHROMIUM_EXECUTABLE when set (for example a newer Chrome with the
- * WebMCP flag), otherwise the Chromium that matches the installed Playwright.
+ * Uses CHROMIUM_EXECUTABLE when set, otherwise the Chromium that matches the
+ * installed Playwright. The WebMCPTesting feature turns on native WebMCP in
+ * Chrome 146 and later; older builds ignore it and the polyfill takes over.
  */
 export function launchChromium(headless: boolean): Promise<Browser> {
   const executablePath = process.env.CHROMIUM_EXECUTABLE;
-  return chromium.launch({ headless, ...(executablePath ? { executablePath } : {}) });
+  return chromium.launch({
+    headless,
+    args: ['--enable-features=WebMCPTesting'],
+    ...(executablePath ? { executablePath } : {}),
+  });
 }
 
 /** Polls the relay until every named tool is listed. The SDK caches lists, so each poll refreshes. */

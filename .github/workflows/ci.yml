@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      # Reads the pnpm version from packageManager, installs Node and runs pnpm install.
+      - uses: pnpm/setup@c9883cc79df532ad1a7b81bf9ab944ceb090d65c # v2.0.0
+        with:
+          runtime: node@22
+          cache: true
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+      - name: Install Chromium for Playwright
+        run: pnpm --filter @tabdock/e2e exec playwright install --with-deps chromium
+      - run: pnpm test:e2e
+      - run: pnpm demo:m0
