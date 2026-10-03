@@ -38,7 +38,7 @@ From the relay's `spike: tools/list` and `spike: client opened a stream` lines a
 
 ## Scan to first call
 
-From the relay's `spike: pairing milestone` lines.
+From the relay's `spike: pairing milestone` lines (`packages/relay/src/spike.ts`), which share a random `tr_` trace id per pairing. The stages are `issued` (debug level), `scanned` (the first `/pair` preview only; the preview after sign-in does not count) with `sinceIssuedMs`, `claimed` with `sinceIssuedMs` and `sinceScannedMs`, `approved` or `refused` with `sinceClaimedMs` and `sinceScannedMs`, and `first_call` with `sinceApprovedMs`, `sinceClaimedMs`, `sinceScannedMs` and `sinceIssuedMs`. A code typed into `pair_page` has no scan. `pnpm demo:m3` prints a sample run.
 
 | Run | Issued to scanned (ms) | Scanned to claimed | Claimed to approved | Approved to first call | Scanned to first call |
 | --- | ---------------------- | ------------------ | ------------------- | ---------------------- | --------------------- |
