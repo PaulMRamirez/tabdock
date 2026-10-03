@@ -1,6 +1,6 @@
 # 0012: Contract clarifications from the M2 review
 
-Status: Proposed, 3 October 2026. Changes SPEC sections 5 and 6 if accepted.
+Status: Accepted by the owner with option A, 3 October 2026. Changes SPEC sections 5 and 6.
 
 ## Context
 
@@ -12,7 +12,7 @@ Fixing the M2 review findings (ADR 0009's and ADR 0001's notes) left two places 
 
 **One write at a time (section 5).** The page holds its write slot until a write's handler ends, also when the call was already answered (a cancel, its deadline, a revoke). The one exception: on the MCP-B polyfill, if the page unregisters a tool while that tool's write is running, the polyfill stops reporting on the handler, which may still run. The page then holds later writes until that call's deadline plus 2 s and lets the next one go, possibly beside the old handler, logging that it did. Two options:
 
-A. Accept that bounded hold and add the exception to section 5. Recommended: a single-page app that swaps its tools per view would otherwise lock every later write until a reload, and the case needs both the polyfill and a page that removes a tool its own write is using.
+A. Accept that bounded hold and add the exception to section 5. Recommended, and chosen: a single-page app that swaps its tools per view would otherwise lock every later write until a reload, and the case needs both the polyfill and a page that removes a tool its own write is using.
 
 B. Hold until the operator reloads the page, so writes never overlap, at the cost of a stuck page in that case.
 
