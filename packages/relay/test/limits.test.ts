@@ -1,12 +1,12 @@
 // The section 9 limits with ADR 0009's defaults, each shrunk here to a few:
 // users per page, calls per user per page per window, tools frames per socket
-// and per address, schema nodes walked per tools frame, page sockets and page
-// sessions per address, and page sessions in total.
+// and per address, schema nodes walked per tools frame and per tool, page
+// sockets and page sessions per address, and page sessions in total.
 
 import type { Client } from '@modelcontextprotocol/client';
 import { CLOSE_DETACH, type PageTool } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
-import { MAX_FRAME_SCHEMA_NODES } from '../src/hub.ts';
+import { MAX_FRAME_SCHEMA_NODES, MAX_TOOL_SCHEMA_NODES } from '../src/hub.ts';
 import { createMemoryStore, DEFAULT_LIMITS, DEFAULT_RATE_LIMITS } from '../src/index.ts';
 import {
   connectPage,
@@ -15,9 +15,11 @@ import {
   openSocket,
   PAGE_ORIGIN,
   type PageOptions,
+  READ_TOOL,
   TestPage,
   TOOLS,
   UpgradeRefused,
+  WRITE_TOOL,
 } from './helpers/page-client.ts';
 import {
   ALICE,
@@ -163,7 +165,12 @@ describe('users per page (S9)', () => {
 
 describe('calls per user per page (S9)', () => {
   it('refuses calls past the limit with rate_limited, counting invalid ones, until the window passes', async () => {
-    const { relay } = await setup({ rateLimits: { callsPerUserPerPage: 3, windowMs: 1000 } });
+    // A generous check budget, so the invalid call is refused by its check
+    // however loaded the test run is; the limit, not the budget, is under test.
+    const { relay } = await setup({
+      rateLimits: { callsPerUserPerPage: 3, windowMs: 1000 },
+      timings: { argumentCheckMs: 2000 },
+    });
     const opened = await page({ onInvoke: echo });
     const other = await page({ onInvoke: echo });
     const alice = await client();
@@ -533,7 +540,7 @@ describe('tools frames per address (S9)', () => {
   });
 });
 
-describe('schema nodes per tools frame (S9, ADR 0010)', () => {
+describe('schema nodes per tools frame and per tool (S9, ADR 0010)', () => {
   /**
    * A read-only tool requiring a string x beside `width` empty properties:
    * width + 7 schema nodes, and far too long to show, so clients see a stub
@@ -550,12 +557,25 @@ describe('schema nodes per tools frame (S9, ADR 0010)', () => {
       annotations: { readOnlyHint: true },
     };
   }
-  /** Over half the cap, so two of these never fit in one frame. */
-  const WIDTH = Math.ceil(MAX_FRAME_SCHEMA_NODES * 0.6);
+  /** Within the per-tool limit and over a fifth of the frame's cap, so four fit in one frame and five do not. */
+  const WIDTH = Math.floor(MAX_FRAME_SCHEMA_NODES / 4.5);
   const CAPPED = `[tabdock: schema removed, the page's tools hold more than ${String(MAX_FRAME_SCHEMA_NODES)} schema nodes in all]`;
+  const OVER_TOOL = `[tabdock: schema removed, more than ${String(MAX_TOOL_SCHEMA_NODES)} schema nodes]`;
 
+  it('sizes the tools these tests list against both limits', () => {
+    expect(WIDTH + 7).toBeLessThanOrEqual(MAX_TOOL_SCHEMA_NODES);
+    expect(4 * (WIDTH + 7)).toBeLessThanOrEqual(MAX_FRAME_SCHEMA_NODES);
+    expect(5 * (WIDTH + 7)).toBeGreaterThan(MAX_FRAME_SCHEMA_NODES);
+    expect(MAX_TOOL_SCHEMA_NODES).toBeLessThan(MAX_FRAME_SCHEMA_NODES);
+  });
+
+  /**
+   * Whether a call is refused by the argument check is what these tests read,
+   * so the check gets a generous budget: a large schema's first check must
+   * never overrun under a loaded test run and pass for a tool left unchecked.
+   */
   async function attached(): Promise<{ opened: TestPage; alice: Client; lines: string[] }> {
-    const { lines } = await setup();
+    const { lines } = await setup({ timings: { argumentCheckMs: 2000 } });
     const opened = await page({ tools: [], onInvoke: echo });
     const alice = await client();
     await pairAndApprove(alice, opened);
@@ -574,66 +594,148 @@ describe('schema nodes per tools frame (S9, ADR 0010)', () => {
     return listed.tools.find((entry) => entry.name === tool)?.inputSchema;
   }
 
-  /** Whether a call without the required x is refused by the relay's check. */
-  async function checked(alice: Client, pageId: string, tool: string): Promise<boolean> {
-    const outcome = await callTool(alice, 'call_page_tool', { page: pageId, tool, arguments: {} });
+  /** Whether a call with these arguments is refused by the relay's check. */
+  async function refused(
+    alice: Client,
+    pageId: string,
+    tool: string,
+    args: Record<string, unknown>,
+  ): Promise<boolean> {
+    const outcome = await callTool(alice, 'call_page_tool', {
+      page: pageId,
+      tool,
+      arguments: args,
+    });
     if (outcome.isError) expect(outcome.text).toMatch(/^invalid_arguments: /);
     return outcome.isError;
   }
 
-  it('lists tools past the cap with a stub and lets their calls through unchecked, while those before it are checked', async () => {
-    const { opened, alice, lines } = await attached();
-    await relist(opened, [wide('first', WIDTH), wide('second', WIDTH), TOOLS[0] as PageTool]);
+  /** Whether a call without the required x is refused by the relay's check. */
+  function checked(alice: Client, pageId: string, tool: string): Promise<boolean> {
+    return refused(alice, pageId, tool, {});
+  }
 
-    expect(await checked(alice, opened.pageId, 'first')).toBe(true);
-    expect(await schemaOf(alice, opened.pageId, 'second')).toEqual({
+  function warnings(lines: string[], phrase: string): string[] {
+    return lines.filter((line) => line.includes(phrase));
+  }
+
+  it('lists tools past the frame cap with a stub and lets their calls through unchecked, while those before it are checked', async () => {
+    const { opened, alice, lines } = await attached();
+    const fitting = ['w1', 'w2', 'w3', 'w4'].map((name) => wide(name, WIDTH));
+    await relist(opened, [...fitting, wide('w5', WIDTH), READ_TOOL]);
+
+    expect(await checked(alice, opened.pageId, 'w1')).toBe(true);
+    expect(await checked(alice, opened.pageId, 'w4')).toBe(true);
+    expect(await schemaOf(alice, opened.pageId, 'w5')).toEqual({
       type: 'object',
       description: CAPPED,
     });
-    expect(await checked(alice, opened.pageId, 'second')).toBe(false);
-    // Every tool after the one that crossed the cap is past it too, however small.
+    expect(await checked(alice, opened.pageId, 'w5')).toBe(false);
+    // The tool that crossed the cap used up what was left of it, so every tool
+    // after it is past the cap too, however small.
     expect(await schemaOf(alice, opened.pageId, 'get_view')).toEqual({
       type: 'object',
       description: CAPPED,
     });
-    const unexpected = await callTool(alice, 'call_page_tool', {
-      page: opened.pageId,
-      tool: 'get_view',
-      arguments: { unexpected: true },
+    expect(await refused(alice, opened.pageId, 'get_view', { unexpected: true })).toBe(false);
+    expect(warnings(lines, 'more schema than the relay walks per frame')).toHaveLength(1);
+    expect(warnings(lines, 'more schema than the relay walks per tool')).toHaveLength(0);
+  });
+
+  it('stubs a tool over the per-tool limit alone, so the tools after it keep their schemas and checks, also after a re-list', async () => {
+    const { opened, alice, lines } = await attached();
+    // More nodes than the whole frame's cap: counted no further than the
+    // per-tool limit, it must not use up the frame for the tools after it.
+    const big = wide('big', MAX_FRAME_SCHEMA_NODES);
+    const frames = [
+      [big, READ_TOOL, WRITE_TOOL],
+      // The same tools again: big is counted again, get_view and add_item are reused.
+      [big, READ_TOOL, WRITE_TOOL],
+      // get_view changed, so it is walked again, still behind big.
+      [big, { ...READ_TOOL, description: 'The viewport, again.' }, WRITE_TOOL],
+    ];
+    for (const tools of frames) {
+      await relist(opened, tools);
+      expect(await schemaOf(alice, opened.pageId, 'big')).toEqual({
+        type: 'object',
+        description: OVER_TOOL,
+      });
+      expect(await checked(alice, opened.pageId, 'big')).toBe(false);
+      expect(await schemaOf(alice, opened.pageId, 'get_view')).toEqual(READ_TOOL.inputSchema);
+      expect(await refused(alice, opened.pageId, 'get_view', { unexpected: true })).toBe(true);
+      expect(await schemaOf(alice, opened.pageId, 'add_item')).toEqual(WRITE_TOOL.inputSchema);
+      expect(await refused(alice, opened.pageId, 'add_item', { label: 5 })).toBe(true);
+    }
+    expect(warnings(lines, 'more schema than the relay walks per tool')).toHaveLength(3);
+    expect(warnings(lines, 'more schema than the relay walks per frame')).toHaveLength(0);
+  });
+
+  it('charges a tool over the per-tool limit no more than the limit, while the frame cap still holds', async () => {
+    const { opened, alice } = await attached();
+    // Each costs the frame at most the limit plus one node, so this many leave room for get_view.
+    const count = Math.floor(MAX_FRAME_SCHEMA_NODES / (MAX_TOOL_SCHEMA_NODES + 1));
+    const bigs = Array.from({ length: count }, (_, i) =>
+      wide(`big${String(i)}`, 2 * MAX_TOOL_SCHEMA_NODES),
+    );
+    await relist(opened, [...bigs, READ_TOOL]);
+    expect(await schemaOf(alice, opened.pageId, 'get_view')).toEqual(READ_TOOL.inputSchema);
+    expect(await refused(alice, opened.pageId, 'get_view', { unexpected: true })).toBe(true);
+
+    // One more uses up the rest of the frame, so a changed get_view after it is
+    // past the cap: no number of large tools makes one frame walk more.
+    await relist(opened, [
+      ...bigs,
+      wide('one_more', 2 * MAX_TOOL_SCHEMA_NODES),
+      { ...READ_TOOL, description: 'The viewport, again.' },
+    ]);
+    expect(await schemaOf(alice, opened.pageId, 'get_view')).toEqual({
+      type: 'object',
+      description: CAPPED,
     });
-    expect(unexpected.isError, unexpected.text).toBe(false);
-    expect(
-      lines.filter((line) => line.includes('more schema than the relay walks per frame')),
-    ).toHaveLength(1);
+    expect(await refused(alice, opened.pageId, 'get_view', { unexpected: true })).toBe(false);
   });
 
   it('walks only tools that changed, so one sent again unchanged costs nothing against the cap', async () => {
     const { opened, alice } = await attached();
-    await relist(opened, [wide('first', WIDTH)]);
-    // first is the same as before, so only second is walked, and it fits.
-    await relist(opened, [wide('first', WIDTH), wide('second', WIDTH)]);
-    expect(await checked(alice, opened.pageId, 'first')).toBe(true);
+    const four = (description?: string) =>
+      ['w1', 'w2', 'w3', 'w4'].map((name) => wide(name, WIDTH, description ?? `${name}.`));
+    await relist(opened, four());
+    // The four are the same as before, so only second is walked, and it fits.
+    await relist(opened, [...four(), wide('second', WIDTH)]);
+    expect(await checked(alice, opened.pageId, 'w1')).toBe(true);
     expect(await checked(alice, opened.pageId, 'second')).toBe(true);
 
-    // A changed tool is walked again: first fits, and second, unchanged, is kept as it was.
-    await relist(opened, [wide('first', WIDTH, 'First, changed.'), wide('second', WIDTH)]);
+    // Changed tools are walked again: the four fit, and second, unchanged, is kept as it was.
+    await relist(opened, [...four('Changed.'), wide('second', WIDTH)]);
     let listed = (await callTool(alice, 'list_page_tools', { page: opened.pageId })).structured as {
       tools: { name: string; description: string }[];
     };
-    expect(listed.tools.map((tool) => tool.description)).toEqual(['First, changed.', 'second.']);
+    expect(listed.tools.map((tool) => tool.description)).toEqual([
+      'Changed.',
+      'Changed.',
+      'Changed.',
+      'Changed.',
+      'second.',
+    ]);
     expect(await checked(alice, opened.pageId, 'second')).toBe(true);
 
-    // Both changed: the cap applies, and second goes unchecked.
-    await relist(opened, [wide('first', WIDTH, 'First, again.'), wide('second', WIDTH, 'Two.')]);
-    expect(await checked(alice, opened.pageId, 'first')).toBe(true);
+    // All changed: the cap applies, and second goes unchecked.
+    await relist(opened, [...four('Again.'), wide('second', WIDTH, 'Two.')]);
+    expect(await checked(alice, opened.pageId, 'w4')).toBe(true);
     expect(await checked(alice, opened.pageId, 'second')).toBe(false);
 
-    // Once first is unchanged again, second fits and is walked and checked once more.
-    await relist(opened, [wide('first', WIDTH, 'First, again.'), wide('second', WIDTH, 'Two.')]);
+    // Once the four are unchanged again, second fits and is walked and checked once more.
+    await relist(opened, [...four('Again.'), wide('second', WIDTH, 'Two.')]);
     expect(await checked(alice, opened.pageId, 'second')).toBe(true);
     listed = (await callTool(alice, 'list_page_tools', { page: opened.pageId })).structured as {
       tools: { name: string; description: string }[];
     };
-    expect(listed.tools.map((tool) => tool.description)).toEqual(['First, again.', 'Two.']);
+    expect(listed.tools.map((tool) => tool.description)).toEqual([
+      'Again.',
+      'Again.',
+      'Again.',
+      'Again.',
+      'Two.',
+    ]);
   });
 });

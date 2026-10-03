@@ -5,7 +5,8 @@
 
 import type { Client } from '@modelcontextprotocol/client';
 import type { JsonObject, PageTool } from '@tabdock/protocol';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ArgumentChecker } from '../src/argument-checker.ts';
 import {
   connectPage,
   type InvokeFrame,
@@ -54,6 +55,7 @@ async function client(user = ALICE, options: ClientOptions = {}): Promise<Client
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const connected of clients.splice(0)) await connected.close();
   for (const opened of pages.splice(0)) opened.ws.terminate();
   await current?.close();
@@ -437,4 +439,118 @@ describe('the write queue while argument checks run (ADR 0010)', () => {
     expect((await running).isError).toBe(false);
     expect((await reading).isError).toBe(false);
   });
+
+  /**
+   * A generous budget: the fan-out check holds its call this long, far longer
+   * than any step below takes on a loaded machine, so the page can re-list a
+   * tool while the check runs, and ordinary checks never come near it.
+   */
+  const WINDOW_MS = 2000;
+
+  /** Resolves once the relay has asked the check worker about a call to this tool. */
+  function checkStarted(tool: string): () => boolean {
+    const check = vi.spyOn(ArgumentChecker.prototype, 'check');
+    return () => check.mock.calls.some(([name]) => name === tool);
+  }
+
+  it('sends a write re-listed as read-only during its check exactly once, and the write behind it does not wait for it', async () => {
+    const { lines } = await setup({
+      timings: { argumentCheckMs: WINDOW_MS, callDeadlineMs: 10_000 },
+    });
+    const { held, onInvoke } = holdingPage();
+    const opened = await page({ tools: [SLOW_WRITE, WRITE_TOOL], onInvoke });
+    const alice = await client();
+    await pairAndApprove(alice, opened);
+    const started = checkStarted('slow_write');
+    const slow = callTool(alice, 'call_page_tool', {
+      page: opened.pageId,
+      tool: 'slow_write',
+      arguments: {},
+    });
+    await eventually(started);
+    const behind = write(alice, opened.pageId, 'behind');
+    await eventually(() => queuedOrder(lines).length === 2);
+    opened.send({
+      t: 'tools',
+      tools: [{ ...SLOW_WRITE, annotations: { readOnlyHint: true } }, WRITE_TOOL],
+    });
+    await opened.sync();
+    expect(held).toHaveLength(0);
+
+    // Its check gives up; it is a read by then, so it goes out beside the write
+    // behind it, which runs without waiting for its answer.
+    await eventually(() => held.length === 2, WINDOW_MS * 3);
+    expect(held.map((frame) => frame.tool)).toEqual(['slow_write', 'add_item']);
+    await delay(100);
+    await opened.sync();
+    expect(held).toHaveLength(2);
+    answer(opened, held[1]);
+    expect((await behind).isError).toBe(false);
+    answer(opened, held[0]);
+    expect((await slow).isError).toBe(false);
+    await opened.sync();
+    expect(held).toHaveLength(2);
+  }, 20_000);
+
+  it('names a client whose only call is a write once its check passes', async () => {
+    const { relay } = await setup({ timings: { argumentCheckMs: WINDOW_MS } });
+    const opened = await page({ onInvoke: () => ({ ok: true, content: '{}' }) });
+    await pairAndApprove(await client(), opened);
+    const writer = await client(ALICE, { name: 'writer', modern: true });
+    expect((await write(writer, opened.pageId, 'x')).isError).toBe(false);
+    await opened.sync();
+    expect(relay.audit.records().map((record) => [record.tool, record.outcome])).toEqual([
+      ['add_item', 'ok'],
+    ]);
+    expect(
+      opened
+        .all('roster')
+        .at(-1)
+        ?.attachments[0]?.clients.map((c) => c.name),
+    ).toEqual(['writer', 'relay-test']);
+  });
+
+  it('refuses a read re-listed as mutating during its check with page_busy when the queue is full (S9)', async () => {
+    const { lines } = await setup({
+      limits: { queueDepth: 1 },
+      timings: { argumentCheckMs: WINDOW_MS, callDeadlineMs: 10_000 },
+    });
+    const { held, onInvoke } = holdingPage();
+    const opened = await page({ tools: [WRITE_TOOL, SLOW_READ], onInvoke });
+    const alice = await client();
+    await pairAndApprove(alice, opened);
+    // One write on the page and one waiting: the queue is at its depth.
+    const running = write(alice, opened.pageId, 'first');
+    await eventually(() => held.length === 1);
+    const waiting = write(alice, opened.pageId, 'second');
+    await eventually(() => queuedOrder(lines).length === 2);
+
+    const started = checkStarted('slow_read');
+    const reading = callTool(alice, 'call_page_tool', {
+      page: opened.pageId,
+      tool: 'slow_read',
+      arguments: {},
+    });
+    await eventually(started);
+    opened.send({
+      t: 'tools',
+      tools: [WRITE_TOOL, { ...SLOW_READ, annotations: { readOnlyHint: false } }],
+    });
+    await opened.sync();
+    // Its check gives up; it is a write by then, and no place is left for it.
+    expect(await reading).toEqual({
+      isError: true,
+      text: 'page_busy: 1 calls that change the page are already waiting their turn; try again shortly',
+      structured: undefined,
+    });
+    expect(queuedOrder(lines)).toHaveLength(2);
+    answer(opened, held[0]);
+    await eventually(() => held.length === 2);
+    expect(held[1]?.tool).toBe('add_item');
+    answer(opened, held[1]);
+    expect((await running).isError).toBe(false);
+    expect((await waiting).isError).toBe(false);
+    await opened.sync();
+    expect(held.map((frame) => frame.tool)).toEqual(['add_item', 'add_item']);
+  }, 20_000);
 });

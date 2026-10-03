@@ -126,6 +126,12 @@ interface PendingCall {
   mutating: boolean;
   /** Its deadline counts from here, however long it waits in the queue. */
   arrivedAt: number;
+  /**
+   * Whether its arrival sent the page a roster for the moved expiry. That
+   * roster could not name its client, which is named only once every check
+   * has passed, so a new name may follow it at once (#nameClient).
+   */
+  rosterAtArrival: boolean;
   /** Whether it waited behind another call; one that went straight out keeps its whole deadline. */
   waited: boolean;
   /**
@@ -163,10 +169,10 @@ interface ArgCheckEntry {
 interface ListedTool {
   /**
    * A hash of the tool's JSON as the page sent it; null when it was not walked
-   * (the frame's node cap) or could not be serialised, so it is never reused.
+   * (a node cap) or could not be serialised, so it is never reused.
    */
   raw: string | null;
-  /** Listed with a stub for the frame's node cap; a later walk keeps nothing from it. */
+  /** Listed with a stub for a node cap, the tool's or the frame's; a later walk keeps nothing from it. */
   capped: boolean;
   /** As clients are shown it, cut (S10). */
   tool: PageTool;
@@ -438,6 +444,14 @@ function cutTool(tool: PageTool, inputSchema = cutSchema(tool.inputSchema)): Pag
  * with a stub, like an oversized schema, and go unchecked (S9, ADR 0010).
  */
 export const MAX_FRAME_SCHEMA_NODES = 20_000;
+
+/**
+ * The most of a frame's walk one tool may take. A tool over it is listed with a
+ * stub and goes unchecked on its own, having cost the frame no more than this
+ * and one node, so one large tool on an honest page cannot leave every tool
+ * after it unchecked, on this frame or any re-list of it.
+ */
+export const MAX_TOOL_SCHEMA_NODES = 5_000;
 
 /**
  * A schema's nodes, counted no further than `limit + 1` and no deeper than the
@@ -851,11 +865,12 @@ export class PageHub {
 
   /**
    * A tools frame costs main-thread time: parsing it, then hashing and walking
-   * each changed tool's schema up to MAX_FRAME_SCHEMA_NODES (ADR 0008, ADR
-   * 0010). So each socket gets a budget of them, and so does each remote
-   * address across all its sockets and reconnects, since one address may hold
-   * many sockets (S9). Past either the socket is closed as a policy breach,
-   * which leaves the page asleep and resumable like any other close.
+   * each changed tool's schema, up to MAX_TOOL_SCHEMA_NODES per tool and
+   * MAX_FRAME_SCHEMA_NODES in all (ADR 0008, ADR 0010). So each socket gets a
+   * budget of them, and so does each remote address across all its sockets and
+   * reconnects, since one address may hold many sockets (S9). Past either the
+   * socket is closed as a policy breach, which leaves the page asleep and
+   * resumable like any other close.
    */
   #toolsFrameAllowed(conn: Conn): boolean {
     const now = Date.now();
@@ -888,7 +903,8 @@ export class PageHub {
     const previous = this.#listed.get(pageId);
     const listed = new Map<string, ListedTool>();
     let nodesLeft = MAX_FRAME_SCHEMA_NODES;
-    let capped = 0;
+    let overTool = 0;
+    let overFrame = 0;
     for (const tool of frame.tools) {
       if (seen.has(tool.name)) continue;
       seen.add(tool.name);
@@ -900,15 +916,24 @@ export class PageHub {
         tools.push(before.tool);
         continue;
       }
-      const { nodes, deep } = schemaNodes(tool.inputSchema, nodesLeft);
-      if (nodes > nodesLeft) {
-        // Every tool after this one is past the cap too, so none of them is walked.
-        nodesLeft = 0;
-        capped += 1;
+      // The count stops one node past the limit, and the frame is charged what
+      // was counted, so the walk per frame stays within the frame's cap plus one
+      // node per tool however many large tools it lists.
+      const limit = Math.min(nodesLeft, MAX_TOOL_SCHEMA_NODES);
+      const { nodes, deep } = schemaNodes(tool.inputSchema, limit);
+      nodesLeft = Math.max(0, nodesLeft - nodes);
+      if (nodes > limit) {
+        // Over its own limit, it alone is stubbed and later tools are walked;
+        // past what is left of the frame's, so is every tool after it.
+        const own = limit === MAX_TOOL_SCHEMA_NODES;
+        if (own) overTool += 1;
+        else overFrame += 1;
         const stub = cutTool(
           tool,
           removedSchema(
-            `the page's tools hold more than ${String(MAX_FRAME_SCHEMA_NODES)} schema nodes in all`,
+            own
+              ? `more than ${String(MAX_TOOL_SCHEMA_NODES)} schema nodes`
+              : `the page's tools hold more than ${String(MAX_FRAME_SCHEMA_NODES)} schema nodes in all`,
           ),
         );
         const check = { schema: null, uncompilable: false, warned: new Set<UncheckedReason>() };
@@ -916,7 +941,6 @@ export class PageHub {
         tools.push(stub);
         continue;
       }
-      nodesLeft -= nodes;
       const cut = cutTool(tool);
       // From the page's own schema, not the cut copy, so a long enum value still
       // matches. Prepared here and compiled in the worker, at the tool's first call.
@@ -940,10 +964,16 @@ export class PageHub {
     if (tools.length !== frame.tools.length) {
       this.#log.warn('page listed a tool name twice; kept the first', { pageId });
     }
-    if (capped > 0) {
+    if (overTool > 0) {
+      this.#log.warn(
+        'page tools hold more schema than the relay walks per tool; each such tool is listed without its schema and goes to the page unchecked',
+        { pageId, toolCount: overTool },
+      );
+    }
+    if (overFrame > 0) {
       this.#log.warn(
         'page tools hold more schema than the relay walks per frame; the rest are listed without their schemas and go to the page unchecked',
-        { pageId, toolCount: capped },
+        { pageId, toolCount: overFrame },
       );
     }
     page.tools = tools;
@@ -1687,7 +1717,7 @@ export class PageHub {
 
     // Every call moves the expiry, but only one that passes every check names
     // its client (#nameClient): refused calls must not add names to the roster.
-    this.#touchAttachment(attachment, arrivedAt);
+    const rosterAtArrival = this.#touchAttachment(attachment, arrivedAt);
     const tool = page.tools.find((candidate) => candidate.name === toolName);
     if (!tool) return hubError('tool_not_found', `page ${pageId} has no tool named ${toolName}`);
     // S5, relay half: observers run only tools the page marked read-only.
@@ -1707,6 +1737,7 @@ export class PageHub {
       args,
       mutating: tool.annotations?.readOnlyHint !== true,
       arrivedAt,
+      rosterAtArrival,
       waited: false,
       checking: false,
       conn: null,
@@ -1810,7 +1841,7 @@ export class PageHub {
       }
       signal.addEventListener('abort', onAbort, { once: true });
       this.#armCallTimer(call);
-      if (attachment) this.#nameClient(attachment, call.caller.client, Date.now());
+      if (attachment) this.#nameClient(call, attachment, Date.now());
       if (!call.mutating) {
         this.#dispatch(call);
         return;
@@ -1856,7 +1887,7 @@ export class PageHub {
       call.settle(current);
       return;
     }
-    this.#nameClient(current.attachment, call.caller.client, Date.now());
+    this.#nameClient(call, current.attachment, Date.now());
     if (!current.mutating) {
       // The page re-listed the tool as read-only meanwhile, so it no longer waits for writes.
       const queue = this.#queues.get(call.pageId);
@@ -2076,35 +2107,44 @@ export class PageHub {
   /**
    * Every call moves its attachment's expiry (ADR 0009), refused or not. A
    * moved expiry alone sends a roster only once the one the page shows has
-   * fallen a refresh step behind.
+   * fallen a refresh step behind. Returns whether it sent one.
    */
-  #touchAttachment(attachment: AttachmentRecord, now: number): void {
+  #touchAttachment(attachment: AttachmentRecord, now: number): boolean {
     attachment.lastUsedAt = now;
     attachment.expiresAt = now + this.#config.timings.attachmentIdleMs;
     this.#armExpiry(attachment);
     this.#store.attachments.put(attachment);
-    if (now - (this.#rosterSentAt.get(attachment.pageId) ?? 0) >= this.#rosterStep()) {
-      this.#sendCallRoster(attachment.pageId, now);
-    }
+    if (now - (this.#rosterSentAt.get(attachment.pageId) ?? 0) < this.#rosterStep()) return false;
+    this.#sendCallRoster(attachment.pageId, now);
+    return true;
   }
 
   /**
    * Records the client of a call that passed every check. A new client goes
-   * out at once only if no roster went out for a call in the last refresh step,
-   * otherwise with a trailing roster at the end of it, so a client that renames
-   * itself on every call cannot keep the operator's roster moving.
+   * out at once if no roster went out for a call in the last refresh step, or
+   * if the last one was this call's own arrival roster, which could not name
+   * it yet; otherwise with a trailing roster at the end of the step. A touch
+   * sends at most one roster per step, so a client that renames itself on
+   * every call adds at most one more per step and cannot keep the operator's
+   * roster moving.
    */
-  #nameClient(attachment: AttachmentRecord, client: ClientInfo | null, now: number): void {
-    const { pageId } = attachment;
-    const named = this.#recordClient(attachment, client);
+  #nameClient(call: PendingCall, attachment: AttachmentRecord, now: number): void {
+    const { pageId } = call;
+    const named = this.#recordClient(attachment, call.caller.client);
     this.#store.attachments.put(attachment);
     if (!named || this.#rosterTimers.has(pageId)) return;
     const step = this.#rosterStep();
-    const since = now - (this.#callRosterAt.get(pageId) ?? 0);
-    if (since >= step || now - (this.#rosterSentAt.get(pageId) ?? 0) >= step) {
+    const last = this.#callRosterAt.get(pageId) ?? 0;
+    // A touch stamps its roster with the call's arrival time, and no other call
+    // roster can follow within that millisecond (the step holds back touches
+    // and names, and the touch's send cleared any trailing timer), so this
+    // holds only while the arrival roster is still the last one for a call.
+    const ownArrival = call.rosterAtArrival && last === call.arrivedAt;
+    if (ownArrival || now - last >= step || now - (this.#rosterSentAt.get(pageId) ?? 0) >= step) {
       this.#sendCallRoster(pageId, now);
       return;
     }
+    const since = now - last;
     this.#setTimer(this.#rosterTimers, pageId, step - since, () => {
       this.#sendCallRoster(pageId, Date.now());
     });

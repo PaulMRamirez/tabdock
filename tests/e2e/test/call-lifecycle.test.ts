@@ -66,7 +66,10 @@ describe('argument validation at the relay (ADR 0008)', () => {
   it.each(RUNTIME_PROFILES)(
     'on %s, refuses arguments that fail the schema with invalid_arguments before the page sees them',
     async (profile) => {
-      world = await startWorld();
+      // A generous check budget: under a loaded test run the default 50 ms can
+      // pass, and a call then goes to the page unchecked (ADR 0010), which is
+      // not what this test reads.
+      world = await startWorld({ timings: { argumentCheckMs: 2000 } });
       const sim = await world.page({ profile, policy: { consequentialTools: ['wipe'] } });
       const alice = await world.client(world.alice, 'alice-laptop');
       const pageId = await attachAs(alice, sim, 'driver');
