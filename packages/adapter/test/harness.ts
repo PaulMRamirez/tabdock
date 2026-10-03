@@ -29,9 +29,12 @@ import {
 } from '../src/core.ts';
 
 export const RELAY_URL = 'ws://relay.test/page';
-export const RESUME_KEY = `tabdock:resume:${RELAY_URL}`;
-export const GRANTS_KEY = `tabdock:grants:${RELAY_URL}`;
-export const REVOKED_KEY = `tabdock:revoked:${RELAY_URL}`;
+export const PAGE_URL = 'http://127.0.0.1:5173/board';
+// Written out, so a change to how records are keyed (ADR 0011) shows up here.
+export const RESUME_KEY = 'tabdock:resume:["ws://relay.test/page","http://127.0.0.1:5173/board"]';
+export const GRANTS_KEY = 'tabdock:grants:["ws://relay.test/page","http://127.0.0.1:5173/board"]';
+export const REVOKED_KEY = 'tabdock:revoked:["ws://relay.test/page","http://127.0.0.1:5173/board"]';
+export const PAUSED_KEY = 'tabdock:paused:["ws://relay.test/page","http://127.0.0.1:5173/board"]';
 export const PAGE_WINDOW = { label: 'page window' };
 export const FRAME_WINDOW = { label: 'iframe window' };
 export const HANDLER_FAILED =
@@ -327,7 +330,8 @@ export function setup(
       return socket;
     },
     storage,
-    pageInfo: () => ({ title: 'Test page', url: 'http://127.0.0.1:5173/board' }),
+    pageUrl: PAGE_URL,
+    pageInfo: () => ({ title: 'Test page' }),
     ownWindow: PAGE_WINDOW,
     adapterVersion: '0.0.0-test',
     logger: {

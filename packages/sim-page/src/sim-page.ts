@@ -3,7 +3,8 @@
 // header the way a browser does. Relay tests drive it like a tab: an operator
 // answers prompts (scripted, or through the Dock handle), uses the roster
 // controls and the pause switch, and reload() drops the socket without a
-// goodbye and boots a fresh page on the same storage.
+// goodbye and boots a fresh page on the same storage; navigate() does the
+// same at another path, as moving to another page of the site in one tab does.
 
 import {
   type ActivityEntry,
@@ -69,7 +70,7 @@ export interface SimPageOptions {
   /** Builds the page's tools; createDefaultTools by default. */
   tools?: (store: SimStore) => FakeToolDefinition[];
   title?: string;
-  /** Path part of the page URL sent in hello. */
+  /** Path part of the page's URL, '/' by default; navigate() moves the tab to another. */
   path?: string;
   /** Receives the adapter's log lines as well as sim.logs. */
   logger?: Logger;
@@ -79,6 +80,8 @@ export interface SimPageOptions {
 }
 
 export interface SimPage {
+  /** The current page's address, origin and path: what one approval covers (ADR 0011). */
+  readonly url: string;
   /** The current page's handle; reload() replaces it. */
   readonly dock: Dock;
   readonly state: DockState;
@@ -112,6 +115,12 @@ export interface SimPage {
    * boots, like a reload stuck behind a sleeping laptop.
    */
   reload(options?: { awayMs?: number }): Promise<void>;
+  /**
+   * Moving to another page of the same origin in the same tab: like reload(),
+   * but the fresh page boots at `path`. One approval covers one page (ADR
+   * 0011), so it starts its own session and its operator approves anew.
+   */
+  navigate(path: string, options?: { awayMs?: number }): Promise<void>;
   /**
    * A deliberate detach: pending prompts denied, socket closed with
    * CLOSE_DETACH (4000) so the relay ends the session at once, resume token
@@ -165,6 +174,7 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
   let connections = 0;
   let lastSocketError: string | null = null;
   let lastClose: { code: number; reason: string } | null = null;
+  let pageUrl = `${pageOrigin}${options.path ?? '/'}`;
 
   const logger: Logger = {
     info: (message) => {
@@ -206,10 +216,8 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
       socketFactory,
       storage,
       ui: options.operator,
-      pageInfo: () => ({
-        title: options.title ?? 'Sim page',
-        url: `${pageOrigin}${options.path ?? '/'}`,
-      }),
+      pageUrl,
+      pageInfo: () => ({ title: options.title ?? 'Sim page' }),
       ownWindow: context.window,
       adapterVersion: options.adapterVersion ?? '0.0.0-sim',
       logger,
@@ -221,7 +229,19 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
 
   let current = await boot();
 
+  /** The current page goes the way a browser leaves one: no detach, and the token stays. */
+  async function leave(awayMs: number): Promise<void> {
+    const closing = socket;
+    current.core.close('unload');
+    await waitClosed(closing);
+    socket = null;
+    if (awayMs > 0) await new Promise((resolve) => setTimeout(resolve, awayMs));
+  }
+
   return {
+    get url() {
+      return pageUrl;
+    },
     get dock() {
       return current.core.dock;
     },
@@ -280,12 +300,12 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
       });
     },
     async reload(reloadOptions = {}) {
-      const closing = socket;
-      current.core.close('unload');
-      await waitClosed(closing);
-      socket = null;
-      const awayMs = reloadOptions.awayMs ?? 0;
-      if (awayMs > 0) await new Promise((resolve) => setTimeout(resolve, awayMs));
+      await leave(reloadOptions.awayMs ?? 0);
+      current = await boot();
+    },
+    async navigate(path, navigateOptions = {}) {
+      await leave(navigateOptions.awayMs ?? 0);
+      pageUrl = `${pageOrigin}${path}`;
       current = await boot();
     },
     async close() {

@@ -56,8 +56,10 @@ export function attach(options: AttachOptions): Dock {
     storage: sessionStorageIfAllowed(),
     locks: 'locks' in navigator ? (navigator.locks satisfies LocksLike) : undefined,
     ownWindow: window,
-    // Origin and path only: queries and fragments can carry secrets.
-    pageInfo: () => ({ title: document.title, url: `${location.origin}${location.pathname}` }),
+    // The page one approval covers (ADR 0011), read once: origin and path only,
+    // as queries and fragments can carry secrets.
+    pageUrl: `${location.origin}${location.pathname}`,
+    pageInfo: () => ({ title: document.title }),
     adapterVersion: ADAPTER_VERSION,
   });
   if (options.ui !== false) mountWidget(core.dock);

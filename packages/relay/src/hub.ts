@@ -248,6 +248,39 @@ export function formatDuration(ms: number): string {
   return `${String(ms)} ms`;
 }
 
+/**
+ * The page a hello url names: its origin and path, whatever the query or
+ * fragment. Text that is not an absolute URL names its page by what comes
+ * before any '?' or '#', so it still matches itself.
+ */
+function pageAddress(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return url.split(/[?#]/, 1)[0] ?? '';
+  }
+}
+
+/**
+ * Why a presented resume token cannot resume its session, or null when it
+ * can. The origin that counts is the socket's Origin header (S1). One
+ * approval covers one page (ADR 0011), so the hello must also name the page
+ * the session began on: another path of the same origin, or a url naming
+ * another origin, is another page, however its token was obtained.
+ */
+function resumeRefusal(
+  candidate: PageRecord | undefined,
+  origin: string,
+  url: string,
+): string | null {
+  if (candidate === undefined) return 'unknown token';
+  if (candidate.state === 'gone') return 'page gone';
+  if (candidate.origin !== origin) return 'different origin';
+  if (pageAddress(candidate.url) !== pageAddress(url)) return 'different page';
+  return null;
+}
+
 function attachmentKey(pageId: string, userId: string): string {
   // Both are ids of letters, digits, '_' and '-', so a space cannot be ambiguous.
   return `${pageId} ${userId}`;
@@ -612,18 +645,16 @@ export class PageHub {
     let page: PageRecord | undefined;
     if (frame.resumeToken !== undefined) {
       const candidate = this.#store.pages.findByResumeTokenHash(digestHex(frame.resumeToken));
-      if (candidate && candidate.state !== 'gone' && candidate.origin === conn.origin) {
+      const refused = resumeRefusal(candidate, conn.origin, frame.url);
+      if (refused === null) {
         page = candidate;
       } else {
-        // The token stays a secret even when it is refused; only the reason is logged.
+        // The token stays a secret even when it is refused; only the reason is
+        // logged. A refused token's session is left as it was, still resumable
+        // by its own page.
         this.#log.warn('resume refused; starting a new page session', {
           origin: conn.origin,
-          reason:
-            candidate === undefined
-              ? 'unknown token'
-              : candidate.state === 'gone'
-                ? 'page gone'
-                : 'different origin',
+          reason: refused,
         });
       }
     }

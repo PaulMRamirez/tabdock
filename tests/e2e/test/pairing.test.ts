@@ -3,6 +3,7 @@
 // and calls one. Then the three ways pairing fails, plus an operator who says
 // nothing at all.
 
+import { storageKey } from '@tabdock/adapter/core';
 import { DEFAULT_SIM_ORIGIN } from '@tabdock/sim-page';
 import { untrustedHeader } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -117,7 +118,7 @@ describe('A1.1: pair by code, approve, list and call', () => {
 
     // S11: no token, code, resume token or argument reached either side's log.
     // The adapter keeps its resume token in the tab's sessionStorage under this key.
-    const resumeToken = sim.storage.getItem(`tabdock:resume:${w.relay.pageUrl}`);
+    const resumeToken = sim.storage.getItem(storageKey('resume', w.relay.pageUrl, sim.url));
     expect(resumeToken).toBeTruthy();
     const logs = [...w.relayLogs, ...sim.logs].join('\n');
     const secrets = [w.alice.token, w.bob.token, code, code.replace('-', ''), argument];
