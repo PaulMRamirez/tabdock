@@ -1,0 +1,15 @@
+# 0013: OAuth in M3: WorkOS issues tokens, the relay checks them
+
+Status: Accepted by the owner, 3 October 2026 (decisions D1, D2, D3 and D7 of the M3 plan). Refines ADR 0006; changes SPEC section 7.
+
+## Context
+
+ADR 0006 planned a minimal `oauth` plugin that "accepts Claude's hosted callback and Claude Code's loopback redirect". The M3 research (`docs/notes/verified.md`, 3 October) showed how Claude actually signs in: it starts only on an HTTP 401 whose `WWW-Authenticate` carries `resource_metadata`, reads RFC 9728 protected resource metadata, registers itself with the authorization server it names (a client ID metadata document, or dynamic registration), always uses S256 PKCE and the RFC 8707 `resource` parameter, and treats any 403 other than `insufficient_scope` as final. The SDK has resource-server helpers but no authorization server and no token verifier. Of twelve identity providers checked, only WorkOS AuthKit offered everything Claude needs from dashboard switches. The auth plugin contract (`authenticate(request)` returns a User or null) cannot express a challenge or serve metadata, and the QR flow (S11) needs the relay to sign a phone's browser in as well.
+
+## Decision
+
+WorkOS AuthKit is the authorization server: it registers Claude, checks redirects (Claude's hosted callback and Claude Code's loopback), runs sign-in and issues access tokens whose audience is the relay's public MCP URL. The relay is a resource server only. The auth plugin contract becomes: `authenticate(request)` returns a user, or a refusal carrying its status and challenge (401 with `resource_metadata` to sign in, 403 for a signed-in person not on the allowlist), and a plugin may serve GET routes. The `oauth` plugin serves `/.well-known/oauth-protected-resource/mcp`, checks the provider's metadata at startup (issuer, S256, and client metadata documents or registration), and verifies each token's signature, issuer, audience and expiry with `jose` 6.2.12 under the SDK's `verifyBearerToken`; a valid token's `sub` maps to a user through an allowlist in `.env`, and anyone else gets 403. The QR page `/pair` signs the phone's browser in with `openid-client` 6.8.8 (and its dependency `oauth4webapi` 3.8.8) against the same provider, holding a short session in a `__Host-` cookie. Tests use `oauth2-mock-server` 9.2.0 as a stand-in provider. The owner approved these three runtime packages and one dev package; all are MIT, by the same maintainer, with nothing else beneath them.
+
+## Consequences
+
+The relay holds no signing keys and no client registrations; swapping providers later changes only the issuer, key URL and audience. A vendor holds the owner's sign-ins, and since strangers may be able to sign up with it, the relay's allowlist is the real gate. Some facts are confirmed only on the owner's first run (Claude Code's loopback port, hosted Claude's metadata document), with dynamic registration as the fallback.

@@ -23,7 +23,7 @@ MCP clients (many) --HTTPS + auth--> RELAY <--WebSocket, dialed out by page-- AD
 | Connector shape | One stable relay URL. Pages pair to the user, not the client to the page | Claude connects from Anthropic's cloud; connectors cannot be edited in place |
 | Tool surface | Five fixed tools first. Page tools as first-class entries in M5 | Fixed tools work on every client |
 | Stack | TypeScript everywhere, Node 22+, pnpm workspace. Any Python helper uses uv | Shared protocol types; matches MCP-B |
-| Relay trust | The relay sees plaintext calls and results. Self-host first | Stock connectors cannot do end-to-end encryption to a page |
+| Relay trust | The relay sees plaintext calls and results, and so does a tunnel that terminates TLS in front of it (ADR 0014). Self-host first | Stock connectors cannot do end-to-end encryption to a page |
 | Upstream | Stay close to MCP-B's page protocol ideas and propose a remote relay mode there | Avoid a competing project |
 
 ## 3. Facts verified on 2 October 2026 (re-verify before relying on them)
@@ -113,7 +113,7 @@ Every page result starts with the header line `[tabdock: untrusted content from 
 
 Errors return as MCP tool errors with one of these codes in the text: `not_attached`, `role_denied`, `tool_not_found`, `page_asleep`, `page_gone`, `denied_by_operator`, `timeout`, `page_busy`, `pairing_expired`, `rate_limited`, `invalid_arguments`. The last covers arguments the relay will not forward: too large for one frame, or, from M2, failing the tool's `inputSchema` (ADR 0007).
 
-Auth is a plugin: `authenticate(request)` returns a User or null. M1 ships `dev-token` (users and bearer tokens from `.env`). M3 adds a minimal `oauth` plugin and M4 hardens it (ADR 0006), delegating sign-in to an external identity provider through a maintained library, accepting Claude's hosted callback and Claude Code's loopback redirect.
+Auth is a plugin: `authenticate(request)` returns a User, or a refusal with its status and challenge (401 to sign in, 403 for someone not allowed), and a plugin may serve GET routes. M1 ships `dev-token` (users and bearer tokens from `.env`). M3 adds a minimal `oauth` plugin and M4 hardens it (ADRs 0006 and 0013): an external identity provider (WorkOS AuthKit) registers Claude, checks its hosted callback and Claude Code's loopback redirect, and issues tokens for the relay, which serves RFC 9728 metadata and verifies each token through a maintained library.
 
 M5 adds first-class page tools named `<alias>__<tool>`, described with an origin prefix capped at 500 characters, with a short `ttlMs` and `list_changed` for session-based clients, behind a config flag. The fixed tools always remain.
 
@@ -146,7 +146,7 @@ Lifecycle: hold a Web Lock while attached, reconnect with backoff from 0.5 s to 
 9. S9. Limits exist for users per page, calls per user per minute, queue depth, frame size and result size.
 10. S10. Page results are always labelled untrusted. Page-supplied descriptions are length capped and never merged into the fixed tools' descriptions.
 11. S11. Tokens and codes never appear in logs. The QR nonce is single use and useless without a signed-in user and an operator approval.
-12. S12. The relay binds to localhost in dev and requires TLS otherwise.
+12. S12. The relay binds to localhost in dev and requires TLS otherwise; a public URL in front of it must be https (ADR 0014).
 13. S13. A user can list and call only pages they are attached to. Access never depends on a page id being hard to guess.
 
 ## 10. Milestones and acceptance tests

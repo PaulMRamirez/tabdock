@@ -1,6 +1,6 @@
 # 0006: Sign in through OAuth from M3
 
-Status: Accepted by the owner, 2 October 2026. Changes SPEC sections 7 and 10.
+Status: Accepted by the owner, 2 October 2026; refined by ADR 0013 (the identity provider handles Claude's redirects, and the relay verifies tokens). Changes SPEC sections 7 and 10.
 
 ## Context
 
