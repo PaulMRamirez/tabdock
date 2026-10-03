@@ -141,6 +141,12 @@ importers:
       '@tabdock/sim-page':
         specifier: workspace:*
         version: link:../../packages/sim-page
+      '@types/ws':
+        specifier: 8.18.2
+        version: 8.18.2
+      ws:
+        specifier: 8.22.0
+        version: 8.22.0
 
 packages:
 
