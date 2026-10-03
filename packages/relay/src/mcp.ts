@@ -3,7 +3,9 @@
 // handler reads who is calling from the request itself, not from the factory,
 // and refuses a request from anyone but the user the server was built for.
 // Tool descriptions are fixed relay text: no page-supplied string is ever
-// merged into them (S10).
+// merged into them (S10). With the M3 spike flag on (spike.ts, ADR 0014) a
+// marker tool may sit beside the five, and call_page_tool results carry
+// timestamps.
 
 import {
   type AuthInfo,
@@ -26,6 +28,7 @@ import {
 import { z } from 'zod';
 import type { ResolvedConfig } from './config.ts';
 import type { CallerIdentity, CallOutcome, PageHub, ToolListing, ToolsOutcome } from './hub.ts';
+import type { Spike } from './spike.ts';
 
 export const RELAY_NAME = 'tabdock-relay';
 export const RELAY_VERSION = '0.0.0';
@@ -67,7 +70,8 @@ export function errorResult(code: ErrorCode, message: string): CallToolResult {
   return { content: [text(formatError(code, message))], isError: true };
 }
 
-function parseClientInfo(raw: unknown): ClientInfo | null {
+/** A client's name and version as it gave them, capped; null when it gave none. */
+export function parseClientInfo(raw: unknown): ClientInfo | null {
   if (typeof raw !== 'object' || raw === null) return null;
   const { name, version } = raw as Record<string, unknown>;
   if (typeof name !== 'string' || typeof version !== 'string') return null;
@@ -206,9 +210,10 @@ export function userIdOf(authInfo: AuthInfo | undefined): string | null {
 export function createMcpFactory(
   hub: PageHub,
   config: ResolvedConfig,
+  spike: Spike | null = null,
 ): (ctx: McpRequestContext) => McpServer {
   const waitSeconds = Math.round(config.timings.pairWaitMs / 1000);
-  return ({ authInfo }) => {
+  return ({ authInfo, era }) => {
     const owner = identityFrom(authInfo).userId;
     const server = new McpServer(
       { name: RELAY_NAME, version: RELAY_VERSION },
@@ -311,8 +316,20 @@ export function createMcpFactory(
         _meta: MAX_RESULT_SIZE_META,
       },
       async ({ page, tool, arguments: args }, ctx) => {
-        const outcome = await hub.callPageTool(caller(ctx), page, tool, args, ctx.mcpReq.signal);
-        return callResult(tool, outcome);
+        const who = caller(ctx);
+        const timer = spike?.startCall(ctx.http?.authInfo ?? authInfo);
+        const outcome = await hub.callPageTool(
+          who,
+          page,
+          tool,
+          args,
+          ctx.mcpReq.signal,
+          timer?.marks ?? null,
+        );
+        const result = callResult(tool, outcome);
+        return spike && timer
+          ? spike.finishCall(timer, result, { userId: who.userId, pageId: page, tool })
+          : result;
       },
     );
 
@@ -335,6 +352,8 @@ export function createMcpFactory(
       },
     );
 
+    // The spike's marker tool, while it exists, sits beside the five (ADR 0014).
+    spike?.attachServer(server, era);
     return server;
   };
 }

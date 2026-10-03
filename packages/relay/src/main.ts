@@ -6,6 +6,7 @@ import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { loadConfigFromEnv } from './config.ts';
 import { createRelay } from './relay.ts';
+import { attachSpikeConsole, SPIKE_CONSOLE_HELP } from './spike.ts';
 
 const envFile = resolve(import.meta.dirname, '../../../.env');
 if (existsSync(envFile)) process.loadEnvFile(envFile);
@@ -30,6 +31,13 @@ try {
               ]),
         ];
   process.stdout.write(`${lines.join('\n')}\n`);
+  // The spike's marker is controlled from this terminal and nowhere else (spike.ts).
+  if (relay.spike) {
+    process.stdout.write(`${SPIKE_CONSOLE_HELP}\n`);
+    attachSpikeConsole(relay.spike, process.stdin, (line) => {
+      process.stdout.write(`${line}\n`);
+    });
+  }
   const stop = (): void => {
     relay.close().then(
       () => process.exit(0),

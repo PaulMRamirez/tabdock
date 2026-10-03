@@ -755,15 +755,6 @@ const QUIET_ZONE = 4;
 /** What a strict page sends: Trusted Types for every script sink, and no data: images. */
 const TRUSTED_TYPES_CSP = "require-trusted-types-for 'script'; img-src 'self'";
 const TRUSTED_HTML_ERROR = "This document requires 'TrustedHTML' assignment.";
-const TRUSTED_SCRIPT_ERROR = "This document requires 'TrustedScript' assignment.";
-/**
- * zod checks whether eval works (its allowsEval) with `new Function('')` in a
- * try block when its first object schema is built, which the protocol's frame
- * schemas do on any page the adapter loads on, so a Trusted Types page logs
- * and reports one violation for it whatever the widget does. This is that
- * violation's sample: an empty function body, nothing more.
- */
-const ZOD_EVAL_PROBE = 'Function|(\n) {\n\n})';
 
 interface Violation {
   directive: string;
@@ -949,13 +940,9 @@ test('the pairing URL draws as a QR code under Trusted Types, matches the librar
   expectDrawing(next, NEXT_PAIRING_URL);
   expect(await widgetVisible(page, 'pairing-qr')).toBe(true);
 
-  // Nothing the widget did broke the policy: the only violation is zod's probe.
-  const seen = await violations();
-  expect(seen.filter((violation) => violation.sample !== ZOD_EVAL_PROBE)).toEqual([]);
-  for (const violation of seen) {
-    expect(violation.directive).toBe('require-trusted-types-for');
-    expectedErrors.push(TRUSTED_SCRIPT_ERROR);
-  }
+  // Loading the adapter and drawing the widget broke nothing: zod runs jitless
+  // (packages/protocol/src/zod-config.ts), so not even its eval probe is reported.
+  expect(await violations()).toEqual([]);
   // And the policy was in force: the library's own SVG string would have been refused.
   const blocked = await page.evaluate(
     (svg) => {

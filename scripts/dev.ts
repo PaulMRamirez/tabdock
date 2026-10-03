@@ -9,7 +9,13 @@
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { startDemoServer, type DemoServer } from '../apps/demo/scripts/server.ts';
-import { createRelay, loadConfigFromEnv, type Relay } from '../packages/relay/src/index.ts';
+import {
+  attachSpikeConsole,
+  createRelay,
+  loadConfigFromEnv,
+  type Relay,
+  SPIKE_CONSOLE_HELP,
+} from '../packages/relay/src/index.ts';
 
 const envFile = resolve(import.meta.dirname, '../.env');
 if (existsSync(envFile)) process.loadEnvFile(envFile);
@@ -84,6 +90,14 @@ process.stdout.write(
     '',
   ].join('\n'),
 );
+
+// TABDOCK_SPIKE=1: the spike's marker tool is added and removed from this terminal (ADR 0014).
+if (relay.spike) {
+  process.stdout.write(`${SPIKE_CONSOLE_HELP}\n\n`);
+  attachSpikeConsole(relay.spike, process.stdin, (line) => {
+    process.stdout.write(`${line}\n`);
+  });
+}
 
 const running = { relay, demo };
 let stopping = false;

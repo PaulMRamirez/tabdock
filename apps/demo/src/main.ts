@@ -1,6 +1,7 @@
 import { initializeWebMCPPolyfill } from '@mcp-b/webmcp-polyfill';
 import { attach, type Dock } from '@tabdock/adapter';
 import { Board } from './board.ts';
+import { busyFromQuery, startBusy } from './busy.ts';
 import { relayFromQuery } from './relay.ts';
 import { type BoardUi, mountBoard } from './render.ts';
 import { createTools } from './tools.ts';
@@ -28,6 +29,16 @@ const ui = mountBoard(requiredElement('#board'), board);
 board.addItem({ label: 'Start', x: 0, y: 0, color: 'green' });
 board.addItem({ label: 'North', x: 0, y: -150, color: 'blue' });
 board.addItem({ label: 'East', x: 220, y: 40, color: 'orange' });
+
+// The M3 spike's CPU-busy variant, for the owner's Energy Saver run (busy.ts).
+const busy = busyFromQuery(new URLSearchParams(window.location.search));
+if (busy) {
+  const line = document.createElement('p');
+  line.className = 'meta';
+  line.dataset.role = 'busy';
+  line.textContent = startBusy(busy);
+  requiredElement('[data-role="status"]').after(line);
+}
 
 const context = document.modelContext;
 if (context) {

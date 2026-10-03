@@ -55,3 +55,20 @@ test('a call through executeTool changes the board and shows in the activity log
   await expect(page.locator('[data-role="log"] li').first()).toHaveText(/add_item: added item-4/);
   await expect(page.locator('[data-role="view"]')).toHaveText(/4 items/);
 });
+
+test('?busy spins in a worker for the Energy Saver soak, and says so on the page', async ({
+  page,
+}) => {
+  await page.goto(`${demo.url}?busy=30`);
+  await page.waitForSelector('html[data-tools="ready"]');
+  await expect(page.locator('[data-role="busy"]')).toHaveText(
+    /spinning 30% of the time in a worker/,
+  );
+  await expect.poll(() => page.workers().length).toBe(1);
+
+  // Without ?busy the board uses no worker at all.
+  await page.goto(demo.url);
+  await page.waitForSelector('html[data-tools="ready"]');
+  await expect(page.locator('[data-role="busy"]')).toHaveCount(0);
+  await expect.poll(() => page.workers().length).toBe(0);
+});
