@@ -127,10 +127,11 @@ describe('pair_page (A1.4, S3, S4)', () => {
     const alice = await client();
     const pending = callTool(alice, 'pair_page', { code: opened.code });
     const request = await opened.next('attach_request');
+    // A 2025-era client is named from its session's initialize (M2).
     expect(request).toMatchObject({
       user: { userId: 'alice', displayName: 'Alice' },
       via: 'code',
-      client: null,
+      client: { name: 'relay-test', version: '1.0.0' },
     });
     expect(request.requestId).toMatch(/^rq_/);
     expect(request.expiresAt).toBeGreaterThan(Date.now());
@@ -153,8 +154,11 @@ describe('pair_page (A1.4, S3, S4)', () => {
     });
     const roster = await opened.next('roster');
     expect(roster.attachments).toMatchObject([
-      { userId: 'alice', displayName: 'Alice', role: 'driver', lastUsedAt: null, expiresAt: null },
+      { userId: 'alice', displayName: 'Alice', role: 'driver', lastUsedAt: null },
     ]);
+    // Unused, an attachment expires 8 hours after its grant (ADR 0009).
+    const [granted] = roster.attachments;
+    expect(granted?.expiresAt).toBe((granted?.grantedAt ?? 0) + 8 * 60 * 60_000);
   });
 
   it('an approval without a role attaches as observer', async () => {
@@ -257,6 +261,31 @@ describe('pair_page (A1.4, S3, S4)', () => {
     await opened.sync();
     expect(opened.all('attach_request')).toHaveLength(1);
     expect(opened.all('roster').at(-1)?.attachments).toMatchObject([{ userId: 'alice' }]);
+  });
+
+  it('names every device that joined a pending request on the roster the approval sends', async () => {
+    const { relay } = await setup();
+    const opened = await page();
+    const laptop = await connectClient(relay, ALICE, { name: 'laptop-client' });
+    const phone = await connectClient(relay, ALICE, { name: 'phone-client', modern: true });
+    clients.push(laptop, phone);
+    const first = callTool(laptop, 'pair_page', { code: opened.code });
+    const request = await opened.next('attach_request');
+    const second = callTool(phone, 'pair_page', { code: (await opened.next('pairing')).code });
+    await opened.next('pairing');
+    await opened.sync();
+    const rostersBefore = opened.all('roster').length;
+    opened.send({ t: 'attach_decision', requestId: request.requestId, allow: true });
+    for (const answer of await Promise.all([first, second])) {
+      expect(answer.isError, answer.text).toBe(false);
+    }
+    await opened.sync();
+    // One roster, from the grant itself, already naming both: newest first.
+    expect(opened.all('roster')).toHaveLength(rostersBefore + 1);
+    expect(opened.all('roster').at(-1)?.attachments[0]?.clients).toEqual([
+      { name: 'phone-client', version: '1.0.0' },
+      { name: 'laptop-client', version: '1.0.0' },
+    ]);
   });
 
   it('a retry after the wait ran out waits on the same request instead of sending another', async () => {

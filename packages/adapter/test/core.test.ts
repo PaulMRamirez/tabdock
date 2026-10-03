@@ -580,6 +580,32 @@ describe('roles and consequential tools', () => {
       expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: 'driver' } });
     });
 
+    it.each(['denies', 'leaves unanswered'] as const)(
+      "drops a grant the relay never applied when the operator %s the user's next request",
+      async (answer) => {
+        const h = setup();
+        const socket = await link(
+          h,
+          { limits: { ...welcome(h.clock).limits, idleTimeoutMs: 600_000 } },
+          {},
+        );
+        // Approved as driver just as the request expired: the relay drops the decision.
+        socket.deliver(attachRequest(h.clock, 'req-1'));
+        expect(h.dock.approve('req-1', 'driver')).toBe(true);
+        socket.deliver(attachRequest(h.clock, 'req-2'));
+        if (answer === 'denies') expect(h.dock.deny('req-2')).toBe(true);
+        else await h.clock.advance(60_000);
+        expect(socket.last()).toEqual({ t: 'attach_decision', requestId: 'req-2', allow: false });
+        // The latest decision stands, even if a relay lists Bob after all.
+        expect(h.storage.getItem(GRANTS_KEY)).toBeNull();
+        socket.deliver({ t: 'roster', attachments: [attachment('bob', 'driver')] });
+        socket.deliver(invoke('set_value', { caller: bob() }));
+        await flush();
+        expect(codes(socket)).toEqual(['role_denied']);
+        expect(h.context.runs).toHaveLength(0);
+      },
+    );
+
     it('leaves a user whose first request the operator denied with no grant', async () => {
       const h = setup();
       // The relay lists Bob anyway; only an approval on the page counts.
@@ -825,8 +851,13 @@ describe('roles and consequential tools', () => {
     socket.deliver(invoke('wipe', { callId: 'call-2' }));
     socket.deliver(invoke('get_value', { callId: 'call-3' }));
     await flush();
-    expect(h.dock.state.pendingConfirms.map((item) => item.tool)).toEqual(['set_value', 'wipe']);
+    // Both writes are consequential; the second waits its turn behind the first's prompt (M2).
+    expect(h.dock.state.pendingConfirms.map((item) => item.tool)).toEqual(['set_value']);
     expect(results(socket).map((frame) => frame.callId)).toEqual(['call-3']);
+    expect(h.dock.confirm('call-1', true)).toBe(true);
+    await flush();
+    expect(h.dock.state.pendingConfirms.map((item) => item.tool)).toEqual(['wipe']);
+    expect(results(socket).map((frame) => frame.callId)).toEqual(['call-3', 'call-1']);
   });
 
   describe('ADR 0002 option C, where the runtime drops consequentialHint', () => {
@@ -1147,6 +1178,108 @@ describe('closing', () => {
   });
 });
 
+describe('one approval covers one page (ADR 0011)', () => {
+  const BOARD = 'http://127.0.0.1:5173/board';
+  const SETTINGS = 'http://127.0.0.1:5173/settings';
+  const caller = (userId: string) => ({
+    userId,
+    displayName: userId.charAt(0).toUpperCase() + userId.slice(1),
+    client: null,
+    role: 'driver' as const,
+  });
+  const codes = (socket: Awaited<ReturnType<typeof link>>) =>
+    results(socket).map((frame) => frame.error?.code ?? 'ok');
+  const listed = [attachment('bob', 'driver'), attachment('carol', 'observer')];
+
+  it('gives two pages of one origin in one tab their own resume token, grants, revokes and pause', async () => {
+    const board = setup({ core: { pageUrl: BOARD } });
+    const first = await link(board, {}, { bob: 'driver', carol: 'observer' });
+    first.drop(1006);
+    // A revoke the relay has not heard yet, and a pause, both stored for the board.
+    expect(board.dock.revoke('carol')).toBe(true);
+    board.dock.pause(true);
+    board.core.close('unload');
+
+    // The operator moves to the settings page in the same tab.
+    const settings = setup({ storage: board.storage, core: { pageUrl: SETTINGS } });
+    expect(settings.dock.state.paused).toBe(false);
+    settings.core.start();
+    const other = settings.socket();
+    other.accept();
+    expect(other.framesOf('hello')[0]).toMatchObject({ url: SETTINGS });
+    expect(other.framesOf('hello')[0]?.resumeToken).toBeUndefined();
+    // Even a relay that wrongly resumed the board's session gets no grant or revoke from it here.
+    other.deliver(
+      welcome(settings.clock, { resumed: true, resumeToken: 'resume-s', roster: listed }),
+    );
+    await flush();
+    expect(other.framesOf('revoke')).toEqual([]);
+    other.deliver(invoke('set_value', { caller: caller('bob') }));
+    await flush();
+    expect(codes(other)).toEqual(['role_denied']);
+    settings.core.close('unload');
+
+    // Back on the board, its reload finds everything it stored, untouched.
+    const reloaded = setup({ storage: board.storage, core: { pageUrl: BOARD } });
+    expect(reloaded.dock.state.paused).toBe(true);
+    reloaded.core.start();
+    const back = reloaded.socket();
+    back.accept();
+    expect(back.framesOf('hello')[0]?.resumeToken).toBe('resume-1');
+    back.deliver(
+      welcome(reloaded.clock, { resumed: true, resumeToken: 'resume-2', roster: listed }),
+    );
+    await flush();
+    expect(back.framesOf('revoke')).toEqual([{ t: 'revoke', userId: 'carol' }]);
+    reloaded.dock.pause(false);
+    back.deliver(invoke('set_value', { caller: caller('bob') }));
+    await flush();
+    expect(codes(back)).toEqual(['ok']);
+  });
+
+  it('keeps one page across a reload with another query or fragment, and never sends either', async () => {
+    const first = setup({ core: { pageUrl: `${BOARD}?view=list#top` } });
+    first.core.start();
+    first.socket().accept();
+    expect(first.socket().framesOf('hello')[0]).toMatchObject({ url: BOARD });
+    first.socket().deliver(welcome(first.clock));
+    await flush();
+    first.core.close('unload');
+
+    const second = setup({ storage: first.storage, core: { pageUrl: `${BOARD}?view=grid` } });
+    second.core.start();
+    second.socket().accept();
+    expect(second.socket().framesOf('hello')[0]).toMatchObject({
+      url: BOARD,
+      resumeToken: 'resume-1',
+    });
+  });
+
+  it('ignores and removes what an older adapter stored under the relay URL alone', async () => {
+    const storage = new MapStorage();
+    const legacy = (record: string) => `tabdock:${record}:${RELAY_URL}`;
+    storage.setItem(legacy('resume'), 'stale-token');
+    storage.setItem(legacy('grants'), '{"pageId":"page-1","grants":{"bob":"driver"}}');
+    storage.setItem(legacy('revoked'), '{"pageId":"page-1","users":["carol"]}');
+    storage.setItem(legacy('paused'), 'true');
+    const h = setup({ storage });
+    expect(h.dock.state.paused).toBe(false);
+    for (const record of ['resume', 'grants', 'revoked', 'paused']) {
+      expect(storage.getItem(legacy(record)), record).toBeNull();
+    }
+    h.core.start();
+    const socket = h.socket();
+    socket.accept();
+    expect(socket.framesOf('hello')[0]?.resumeToken).toBeUndefined();
+    socket.deliver(welcome(h.clock, { resumed: true, roster: listed }));
+    await flush();
+    expect(socket.framesOf('revoke')).toEqual([]);
+    socket.deliver(invoke('set_value', { caller: caller('bob') }));
+    await flush();
+    expect(codes(socket)).toEqual(['role_denied']);
+  });
+});
+
 describe('createAdapterCore', () => {
   it('rejects an invalid policy at once', () => {
     expect(() =>
@@ -1156,7 +1289,8 @@ describe('createAdapterCore', () => {
         socketFactory: () => {
           throw new Error('unused');
         },
-        pageInfo: () => ({ title: '', url: '' }),
+        pageUrl: '',
+        pageInfo: () => ({ title: '' }),
         adapterVersion: '0',
       }),
     ).toThrow();

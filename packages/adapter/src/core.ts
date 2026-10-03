@@ -39,7 +39,9 @@ import {
 } from '@tabdock/protocol';
 import {
   isConsequential,
+  isReadOnly,
   needsHintNotice,
+  type NormalisedTool,
   normaliseTools,
   type RuntimeTool,
   type ToolSnapshot,
@@ -106,10 +108,9 @@ export interface Logger {
   error(message: string): void;
 }
 
+/** What hello says about the page that can change while it is open. */
 export interface PageInfo {
   title: string;
-  /** Origin plus path only: queries and fragments can carry secrets. */
-  url: string;
 }
 
 export type AttachAnswer = Role | 'deny';
@@ -140,6 +141,14 @@ export interface CoreOptions {
   socketFactory: SocketFactory;
   storage?: StorageLike | undefined;
   ui?: UiPort | undefined;
+  /**
+   * The page's address when the adapter starts: location.origin plus
+   * location.pathname in a browser. One approval covers one page (ADR 0011),
+   * so the resume token, grants, revokes and pause are kept under it, and
+   * hello names it. Any query or fragment is dropped.
+   */
+  pageUrl: string;
+  /** Read at every hello. */
   pageInfo: () => PageInfo;
   /** When getTools() entries carry a window, only those whose window is this one are shared. */
   ownWindow?: unknown;
@@ -173,17 +182,62 @@ export interface PendingConfirm {
   readonly expiresAt: number;
 }
 
+/** How a call ended, as the page activity log shows it; 'running' until it does. */
+export type ActivityOutcome = 'running' | 'ok' | PageErrorCode;
+
+/**
+ * One call in the page activity log (S7): who asked, through which client,
+ * for which tool, and how it ended. Never the arguments or the result.
+ */
+export interface ActivityEntry {
+  readonly callId: string;
+  /** Local epoch milliseconds at which the invoke arrived. */
+  readonly time: number;
+  readonly user: User;
+  readonly client: ClientInfo | null;
+  readonly tool: string;
+  readonly outcome: ActivityOutcome;
+  /** Milliseconds from arrival to the end; null while the call runs. */
+  readonly durationMs: number | null;
+  /**
+   * True from when the call was answered (cancelled, timed out, revoked or cut
+   * off) until the page's handler, which kept running, ends. A write holds
+   * the page meanwhile, so later writes wait for it.
+   */
+  readonly handlerRunning: boolean;
+}
+
+/** What this page lets one user the roster lists do; see DockState.pageRoles. */
+export interface PageRole {
+  readonly userId: string;
+  /** The role the page runs their calls under, or null when it runs none. */
+  readonly role: Role | null;
+  /** Revoked here, and the relay has not dropped them yet. */
+  readonly revoked: boolean;
+}
+
 export interface DockState {
   readonly link: LinkState;
   readonly pageId: string | null;
   readonly pairing: Pairing | null;
   readonly roster: readonly AttachmentView[];
+  /**
+   * One entry per roster entry, in the same order: the role the page itself
+   * enforces, the lesser of the operator's grant and the roster's role. The
+   * roster is the relay's claim; a user the operator never approved here, or
+   * revoked, gets null whatever it says.
+   */
+  readonly pageRoles: readonly PageRole[];
   readonly pendingRequests: readonly PendingRequest[];
   readonly pendingConfirms: readonly PendingConfirm[];
   /** Advice for the page author, such as the consequentialHint fallback (ADR 0002). */
   readonly notice: string | null;
   /** Why the link is not working, when it is not. */
   readonly error: string | null;
+  /** While true, every new call is answered page_busy; calls already running finish. */
+  readonly paused: boolean;
+  /** The last ACTIVITY_LIMIT calls, newest first. */
+  readonly activity: readonly ActivityEntry[];
 }
 
 /** The only control handle. Each method returns false when there was nothing to act on. */
@@ -194,6 +248,17 @@ export interface Dock {
   deny(requestId: string): boolean;
   confirm(callId: string, allow: boolean): boolean;
   rotatePairing(): boolean;
+  /**
+   * The operator's role switch, for a user the roster lists and the operator
+   * approved on this page (or autoApprove let in). The relay may still hold a
+   * new driver at maxDrivers; the page runs calls under the lesser of this
+   * choice and the relay's roster either way.
+   */
+  setRole(userId: string, role: Role): boolean;
+  /** Ends one user's attachment, or everyone's with '*' (S8). */
+  revoke(userId: string): boolean;
+  /** Pauses or resumes calls on this page. Only false resumes, and the choice survives a reload. */
+  pause(paused: boolean): void;
   close(): void;
 }
 
@@ -221,6 +286,23 @@ const TOOLCHANGE_DEBOUNCE_MS = 25;
 /** A link that hears nothing for the relay's idle timeout plus this grace is treated as dead. */
 export const SILENCE_GRACE_MS = 5000;
 
+/** The page activity log keeps this many calls (SPEC section 8). */
+export const ACTIVITY_LIMIT = 50;
+
+/**
+ * Writes the page holds waiting at once, ADR 0009's per-page queue default.
+ * The relay sends one write at a time, so only a relay that floods the page
+ * gets here; past it, writes are answered page_busy rather than piling up.
+ */
+export const MAX_WAITING_WRITES = 32;
+
+/**
+ * How long past its deadline a write keeps the page once the runtime has
+ * stopped watching its handler (see holdUnwatched); the relay gives a
+ * running call the same grace.
+ */
+export const UNWATCHED_HANDLER_GRACE_MS = 2000;
+
 /** Results are cut this far under the cap so the truncation marker fits under it too. */
 const MARKER_ROOM = 100;
 
@@ -230,9 +312,30 @@ const MAX_ERROR_CHARS = 2000;
 /** The smallest frame limit honoured from a relay, so a truncated result always fits. */
 const MIN_FRAME_BYTES = 4096;
 
-const RESUME_KEY_PREFIX = 'tabdock:resume:';
-const GRANTS_KEY_PREFIX = 'tabdock:grants:';
+/** What the adapter keeps in the tab's storage, each for one relay and one page. */
+export type StoredRecord = 'resume' | 'grants' | 'revoked' | 'paused';
+
+const STORED_RECORDS: readonly StoredRecord[] = ['resume', 'grants', 'revoked', 'paused'];
+
 const LOCK_PREFIX = 'tabdock:';
+
+/**
+ * The MCP-B polyfill 5.1 sets this on its context (its dist/index.js; the
+ * README does not mention it). That runtime never hands a handler the signal
+ * given to executeTool, it only races the call against it (ADR 0001).
+ */
+const POLYFILL_MARKER = '__isWebMCPPolyfill';
+
+/**
+ * The polyfill 5.1 also races each handler against its tool's registration
+ * signal and, when the page unregisters the tool mid-run, rejects executeTool
+ * with this UnknownError while the handler runs on (its dist/index.js,
+ * #invokeToolByName).
+ */
+const POLYFILL_UNREGISTERED = 'Tool unregistered';
+
+/** Its UnknownError for a tool already gone when the call starts, before any handler runs. */
+const POLYFILL_NOT_FOUND = /^Tool not found/;
 
 const POLYFILL_HINT =
   'document.modelContext is missing, so Tabdock stays idle. Load a WebMCP polyfill first ' +
@@ -255,16 +358,46 @@ type WelcomeFrame = Extract<RelayFrame, { t: 'welcome' }>;
 type AttachRequestFrame = Extract<RelayFrame, { t: 'attach_request' }>;
 
 type Outcome = { ok: true; content: string } | { ok: false; code: PageErrorCode; message: string };
+type Refusal = Extract<Outcome, { ok: false }>;
+
+const PAUSED: Refusal = {
+  ok: false,
+  code: 'page_busy',
+  message: 'the operator paused this page, so it runs no calls for now',
+};
+
+const REVOKED_MESSAGE = 'the operator revoked this caller';
+
+/**
+ * admitting: reading the tool list to learn whether the tool writes.
+ * queued: a write waiting for the writes that arrived before it.
+ * checking: cleared to go, perhaps waiting on the operator's confirmation.
+ * running: the page's handler has started, so a pause lets it finish.
+ */
+type CallStage = 'admitting' | 'queued' | 'checking' | 'running';
 
 interface CallRecord {
   readonly frame: InvokeFrame;
+  /** Arrival order, which the write queue keeps. */
+  readonly seq: number;
   /** Local epoch milliseconds of the call's deadline. */
   readonly deadlineAt: number;
   readonly controller: AbortController;
+  /** The call's current line in the activity log; each change replaces it. */
+  entry: ActivityEntry;
+  stage: CallStage;
   finished: boolean;
+  /** From the executeTool call until the runtime settles it, which may be after the call was answered. */
+  executing: boolean;
   deadline: unknown;
   /** Set while the call waits for the operator's confirmation. */
   confirm: { readonly resolve: (allow: boolean) => void; readonly port: AbortController } | null;
+}
+
+type Checked = { ok: true; tool: NormalisedTool } | { ok: false; refusal: Refusal };
+
+function refuse(code: PageErrorCode, message: string): Checked {
+  return { ok: false, refusal: { ok: false, code, message } };
 }
 
 interface RequestRecord {
@@ -310,13 +443,7 @@ function overByteLimit(text: string, limit: number): boolean {
  * reads as no grants at all rather than as a partial list.
  */
 function parseGrants(text: string): { pageId: string; grants: [string, Role][] } | null {
-  let value: unknown;
-  try {
-    value = JSON.parse(text);
-  } catch {
-    return null;
-  }
-  const record = JsonObjectSchema.safeParse(value);
+  const record = JsonObjectSchema.safeParse(parseJson(text));
   if (!record.success) return null;
   const pageId = IdSchema.safeParse(record.data.pageId);
   const stored = JsonObjectSchema.safeParse(record.data.grants);
@@ -329,6 +456,25 @@ function parseGrants(text: string): { pageId: string; grants: [string, Role][] }
     grants.push([user.data, granted.data]);
   }
   return { pageId: pageId.data, grants };
+}
+
+/** The revokes the relay has not applied yet, stored beside the grants and read the same way. */
+function parseRevoked(text: string): { pageId: string; users: string[] } | null {
+  const record = JsonObjectSchema.safeParse(parseJson(text));
+  if (!record.success) return null;
+  const pageId = IdSchema.safeParse(record.data.pageId);
+  const users = IdSchema.array().safeParse(record.data.users);
+  if (!pageId.success || !users.success) return null;
+  return { pageId: pageId.data, users: users.data };
+}
+
+/** undefined for text that is not JSON, which every schema then refuses. */
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return undefined;
+  }
 }
 
 function errorParts(error: unknown): { name: string; message: string } {
@@ -392,6 +538,34 @@ function otherInputFormat(error: unknown, tried: InputFormat): InputFormat | nul
 
 type InputFormat = 'object' | 'string';
 
+/**
+ * The page an address names (ADR 0011): its origin and path. A query or
+ * fragment does not make another page, and can carry secrets that belong
+ * neither in storage keys nor in hello. Text that is not an absolute URL is
+ * cut at its first '?' or '#' instead, so it still names one page the same
+ * way every time.
+ */
+export function pageAddress(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return url.split(/[?#]/, 1)[0] ?? '';
+  }
+}
+
+/**
+ * Where one record is kept. sessionStorage is shared by every page of the
+ * origin in a tab, and one approval covers one page (ADR 0011), so each key
+ * names the relay and the page: another page of the site finds none of this
+ * page's records and starts its own session. The pair is written as JSON so
+ * no two pairs run together, and so no key can match an older adapter's,
+ * which named the relay URL alone.
+ */
+export function storageKey(record: StoredRecord, relayUrl: string, pageUrl: string): string {
+  return `tabdock:${record}:${JSON.stringify([relayUrl, pageAddress(pageUrl)])}`;
+}
+
 /** A relay URL the core can dial, or a TypeError: retrying a malformed URL forever helps nobody. */
 function checkRelayUrl(relayUrl: string): void {
   let protocol = '';
@@ -405,6 +579,22 @@ function checkRelayUrl(relayUrl: string): void {
   }
 }
 
+/**
+ * Removes what an adapter before ADR 0011 kept under the relay URL alone, for
+ * every page of the origin at once. None of it is read, as it may belong to
+ * another page; removing it keeps a stale token out of storage. A pause
+ * stored there goes too, since it may have been another page's.
+ */
+function forgetLegacyRecords(storage: StorageLike | undefined, relayUrl: string): void {
+  for (const record of STORED_RECORDS) {
+    try {
+      storage?.removeItem(`tabdock:${record}:${relayUrl}`);
+    } catch {
+      // Storage that throws holds nothing this page could read either.
+    }
+  }
+}
+
 export function createAdapterCore(options: CoreOptions): AdapterCore {
   checkRelayUrl(options.relayUrl);
   // A bad policy is a page bug; throwing here surfaces it at attach().
@@ -415,18 +605,39 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   const clock = options.clock ?? (() => Date.now());
   const timers = options.timers ?? defaultTimers;
   const random = options.random ?? Math.random;
-  const resumeKey = `${RESUME_KEY_PREFIX}${options.relayUrl}`;
-  const grantsKey = `${GRANTS_KEY_PREFIX}${options.relayUrl}`;
+  /**
+   * Fixed for the life of this core, like its storage keys: an app that
+   * changes its path without reloading is still one document with one
+   * operator, so it keeps its session (ADR 0011), and the relay, which
+   * resumes only a hello naming the same page, must hear the same address.
+   */
+  const address = pageAddress(options.pageUrl);
+  const resumeKey = storageKey('resume', options.relayUrl, options.pageUrl);
+  const grantsKey = storageKey('grants', options.relayUrl, options.pageUrl);
+  const revokedKey = storageKey('revoked', options.relayUrl, options.pageUrl);
+  const pausedKey = storageKey('paused', options.relayUrl, options.pageUrl);
+  forgetLegacyRecords(options.storage, options.relayUrl);
+  const polyfillMarker: unknown = context && Reflect.get(context, POLYFILL_MARKER);
+  /**
+   * Under ADR 0001 a call that ends early aborts the signal it handed
+   * executeTool, which native WebMCP passes on to the handler. The polyfill
+   * only races executeTool against it, so there an abort stops nothing and
+   * hides when the handler really ends, which the write queue must know.
+   */
+  const abortReachesHandlers = polyfillMarker !== true;
 
   let state: DockState = Object.freeze({
     link: 'idle',
     pageId: null,
     pairing: null,
     roster: [],
+    pageRoles: [],
     pendingRequests: [],
     pendingConfirms: [],
     notice: null,
     error: null,
+    paused: readPaused(),
+    activity: [],
   });
   const listeners = new Set<(state: DockState) => void>();
 
@@ -458,9 +669,34 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   const grants = new Map<string, Role>();
   /** The page session the grants belong to; they mean nothing on another. */
   let grantsPage: string | null = null;
+  /**
+   * Users the operator revoked whom the relay's roster still lists, because
+   * the revoke has not reached it yet (or was made while the link was down).
+   * They get nothing, even under autoApprove 'observer', until the roster
+   * drops them; a resumed link sends their revoke again. Stored beside the
+   * grants, so a reload before the link comes back keeps it too.
+   */
+  const revoked = new Set<string>();
+  /**
+   * Writes wait here in arrival order and run one at a time, whatever a relay
+   * sends (SPEC section 5): two writes from one relay, or a relay that lost
+   * its own queue, must not interleave on the page. Read-only calls skip it.
+   */
+  const queue: CallRecord[] = [];
+  /**
+   * The write now holding the page, from its last check until its handler
+   * ends. Answering it early (a cancel, deadline, revoke or lost link) does
+   * not stop a handler that ignores or never sees its signal, so the page
+   * stays held until the runtime settles the call. A handler that never
+   * settles is a page bug; pause, revoke and reload still work, and later
+   * writes time out at their own deadlines.
+   */
+  let writing: CallRecord | null = null;
+  let nextSeq = 0;
 
   function setState(patch: Partial<DockState>): void {
-    state = Object.freeze({ ...state, ...patch });
+    const next = { ...state, ...patch };
+    state = Object.freeze({ ...next, pageRoles: rolesFor(next.roster) });
     for (const listener of [...listeners]) {
       try {
         listener(state);
@@ -488,35 +724,61 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     }
   }
 
-  // Grants sit beside the resume token so a reload inside the resume window keeps them.
-  function loadGrants(): void {
-    let text: string | null;
+  function readStored(key: string): string | null {
     try {
-      text = options.storage?.getItem(grantsKey) ?? null;
+      return options.storage?.getItem(key) ?? null;
     } catch {
-      return;
+      return null;
     }
-    if (text === null) return;
-    const stored = parseGrants(text);
-    if (!stored) {
-      log.warn('ignored stored grants that did not parse');
-      return;
-    }
-    grantsPage = stored.pageId;
-    for (const [userId, role] of stored.grants) grants.set(userId, role);
   }
 
-  function saveGrants(): void {
-    try {
-      if (grants.size === 0 || grantsPage === null) {
-        options.storage?.removeItem(grantsKey);
-      } else {
-        const stored = { pageId: grantsPage, grants: Object.fromEntries(grants) };
-        options.storage?.setItem(grantsKey, JSON.stringify(stored));
-      }
-    } catch (error) {
-      log.warn(`could not store the operator's grants: ${describe(error)}`);
+  // Grants sit beside the resume token so a reload inside the resume window keeps them.
+  function loadGrants(): void {
+    const text = readStored(grantsKey);
+    const stored = text === null ? null : parseGrants(text);
+    if (text !== null && !stored) log.warn('ignored stored grants that did not parse');
+    if (stored) {
+      grantsPage = stored.pageId;
+      for (const [userId, role] of stored.grants) grants.set(userId, role);
     }
+    // Pending revokes belong to the same page session, which is the only page a
+    // record of revokes alone (the user revoked held the last grant) can name.
+    const revokedText = readStored(revokedKey);
+    const pending = revokedText === null ? null : parseRevoked(revokedText);
+    if (revokedText !== null && !pending) log.warn('ignored stored revokes that did not parse');
+    if (pending && (grantsPage === null || grantsPage === pending.pageId)) {
+      grantsPage = pending.pageId;
+      for (const userId of pending.users) revoked.add(userId);
+    }
+  }
+
+  function writeStored(key: string, value: string | null, what: string): void {
+    try {
+      if (value === null) options.storage?.removeItem(key);
+      else options.storage?.setItem(key, value);
+    } catch (error) {
+      log.warn(`could not store ${what}: ${describe(error)}`);
+    }
+  }
+
+  /** Every change to the grants or the pending revokes ends here, so storage and the shown roles always match memory. */
+  function saveGrants(): void {
+    const page = grantsPage;
+    writeStored(
+      grantsKey,
+      grants.size === 0 || page === null
+        ? null
+        : JSON.stringify({ pageId: page, grants: Object.fromEntries(grants) }),
+      "the operator's grants",
+    );
+    writeStored(
+      revokedKey,
+      revoked.size === 0 || page === null
+        ? null
+        : JSON.stringify({ pageId: page, users: [...revoked] }),
+      "the operator's revokes",
+    );
+    if (JSON.stringify(rolesFor(state.roster)) !== JSON.stringify(state.pageRoles)) setState({});
   }
 
   /** The operator's approvals go through here, so storage always matches memory. */
@@ -535,13 +797,43 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     if (changed) saveGrants();
   }
 
+  /** Drops pending revokes the relay has applied, or that an approval has overtaken. */
+  function forgetRevokes(userIds: Iterable<string>): void {
+    let changed = false;
+    for (const userId of userIds) changed = revoked.delete(userId) || changed;
+    if (changed) saveGrants();
+  }
+
   function clearGrants(): void {
     grants.clear();
+    revoked.clear();
     grantsPage = null;
     saveGrants();
   }
 
   loadGrants();
+
+  /**
+   * The pause sits beside the grants so a reload does not quietly resume a
+   * paused page. It is not tied to a page session: only the operator lifts
+   * it. Any stored value reads as paused, so a damaged entry fails safe.
+   */
+  function readPaused(): boolean {
+    try {
+      return (options.storage?.getItem(pausedKey) ?? null) !== null;
+    } catch {
+      return false;
+    }
+  }
+
+  function writePaused(paused: boolean): void {
+    try {
+      if (paused) options.storage?.setItem(pausedKey, 'true');
+      else options.storage?.removeItem(pausedKey);
+    } catch (error) {
+      log.warn(`could not store the pause: ${describe(error)}`);
+    }
+  }
 
   /**
    * S5, second check: the least privileged of the operator's grant, the
@@ -555,12 +847,24 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   function callerRole(caller: Caller): Role | null {
     const listed = state.roster.find((attachment) => attachment.userId === caller.userId)?.role;
     if (listed === undefined) return null;
+    const role = pageRole(caller.userId, listed);
+    if (role === null) return null;
+    return caller.role === 'observer' ? 'observer' : role;
+  }
+
+  /** callerRole before the invoke's own claim, for a user the roster lists as `listed`. */
+  function pageRole(userId: string, listed: Role): Role | null {
+    if (revoked.has(userId)) return null;
     const granted =
-      grants.get(caller.userId) ?? (policy.autoApprove === 'observer' ? 'observer' : undefined);
+      grants.get(userId) ?? (policy.autoApprove === 'observer' ? 'observer' : undefined);
     if (granted === undefined) return null;
-    return granted === 'observer' || listed === 'observer' || caller.role === 'observer'
-      ? 'observer'
-      : 'driver';
+    return granted === 'observer' || listed === 'observer' ? 'observer' : 'driver';
+  }
+
+  function rolesFor(roster: readonly AttachmentView[]): PageRole[] {
+    return roster.map(({ userId, role }) =>
+      Object.freeze({ userId, role: pageRole(userId, role), revoked: revoked.has(userId) }),
+    );
   }
 
   function send(frame: PageFrameInput): boolean {
@@ -656,7 +960,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       v: PROTOCOL_VERSION,
       ...(token === null ? {} : { resumeToken: token }),
       title: page.title.slice(0, 300),
-      url: page.url.slice(0, 2048),
+      url: address.slice(0, 2048),
       adapterVersion: options.adapterVersion.slice(0, 50),
       policy,
     });
@@ -741,10 +1045,14 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     // resumed one keeps the grants of users the relay still lists; the relay
     // drops attach requests when a link ends, so no approval is in flight here.
     const listed = new Set(frame.roster.map((attachment) => attachment.userId));
+    const samePage = frame.resumed && grantsPage === frame.pageId;
     for (const userId of [...grants.keys()]) {
-      if (!frame.resumed || grantsPage !== frame.pageId || !listed.has(userId)) {
-        grants.delete(userId);
-      }
+      if (!samePage || !listed.has(userId)) grants.delete(userId);
+    }
+    // A revoke the relay never applied (stored, if the page reloaded since) is
+    // sent again below; on a new session it has nothing to end.
+    for (const userId of [...revoked]) {
+      if (!samePage || !listed.has(userId)) revoked.delete(userId);
     }
     grantsPage = frame.pageId;
     saveGrants();
@@ -764,6 +1072,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       error: null,
     });
     log.info(frame.resumed ? `resumed page ${frame.pageId}` : `linked as page ${frame.pageId}`);
+    for (const userId of revoked) send({ t: 'revoke', userId });
     takeLock(frame.pageId);
     lastToolsKey = null;
     void syncTools();
@@ -781,6 +1090,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     pruneGrants(
       state.roster.map((attachment) => attachment.userId).filter((userId) => !listed.has(userId)),
     );
+    // The relay has applied a revoke once it stops listing the user.
+    forgetRevokes([...revoked].filter((userId) => !listed.has(userId)));
     setState({ roster: attachments });
   }
 
@@ -972,23 +1283,47 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   // Calls
 
   function onInvoke(frame: InvokeFrame): void {
-    if (calls.has(frame.callId)) {
+    // A write answered early still holds the page under its id until its
+    // handler ends; a relay reusing that id meanwhile is confused about which
+    // call it means, so the page takes no second call by it.
+    if (calls.has(frame.callId) || writing?.frame.callId === frame.callId) {
       log.warn(`ignored a repeated invoke for call ${frame.callId}`);
       return;
     }
+    const now = clock();
+    const { userId, displayName, client } = frame.caller;
+    const entry: ActivityEntry = Object.freeze({
+      callId: frame.callId,
+      time: now,
+      user: Object.freeze({ userId, displayName }),
+      client: client === null ? null : Object.freeze({ ...client }),
+      tool: frame.tool,
+      outcome: 'running',
+      durationMs: null,
+      handlerRunning: false,
+    });
     const call: CallRecord = {
       frame,
-      deadlineAt: clock() + frame.deadlineMs,
+      seq: nextSeq++,
+      deadlineAt: now + frame.deadlineMs,
       controller: new AbortController(),
+      entry,
+      stage: 'admitting',
       finished: false,
+      executing: false,
       deadline: null,
       confirm: null,
     };
     calls.set(frame.callId, call);
+    setState({ activity: [entry, ...state.activity].slice(0, ACTIVITY_LIMIT) });
     call.deadline = timers.setTimeout(() => {
       onDeadline(call);
     }, frame.deadlineMs);
-    void runCall(call);
+    if (state.paused) {
+      finish(call, PAUSED);
+      return;
+    }
+    void admit(call);
   }
 
   function onDeadline(call: CallRecord): void {
@@ -1019,6 +1354,40 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     log.info(`call ${callId} ${tool} by ${caller.displayName} (${caller.role}): ${outcome}`);
   }
 
+  function updateEntry(call: CallRecord, patch: Partial<ActivityEntry>): void {
+    const index = state.activity.indexOf(call.entry);
+    // Gone when fifty newer calls have pushed it out.
+    if (index === -1) return;
+    const activity = [...state.activity];
+    call.entry = Object.freeze({ ...call.entry, ...patch });
+    activity[index] = call.entry;
+    setState({ activity });
+  }
+
+  /** Replaces the call's running line in the activity log with how it ended. */
+  function settleEntry(call: CallRecord, outcome: ActivityOutcome): void {
+    updateEntry(call, {
+      outcome,
+      durationMs: Math.max(0, clock() - call.entry.time),
+      handlerRunning: call.executing,
+    });
+  }
+
+  /**
+   * Takes a settled call off the books and lets the next write have the
+   * page, unless its handler is still running; proceed calls this again once
+   * the runtime settles it.
+   */
+  function release(call: CallRecord): void {
+    // The second release, when a lingering handler ends, may find a newer
+    // call under the same id, which revoke, cancel and pause must still reach.
+    if (calls.get(call.frame.callId) === call) calls.delete(call.frame.callId);
+    const queued = queue.indexOf(call);
+    if (queued !== -1) queue.splice(queued, 1);
+    if (writing === call && !call.executing) writing = null;
+    pump();
+  }
+
   /**
    * Ends a call on this side without a result frame: the relay answers its
    * caller from how the link ended (page_asleep, or page_gone after
@@ -1028,17 +1397,18 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     if (call.finished) return;
     call.finished = true;
     timers.clearTimeout(call.deadline);
-    calls.delete(call.frame.callId);
     call.controller.abort();
     settleConfirmPromise(call, false);
     logCall(call, why);
+    // The log's outcomes are the page's own, and from here the call was cancelled.
+    settleEntry(call, 'cancelled');
+    release(call);
   }
 
   function finish(call: CallRecord, outcome: Outcome): void {
     if (call.finished) return;
     call.finished = true;
     timers.clearTimeout(call.deadline);
-    calls.delete(call.frame.callId);
     settleConfirmPromise(call, false);
     const { callId } = call.frame;
     logCall(call, outcome.ok ? 'ok' : outcome.code);
@@ -1052,6 +1422,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         error: { code: outcome.code, message: outcome.message.slice(0, MAX_ERROR_CHARS) },
       });
     }
+    settleEntry(call, outcome.ok ? 'ok' : outcome.code);
+    release(call);
   }
 
   /** Cuts the text to the result limit, then further if JSON escaping or UTF-8 still overflow the frame. */
@@ -1066,42 +1438,101 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     }
   }
 
-  // A function, not an inline test: a cancel or deadline can finish the call while runCall awaits.
+  // A function, not an inline test: a cancel or deadline can finish the call while an await is pending.
   function isDone(call: CallRecord): boolean {
     return call.finished;
   }
 
-  async function runCall(call: CallRecord): Promise<void> {
-    const { frame } = call;
-    const snapshot = await readTools();
-    if (isDone(call)) return;
-    // S5, second check, after the await so the roster is the newest one.
+  /**
+   * S5, second check: the caller's role on this page, then the tool. It runs
+   * when a call arrives and again when a write reaches the front of the
+   * queue, since the roster, the grants and the tools may have changed while
+   * it waited.
+   */
+  function check(frame: InvokeFrame, snapshot: ToolSnapshot | null): Checked {
     const role = callerRole(frame.caller);
     if (role === null) {
-      finish(call, {
-        ok: false,
-        code: 'role_denied',
-        message: 'the operator has not approved this caller on this page',
-      });
-      return;
+      return refuse('role_denied', 'the operator has not approved this caller on this page');
     }
-    if (!snapshot) {
-      finish(call, { ok: false, code: 'tool_error', message: 'the page could not list its tools' });
-      return;
-    }
+    if (!snapshot) return refuse('tool_error', 'the page could not list its tools');
     const tool = snapshot.byName.get(frame.tool);
-    if (!tool) {
-      finish(call, { ok: false, code: 'tool_not_found', message: `no tool named ${frame.tool}` });
+    if (!tool) return refuse('tool_not_found', `no tool named ${frame.tool}`);
+    if (role === 'observer' && !isReadOnly(tool.page)) {
+      return refuse('role_denied', 'observers may only run read-only tools');
+    }
+    return { ok: true, tool };
+  }
+
+  /**
+   * Reads the tools to learn whether the call writes. A refusal goes back at
+   * once, so nobody waits in the queue only to be turned away; a read runs
+   * now, beside whatever else is running; a write joins the queue.
+   */
+  async function admit(call: CallRecord): Promise<void> {
+    const snapshot = await readTools();
+    if (isDone(call)) return;
+    const checked = check(call.frame, snapshot);
+    if (!checked.ok) {
+      finish(call, checked.refusal);
       return;
     }
-    if (role === 'observer' && tool.page.annotations?.readOnlyHint !== true) {
+    if (snapshot && isReadOnly(checked.tool.page)) {
+      call.stage = 'checking';
+      // This call may be the earlier arrival a queued write was waiting on.
+      pump();
+      await proceed(call, checked.tool, snapshot);
+      return;
+    }
+    if (queue.length >= MAX_WAITING_WRITES) {
       finish(call, {
         ok: false,
-        code: 'role_denied',
-        message: 'observers may only run read-only tools',
+        code: 'page_busy',
+        message: 'too many writes are already waiting on this page',
       });
       return;
     }
+    call.stage = 'queued';
+    const later = queue.findIndex((other) => other.seq > call.seq);
+    if (later === -1) queue.push(call);
+    else queue.splice(later, 0, call);
+    pump();
+  }
+
+  /** Gives the page to the oldest queued write once nothing else is writing. */
+  function pump(): void {
+    // A pause answers every queued write itself, so none should start meanwhile.
+    if (writing !== null || state.paused || !isLinked()) return;
+    const next = queue[0];
+    if (!next) return;
+    // An earlier arrival still reading the tool list may turn out to be a write that goes first.
+    for (const call of calls.values()) {
+      if (call.stage === 'admitting' && call.seq < next.seq) return;
+    }
+    queue.shift();
+    writing = next;
+    next.stage = 'checking';
+    void runWrite(next);
+  }
+
+  async function runWrite(call: CallRecord): Promise<void> {
+    const snapshot = await readTools();
+    if (isDone(call)) return;
+    const checked = check(call.frame, snapshot);
+    if (!checked.ok) {
+      finish(call, checked.refusal);
+      return;
+    }
+    // check() refuses a missing snapshot, so this only narrows the type.
+    if (snapshot) await proceed(call, checked.tool, snapshot);
+  }
+
+  /** Consequential policy and the operator's confirmation, then the handler. */
+  async function proceed(
+    call: CallRecord,
+    tool: NormalisedTool,
+    snapshot: ToolSnapshot,
+  ): Promise<void> {
+    const { frame } = call;
     if (isConsequential(tool.page, snapshot.hintSupport, policy, pageListedTools)) {
       if (policy.consequential === 'deny') {
         finish(call, {
@@ -1122,19 +1553,82 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
           });
           return;
         }
+        // The operator may have lowered this caller's role while the prompt was up.
+        const again = check(frame, snapshot);
+        if (!again.ok) {
+          finish(call, again.refusal);
+          return;
+        }
       }
     }
-    let value: unknown;
+    call.stage = 'running';
+    call.executing = true;
+    let outcome: Outcome;
+    let unwatched = false;
     try {
-      value = await execute(tool.runtime, frame.arguments, call.controller.signal);
+      const value = await execute(tool.runtime, frame.arguments, call);
+      outcome = { ok: true, content: resultText(value) };
     } catch (error) {
-      // A cancel or deadline already answered; whatever the runtime says now is dropped.
-      if (isDone(call)) return;
-      finish(call, { ok: false, code: 'tool_error', message: errorParts(error).message });
+      outcome = { ok: false, code: 'tool_error', message: errorParts(error).message };
+      unwatched = await lostSightOfHandler(call, tool, error);
+    }
+    if (unwatched) {
+      holdUnwatched(call);
+      // The relay still hears the runtime's answer, unless something answered first.
+      if (!isDone(call)) finish(call, outcome);
       return;
     }
-    if (isDone(call)) return;
-    finish(call, { ok: true, content: resultText(value) });
+    call.executing = false;
+    if (isDone(call)) {
+      // Something answered first and whatever the runtime says now is
+      // dropped, but only now has the handler let go of the page.
+      if (call.entry.handlerRunning) updateEntry(call, { handlerRunning: false });
+      release(call);
+      return;
+    }
+    finish(call, outcome);
+  }
+
+  /**
+   * Whether a write's rejection says only that the runtime stopped watching a
+   * handler that may still be running. On the polyfill a write's executeTool
+   * gets a signal nothing aborts, so it settles early only when the page ends
+   * the tool's registration mid-run: its 'Tool unregistered', or, should
+   * that text change, a tool missing from the list afterwards. A tool
+   * already missing when the call started never ran its handler.
+   */
+  async function lostSightOfHandler(
+    call: CallRecord,
+    tool: NormalisedTool,
+    error: unknown,
+  ): Promise<boolean> {
+    if (abortReachesHandlers || writing !== call) return false;
+    const { name, message } = errorParts(error);
+    if (name === 'UnknownError' && message === POLYFILL_UNREGISTERED) return true;
+    if (name === 'UnknownError' && POLYFILL_NOT_FOUND.test(message)) return false;
+    // A list that cannot be read cannot show the tool is still there either.
+    const snapshot = await readTools();
+    return snapshot === null || !snapshot.byName.has(tool.page.name);
+  }
+
+  /**
+   * Keeps the page for a write whose handler the runtime no longer watches.
+   * Nothing will say when that handler ends (the polyfill neither hands it
+   * a signal nor reports its end), so time is the only bound there is: the
+   * call's deadline plus a grace, or a grace from now when the handler has
+   * already outrun its deadline. Then the next write may start, possibly
+   * beside it.
+   */
+  function holdUnwatched(call: CallRecord): void {
+    const until = Math.max(call.deadlineAt, clock()) + UNWATCHED_HANDLER_GRACE_MS;
+    timers.setTimeout(() => {
+      call.executing = false;
+      if (call.entry.handlerRunning) updateEntry(call, { handlerRunning: false });
+      log.warn(
+        `call ${call.frame.callId}: stopped waiting for a handler whose tool was unregistered while it ran`,
+      );
+      release(call);
+    }, until - clock());
   }
 
   /**
@@ -1146,9 +1640,15 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   async function execute(
     tool: RuntimeTool,
     args: Record<string, unknown>,
-    signal: AbortSignal,
+    call: CallRecord,
   ): Promise<unknown> {
     if (!context?.executeTool) throw new Error('this WebMCP runtime has no executeTool');
+    // A write on the polyfill gets a signal nothing aborts, so the runtime
+    // settles it when the handler ends and the page stays held until then.
+    const signal =
+      writing === call && !abortReachesHandlers
+        ? new AbortController().signal
+        : call.controller.signal;
     const run = (format: InputFormat): Promise<unknown> =>
       context.executeTool
         ? context.executeTool(tool, format === 'string' ? JSON.stringify(args) : args, {
@@ -1161,7 +1661,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       inputFormat ??= first;
       return value;
     } catch (error) {
-      const other = signal.aborted ? null : otherInputFormat(error, first);
+      const other = call.controller.signal.aborted ? null : otherInputFormat(error, first);
       if (other === null) throw error;
       inputFormat = other;
       log.info(
@@ -1272,12 +1772,17 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     // attachment as it is (role changes are set_role's job, from M2). It wins
     // only while the roster lists the user: a grant for a user the relay never
     // attached came from an approval it ignored (one that crossed the request's
-    // expiry), so this approval is the one the relay will apply. A denial, or
-    // silence, answers only this request: it leaves an existing grant alone,
-    // since the relay keeps that user attached; withdrawing access is revoke's job.
+    // expiry), so this decision is the one the relay will apply. For a listed
+    // user a denial, or silence, answers only this request and leaves the
+    // grant alone, since the relay keeps them attached (ADR 0007); withdrawing
+    // access is revoke's job. For anyone else it withdraws that ignored grant,
+    // so the operator's latest decision stands.
     const { userId } = record.request.user;
     const listed = state.roster.some((attachment) => attachment.userId === userId);
+    // An approval after a revoke lets the user back in; the relay applies the two in that order too.
+    if (allow) forgetRevokes([userId]);
     if (allow && role !== undefined && (!listed || !grants.has(userId))) setGrant(userId, role);
+    if (!allow && !listed) pruneGrants([userId]);
     const who = record.request.user.displayName;
     log.info(allow ? `allowed ${who} as ${String(role)}` : `denied ${who}`);
     return send({
@@ -1286,6 +1791,79 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       allow,
       ...(allow && role !== undefined ? { role } : {}),
     });
+  }
+
+  // Operator controls
+
+  /**
+   * The operator's own decision, so it becomes the grant before the frame
+   * goes out: a demotion holds on the page at once, even if the relay is slow
+   * to apply it or never does, and a promotion takes effect once the relay's
+   * roster agrees (it may refuse a driver over maxDrivers).
+   */
+  function setRole(userId: string, role: Role): boolean {
+    if (!RoleSchema.safeParse(role).success) {
+      log.warn('ignored a role change without a valid role');
+      return false;
+    }
+    const attachment = state.roster.find((entry) => entry.userId === userId);
+    if (!attachment || revoked.has(userId) || !isLinked()) return false;
+    // Only for someone the operator approved here, or autoApprove let in (S4):
+    // otherwise even Make observer would be the approval S4 asks for, made by
+    // a click meant to lower access. Revoke is what such a row needs.
+    if (!grants.has(userId) && policy.autoApprove !== 'observer') return false;
+    setGrant(userId, role);
+    log.info(`set ${attachment.displayName} to ${role}`);
+    return send({ t: 'set_role', userId, role });
+  }
+
+  /**
+   * S8 on the page's side: the grant goes at once (stored copy too), so no
+   * call of theirs runs here again whatever the relay does next. The revoke
+   * frame goes first, so the relay answers their calls with not_attached
+   * before any result below reaches it; their pending requests and prompts
+   * are denied, and their calls in flight are cancelled.
+   */
+  function revoke(target: string): boolean {
+    const everyone = target === '*';
+    if (closed || (!everyone && !IdSchema.safeParse(target).success)) return false;
+    const hits = (userId: string): boolean => everyone || userId === target;
+    const listed = state.roster.map((attachment) => attachment.userId).filter(hits);
+    const granted = [...grants.keys()].filter(hits);
+    const asking = [...requests.values()].filter((record) => hits(record.request.user.userId));
+    const running = [...calls.values()].filter((call) => hits(call.frame.caller.userId));
+    if (listed.length + granted.length + asking.length + running.length === 0) return false;
+    for (const userId of listed) revoked.add(userId);
+    for (const userId of granted) grants.delete(userId);
+    saveGrants();
+    log.info(everyone ? 'the operator revoked everyone' : `the operator revoked ${target}`);
+    // While the link is down, the next welcome sends it for anyone still listed.
+    if (isLinked()) send({ t: 'revoke', userId: target });
+    for (const record of asking) decide(record.request.requestId, false);
+    for (const call of running) {
+      if (call.confirm) {
+        finish(call, { ok: false, code: 'denied_by_operator', message: REVOKED_MESSAGE });
+      } else {
+        call.controller.abort();
+        finish(call, { ok: false, code: 'cancelled', message: REVOKED_MESSAGE });
+      }
+    }
+    return true;
+  }
+
+  /** Calls already in the page's hands finish; every other call, now or later, is answered page_busy. */
+  function pause(paused: boolean): void {
+    writePaused(paused);
+    if (paused === state.paused) return;
+    setState({ paused });
+    log.info(paused ? 'the operator paused calls' : 'the operator resumed calls');
+    if (!paused) {
+      pump();
+      return;
+    }
+    for (const call of [...calls.values()]) {
+      if (call.stage !== 'running') finish(call, PAUSED);
+    }
   }
 
   // Public surface
@@ -1354,6 +1932,12 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     // Strictly true: a script passing the string 'false' must not allow a consequential call.
     confirm: (callId: string, allow: boolean) => confirmCall(callId, (allow as unknown) === true),
     rotatePairing: () => isLinked() && send({ t: 'rotate_pairing' }),
+    setRole: (userId: string, role: Role) => setRole(userId, role),
+    revoke: (userId: string) => revoke(userId),
+    // Only false resumes: resuming lets calls run again, so a script's 'false' or 0 keeps the pause.
+    pause: (paused: boolean) => {
+      pause((paused as unknown) !== false);
+    },
     close: () => {
       close('detach');
     },

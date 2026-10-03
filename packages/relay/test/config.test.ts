@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage } from 'node:http';
 import { DEFAULT_CALL_DEADLINE_MS } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
-import { isLoopbackHost, resolveConfig } from '../src/config.ts';
+import { isLoopbackHost, MAX_TIMER_MS, resolveConfig } from '../src/config.ts';
 import {
   createDevTokenAuth,
   createRelay,
@@ -150,6 +150,33 @@ describe('origin policy (S1, S2)', () => {
     expect(resolveConfig({ auth, timings: { pairWaitMs: 1234 } }).timings.pairWaitMs).toBe(1234);
   });
 
+  it('defaults the section 9 limits and lifetimes to ADR 0009, and checks every override', () => {
+    const { limits, rateLimits, timings } = resolveConfig({ auth });
+    expect(limits).toEqual({
+      sessionsPerUser: 20,
+      sessions: 1000,
+      usersPerPage: 10,
+      queueDepth: 32,
+      pageSocketsPerAddress: 20,
+      pageSessionsPerAddress: 20,
+      pageSessions: 1000,
+    });
+    expect(rateLimits.callsPerUserPerPage).toBe(120);
+    expect(timings.sessionIdleMs).toBe(30 * 60_000);
+    expect(timings.attachmentIdleMs).toBe(8 * 60 * 60_000);
+    expect(timings.sseKeepAliveMs).toBe(15_000);
+    expect(resolveConfig({ auth, limits: { usersPerPage: 3 } }).limits.usersPerPage).toBe(3);
+    expect(() => resolveConfig({ auth, limits: { queueDepth: 0 } })).toThrow(/queueDepth/);
+    expect(() => resolveConfig({ auth, limits: { sessions: 2.5 } })).toThrow(/sessions/);
+    expect(() => resolveConfig({ auth, rateLimits: { callsPerUserPerPage: -1 } })).toThrow(
+      /callsPerUserPerPage/,
+    );
+    // Node runs a longer setTimeout after 1 ms, which would expire everything at once.
+    expect(() =>
+      resolveConfig({ auth, timings: { attachmentIdleMs: 30 * 24 * 60 * 60_000 } }),
+    ).toThrow(/attachmentIdleMs must be at most 2147483647/);
+  });
+
   it("waits a 2 s grace past the page's call deadline by default", () => {
     const { timings } = resolveConfig({ auth });
     expect(timings.callDeadlineMs).toBe(DEFAULT_CALL_DEADLINE_MS);
@@ -157,6 +184,37 @@ describe('origin policy (S1, S2)', () => {
     expect(() => resolveConfig({ auth, timings: { callDeadlineGraceMs: -1 } })).toThrow(
       /callDeadlineGraceMs/,
     );
+  });
+
+  it('gives each argument check 50 ms by default, bounded like every other timing (ADR 0010)', () => {
+    expect(resolveConfig({ auth }).timings.argumentCheckMs).toBe(50);
+    expect(resolveConfig({ auth, timings: { argumentCheckMs: 80 } }).timings.argumentCheckMs).toBe(
+      80,
+    );
+    expect(() => resolveConfig({ auth, timings: { argumentCheckMs: 0 } })).toThrow(
+      /argumentCheckMs must be a positive integer/,
+    );
+    expect(() => resolveConfig({ auth, timings: { argumentCheckMs: 12.5 } })).toThrow(
+      /argumentCheckMs must be a positive integer/,
+    );
+    expect(() => resolveConfig({ auth, timings: { argumentCheckMs: MAX_TIMER_MS + 1 } })).toThrow(
+      /argumentCheckMs must be at most 2147483647/,
+    );
+  });
+
+  it('refuses a call deadline whose sum with the grace would not fit one setTimeout', () => {
+    // A call's timer is armed for both together, and Node runs a longer one after 1 ms.
+    expect(() =>
+      resolveConfig({ auth, timings: { callDeadlineMs: MAX_TIMER_MS, callDeadlineGraceMs: 2000 } }),
+    ).toThrow(/callDeadlineMs plus callDeadlineGraceMs must be at most 2147483647/);
+    expect(() => resolveConfig({ auth, timings: { callDeadlineMs: MAX_TIMER_MS - 1999 } })).toThrow(
+      /callDeadlineMs plus callDeadlineGraceMs/,
+    );
+    const fits = resolveConfig({
+      auth,
+      timings: { callDeadlineMs: MAX_TIMER_MS - 2000, callDeadlineGraceMs: 2000 },
+    });
+    expect(fits.timings.callDeadlineMs + fits.timings.callDeadlineGraceMs).toBe(MAX_TIMER_MS);
   });
 });
 
@@ -187,6 +245,51 @@ describe('loadConfigFromEnv', () => {
       allowedOrigins: ['https://a.example', 'https://b.example'],
       allowMissingOrigin: true,
     });
+  });
+
+  it('reads the limits and the idle lifetimes, in minutes, leaving unset ones to the defaults', () => {
+    const options = loadConfigFromEnv({
+      TABDOCK_DEV_TOKENS: tokens,
+      TABDOCK_MAX_SESSIONS_PER_USER: '5',
+      TABDOCK_MAX_SESSIONS: '50',
+      TABDOCK_MAX_USERS_PER_PAGE: ' 4 ',
+      TABDOCK_MAX_QUEUE_DEPTH: '8',
+      TABDOCK_MAX_PAGE_SOCKETS_PER_ADDRESS: '3',
+      TABDOCK_MAX_PAGE_SESSIONS_PER_ADDRESS: '6',
+      TABDOCK_MAX_PAGE_SESSIONS: '30',
+      TABDOCK_MAX_CALLS_PER_MINUTE: '60',
+      TABDOCK_SESSION_IDLE_MINUTES: '10',
+      TABDOCK_ATTACHMENT_IDLE_MINUTES: '120',
+    });
+    const config = resolveConfig(options);
+    expect(config.limits).toEqual({
+      sessionsPerUser: 5,
+      sessions: 50,
+      usersPerPage: 4,
+      queueDepth: 8,
+      pageSocketsPerAddress: 3,
+      pageSessionsPerAddress: 6,
+      pageSessions: 30,
+    });
+    expect(config.rateLimits.callsPerUserPerPage).toBe(60);
+    expect(config.timings.sessionIdleMs).toBe(10 * 60_000);
+    expect(config.timings.attachmentIdleMs).toBe(120 * 60_000);
+    const defaults = resolveConfig(
+      loadConfigFromEnv({ TABDOCK_DEV_TOKENS: tokens, TABDOCK_MAX_QUEUE_DEPTH: '' }),
+    );
+    expect(defaults.limits.queueDepth).toBe(32);
+    expect(defaults.timings.attachmentIdleMs).toBe(8 * 60 * 60_000);
+    for (const [name, value] of [
+      ['TABDOCK_MAX_QUEUE_DEPTH', '0'],
+      ['TABDOCK_MAX_USERS_PER_PAGE', 'ten'],
+      ['TABDOCK_MAX_CALLS_PER_MINUTE', '1.5'],
+      ['TABDOCK_SESSION_IDLE_MINUTES', '-3'],
+      ['TABDOCK_ATTACHMENT_IDLE_MINUTES', '99999'],
+    ] as const) {
+      expect(() => loadConfigFromEnv({ TABDOCK_DEV_TOKENS: tokens, [name]: value }), name).toThrow(
+        new RegExp(name),
+      );
+    }
   });
 
   it('names the bad variable and never echoes a token', () => {

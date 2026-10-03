@@ -71,7 +71,7 @@ The demo page should make state visible: a canvas board with items and a viewpor
 
 Trust rule: no attachment exists without an approval made on the page, unless the page set `autoApprove: 'observer'`. The first approval sets a user's role; later approvals and denials for an attached user change nothing, because role changes and withdrawals go through `set_role` and `revoke`. The adapter keeps its own record of these grants and runs a call only under the least privileged of that record, the relay's roster and the role the invoke claims; a user missing from the roster has no role (ADR 0007).
 
-Roles: an observer may call only tools whose `readOnlyHint` is true. A driver may call every tool. Consequential tools follow page policy: `confirm` (default, an on-page prompt per call), `allow`, or `deny`. A tool is consequential when its `consequentialHint` is true or the page names it in `policy.consequentialTools`; when the runtime cannot report the hint and the page names none, every tool that is not read-only counts as consequential (ADR 0002). A page whose tools carry no annotations at all declared no hints, so none were lost and only `policy.consequentialTools` applies (ADR 0007). `maxDrivers` defaults to 1 and counts users, so one person's phone and laptop both drive. Mutating calls run one at a time per page in arrival order; read-only calls run concurrently.
+Roles: an observer may call only tools whose `readOnlyHint` is true. A driver may call every tool. Consequential tools follow page policy: `confirm` (default, an on-page prompt per call), `allow`, or `deny`. A tool is consequential when its `consequentialHint` is true or the page names it in `policy.consequentialTools`; when the runtime cannot report the hint and the page names none, every tool that is not read-only counts as consequential (ADR 0002). A page whose tools carry no annotations at all declared no hints, so none were lost and only `policy.consequentialTools` applies (ADR 0007). `maxDrivers` defaults to 1 and counts users, so one person's phone and laptop both drive. Mutating calls run one at a time per page in arrival order; read-only calls run concurrently. The one exception: on the MCP-B polyfill, which cannot report a handler's end once the page unregisters its tool mid-call, the page waits until that call's deadline plus 2 s and then lets the next write run (ADR 0012).
 
 ## 6. Page link protocol (adapter to relay)
 
@@ -79,7 +79,7 @@ Transport: WebSocket at `/page`, subprotocol `tabdock.v1`, JSON text frames shap
 
 | Direction | Type | Payload | Meaning |
 | --- | --- | --- | --- |
-| page to relay | `hello` | `v`, `resumeToken?`, `title`, `url`, `adapterVersion`, `policy` | First frame. A valid `resumeToken` resumes a session after reload |
+| page to relay | `hello` | `v`, `resumeToken?`, `title`, `url`, `adapterVersion`, `policy` | First frame. A valid `resumeToken` resumes a session after a reload of the same page (same origin and path; ADR 0011) |
 | relay to page | `welcome` | `pageId`, `resumeToken`, `resumed`, `pairing`, `roster`, `limits` | Session accepted; `resumed` says whether the resume token was honoured |
 | page to relay | `tools` | `tools[]` with `name`, `description`, `inputSchema`, `annotations` | Full replacement on every change |
 | relay to page | `attach_request` | `requestId`, `user`, `via`, `client?`, `expiresAt` | Someone wants to attach |
@@ -95,7 +95,7 @@ Transport: WebSocket at `/page`, subprotocol `tabdock.v1`, JSON text frames shap
 
 When the socket drops, the page becomes `asleep` and its attachments survive for a 10 minute resume window. After that the page is `gone` and its attachments are deleted.
 
-Close codes (ADR 0007): only a deliberate detach ends a session at once. A page that calls `dock.close()` closes with 4000, becomes `gone` without the resume window, and its in-flight calls fail with `page_gone`, except calls still waiting on an operator prompt, which the page denies first. Every other close leaves the page asleep, including 4002 (the page heard nothing from the relay and is reconnecting) and 4008 (the page's stand-in for 1008, which page code cannot send). The relay closes a superseded socket with 4001, which the page must not reconnect from, and uses 1001, 1008 and 1009 for idle or shutdown, malformed frames and oversized frames.
+Close codes (ADR 0007): only a deliberate detach ends a session at once. A page that calls `dock.close()` closes with 4000, becomes `gone` without the resume window, and its in-flight calls fail with `page_gone`, except calls still waiting on an operator prompt, which the page denies first. Every other close leaves the page asleep, including 4002 (the page heard nothing from the relay and is reconnecting) and 4008 (the page's stand-in for 1008, which page code cannot send). The relay closes a superseded socket with 4001, which the page must not reconnect from, and uses 1001, 1008 and 1009 for idle or shutdown, malformed frames (and a page or address over its `tools`-frame budget) and oversized frames, and 1013 when there is no room for a new page session (ADR 0012).
 
 ## 7. MCP surface (relay to clients)
 
@@ -131,7 +131,7 @@ A script-tag build reads the same options from data attributes. The adapter neve
 
 The widget lives in a closed shadow root: a badge with link state and attached count, and a panel with the pairing code and QR, the roster with role switch and revoke, an activity log of the last 50 calls, and a pause switch. Attach prompts and consequential-call prompts default to deny on timeout. Only the code that called `attach()` holds the control handle.
 
-Lifecycle: hold a Web Lock while attached, reconnect with backoff from 0.5 s to 30 s using the `resumeToken`, and enforce role and policy again locally before running any call.
+Lifecycle: hold a Web Lock while attached, reconnect with backoff from 0.5 s to 30 s using the `resumeToken`, and enforce role and policy again locally before running any call. The resume token, the operator's grants and the pause switch are kept per page, by relay URL plus the page's origin and path (ADR 0011).
 
 ## 9. Security requirements (each needs an automated test unless marked manual)
 

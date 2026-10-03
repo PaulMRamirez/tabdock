@@ -12,3 +12,6 @@ blob-report/
 .cache/
 *.log
 .DS_Store
+
+# Temporary git worktrees made by Claude Code agents.
+.claude/worktrees/

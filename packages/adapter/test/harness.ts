@@ -29,8 +29,12 @@ import {
 } from '../src/core.ts';
 
 export const RELAY_URL = 'ws://relay.test/page';
-export const RESUME_KEY = `tabdock:resume:${RELAY_URL}`;
-export const GRANTS_KEY = `tabdock:grants:${RELAY_URL}`;
+export const PAGE_URL = 'http://127.0.0.1:5173/board';
+// Written out, so a change to how records are keyed (ADR 0011) shows up here.
+export const RESUME_KEY = 'tabdock:resume:["ws://relay.test/page","http://127.0.0.1:5173/board"]';
+export const GRANTS_KEY = 'tabdock:grants:["ws://relay.test/page","http://127.0.0.1:5173/board"]';
+export const REVOKED_KEY = 'tabdock:revoked:["ws://relay.test/page","http://127.0.0.1:5173/board"]';
+export const PAUSED_KEY = 'tabdock:paused:["ws://relay.test/page","http://127.0.0.1:5173/board"]';
 export const PAGE_WINDOW = { label: 'page window' };
 export const FRAME_WINDOW = { label: 'iframe window' };
 export const HANDLER_FAILED =
@@ -175,9 +179,22 @@ export class TestContext implements ModelContextLike {
   /** Handler runs only. */
   readonly runs: { tool: string; args: unknown; signal: AbortSignal }[] = [];
   readonly #listeners = new Set<() => void>();
+  /**
+   * One registration per tool, as the MCP-B polyfill 5.1 keeps the signal
+   * each registerTool call was given. Its executeTool races the handler
+   * against that signal as well as the caller's (dist/index.js,
+   * #invokeToolByName), so this runtime does too, whatever honoursAbort says.
+   */
+  readonly #registrations = new Map<string, AbortController>();
+  /** Tools unregistered and not listed again, which the polyfill no longer finds. */
+  readonly #unregistered = new Set<string>();
 
-  constructor(tools: RuntimeTool[]) {
+  constructor(tools: RuntimeTool[], polyfill = false) {
     this.tools = tools;
+    // The MCP-B polyfill 5.1 marks its context this way (dist/index.js), which
+    // tells the adapter that handlers never see the call's signal. Tests that
+    // play it use handlers that ignore theirs.
+    if (polyfill) Object.defineProperty(this, '__isWebMCPPolyfill', { value: true });
   }
 
   getTools(): Promise<readonly RuntimeTool[]> {
@@ -191,6 +208,11 @@ export class TestContext implements ModelContextLike {
   ): Promise<unknown> {
     await Promise.resolve();
     this.attempts.push({ tool: tool.name, input });
+    if (this.#unregistered.has(tool.name) && !this.tools.some((each) => each.name === tool.name)) {
+      // The polyfill's text for a tool missing when the call starts, before any handler runs.
+      throw new DOMException(`Tool not found: ${tool.name}`, 'UnknownError');
+    }
+    const registration = this.#registration(tool.name).signal;
     if (this.inputForm === 'string' && typeof input !== 'string') {
       throw new DOMException('Failed to parse input arguments', 'UnknownError');
     }
@@ -202,7 +224,7 @@ export class TestContext implements ModelContextLike {
     const args: unknown = typeof input === 'string' ? JSON.parse(input) : input;
     const handler: Handler = this.handlers.get(tool.name) ?? ((value) => value);
     this.runs.push({ tool: tool.name, args, signal: options.signal });
-    const run = Promise.resolve()
+    const handled = Promise.resolve()
       .then(() => handler(args, options.signal))
       .then(
         (value) =>
@@ -217,6 +239,17 @@ export class TestContext implements ModelContextLike {
           );
         },
       );
+    // Unregistering rejects the call at once and leaves the handler running.
+    const run = new Promise<string>((resolve, reject) => {
+      registration.addEventListener(
+        'abort',
+        () => {
+          reject(new DOMException('Tool unregistered', 'UnknownError'));
+        },
+        { once: true },
+      );
+      handled.then(resolve, reject);
+    });
     if (!this.honoursAbort) return run;
     return new Promise((resolve, reject) => {
       options.signal.addEventListener('abort', () => {
@@ -236,6 +269,29 @@ export class TestContext implements ModelContextLike {
 
   fireToolChange(): void {
     for (const listener of this.#listeners) listener();
+  }
+
+  /**
+   * Ends a tool's registration the way a page aborting its registerTool
+   * signal does, as a single-page app does when a view goes away: the tool
+   * leaves the list, and a call running it is rejected with the polyfill's
+   * 'Tool unregistered' while its handler runs on.
+   */
+  unregister(name: string): void {
+    this.#registration(name).abort();
+    this.#registrations.delete(name);
+    this.#unregistered.add(name);
+    this.tools = this.tools.filter((tool) => tool.name !== name);
+    this.fireToolChange();
+  }
+
+  #registration(name: string): AbortController {
+    let registration = this.#registrations.get(name);
+    if (!registration) {
+      registration = new AbortController();
+      this.#registrations.set(name, registration);
+    }
+    return registration;
   }
 
   get listenerCount(): number {
@@ -304,10 +360,12 @@ export function setup(
     browserCloseRules?: boolean;
     /** sessionStorage shared with an earlier harness, to play a page reload. */
     storage?: MapStorage;
+    /** Mark the runtime as the MCP-B polyfill 5.1, whose handlers never see the call's signal. */
+    polyfill?: boolean;
   } = {},
 ): Harness {
   const clock = new ManualClock();
-  const context = new TestContext(options.tools ?? chromeTools());
+  const context = new TestContext(options.tools ?? chromeTools(), options.polyfill);
   const storage = options.storage ?? new MapStorage();
   const sockets: FakeSocket[] = [];
   const logs: string[] = [];
@@ -320,7 +378,8 @@ export function setup(
       return socket;
     },
     storage,
-    pageInfo: () => ({ title: 'Test page', url: 'http://127.0.0.1:5173/board' }),
+    pageUrl: PAGE_URL,
+    pageInfo: () => ({ title: 'Test page' }),
     ownWindow: PAGE_WINDOW,
     adapterVersion: '0.0.0-test',
     logger: {

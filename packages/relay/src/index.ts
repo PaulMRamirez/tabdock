@@ -7,11 +7,13 @@ export {
 } from './auth.ts';
 export {
   DEFAULT_CLI_PORT,
+  DEFAULT_LIMITS,
   DEFAULT_RATE_LIMITS,
   DEFAULT_TIMINGS,
   loadConfigFromEnv,
   NO_ORIGIN,
   type RelayEnv,
+  type RelayLimits,
   type RelayOptions,
   type RelayRateLimits,
   type RelayTimings,

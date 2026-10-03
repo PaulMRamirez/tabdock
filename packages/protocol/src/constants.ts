@@ -51,7 +51,8 @@ export const RECONNECT_MIN_MS = 500;
 export const RECONNECT_MAX_MS = 30_000;
 
 // Close codes on the page link. The standard ones in use: 1001 (relay idle
-// timeout or shutdown), 1008 (malformed frame), 1009 (frame too large). Browsers
+// timeout or shutdown), 1008 (malformed frame, or too many tools frames), 1009
+// (frame too large), 1013 (no room for a new page session; try again). Browsers
 // let page code send only 1000 and 3000 to 4999, so codes a page sends sit in the
 // 4000 range. Only CLOSE_DETACH ends a session at once; every other close leaves
 // the page asleep for the resume window (SPEC section 6, ADR 0007).

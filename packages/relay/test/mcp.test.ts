@@ -206,7 +206,13 @@ describe('the five tools end to end (A1.1)', () => {
     expect(invoke).toMatchObject({
       tool: 'add_item',
       arguments: { label: 'hello' },
-      caller: { userId: 'alice', displayName: 'Alice', client: null, role: 'driver' },
+      // A 2025-era client is named from its session's initialize (M2).
+      caller: {
+        userId: 'alice',
+        displayName: 'Alice',
+        client: { name: 'relay-test', version: '1.0.0' },
+        role: 'driver',
+      },
       deadlineMs: 3000,
     });
     expect(invoke?.callId).toMatch(/^cl_/);
@@ -352,7 +358,13 @@ describe('roles (S5, relay half)', () => {
     opened.send({ t: 'set_role', userId: 'alice', role: 'driver' });
     await opened.sync();
     expect(
-      (await callTool(alice, 'call_page_tool', { page: opened.pageId, tool: 'add_item' })).isError,
+      (
+        await callTool(alice, 'call_page_tool', {
+          page: opened.pageId,
+          tool: 'add_item',
+          arguments: { label: 'x' },
+        })
+      ).isError,
     ).toBe(false);
     opened.send({ t: 'set_role', userId: 'bob', role: 'driver' });
     await opened.sync();
@@ -364,7 +376,13 @@ describe('roles (S5, relay half)', () => {
       ['bob', 'observer'],
     ]);
     expect(
-      (await callTool(bob, 'call_page_tool', { page: opened.pageId, tool: 'add_item' })).text,
+      (
+        await callTool(bob, 'call_page_tool', {
+          page: opened.pageId,
+          tool: 'add_item',
+          arguments: { label: 'x' },
+        })
+      ).text,
     ).toMatch(/^role_denied: /);
   });
 });
@@ -636,6 +654,7 @@ describe('untrusted page content (S10, S9)', () => {
     const failed = await callTool(alice, 'call_page_tool', {
       page: opened.pageId,
       tool: 'add_item',
+      arguments: { label: 'x' },
     });
     expect(failed).toMatchObject({
       isError: true,
@@ -844,7 +863,11 @@ describe('call outcomes', () => {
 describe('audit (S7)', () => {
   it('keeps one record per call with user, client, tool, time and outcome, and never the arguments', async () => {
     const { relay, lines } = await setup();
-    const opened = await page({ onInvoke: echo });
+    // This page's get_view takes any arguments, so the marked one reaches the page.
+    const opened = await page({
+      onInvoke: echo,
+      tools: [{ ...READ_TOOL, inputSchema: { type: 'object' } }, WRITE_TOOL, UNMARKED_TOOL],
+    });
     const alice = await client();
     await pairAndApprove(alice, opened, 'observer');
     const secret = 'argument-value-that-must-not-be-kept';
@@ -880,7 +903,7 @@ describe('audit (S7)', () => {
     expect(lines.join('\n')).not.toContain(secret);
   });
 
-  it('names the client when it says who it is (2026-07-28), and null when it cannot', async () => {
+  it('names the client on both eras: from _meta (2026-07-28) and from the session initialize (2025)', async () => {
     const { relay } = await setup();
     const opened = await page({ onInvoke: echo });
     const modern = await client(ALICE, { modern: true, name: 'phone-app', version: '2.1.0' });
@@ -890,14 +913,19 @@ describe('audit (S7)', () => {
     await callTool(legacy, 'call_page_tool', { page: opened.pageId, tool: 'get_view' });
     expect(relay.audit.records().map((record) => record.client)).toEqual([
       { name: 'phone-app', version: '2.1.0' },
-      null,
+      { name: 'laptop-app', version: '9.9.9' },
     ]);
-    expect(opened.all('invoke')[0]?.caller.client).toEqual({ name: 'phone-app', version: '2.1.0' });
-    const roster = opened.all('roster');
-    expect(roster[roster.length - 1]?.attachments[0]?.clients).toEqual([
+    expect(opened.all('invoke').map((frame) => frame.caller.client)).toEqual([
+      { name: 'phone-app', version: '2.1.0' },
+      { name: 'laptop-app', version: '9.9.9' },
+    ]);
+    // A new client changes the roster, newest first.
+    const last = opened.all('roster').at(-1)?.attachments[0];
+    expect(last?.clients).toEqual([
+      { name: 'laptop-app', version: '9.9.9' },
       { name: 'phone-app', version: '2.1.0' },
     ]);
-    expect(roster[roster.length - 1]?.attachments[0]?.lastUsedAt).toBeNull();
+    expect(last?.lastUsedAt).toEqual(expect.any(Number));
   });
 
   it('still records a call that fails inside the relay itself', async () => {
@@ -952,7 +980,11 @@ describe('revocation (S8)', () => {
     const opened = await page();
     const alice = await client();
     await pairAndApprove(alice, opened);
-    const pending = callTool(alice, 'call_page_tool', { page: opened.pageId, tool: 'add_item' });
+    const pending = callTool(alice, 'call_page_tool', {
+      page: opened.pageId,
+      tool: 'add_item',
+      arguments: { label: 'x' },
+    });
     const invoke = await opened.next('invoke');
     const started = Date.now();
     opened.send({ t: 'revoke', userId: 'alice' });
@@ -969,7 +1001,13 @@ describe('revocation (S8)', () => {
     await opened.sync();
     expect(opened.all('roster').at(-1)?.attachments).toEqual([]);
     expect(
-      (await callTool(alice, 'call_page_tool', { page: opened.pageId, tool: 'add_item' })).text,
+      (
+        await callTool(alice, 'call_page_tool', {
+          page: opened.pageId,
+          tool: 'add_item',
+          arguments: { label: 'x' },
+        })
+      ).text,
     ).toMatch(/^not_attached: /);
     expect((await callTool(alice, 'list_pages')).structured).toEqual({ pages: [] });
   });
@@ -1210,6 +1248,46 @@ describe('page lifecycle (A1.3)', () => {
     ).toBe(true);
     const back = await page({ resumeToken: token });
     expect(back.welcome).toMatchObject({ pageId: first.pageId, resumed: true });
+  });
+
+  it('a resume token from another page of the origin starts a new session and leaves the old one asleep; another query still resumes (ADR 0011)', async () => {
+    const store = createMemoryStore();
+    const { lines } = await setup({ store });
+    const board = await page({ url: `${PAGE_ORIGIN}/board`, onInvoke: echo });
+    const alice = await client();
+    await pairAndApprove(alice, board, 'driver');
+    const token = board.welcome?.resumeToken ?? '';
+    await board.close();
+    await delay(50);
+
+    // Another path, and the same path under another origin than the url named before,
+    // even with the Origin header unchanged: neither is the page the token belongs to.
+    for (const url of [`${PAGE_ORIGIN}/settings`, 'http://127.0.0.1:5173/board']) {
+      const other = await page({ url, resumeToken: token });
+      expect(other.welcome?.resumed, url).toBe(false);
+      expect(other.pageId).not.toBe(board.pageId);
+      expect(other.welcome?.roster).toEqual([]);
+    }
+    const refusals = lines.filter((line) => line.includes('resume refused'));
+    expect(refusals).toHaveLength(2);
+    for (const line of refusals) expect(line).toContain('different page');
+    for (const line of lines) expect(line).not.toContain(token);
+    // Left as if the token had never been shown: still asleep, Alice still attached.
+    expect((await callTool(alice, 'list_pages')).structured).toMatchObject({
+      pages: [{ page: board.pageId, state: 'asleep', role: 'driver' }],
+    });
+
+    const back = await page({
+      url: `${PAGE_ORIGIN}/board?view=grid#top`,
+      resumeToken: token,
+      onInvoke: echo,
+    });
+    expect(back.welcome).toMatchObject({ pageId: board.pageId, resumed: true });
+    expect(back.welcome?.roster).toMatchObject([{ userId: 'alice', role: 'driver' }]);
+    expect(store.pages.get(board.pageId)?.url).toBe(`${PAGE_ORIGIN}/board?view=grid#top`);
+    expect(
+      (await callTool(alice, 'call_page_tool', { page: board.pageId, tool: 'get_view' })).isError,
+    ).toBe(false);
   });
 
   it('after the resume window the page is gone: attachments deleted, page_gone from a tombstone, then forgotten', async () => {

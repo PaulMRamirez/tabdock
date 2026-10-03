@@ -54,9 +54,7 @@ export interface TestRelay {
   close(): Promise<void>;
 }
 
-export async function startRelay(
-  options: Omit<Partial<RelayOptions>, 'timings'> & { timings?: Partial<typeof FAST_TIMINGS> } = {},
-): Promise<TestRelay> {
+export async function startRelay(options: Partial<RelayOptions> = {}): Promise<TestRelay> {
   const lines: string[] = [];
   const relay = await createRelay({
     auth: createDevTokenAuth([ALICE, BOB, CAROL]),
@@ -134,4 +132,22 @@ export async function pairAndApprove(
 
 export function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** The 2025-era session a client holds; undefined for a 2026-07-28 client, which has none. */
+export function sessionIdOf(client: Client): string | undefined {
+  const transport = client.transport;
+  return transport instanceof StreamableHTTPClientTransport ? transport.sessionId : undefined;
+}
+
+/** Polls until `check` holds, for effects that land a few event loop turns later. */
+export async function eventually(
+  check: () => boolean | Promise<boolean>,
+  timeoutMs = 2000,
+): Promise<void> {
+  const until = Date.now() + timeoutMs;
+  while (!(await check())) {
+    if (Date.now() > until) throw new Error(`condition not met within ${String(timeoutMs)} ms`);
+    await delay(10);
+  }
 }

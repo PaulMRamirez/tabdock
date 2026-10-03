@@ -5,7 +5,13 @@
 
 import { randomBytes } from 'node:crypto';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
-import { type ErrorCode, isErrorCode, type Role } from '@tabdock/protocol';
+import {
+  type ErrorCode,
+  isErrorCode,
+  parseRelayFrame,
+  type RelayFrame,
+  type Role,
+} from '@tabdock/protocol';
 import {
   createDevTokenAuth,
   createRelay,
@@ -14,7 +20,12 @@ import {
   type RelayOptions,
 } from '@tabdock/relay';
 import type { DockState } from '@tabdock/adapter/core';
-import { type SimPage, type SimPageOptions, startSimPage } from '@tabdock/sim-page';
+import {
+  type FakeToolDefinition,
+  type SimPage,
+  type SimPageOptions,
+  startSimPage,
+} from '@tabdock/sim-page';
 import { expect } from 'vitest';
 
 /** Fresh random tokens on every run, so no usable credential ever sits in the repo. */
@@ -31,13 +42,26 @@ export interface World {
   /** Every sim page started in this world, including closed ones. */
   pages: SimPage[];
   page(options?: Omit<SimPageOptions, 'relayUrl'>): Promise<SimPage>;
-  client(user: DevTokenUser, name?: string): Promise<Client>;
+  client(user: DevTokenUser, name?: string, options?: ClientOptions): Promise<Client>;
   close(): Promise<void>;
 }
 
-export async function startWorld(
-  options: { timings?: RelayOptions['timings'] } = {},
-): Promise<World> {
+export interface ClientOptions {
+  /**
+   * Pin MCP revision 2026-07-28, whose requests name the client every time.
+   * Without it the SDK speaks the 2025 revision and gets a session from the
+   * relay's sessionful leg (ADR 0009).
+   */
+  modern?: boolean;
+}
+
+export interface WorldOptions {
+  timings?: RelayOptions['timings'];
+  limits?: RelayOptions['limits'];
+  rateLimits?: RelayOptions['rateLimits'];
+}
+
+export async function startWorld(options: WorldOptions = {}): Promise<World> {
   const alice = devUser('alice', 'Alice');
   const bob = devUser('bob', 'Bob');
   const relayLogs: string[] = [];
@@ -51,6 +75,8 @@ export async function startWorld(
       relayLogs.push(line);
     },
     timings: options.timings,
+    limits: options.limits,
+    rateLimits: options.rateLimits,
   });
   const pages: SimPage[] = [];
   const clients: Client[] = [];
@@ -65,11 +91,14 @@ export async function startWorld(
       pages.push(sim);
       return sim;
     },
-    async client(user, name = 'tabdock-e2e') {
+    async client(user, name = 'tabdock-e2e', clientOptions = {}) {
       const transport = new StreamableHTTPClientTransport(new URL(relay.mcpUrl), {
         requestInit: { headers: { Authorization: `Bearer ${user.token}` } },
       });
-      const client = new Client({ name, version: '0.0.0' });
+      const client = new Client(
+        { name, version: '0.0.0' },
+        clientOptions.modern ? { versionNegotiation: { mode: { pin: '2026-07-28' } } } : {},
+      );
       await client.connect(transport);
       clients.push(client);
       return client;
@@ -148,6 +177,20 @@ export async function attachAs(client: Client, sim: SimPage, role: Role): Promis
 }
 
 /**
+ * pair_page from another client of a user the page already lists, which the
+ * relay answers at once without asking the operator. The code is single use
+ * and the page hears of its successor on the page link while the client hears
+ * the answer over HTTP, so this waits for the new code to reach the page: a
+ * pairing right after must not pick up the code that just died.
+ */
+export async function pairAgain(client: Client, sim: SimPage): Promise<ToolOutcome> {
+  const code = await pairingCode(sim);
+  const outcome = await callTool(client, 'pair_page', { code });
+  await sim.waitFor((s) => s.pairing !== null && s.pairing.code !== code);
+  return outcome;
+}
+
+/**
  * Waits until the relay lists `count` tools for the page. The adapter shares
  * its tools right after the welcome, so a fast test can otherwise outrun it.
  */
@@ -199,3 +242,106 @@ export function delay(ms: number): Promise<void> {
 
 /** The six tools every sim page offers by default (packages/sim-page/src/default-tools.ts). */
 export const SIM_TOOL_COUNT = 6;
+
+/** The relay's log lines as objects; the relay writes one JSON object per line. */
+export function relayEntries(lines: readonly string[]): { msg: string; [key: string]: unknown }[] {
+  return lines.map((line) => JSON.parse(line) as { msg: string; [key: string]: unknown });
+}
+
+/**
+ * Call ids in the order the relay logged them joining a page's write queue
+ * (its 'call queued' debug line), which is the order mutating calls arrived.
+ */
+export function queuedCallIds(lines: readonly string[]): string[] {
+  return relayEntries(lines)
+    .filter((entry) => entry.msg === 'call queued')
+    .map((entry) => (typeof entry.callId === 'string' ? entry.callId : ''));
+}
+
+/**
+ * Every frame the relay sends to the sim page from now on, recorded off the
+ * page's own socket beside the adapter's handler, so a test sees the wire as
+ * the page did. Only valid frames are kept; the adapter checks the rest.
+ */
+export function watchFrames(sim: SimPage): RelayFrame[] {
+  const socket = sim.socket;
+  if (!socket) throw new Error('the sim page has no socket to watch');
+  const frames: RelayFrame[] = [];
+  socket.on('message', (data, isBinary) => {
+    if (isBinary || !Buffer.isBuffer(data)) return;
+    const parsed = parseRelayFrame(data.toString('utf8'));
+    if (parsed.kind === 'ok') frames.push(parsed.frame);
+  });
+  return frames;
+}
+
+export interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+}
+
+/** A promise a test settles itself, such as a gate that holds a page handler. */
+export function deferred<T = void>(): Deferred<T> {
+  let resolve: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+/** A string field of a tool's input, as a sim page handler receives it. */
+export function inputField(input: unknown, key: string): string {
+  const value =
+    typeof input === 'object' && input !== null
+      ? (input as Record<string, unknown>)[key]
+      : undefined;
+  return typeof value === 'string' ? value : '';
+}
+
+/** What one run of a hold tool's handler went through. */
+export interface HoldRecord {
+  /** Resolves when the handler starts, saying whether the runtime handed it an AbortSignal. */
+  started: Deferred<{ hasSignal: boolean }>;
+  /** Resolves when that signal fires; it never does on a runtime that passes none. */
+  aborted: Deferred<void>;
+}
+
+export function holdRecord(): HoldRecord {
+  return { started: deferred(), aborted: deferred() };
+}
+
+/**
+ * A page tool whose handler keeps running until the runtime aborts it, so a
+ * test can act while a call is in flight and see whether the page's handler
+ * was told to stop. It gives up by itself after 20 s, so a failing test leaves
+ * nothing behind.
+ */
+export function holdTool(
+  record: HoldRecord,
+  options: { name?: string; readOnly?: boolean } = {},
+): FakeToolDefinition {
+  return {
+    name: options.name ?? 'hold',
+    description: 'Run until cancelled.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    annotations: { readOnlyHint: options.readOnly ?? false },
+    execute: (_input, runtime) =>
+      new Promise((resolve, reject) => {
+        const signal = runtime?.signal;
+        record.started.resolve({ hasSignal: signal !== undefined });
+        const timer = setTimeout(() => {
+          resolve({ held: 'gave up waiting' });
+        }, 20_000);
+        timer.unref();
+        signal?.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(timer);
+            record.aborted.resolve();
+            reject(signal.reason as Error);
+          },
+          { once: true },
+        );
+      }),
+  };
+}

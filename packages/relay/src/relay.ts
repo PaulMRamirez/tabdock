@@ -1,7 +1,10 @@
 // One node:http server for everything: /page upgrades to the page link through
 // `ws`, /mcp goes through the official MCP SDK, /healthz answers ok. Checks run
-// before any protocol code sees a request: origin and subprotocol for pages
-// (S1, S2), Host and the auth plugin for MCP clients.
+// before any protocol code sees a request: origin, subprotocol and the socket
+// limits for pages (S1, S2, S9), Host and the auth plugin for MCP clients. /mcp
+// has two legs behind those checks, composed as the SDK documents (ADR 0009):
+// 2025-era traffic goes to the sessionful leg in sessions.ts, everything else to
+// a strict 2026-07-28 handler.
 
 import { createServer, type IncomingMessage, type ServerResponse, STATUS_CODES } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -11,13 +14,19 @@ import {
   type NodeIncomingMessageLike,
   toNodeHandler,
 } from '@modelcontextprotocol/node';
-import { type AuthInfo, createMcpHandler } from '@modelcontextprotocol/server';
+import {
+  type AuthInfo,
+  createMcpHandler,
+  isLegacyRequest,
+  type McpHandlerRequestOptions,
+} from '@modelcontextprotocol/server';
 import { MAX_FRAME_BYTES, SUBPROTOCOL, type User, UserSchema } from '@tabdock/protocol';
 import { WebSocketServer } from 'ws';
 import { NO_ORIGIN, type RelayOptions, resolveConfig } from './config.ts';
 import { PageHub } from './hub.ts';
 import { createLogger } from './log.ts';
-import { type AuthExtra, createMcpFactory } from './mcp.ts';
+import { type AuthExtra, createMcpFactory, userIdOf } from './mcp.ts';
+import { McpSessions } from './sessions.ts';
 import { type AuditRecord, createMemoryStore } from './store.ts';
 
 export interface Relay {
@@ -91,13 +100,32 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   const store = options.store ?? createMemoryStore();
   const hub = new PageHub(config, store, log);
 
-  const mcp = createMcpHandler(createMcpFactory(hub, config), {
+  const factory = createMcpFactory(hub, config);
+  const mcp = createMcpHandler(factory, {
+    legacy: 'reject',
     maxRequestBodySize: MAX_MCP_BODY_BYTES,
+    keepAliveMs: config.timings.sseKeepAliveMs,
     onerror: (error) => {
       log.warn('mcp handler error', { error });
     },
   });
-  const mcpNode = toNodeHandler(mcp, {
+  const sessions = new McpSessions({
+    createServer: (authInfo, request) => factory({ era: 'legacy', authInfo, requestInfo: request }),
+    ownerOf: userIdOf,
+    perUser: config.limits.sessionsPerUser,
+    total: config.limits.sessions,
+    idleMs: config.timings.sessionIdleMs,
+    keepAliveMs: config.timings.sseKeepAliveMs,
+    maxRequestBodySize: MAX_MCP_BODY_BYTES,
+    log,
+  });
+  const legs = {
+    fetch: async (request: Request, options?: McpHandlerRequestOptions): Promise<Response> =>
+      (await isLegacyRequest(request, undefined, { maxRequestBodySize: MAX_MCP_BODY_BYTES }))
+        ? sessions.handle(request, options?.authInfo)
+        : mcp.fetch(request, options),
+  };
+  const mcpNode = toNodeHandler(legs, {
     maxRequestBodySize: MAX_MCP_BODY_BYTES,
     onerror: (error) => {
       log.error('mcp adapter error', { error });
@@ -204,12 +232,22 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     } else {
       origin = header;
     }
+    // S9: refused before upgrading, so the page gets a plain HTTP status.
+    const refusal = hub.admitSocket(address);
+    if (refusal) {
+      refuseUpgrade(socket, refusal.status, refusal.message);
+      return;
+    }
     wss.handleUpgrade(request, socket, head, (ws) => {
       hub.acceptSocket(ws, origin, address);
     });
   });
 
   try {
+    // The argument check worker loads in about 100 ms; a relay that listened
+    // first would let its first calls through unchecked. If it cannot start,
+    // the relay serves anyway and keeps restarting it (ADR 0010).
+    await hub.ready();
     await new Promise<void>((resolveListen, rejectListen) => {
       server.once('error', rejectListen);
       server.listen(config.port, config.host.replace(/^\[(.*)\]$/, '$1'), () => {
@@ -218,9 +256,11 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       });
     });
   } catch (error) {
-    // A port in use must not leave the MCP handler or the socket server behind.
+    // A port in use must not leave the MCP handler, the socket server or the check worker behind.
     wss.close();
+    await hub.shutdown();
     await mcp.close();
+    await sessions.closeAll();
     throw error;
   }
   const bound = server.address() as AddressInfo;
@@ -250,6 +290,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
           });
         });
         await mcp.close();
+        await sessions.closeAll();
         server.closeAllConnections();
         await new Promise<void>((resolveClose) => {
           server.close(() => {
