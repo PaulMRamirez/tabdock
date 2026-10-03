@@ -13,8 +13,12 @@ export const PAIRING_CODE_BITS = PAIRING_CODE_LENGTH * 5;
 
 const ID_LENGTH = 10;
 const RESUME_TOKEN_BYTES = 32;
+/** S11 and ADR 0016: QR nonces, and invite secrets from M4, carry 128 bits. */
+export const SINGLE_USE_SECRET_BYTES = 16;
+const SESSION_SECRET_BYTES = 32;
 
-export type IdPrefix = 'pg' | 'rq' | 'cl';
+/** Pages, attach requests, calls, QR claims, and the trace ids that follow one QR pairing in the logs. */
+export type IdPrefix = 'pg' | 'rq' | 'cl' | 'qc' | 'tr';
 
 /** Each byte's low 5 bits pick a symbol; 256 is a multiple of 32, so there is no bias. */
 export function randomCrockford(length: number): string {
@@ -55,6 +59,22 @@ export function normalisePairingCode(input: string): string | null {
 
 export function newResumeToken(): string {
   return randomBytes(RESUME_TOKEN_BYTES).toString('base64url');
+}
+
+/**
+ * A secret for a single-use ticket (store.ts): 128 random bits as 22
+ * base64url characters, short enough for a QR code a phone reads at a glance.
+ */
+export function newSingleUseSecret(): string {
+  return randomBytes(SINGLE_USE_SECRET_BYTES).toString('base64url');
+}
+
+/** What a single-use secret looks like on the wire, so anything else is refused before a lookup. */
+export const SINGLE_USE_SECRET_PATTERN = /^[A-Za-z0-9_-]{22}$/;
+
+/** The value of a browser session cookie at /pair: 256 random bits, stored only as a digest. */
+export function newSessionSecret(): string {
+  return randomBytes(SESSION_SECRET_BYTES).toString('base64url');
 }
 
 export function digest(secret: string): Buffer {

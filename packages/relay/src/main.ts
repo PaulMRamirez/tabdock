@@ -22,6 +22,7 @@ try {
       : [
           `Tabdock relay on ${relay.url}, public URL ${relay.publicUrl ?? ''}`,
           `  Connector URL (OAuth sign-in through TABDOCK_OAUTH_ISSUER): ${relay.publicMcpUrl}`,
+          `  QR pairing page, signing phones in with TABDOCK_PAIR_CLIENT_ID: ${relay.publicUrl ?? ''}/pair`,
           `  Page socket for the adapter, on this machine only: ${relay.pageUrl}`,
           ...((process.env.TABDOCK_DEV_TOKENS?.trim() ?? '') === ''
             ? []

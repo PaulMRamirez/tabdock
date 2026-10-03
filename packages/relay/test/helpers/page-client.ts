@@ -85,6 +85,8 @@ export class TestPage {
   welcome: RelayFrameOf<'welcome'> | null = null;
   /** The newest pairing code the relay sent, as displayed. */
   code = '';
+  /** The newest pairing URL the relay sent (public URL mode only), its nonce in the fragment. */
+  pairingUrl: string | undefined;
   onInvoke: PageOptions['onInvoke'];
   readonly #autoPong: boolean;
   readonly #queue: RelayFrame[] = [];
@@ -109,13 +111,26 @@ export class TestPage {
     return this.welcome.pageId;
   }
 
+  /** The QR nonce of the newest pairing: what a phone reads from the URL fragment. */
+  get nonce(): string {
+    const url = this.pairingUrl;
+    if (url === undefined) throw new Error('the relay sent no pairing URL');
+    return new URL(url).hash.slice(1);
+  }
+
   #receive(text: string): void {
     const parsed = parseRelayFrame(text);
     if (parsed.kind !== 'ok') throw new Error(`relay sent a bad frame: ${parsed.kind}`);
     const frame = parsed.frame;
     this.received.push(frame);
-    if (frame.t === 'welcome') this.code = frame.pairing.code;
-    if (frame.t === 'pairing') this.code = frame.code;
+    if (frame.t === 'welcome') {
+      this.code = frame.pairing.code;
+      this.pairingUrl = frame.pairing.url;
+    }
+    if (frame.t === 'pairing') {
+      this.code = frame.code;
+      this.pairingUrl = frame.url;
+    }
     if (frame.t === 'ping' && this.#autoPong) this.send({ t: 'pong' });
     if (frame.t === 'invoke' && this.onInvoke) {
       const answer = this.onInvoke;

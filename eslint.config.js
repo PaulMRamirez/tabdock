@@ -35,5 +35,10 @@ export default defineConfig(
     files: ['**/*.js', '**/*.mjs'],
     extends: [tseslint.configs.disableTypeChecked],
   },
+  {
+    // The /pair page's script runs in the phone's browser, not in Node.
+    files: ['packages/relay/src/pair-page/**/*.js'],
+    languageOptions: { globals: { ...globals.browser } },
+  },
   prettier,
 );

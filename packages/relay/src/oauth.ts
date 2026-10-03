@@ -7,8 +7,10 @@
 // and checks each token with the SDK's verifyBearerToken over a jose verifier:
 // RS256 only, the provider's published keys, issuer, audience and expiry. Any
 // bad token becomes the SDK's 401 challenge with resource_metadata, which is the
-// only answer that makes Claude sign in; a token's `sub` must then be on the
-// allowlist, or the answer is a plain 403, which Claude treats as final.
+// only answer that makes Claude sign in; a token's `sub` must then map to a
+// member, or the answer is a plain 403, which Claude treats as final. The same
+// mapping, which says what kind of account a subject is (ADR 0016), serves the
+// browser sign-in at /pair, so a person is one user on both.
 
 import type { IncomingMessage } from 'node:http';
 import {
@@ -26,7 +28,15 @@ import {
 import { IdSchema, type User, UserSchema } from '@tabdock/protocol';
 import { createRemoteJWKSet, errors, type JWTPayload, type JWTVerifyGetKey, jwtVerify } from 'jose';
 import { z } from 'zod';
-import type { AuthOutcome, AuthPlugin, AuthRefusal, AuthRoute } from './auth.ts';
+import type {
+  Account,
+  AuthOutcome,
+  AuthPlugin,
+  AuthRefusal,
+  AuthRoute,
+  ProviderEndpoints,
+} from './auth.ts';
+import { digestHex } from './secrets.ts';
 
 export interface OAuthUser {
   /** The provider's subject identifier for this person, the token's `sub`. */
@@ -320,8 +330,22 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
     userIds.add(user.data.userId);
   }
 
+  /**
+   * The one account mapping (ADR 0016): an allowlisted subject is a member;
+   * anyone else the provider signs in is an invitee, whom every caller refuses
+   * until M4 lets invites in. The key stands in for the subject, which never
+   * leaves this function.
+   */
+  const accountOf = (sub: string): Account => {
+    const user = bySub.get(sub);
+    return user === undefined
+      ? { kind: 'invitee', key: digestHex(`invitee ${sub}`).slice(0, 32) }
+      : { kind: 'member', user };
+  };
+
   const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(resourceUrl);
   const expectedResource = new URL(resource);
+  let provider: ProviderEndpoints | null = null;
   let verifier: OAuthTokenVerifier | null = null;
   let metadataOptions: {
     oauthMetadata: OAuthMetadata;
@@ -360,9 +384,18 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
     name: 'oauth',
     resource,
     routes: new Map([[new URL(resourceMetadataUrl).pathname, metadataRoute]]),
+    browserSignIn: { provider: () => provider, accountOf },
 
     async start() {
       const metadata = await discover(issuer);
+      provider = {
+        issuer: metadata.issuer,
+        authorization_endpoint: metadata.authorization_endpoint,
+        token_endpoint: metadata.token_endpoint,
+        jwks_uri: metadata.jwks_uri,
+        response_types_supported: metadata.response_types_supported,
+        token_endpoint_auth_methods_supported: metadata.token_endpoint_auth_methods_supported,
+      };
       metadataOptions = {
         oauthMetadata: {
           issuer: metadata.issuer,
@@ -465,9 +498,10 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
         return challenge(error);
       }
       const sub = info.extra?.sub;
-      const user = typeof sub === 'string' ? bySub.get(sub) : undefined;
-      if (user === undefined) {
+      const account = typeof sub === 'string' ? accountOf(sub) : undefined;
+      if (account?.kind !== 'member') {
         // Not insufficient_scope: Claude would only sign in again and land here once more.
+        // M4 admits invitees here instead (ADR 0016); until then only members get in.
         return {
           kind: 'refused',
           status: 403,
@@ -476,7 +510,7 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
           headers: {},
         };
       }
-      return { kind: 'user', user };
+      return { kind: 'user', user: account.user };
     },
   };
 }

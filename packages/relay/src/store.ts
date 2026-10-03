@@ -52,6 +52,30 @@ export interface PairingTicketRecord {
   expiresAt: number;
 }
 
+/**
+ * What a single-use ticket admits (ADR 0016): 'pair' is the QR nonce beside a
+ * page's pairing code. M4's invites reuse the same store with a kind of their own.
+ */
+export type SingleUseKind = 'pair';
+
+/**
+ * A secret that works once, for one page, until it expires. Only its digest is
+ * kept; the secret itself goes to the page and from there into a URL fragment.
+ */
+export interface SingleUseTicketRecord {
+  kind: SingleUseKind;
+  /** SHA-256 of the secret. */
+  secretHash: Buffer;
+  pageId: string;
+  createdAt: number;
+  expiresAt: number;
+  /**
+   * Names this ticket in log lines, so one pairing can be followed from issue
+   * to first call without the secret ever being written down.
+   */
+  traceId: string;
+}
+
 export interface AttachRequestRecord {
   requestId: string;
   pageId: string;
@@ -110,6 +134,16 @@ export interface TicketStore {
   deleteForPage(pageId: string): void;
 }
 
+export interface SingleUseTicketStore {
+  put(ticket: SingleUseTicketRecord): void;
+  /** Looks a ticket up by its digest (hex) without using it. */
+  find(kind: SingleUseKind, hashHex: string): SingleUseTicketRecord | undefined;
+  /** Finds and removes in one step: whoever takes a ticket is its only user. */
+  take(kind: SingleUseKind, hashHex: string): SingleUseTicketRecord | undefined;
+  /** Removes every ticket of this kind for the page. */
+  deleteForPage(kind: SingleUseKind, pageId: string): void;
+}
+
 export interface AttachRequestStore {
   get(requestId: string): AttachRequestRecord | undefined;
   put(request: AttachRequestRecord): void;
@@ -127,6 +161,8 @@ export interface RelayStore {
   pages: PageStore;
   attachments: AttachmentStore;
   tickets: TicketStore;
+  /** Single-use tickets keyed by the digest of their secret (ADR 0016). */
+  singleUse: SingleUseTicketStore;
   requests: AttachRequestStore;
   audit: AuditLog;
 }
@@ -243,6 +279,57 @@ class MemoryTicketStore implements TicketStore {
   }
 }
 
+class MemorySingleUseTicketStore implements SingleUseTicketStore {
+  readonly #byHash = new Map<string, SingleUseTicketRecord>();
+  /** Each page's tickets by kind, so a page's end or a rotation finds them without a scan. */
+  readonly #byPage = new Map<string, Set<string>>();
+
+  put(ticket: SingleUseTicketRecord): void {
+    const key = ticketKey(ticket.kind, ticket.secretHash.toString('hex'));
+    this.#forget(key);
+    this.#byHash.set(key, ticket);
+    const pageKey = ticketKey(ticket.kind, ticket.pageId);
+    let keys = this.#byPage.get(pageKey);
+    if (!keys) {
+      keys = new Set();
+      this.#byPage.set(pageKey, keys);
+    }
+    keys.add(key);
+  }
+
+  find(kind: SingleUseKind, hashHex: string): SingleUseTicketRecord | undefined {
+    return this.#byHash.get(ticketKey(kind, hashHex));
+  }
+
+  take(kind: SingleUseKind, hashHex: string): SingleUseTicketRecord | undefined {
+    const key = ticketKey(kind, hashHex);
+    const ticket = this.#byHash.get(key);
+    this.#forget(key);
+    return ticket;
+  }
+
+  deleteForPage(kind: SingleUseKind, pageId: string): void {
+    const pageKey = ticketKey(kind, pageId);
+    for (const key of this.#byPage.get(pageKey) ?? []) this.#byHash.delete(key);
+    this.#byPage.delete(pageKey);
+  }
+
+  #forget(key: string): void {
+    const ticket = this.#byHash.get(key);
+    if (!ticket) return;
+    this.#byHash.delete(key);
+    const pageKey = ticketKey(ticket.kind, ticket.pageId);
+    const keys = this.#byPage.get(pageKey);
+    keys?.delete(key);
+    if (keys?.size === 0) this.#byPage.delete(pageKey);
+  }
+}
+
+/** A kind and a hex digest or a page id: neither holds a space, so the pair is unambiguous. */
+function ticketKey(kind: SingleUseKind, value: string): string {
+  return `${kind} ${value}`;
+}
+
 class MemoryAttachRequestStore implements AttachRequestStore {
   readonly #requests = new Map<string, AttachRequestRecord>();
 
@@ -289,6 +376,7 @@ export function createMemoryStore(options: { auditCapacity?: number } = {}): Rel
     pages: new MemoryPageStore(),
     attachments: new MemoryAttachmentStore(),
     tickets: new MemoryTicketStore(),
+    singleUse: new MemorySingleUseTicketStore(),
     requests: new MemoryAttachRequestStore(),
     audit: new MemoryAuditLog(options.auditCapacity),
   };

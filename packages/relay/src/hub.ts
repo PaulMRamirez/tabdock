@@ -47,8 +47,10 @@ import {
   newId,
   newPairingCode,
   newResumeToken,
+  newSingleUseSecret,
   normalisePairingCode,
   sameDigest,
+  SINGLE_USE_SECRET_PATTERN,
 } from './secrets.ts';
 import type {
   AttachmentRecord,
@@ -57,6 +59,7 @@ import type {
   PageRecord,
   PageState,
   RelayStore,
+  SingleUseTicketRecord,
 } from './store.ts';
 
 type FrameOf<T extends PageFrame['t']> = Extract<PageFrame, { t: T }>;
@@ -66,8 +69,6 @@ export interface CallerIdentity {
   userId: string;
   displayName: string;
   client: ClientInfo | null;
-  /** The HTTP peer address, for per-address rate limits. */
-  address: string;
 }
 
 export interface HubError {
@@ -78,6 +79,50 @@ export interface HubError {
 
 export type PairOutcome =
   { kind: 'attached'; pageId: string; origin: string; role: Role; existing: boolean } | HubError;
+
+/** What /pair shows for a live QR nonce before anyone claims it; looking uses nothing up. */
+export interface PairPreview {
+  /** From the page socket's Origin header (S1), never from the page's own words. */
+  origin: string;
+  /** Written by the page (S10): capped here, and shown as the page's own words. */
+  title: string;
+  titleCut: boolean;
+  /** The code the widget shows beside the QR code, for the person to compare. */
+  code: string;
+  expiresAt: number;
+}
+
+/**
+ * A QR claim: refused at once, or claimed, with `settled` resolving when the
+ * operator decides, the request runs out, or the page goes (ADR 0005's wait
+ * does not apply: the phone polls instead of holding a request open).
+ */
+export type ClaimOutcome =
+  HubError | { kind: 'claimed'; pageId: string; settled: Promise<PairOutcome> };
+
+/** A page title longer than this is cut before /pair shows it (S10). */
+export const MAX_PAIR_TITLE_CHARS = 120;
+
+/** Follows one QR pairing through the logs by its ticket's trace id, never its nonce. */
+interface QrTrace {
+  traceId: string;
+  issuedAt: number;
+}
+
+/** QR pairings remembered until their first call; the oldest go first past this. */
+const MAX_QR_TRACES = 1000;
+
+const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
+/** The first `max` characters as people see them, so no emoji or accent is cut in half. */
+function firstCharacters(text: string, max: number): { text: string; cut: boolean } {
+  let count = 0;
+  for (const { index } of GRAPHEMES.segment(text)) {
+    if (count === max) return { text: text.slice(0, index), cut: true };
+    count += 1;
+  }
+  return { text, cut: false };
+}
 
 export interface PageListing {
   page: string;
@@ -531,8 +576,22 @@ export class PageHub {
   readonly #callRosterAt = new Map<string, number>();
   /** A roster held back by the refresh step, so a new client still reaches the page. */
   readonly #rosterTimers = new Map<string, NodeJS.Timeout>();
+  /**
+   * Each page's current code as its widget shows it, kept in public URL mode
+   * only and in memory only, so /pair can show it beside the page's title; the
+   * store keeps nothing but its digest.
+   */
+  readonly #liveCodes = new Map<string, string>();
+  /** QR pairings waiting on their attach request, by requestId, for the approval's log line. */
+  readonly #qrRequests = new Map<string, QrTrace>();
+  /** QR pairings approved and not yet followed by a call, by attachmentKey. */
+  readonly #qrFirstCalls = new Map<string, QrTrace>();
+  /**
+   * Pairing attempts are counted per user and per page, never per address:
+   * behind a tunnel every caller arrives from the same one (S3, ADR 0016).
+   */
   readonly #userLimiter: SlidingWindowLimiter;
-  readonly #addressLimiter: SlidingWindowLimiter;
+  readonly #pageLimiter: SlidingWindowLimiter;
   readonly #callLimiter: SlidingWindowLimiter;
   /** Tools frames per remote address, shared by its sockets and kept across reconnects. */
   readonly #toolsFrameLimiter: SlidingWindowLimiter;
@@ -544,14 +603,14 @@ export class PageHub {
     this.#log = log;
     const {
       pairAttemptsPerUser,
-      pairAttemptsPerAddress,
+      pairAttemptsPerPage,
       callsPerUserPerPage,
       windowMs,
       toolsFramesPerAddress,
       toolsFramesWindowMs,
     } = config.rateLimits;
     this.#userLimiter = new SlidingWindowLimiter(pairAttemptsPerUser, windowMs);
-    this.#addressLimiter = new SlidingWindowLimiter(pairAttemptsPerAddress, windowMs);
+    this.#pageLimiter = new SlidingWindowLimiter(pairAttemptsPerPage, windowMs);
     this.#callLimiter = new SlidingWindowLimiter(callsPerUserPerPage, windowMs);
     this.#toolsFrameLimiter = new SlidingWindowLimiter(toolsFramesPerAddress, toolsFramesWindowMs);
     this.#checker = new ArgumentChecker({ budgetMs: config.timings.argumentCheckMs, log });
@@ -1032,8 +1091,7 @@ export class PageHub {
     this.#asleep.add(pageId);
     const creator = this.#pageAddress.get(pageId);
     if (creator !== undefined) this.#sessionsByAddress.get(creator)?.asleep.add(pageId);
-    this.#store.tickets.deleteForPage(pageId);
-    this.#clearTimer(this.#pairingTimers, pageId);
+    this.#dropTicket(pageId);
     // The welcome on resume carries the roster as it is by then.
     this.#clearTimer(this.#rosterTimers, pageId);
     this.#dropRequests(pageId);
@@ -1062,6 +1120,7 @@ export class PageHub {
     for (const attachment of attachments) {
       this.#store.attachments.delete(pageId, attachment.userId);
       this.#clearTimer(this.#expiryTimers, attachmentKey(pageId, attachment.userId));
+      this.#qrFirstCalls.delete(attachmentKey(pageId, attachment.userId));
     }
     page.state = 'gone';
     page.goneAt = Date.now();
@@ -1110,23 +1169,82 @@ export class PageHub {
   #issueTicket(pageId: string): Pairing {
     const code = newPairingCode();
     const { pairingTtlMs } = this.#config.timings;
-    const expiresAt = Date.now() + pairingTtlMs;
+    const now = Date.now();
+    const expiresAt = now + pairingTtlMs;
     this.#store.tickets.put({ pageId, codeHash: digest(code), expiresAt });
     this.#setTimer(this.#pairingTimers, pageId, pairingTtlMs, () => {
       this.#rotateTicket(pageId, 'expired');
     });
-    return { code: formatPairingCode(code), expiresAt };
+    const shown = formatPairingCode(code);
+    const url = this.#issuePairNonce(pageId, shown, now, expiresAt);
+    return { code: shown, ...(url === null ? {} : { url }), expiresAt };
+  }
+
+  /**
+   * In public URL mode, a QR nonce beside the code (S11): 128 bits, bound to
+   * the page, single use, living exactly as long as the code and replaced with
+   * it. Its URL carries it in the fragment, which a browser never sends, so it
+   * reaches no server or tunnel log. Null, and no URL, otherwise.
+   */
+  #issuePairNonce(pageId: string, shown: string, now: number, expiresAt: number): string | null {
+    this.#store.singleUse.deleteForPage('pair', pageId);
+    const { publicUrl } = this.#config;
+    if (publicUrl === null) return null;
+    const nonce = newSingleUseSecret();
+    const traceId = newId('tr');
+    this.#store.singleUse.put({
+      kind: 'pair',
+      secretHash: digest(nonce),
+      pageId,
+      createdAt: now,
+      expiresAt,
+      traceId,
+    });
+    this.#liveCodes.set(pageId, shown);
+    this.#log.debug('pairing nonce issued', { pageId, trace: traceId });
+    return `${publicUrl}/pair#${nonce}`;
+  }
+
+  /** The page has no live code or nonce any more, until its next welcome. */
+  #dropTicket(pageId: string): void {
+    this.#store.tickets.deleteForPage(pageId);
+    this.#store.singleUse.deleteForPage('pair', pageId);
+    this.#liveCodes.delete(pageId);
+    this.#clearTimer(this.#pairingTimers, pageId);
   }
 
   #rotateTicket(pageId: string, reason: string): void {
     const conn = this.#live.get(pageId);
     if (!conn || conn.closing) {
-      this.#store.tickets.deleteForPage(pageId);
-      this.#clearTimer(this.#pairingTimers, pageId);
+      this.#dropTicket(pageId);
       return;
     }
     this.#send(conn, { t: 'pairing', ...this.#issueTicket(pageId) });
     this.#log.debug('pairing code rotated', { pageId, reason });
+  }
+
+  /**
+   * A live QR nonce, found by its digest and confirmed in constant time, as
+   * codes are (S3). `take` removes it in the same step, so two claims racing
+   * for one nonce cannot both have it. Unknown, used and expired look alike.
+   */
+  #pairTicket(nonce: string, now: number, take: boolean): SingleUseTicketRecord | null {
+    if (!SINGLE_USE_SECRET_PATTERN.test(nonce)) return null;
+    const hash = digest(nonce);
+    const hashHex = hash.toString('hex');
+    const ticket = take
+      ? this.#store.singleUse.take('pair', hashHex)
+      : this.#store.singleUse.find('pair', hashHex);
+    if (!ticket || !sameDigest(ticket.secretHash, hash) || ticket.expiresAt <= now) return null;
+    return ticket;
+  }
+
+  /** The page and its socket, while it is awake and its socket is not closing. */
+  #livePage(pageId: string): { page: PageRecord; conn: Conn } | null {
+    const page = this.#store.pages.get(pageId);
+    const conn = this.#live.get(pageId);
+    if (page?.state !== 'awake' || !conn || conn.closing) return null;
+    return { page, conn };
   }
 
   /** Looks the code up by its hash, then confirms in constant time (S3). */
@@ -1176,6 +1294,8 @@ export class PageHub {
       return;
     }
     const attachment = this.#grant(request, frame.role ?? 'observer');
+    const trace = this.#qrRequests.get(request.requestId);
+    if (trace) this.#traceApproved(trace, pageId, request.userId, attachment.role);
     const page = this.#store.pages.get(pageId);
     this.#endRequest(request.requestId, {
       kind: 'attached',
@@ -1287,6 +1407,7 @@ export class PageHub {
     for (const userId of users) {
       this.#store.attachments.delete(pageId, userId);
       this.#clearTimer(this.#expiryTimers, attachmentKey(pageId, userId));
+      this.#qrFirstCalls.delete(attachmentKey(pageId, userId));
     }
     const outcome = hubError('not_attached', message);
     // Queued calls first, so a running one settling does not hand the page a call that is ending.
@@ -1358,6 +1479,7 @@ export class PageHub {
   #endRequest(requestId: string, outcome: PairOutcome): void {
     this.#store.requests.delete(requestId);
     this.#clearTimer(this.#requestTimers, requestId);
+    this.#qrRequests.delete(requestId);
     for (const waiter of [...(this.#pairWaiters.get(requestId) ?? [])]) waiter(outcome);
   }
 
@@ -1490,31 +1612,116 @@ export class PageHub {
 
   async pairPage(caller: CallerIdentity, code: string, signal: AbortSignal): Promise<PairOutcome> {
     const now = Date.now();
-    if (
-      !this.#userLimiter.allows(caller.userId, now) ||
-      !this.#addressLimiter.allows(caller.address, now)
-    ) {
-      this.#log.warn('pairing attempt rate limited', {
-        userId: caller.userId,
-        address: caller.address,
-      });
-      return hubError('rate_limited', 'too many pairing attempts; wait a minute and try again');
-    }
-    this.#userLimiter.record(caller.userId, now);
-    this.#addressLimiter.record(caller.address, now);
+    const limited = this.#pairingLimited(caller.userId, now);
+    if (limited) return limited;
 
     const normalised = normalisePairingCode(code);
     const pageId = normalised === null ? null : this.#matchTicket(normalised, now);
-    const page = pageId === null ? undefined : this.#store.pages.get(pageId);
-    const conn = pageId === null ? undefined : this.#live.get(pageId);
+    const live = pageId === null ? null : this.#livePage(pageId);
     // Wrong and expired look the same: telling them apart would confirm a code once existed.
-    if (!page || page.state !== 'awake' || !conn || conn.closing) {
+    if (!live) {
       this.#log.info('pairing refused: no live code matched', { userId: caller.userId });
       return hubError('pairing_expired', 'code is invalid or expired');
     }
+    const started = this.#startPairing(caller, live.page, live.conn, 'code', now, null);
+    return started.kind === 'pending' ? this.#waitForDecision(started.record, signal) : started;
+  }
 
-    // Single use: the matched code dies here and the page gets a fresh one.
+  /**
+   * What /pair shows for a QR nonce: the page's origin, its title as the page
+   * wrote it, and the code its widget shows, so the person can check the phone
+   * is about to join the page in front of them. Uses nothing up; null for an
+   * unknown, used or expired nonce alike.
+   */
+  previewPairNonce(nonce: string): PairPreview | null {
+    const ticket = this.#pairTicket(nonce, Date.now(), false);
+    const live = ticket === null ? null : this.#livePage(ticket.pageId);
+    const code = ticket === null ? undefined : this.#liveCodes.get(ticket.pageId);
+    if (!ticket || !live || code === undefined) return null;
+    this.#log.debug('pairing nonce previewed', { pageId: ticket.pageId, trace: ticket.traceId });
+    const title = firstCharacters(live.page.title, MAX_PAIR_TITLE_CHARS);
+    return {
+      origin: live.page.origin,
+      title: title.text,
+      titleCut: title.cut,
+      code,
+      expiresAt: ticket.expiresAt,
+    };
+  }
+
+  /**
+   * A signed-in member's QR claim from /pair: the nonce is used up at once
+   * and the page gets a fresh code and nonce, then everything goes as for
+   * pair_page (via 'qr'): the same limits, one pending request per user and
+   * page, the operator's approval, and silence as a denial.
+   */
+  claimPairNonce(caller: CallerIdentity, nonce: string): ClaimOutcome {
+    const now = Date.now();
+    const limited = this.#pairingLimited(caller.userId, now);
+    if (limited) return limited;
+    const ticket = this.#pairTicket(nonce, now, true);
+    const live = ticket === null ? null : this.#livePage(ticket.pageId);
+    if (!ticket || !live) {
+      this.#log.info('qr pairing refused: no live nonce matched', { userId: caller.userId });
+      return hubError('pairing_expired', 'this pairing link is invalid or expired');
+    }
+    const trace: QrTrace = { traceId: ticket.traceId, issuedAt: ticket.createdAt };
+    this.#log.debug('pairing nonce claimed', {
+      pageId: ticket.pageId,
+      userId: caller.userId,
+      trace: trace.traceId,
+      sinceIssuedMs: now - trace.issuedAt,
+    });
+    const started = this.#startPairing(caller, live.page, live.conn, 'qr', now, trace);
+    if (started.kind === 'error') return started;
+    return {
+      kind: 'claimed',
+      pageId: ticket.pageId,
+      settled:
+        started.kind === 'pending' ? this.#waitForEnd(started.record) : Promise.resolve(started),
+    };
+  }
+
+  /** Counts one pairing attempt for the user, or refuses it past the limit (S3). */
+  #pairingLimited(userId: string, now: number): HubError | null {
+    if (!this.#userLimiter.allows(userId, now)) {
+      this.#log.warn('pairing attempt rate limited', { userId });
+      return hubError('rate_limited', 'too many pairing attempts; wait a minute and try again');
+    }
+    this.#userLimiter.record(userId, now);
+    return null;
+  }
+
+  /**
+   * Everything after a live code or nonce matched: it is spent and replaced,
+   * the page's own pairing limit is counted, and then the caller is already
+   * attached, joins their pending request, is refused for a full page, is let
+   * in by autoApprove, or gets a new request the operator sees.
+   */
+  #startPairing(
+    caller: CallerIdentity,
+    page: PageRecord,
+    conn: Conn,
+    via: AttachRequestRecord['via'],
+    now: number,
+    trace: QrTrace | null,
+  ): PairOutcome | { kind: 'pending'; record: AttachRequestRecord } {
+    // Single use: the matched code or nonce dies here and the page gets a fresh pair.
     this.#rotateTicket(page.pageId, 'used');
+
+    // Every pairing that lands on a page counts against it, whoever sends it, so
+    // a page whose codes leak cannot be buried in prompts.
+    if (!this.#pageLimiter.allows(page.pageId, now)) {
+      this.#log.warn('pairing refused: too many pairings for one page', {
+        pageId: page.pageId,
+        userId: caller.userId,
+      });
+      return hubError(
+        'rate_limited',
+        'too many pairing attempts on this page; wait a minute and try again',
+      );
+    }
+    this.#pageLimiter.record(page.pageId, now);
 
     this.#expireIfDue(page.pageId, caller.userId);
     const existing = this.#store.attachments.get(page.pageId, caller.userId);
@@ -1523,6 +1730,7 @@ export class PageHub {
       const named = this.#recordClient(existing, caller.client);
       this.#store.attachments.put(existing);
       if (named) this.#sendRoster(page.pageId);
+      if (trace) this.#traceApproved(trace, page.pageId, caller.userId, existing.role);
       return {
         kind: 'attached',
         pageId: page.pageId,
@@ -1556,12 +1764,16 @@ export class PageHub {
         pending.joined.push(joining);
         this.#store.requests.put(pending);
       }
-      this.#log.info('pair_page joined a pending attach request', {
+      this.#log.info('pairing joined a pending attach request', {
         pageId: pending.pageId,
         userId: pending.userId,
         requestId: pending.requestId,
+        via,
       });
-      return this.#waitForDecision(pending, signal);
+      if (trace && !this.#qrRequests.has(pending.requestId)) {
+        this.#qrRequests.set(pending.requestId, trace);
+      }
+      return { kind: 'pending', record: pending };
     }
 
     // S9: a full page is refused before its operator is asked anything.
@@ -1575,6 +1787,7 @@ export class PageHub {
 
     if (page.policy.autoApprove === 'observer') {
       const attachment = this.#grant(request, 'observer');
+      if (trace) this.#traceApproved(trace, page.pageId, caller.userId, attachment.role);
       return {
         kind: 'attached',
         pageId: page.pageId,
@@ -1588,11 +1801,12 @@ export class PageHub {
     const record: AttachRequestRecord = {
       ...request,
       requestId: newId('rq'),
-      via: 'code',
+      via,
       joined: [],
       expiresAt: now + attachRequestTtlMs,
     };
     this.#store.requests.put(record);
+    if (trace) this.#qrRequests.set(record.requestId, trace);
     this.#setTimer(this.#requestTimers, record.requestId, attachRequestTtlMs, () => {
       this.#log.info('attach request expired unanswered', {
         pageId: record.pageId,
@@ -1616,8 +1830,66 @@ export class PageHub {
       pageId: record.pageId,
       userId: record.userId,
       requestId: record.requestId,
+      via,
     });
-    return this.#waitForDecision(record, signal);
+    return { kind: 'pending', record };
+  }
+
+  /**
+   * Waits for the request itself to end: approval, denial, its lifetime run
+   * out, the page gone or asleep, or shutdown. Every one of those calls
+   * #endRequest or answers the waiters directly, so this always settles.
+   */
+  #waitForEnd(record: AttachRequestRecord): Promise<PairOutcome> {
+    return new Promise((resolve) => {
+      const finish = (outcome: PairOutcome): void => {
+        const waiters = this.#pairWaiters.get(record.requestId);
+        waiters?.delete(finish);
+        if (waiters?.size === 0) this.#pairWaiters.delete(record.requestId);
+        resolve(outcome);
+      };
+      let waiters = this.#pairWaiters.get(record.requestId);
+      if (!waiters) {
+        waiters = new Set();
+        this.#pairWaiters.set(record.requestId, waiters);
+      }
+      waiters.add(finish);
+    });
+  }
+
+  /**
+   * Scan to first call (A3.3): a QR pairing is approved (or found already
+   * attached), and the next call by that user on that page is logged under
+   * the same trace id. Debug level, ids and times only.
+   */
+  #traceApproved(trace: QrTrace, pageId: string, userId: string, role: Role): void {
+    this.#log.debug('qr pairing approved', {
+      pageId,
+      userId,
+      role,
+      trace: trace.traceId,
+      sinceIssuedMs: Date.now() - trace.issuedAt,
+    });
+    const key = attachmentKey(pageId, userId);
+    this.#qrFirstCalls.delete(key);
+    this.#qrFirstCalls.set(key, trace);
+    for (const oldest of this.#qrFirstCalls.keys()) {
+      if (this.#qrFirstCalls.size <= MAX_QR_TRACES) break;
+      this.#qrFirstCalls.delete(oldest);
+    }
+  }
+
+  #traceFirstCall(userId: string, pageId: string): void {
+    const key = attachmentKey(pageId, userId);
+    const trace = this.#qrFirstCalls.get(key);
+    if (!trace) return;
+    this.#qrFirstCalls.delete(key);
+    this.#log.debug('first call after qr pairing', {
+      pageId,
+      userId,
+      trace: trace.traceId,
+      sinceIssuedMs: Date.now() - trace.issuedAt,
+    });
   }
 
   #waitForDecision(record: AttachRequestRecord, signal: AbortSignal): Promise<PairOutcome> {
@@ -1664,6 +1936,7 @@ export class PageHub {
     signal: AbortSignal,
   ): Promise<CallOutcome> {
     const started = Date.now();
+    this.#traceFirstCall(caller.userId, pageId);
     let auditOutcome: AuditOutcome = 'relay_error';
     try {
       const outcome = await this.#call(caller, pageId, tool, args, signal);
@@ -2290,6 +2563,9 @@ export class PageHub {
       for (const timer of map.values()) clearTimeout(timer);
       map.clear();
     }
+    this.#liveCodes.clear();
+    this.#qrRequests.clear();
+    this.#qrFirstCalls.clear();
     await Promise.all([...closing, checkerClosed]);
   }
 }

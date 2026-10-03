@@ -1,9 +1,11 @@
 export {
+  type Account,
   type AuthOutcome,
   AuthOutcomeSchema,
   type AuthPlugin,
   type AuthRefusal,
   type AuthRoute,
+  type BrowserSignIn,
   createDevTokenAuth,
   type DevTokenUser,
   MIN_DEV_TOKEN_LENGTH,
@@ -16,6 +18,8 @@ export {
   DEFAULT_TIMINGS,
   loadConfigFromEnv,
   NO_ORIGIN,
+  type PairClientOptions,
+  pairRedirectUriOf,
   parsePublicUrl,
   publicMcpUrlOf,
   type RelayEnv,
@@ -32,6 +36,7 @@ export {
   type OAuthUser,
   parseOAuthUsers,
 } from './oauth.ts';
+export { LOGIN_COOKIE, PAIR_ROUTES, SESSION_COOKIE } from './pair.ts';
 export { createRelay, type Relay } from './relay.ts';
 export {
   type AttachmentRecord,
@@ -48,5 +53,8 @@ export {
   type PageStore,
   type PairingTicketRecord,
   type RelayStore,
+  type SingleUseKind,
+  type SingleUseTicketRecord,
+  type SingleUseTicketStore,
   type TicketStore,
 } from './store.ts';
