@@ -161,8 +161,10 @@ describe('origin policy (S1, S2)', () => {
       pageSessionsPerAddress: 20,
       pageSessions: 1000,
       pairSessions: 200,
+      pairSignInsInFlight: 8,
     });
     expect(rateLimits.callsPerUserPerPage).toBe(120);
+    expect(rateLimits.pairSignIns).toBe(60);
     expect(timings.sessionIdleMs).toBe(30 * 60_000);
     expect(timings.attachmentIdleMs).toBe(8 * 60 * 60_000);
     expect(timings.sseKeepAliveMs).toBe(15_000);
@@ -260,6 +262,8 @@ describe('loadConfigFromEnv', () => {
       TABDOCK_MAX_PAGE_SESSIONS_PER_ADDRESS: '6',
       TABDOCK_MAX_PAGE_SESSIONS: '30',
       TABDOCK_MAX_CALLS_PER_MINUTE: '60',
+      TABDOCK_MAX_PAIR_SIGNINS_PER_MINUTE: '20',
+      TABDOCK_MAX_PAIR_SIGNINS_IN_FLIGHT: '4',
       TABDOCK_SESSION_IDLE_MINUTES: '10',
       TABDOCK_ATTACHMENT_IDLE_MINUTES: '120',
     });
@@ -273,19 +277,25 @@ describe('loadConfigFromEnv', () => {
       pageSessionsPerAddress: 6,
       pageSessions: 30,
       pairSessions: 200,
+      pairSignInsInFlight: 4,
     });
     expect(config.rateLimits.callsPerUserPerPage).toBe(60);
+    expect(config.rateLimits.pairSignIns).toBe(20);
     expect(config.timings.sessionIdleMs).toBe(10 * 60_000);
     expect(config.timings.attachmentIdleMs).toBe(120 * 60_000);
     const defaults = resolveConfig(
       loadConfigFromEnv({ TABDOCK_DEV_TOKENS: tokens, TABDOCK_MAX_QUEUE_DEPTH: '' }),
     );
     expect(defaults.limits.queueDepth).toBe(32);
+    expect(defaults.limits.pairSignInsInFlight).toBe(8);
+    expect(defaults.rateLimits.pairSignIns).toBe(60);
     expect(defaults.timings.attachmentIdleMs).toBe(8 * 60 * 60_000);
     for (const [name, value] of [
       ['TABDOCK_MAX_QUEUE_DEPTH', '0'],
       ['TABDOCK_MAX_USERS_PER_PAGE', 'ten'],
       ['TABDOCK_MAX_CALLS_PER_MINUTE', '1.5'],
+      ['TABDOCK_MAX_PAIR_SIGNINS_PER_MINUTE', '0'],
+      ['TABDOCK_MAX_PAIR_SIGNINS_IN_FLIGHT', 'eight'],
       ['TABDOCK_SESSION_IDLE_MINUTES', '-3'],
       ['TABDOCK_ATTACHMENT_IDLE_MINUTES', '99999'],
     ] as const) {
