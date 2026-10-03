@@ -13,7 +13,7 @@ import {
   GRANTS_KEY,
   invoke,
   link,
-  RELAY_URL,
+  PAUSED_KEY,
   results,
   REVOKED_KEY,
   runtimeTool,
@@ -21,8 +21,6 @@ import {
   welcome,
   type Harness,
 } from './harness.ts';
-
-const PAUSED_KEY = `tabdock:paused:${RELAY_URL}`;
 
 function caller(userId: string, role: 'driver' | 'observer' = 'driver') {
   return {

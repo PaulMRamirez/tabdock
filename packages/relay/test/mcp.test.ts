@@ -1250,6 +1250,46 @@ describe('page lifecycle (A1.3)', () => {
     expect(back.welcome).toMatchObject({ pageId: first.pageId, resumed: true });
   });
 
+  it('a resume token from another page of the origin starts a new session and leaves the old one asleep; another query still resumes (ADR 0011)', async () => {
+    const store = createMemoryStore();
+    const { lines } = await setup({ store });
+    const board = await page({ url: `${PAGE_ORIGIN}/board`, onInvoke: echo });
+    const alice = await client();
+    await pairAndApprove(alice, board, 'driver');
+    const token = board.welcome?.resumeToken ?? '';
+    await board.close();
+    await delay(50);
+
+    // Another path, and the same path under another origin than the url named before,
+    // even with the Origin header unchanged: neither is the page the token belongs to.
+    for (const url of [`${PAGE_ORIGIN}/settings`, 'http://127.0.0.1:5173/board']) {
+      const other = await page({ url, resumeToken: token });
+      expect(other.welcome?.resumed, url).toBe(false);
+      expect(other.pageId).not.toBe(board.pageId);
+      expect(other.welcome?.roster).toEqual([]);
+    }
+    const refusals = lines.filter((line) => line.includes('resume refused'));
+    expect(refusals).toHaveLength(2);
+    for (const line of refusals) expect(line).toContain('different page');
+    for (const line of lines) expect(line).not.toContain(token);
+    // Left as if the token had never been shown: still asleep, Alice still attached.
+    expect((await callTool(alice, 'list_pages')).structured).toMatchObject({
+      pages: [{ page: board.pageId, state: 'asleep', role: 'driver' }],
+    });
+
+    const back = await page({
+      url: `${PAGE_ORIGIN}/board?view=grid#top`,
+      resumeToken: token,
+      onInvoke: echo,
+    });
+    expect(back.welcome).toMatchObject({ pageId: board.pageId, resumed: true });
+    expect(back.welcome?.roster).toMatchObject([{ userId: 'alice', role: 'driver' }]);
+    expect(store.pages.get(board.pageId)?.url).toBe(`${PAGE_ORIGIN}/board?view=grid#top`);
+    expect(
+      (await callTool(alice, 'call_page_tool', { page: board.pageId, tool: 'get_view' })).isError,
+    ).toBe(false);
+  });
+
   it('after the resume window the page is gone: attachments deleted, page_gone from a tombstone, then forgotten', async () => {
     await setup({ timings: { resumeWindowMs: 150, goneTombstoneMs: 300 } });
     const opened = await page();

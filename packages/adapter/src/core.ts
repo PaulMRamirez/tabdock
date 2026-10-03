@@ -108,10 +108,9 @@ export interface Logger {
   error(message: string): void;
 }
 
+/** What hello says about the page that can change while it is open. */
 export interface PageInfo {
   title: string;
-  /** Origin plus path only: queries and fragments can carry secrets. */
-  url: string;
 }
 
 export type AttachAnswer = Role | 'deny';
@@ -142,6 +141,14 @@ export interface CoreOptions {
   socketFactory: SocketFactory;
   storage?: StorageLike | undefined;
   ui?: UiPort | undefined;
+  /**
+   * The page's address when the adapter starts: location.origin plus
+   * location.pathname in a browser. One approval covers one page (ADR 0011),
+   * so the resume token, grants, revokes and pause are kept under it, and
+   * hello names it. Any query or fragment is dropped.
+   */
+  pageUrl: string;
+  /** Read at every hello. */
   pageInfo: () => PageInfo;
   /** When getTools() entries carry a window, only those whose window is this one are shared. */
   ownWindow?: unknown;
@@ -298,10 +305,11 @@ const MAX_ERROR_CHARS = 2000;
 /** The smallest frame limit honoured from a relay, so a truncated result always fits. */
 const MIN_FRAME_BYTES = 4096;
 
-const RESUME_KEY_PREFIX = 'tabdock:resume:';
-const GRANTS_KEY_PREFIX = 'tabdock:grants:';
-const REVOKED_KEY_PREFIX = 'tabdock:revoked:';
-const PAUSED_KEY_PREFIX = 'tabdock:paused:';
+/** What the adapter keeps in the tab's storage, each for one relay and one page. */
+export type StoredRecord = 'resume' | 'grants' | 'revoked' | 'paused';
+
+const STORED_RECORDS: readonly StoredRecord[] = ['resume', 'grants', 'revoked', 'paused'];
+
 const LOCK_PREFIX = 'tabdock:';
 
 /**
@@ -512,6 +520,34 @@ function otherInputFormat(error: unknown, tried: InputFormat): InputFormat | nul
 
 type InputFormat = 'object' | 'string';
 
+/**
+ * The page an address names (ADR 0011): its origin and path. A query or
+ * fragment does not make another page, and can carry secrets that belong
+ * neither in storage keys nor in hello. Text that is not an absolute URL is
+ * cut at its first '?' or '#' instead, so it still names one page the same
+ * way every time.
+ */
+export function pageAddress(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return url.split(/[?#]/, 1)[0] ?? '';
+  }
+}
+
+/**
+ * Where one record is kept. sessionStorage is shared by every page of the
+ * origin in a tab, and one approval covers one page (ADR 0011), so each key
+ * names the relay and the page: another page of the site finds none of this
+ * page's records and starts its own session. The pair is written as JSON so
+ * no two pairs run together, and so no key can match an older adapter's,
+ * which named the relay URL alone.
+ */
+export function storageKey(record: StoredRecord, relayUrl: string, pageUrl: string): string {
+  return `tabdock:${record}:${JSON.stringify([relayUrl, pageAddress(pageUrl)])}`;
+}
+
 /** A relay URL the core can dial, or a TypeError: retrying a malformed URL forever helps nobody. */
 function checkRelayUrl(relayUrl: string): void {
   let protocol = '';
@@ -525,6 +561,22 @@ function checkRelayUrl(relayUrl: string): void {
   }
 }
 
+/**
+ * Removes what an adapter before ADR 0011 kept under the relay URL alone, for
+ * every page of the origin at once. None of it is read, as it may belong to
+ * another page; removing it keeps a stale token out of storage. A pause
+ * stored there goes too, since it may have been another page's.
+ */
+function forgetLegacyRecords(storage: StorageLike | undefined, relayUrl: string): void {
+  for (const record of STORED_RECORDS) {
+    try {
+      storage?.removeItem(`tabdock:${record}:${relayUrl}`);
+    } catch {
+      // Storage that throws holds nothing this page could read either.
+    }
+  }
+}
+
 export function createAdapterCore(options: CoreOptions): AdapterCore {
   checkRelayUrl(options.relayUrl);
   // A bad policy is a page bug; throwing here surfaces it at attach().
@@ -535,10 +587,18 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   const clock = options.clock ?? (() => Date.now());
   const timers = options.timers ?? defaultTimers;
   const random = options.random ?? Math.random;
-  const resumeKey = `${RESUME_KEY_PREFIX}${options.relayUrl}`;
-  const grantsKey = `${GRANTS_KEY_PREFIX}${options.relayUrl}`;
-  const revokedKey = `${REVOKED_KEY_PREFIX}${options.relayUrl}`;
-  const pausedKey = `${PAUSED_KEY_PREFIX}${options.relayUrl}`;
+  /**
+   * Fixed for the life of this core, like its storage keys: an app that
+   * changes its path without reloading is still one document with one
+   * operator, so it keeps its session (ADR 0011), and the relay, which
+   * resumes only a hello naming the same page, must hear the same address.
+   */
+  const address = pageAddress(options.pageUrl);
+  const resumeKey = storageKey('resume', options.relayUrl, options.pageUrl);
+  const grantsKey = storageKey('grants', options.relayUrl, options.pageUrl);
+  const revokedKey = storageKey('revoked', options.relayUrl, options.pageUrl);
+  const pausedKey = storageKey('paused', options.relayUrl, options.pageUrl);
+  forgetLegacyRecords(options.storage, options.relayUrl);
   const polyfillMarker: unknown = context && Reflect.get(context, POLYFILL_MARKER);
   /**
    * Under ADR 0001 a call that ends early aborts the signal it handed
@@ -882,7 +942,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       v: PROTOCOL_VERSION,
       ...(token === null ? {} : { resumeToken: token }),
       title: page.title.slice(0, 300),
-      url: page.url.slice(0, 2048),
+      url: address.slice(0, 2048),
       adapterVersion: options.adapterVersion.slice(0, 50),
       policy,
     });

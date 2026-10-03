@@ -19,6 +19,7 @@ import {
   type RelayFrame,
   RESUME_WINDOW_MS,
 } from '@tabdock/protocol';
+import { storageKey } from '@tabdock/adapter/core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 import { DEFAULT_SIM_ORIGIN, RUNTIME_PROFILES, startSimPage, type SimPage } from '../src/index.ts';
@@ -191,7 +192,7 @@ describe.each(RUNTIME_PROFILES)('the sim page as %s', (profile) => {
     const hello = await frameOf(connection, 'hello');
     expect(hello).toMatchObject({ v: 1, url: `${DEFAULT_SIM_ORIGIN}/`, title: 'Sim page' });
     expect(hello.resumeToken).toBeUndefined();
-    expect(sim.storage.getItem(`tabdock:resume:${relay.url}`)).toBe('token-1');
+    expect(sim.storage.getItem(storageKey('resume', relay.url, sim.url))).toBe('token-1');
 
     const tools = await frameOf(connection, 'tools');
     expect(tools.tools.map((tool) => tool.name)).toEqual([
@@ -321,8 +322,31 @@ describe('startSimPage', () => {
     expect(sim.context).not.toBe(firstContext);
     send(second, welcome('token-2', true));
     await sim.waitFor((state) => state.link === 'linked');
-    expect(sim.storage.getItem(`tabdock:resume:${relay.url}`)).toBe('token-2');
+    expect(sim.storage.getItem(storageKey('resume', relay.url, sim.url))).toBe('token-2');
     expect(sim.connections).toBe(2);
+  });
+
+  it("navigates like a browser: the next page has its own session, and going back finds the first page's", async () => {
+    const { relay, sim, connection } = await linked({ path: '/board' });
+    expect(sim.url).toBe(`${DEFAULT_SIM_ORIGIN}/board`);
+    await sim.navigate('/settings');
+    await vi.waitFor(() => {
+      expect(connection.closed?.code).toBe(1001);
+    });
+    expect(sim.url).toBe(`${DEFAULT_SIM_ORIGIN}/settings`);
+    const second = await relay.connection(1);
+    const hello = await frameOf(second, 'hello');
+    expect(hello.url).toBe(`${DEFAULT_SIM_ORIGIN}/settings`);
+    expect(hello.resumeToken).toBeUndefined();
+    send(second, welcome('token-2'));
+    await sim.waitFor((state) => state.link === 'linked');
+
+    await sim.navigate('/board');
+    const third = await relay.connection(2);
+    expect(await frameOf(third, 'hello')).toMatchObject({
+      url: `${DEFAULT_SIM_ORIGIN}/board`,
+      resumeToken: 'token-1',
+    });
   });
 
   it('detaches on close: CLOSE_DETACH and no token left behind', async () => {
@@ -331,7 +355,7 @@ describe('startSimPage', () => {
     await vi.waitFor(() => {
       expect(connection.closed?.code).toBe(CLOSE_DETACH);
     });
-    expect(sim.storage.getItem(`tabdock:resume:${relay.url}`)).toBeNull();
+    expect(sim.storage.getItem(storageKey('resume', relay.url, sim.url))).toBeNull();
     expect(sim.state.link).toBe('closed');
   });
 
