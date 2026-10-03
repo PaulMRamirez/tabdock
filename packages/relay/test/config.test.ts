@@ -160,11 +160,13 @@ describe('origin policy (S1, S2)', () => {
       pageSocketsPerAddress: 20,
       pageSessionsPerAddress: 20,
       pageSessions: 1000,
+      pairSessions: 200,
     });
     expect(rateLimits.callsPerUserPerPage).toBe(120);
     expect(timings.sessionIdleMs).toBe(30 * 60_000);
     expect(timings.attachmentIdleMs).toBe(8 * 60 * 60_000);
     expect(timings.sseKeepAliveMs).toBe(15_000);
+    expect(timings.pairSessionMs).toBe(15 * 60_000);
     expect(resolveConfig({ auth, limits: { usersPerPage: 3 } }).limits.usersPerPage).toBe(3);
     expect(() => resolveConfig({ auth, limits: { queueDepth: 0 } })).toThrow(/queueDepth/);
     expect(() => resolveConfig({ auth, limits: { sessions: 2.5 } })).toThrow(/sessions/);
@@ -270,6 +272,7 @@ describe('loadConfigFromEnv', () => {
       pageSocketsPerAddress: 3,
       pageSessionsPerAddress: 6,
       pageSessions: 30,
+      pairSessions: 200,
     });
     expect(config.rateLimits.callsPerUserPerPage).toBe(60);
     expect(config.timings.sessionIdleMs).toBe(10 * 60_000);

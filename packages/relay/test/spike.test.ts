@@ -14,9 +14,9 @@ import { resolveConfig } from '../src/config.ts';
 import { createLogger } from '../src/log.ts';
 import { Spike } from '../src/spike.ts';
 import {
-  type AuthPlugin,
   attachSpikeConsole,
   createDevTokenAuth,
+  createOAuthAuth,
   createRelay,
   loadConfigFromEnv,
   markerToolName,
@@ -24,6 +24,7 @@ import {
   SpikeTimingSchema,
 } from '../src/index.ts';
 import { connectPage, READ_TOOL, type TestPage, TOOLS } from './helpers/page-client.ts';
+import { PAIR_CLIENT } from './helpers/provider.ts';
 import {
   ALICE,
   BOB,
@@ -147,14 +148,16 @@ describe('the spike flag', () => {
   });
 
   it('works in public URL mode, which is where hosted Claude reaches it', () => {
-    const oauth: AuthPlugin = {
-      name: 'oauth',
+    // Construction alone fetches nothing; resolveConfig only reads the plugin's shape.
+    const oauth = createOAuthAuth({
+      issuer: 'https://idp.example',
       resource: 'https://relay.example/mcp',
-      authenticate: () => Promise.reject(new Error('not called')),
-    };
+      users: [{ sub: 'sub-alice', userId: 'alice', displayName: 'Alice' }],
+    });
     const config = resolveConfig({
       auth: oauth,
       publicUrl: 'https://relay.example',
+      pairClient: PAIR_CLIENT,
       allowedOrigins: ['http://localhost:5173'],
       spike: true,
     });
@@ -351,6 +354,12 @@ describe('what the spike logs', () => {
       .filter((line) => line.pageId === opened.pageId && line.userId === 'alice')
       .map((line) => line.stage);
     expect(stages).toEqual(['claimed', 'approved', 'first_call']);
+    // Timed from the welcome's ticket, the one the code came from, not from its replacement.
+    const milestones = spikeLines('spike: pairing milestone');
+    const welcomed = milestones.find((line) => line.stage === 'issued');
+    const claimed = milestones.find((line) => line.stage === 'claimed');
+    expect(welcomed?.trace).toMatch(/^tr_[0-9A-Z]{10}$/);
+    expect(claimed?.trace).toBe(welcomed?.trace);
     const first = spikeLines('spike: pairing milestone').find(
       (line) => line.stage === 'first_call',
     );
@@ -369,8 +378,8 @@ describe('what the spike logs', () => {
   });
 });
 
-describe('the QR pairing milestones the /pair phase will report', () => {
-  it('time a scan through claim and approval to the first call', async () => {
+describe('the pairing milestones, which /pair reports through the hub', () => {
+  it('time a scan through claim and approval to the first call, under one trace per ticket', async () => {
     const lines: string[] = [];
     const spike = new Spike(
       createLogger({ sink: (line) => lines.push(line), level: 'debug' }),
@@ -379,7 +388,11 @@ describe('the QR pairing milestones the /pair phase will report', () => {
     spike.pairingIssued('pg_page');
     spike.pairingScanned('pg_page');
     await new Promise((resolve) => setTimeout(resolve, 20));
+    // The page looks again after sign-in; that is no second scan.
+    spike.pairingScanned('pg_page');
     spike.pairingClaimed('pg_page', 'alice', 'qr');
+    // The hub replaces the spent ticket after the claim; the claim keeps the old one's trace.
+    spike.pairingIssued('pg_page');
     spike.pairingDecided('pg_page', 'alice', true);
     // Someone else's call, and a call before any approval, are not this pairing's first call.
     spike.callFinished('pg_page', 'bob', 'ok');
@@ -392,20 +405,38 @@ describe('the QR pairing milestones the /pair phase will report', () => {
       'issued',
       'scanned',
       'claimed',
+      'issued',
       'approved',
       'first_call',
     ]);
-    const first = stages[4];
+    const trace = stages[0]?.trace;
+    expect(trace).toMatch(/^tr_[0-9A-Z]{10}$/);
+    expect(stages.filter((line) => line.trace === trace).map((line) => line.stage)).toEqual([
+      'issued',
+      'scanned',
+      'claimed',
+      'approved',
+      'first_call',
+    ]);
+    expect(stages[3]?.trace).not.toBe(trace);
+    const first = stages[5];
     expect(first).toMatchObject({ via: 'qr', userId: 'alice', outcome: 'ok' });
     expect(first?.sinceScannedMs).toBeGreaterThanOrEqual(20);
-    expect(typeof first?.sinceIssuedMs).toBe('number');
+    expect(first?.sinceIssuedMs).toBeGreaterThanOrEqual(20);
 
-    // A refusal closes the record, so a later call is no first call either.
+    // A code claim is timed from the ticket that matched, and a scan of an earlier ticket is not its scan.
+    spike.pairingScanned('pg_page');
+    await new Promise((resolve) => setTimeout(resolve, 20));
     spike.pairingClaimed('pg_page', 'carol', 'code');
+    // A refusal closes the record, so a later call is no first call either.
     spike.pairingDecided('pg_page', 'carol', false);
     spike.callFinished('pg_page', 'carol', 'not_attached');
     const after = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
     expect(after.filter((line) => line.stage === 'first_call')).toHaveLength(1);
+    const carol = after.filter((line) => line.userId === 'carol');
+    expect(carol.map((line) => line.stage)).toEqual(['claimed', 'refused']);
+    expect(carol[0]).toMatchObject({ via: 'code', trace: stages[3]?.trace, sinceScannedMs: null });
+    expect(carol[0]?.sinceIssuedMs).toBeGreaterThanOrEqual(20);
     expect(after.at(-1)).toMatchObject({ stage: 'refused', via: 'code' });
   });
 });

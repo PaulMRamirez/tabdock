@@ -14,11 +14,13 @@ pnpm test        # unit tests, no browser needed
 pnpm lint
 pnpm typecheck
 pnpm dev         # relay and demo board together; needs TABDOCK_DEV_TOKENS in .env (see .env.example)
+pnpm dev:public  # the same in public URL mode for Claude on a phone; prints the connector URL and provider settings
 pnpm dev:demo    # the demo board alone at http://127.0.0.1:5173/
 pnpm test:e2e    # browser tests (fetches Chromium on first run)
 pnpm demo:m0     # the M0 baseline through MCP-B's local relay, narrated
 pnpm demo:m1     # an MCP client pairs with the demo board through the Tabdock relay, narrated
 pnpm demo:m2     # two users and three clients share the board: roles, the write queue, revoke
+pnpm demo:m3     # sign-in, pairing by code and by the widget's QR code from a phone-sized browser, all local
 ```
 
 ## Layout

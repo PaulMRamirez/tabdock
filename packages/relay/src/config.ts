@@ -2,9 +2,10 @@
 // before anything listens: loopback only until TLS arrives in M4 (S12), and an
 // explicit origin allowlist in production (S2). Public URL mode (ADR 0014) puts
 // an https address in front of the loopback relay through a tunnel: it brings
-// production rules, and only OAuth sign-in for that address. The section 9
-// limits and the session and attachment lifetimes follow ADR 0009. The M3
-// spike's measurement flag (ADR 0014) is refused in production.
+// production rules, only OAuth sign-in for that address, and the QR sign-in at
+// /pair, which needs a client of its own at the provider. The section 9 limits
+// and the session and attachment lifetimes follow ADR 0009. The M3 spike's
+// measurement flag (ADR 0014) is refused in production.
 
 import {
   ATTACH_REQUEST_TTL_MS,
@@ -51,13 +52,21 @@ export interface RelayTimings {
    * waits at most about twice this for its check.
    */
   argumentCheckMs: number;
+  /** How long a browser stays signed in at /pair, counted from sign-in. */
+  pairSessionMs: number;
 }
 
 export interface RelayRateLimits {
-  /** pair_page attempts one user may make per window. */
+  /** Pairing attempts one user may make per window: pair_page and QR claims together (S3). */
   pairAttemptsPerUser: number;
-  /** pair_page attempts one client address may make per window, across users. */
-  pairAttemptsPerAddress: number;
+  /**
+   * Pairings one page may receive per window, counted when a live code or QR
+   * nonce of that page is used, whoever uses it. Never per address: behind a
+   * tunnel every caller shares one (ADR 0016).
+   */
+  pairAttemptsPerPage: number;
+  /** Times one QR nonce may be looked at through /pair/preview per window; a preview uses nothing up. */
+  pairPreviewsPerNonce: number;
   /** call_page_tool calls one user may make to one page per window (S9). */
   callsPerUserPerPage: number;
   /** The window every limit above counts over. */
@@ -105,6 +114,17 @@ export interface RelayLimits {
    * open at once, and the most gone pages remembered for page_gone.
    */
   pageSessions: number;
+  /**
+   * Browser sessions signed in at /pair held at once. Past it a new sign-in
+   * ends the oldest session of an account that is not a member first.
+   */
+  pairSessions: number;
+}
+
+/** The relay's own client at the identity provider, for the browser sign-in at /pair. */
+export interface PairClientOptions {
+  clientId: string;
+  clientSecret: string;
 }
 
 export interface RelayOptions {
@@ -131,6 +151,12 @@ export interface RelayOptions {
    * oauth plugin for that resource, and /page refuses anything not local.
    */
   publicUrl?: string | undefined;
+  /**
+   * The client the QR page at /pair signs browsers in with, registered at the
+   * provider with `<publicUrl>/pair/callback` as its redirect URI. Required in
+   * public URL mode, refused without it.
+   */
+  pairClient?: PairClientOptions | undefined;
   timings?: { [K in keyof RelayTimings]?: number | undefined } | undefined;
   rateLimits?: { [K in keyof RelayRateLimits]?: number | undefined } | undefined;
   limits?: { [K in keyof RelayLimits]?: number | undefined } | undefined;
@@ -160,6 +186,8 @@ export const ATTACHMENT_IDLE_MS = 8 * 60 * 60_000;
 export const SSE_KEEP_ALIVE_MS = 15_000;
 /** ADR 0010: an ordinary check takes a millisecond or two, and a stall this short goes unnoticed. */
 export const ARGUMENT_CHECK_MS = 50;
+/** Long enough to sign in and scan a few codes, short enough that a forgotten phone is soon signed out. */
+export const PAIR_SESSION_MS = 15 * 60_000;
 /**
  * The longest delay setTimeout honours. Node runs a longer one after 1 ms
  * instead, which would expire every attachment at once.
@@ -181,11 +209,13 @@ export const DEFAULT_TIMINGS: RelayTimings = {
   attachmentIdleMs: ATTACHMENT_IDLE_MS,
   sseKeepAliveMs: SSE_KEEP_ALIVE_MS,
   argumentCheckMs: ARGUMENT_CHECK_MS,
+  pairSessionMs: PAIR_SESSION_MS,
 };
 
 export const DEFAULT_RATE_LIMITS: RelayRateLimits = {
   pairAttemptsPerUser: 10,
-  pairAttemptsPerAddress: 30,
+  pairAttemptsPerPage: 30,
+  pairPreviewsPerNonce: 30,
   callsPerUserPerPage: 120,
   windowMs: 60_000,
   toolsFramesPerSocket: 10,
@@ -201,6 +231,7 @@ export const DEFAULT_LIMITS: RelayLimits = {
   pageSocketsPerAddress: 20,
   pageSessionsPerAddress: 20,
   pageSessions: 1000,
+  pairSessions: 200,
 };
 
 /** What a header-less page socket is recorded as when the dev flag lets it in. */
@@ -288,6 +319,32 @@ export function publicMcpUrlOf(publicOrigin: string): string {
   return new URL('/mcp', publicOrigin).href;
 }
 
+/** Where the provider sends a browser back to after sign-in at /pair. */
+export function pairRedirectUriOf(publicOrigin: string): string {
+  return new URL('/pair/callback', publicOrigin).href;
+}
+
+/** OAuth client ids and secrets are opaque but printable (RFC 6749 appendix A); no spaces, so .env trimming cannot change one. */
+const CLIENT_ID = /^[\x21-\x7e]{1,255}$/;
+const CLIENT_SECRET = /^[\x21-\x7e]{1,1024}$/;
+
+/**
+ * The /pair client settings, checked without ever echoing them: the secret
+ * belongs in .env, and an id typed into the wrong variable may be one too.
+ */
+function checkPairClient(pairClient: PairClientOptions): void {
+  if (!CLIENT_ID.test(pairClient.clientId)) {
+    throw new Error(
+      'the /pair client id (TABDOCK_PAIR_CLIENT_ID) must be 1 to 255 printable characters without spaces',
+    );
+  }
+  if (!CLIENT_SECRET.test(pairClient.clientSecret)) {
+    throw new Error(
+      'the /pair client secret (TABDOCK_PAIR_CLIENT_SECRET) must be 1 to 1024 printable characters without spaces',
+    );
+  }
+}
+
 export function resolveConfig(options: RelayOptions): ResolvedConfig {
   const env = options.env ?? 'development';
   // Checked at run time too: JavaScript callers and env parsing can pass anything.
@@ -370,6 +427,27 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     }
     isOriginAllowed = (origin) => allowed.has(origin);
     originPolicy = [...allowed].join(', ');
+  }
+
+  // The QR page signs phones in at the same provider as the plugin, with a
+  // client of the relay's own, so both are needed in public URL mode and the
+  // client means nothing without it.
+  if (publicUrl !== null) {
+    if (options.auth.browserSignIn === undefined) {
+      throw new Error(
+        `public URL mode serves the QR sign-in at /pair, and the ${options.auth.name} plugin cannot sign a browser in`,
+      );
+    }
+    if (options.pairClient === undefined) {
+      throw new Error(
+        `public URL mode needs the /pair sign-in client (TABDOCK_PAIR_CLIENT_ID and TABDOCK_PAIR_CLIENT_SECRET), registered at the provider with ${pairRedirectUriOf(publicUrl)} as its redirect URI`,
+      );
+    }
+    checkPairClient(options.pairClient);
+  } else if (options.pairClient !== undefined) {
+    throw new Error(
+      'the /pair sign-in client (TABDOCK_PAIR_CLIENT_ID and TABDOCK_PAIR_CLIENT_SECRET) needs public URL mode (TABDOCK_PUBLIC_URL)',
+    );
   }
 
   // Every timing ends up in a setTimeout, so it must fit one.
@@ -457,10 +535,16 @@ function parseMinutes(name: string, value: string | undefined): number | undefin
  * M1. The OAuth settings alone mean nothing, since tokens are issued for the
  * public URL, so they are refused rather than silently unused.
  */
-function authFromEnv(env: NodeJS.ProcessEnv): { auth: AuthPlugin; publicUrl?: string } {
+function authFromEnv(env: NodeJS.ProcessEnv): {
+  auth: AuthPlugin;
+  publicUrl?: string;
+  pairClient?: PairClientOptions;
+} {
   const publicText = env.TABDOCK_PUBLIC_URL?.trim() ?? '';
   const issuer = env.TABDOCK_OAUTH_ISSUER?.trim() ?? '';
   const oauthUsers = env.TABDOCK_OAUTH_USERS?.trim() ?? '';
+  const pairClientId = env.TABDOCK_PAIR_CLIENT_ID?.trim() ?? '';
+  const pairClientSecret = env.TABDOCK_PAIR_CLIENT_SECRET?.trim() ?? '';
   if (publicText !== '') {
     if (issuer === '' || oauthUsers === '') {
       throw new Error(
@@ -468,18 +552,30 @@ function authFromEnv(env: NodeJS.ProcessEnv): { auth: AuthPlugin; publicUrl?: st
       );
     }
     const publicUrl = parsePublicUrl(publicText);
+    const auth = createOAuthAuth({
+      issuer,
+      resource: publicMcpUrlOf(publicUrl),
+      users: parseOAuthUsers(oauthUsers),
+    });
+    if (pairClientId === '' || pairClientSecret === '') {
+      throw new Error(
+        'TABDOCK_PUBLIC_URL needs TABDOCK_PAIR_CLIENT_ID and TABDOCK_PAIR_CLIENT_SECRET: the client the QR page at /pair signs phones in with',
+      );
+    }
     return {
-      auth: createOAuthAuth({
-        issuer,
-        resource: publicMcpUrlOf(publicUrl),
-        users: parseOAuthUsers(oauthUsers),
-      }),
+      auth,
       publicUrl,
+      pairClient: { clientId: pairClientId, clientSecret: pairClientSecret },
     };
   }
   if (issuer !== '' || oauthUsers !== '') {
     throw new Error(
       'TABDOCK_OAUTH_ISSUER and TABDOCK_OAUTH_USERS work only with TABDOCK_PUBLIC_URL, the https address tokens are issued for (ADR 0014)',
+    );
+  }
+  if (pairClientId !== '' || pairClientSecret !== '') {
+    throw new Error(
+      'TABDOCK_PAIR_CLIENT_ID and TABDOCK_PAIR_CLIENT_SECRET work only with TABDOCK_PUBLIC_URL, where the QR page signs phones in',
     );
   }
   const tokens = env.TABDOCK_DEV_TOKENS?.trim() ?? '';
@@ -521,12 +617,13 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv): RelayOptions {
           .map((entry) => entry.trim())
           .filter((entry) => entry.length > 0);
 
-  const { auth, publicUrl } = authFromEnv(env);
+  const { auth, publicUrl, pairClient } = authFromEnv(env);
 
   const host = env.TABDOCK_HOST?.trim();
   return {
     auth,
     publicUrl,
+    pairClient,
     host: host === undefined || host === '' ? undefined : host,
     port,
     env: envName === '' ? 'development' : envName,

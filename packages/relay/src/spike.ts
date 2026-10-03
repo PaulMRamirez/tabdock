@@ -17,10 +17,13 @@
 // 3. Timestamps for each call_page_tool (request in, invoke out, result in,
 //    response out), in the result's _meta and in a log line, so a client can
 //    split its round trip into tunnel-and-client and page.
-// 4. Pairing milestones (ticket or nonce issued, QR scanned, claimed,
-//    decided, first call), for the time from scan to first call. The /pair
-//    routes call pairingScanned and pairingClaimed(..., 'qr'); the hub calls
-//    the rest.
+// 4. Pairing milestones (ticket issued, QR scanned, claimed, decided, first
+//    call), for the time from scan to first call. The hub calls every hook,
+//    pairingScanned from the /pair preview and pairingClaimed(..., 'qr')
+//    from the /pair claim among them. These lines are the only record of
+//    those times: each carries a trace id the spike draws for the ticket
+//    (tr_...), random and unrelated to the code or nonce, so one pairing can
+//    be followed through the log without a secret in it.
 //
 // Nothing here logs a token, a pairing code, a nonce or a session id; the
 // logger redacts those field names anyway (log.ts).
@@ -39,6 +42,7 @@ import type { ClientInfo } from '@tabdock/protocol';
 import { z } from 'zod';
 import type { Logger } from './log.ts';
 import { parseClientInfo } from './mcp.ts';
+import { newId } from './secrets.ts';
 import { trackBody } from './sessions.ts';
 
 /** The marker's name, numbered so a client showing an old list is told apart from one showing the new. */
@@ -99,15 +103,17 @@ export type PairingVia = 'code' | 'qr';
 
 /**
  * The hub's side of the spike: pairing milestones, and the end of each call.
- * The hub calls pairingIssued with every ticket, pairingClaimed for a code,
- * pairingDecided and callFinished. The /pair phase calls pairingScanned from
- * its preview and pairingClaimed(..., 'qr') from its claim, which is all the
- * scan-to-first-call figure still needs.
+ * A page has one live ticket at a time (its code and, in public URL mode, the
+ * QR nonce beside it), so the page id names the ticket.
  */
 export interface SpikeHooks {
+  /** A new ticket replaced the page's last one. */
   pairingIssued(pageId: string): void;
+  /** /pair previewed the page's live nonce; only the first look is the scan. */
   pairingScanned(pageId: string): void;
+  /** A live code or nonce matched, called before the hub spends and replaces it. */
   pairingClaimed(pageId: string, userId: string, via: PairingVia): void;
+  /** The claim ended in an attachment (approved, let in, or already attached) or a refusal. */
   pairingDecided(pageId: string, userId: string, allowed: boolean): void;
   callFinished(pageId: string, userId: string, outcome: string): void;
 }
@@ -128,7 +134,15 @@ interface SessionLabel {
   userId: string;
 }
 
+/** A page's live ticket, as the spike saw it. */
+interface IssuedTicket {
+  trace: string;
+  issuedAt: number;
+  scannedAt: number | null;
+}
+
 interface PendingPairing {
+  trace: string;
   via: PairingVia;
   issuedAt: number | null;
   scannedAt: number | null;
@@ -207,8 +221,8 @@ export class Spike implements SpikeControl, SpikeHooks {
   /** Session id to its label; the id itself is never logged. */
   readonly #sessions = new Map<string, SessionLabel>();
   #nextSession = 1;
-  readonly #issued = new Map<string, number>();
-  readonly #scanned = new Map<string, number>();
+  /** Each page's live ticket, by page id. */
+  readonly #tickets = new Map<string, IssuedTicket>();
   readonly #pairings = new Map<string, PendingPairing>();
 
   constructor(log: Logger, maxBodyBytes: number) {
@@ -429,32 +443,47 @@ export class Spike implements SpikeControl, SpikeHooks {
 
   // 4. Pairing milestones
 
-  /** A ticket was issued: a pairing code, and from the /pair phase its QR nonce with it. */
+  /** A ticket was issued: a pairing code, and in public URL mode its QR nonce with it. */
   pairingIssued(pageId: string): void {
-    this.#issued.set(pageId, Date.now());
-    bound(this.#issued);
-    this.#log.debug('spike: pairing milestone', { stage: 'issued', pageId });
+    const trace = newId('tr');
+    // Delete first so a page's re-issued ticket moves to the newest end for bound().
+    this.#tickets.delete(pageId);
+    this.#tickets.set(pageId, { trace, issuedAt: Date.now(), scannedAt: null });
+    bound(this.#tickets);
+    this.#log.debug('spike: pairing milestone', { stage: 'issued', pageId, trace });
   }
 
-  /** The /pair preview: a phone opened the QR URL for this page. Called by the /pair routes. */
+  /**
+   * The /pair preview: a phone opened the QR URL for this page's live ticket.
+   * The page previews again after sign-in; only the first look is the scan.
+   */
   pairingScanned(pageId: string): void {
+    const ticket = this.#tickets.get(pageId);
+    if (ticket === undefined || ticket.scannedAt !== null) return;
     const now = Date.now();
-    this.#scanned.set(pageId, now);
-    bound(this.#scanned);
+    ticket.scannedAt = now;
     this.#log.info('spike: pairing milestone', {
       stage: 'scanned',
       pageId,
-      sinceIssuedMs: since(this.#issued.get(pageId), now),
+      trace: ticket.trace,
+      sinceIssuedMs: since(ticket.issuedAt, now),
     });
   }
 
-  /** pair_page matched a code, or /pair/claim consumed a nonce. */
+  /** pair_page matched a code, or /pair/claim consumed a nonce; the ticket is spent. */
   pairingClaimed(pageId: string, userId: string, via: PairingVia): void {
     const now = Date.now();
     this.#prune(now);
-    const issuedAt = this.#issued.get(pageId) ?? null;
-    const scannedAt = via === 'qr' ? (this.#scanned.get(pageId) ?? null) : null;
+    const ticket = this.#tickets.get(pageId);
+    this.#tickets.delete(pageId);
+    const issuedAt = ticket?.issuedAt ?? null;
+    // A scan belongs to a QR claim; someone who looked and then typed the code did not scan to pair.
+    const scannedAt = via === 'qr' ? (ticket?.scannedAt ?? null) : null;
+    const trace = ticket?.trace ?? newId('tr');
+    // A second claim by the same person (another device, or a retry) is the one timed from here.
+    this.#pairings.delete(`${pageId} ${userId}`);
     this.#pairings.set(`${pageId} ${userId}`, {
+      trace,
       via,
       issuedAt,
       scannedAt,
@@ -467,6 +496,7 @@ export class Spike implements SpikeControl, SpikeHooks {
       pageId,
       userId,
       via,
+      trace,
       sinceIssuedMs: since(issuedAt, now),
       sinceScannedMs: since(scannedAt, now),
     });
@@ -482,6 +512,7 @@ export class Spike implements SpikeControl, SpikeHooks {
       pageId,
       userId,
       via: pending.via,
+      trace: pending.trace,
       sinceClaimedMs: since(pending.claimedAt, now),
       sinceScannedMs: since(pending.scannedAt, now),
     });
@@ -501,6 +532,7 @@ export class Spike implements SpikeControl, SpikeHooks {
       pageId,
       userId,
       via: pending.via,
+      trace: pending.trace,
       outcome,
       sinceApprovedMs: since(pending.approvedAt, now),
       sinceClaimedMs: since(pending.claimedAt, now),

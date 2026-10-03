@@ -28,11 +28,13 @@ export const SPIKE_CLIENT = { name: 'tabdock-spike-latency', version: '0.0.0' };
 export interface ConnectOptions {
   /** Speak MCP 2026-07-28 instead of the 2025 revision the SDK negotiates by default. */
   modern?: boolean;
+  /** The name and version the client gives the relay; the latency spike's own by default. */
+  client?: { name: string; version: string };
 }
 
 function newClient(options: ConnectOptions): Client {
   return new Client(
-    SPIKE_CLIENT,
+    options.client ?? SPIKE_CLIENT,
     options.modern ? { versionNegotiation: { mode: { pin: '2026-07-28' } } } : {},
   );
 }
@@ -61,6 +63,12 @@ export interface OAuthOptions extends ConnectOptions {
    * this loopback redirect. Without it the SDK registers one dynamically.
    */
   clientId?: string;
+  /**
+   * The issuer of the provider that knows clientId. The SDK then sends that
+   * client id to this provider only (its SEP-2352 issuer stamp); without it
+   * the SDK warns once and binds the id to the first provider it meets.
+   */
+  clientIssuer?: string;
   /** How long to wait for the browser to come back, 5 minutes by default. */
   timeoutMs?: number;
   /** Stands in for fetch, so a test can play the tunnel. */
@@ -91,9 +99,7 @@ class LoopbackCallback {
         'Referrer-Policy': 'no-referrer',
       });
       response.end(
-        ok
-          ? 'Signed in for the Tabdock latency spike. You can close this tab.'
-          : 'Not a sign-in callback.',
+        ok ? 'Signed in to the Tabdock relay. You can close this tab.' : 'Not a sign-in callback.',
       );
       if (ok) this.#settle?.(url.searchParams);
     });
@@ -136,11 +142,17 @@ class SpikeOAuthProvider implements OAuthClientProvider {
     callback: LoopbackCallback,
     show: (url: URL) => void,
     clientId: string | undefined,
+    clientIssuer: string | undefined,
   ) {
     this.#redirect = redirect;
     this.#callback = callback;
     this.#show = show;
-    if (clientId !== undefined) this.#client = { client_id: clientId };
+    if (clientId !== undefined) {
+      this.#client = {
+        client_id: clientId,
+        ...(clientIssuer === undefined ? {} : { issuer: clientIssuer }),
+      };
+    }
   }
 
   get redirectUrl(): string {
@@ -214,6 +226,7 @@ export async function connectWithOAuth(url: string, options: OAuthOptions): Prom
       callback,
       options.showSignIn,
       options.clientId,
+      options.clientIssuer,
     );
     const transport = (): StreamableHTTPClientTransport =>
       new StreamableHTTPClientTransport(new URL(url), {

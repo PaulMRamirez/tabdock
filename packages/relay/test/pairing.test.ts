@@ -372,9 +372,9 @@ describe('pair_page (A1.4, S3, S4)', () => {
   });
 });
 
-describe('pairing rate limits (S3)', () => {
+describe('pairing rate limits (S3, ADR 0016)', () => {
   it('limit attempts per user', async () => {
-    await setup({ rateLimits: { pairAttemptsPerUser: 3, pairAttemptsPerAddress: 100 } });
+    await setup({ rateLimits: { pairAttemptsPerUser: 3, pairAttemptsPerPage: 100 } });
     const opened = await page({ policy: { autoApprove: 'observer' } });
     const alice = await client();
     for (let i = 0; i < 3; i += 1) {
@@ -390,16 +390,52 @@ describe('pairing rate limits (S3)', () => {
     );
   });
 
-  it('limit attempts per client address across users', async () => {
-    await setup({ rateLimits: { pairAttemptsPerUser: 100, pairAttemptsPerAddress: 4 } });
+  it('never count by address: one user flooding from the shared address locks out no one else', async () => {
+    // Every client here comes from 127.0.0.1, as every caller behind a tunnel
+    // comes from the tunnel's address. Alice spends her own budget and more.
+    await setup({ rateLimits: { pairAttemptsPerUser: 3 } });
+    const opened = await page({ policy: { autoApprove: 'observer' } });
     const alice = await client();
-    const bob = await client(BOB);
-    for (const who of [alice, alice, bob, bob]) {
-      expect((await callTool(who, 'pair_page', { code: 'ZZZZZ-ZZZZZ' })).text).toBe(EXPIRED);
+    for (let i = 0; i < 20; i += 1) {
+      await callTool(alice, 'pair_page', { code: 'ZZZZZ-ZZZZZ' });
     }
-    expect(
-      (await callTool(await client(CAROL), 'pair_page', { code: 'ZZZZZ-ZZZZZ' })).text,
-    ).toMatch(/^rate_limited: /);
+    expect((await callTool(alice, 'pair_page', { code: opened.code })).text).toMatch(
+      /^rate_limited: /,
+    );
+    // Bob and Carol, from the very same address, are untouched by it.
+    const bob = await client(BOB);
+    expect((await callTool(bob, 'pair_page', { code: 'ZZZZZ-ZZZZZ' })).text).toBe(EXPIRED);
+    expect((await callTool(bob, 'pair_page', { code: opened.code })).isError).toBe(false);
+    expect((await callTool(await client(CAROL), 'pair_page', { code: opened.code })).isError).toBe(
+      false,
+    );
+  });
+
+  it('limit pairings that land on one page, whoever sends them, and spend the code anyway', async () => {
+    await setup({ rateLimits: { pairAttemptsPerUser: 100, pairAttemptsPerPage: 2 } });
+    const opened = await page({ policy: { autoApprove: 'observer' } });
+    const other = await page({ policy: { autoApprove: 'observer' } });
+    // Wrong codes name no page, so they count only against their sender.
+    const carol = await client(CAROL);
+    for (let i = 0; i < 5; i += 1) {
+      expect((await callTool(carol, 'pair_page', { code: 'ZZZZZ-ZZZZZ' })).text).toBe(EXPIRED);
+    }
+    expect((await callTool(await client(), 'pair_page', { code: opened.code })).isError).toBe(
+      false,
+    );
+    expect((await callTool(await client(BOB), 'pair_page', { code: opened.code })).isError).toBe(
+      false,
+    );
+    const spent = opened.code;
+    expect(await callTool(carol, 'pair_page', { code: spent })).toMatchObject({
+      isError: true,
+      text: 'rate_limited: too many pairing attempts on this page; wait a minute and try again',
+    });
+    // The refused code was still used up, and the page shows a fresh one.
+    await opened.sync();
+    expect(opened.code).not.toBe(spent);
+    // Another page keeps its own count.
+    expect((await callTool(carol, 'pair_page', { code: other.code })).isError).toBe(false);
   });
 
   it('let attempts through again once the window has passed', async () => {

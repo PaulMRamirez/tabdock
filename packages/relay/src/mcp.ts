@@ -33,11 +33,14 @@ import type { Spike } from './spike.ts';
 export const RELAY_NAME = 'tabdock-relay';
 export const RELAY_VERSION = '0.0.0';
 
-/** What the HTTP layer puts in authInfo.extra. The token itself is never carried along. */
+/**
+ * What the HTTP layer puts in authInfo.extra. The token itself is never
+ * carried along, and neither is the peer address: behind a tunnel every
+ * caller shares one, so nothing on /mcp may count by it (ADR 0016).
+ */
 export const AuthExtraSchema = z.object({
   userId: IdSchema,
   displayName: z.string().min(1).max(100),
-  clientAddress: z.string().max(100),
 });
 export type AuthExtra = z.infer<typeof AuthExtraSchema>;
 
@@ -197,7 +200,6 @@ function identityFrom(authInfo: AuthInfo | undefined): Omit<CallerIdentity, 'cli
   return {
     userId: extra.data.userId,
     displayName: extra.data.displayName,
-    address: extra.data.clientAddress,
   };
 }
 
