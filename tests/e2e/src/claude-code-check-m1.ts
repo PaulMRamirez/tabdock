@@ -18,6 +18,7 @@ import {
   activityStrip,
   approveThroughHandle,
   dockState,
+  maskCode,
   startTabdock,
   waitForLink,
 } from './tabdock-harness.ts';
@@ -33,12 +34,15 @@ const tabdock = await startTabdock();
 let browser: Browser | undefined;
 const dir = await mkdtemp(join(tmpdir(), 'tabdock-a12-'));
 const operator = { stop: false, approved: [] as string[] };
+/** The code in the prompt; Claude's answer or a CLI error could repeat it, so printed text masks it. */
+let promptCode: string | null = null;
 try {
   browser = await launchChromium(true);
   const page = await browser.newPage();
   await page.goto(tabdock.pageUrl);
   await page.waitForSelector('html[data-tools="ready"]');
   const { pageId, code } = await waitForLink(page);
+  promptCode = code;
 
   const configPath = join(dir, 'mcp.json');
   await writeFile(
@@ -92,7 +96,7 @@ try {
 
   const parsed = JSON.parse(output) as { result?: string; num_turns?: number; is_error?: boolean };
   console.log(
-    `\nClaude Code answered (${String(parsed.num_turns)} turns):\n${parsed.result ?? output}\n`,
+    `\nClaude Code answered (${String(parsed.num_turns)} turns):\n${mask(parsed.result ?? output)}\n`,
   );
 
   console.log(`The operator loop approved ${String(operator.approved.length)} attach request(s).`);
@@ -128,7 +132,7 @@ try {
   );
   process.exitCode = passed && parsed.is_error !== true ? 0 : 1;
 } catch (error) {
-  console.log(`A1.2 FAIL: ${error instanceof Error ? error.message : String(error)}`);
+  console.log(`A1.2 FAIL: ${mask(error instanceof Error ? error.message : String(error))}`);
   process.exitCode = 1;
 } finally {
   operator.stop = true;
@@ -168,4 +172,8 @@ function run(cwd: string, command: string, args: string[]): Promise<string> {
       else reject(new Error(`${command} exited with ${String(code)}: ${stdout.slice(0, 500)}`));
     });
   });
+}
+
+function mask(text: string): string {
+  return promptCode === null ? text : text.split(promptCode).join(maskCode(promptCode));
 }

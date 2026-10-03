@@ -12,6 +12,7 @@
     "typecheck": "tsc -p tsconfig.json",
     "check:claude-code": "node src/claude-code-check.ts",
     "check:claude-code:m1": "node src/claude-code-check-m1.ts",
+    "check:claude-code:m2": "node src/claude-code-check-m2.ts",
     "demo:m1": "node src/demo-m1.ts",
     "demo:m2": "node src/demo-m2.ts"
   },
