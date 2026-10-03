@@ -1,7 +1,7 @@
-// Shared setup for M1 in a real browser: the Tabdock relay on a free port with
-// throwaway dev tokens, the demo page served beside it and opened with
-// ?relay and ?e2e, and MCP clients from the official SDK with a bearer header.
-// The Playwright specs, pnpm demo:m1 and the Claude Code check all use it.
+// Shared setup for Tabdock in a real browser: the relay on a free port with
+// throwaway dev tokens, the demo page served beside it and opened with ?relay
+// and ?e2e, and MCP clients from the official SDK with a bearer header. The
+// Playwright specs, the milestone demos and the Claude Code checks all use it.
 
 import { randomBytes } from 'node:crypto';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
@@ -13,6 +13,7 @@ import {
   createDevTokenAuth,
   createRelay,
   type DevTokenUser,
+  type LogLevel,
   type LogSink,
   type Relay,
   type RelayOptions,
@@ -43,6 +44,8 @@ export async function startTabdock(
   options: {
     demo?: DemoServer;
     logSink?: LogSink;
+    /** info unless set; debug adds the relay's queue lines ('call queued'), which ordering checks read. */
+    logLevel?: LogLevel;
     timings?: RelayOptions['timings'];
   } = {},
 ): Promise<Tabdock> {
@@ -56,6 +59,7 @@ export async function startTabdock(
       // A real browser always sends Origin; the dev default allows 127.0.0.1 at any port.
       allowMissingOrigin: false,
       logSink: options.logSink ?? (() => undefined),
+      logLevel: options.logLevel,
       timings: options.timings,
     });
   } catch (error) {
@@ -83,8 +87,9 @@ export function demoPageUrl(demoUrl: string, relayPageUrl: string, e2e = true): 
 
 /**
  * modern pins MCP revision 2026-07-28, whose requests name the client every
- * time, so the relay can attribute calls to it; by default the SDK speaks the
- * 2025 revision statelessly and the relay records the user only (ADR 0005).
+ * time; by default the SDK speaks a 2025 revision, which the relay serves on
+ * its sessionful leg and names from the client's initialize (ADR 0009). Either
+ * way the roster and the audit name the client.
  */
 export async function connectMcp(
   relay: Relay,
@@ -380,6 +385,50 @@ export async function widgetText(page: Page, role: string): Promise<string | nul
   } finally {
     await cdp.detach();
   }
+}
+
+/** One entry of a widget list as the operator sees it: its text, and its data-* attributes for telling entries apart. */
+export interface WidgetItem {
+  text: string;
+  data: Record<string, string>;
+}
+
+function isWidgetItem(value: unknown): value is WidgetItem {
+  if (typeof value !== 'object' || value === null) return false;
+  const { text, data } = value as { text?: unknown; data?: unknown };
+  return (
+    typeof text === 'string' &&
+    typeof data === 'object' &&
+    data !== null &&
+    Object.values(data).every((entry) => typeof entry === 'string')
+  );
+}
+
+/**
+ * The entries of the widget list with this data-role, in screen order, read
+ * through the DevTools protocol: 'roster' gives one row per user (data.userId),
+ * 'activity' one line per call, newest first (data.activityId, data.outcome).
+ * Empty while the list is not in the widget.
+ */
+export async function widgetItems(page: Page, role: string): Promise<WidgetItem[]> {
+  return withCdp(page, async (cdp) => {
+    const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
+    const node = findNode(root, (n) => attribute(n, 'data-role') === role);
+    if (!node) return [];
+    const { object } = await cdp.send('DOM.resolveNode', { backendNodeId: node.backendNodeId });
+    if (object.objectId === undefined) return [];
+    const { result } = await cdp.send('Runtime.callFunctionOn', {
+      objectId: object.objectId,
+      functionDeclaration:
+        'function () { return Array.from(this.children, (child) => ({ text: child.textContent, data: Object.assign({}, child.dataset) })); }',
+      returnByValue: true,
+    });
+    const value: unknown = result.value;
+    if (!Array.isArray(value) || !value.every(isWidgetItem)) {
+      throw new Error(`the widget's ${role} list did not read back as text and data attributes`);
+    }
+    return value;
+  });
 }
 
 /** The demo page's own activity strip, newest first. */
