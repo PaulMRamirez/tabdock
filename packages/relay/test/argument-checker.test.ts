@@ -18,6 +18,12 @@ import { createLogger } from '../src/log.ts';
 import { delay } from './helpers/relay.ts';
 
 const BUDGET_MS = 50;
+/**
+ * For tests that read what a check decides rather than how long it may take: a
+ * first compile under a loaded test run can pass 50 ms, and the check would
+ * then go unchecked for want of time instead of giving the answer under test.
+ */
+const GENEROUS_MS = 2000;
 const cleanups: (() => Promise<void>)[] = [];
 
 afterEach(async () => {
@@ -84,7 +90,7 @@ function watchLoop(): { stop: () => number } {
 
 describe('ArgumentChecker', () => {
   it('checks in the worker and describes a failure in the relay words', async () => {
-    const { checker } = start();
+    const { checker } = start({ budgetMs: GENEROUS_MS });
     expect(await checker.ready()).toBe(true);
     expect(await checker.check('form', FORM, { name: 'Ada' })).toEqual({ kind: 'valid' });
     expect(await checker.check('form', FORM, { name: 'far too long' })).toEqual({
@@ -121,7 +127,8 @@ describe('ArgumentChecker', () => {
   });
 
   it('replaces an overrunning worker, and the replacement checks later calls as before', async () => {
-    const { checker, lines } = start();
+    // 2^30 steps overrun any budget; the generous one keeps the replacement's checks in time.
+    const { checker, lines } = start({ budgetMs: GENEROUS_MS });
     expect(await checker.ready()).toBe(true);
     const before = checker.generation;
     expect(await checker.check('fan_out', FAN_OUT, {})).toMatchObject({ kind: 'unchecked' });
@@ -134,10 +141,10 @@ describe('ArgumentChecker', () => {
     });
     expect(await checker.check('form', FORM, { name: 'Ada' })).toEqual({ kind: 'valid' });
     expect(lines.join('\n')).not.toContain('d0');
-  });
+  }, 15_000);
 
   it('reports a schema CfWorker cannot compile, and a check that throws, without page text', async () => {
-    const { checker } = start();
+    const { checker } = start({ budgetMs: GENEROUS_MS });
     expect(await checker.ready()).toBe(true);
     const old = prepared({ $schema: 'http://json-schema.org/draft-04/schema#', type: 'object' });
     expect(await checker.check('old', old, {})).toEqual({ kind: 'uncompilable' });
@@ -170,7 +177,9 @@ describe('ArgumentChecker', () => {
   });
 
   it('lets a check through unchecked at once when its worker crashes, and starts another', async () => {
-    const { checker } = start({ entry: fixture('crash-worker.ts') });
+    // With a generous budget, a crash cannot be mistaken for an overrun, and
+    // answering in far less than the budget shows the check did not wait for it.
+    const { checker } = start({ entry: fixture('crash-worker.ts'), budgetMs: GENEROUS_MS });
     expect(await checker.ready()).toBe(true);
     const before = checker.generation;
     const started = performance.now();
@@ -178,12 +187,12 @@ describe('ArgumentChecker', () => {
       kind: 'unchecked',
       reason: 'failed',
     });
-    expect(performance.now() - started).toBeLessThan(BUDGET_MS + 100);
+    expect(performance.now() - started).toBeLessThan(GENEROUS_MS / 4);
     expect(checker.generation).toBe(before + 1);
   });
 
   it('treats a reply that fails validation as a failed worker', async () => {
-    const { checker } = start({ entry: fixture('garbage-worker.ts') });
+    const { checker } = start({ entry: fixture('garbage-worker.ts'), budgetMs: GENEROUS_MS });
     expect(await checker.ready()).toBe(true);
     const before = checker.generation;
     expect(await checker.check('form', FORM, { name: 'Ada' })).toEqual({
@@ -204,7 +213,7 @@ describe('ArgumentChecker', () => {
       channel.close();
       return Promise.resolve();
     });
-    const { checker } = start({ entry: fixture('heartbeat-worker.ts') });
+    const { checker } = start({ entry: fixture('heartbeat-worker.ts'), budgetMs: GENEROUS_MS });
     expect(await checker.ready()).toBe(true);
     expect(await checker.check('form', FORM, { name: 'Ada' })).toEqual({ kind: 'valid' });
     await delay(50);

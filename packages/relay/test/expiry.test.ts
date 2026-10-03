@@ -156,7 +156,12 @@ describe('attachment idle expiry', () => {
   });
 
   it('names a client only once its call passes every check', async () => {
-    const { relay, lines } = await setup({ limits: { queueDepth: 1 } });
+    // A generous check budget, so the invalid call below is refused by its
+    // check however loaded the test run is, rather than let through unchecked.
+    const { relay, lines } = await setup({
+      limits: { queueDepth: 1 },
+      timings: { argumentCheckMs: 2000 },
+    });
     const held: InvokeFrame[] = [];
     const opened = await page({
       policy: { maxDrivers: 2 },
@@ -257,6 +262,69 @@ describe('attachment idle expiry', () => {
     ).toEqual(['c8', 'c7', 'c6', 'c5', 'c4', 'c3', 'c2', 'c1']);
     await delay(300);
     expect(opened.all('roster')).toHaveLength(before + 2);
+  });
+
+  it('names a new client in the roster its own call sends after a quiet step, for a read and for a write', async () => {
+    // A tenth of the idle time: a 1 s refresh step.
+    const { relay } = await setup({ timings: { attachmentIdleMs: 10_000 } });
+    const opened = await page({ onInvoke: () => ({ ok: true, content: '{}' }) });
+    await pairAndApprove(await client(), opened);
+    for (const [name, tool, args] of [
+      ['phone', 'get_view', {}],
+      ['tablet', 'add_item', { label: 'x' }],
+    ] as const) {
+      const renamed = await connectClient(relay, ALICE, { name, modern: true });
+      clients.push(renamed);
+      // A quiet step: the roster the page shows is a step old, so the call's arrival sends one.
+      await delay(1100);
+      await opened.sync();
+      const before = opened.all('roster').length;
+      const outcome = await callTool(renamed, 'call_page_tool', {
+        page: opened.pageId,
+        tool,
+        arguments: args,
+      });
+      expect(outcome.isError, outcome.text).toBe(false);
+      await opened.sync();
+      // The arrival's roster could not name a client whose call was not yet
+      // checked, so one naming it follows at once rather than a step later.
+      expect(opened.all('roster')).toHaveLength(before + 2);
+      expect(opened.all('roster').at(-1)?.attachments[0]?.clients[0]?.name).toBe(name);
+    }
+  });
+
+  it('after a quiet step, a burst of new clients sends the arrival roster and the first name at once, and one trailing roster for the rest', async () => {
+    // A tenth of the idle time: a 1.5 s refresh step.
+    const { relay } = await setup({ timings: { attachmentIdleMs: 15_000 } });
+    const opened = await page({ onInvoke: () => ({ ok: true, content: '{}' }) });
+    await pairAndApprove(await client(), opened);
+    const renamed: Client[] = [];
+    for (let i = 1; i <= 6; i += 1) {
+      renamed.push(await connectClient(relay, ALICE, { name: `r${String(i)}`, modern: true }));
+    }
+    clients.push(...renamed);
+    await delay(1600);
+    await opened.sync();
+    const before = opened.all('roster').length;
+    const started = Date.now();
+    for (const each of renamed) expect((await getView(each, opened.pageId)).isError).toBe(false);
+    await opened.sync();
+    // The burst fits well inside one step, so a client renaming itself on
+    // every call adds one roster to the arrival's, and no more, until the step ends.
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(opened.all('roster')).toHaveLength(before + 2);
+    expect(opened.all('roster').at(-1)?.attachments[0]?.clients[0]?.name).toBe('r1');
+    await eventually(() => opened.all('roster').length === before + 3, 3000);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1400);
+    expect(
+      opened
+        .all('roster')
+        .at(-1)
+        ?.attachments[0]?.clients.map((c) => c.name)
+        .slice(0, 6),
+    ).toEqual(['r6', 'r5', 'r4', 'r3', 'r2', 'r1']);
+    await delay(300);
+    expect(opened.all('roster')).toHaveLength(before + 3);
   });
 
   it('formats idle times in the unit that divides them', () => {

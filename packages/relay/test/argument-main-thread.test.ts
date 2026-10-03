@@ -61,7 +61,8 @@ const FORM: PageTool = {
 
 describe('CfWorker never runs on the relay main thread (ADR 0010)', () => {
   it('compiles nothing on the main thread for a tools frame, a re-sent one or calls, and still refuses invalid arguments', async () => {
-    current = await startRelay();
+    // A generous budget, so the worker's refusal never turns into an unchecked call under load.
+    current = await startRelay({ timings: { argumentCheckMs: 2000 } });
     const page = await connectPage(current.relay.pageUrl, {
       tools: [FORM],
       onInvoke: () => ({ ok: true, content: 'done' }),
