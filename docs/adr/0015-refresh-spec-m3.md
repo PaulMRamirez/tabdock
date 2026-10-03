@@ -1,6 +1,6 @@
 # 0015: Refresh SPEC sections 3 and 12 with the facts verified for M3
 
-Status: Proposed, 3 October 2026. Changes SPEC sections 3 and 12 if accepted.
+Status: Accepted by the owner, 3 October 2026. Changes SPEC sections 3 and 12.
 
 ## Context
 

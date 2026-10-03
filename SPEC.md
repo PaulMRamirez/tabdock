@@ -26,7 +26,7 @@ MCP clients (many) --HTTPS + auth--> RELAY <--WebSocket, dialed out by page-- AD
 | Relay trust | The relay sees plaintext calls and results, and so does a tunnel that terminates TLS in front of it (ADR 0014). Self-host first | Stock connectors cannot do end-to-end encryption to a page |
 | Upstream | Stay close to MCP-B's page protocol ideas and propose a remote relay mode there | Avoid a competing project |
 
-## 3. Facts verified on 2 October 2026 (re-verify before relying on them)
+## 3. Facts verified on 2 and 3 October 2026 (re-verify before relying on them)
 
 These standards and packages are moving. Check current docs before coding against any of them, and log what you checked in `docs/notes/verified.md`.
 
@@ -38,9 +38,10 @@ These standards and packages are moving. Check current docs before coding agains
 | MCP SDK packages: `@modelcontextprotocol/server`, `client` and `core` 2.3.0 with `@modelcontextprotocol/node` 2.1.1 (v2 line, serves 2026-07-28 and 2025-era clients), `@modelcontextprotocol/sdk` 1.32.0 (v1 line, 2025-era only) | npm registry |
 | Claude reaches custom connectors from Anthropic's cloud (160.79.104.0/21, IPv4) on every client. It supports Streamable HTTP, OAuth, fixed request headers (a beta for a limited set of organizations) or no auth, tools, prompts and resources. No resource subscriptions, sampling or draft capabilities. Hosted limits: 240 s per tool call, about 150,000 characters per result | support.claude.com article 11175166, claude.com/docs/connectors/building |
 | Claude Code supports `list_changed` and HTTP servers with custom headers. It fails an HTTP tool call after 60 s without a first byte and caps results at 25,000 tokens unless the server says otherwise | code.claude.com/docs/en/mcp |
+| Hosted Claude follows the 2025-03-26, 2025-06-18 and 2025-11-25 MCP authorization specs, while 2026-07-28 deprecates dynamic client registration in favour of client ID metadata documents. A connector's auth settings cannot be edited after it is added. Installing connectors on mobile is a beta: a connector is added on the web or desktop first and then appears on the phone | `docs/notes/m3/`, `docs/notes/verified.md` (3 October) |
 | Other versions: `ws` 8.22.0, `hono` 4.13.12, `qrcode-generator` 2.0.4, Node 22.18 or later (it runs `.ts` files directly) | npm registry, nodejs.org |
 
-Rows refreshed by ADR 0004 from `docs/notes/verified.md`. Unverified and to be measured in M3: whether hosted Claude (web, desktop, mobile) refreshes a changing tool list during a conversation.
+Rows refreshed by ADRs 0004 and 0015 from `docs/notes/verified.md`. Unverified and measured by the owner's M3 runs (`docs/notes/spike.md`): whether hosted Claude (web, desktop, mobile) refreshes a changing tool list during a conversation.
 
 ## 4. Architecture and repo layout
 
@@ -192,4 +193,4 @@ Laptop: Node 22+, pnpm, Chrome. The demo uses the polyfill, so no origin trial t
 
 ## 12. Open items to settle during the build
 
-The final name. The identity provider for M4. Where a public demo lives, if anywhere. Whether the write queue also needs a per-user fairness rule.
+The final name. Where a public demo lives, if anywhere. Whether the write queue also needs a per-user fairness rule.
