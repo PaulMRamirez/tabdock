@@ -1,4 +1,5 @@
 import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
+import { encodeQr } from '@tabdock/adapter/qr';
 import { startDemoServer, type DemoServer } from '@tabdock/demo/server';
 import {
   ATTACH_REQUEST_TTL_MS,
@@ -43,6 +44,8 @@ test.use({ viewport: { width: 1280, height: 1200 } });
 
 let demo: DemoServer;
 let pageErrors: string[];
+/** Console errors a test causes on purpose, in order; any other fails it. */
+let expectedErrors: string[];
 
 test.beforeAll(async () => {
   demo = await startDemoServer();
@@ -52,13 +55,14 @@ test.afterAll(async () => {
 });
 test.beforeEach(({ page }) => {
   pageErrors = [];
+  expectedErrors = [];
   page.on('console', (message) => {
     if (message.type() === 'error') pageErrors.push(message.text());
   });
   page.on('pageerror', (error) => pageErrors.push(error.message));
 });
 test.afterEach(() => {
-  expect(pageErrors).toEqual([]);
+  expect(pageErrors).toEqual(expectedErrors);
 });
 
 interface FakeRelay {
@@ -98,8 +102,12 @@ function attachRequest(requestId: string, userId: string): RelayFrame {
  * Opens the demo page against a scripted relay that welcomes every hello
  * (resuming when the hello carries a token) with an empty roster, and waits
  * for the link. The clock is installed first, so a test can pause it later.
+ * pairingUrl goes in the welcome's pairing, as a relay with a public URL sends it.
  */
-async function openWithFakeRelay(page: Page): Promise<FakeRelay> {
+async function openWithFakeRelay(
+  page: Page,
+  options: { pairingUrl?: string } = {},
+): Promise<FakeRelay> {
   const frames: PageFrame[] = [];
   let current: WebSocketRoute | null = null;
   let connections = 0;
@@ -118,7 +126,11 @@ async function openWithFakeRelay(page: Page): Promise<FakeRelay> {
           pageId: 'page-1',
           resumeToken: `resume-${connections}`,
           resumed: parsed.frame.resumeToken !== undefined,
-          pairing: { code: 'ABCDE-FGHJK', expiresAt: Date.now() + 120_000 },
+          pairing: {
+            code: 'ABCDE-FGHJK',
+            ...(options.pairingUrl === undefined ? {} : { url: options.pairingUrl }),
+            expiresAt: Date.now() + 120_000,
+          },
           roster: [],
           limits: {
             maxFrameBytes: MAX_FRAME_BYTES,
@@ -725,4 +737,308 @@ test('pause answers calls with page_busy, shows on the badge, and holds across a
   await expect
     .poll(() => framesOf(relay, 'result').map((frame) => frame.error?.code))
     .toEqual(['page_busy', 'page_busy', 'role_denied']);
+});
+
+// M3: the pairing QR code. A relay with a public URL sends a pairing URL whose
+// fragment holds a single-use nonce; the widget draws it as one SVG path inside
+// the closed shadow root, built with DOM calls, so it works on a page that
+// enforces Trusted Types, and the URL never reaches the console.
+
+// Shaped like the relay's: its public URL, /pair#, and a 22-character base64url nonce.
+const PAIRING_NONCE = 'q3Zf0_Wn-8xLr2TmB9cKpA';
+const NEXT_PAIRING_NONCE = 'Vb7nQ1sX_e4Jk0LmZp9RtA';
+const PAIRING_URL = `https://tabdock-owner.ngrok-free.app/pair#${PAIRING_NONCE}`;
+const NEXT_PAIRING_URL = `https://tabdock-owner.ngrok-free.app/pair#${NEXT_PAIRING_NONCE}`;
+/** The QR spec's quiet zone: four light modules on every side. */
+const QUIET_ZONE = 4;
+
+/** What a strict page sends: Trusted Types for every script sink, and no data: images. */
+const TRUSTED_TYPES_CSP = "require-trusted-types-for 'script'; img-src 'self'";
+const TRUSTED_HTML_ERROR = "This document requires 'TrustedHTML' assignment.";
+const TRUSTED_SCRIPT_ERROR = "This document requires 'TrustedScript' assignment.";
+/**
+ * zod checks whether eval works (its allowsEval) with `new Function('')` in a
+ * try block when its first object schema is built, which the protocol's frame
+ * schemas do on any page the adapter loads on, so a Trusted Types page logs
+ * and reports one violation for it whatever the widget does. This is that
+ * violation's sample: an empty function body, nothing more.
+ */
+const ZOD_EVAL_PROBE = 'Function|(\n) {\n\n})';
+
+interface Violation {
+  directive: string;
+  sample: string;
+}
+
+/**
+ * Serves the demo page with TRUSTED_TYPES_CSP added to the demo server's own
+ * policy on its way to the browser, so the page is the real demo page under a
+ * strict CSP, and records every violation the page reports.
+ */
+async function enforceTrustedTypes(page: Page): Promise<() => Promise<Violation[]>> {
+  await page.addInitScript(() => {
+    const seen: Violation[] = [];
+    Object.defineProperty(window, '__cspViolations', { value: seen });
+    document.addEventListener('securitypolicyviolation', (event) => {
+      seen.push({ directive: event.effectiveDirective, sample: event.sample });
+    });
+  });
+  const demoOrigin = new URL(demo.url).origin;
+  await page.route(
+    (url) => url.origin === demoOrigin && url.pathname === '/',
+    async (route) => {
+      const response = await route.fetch();
+      const headers = response.headers();
+      const own = headers['content-security-policy'];
+      await route.fulfill({
+        response,
+        headers: {
+          ...headers,
+          'content-security-policy': own ? `${own}; ${TRUSTED_TYPES_CSP}` : TRUSTED_TYPES_CSP,
+        },
+      });
+    },
+  );
+  return () =>
+    page.evaluate(() => (window as unknown as { __cspViolations: Violation[] }).__cspViolations);
+}
+
+/** Every console line the page writes, of any level. */
+function recordConsole(page: Page): string[] {
+  const lines: string[] = [];
+  page.on('console', (message) => lines.push(message.text()));
+  return lines;
+}
+
+interface Box {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
+/** The QR drawing and what sits around it, read from inside the closed shadow root. */
+interface QrReading {
+  namespace: string | null;
+  /** Every element inside the svg, by name. */
+  inside: string[];
+  viewBox: string | null;
+  d: string | null;
+  qr: Box;
+  code: Box | null;
+  /** How far the panel's content is wider than the panel; above 0 means it scrolls sideways. */
+  panelOverflow: number;
+}
+
+interface CdpNode {
+  backendNodeId: number;
+  attributes?: string[];
+  children?: CdpNode[];
+  shadowRoots?: CdpNode[];
+}
+
+function nodeWithRole(node: CdpNode, role: string): CdpNode | null {
+  const list = node.attributes ?? [];
+  for (let i = 0; i + 1 < list.length; i += 2) {
+    if (list[i] === 'data-role' && list[i + 1] === role) return node;
+  }
+  for (const child of [...(node.children ?? []), ...(node.shadowRoots ?? [])]) {
+    const found = nodeWithRole(child, role);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** Page script cannot reach into the closed shadow root; the DevTools protocol can. */
+async function readQr(page: Page): Promise<QrReading> {
+  const cdp = await page.context().newCDPSession(page);
+  try {
+    const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
+    const node = nodeWithRole(root, 'pairing-qr');
+    if (!node) throw new Error('the widget has no pairing-qr element');
+    const { object } = await cdp.send('DOM.resolveNode', { backendNodeId: node.backendNodeId });
+    if (object.objectId === undefined) throw new Error('could not resolve the QR element');
+    const { result } = await cdp.send('Runtime.callFunctionOn', {
+      objectId: object.objectId,
+      functionDeclaration: `function () {
+        const box = (element) => {
+          if (!element) return null;
+          const { left, top, right, bottom } = element.getBoundingClientRect();
+          return { left, top, right, bottom };
+        };
+        const svg = this.firstElementChild;
+        const panel = this.closest('.panel');
+        return {
+          namespace: svg ? svg.namespaceURI : null,
+          inside: svg ? Array.from(svg.querySelectorAll('*'), (element) => element.localName) : [],
+          viewBox: svg ? svg.getAttribute('viewBox') : null,
+          d: svg && svg.firstElementChild ? svg.firstElementChild.getAttribute('d') : null,
+          qr: box(this),
+          code: box(panel.querySelector('[data-role="pairing-code"]')),
+          panelOverflow: panel.scrollWidth - panel.clientWidth,
+        };
+      }`,
+      returnByValue: true,
+    });
+    return result.value as QrReading;
+  } finally {
+    await cdp.detach();
+  }
+}
+
+/** The dark modules a path draws, which must be nothing but one-module-tall runs. */
+function drawnModules(d: string): Set<string> {
+  const run = /M(\d+) (\d+)h(\d+)v1h-(\d+)z/gy;
+  const dark = new Set<string>();
+  let end = 0;
+  for (let match = run.exec(d); match !== null; match = run.exec(d)) {
+    const [, x = 0, y = 0, width = 0, back] = match.map(Number);
+    expect(back).toBe(width);
+    for (let col = x; col < x + width; col += 1) dark.add(`${y},${col}`);
+    end = run.lastIndex;
+  }
+  expect(end).toBe(d.length);
+  return dark;
+}
+
+/** The library's matrix for a URL at level M, shifted by the quiet zone, and the side with it. */
+function libraryModules(url: string): { modules: number; size: number; dark: Set<string> } {
+  const code = encodeQr(url);
+  if (!code) throw new Error('the library would not encode the URL');
+  const modules = code.getModuleCount();
+  const dark = new Set<string>();
+  for (let row = 0; row < modules; row += 1) {
+    for (let col = 0; col < modules; col += 1) {
+      if (code.isDark(row, col)) dark.add(`${row + QUIET_ZONE},${col + QUIET_ZONE}`);
+    }
+  }
+  return { modules, size: modules + 2 * QUIET_ZONE, dark };
+}
+
+function expectDrawing(reading: QrReading, url: string): void {
+  const expected = libraryModules(url);
+  expect(reading.namespace).toBe('http://www.w3.org/2000/svg');
+  expect(reading.inside).toEqual(['path']);
+  expect(reading.viewBox).toBe(`0 0 ${expected.size} ${expected.size}`);
+  const dark = drawnModules(reading.d ?? '');
+  expect(dark.size).toBe(expected.dark.size);
+  expect(dark).toEqual(expected.dark);
+}
+
+test('the pairing URL draws as a QR code under Trusted Types, matches the library, redraws for a new pairing and never reaches the console', async ({
+  page,
+}) => {
+  const lines = recordConsole(page);
+  const violations = await enforceTrustedTypes(page);
+  const relay = await openWithFakeRelay(page, { pairingUrl: PAIRING_URL });
+  await expect.poll(() => widgetVisible(page, 'pairing-qr')).toBe(true);
+  const first = await readQr(page);
+  expectDrawing(first, PAIRING_URL);
+  expect(first.qr.right - first.qr.left).toBeGreaterThanOrEqual(120);
+
+  // A new ticket (a rotation, or a code used up) brings a new URL.
+  relay.send({
+    t: 'pairing',
+    code: 'KMNPQ-RSTVW',
+    url: NEXT_PAIRING_URL,
+    expiresAt: Date.now() + 120_000,
+  });
+  await waitForDock(page, (state) => state.pairing?.code === 'KMNPQ-RSTVW');
+  const next = await readQr(page);
+  expect(next.d).not.toBe(first.d);
+  expectDrawing(next, NEXT_PAIRING_URL);
+  expect(await widgetVisible(page, 'pairing-qr')).toBe(true);
+
+  // Nothing the widget did broke the policy: the only violation is zod's probe.
+  const seen = await violations();
+  expect(seen.filter((violation) => violation.sample !== ZOD_EVAL_PROBE)).toEqual([]);
+  for (const violation of seen) {
+    expect(violation.directive).toBe('require-trusted-types-for');
+    expectedErrors.push(TRUSTED_SCRIPT_ERROR);
+  }
+  // And the policy was in force: the library's own SVG string would have been refused.
+  const blocked = await page.evaluate(
+    (svg) => {
+      try {
+        document.createElement('div').innerHTML = svg;
+        return 'allowed';
+      } catch (error) {
+        return error instanceof TypeError ? 'blocked' : 'other';
+      }
+    },
+    encodeQr(PAIRING_URL)?.createSvgTag() ?? '<svg></svg>',
+  );
+  expect(blocked).toBe('blocked');
+  expectedErrors.push(TRUSTED_HTML_ERROR);
+
+  // The nonce is a credential (S11): no console line carries either URL.
+  expect(lines.length).toBeGreaterThan(0);
+  for (const secret of [PAIRING_NONCE, NEXT_PAIRING_NONCE, '/pair#']) {
+    expect(lines.filter((line) => line.includes(secret))).toEqual([]);
+  }
+});
+
+test('a pairing without a URL, or with one that is not https, shows the code and no QR code', async ({
+  page,
+}) => {
+  const relay = await openWithFakeRelay(page);
+  expect(await widgetVisible(page, 'pairing-code')).toBe(true);
+  expect(await widgetVisible(page, 'pairing-qr')).toBe(false);
+  expect((await readQr(page)).d).toBeNull();
+
+  const pairing = (code: string, url?: string): RelayFrame => ({
+    t: 'pairing',
+    code,
+    ...(url === undefined ? {} : { url }),
+    expiresAt: Date.now() + 120_000,
+  });
+  // The relay builds the URL from its public URL, which must be https; a phone is never sent anywhere else.
+  relay.send(pairing('CDEFG-HJKMN', `http://tabdock-owner.ngrok-free.app/pair#${PAIRING_NONCE}`));
+  await waitForDock(page, (state) => state.pairing?.code === 'CDEFG-HJKMN');
+  expect(await widgetVisible(page, 'pairing-qr')).toBe(false);
+  expect((await readQr(page)).d).toBeNull();
+
+  relay.send(pairing('DEFGH-JKMNP', PAIRING_URL));
+  await expect.poll(() => widgetVisible(page, 'pairing-qr')).toBe(true);
+  expectDrawing(await readQr(page), PAIRING_URL);
+
+  // The next ticket comes without one: the old drawing goes, and nothing of it stays behind.
+  relay.send(pairing('EFGHJ-KMNPQ'));
+  await waitForDock(page, (state) => state.pairing?.code === 'EFGHJ-KMNPQ');
+  expect(await widgetVisible(page, 'pairing-qr')).toBe(false);
+  const cleared = await readQr(page);
+  expect(cleared.d).toBeNull();
+  expect(cleared.viewBox).toBeNull();
+  expect(await widgetText(page, 'pairing-code')).toBe('EFGHJ-KMNPQ');
+});
+
+test('at phone width the QR code and the typed code both fit the panel, and on a laptop they sit side by side', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 360, height: 740 });
+  await openWithFakeRelay(page, { pairingUrl: PAIRING_URL });
+  await expect.poll(() => widgetVisible(page, 'pairing-qr')).toBe(true);
+  /** One line of the 26 px code is about 31 px tall; a wrapped code would be twice that. */
+  const ONE_LINE = 40;
+
+  const phone = await readQr(page);
+  expectDrawing(phone, PAIRING_URL);
+  expect(phone.panelOverflow).toBeLessThanOrEqual(0);
+  expect(phone.qr.left).toBeGreaterThanOrEqual(0);
+  expect(phone.qr.right).toBeLessThanOrEqual(360);
+  expect(phone.qr.right - phone.qr.left).toBeGreaterThanOrEqual(120);
+  // No room for both on one line, so the code goes below the QR, whole.
+  const code = phone.code ?? { left: 0, top: 0, right: 0, bottom: 0 };
+  expect(code.top).toBeGreaterThanOrEqual(phone.qr.bottom);
+  expect(code.right).toBeLessThanOrEqual(360);
+  expect(code.bottom - code.top).toBeLessThan(ONE_LINE);
+
+  await page.setViewportSize({ width: 1280, height: 1200 });
+  const laptop = await readQr(page);
+  const beside = laptop.code ?? { left: 0, top: 0, right: 0, bottom: 0 };
+  expect(laptop.panelOverflow).toBeLessThanOrEqual(0);
+  expect(beside.left).toBeGreaterThanOrEqual(laptop.qr.right);
+  expect(beside.top).toBeGreaterThanOrEqual(laptop.qr.top);
+  expect(beside.bottom).toBeLessThanOrEqual(laptop.qr.bottom);
+  expect(beside.bottom - beside.top).toBeLessThan(ONE_LINE);
 });

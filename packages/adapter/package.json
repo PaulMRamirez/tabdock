@@ -7,14 +7,16 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
-    "./core": "./src/core.ts"
+    "./core": "./src/core.ts",
+    "./qr": "./src/qr.ts"
   },
   "scripts": {
     "build": "node scripts/build.ts",
     "typecheck": "tsc -p tsconfig.json && tsc -p scripts/tsconfig.json"
   },
   "dependencies": {
-    "@tabdock/protocol": "workspace:*"
+    "@tabdock/protocol": "workspace:*",
+    "qrcode-generator": "2.0.4"
   },
   "devDependencies": {
     "esbuild": "0.28.2"
