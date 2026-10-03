@@ -41,6 +41,12 @@ export interface RelayTimings {
   attachmentIdleMs: number;
   /** How often an open MCP event stream gets a keep-alive comment; the SDK's own default. */
   sseKeepAliveMs: number;
+  /**
+   * How long one argument check may wait for the check worker and then run in
+   * it (ADR 0010). Past either, the call goes to the page unchecked, so a call
+   * waits at most about twice this for its check.
+   */
+  argumentCheckMs: number;
 }
 
 export interface RelayRateLimits {
@@ -54,8 +60,9 @@ export interface RelayRateLimits {
   windowMs: number;
   /**
    * tools frames one page socket may send per toolsFramesWindowMs; past it the
-   * socket is closed with 1008 (S9). Each frame recompiles every tool's argument
-   * check (ADR 0008), so a page re-sending large ones could keep the relay busy.
+   * socket is closed with 1008 (S9). Each frame prepares and hashes every tool's
+   * schema for the argument check on the main thread (ADR 0008, ADR 0010), so a
+   * page re-sending large ones could keep the relay busy.
    */
   toolsFramesPerSocket: number;
   /** Short, so a burst is caught at once while a page that changes its tools now and then never is. */
@@ -121,6 +128,8 @@ export const GONE_TOMBSTONE_MS = RESUME_WINDOW_MS;
 export const SESSION_IDLE_MS = 30 * 60_000;
 export const ATTACHMENT_IDLE_MS = 8 * 60 * 60_000;
 export const SSE_KEEP_ALIVE_MS = 15_000;
+/** ADR 0010: an ordinary check takes a millisecond or two, and a stall this short goes unnoticed. */
+export const ARGUMENT_CHECK_MS = 50;
 /**
  * The longest delay setTimeout honours. Node runs a longer one after 1 ms
  * instead, which would expire every attachment at once.
@@ -141,6 +150,7 @@ export const DEFAULT_TIMINGS: RelayTimings = {
   sessionIdleMs: SESSION_IDLE_MS,
   attachmentIdleMs: ATTACHMENT_IDLE_MS,
   sseKeepAliveMs: SSE_KEEP_ALIVE_MS,
+  argumentCheckMs: ARGUMENT_CHECK_MS,
 };
 
 export const DEFAULT_RATE_LIMITS: RelayRateLimits = {

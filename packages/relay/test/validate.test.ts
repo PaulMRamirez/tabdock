@@ -5,12 +5,8 @@
 import { CfWorkerJsonSchemaValidator } from '@modelcontextprotocol/server/validators/cf-worker';
 import type { JsonObject } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
-import {
-  compileArgumentCheck,
-  describeFailure,
-  MAX_CHECKED_SCHEMA_DEPTH,
-  prepareSchema,
-} from '../src/validate.ts';
+import { compileArgumentCheck } from '../src/cfworker.ts';
+import { describeFailure, MAX_CHECKED_SCHEMA_DEPTH, prepareSchema } from '../src/validate.ts';
 
 function check(schema: JsonObject, args: JsonObject) {
   const compiled = compileArgumentCheck('tool_x', schema);
@@ -135,6 +131,36 @@ describe('prepareSchema', () => {
     });
   });
 
+  it('drops uniqueItems, quadratic in a client array, and loosens around it as for a regex (ADR 0010)', () => {
+    expect(
+      prepareSchema({
+        type: 'object',
+        properties: {
+          tags: { type: 'array', uniqueItems: true, items: { type: 'string' } },
+          pairs: { not: { type: 'array', uniqueItems: true } },
+          either: { oneOf: [{ uniqueItems: true }, { type: 'array' }] },
+          list: { contains: { type: 'array', uniqueItems: true }, maxContains: 1 },
+          ref: { not: { $ref: '#/$defs/plain' } },
+        },
+        if: { properties: { tags: { uniqueItems: true } } },
+        then: { required: ['a'] },
+        dependencies: { uniqueItems: ['x'], kept: ['y'] },
+        $defs: { plain: { type: 'string' } },
+      }),
+    ).toEqual({
+      type: 'object',
+      properties: {
+        tags: { type: 'array', items: { type: 'string' } },
+        pairs: {},
+        either: { anyOf: [{}, { type: 'array' }] },
+        list: { contains: { type: 'array' } },
+        ref: {},
+      },
+      dependencies: { kept: ['y'] },
+      $defs: { plain: { type: 'string' } },
+    });
+  });
+
   it(`refuses a schema nested deeper than ${String(MAX_CHECKED_SCHEMA_DEPTH)} levels`, () => {
     const nest = (levels: number): JsonObject => {
       let schema: JsonObject = { type: 'string' };
@@ -203,6 +229,55 @@ describe('the prepared check never refuses what the page schema accepts', () => 
       'a format',
       { type: 'object', properties: { e: { type: 'string', format: 'email' } } },
       [{ e: 'x@y.z' }, { e: 'nope' }],
+    ],
+    [
+      'not around uniqueItems',
+      { type: 'object', properties: { a: { not: { type: 'array', uniqueItems: true } } } },
+      [{ a: [1, 1] }, { a: [1, 2] }, { a: 1 }, {}],
+    ],
+    [
+      'oneOf with a uniqueItems branch',
+      { type: 'object', properties: { a: { oneOf: [{ uniqueItems: true }, { type: 'array' }] } } },
+      [{ a: [1, 2] }, { a: [1, 1] }, { a: 'x' }],
+    ],
+    [
+      'if on uniqueItems',
+      {
+        type: 'object',
+        if: { properties: { t: { uniqueItems: true } } },
+        then: { required: ['a'] },
+        else: { required: ['b'] },
+      },
+      [
+        { t: [1, 2], a: 1 },
+        { t: [1, 1], b: 1 },
+        { t: [1, 1], a: 1 },
+        { t: [1, 2], b: 1 },
+      ],
+    ],
+    [
+      'maxContains on uniqueItems',
+      { type: 'array', contains: { type: 'array', uniqueItems: true }, maxContains: 1 },
+      [
+        [[1, 2]],
+        [
+          [1, 2],
+          [1, 1],
+        ],
+        [
+          [1, 2],
+          [3, 4],
+        ],
+        [
+          [1, 1],
+          [2, 2],
+        ],
+      ],
+    ],
+    [
+      'uniqueItems reached through a reference under not',
+      { not: { $ref: '#/$defs/u' }, $defs: { u: { type: 'array', uniqueItems: true } } },
+      [[1, 1], [1, 2], 'x'],
     ],
   ];
 
@@ -298,6 +373,17 @@ describe('compileArgumentCheck', () => {
     expect(
       check(redos, { s: `${'a'.repeat(100_000)}!`, u: `http://${'a'.repeat(100_000)}!` }),
     ).toEqual({ kind: 'valid' });
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  it('checks a uniqueItems array near 1 MB in linear time, as the relay drops the rule (ADR 0010)', () => {
+    const schema: JsonObject = {
+      type: 'object',
+      properties: { tags: { type: 'array', uniqueItems: true } },
+    };
+    const tags = Array.from({ length: 150_000 }, (_, index) => index);
+    const started = performance.now();
+    expect(check(schema, { tags })).toEqual({ kind: 'valid' });
     expect(performance.now() - started).toBeLessThan(500);
   });
 

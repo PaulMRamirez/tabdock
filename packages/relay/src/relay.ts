@@ -244,6 +244,10 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   });
 
   try {
+    // The argument check worker loads in about 100 ms; a relay that listened
+    // first would let its first calls through unchecked. If it cannot start,
+    // the relay serves anyway and keeps restarting it (ADR 0010).
+    await hub.ready();
     await new Promise<void>((resolveListen, rejectListen) => {
       server.once('error', rejectListen);
       server.listen(config.port, config.host.replace(/^\[(.*)\]$/, '$1'), () => {
@@ -252,8 +256,9 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       });
     });
   } catch (error) {
-    // A port in use must not leave the MCP handler or the socket server behind.
+    // A port in use must not leave the MCP handler, the socket server or the check worker behind.
     wss.close();
+    await hub.shutdown();
     await mcp.close();
     await sessions.closeAll();
     throw error;
