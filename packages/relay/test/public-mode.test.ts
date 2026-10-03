@@ -430,6 +430,34 @@ describe('a relay with a public URL (ADR 0014)', () => {
         hosts.join(' '),
       ).toBe(400);
     }
+    // Past Node's default of 2000 header entries the rest would be dropped unseen,
+    // so a second Host line after a thousand fillers must still be counted.
+    const fillers = Array.from({ length: 1100 }, (_, index) => `a${String(index)}:`);
+    for (const late of ['Host: evil.example', `Host: ${PUBLIC_HOST}`]) {
+      expect(
+        await rawStatus([
+          'GET /pair HTTP/1.1',
+          'Host: localhost',
+          ...fillers,
+          late,
+          'Connection: close',
+        ]),
+      ).toBe(400);
+      expect(
+        await rawStatus([
+          'GET /page HTTP/1.1',
+          'Host: localhost',
+          'Connection: Upgrade',
+          'Upgrade: websocket',
+          'Sec-WebSocket-Version: 13',
+          'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+          `Sec-WebSocket-Protocol: ${SUBPROTOCOL}`,
+          `Origin: ${PAGE_ORIGIN}`,
+          ...fillers,
+          late,
+        ]),
+      ).toBe(400);
+    }
     // One Host line, the same request: the page link opens.
     expect(
       await rawStatus([
@@ -443,6 +471,27 @@ describe('a relay with a public URL (ADR 0014)', () => {
         `Origin: ${PAGE_ORIGIN}`,
       ]),
     ).toBe(101);
+  });
+
+  it('sees a proxy header on a /page upgrade however many header lines come before it', async () => {
+    const fillers = Array.from({ length: 1100 }, (_, index) => `a${String(index)}:`);
+    for (const proxied of ['X-Forwarded-For: 203.0.113.9', 'Forwarded: for=203.0.113.9']) {
+      expect(
+        await rawStatus([
+          'GET /page HTTP/1.1',
+          'Host: localhost',
+          'Connection: Upgrade',
+          'Upgrade: websocket',
+          'Sec-WebSocket-Version: 13',
+          'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+          `Sec-WebSocket-Protocol: ${SUBPROTOCOL}`,
+          `Origin: ${PAGE_ORIGIN}`,
+          ...fillers,
+          proxied,
+        ]),
+        proxied,
+      ).toBe(403);
+    }
   });
 
   it('refuses dev tokens on every request, local or through the tunnel', async () => {

@@ -378,6 +378,11 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       else response.destroy();
     });
   });
+  // Node stops collecting header lines past maxHeadersCount (2000 entries) and
+  // drops the rest unseen, so a second Host line or a proxy header placed after
+  // a thousand filler lines would slip past malformedHost and madeLocally. Count
+  // every line; maxHeaderSize still caps the whole header at 16 KiB (431).
+  server.maxHeadersCount = 0;
 
   server.on('upgrade', (request: IncomingMessage, socket: Duplex, head: Buffer) => {
     const address = request.socket.remoteAddress ?? 'unknown';
