@@ -15,3 +15,7 @@ Cancellation in S8 is defined at the boundary Tabdock controls: on `cancel`, rev
 ## Consequences
 
 Tabdock works on today's Stable, on 155 next week and on the polyfill without configuration. SPEC section 3's `executeTool` row should read "input is a JSON string on Chrome 153 and 154 and MCP-B 5.x, an object on Chrome 155+ and MCP-B 6". The adapter carries one extra probe call per page session, and a mutating call can still finish its side effects after a revoke on the polyfill, which the activity log will show.
+
+## Notes after M2
+
+M2 runs writes one at a time on the page, which means a write the relay has already given up on (a client cancel, its deadline, a revoke) must keep the page until its handler really ends. Native WebMCP hands the handler the abort signal, so the adapter aborts it. The MCP-B polyfill 5.1 never passes the signal to the handler and only races `executeTool` against it, so aborting would end the call while the handler kept changing the page. On that runtime, which the adapter recognises by the `__isWebMCPPolyfill` property the polyfill sets on its context (in its code, not its README; `docs/notes/verified.md`), the adapter leaves a running write's signal alone and waits for the handler. A handler that never ends therefore holds later writes until the operator pauses, revokes or reloads; they time out at their own deadlines. Re-check the marker when the demo moves to MCP-B 6.

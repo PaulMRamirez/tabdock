@@ -15,3 +15,4 @@ Short records of decisions that change or refine `SPEC.md`, or that a future con
 | [0009](0009-sessions-limits-expiry.md)           | MCP sessions, section 9 limits and idle expiry in M2          | Accepted |
 | [0010](0010-bounded-argument-checks.md)          | The argument check runs off the main thread with a time limit | Accepted |
 | [0011](0011-one-approval-per-page.md)            | One approval covers one page                                  | Accepted |
+| [0012](0012-close-codes-m2.md)                   | Two more close codes from the M2 limits                       | Proposed |
