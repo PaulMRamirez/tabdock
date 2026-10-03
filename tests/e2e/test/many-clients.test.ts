@@ -14,7 +14,7 @@ import {
   eventually,
   inputField,
   listPages,
-  pairingCode,
+  pairAgain,
   queuedCallIds,
   SIM_TOOL_COUNT,
   startWorld,
@@ -29,6 +29,42 @@ afterEach(async () => {
   await world?.close();
   world = undefined;
 });
+
+interface PageEvent {
+  kind: 'start' | 'end' | 'read';
+  label: string;
+  /** performance.now() where the handler ran; the sim page shares the test's clock. */
+  at: number;
+}
+
+interface WriteSpan {
+  label: string;
+  startIndex: number;
+  endIndex: number;
+  startAt: number;
+  endAt: number;
+}
+
+/** Each write's start and end on the page, in the order the writes started. */
+function writeSpans(events: readonly PageEvent[]): WriteSpan[] {
+  const spans: WriteSpan[] = [];
+  events.forEach((event, index) => {
+    if (event.kind !== 'start') return;
+    const endIndex = events.findIndex(
+      (other, at) => at > index && other.kind === 'end' && other.label === event.label,
+    );
+    const end = events[endIndex];
+    if (!end) throw new Error(`write ${event.label} never ended`);
+    spans.push({
+      label: event.label,
+      startIndex: index,
+      endIndex,
+      startAt: event.at,
+      endAt: end.at,
+    });
+  });
+  return spans;
+}
 
 /** Each client's name, sorted, per user on the page's roster. */
 function rosterClients(
@@ -52,8 +88,8 @@ describe('A2.1: two users and three clients on one page', () => {
     const tablet = await world.client(world.bob, 'bob-tablet');
 
     const pageId = await attachAs(laptop, sim, 'driver');
-    // Alice's second device pairs with the next code and joins her attachment without a prompt.
-    const again = await callTool(phone, 'pair_page', { code: await pairingCode(sim) });
+    // Alice's second client pairs with the next code and joins her attachment without a prompt.
+    const again = await pairAgain(phone, sim);
     expect(again.isError, again.text).toBe(false);
     expect(again.text).toMatch(/You were already attached\./);
     expect(again.structured).toMatchObject({ page: pageId, role: 'driver' });
@@ -105,35 +141,39 @@ describe('A2.3: the write queue through the real adapter', () => {
     world = await startWorld({ timings: { callDeadlineMs: 20_000 } });
     const w = world;
 
-    // What the page handlers saw, in the order they saw it.
-    const events: string[] = [];
-    const writeStarts: string[] = [];
+    // The page's own record, in the order things happened there: when each
+    // write's handler started and ended, and when each read ran.
+    const events: PageEvent[] = [];
+    const note = (kind: PageEvent['kind'], label: string): void => {
+      events.push({ kind, label, at: performance.now() });
+    };
     let writesRunning = 0;
     let mostWritesRunning = 0;
     // Holds the first write on the page until the reads have come back.
     const gate = deferred();
+    const startedWrites = (): number => events.filter((event) => event.kind === 'start').length;
     const reads: { label: string; queuedAtRelay: number; startedOnPage: number }[] = [];
+    const labelled = {
+      type: 'object',
+      properties: { label: { type: 'string' } },
+      required: ['label'],
+      additionalProperties: false,
+    };
     const probeTools = (): FakeToolDefinition[] => [
       {
         name: 'write',
         description: 'Record a write; the first one waits for the test.',
-        inputSchema: {
-          type: 'object',
-          properties: { label: { type: 'string' } },
-          required: ['label'],
-          additionalProperties: false,
-        },
+        inputSchema: labelled,
         annotations: { readOnlyHint: false },
         execute: async (input) => {
           const label = inputField(input, 'label');
           writesRunning += 1;
           mostWritesRunning = Math.max(mostWritesRunning, writesRunning);
-          events.push(`start ${label}`);
-          writeStarts.push(label);
-          if (writeStarts.length === 1) await gate.promise;
+          note('start', label);
+          if (startedWrites() === 1) await gate.promise;
           // A real macrotask, so a second write could start meanwhile if anything let it.
           await new Promise((resolve) => setTimeout(resolve, 1));
-          events.push(`end ${label}`);
+          note('end', label);
           writesRunning -= 1;
           return { label };
         },
@@ -141,21 +181,16 @@ describe('A2.3: the write queue through the real adapter', () => {
       {
         name: 'read',
         description: 'Record a read and what the relay had queued by then.',
-        inputSchema: {
-          type: 'object',
-          properties: { label: { type: 'string' } },
-          required: ['label'],
-          additionalProperties: false,
-        },
+        inputSchema: labelled,
         annotations: { readOnlyHint: true },
         execute: (input) => {
           const label = inputField(input, 'label');
-          events.push(`read ${label}`);
+          note('read', label);
           // The relay runs in this process, so its log is the relay's own record at this instant.
           reads.push({
             label,
             queuedAtRelay: queuedCallIds(w.relayLogs).length,
-            startedOnPage: writeStarts.length,
+            startedOnPage: startedWrites(),
           });
           return { label };
         },
@@ -169,9 +204,8 @@ describe('A2.3: the write queue through the real adapter', () => {
     const phone = await w.client(w.alice, 'alice-phone', { modern: true });
     const tablet = await w.client(w.bob, 'bob-tablet');
     const pageId = await attachAs(laptop, sim, 'driver');
-    expect((await callTool(phone, 'pair_page', { code: await pairingCode(sim) })).isError).toBe(
-      false,
-    );
+    const again = await pairAgain(phone, sim);
+    expect(again.isError, again.text).toBe(false);
     await attachAs(tablet, sim, 'driver');
     await waitForTools(laptop, pageId, SIM_TOOL_COUNT + 2);
     const wire = watchFrames(sim);
@@ -190,28 +224,31 @@ describe('A2.3: the write queue through the real adapter', () => {
 
     // All twenty have reached the relay and the first holds the page.
     await eventually(async () =>
-      Promise.resolve(queuedCallIds(w.relayLogs).length === 20 && writeStarts.length === 1),
+      Promise.resolve(queuedCallIds(w.relayLogs).length === 20 && startedWrites() === 1),
     );
     // Reads from every client come back while nineteen writes still wait their turn.
     const readOutcomes = await Promise.all(
       clients.map(([name, client]) => call(client, 'read', `r-${name}`)),
     );
     for (const outcome of readOutcomes) expect(outcome.isError, outcome.text).toBe(false);
-    expect(writeStarts).toHaveLength(1);
+    expect(startedWrites()).toBe(1);
     gate.resolve();
 
     const outcomes = await Promise.all(writes);
     for (const outcome of outcomes) expect(outcome.isError, outcome.text).toBe(false);
 
-    // Strictly one at a time: every write ends before the next one starts.
-    const writeEvents = events.filter((event) => !event.startsWith('read '));
-    expect(writeEvents).toHaveLength(40);
-    for (let i = 0; i < writeEvents.length; i += 2) {
-      const label = (writeEvents[i] ?? '').slice('start '.length);
-      expect(writeEvents[i]).toBe(`start ${label}`);
-      expect(writeEvents[i + 1]).toBe(`end ${label}`);
+    // Strictly one at a time: each write's span on the page ends before the next one starts,
+    // in the page's event order and on its clock.
+    const spans = writeSpans(events);
+    expect(spans).toHaveLength(20);
+    for (let k = 0; k + 1 < spans.length; k += 1) {
+      const [current, next] = [spans[k], spans[k + 1]];
+      if (!current || !next) throw new Error('missing span');
+      expect(current.endIndex).toBeLessThan(next.startIndex);
+      expect(current.endAt).toBeLessThanOrEqual(next.startAt);
     }
     expect(mostWritesRunning).toBe(1);
+    const writeStarts = spans.map((span) => span.label);
 
     // In arrival order: the page started them in the order the relay logged them arriving.
     const labelByCallId = new Map<string, string>();
@@ -223,7 +260,7 @@ describe('A2.3: the write queue through the real adapter', () => {
     const arrival = queuedCallIds(w.relayLogs);
     expect(arrival).toHaveLength(20);
     expect(arrival.map((callId) => labelByCallId.get(callId))).toEqual(writeStarts);
-    // And the relay sent each write only after the one before it had answered.
+    // The invokes reached the page in that same order, on the page's own socket.
     const writeIds = new Set(arrival);
     const order = wire
       .filter((frame) => frame.t === 'invoke' && writeIds.has(frame.callId))
@@ -235,11 +272,12 @@ describe('A2.3: the write queue through the real adapter', () => {
     for (const read of reads) {
       expect(read.queuedAtRelay - read.startedOnPage).toBeGreaterThanOrEqual(1);
     }
-    const firstEnd = events.indexOf(`end ${writeStarts[0] ?? ''}`);
+    const first = spans[0];
+    if (!first) throw new Error('no write ran');
     for (const [name] of clients) {
-      const at = events.indexOf(`read r-${name}`);
-      expect(at).toBeGreaterThan(0);
-      expect(at).toBeLessThan(firstEnd);
+      const at = events.findIndex((event) => event.kind === 'read' && event.label === `r-${name}`);
+      expect(at).toBeGreaterThan(first.startIndex);
+      expect(at).toBeLessThan(first.endIndex);
     }
 
     // The writes came from all three clients, and the page and the relay attribute each one.

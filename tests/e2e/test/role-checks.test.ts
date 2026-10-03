@@ -1,21 +1,26 @@
 // A2.2: roles are checked twice (S5). The real relay refuses an observer a
 // mutating tool before the page hears of it, including after the operator
-// demotes a driver. Then the relay's check is taken out of the way: a scripted
+// demotes a driver, and also when the demotion lands while that driver's write
+// is waiting in the queue. Then the relay's check is taken out of the way: a scripted
 // stand-in relay sends the real adapter an invoke that claims driver for a
 // user the operator approved as observer, on a roster that lies too, and the
 // page answers role_denied without running its handler.
 
-import { type SimPage, startSimPage } from '@tabdock/sim-page';
+import { createDefaultTools, type SimPage, startSimPage } from '@tabdock/sim-page';
 import type { Caller } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   attachAs,
   callTool,
+  deferred,
   errorCode,
+  eventually,
   linked,
+  queuedCallIds,
   SIM_TOOL_COUNT,
   startWorld,
   waitForTools,
+  watchFrames,
   type World,
 } from './helpers.ts';
 import { STAND_IN_LIMITS, type StandInRelay, startStandInRelay } from './stand-in-relay.ts';
@@ -82,6 +87,63 @@ describe('A2.2: the relay refuses an observer a mutating tool', () => {
       ['alice', 'set_value', 'ok'],
       ['alice', 'set_value', 'role_denied'],
     ]);
+  });
+});
+
+describe('A2.2: a demotion reaches a write already waiting in the queue', () => {
+  it('refuses the queued write when it reaches the front, so the page never runs it', async () => {
+    world = await startWorld({ timings: { callDeadlineMs: 15_000 } });
+    const w = world;
+    const started = deferred();
+    const gate = deferred();
+    const page = await w.page({
+      policy: { maxDrivers: 2 },
+      tools: (store) => [
+        ...createDefaultTools(store),
+        {
+          name: 'slow_write',
+          description: 'A write that holds the page until the test lets it finish.',
+          inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+          annotations: { readOnlyHint: false },
+          execute: async () => {
+            started.resolve();
+            await gate.promise;
+            return { done: true };
+          },
+        },
+      ],
+    });
+    const alice = await w.client(w.alice, 'alice-laptop');
+    const bob = await w.client(w.bob, 'bob-tablet', { modern: true });
+    const pageId = await attachAs(alice, page, 'driver');
+    await attachAs(bob, page, 'driver');
+    await waitForTools(alice, pageId, SIM_TOOL_COUNT + 1);
+    const wire = watchFrames(page);
+
+    const slow = callTool(alice, 'call_page_tool', { page: pageId, tool: 'slow_write' });
+    await started.promise;
+    const waiting = callTool(bob, 'call_page_tool', {
+      page: pageId,
+      tool: 'set_value',
+      arguments: { value: 'queued before the demotion' },
+    });
+    await eventually(async () => Promise.resolve(queuedCallIds(w.relayLogs).length === 2));
+
+    // Bob was a driver when his write arrived; the operator demotes him while it waits.
+    expect(page.setRole('bob', 'observer')).toBe(true);
+    await page.waitFor((s) => s.roster.find((a) => a.userId === 'bob')?.role === 'observer');
+    gate.resolve();
+    expect((await slow).isError).toBe(false);
+    const refused = await waiting;
+    expect(refused.text).toBe(
+      'role_denied: you are an observer on this page now, and set_value is not marked read-only',
+    );
+    // Only Alice's write was ever sent to the page.
+    expect(wire.flatMap((frame) => (frame.t === 'invoke' ? [frame.tool] : []))).toEqual([
+      'slow_write',
+    ]);
+    expect(page.store.calls).toEqual([]);
+    expect(page.store.value).toBeNull();
   });
 });
 

@@ -177,6 +177,20 @@ export async function attachAs(client: Client, sim: SimPage, role: Role): Promis
 }
 
 /**
+ * pair_page from another client of a user the page already lists, which the
+ * relay answers at once without asking the operator. The code is single use
+ * and the page hears of its successor on the page link while the client hears
+ * the answer over HTTP, so this waits for the new code to reach the page: a
+ * pairing right after must not pick up the code that just died.
+ */
+export async function pairAgain(client: Client, sim: SimPage): Promise<ToolOutcome> {
+  const code = await pairingCode(sim);
+  const outcome = await callTool(client, 'pair_page', { code });
+  await sim.waitFor((s) => s.pairing !== null && s.pairing.code !== code);
+  return outcome;
+}
+
+/**
  * Waits until the relay lists `count` tools for the page. The adapter shares
  * its tools right after the welcome, so a fast test can otherwise outrun it.
  */

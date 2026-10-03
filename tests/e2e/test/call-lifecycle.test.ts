@@ -2,8 +2,8 @@
 // end through the real adapter: an attachment left unused past its idle time
 // expires and drops off the page's roster (ADR 0009); arguments that fail a
 // tool's inputSchema are refused at the relay before the page sees them, on
-// every measured runtime (ADR 0008); and a 2025-era client's cancellation
-// reaches the page and aborts the running handler.
+// every measured runtime (ADR 0008); and a client's cancellation, on either
+// protocol era, reaches the page and aborts the running handler.
 
 import { createDefaultTools, RUNTIME_PROFILES } from '@tabdock/sim-page';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -32,7 +32,7 @@ afterEach(async () => {
 describe('idle expiry (ADR 0009)', () => {
   it('drops an attachment unused for its idle time from the roster, and its next call is not_attached', async () => {
     // Shortened from 8 hours. Long enough for the first call to land well inside it.
-    world = await startWorld({ timings: { attachmentIdleMs: 1500 } });
+    world = await startWorld({ timings: { attachmentIdleMs: 2000 } });
     const w = world;
     const sim = await w.page();
     const alice = await w.client(w.alice, 'alice-laptop');
@@ -40,13 +40,20 @@ describe('idle expiry (ADR 0009)', () => {
     const attached = await sim.waitFor((s) => s.roster.length === 1);
     const entry = attached.roster[0];
     // The roster tells the operator when the attachment will end.
-    expect(entry?.expiresAt).toBe((entry?.grantedAt ?? 0) + 1500);
+    expect(entry?.expiresAt).toBe((entry?.grantedAt ?? 0) + 2000);
     await waitForTools(alice, pageId, SIM_TOOL_COUNT);
+    // A call strictly after the grant, so an expiry counted from the grant would come first.
+    await eventually(async () => Promise.resolve(Date.now() > (entry?.grantedAt ?? 0)));
+    // The relay stamps the call on arrival, no earlier than this.
+    const calledAt = Date.now();
     const used = await callTool(alice, 'call_page_tool', { page: pageId, tool: 'get_value' });
     expect(used.isError, used.text).toBe(false);
 
     // No more calls: the relay ends the attachment and tells the page.
     await sim.waitFor((s) => s.roster.length === 0, 10_000);
+    // Counted from the call, not the grant: the call moved the expiry (the relay
+    // ends an attachment only once Date.now() has passed its expiresAt).
+    expect(Date.now()).toBeGreaterThanOrEqual(calledAt + 2000);
     expect(relayEntries(w.relayLogs).some((e) => e.msg === 'attachment expired')).toBe(true);
     expect(await listPages(alice)).toEqual([]);
     const next = await callTool(alice, 'call_page_tool', { page: pageId, tool: 'get_value' });
@@ -96,51 +103,58 @@ describe('argument validation at the relay (ADR 0008)', () => {
   );
 });
 
-describe('cancellation from a 2025-era client', () => {
-  it('reaches the page as cancel with reason client and aborts the running handler', async () => {
-    world = await startWorld({ timings: { callDeadlineMs: 15_000 } });
-    const held = holdRecord();
-    const sim = await world.page({
-      profile: 'chrome-156',
-      tools: (store) => [...createDefaultTools(store), holdTool(held, { readOnly: true })],
-    });
+describe('cancellation from a client', () => {
+  it.each([
     // No version pin: the SDK speaks the 2025 revision and holds a session with the relay.
-    const alice = await world.client(world.alice, 'alice-laptop');
-    const pageId = await attachAs(alice, sim, 'driver');
-    await waitForTools(alice, pageId, SIM_TOOL_COUNT + 1);
-    const wire = watchFrames(sim);
+    ['a 2025-era session client (notifications/cancelled)', 'alice-laptop', false],
+    // Pinned to 2026-07-28, the client cancels by dropping its request stream.
+    ['a 2026-07-28 client (it drops its request stream)', 'alice-phone', true],
+  ])(
+    'from %s reaches the page as cancel with reason client and aborts the running handler',
+    async (_label, name, modern) => {
+      world = await startWorld({ timings: { callDeadlineMs: 15_000 } });
+      const held = holdRecord();
+      const sim = await world.page({
+        profile: 'chrome-156',
+        tools: (store) => [...createDefaultTools(store), holdTool(held, { readOnly: true })],
+      });
+      const alice = await world.client(world.alice, name, { modern });
+      const pageId = await attachAs(alice, sim, 'driver');
+      await waitForTools(alice, pageId, SIM_TOOL_COUNT + 1);
+      const wire = watchFrames(sim);
 
-    const abort = new AbortController();
-    const pending = alice
-      .callTool(
-        { name: 'call_page_tool', arguments: { page: pageId, tool: 'hold' } },
-        { signal: abort.signal },
-      )
-      .then(
-        () => 'answered',
-        () => 'rejected',
-      );
-    expect(await held.started.promise).toEqual({ hasSignal: true });
-    abort.abort();
-    expect(await pending).toBe('rejected');
+      const abort = new AbortController();
+      const pending = alice
+        .callTool(
+          { name: 'call_page_tool', arguments: { page: pageId, tool: 'hold' } },
+          { signal: abort.signal },
+        )
+        .then(
+          () => 'answered',
+          () => 'rejected',
+        );
+      expect(await held.started.promise).toEqual({ hasSignal: true });
+      abort.abort();
+      expect(await pending).toBe('rejected');
 
-    await held.aborted.promise;
-    const invoke = wire.find((frame) => frame.t === 'invoke' && frame.tool === 'hold');
-    if (invoke?.t !== 'invoke') throw new Error('the hold invoke never reached the page');
-    expect(invoke.caller.client).toEqual({ name: 'alice-laptop', version: '0.0.0' });
-    expect(wire.filter((frame) => frame.t === 'cancel')).toEqual([
-      { t: 'cancel', callId: invoke.callId, reason: 'client' },
-    ]);
-    expect(sim.activity.find((e) => e.callId === invoke.callId)?.outcome).toBe('cancelled');
-    await eventually(async () => Promise.resolve(world?.relay.audit.records().length === 1));
-    expect(world.relay.audit.records()[0]).toMatchObject({
-      tool: 'hold',
-      outcome: 'cancelled',
-      client: { name: 'alice-laptop', version: '0.0.0' },
-    });
+      await held.aborted.promise;
+      const invoke = wire.find((frame) => frame.t === 'invoke' && frame.tool === 'hold');
+      if (invoke?.t !== 'invoke') throw new Error('the hold invoke never reached the page');
+      expect(invoke.caller.client).toEqual({ name, version: '0.0.0' });
+      expect(wire.filter((frame) => frame.t === 'cancel')).toEqual([
+        { t: 'cancel', callId: invoke.callId, reason: 'client' },
+      ]);
+      expect(sim.activity.find((e) => e.callId === invoke.callId)?.outcome).toBe('cancelled');
+      await eventually(async () => Promise.resolve(world?.relay.audit.records().length === 1));
+      expect(world.relay.audit.records()[0]).toMatchObject({
+        tool: 'hold',
+        outcome: 'cancelled',
+        client: { name, version: '0.0.0' },
+      });
 
-    // The session carries on: the same client calls again.
-    const read = await callTool(alice, 'call_page_tool', { page: pageId, tool: 'get_value' });
-    expect(read.isError, read.text).toBe(false);
-  });
+      // The client carries on: the same client calls again.
+      const read = await callTool(alice, 'call_page_tool', { page: pageId, tool: 'get_value' });
+      expect(read.isError, read.text).toBe(false);
+    },
+  );
 });

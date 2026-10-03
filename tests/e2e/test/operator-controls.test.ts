@@ -84,6 +84,55 @@ describe('A2.4: revoke cancels an in-flight call and blocks the next one', () =>
     ]);
   });
 
+  it("drops the revoked user's queued writes too, and another user's queued write still runs", async () => {
+    world = await startWorld({ timings: { callDeadlineMs: 15_000 } });
+    const w = world;
+    const held = holdRecord();
+    const sim = await w.page({
+      policy: { maxDrivers: 2 },
+      tools: (store) => [...createDefaultTools(store), holdTool(held)],
+    });
+    const alice = await w.client(w.alice, 'alice-laptop');
+    const bob = await w.client(w.bob, 'bob-phone', { modern: true });
+    const pageId = await attachAs(alice, sim, 'driver');
+    await attachAs(bob, sim, 'driver');
+    await waitForTools(alice, pageId, SIM_TOOL_COUNT + 1);
+    const wire = watchFrames(sim);
+    const setValue = (client: typeof alice, value: string) =>
+      callTool(client, 'call_page_tool', { page: pageId, tool: 'set_value', arguments: { value } });
+
+    // Alice's hold runs on the page; two more of hers and one of Bob's wait behind it.
+    const holding = callTool(alice, 'call_page_tool', { page: pageId, tool: 'hold' });
+    await held.started.promise;
+    const aliceFirst = setValue(alice, 'alice 1');
+    await eventually(async () => Promise.resolve(queuedCallIds(w.relayLogs).length === 2));
+    const bobs = setValue(bob, 'bob');
+    await eventually(async () => Promise.resolve(queuedCallIds(w.relayLogs).length === 3));
+    const aliceSecond = setValue(alice, 'alice 2');
+    await eventually(async () => Promise.resolve(queuedCallIds(w.relayLogs).length === 4));
+
+    expect(sim.revoke('alice')).toBe(true);
+    const revoked = 'not_attached: the page operator revoked your attachment';
+    expect((await holding).text).toBe(revoked);
+    expect((await aliceFirst).text).toBe(revoked);
+    expect((await aliceSecond).text).toBe(revoked);
+    await held.aborted.promise;
+    const after = await bobs;
+    expect(after.isError, after.text).toBe(false);
+
+    // Of the four calls in arrival order, only the hold and Bob's write ever reached the page.
+    const [holdId, aliceFirstId, bobId, aliceSecondId] = queuedCallIds(w.relayLogs);
+    expect(new Set([holdId, aliceFirstId, bobId, aliceSecondId]).size).toBe(4);
+    const invokes = wire.flatMap((frame) => (frame.t === 'invoke' ? [frame.callId] : []));
+    expect(invokes).toEqual([holdId, bobId]);
+    expect(wire.filter((frame) => frame.t === 'cancel')).toEqual([
+      { t: 'cancel', callId: holdId, reason: 'revoked' },
+    ]);
+    // The hold tool keeps no store record; set_value does, and only Bob's ran.
+    expect(sim.store.calls).toEqual([{ tool: 'set_value', input: { value: 'bob' } }]);
+    expect(sim.store.value).toBe('bob');
+  });
+
   it("Revoke all ends everyone's attachment at once", async () => {
     world = await startWorld();
     const sim = await world.page({ policy: { maxDrivers: 2 } });
