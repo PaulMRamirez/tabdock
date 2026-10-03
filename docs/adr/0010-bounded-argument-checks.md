@@ -12,7 +12,7 @@ The relay never runs the validator on its main thread. One worker thread (Node's
 
 ## Consequences
 
-No page schema and no client argument can hold up the relay's main loop through the check itself. Receiving a `tools` frame still costs main-thread time in proportion to its size (parsing, cutting the listing and preparing changed schemas), which the per-socket and per-address frame budgets and a cap on schema nodes walked per frame bound (ADR 0009's notes). Under attack, checks for other users may be skipped, never blocked. A call waits at most about 100 ms for its check.
+No page schema and no client argument can hold up the relay's main loop through the check itself. Receiving a `tools` frame still costs main-thread time in proportion to its size (parsing, cutting the listing and preparing changed schemas), which the per-socket and per-address frame budgets and caps on schema nodes walked per tool (5,000) and per frame (20,000) bound (ADR 0009's notes). Under attack, checks for other users may be skipped, never blocked. A call waits at most about 100 ms for its check.
 
 ## Notes after the build
 
