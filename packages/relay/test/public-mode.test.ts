@@ -314,6 +314,67 @@ describe('a relay with a public URL (ADR 0014)', () => {
     }
   });
 
+  /** The upgrade's HTTP status: 101 when the socket opened. */
+  const upgradeStatus = (headers: Record<string, string>): Promise<number> =>
+    openSocket(relay.pageUrl, { headers }).then(
+      (ws) => {
+        ws.terminate();
+        return 101;
+      },
+      (error: unknown) => {
+        if (error instanceof UpgradeRefused) return error.status;
+        throw error;
+      },
+    );
+
+  it('reads Host as RFC 9110 does, a host and an optional port, and compares it as written', async () => {
+    const token = `Bearer ${await provider.token({ sub: 'sub-alice', aud: PUBLIC_MCP_URL })}`;
+    // No host at all, though the URL parser reads each as a loopback name or the public host.
+    for (const host of [
+      'relay.test@localhost',
+      'relay.test:443@127.0.0.1',
+      'evil.example@relay.test',
+      'u:p@relay.test',
+      'localhost/relay.test',
+      'relay.test/evil',
+      'localhost#relay.test',
+      'relay.test?evil',
+      'localhost\\relay.test',
+      'loc%61lhost',
+      'relay.test:99999',
+      '[::1',
+      '[relay.test]',
+    ]) {
+      expect((await discover(token, host)).status, host).toBe(400);
+      expect((await rawRequest(relay.url, '/pair', { host })).status, host).toBe(400);
+      expect(await upgradeStatus({ Host: host }), host).toBe(400);
+    }
+    // Well formed, and loopback to the URL parser, but not a name the relay answers to as written.
+    for (const host of [
+      '2130706433',
+      '0x7f.1',
+      '127.1',
+      '0177.0.0.1',
+      '[0:0:0:0:0:0:0:1]',
+      'localhost.',
+      'relay.test.',
+    ]) {
+      expect((await discover(token, host)).status, host).toBe(403);
+      expect((await rawRequest(relay.url, '/pair', { host })).status, host).toBe(403);
+      expect(await upgradeStatus({ Host: host }), host).toBe(403);
+    }
+    // Ordinary hosts, with or without a port and in any case, still work.
+    for (const host of [PUBLIC_HOST, 'RELAY.TEST:443', '127.0.0.1', 'localhost:8787', '[::1]']) {
+      expect((await discover(token, host)).status, host).toBe(200);
+      expect((await rawRequest(relay.url, '/pair', { host })).status, host).toBe(200);
+    }
+    for (const host of ['localhost', 'LocalHost:8787', '127.0.0.1', '[::1]:8787']) {
+      expect(await upgradeStatus({ Host: host }), host).toBe(101);
+    }
+    // A Host is never echoed into the log.
+    expect(lines.join('\n')).not.toContain('evil');
+  });
+
   it('refuses dev tokens on every request, local or through the tunnel', async () => {
     for (const host of [undefined, PUBLIC_HOST]) {
       const answer = await discover(`Bearer ${ALICE.token}`, host);

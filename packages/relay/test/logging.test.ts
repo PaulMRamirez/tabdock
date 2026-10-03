@@ -12,6 +12,7 @@ import {
   startRelay,
   type TestRelay,
 } from './helpers/relay.ts';
+import { rawRequest } from './helpers/tunnel.ts';
 
 describe('the logger', () => {
   it('writes one JSON object per line with ts, level and msg first', () => {
@@ -197,6 +198,27 @@ describe('secrets never reach the logs (S11)', () => {
     expect(failed).toHaveLength(1);
     expect(failed[0]).toMatchObject({ route: '/broken' });
     expect(failed[0]).not.toHaveProperty('path');
+    expect(lines.join('\n')).not.toContain(secret);
+  });
+
+  it('logs an unexpected /mcp failure by a fixed phrase and the error class, never its message', async () => {
+    current = await startRelay({ logLevel: 'debug' });
+    const { relay, lines } = current;
+    const secret = 'q3Zf0_Wn-8xLr2TmB9cKpA';
+    // TRACE passes sign-in, and then the SDK's adapter cannot make a web Request of it:
+    // the path where undici's own message, which may quote the URL, used to be logged.
+    const traced = await rawRequest(relay.url, `/mcp?code=${secret}`, {
+      method: 'TRACE',
+      headers: { Authorization: `Bearer ${ALICE.token}` },
+    });
+    expect(traced.status).toBe(500);
+    const errors = lines
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((entry) => entry.level === 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ msg: 'mcp adapter error', errorClass: 'TypeError' });
+    // The phrase and the class, and nothing of the error's own text.
+    expect(Object.keys(errors[0] ?? {}).sort()).toEqual(['errorClass', 'level', 'msg', 'ts']);
     expect(lines.join('\n')).not.toContain(secret);
   });
 });

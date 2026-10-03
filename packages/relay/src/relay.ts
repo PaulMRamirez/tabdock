@@ -4,35 +4,38 @@
 // before any protocol code sees a request: origin, subprotocol and the socket
 // limits for pages (S1, S2, S9), Host and the auth plugin for MCP clients, so
 // every unauthenticated /mcp request gets the plugin's challenge before either
-// leg runs. /mcp has two legs behind those checks, composed as the SDK
-// documents (ADR 0009): 2025-era traffic goes to the sessionful leg in
-// sessions.ts, everything else to a strict 2026-07-28 handler. In public URL
-// mode (ADR 0014) the public host passes the Host check for /mcp and the QR
-// flow at /pair (pair.ts) is served behind the same check, while /page still
-// takes only requests made on this machine. Requests are logged by route,
-// never by raw path or query, so no secret a URL carries reaches a log. The M3
-// spike's measurements (spike.ts) hook in here when TABDOCK_SPIKE is on;
-// nothing over HTTP controls them.
+// leg runs. Before all of them, a Host header that is not a host and optional
+// port (RFC 9110) makes the request a 400, and an allowlist matches a Host
+// only as written, never as the URL parser would rewrite it. /mcp has two legs
+// behind those checks, composed as the SDK documents (ADR 0009): 2025-era
+// traffic goes to the sessionful leg in sessions.ts, everything else to a
+// strict 2026-07-28 handler. In public URL mode (ADR 0014) the public host
+// passes the Host check for /mcp and the QR flow at /pair (pair.ts) is served
+// behind the same check, while /page still takes only requests made on this
+// machine. Requests are logged by route, never by raw path or query, so no
+// secret a URL carries reaches a log. The M3 spike's measurements (spike.ts)
+// hook in here when TABDOCK_SPIKE is on; nothing over HTTP controls them.
 
 import { createServer, type IncomingMessage, type ServerResponse, STATUS_CODES } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { Duplex } from 'node:stream';
-import {
-  hostHeaderValidation,
-  type NodeIncomingMessageLike,
-  toNodeHandler,
-} from '@modelcontextprotocol/node';
+import { type NodeIncomingMessageLike, toNodeHandler } from '@modelcontextprotocol/node';
 import {
   type AuthInfo,
   createMcpHandler,
   isLegacyRequest,
   type McpHandlerRequestOptions,
-  validateHostHeader,
 } from '@modelcontextprotocol/server';
 import { MAX_FRAME_BYTES, SUBPROTOCOL } from '@tabdock/protocol';
 import { WebSocketServer } from 'ws';
 import { type AuthOutcome, AuthOutcomeSchema, type AuthRoute } from './auth.ts';
-import { LOOPBACK_HOSTNAMES, NO_ORIGIN, type RelayOptions, resolveConfig } from './config.ts';
+import {
+  LOOPBACK_HOSTNAMES,
+  NO_ORIGIN,
+  parseHostHeader,
+  type RelayOptions,
+  resolveConfig,
+} from './config.ts';
 import { PageHub } from './hub.ts';
 import { createLogger } from './log.ts';
 import { type AuthExtra, createMcpFactory, userIdOf } from './mcp.ts';
@@ -62,16 +65,35 @@ export interface Relay {
 }
 
 /**
+ * Whether a request's Host header, if it has one, is no host at all. Such a
+ * request is malformed (400) before any route or allowlist reads its Host. A
+ * missing Host is left to the checks that need one, which refuse it.
+ */
+function malformedHost(request: IncomingMessage): boolean {
+  const host = request.headers.host;
+  return host !== undefined && parseHostHeader(host) === null;
+}
+
+/**
  * Whether a /page upgrade was made on this machine rather than through the
- * tunnel. The Host must be a loopback name, and no proxy header may be
- * present: a tunnel told to rewrite Host still adds X-Forwarded-For, while a
- * browser's WebSocket can set neither.
+ * tunnel. The Host must be a loopback name exactly as written, and no proxy
+ * header may be present: a tunnel told to rewrite Host still adds
+ * X-Forwarded-For, while a browser's WebSocket can set neither.
  */
 function madeLocally(request: IncomingMessage): boolean {
-  if (!validateHostHeader(request.headers.host, [...LOOPBACK_HOSTNAMES]).ok) return false;
+  const host = request.headers.host === undefined ? null : parseHostHeader(request.headers.host);
+  if (host === null || !LOOPBACK_HOSTNAMES.includes(host)) return false;
   return !Object.keys(request.headers).some(
     (name) => name === 'forwarded' || name.startsWith('x-forwarded-'),
   );
+}
+
+/**
+ * What kind of error reached a catch-all, for a log line that leaves out its
+ * message: a library's message may quote the request URL with its query.
+ */
+function errorClass(error: unknown): string {
+  return error instanceof Error ? error.name : typeof error;
 }
 
 /**
@@ -200,12 +222,30 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   const mcpNode = toNodeHandler(legs, {
     maxRequestBodySize: MAX_MCP_BODY_BYTES,
     onerror: (error) => {
-      log.error('mcp adapter error', { error });
+      // undici's message for a Request it cannot build quotes the URL, query and all.
+      log.error('mcp adapter error', { errorClass: errorClass(error) });
     },
   });
-  // DNS rebinding guard: a loopback relay only answers Host names that mean
-  // loopback, plus the public host in public URL mode.
-  const validateHost = hostHeaderValidation(config.allowedHosts);
+  /**
+   * The DNS rebinding guard: a loopback relay only answers Host names that
+   * mean loopback, plus the public host in public URL mode, each exactly as
+   * written. The answer keeps the shape of the SDK's own guard.
+   */
+  const validateHost = (request: IncomingMessage, response: ServerResponse): boolean => {
+    const host = request.headers.host === undefined ? null : parseHostHeader(request.headers.host);
+    if (host !== null && config.allowedHosts.includes(host)) return true;
+    send(
+      response,
+      403,
+      JSON.stringify({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Invalid Host' },
+        id: null,
+      }),
+      { 'Content-Type': 'application/json' },
+    );
+    return false;
+  };
   const authRoutes: ReadonlyMap<string, AuthRoute> = auth.routes ?? new Map();
   const knownRoutes = new Set([...FIXED_ROUTES, ...authRoutes.keys()]);
   /**
@@ -306,7 +346,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     const path = pathOf(request.url);
     const route = async (): Promise<void> => {
       const authRoute = path === null ? undefined : authRoutes.get(path);
-      if (path === null) {
+      if (path === null || malformedHost(request)) {
         send(response, 400, 'Bad request');
       } else if (path === '/healthz') {
         if (request.method === 'GET' || request.method === 'HEAD') send(response, 200, 'ok');
@@ -336,6 +376,11 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     const address = request.socket.remoteAddress ?? 'unknown';
     if (pathOf(request.url) !== '/page') {
       refuseUpgrade(socket, 404, 'Not found');
+      return;
+    }
+    if (malformedHost(request)) {
+      log.info('page socket refused: malformed Host', { address });
+      refuseUpgrade(socket, 400, 'Bad request');
       return;
     }
     // ADR 0014: every request through the tunnel arrives from loopback, so the

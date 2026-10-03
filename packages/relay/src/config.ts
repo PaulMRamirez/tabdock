@@ -7,6 +7,7 @@
 // and the session and attachment lifetimes follow ADR 0009. The M3 spike's
 // measurement flag (ADR 0014) is refused in production.
 
+import { isIPv6 } from 'node:net';
 import {
   ATTACH_REQUEST_TTL_MS,
   DEFAULT_CALL_DEADLINE_MS,
@@ -281,6 +282,31 @@ export function parseOrigin(value: string): string | null {
 
 /** The Host names the SDK's localhost guard accepts, as its own helper lists them. */
 export const LOOPBACK_HOSTNAMES: readonly string[] = ['localhost', '127.0.0.1', '[::1]'];
+
+/**
+ * RFC 9110's Host, uri-host [":" port], narrowed to what clients send: a
+ * reg-name of RFC 3986's unreserved characters (a dotted IPv4 address is one),
+ * or an IPv6 address in brackets, and a port of one to five digits.
+ */
+const HOST_HEADER = /^(?<host>[a-z0-9._~-]+|\[(?<ipv6>[0-9a-f:.]+)\])(?::(?<port>\d{1,5}))?$/i;
+
+/**
+ * The host a Host header names, lower-cased and without its port, or null
+ * when the header is not a host at all. The URL parser is no test of that: it
+ * drops userinfo, a path or a fragment and rewrites numeric and
+ * percent-encoded forms, so 'evil@localhost' or '2130706433' would read as
+ * loopback. Callers compare the result exactly, so only the names as written
+ * pass an allowlist.
+ */
+export function parseHostHeader(header: string): string | null {
+  const groups = HOST_HEADER.exec(header)?.groups;
+  const host = groups?.host;
+  if (host === undefined) return null;
+  if (groups?.ipv6 !== undefined && !isIPv6(groups.ipv6)) return null;
+  // The adapter rebuilds the request URL from Host, and the URL parser refuses a larger port.
+  if (groups?.port !== undefined && Number(groups.port) > 65_535) return null;
+  return host.toLowerCase();
+}
 
 /**
  * The public URL as an origin (https, no path, no credentials), or an error

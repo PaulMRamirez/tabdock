@@ -14,8 +14,10 @@ import {
   type StoredOAuthTokens,
   StreamableHTTPClientTransport,
 } from '@modelcontextprotocol/client';
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { generateKeyPair, SignJWT, UnsecuredJWT } from 'jose';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   createOAuthAuth,
   createRelay,
@@ -23,6 +25,7 @@ import {
   type OAuthUser,
   type Relay,
 } from '../src/index.ts';
+import { JWKS_RETRY_MS, STALE_KEYS_MAX_AGE_MS } from '../src/oauth.ts';
 import { PAGE_ORIGIN } from './helpers/page-client.ts';
 import {
   goodMetadata,
@@ -470,6 +473,148 @@ describe('tokens (ADR 0013)', () => {
     expect(answer.headers.get('retry-after')).toBe('5');
     expect(answer.headers.get('www-authenticate')).toBeNull();
     expect(lines.join('\n')).toContain('identity provider keys unreachable');
+  });
+});
+
+describe("the provider's key set while it cannot be fetched", () => {
+  /**
+   * Stands in for the provider's jwks_uri: counts every fetch, and while
+   * `failing` answers 500 as a provider in trouble would, else passes the
+   * provider's real key set on.
+   */
+  const keySet = { fetches: 0, failing: false };
+  let keyServer: Server | undefined;
+  /** jose's default cacheMaxAge, which the plugin keeps: past it a lookup refetches. */
+  const JOSE_CACHE_MAX_AGE_MS = 10 * 60_000;
+  /** Shaped like a provider token (RS256), so it reaches the key lookup, but signed by nobody. */
+  const forged = (kid: string): string => {
+    const part = (value: unknown): string =>
+      Buffer.from(JSON.stringify(value)).toString('base64url');
+    return `Bearer ${part({ alg: 'RS256', kid })}.${part({ sub: 'x' })}.${part('sig')}`;
+  };
+
+  beforeEach(async () => {
+    keySet.fetches = 0;
+    keySet.failing = false;
+    const server = createServer((_request, response) => {
+      keySet.fetches += 1;
+      if (keySet.failing) {
+        response.writeHead(500, { 'Content-Type': 'text/plain' });
+        response.end('down');
+        return;
+      }
+      fetch(`${provider.issuer}/jwks`)
+        .then(async (upstream) => {
+          response.writeHead(upstream.status, { 'Content-Type': 'application/json' });
+          response.end(await upstream.text());
+        })
+        .catch(() => {
+          response.writeHead(502);
+          response.end();
+        });
+    });
+    keyServer = server;
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const { port } = server.address() as AddressInfo;
+    provider.oauthMetadata = {
+      ...goodMetadata(provider.issuer),
+      jwks_uri: `http://127.0.0.1:${String(port)}/jwks`,
+    };
+    await startPublicRelay();
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    const server = keyServer;
+    keyServer = undefined;
+    if (server === undefined) return;
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => {
+      server.close(() => {
+        resolve();
+      });
+    });
+  });
+
+  it('fetches once per Retry-After from a cold start, whatever tokens arrive, then works once the keys are back', async () => {
+    // Only Date is faked: jose and the plugin time the key set by it, and the test steps it.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    keySet.failing = true;
+    const token = `Bearer ${await aliceToken()}`;
+    const answers: RawAnswer[] = [];
+    for (let index = 0; index < 10; index += 1) {
+      answers.push(await send(DISCOVER, index % 2 === 0 ? token : forged(`kid-${String(index)}`)));
+    }
+    answers.push(
+      ...(await Promise.all(Array.from({ length: 10 }, () => send(DISCOVER, forged('spray'))))),
+    );
+    for (const answer of answers) {
+      expect(answer.status, answer.body).toBe(503);
+      expect(answer.headers.get('www-authenticate')).toBeNull();
+    }
+    const retryAfter = Number(answers[0]?.headers.get('retry-after'));
+    expect(retryAfter).toBe(5);
+    expect(keySet.fetches).toBe(1);
+
+    // The provider is back, but the relay waits out the time it asked clients to wait.
+    keySet.failing = false;
+    vi.setSystemTime(Date.now() + retryAfter * 1000 - 1);
+    expect((await send(DISCOVER, token)).status).toBe(503);
+    expect(keySet.fetches).toBe(1);
+    vi.setSystemTime(Date.now() + 1);
+    const back = await send(DISCOVER, token);
+    expect(back.status, back.body).toBe(200);
+    expect(keySet.fetches).toBe(2);
+    // Cached again: valid tokens pass and forged ones are refused, with no fetch for either.
+    expect((await send(DISCOVER, token)).status).toBe(200);
+    expectChallenge(await send(DISCOVER, forged('spray')), /key the provider does not publish/);
+    expect(keySet.fetches).toBe(2);
+  });
+
+  it('checks tokens with the last key set it fetched while a refresh fails, for a bounded time', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const fetchedAt = Date.now();
+    expect((await send(DISCOVER, `Bearer ${await aliceToken()}`)).status).toBe(200);
+    expect(keySet.fetches).toBe(1);
+
+    // Past jose's cache life a refresh is due, and it fails.
+    keySet.failing = true;
+    vi.setSystemTime(fetchedAt + JOSE_CACHE_MAX_AGE_MS + 1);
+    const token = `Bearer ${await aliceToken()}`;
+    const stale = await send(DISCOVER, token);
+    expect(stale.status, stale.body).toBe(200);
+    expect(keySet.fetches).toBe(2);
+    // The old keys still check signatures: an altered token is the token's fault.
+    const [header, , signature] = (await aliceToken()).split('.');
+    const altered = Buffer.from(
+      JSON.stringify({
+        sub: 'sub-alice',
+        aud: PUBLIC_MCP_URL,
+        iss: provider.issuer,
+        exp: now() + 600,
+      }),
+    ).toString('base64url');
+    expectChallenge(
+      await send(DISCOVER, `Bearer ${header ?? ''}.${altered}.${signature ?? ''}`),
+      /signature is invalid/,
+    );
+    // A key they lack may be one published since: the provider's to answer, so 503, not a sign-in.
+    const unknown = await send(DISCOVER, forged('published-since'));
+    expect(unknown.status).toBe(503);
+    expect(unknown.headers.get('retry-after')).toBe('5');
+    expect(keySet.fetches).toBe(2);
+
+    // Past the bound the old keys no longer stand in for the provider's.
+    vi.setSystemTime(fetchedAt + STALE_KEYS_MAX_AGE_MS + 1);
+    expect((await send(DISCOVER, `Bearer ${await aliceToken()}`)).status).toBe(503);
+    expect(keySet.fetches).toBe(3);
+    // And once a fetch succeeds again, the fresh keys take over.
+    keySet.failing = false;
+    vi.setSystemTime(Date.now() + JWKS_RETRY_MS);
+    expect((await send(DISCOVER, `Bearer ${await aliceToken()}`)).status).toBe(200);
+    expect(keySet.fetches).toBe(4);
   });
 });
 

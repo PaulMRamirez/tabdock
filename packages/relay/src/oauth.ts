@@ -8,9 +8,12 @@
 // RS256 only, the provider's published keys, issuer, audience and expiry. Any
 // bad token becomes the SDK's 401 challenge with resource_metadata, which is the
 // only answer that makes Claude sign in; a token's `sub` must then map to a
-// member, or the answer is a plain 403, which Claude treats as final. The same
-// mapping, which says what kind of account a subject is (ADR 0016), serves the
-// browser sign-in at /pair, so a person is one user on both.
+// member, or the answer is a plain 403, which Claude treats as final. Keys that
+// cannot be fetched are the provider's fault, not the token's: a 503 with
+// Retry-After, no new fetch until then, and meanwhile the last key set fetched,
+// while it is young, still checks tokens. The same mapping, which says what
+// kind of account a subject is (ADR 0016), serves the browser sign-in at /pair,
+// so a person is one user on both.
 
 import type { IncomingMessage } from 'node:http';
 import {
@@ -26,7 +29,17 @@ import {
   verifyBearerToken,
 } from '@modelcontextprotocol/server';
 import { IdSchema, type User, UserSchema } from '@tabdock/protocol';
-import { createRemoteJWKSet, errors, type JWTPayload, type JWTVerifyGetKey, jwtVerify } from 'jose';
+import {
+  createLocalJWKSet,
+  createRemoteJWKSet,
+  errors,
+  type ExportedJWKSCache,
+  type JWKSCacheInput,
+  jwksCache,
+  type JWTPayload,
+  type JWTVerifyGetKey,
+  jwtVerify,
+} from 'jose';
 import { z } from 'zod';
 import type {
   Account,
@@ -58,6 +71,19 @@ export interface OAuthAuthOptions {
 export const DISCOVERY_TIMEOUT_MS = 10_000;
 /** jose's default; a key fetch slower than this fails the request with 503. */
 export const JWKS_TIMEOUT_MS = 5000;
+/**
+ * After a key set fetch fails, the relay answers 503 for this long without
+ * fetching again, and says so in Retry-After. jose remembers no failure, so
+ * without it every request bearing an RS256-shaped token, forged or not,
+ * would be one more fetch at a provider already in trouble.
+ */
+export const JWKS_RETRY_MS = 5000;
+/**
+ * While fetches fail, the last key set fetched still checks tokens until it
+ * is this old: long enough to ride out an outage, short enough that a key the
+ * provider withdrew does not stay trusted for long.
+ */
+export const STALE_KEYS_MAX_AGE_MS = 30 * 60_000;
 /** Small: enough for clocks a little apart, never enough to stretch a token's life. */
 export const CLOCK_TOLERANCE_SECONDS = 5;
 /** Provider tokens are a kilobyte or two; past this, a header is not a token. */
@@ -409,25 +435,59 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
       // The SDK's own checks on the issuer, once now rather than on the first request.
       buildOAuthProtectedResourceMetadata(metadataOptions);
 
+      // jose writes the last key set it fetched here, with when it did; it
+      // starts empty, which jose's own type allows only as Record<string, never>.
+      const fetched: Partial<ExportedJWKSCache> = {};
       const jwks = createRemoteJWKSet(new URL(metadata.jwks_uri), {
         timeoutDuration: JWKS_TIMEOUT_MS,
+        [jwksCache]: fetched as JWKSCacheInput,
       });
+      let failedAt = Number.NEGATIVE_INFINITY;
+      let lastGood: { fetchedAt: number; keys: JWTVerifyGetKey } | null = null;
+      /** The last key set fetched, while it is young enough to stand in for the provider's. */
+      const standIn = (now: number): JWTVerifyGetKey | null => {
+        const { uat, jwks: set } = fetched;
+        if (uat === undefined || set === undefined || now - uat > STALE_KEYS_MAX_AGE_MS) {
+          return null;
+        }
+        if (lastGood?.fetchedAt !== uat) {
+          lastGood = { fetchedAt: uat, keys: createLocalJWKSet(set) };
+        }
+        return lastGood.keys;
+      };
       // A key that is not published is the token's fault (401); keys that
       // cannot be fetched at all are the provider's (503).
       const keys: JWTVerifyGetKey = async (header, token) => {
-        try {
-          return await jwks(header, token);
-        } catch (error) {
-          if (
-            error instanceof errors.JWKSNoMatchingKey ||
-            error instanceof errors.JWKSMultipleMatchingKeys
-          ) {
-            throw error;
+        const sinceFailure = Date.now() - failedAt;
+        let cause: unknown;
+        // A clock set back counts as still waiting, never as a reason to fetch.
+        if (!(sinceFailure >= 0 && sinceFailure < JWKS_RETRY_MS)) {
+          try {
+            return await jwks(header, token);
+          } catch (error) {
+            if (
+              error instanceof errors.JWKSNoMatchingKey ||
+              error instanceof errors.JWKSMultipleMatchingKeys
+            ) {
+              throw error;
+            }
+            // A first fetch that fails counts too, so a cold start waits like any other.
+            failedAt = Date.now();
+            cause = error;
           }
-          throw new ProviderUnavailable('the identity provider keys cannot be fetched', {
-            cause: error,
-          });
         }
+        const stale = standIn(Date.now());
+        if (stale !== null) {
+          try {
+            return await stale(header, token);
+          } catch (error) {
+            if (error instanceof errors.JWKSMultipleMatchingKeys) throw error;
+            // A key missing from the old set may have been published since; that
+            // is for the provider to answer once it is back, so not a 401.
+            cause = error;
+          }
+        }
+        throw new ProviderUnavailable('the identity provider keys cannot be fetched', { cause });
       };
       verifier = {
         async verifyAccessToken(token): Promise<AuthInfo> {
@@ -492,7 +552,7 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
             status: 503,
             reason: 'identity provider keys unreachable',
             body: 'Sign-in cannot be checked right now; try again shortly',
-            headers: { 'Retry-After': '5' },
+            headers: { 'Retry-After': String(Math.ceil(JWKS_RETRY_MS / 1000)) },
           };
         }
         return challenge(error);

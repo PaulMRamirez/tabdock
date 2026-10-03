@@ -379,23 +379,28 @@ describe('what the spike logs', () => {
 });
 
 describe('the pairing milestones, which /pair reports through the hub', () => {
-  it('time a scan through claim and approval to the first call, under one trace per ticket', async () => {
+  it('time a scan through claim and approval to the first call, under one trace per ticket', () => {
     const lines: string[] = [];
+    // A clock the test steps, so every interval below is exact rather than a timer's best effort.
+    let clock = 1_000_000;
     const spike = new Spike(
       createLogger({ sink: (line) => lines.push(line), level: 'debug' }),
       1024,
+      { now: () => clock },
     );
     spike.pairingIssued('pg_page');
     spike.pairingScanned('pg_page');
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    clock += 20;
     // The page looks again after sign-in; that is no second scan.
     spike.pairingScanned('pg_page');
     spike.pairingClaimed('pg_page', 'alice', 'qr');
     // The hub replaces the spent ticket after the claim; the claim keeps the old one's trace.
     spike.pairingIssued('pg_page');
+    clock += 5;
     spike.pairingDecided('pg_page', 'alice', true);
     // Someone else's call, and a call before any approval, are not this pairing's first call.
     spike.callFinished('pg_page', 'bob', 'ok');
+    clock += 7;
     spike.callFinished('pg_page', 'alice', 'ok');
     spike.callFinished('pg_page', 'alice', 'ok');
     const stages = lines
@@ -419,14 +424,22 @@ describe('the pairing milestones, which /pair reports through the hub', () => {
       'first_call',
     ]);
     expect(stages[3]?.trace).not.toBe(trace);
+    expect(stages[2]).toMatchObject({ sinceIssuedMs: 20, sinceScannedMs: 20 });
+    expect(stages[4]).toMatchObject({ sinceClaimedMs: 5, sinceScannedMs: 25 });
     const first = stages[5];
-    expect(first).toMatchObject({ via: 'qr', userId: 'alice', outcome: 'ok' });
-    expect(first?.sinceScannedMs).toBeGreaterThanOrEqual(20);
-    expect(first?.sinceIssuedMs).toBeGreaterThanOrEqual(20);
+    expect(first).toMatchObject({
+      via: 'qr',
+      userId: 'alice',
+      outcome: 'ok',
+      sinceApprovedMs: 7,
+      sinceClaimedMs: 12,
+      sinceScannedMs: 32,
+      sinceIssuedMs: 32,
+    });
 
     // A code claim is timed from the ticket that matched, and a scan of an earlier ticket is not its scan.
     spike.pairingScanned('pg_page');
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    clock += 20;
     spike.pairingClaimed('pg_page', 'carol', 'code');
     // A refusal closes the record, so a later call is no first call either.
     spike.pairingDecided('pg_page', 'carol', false);
@@ -435,8 +448,13 @@ describe('the pairing milestones, which /pair reports through the hub', () => {
     expect(after.filter((line) => line.stage === 'first_call')).toHaveLength(1);
     const carol = after.filter((line) => line.userId === 'carol');
     expect(carol.map((line) => line.stage)).toEqual(['claimed', 'refused']);
-    expect(carol[0]).toMatchObject({ via: 'code', trace: stages[3]?.trace, sinceScannedMs: null });
-    expect(carol[0]?.sinceIssuedMs).toBeGreaterThanOrEqual(20);
+    // Its ticket was issued when Alice claimed hers, 32 ms before.
+    expect(carol[0]).toMatchObject({
+      via: 'code',
+      trace: stages[3]?.trace,
+      sinceIssuedMs: 32,
+      sinceScannedMs: null,
+    });
     expect(after.at(-1)).toMatchObject({ stage: 'refused', via: 'code' });
   });
 });
