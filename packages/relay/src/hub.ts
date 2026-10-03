@@ -141,6 +141,17 @@ interface ArgCheckEntry {
   warned: boolean;
 }
 
+/** The page sessions one remote address created and still holds, awake or asleep. */
+interface AddressSessions {
+  pages: Set<string>;
+  /** Those asleep, oldest asleep first: a page joins at the end when it falls asleep. */
+  asleep: Set<string>;
+}
+
+function firstOf(set: ReadonlySet<string> | undefined): string | undefined {
+  return set?.values().next().value;
+}
+
 interface Conn {
   ws: WebSocket;
   origin: string;
@@ -152,10 +163,14 @@ interface Conn {
   idleTimer: NodeJS.Timeout | null;
   /** Calls whose invoke went out on this socket and that have not settled yet. */
   inflight: Map<string, PendingCall>;
+  /** When this socket's recent tools frames arrived, for toolsFramesPerSocket. */
+  toolsFrames: number[];
 }
 
 const CLOSE_POLICY = 1008;
 const CLOSE_GOING_AWAY = 1001;
+/** The standard "try again later": a page refused for want of room reconnects with backoff. */
+const CLOSE_TRY_AGAIN_LATER = 1013;
 /** A newer socket resumed this page's session. */
 export const CLOSE_RESUMED_ELSEWHERE = CLOSE_REPLACED;
 const CLOSE_GRACE_MS = 2000;
@@ -345,6 +360,18 @@ export class PageHub {
   readonly #live = new Map<string, Conn>();
   /** Open page sockets per remote address, for pageSocketsPerAddress. */
   readonly #socketsByAddress = new Map<string, number>();
+  /**
+   * The address that created each awake or asleep page; its size is the page
+   * sessions held (pageSessions). A page stays counted there until it is gone,
+   * even if it resumes from elsewhere.
+   */
+  readonly #pageAddress = new Map<string, string>();
+  /** Page sessions per creating address, for pageSessionsPerAddress. */
+  readonly #sessionsByAddress = new Map<string, AddressSessions>();
+  /** Every asleep page, oldest asleep first, so making room never scans the store. */
+  readonly #asleep = new Set<string>();
+  /** Gone pages still remembered for page_gone, oldest first, at most pageSessions of them. */
+  readonly #tombstones = new Set<string>();
   readonly #pairingTimers = new Map<string, NodeJS.Timeout>();
   /** asleep to gone, then gone to forgotten. */
   readonly #lifecycleTimers = new Map<string, NodeJS.Timeout>();
@@ -360,6 +387,10 @@ export class PageHub {
   readonly #argChecks = new Map<string, Map<string, ArgCheckEntry>>();
   /** When each page last got a roster, for EXPIRY_ROSTER_REFRESH_MS. */
   readonly #rosterSentAt = new Map<string, number>();
+  /** When each page last got a roster for what a call alone changed (expiry or a new client). */
+  readonly #callRosterAt = new Map<string, number>();
+  /** A roster held back by the refresh step, so a new client still reaches the page. */
+  readonly #rosterTimers = new Map<string, NodeJS.Timeout>();
   readonly #userLimiter: SlidingWindowLimiter;
   readonly #addressLimiter: SlidingWindowLimiter;
   readonly #callLimiter: SlidingWindowLimiter;
@@ -380,11 +411,10 @@ export class PageHub {
 
   /**
    * Whether one more page socket from this address fits, asked before the
-   * upgrade so a refusal is a plain HTTP status. When the relay holds as many
-   * page sessions as it may, the page asleep longest becomes gone to make room,
-   * as it would at the end of its resume window; with none asleep, the socket is
-   * refused. ws completes the upgrade in the same turn, so acceptSocket counts
-   * this socket before any other upgrade is asked about.
+   * upgrade so a refusal is a plain HTTP status. Only open sockets count here:
+   * whether a socket resumes a session or needs room for a new one is known only
+   * at its hello (#makeRoom). ws completes the upgrade in the same turn, so
+   * acceptSocket counts this socket before any other upgrade is asked about.
    */
   admitSocket(address: string): SocketRefusal | null {
     const { pageSocketsPerAddress, pageSessions } = this.#config.limits;
@@ -392,22 +422,50 @@ export class PageHub {
       this.#log.warn('page socket refused: too many from one address', { address });
       return { status: 429, message: 'Too many page sockets from this address' };
     }
-    const asleep = this.#store.pages.all().filter((page) => page.state === 'asleep');
-    if (this.#conns.size + asleep.length >= pageSessions) {
-      const oldest = asleep.reduce<PageRecord | undefined>(
-        (first, page) => (first && (first.asleepAt ?? 0) <= (page.asleepAt ?? 0) ? first : page),
-        undefined,
-      );
-      if (!oldest) {
-        this.#log.warn('page socket refused: the relay holds the most page sessions allowed', {
+    // Ending asleep pages frees no sockets, so open ones alone are refused outright.
+    if (this.#conns.size >= pageSessions) {
+      this.#log.warn('page socket refused: the relay holds the most page sockets allowed', {
+        address,
+      });
+      return { status: 503, message: 'The relay holds as many pages as it can; try again later' };
+    }
+    return null;
+  }
+
+  /**
+   * Room for one new page session, made at its hello; a resume only wakes its
+   * own record and never needs any. An address at pageSessionsPerAddress ends
+   * its own page asleep longest, so churn from one address never ends anyone
+   * else's page. At pageSessions the relay ends that address's own sleeper if it
+   * has one, else the page asleep longest, as at the end of its resume window.
+   * Returns why there is no room when nothing asleep can make way.
+   */
+  #makeRoom(address: string): string | null {
+    const { pageSessionsPerAddress, pageSessions } = this.#config.limits;
+    const own = this.#sessionsByAddress.get(address);
+    if ((own?.pages.size ?? 0) >= pageSessionsPerAddress) {
+      const oldest = firstOf(own?.asleep);
+      if (oldest === undefined) {
+        this.#log.warn('page session refused: too many from one address', { address });
+        return 'too many pages from this address; try again later';
+      }
+      this.#log.info("ended this address's page asleep longest to make room for its new one", {
+        pageId: oldest,
+      });
+      this.#gone(oldest);
+    }
+    if (this.#pageAddress.size >= pageSessions) {
+      const oldest = firstOf(own?.asleep) ?? firstOf(this.#asleep);
+      if (oldest === undefined) {
+        this.#log.warn('page session refused: the relay holds the most page sessions allowed', {
           address,
         });
-        return { status: 503, message: 'The relay holds as many pages as it can; try again later' };
+        return 'the relay holds as many pages as it can; try again later';
       }
       this.#log.info('ended the page asleep longest to make room for a new one', {
-        pageId: oldest.pageId,
+        pageId: oldest,
       });
-      this.#gone(oldest.pageId);
+      this.#gone(oldest);
     }
     return null;
   }
@@ -428,6 +486,7 @@ export class PageHub {
       pingTimer: null,
       idleTimer: null,
       inflight: new Map(),
+      toolsFrames: [],
     };
     this.#conns.add(conn);
     this.#socketsByAddress.set(address, (this.#socketsByAddress.get(address) ?? 0) + 1);
@@ -488,7 +547,7 @@ export class PageHub {
         this.#closeSocket(conn, CLOSE_POLICY, 'hello sent twice');
         return;
       case 'tools':
-        this.#tools(pageId, frame);
+        if (this.#toolsFrameAllowed(conn)) this.#tools(pageId, frame);
         return;
       case 'attach_decision':
         this.#decision(pageId, frame);
@@ -551,6 +610,9 @@ export class PageHub {
         this.#dropRequests(page.pageId);
       }
       this.#clearTimer(this.#lifecycleTimers, page.pageId);
+      this.#asleep.delete(page.pageId);
+      const creator = this.#pageAddress.get(page.pageId);
+      if (creator !== undefined) this.#sessionsByAddress.get(creator)?.asleep.delete(page.pageId);
       // The adapter lists its tools again right after the welcome. Until then any
       // held here belong to a replaced socket, and a toolCount from them would
       // tell list_pages callers the page is ready while calls still wait.
@@ -562,8 +624,20 @@ export class PageHub {
       page.adapterVersion = frame.adapterVersion;
       page.policy = frame.policy;
     } else {
+      const noRoom = this.#makeRoom(conn.address);
+      if (noRoom !== null) {
+        this.#closeSocket(conn, CLOSE_TRY_AGAIN_LATER, noRoom);
+        return;
+      }
       let pageId = newId('pg');
       while (this.#store.pages.get(pageId)) pageId = newId('pg');
+      this.#pageAddress.set(pageId, conn.address);
+      let sessions = this.#sessionsByAddress.get(conn.address);
+      if (!sessions) {
+        sessions = { pages: new Set(), asleep: new Set() };
+        this.#sessionsByAddress.set(conn.address, sessions);
+      }
+      sessions.pages.add(pageId);
       page = {
         pageId,
         origin: conn.origin,
@@ -630,6 +704,24 @@ export class PageHub {
       this.#closeSocket(conn, CLOSE_GOING_AWAY, 'idle timeout');
     }, idleTimeoutMs);
     conn.idleTimer.unref();
+  }
+
+  /**
+   * A tools frame costs a compile per tool (ADR 0008), so each socket gets a
+   * budget of them (S9). Past it the socket is closed as a policy breach, which
+   * leaves the page asleep and resumable like any other close.
+   */
+  #toolsFrameAllowed(conn: Conn): boolean {
+    const now = Date.now();
+    const { toolsFramesPerSocket, toolsFramesWindowMs } = this.#config.rateLimits;
+    conn.toolsFrames = conn.toolsFrames.filter((at) => at > now - toolsFramesWindowMs);
+    if (conn.toolsFrames.length >= toolsFramesPerSocket) {
+      this.#log.warn('closing page socket: too many tools frames', { pageId: conn.pageId });
+      this.#closeSocket(conn, CLOSE_POLICY, 'too many tools frames');
+      return false;
+    }
+    conn.toolsFrames.push(now);
+    return true;
   }
 
   #tools(pageId: string, frame: FrameOf<'tools'>): void {
@@ -703,8 +795,13 @@ export class PageHub {
     page.tools = [];
     this.#argChecks.delete(pageId);
     this.#store.pages.put(page);
+    this.#asleep.add(pageId);
+    const creator = this.#pageAddress.get(pageId);
+    if (creator !== undefined) this.#sessionsByAddress.get(creator)?.asleep.add(pageId);
     this.#store.tickets.deleteForPage(pageId);
     this.#clearTimer(this.#pairingTimers, pageId);
+    // The welcome on resume carries the roster as it is by then.
+    this.#clearTimer(this.#rosterTimers, pageId);
     this.#dropRequests(pageId);
     this.#setTimer(this.#lifecycleTimers, pageId, this.#config.timings.resumeWindowMs, () => {
       this.#gone(pageId);
@@ -737,14 +834,41 @@ export class PageHub {
     page.resumeTokenHash = '';
     page.tools = [];
     page.formerAttachments = attachments.map(({ userId, role }) => ({ userId, role }));
+    // A gone record keeps only what list_pages, page_gone and detach_page read.
+    page.url = '';
+    page.adapterVersion = '';
+    page.policy = { ...page.policy, consequentialTools: [] };
     this.#store.pages.put(page);
     this.#argChecks.delete(pageId);
     this.#rosterSentAt.delete(pageId);
+    this.#callRosterAt.delete(pageId);
+    this.#asleep.delete(pageId);
+    const creator = this.#pageAddress.get(pageId);
+    this.#pageAddress.delete(pageId);
+    if (creator !== undefined) {
+      const sessions = this.#sessionsByAddress.get(creator);
+      sessions?.pages.delete(pageId);
+      sessions?.asleep.delete(pageId);
+      if (sessions?.pages.size === 0) this.#sessionsByAddress.delete(creator);
+    }
+    this.#tombstones.add(pageId);
     this.#setTimer(this.#lifecycleTimers, pageId, this.#config.timings.goneTombstoneMs, () => {
-      this.#store.pages.delete(pageId);
-      this.#log.debug('gone page forgotten', { pageId });
+      this.#forget(pageId);
     });
+    // Bounded by count as well as time, so pages that detach fast cannot pile them up.
+    for (const oldest of this.#tombstones) {
+      if (this.#tombstones.size <= this.#config.limits.pageSessions) break;
+      this.#clearTimer(this.#lifecycleTimers, oldest);
+      this.#forget(oldest);
+    }
     this.#log.info('page gone', { pageId, attachmentsDeleted: attachments.length });
+  }
+
+  /** A gone page is dropped for good; its former users hear not_attached from then on. */
+  #forget(pageId: string): void {
+    this.#tombstones.delete(pageId);
+    this.#store.pages.delete(pageId);
+    this.#log.debug('gone page forgotten', { pageId });
   }
 
   // Pairing tickets
@@ -829,12 +953,16 @@ export class PageHub {
   }
 
   #grant(
-    request: Pick<AttachRequestRecord, 'pageId' | 'userId' | 'displayName' | 'client'>,
+    request: Pick<AttachRequestRecord, 'pageId' | 'userId' | 'displayName' | 'client'> &
+      Partial<Pick<AttachRequestRecord, 'joined'>>,
     wanted: Role,
   ): AttachmentRecord {
     const existing = this.#store.attachments.get(request.pageId, request.userId);
     if (existing) return existing;
     const now = Date.now();
+    // Newest first, as every roster lists clients; a joined device came after the first.
+    const clients = [...(request.joined ?? [])].reverse();
+    if (request.client) clients.push(request.client);
     const attachment: AttachmentRecord = {
       pageId: request.pageId,
       userId: request.userId,
@@ -843,7 +971,7 @@ export class PageHub {
       grantedAt: now,
       lastUsedAt: null,
       expiresAt: now + this.#config.timings.attachmentIdleMs,
-      clients: request.client ? [request.client] : [],
+      clients: clients.slice(0, MAX_ROSTER_CLIENTS),
     };
     this.#store.attachments.put(attachment);
     this.#armExpiry(attachment);
@@ -985,6 +1113,8 @@ export class PageHub {
   }
 
   #sendRoster(pageId: string): void {
+    // Whatever a held-back roster was for, this one carries it.
+    this.#clearTimer(this.#rosterTimers, pageId);
     const conn = this.#live.get(pageId);
     if (!conn) return;
     this.#send(conn, { t: 'roster', attachments: this.#roster(pageId) });
@@ -1050,8 +1180,9 @@ export class PageHub {
         toolCount: page.tools.length,
       });
     }
-    for (const page of this.#store.pages.all()) {
-      if (page.state !== 'gone') continue;
+    for (const pageId of this.#tombstones) {
+      const page = this.#store.pages.get(pageId);
+      if (page?.state !== 'gone') continue;
       const former = page.formerAttachments.find((entry) => entry.userId === userId);
       if (!former) continue;
       listings.push({
@@ -1154,7 +1285,10 @@ export class PageHub {
     this.#expireIfDue(page.pageId, caller.userId);
     const existing = this.#store.attachments.get(page.pageId, caller.userId);
     if (existing) {
-      this.#touchClients(existing, caller.client);
+      // Named at once: this device used a code the operator just showed, so it cannot churn.
+      const named = this.#recordClient(existing, caller.client);
+      this.#store.attachments.put(existing);
+      if (named) this.#sendRoster(page.pageId);
       return {
         kind: 'attached',
         pageId: page.pageId,
@@ -1179,6 +1313,15 @@ export class PageHub {
       .listForPage(page.pageId)
       .find((candidate) => candidate.userId === caller.userId);
     if (pending) {
+      const joining = caller.client;
+      const known = [pending.client, ...pending.joined].some(
+        (seen) => seen !== null && joining !== null && sameClient(seen, joining),
+      );
+      // Bounded like the roster's own list; each join already spent a fresh code.
+      if (joining && !known && pending.joined.length < MAX_ROSTER_CLIENTS) {
+        pending.joined.push(joining);
+        this.#store.requests.put(pending);
+      }
       this.#log.info('pair_page joined a pending attach request', {
         pageId: pending.pageId,
         userId: pending.userId,
@@ -1212,6 +1355,7 @@ export class PageHub {
       ...request,
       requestId: newId('rq'),
       via: 'code',
+      joined: [],
       expiresAt: now + attachRequestTtlMs,
     };
     this.#store.requests.put(record);
@@ -1343,9 +1487,14 @@ export class PageHub {
       );
     }
     this.#callLimiter.record(rateKey, arrivedAt);
-    this.#touchAttachment(attachment, caller.client, arrivedAt);
 
     const tool = page.tools.find((candidate) => candidate.name === toolName);
+    const allowed =
+      tool !== undefined &&
+      (attachment.role === 'driver' || tool.annotations?.readOnlyHint === true);
+    // Every call moves the expiry, but only one that passes the tool and role
+    // checks names its client: refused calls must not add names to the roster.
+    this.#touchAttachment(attachment, allowed ? caller.client : null, arrivedAt);
     if (!tool) {
       return Promise.resolve(
         hubError('tool_not_found', `page ${pageId} has no tool named ${toolName}`),
@@ -1603,37 +1752,55 @@ export class PageHub {
 
   /**
    * Every call moves its attachment's expiry (ADR 0009) and records the calling
-   * client. The roster goes out when a client is new, or when the expiry it
-   * shows has fallen behind by a refresh step.
+   * client, if any. Neither alone sends a roster more than once per refresh step:
+   * a moved expiry waits until the one the page shows has fallen a step behind,
+   * and a new client goes out at once only if no roster went out for a call in
+   * the last step, otherwise with a trailing roster at the end of it.
    */
   #touchAttachment(attachment: AttachmentRecord, client: ClientInfo | null, now: number): void {
+    const { pageId } = attachment;
     attachment.lastUsedAt = now;
     attachment.expiresAt = now + this.#config.timings.attachmentIdleMs;
     this.#armExpiry(attachment);
-    const step = Math.min(
+    const named = this.#recordClient(attachment, client);
+    this.#store.attachments.put(attachment);
+    const step = this.#rosterStep();
+    if (now - (this.#rosterSentAt.get(pageId) ?? 0) >= step) {
+      this.#sendCallRoster(pageId, now);
+      return;
+    }
+    if (!named || this.#rosterTimers.has(pageId)) return;
+    const since = now - (this.#callRosterAt.get(pageId) ?? 0);
+    if (since >= step) {
+      this.#sendCallRoster(pageId, now);
+      return;
+    }
+    this.#setTimer(this.#rosterTimers, pageId, step - since, () => {
+      this.#sendCallRoster(pageId, Date.now());
+    });
+  }
+
+  /** How often at most a roster goes out for what calls alone change. */
+  #rosterStep(): number {
+    return Math.min(
       EXPIRY_ROSTER_REFRESH_MS,
       Math.ceil(this.#config.timings.attachmentIdleMs / 10),
     );
-    const stale = now - (this.#rosterSentAt.get(attachment.pageId) ?? 0) >= step;
-    if (!this.#touchClients(attachment, client) && stale) this.#sendRoster(attachment.pageId);
   }
 
-  /**
-   * Records the calling client on the attachment, newest first. A new client
-   * changes the roster, which is then sent; returns whether it was.
-   */
-  #touchClients(attachment: AttachmentRecord, client: ClientInfo | null): boolean {
-    let changed = false;
-    if (client) {
-      const index = attachment.clients.findIndex((seen) => sameClient(seen, client));
-      if (index === -1) changed = true;
-      else attachment.clients.splice(index, 1);
-      attachment.clients.unshift(client);
-      attachment.clients.length = Math.min(attachment.clients.length, MAX_ROSTER_CLIENTS);
-    }
-    this.#store.attachments.put(attachment);
-    if (changed) this.#sendRoster(attachment.pageId);
-    return changed;
+  #sendCallRoster(pageId: string, now: number): void {
+    this.#sendRoster(pageId);
+    this.#callRosterAt.set(pageId, now);
+  }
+
+  /** Records a client on the attachment, newest first; returns whether it was new. */
+  #recordClient(attachment: AttachmentRecord, client: ClientInfo | null): boolean {
+    if (!client) return false;
+    const index = attachment.clients.findIndex((seen) => sameClient(seen, client));
+    if (index !== -1) attachment.clients.splice(index, 1);
+    attachment.clients.unshift(client);
+    attachment.clients.length = Math.min(attachment.clients.length, MAX_ROSTER_CLIENTS);
+    return index === -1;
   }
 
   detachPage(userId: string, pageId: string): DetachOutcome {
@@ -1735,6 +1902,7 @@ export class PageHub {
       this.#lifecycleTimers,
       this.#requestTimers,
       this.#expiryTimers,
+      this.#rosterTimers,
     ]) {
       for (const timer of map.values()) clearTimeout(timer);
       map.clear();

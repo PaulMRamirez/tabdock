@@ -34,16 +34,20 @@ export interface SocketOptions {
   /** null sends no Origin header at all. */
   origin?: string | null;
   protocols?: string[];
+  /**
+   * Another loopback address to connect from, such as 127.0.0.2, so a test can
+   * stand for a second remote address; per-address limits count by it.
+   */
+  localAddress?: string;
 }
 
 /** Opens a page socket; rejects with UpgradeRefused when the relay answers with an HTTP status. */
 export function openSocket(url: string, options: SocketOptions = {}): Promise<WebSocket> {
   const origin = options.origin === undefined ? PAGE_ORIGIN : options.origin;
-  const ws = new WebSocket(
-    url,
-    options.protocols ?? [SUBPROTOCOL],
-    origin === null ? {} : { origin },
-  );
+  const ws = new WebSocket(url, options.protocols ?? [SUBPROTOCOL], {
+    ...(origin === null ? {} : { origin }),
+    ...(options.localAddress === undefined ? {} : { localAddress: options.localAddress }),
+  });
   return new Promise((resolve, reject) => {
     ws.once('open', () => {
       resolve(ws);
