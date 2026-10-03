@@ -52,6 +52,14 @@ export interface RelayRateLimits {
   callsPerUserPerPage: number;
   /** The window every limit above counts over. */
   windowMs: number;
+  /**
+   * tools frames one page socket may send per toolsFramesWindowMs; past it the
+   * socket is closed with 1008 (S9). Each frame recompiles every tool's argument
+   * check (ADR 0008), so a page re-sending large ones could keep the relay busy.
+   */
+  toolsFramesPerSocket: number;
+  /** Short, so a burst is caught at once while a page that changes its tools now and then never is. */
+  toolsFramesWindowMs: number;
 }
 
 /** Capacities (S9, ADR 0009). Past one, the relay refuses rather than grows. */
@@ -64,9 +72,17 @@ export interface RelayLimits {
   usersPerPage: number;
   /** Mutating calls waiting behind the running one on one page. */
   queueDepth: number;
-  /** Page sockets open from one remote address. */
+  /** Page sockets open from one remote address, refused before the upgrade past it. */
   pageSocketsPerAddress: number;
-  /** Page sessions held in total: open page sockets plus asleep pages. */
+  /**
+   * Page sessions, awake or asleep, created from one remote address. Past it a
+   * new one ends that address's own page asleep longest, or is refused.
+   */
+  pageSessionsPerAddress: number;
+  /**
+   * Page sessions held in total, awake or asleep; also the most page sockets
+   * open at once, and the most gone pages remembered for page_gone.
+   */
   pageSessions: number;
 }
 
@@ -132,6 +148,8 @@ export const DEFAULT_RATE_LIMITS: RelayRateLimits = {
   pairAttemptsPerAddress: 30,
   callsPerUserPerPage: 120,
   windowMs: 60_000,
+  toolsFramesPerSocket: 10,
+  toolsFramesWindowMs: 10_000,
 };
 
 export const DEFAULT_LIMITS: RelayLimits = {
@@ -140,6 +158,7 @@ export const DEFAULT_LIMITS: RelayLimits = {
   usersPerPage: 10,
   queueDepth: 32,
   pageSocketsPerAddress: 20,
+  pageSessionsPerAddress: 20,
   pageSessions: 1000,
 };
 
@@ -232,6 +251,15 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     originPolicy = [...allowed].join(', ');
   }
 
+  // Every timing ends up in a setTimeout, so it must fit one.
+  const timings = positiveIntegers(DEFAULT_TIMINGS, options.timings, MAX_TIMER_MS);
+  // A call that reached its page is timed for both together.
+  if (timings.callDeadlineMs + timings.callDeadlineGraceMs > MAX_TIMER_MS) {
+    throw new Error(
+      `callDeadlineMs plus callDeadlineGraceMs must be at most ${String(MAX_TIMER_MS)}`,
+    );
+  }
+
   return {
     host,
     port,
@@ -240,8 +268,7 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     allowMissingOrigin,
     isOriginAllowed,
     originPolicy,
-    // Every timing ends up in a setTimeout, so it must fit one.
-    timings: positiveIntegers(DEFAULT_TIMINGS, options.timings, MAX_TIMER_MS),
+    timings,
     rateLimits: positiveIntegers(DEFAULT_RATE_LIMITS, options.rateLimits),
     limits: positiveIntegers(DEFAULT_LIMITS, options.limits),
   };
@@ -364,6 +391,10 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv): RelayOptions {
       pageSocketsPerAddress: parseCount(
         'TABDOCK_MAX_PAGE_SOCKETS_PER_ADDRESS',
         env.TABDOCK_MAX_PAGE_SOCKETS_PER_ADDRESS,
+      ),
+      pageSessionsPerAddress: parseCount(
+        'TABDOCK_MAX_PAGE_SESSIONS_PER_ADDRESS',
+        env.TABDOCK_MAX_PAGE_SESSIONS_PER_ADDRESS,
       ),
       pageSessions: parseCount('TABDOCK_MAX_PAGE_SESSIONS', env.TABDOCK_MAX_PAGE_SESSIONS),
     },

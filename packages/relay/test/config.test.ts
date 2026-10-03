@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage } from 'node:http';
 import { DEFAULT_CALL_DEADLINE_MS } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
-import { isLoopbackHost, resolveConfig } from '../src/config.ts';
+import { isLoopbackHost, MAX_TIMER_MS, resolveConfig } from '../src/config.ts';
 import {
   createDevTokenAuth,
   createRelay,
@@ -158,6 +158,7 @@ describe('origin policy (S1, S2)', () => {
       usersPerPage: 10,
       queueDepth: 32,
       pageSocketsPerAddress: 20,
+      pageSessionsPerAddress: 20,
       pageSessions: 1000,
     });
     expect(rateLimits.callsPerUserPerPage).toBe(120);
@@ -183,6 +184,21 @@ describe('origin policy (S1, S2)', () => {
     expect(() => resolveConfig({ auth, timings: { callDeadlineGraceMs: -1 } })).toThrow(
       /callDeadlineGraceMs/,
     );
+  });
+
+  it('refuses a call deadline whose sum with the grace would not fit one setTimeout', () => {
+    // A call's timer is armed for both together, and Node runs a longer one after 1 ms.
+    expect(() =>
+      resolveConfig({ auth, timings: { callDeadlineMs: MAX_TIMER_MS, callDeadlineGraceMs: 2000 } }),
+    ).toThrow(/callDeadlineMs plus callDeadlineGraceMs must be at most 2147483647/);
+    expect(() => resolveConfig({ auth, timings: { callDeadlineMs: MAX_TIMER_MS - 1999 } })).toThrow(
+      /callDeadlineMs plus callDeadlineGraceMs/,
+    );
+    const fits = resolveConfig({
+      auth,
+      timings: { callDeadlineMs: MAX_TIMER_MS - 2000, callDeadlineGraceMs: 2000 },
+    });
+    expect(fits.timings.callDeadlineMs + fits.timings.callDeadlineGraceMs).toBe(MAX_TIMER_MS);
   });
 });
 
@@ -223,6 +239,7 @@ describe('loadConfigFromEnv', () => {
       TABDOCK_MAX_USERS_PER_PAGE: ' 4 ',
       TABDOCK_MAX_QUEUE_DEPTH: '8',
       TABDOCK_MAX_PAGE_SOCKETS_PER_ADDRESS: '3',
+      TABDOCK_MAX_PAGE_SESSIONS_PER_ADDRESS: '6',
       TABDOCK_MAX_PAGE_SESSIONS: '30',
       TABDOCK_MAX_CALLS_PER_MINUTE: '60',
       TABDOCK_SESSION_IDLE_MINUTES: '10',
@@ -235,6 +252,7 @@ describe('loadConfigFromEnv', () => {
       usersPerPage: 4,
       queueDepth: 8,
       pageSocketsPerAddress: 3,
+      pageSessionsPerAddress: 6,
       pageSessions: 30,
     });
     expect(config.rateLimits.callsPerUserPerPage).toBe(60);

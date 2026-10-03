@@ -1,15 +1,17 @@
 // The section 9 limits with ADR 0009's defaults, each shrunk here to a few:
-// users per page, calls per user per page per window, page sockets per address
-// and page sessions in total.
+// users per page, calls per user per page per window, tools frames per socket,
+// page sockets and page sessions per address, and page sessions in total.
 
 import type { Client } from '@modelcontextprotocol/client';
+import { CLOSE_DETACH } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
-import { DEFAULT_LIMITS, DEFAULT_RATE_LIMITS } from '../src/index.ts';
+import { createMemoryStore, DEFAULT_LIMITS, DEFAULT_RATE_LIMITS } from '../src/index.ts';
 import {
   connectPage,
   type InvokeFrame,
   type InvokeReply,
   openSocket,
+  PAGE_ORIGIN,
   type PageOptions,
   TestPage,
   TOOLS,
@@ -79,10 +81,13 @@ describe('ADR 0009 defaults', () => {
       usersPerPage: 10,
       queueDepth: 32,
       pageSocketsPerAddress: 20,
+      pageSessionsPerAddress: 20,
       pageSessions: 1000,
     });
     expect(DEFAULT_RATE_LIMITS.callsPerUserPerPage).toBe(120);
     expect(DEFAULT_RATE_LIMITS.windowMs).toBe(60_000);
+    expect(DEFAULT_RATE_LIMITS.toolsFramesPerSocket).toBe(10);
+    expect(DEFAULT_RATE_LIMITS.toolsFramesWindowMs).toBe(10_000);
   });
 });
 
@@ -193,6 +198,40 @@ describe('calls per user per page (S9)', () => {
   });
 });
 
+describe('tools frames per socket (S9)', () => {
+  it('closes a socket that sends more tools frames than its budget, leaving the page asleep', async () => {
+    const { lines } = await setup({
+      rateLimits: { toolsFramesPerSocket: 3, toolsFramesWindowMs: 1000 },
+    });
+    // connectPage sends the first tools frame itself.
+    const opened = await page();
+    const alice = await client();
+    await pairAndApprove(alice, opened);
+    opened.send({ t: 'tools', tools: TOOLS });
+    opened.send({ t: 'tools', tools: TOOLS });
+    await opened.sync();
+    expect(opened.ws.readyState).toBe(opened.ws.OPEN);
+    opened.send({ t: 'tools', tools: TOOLS });
+    expect(await opened.closed).toEqual({ code: 1008, reason: 'too many tools frames' });
+    expect(lines.some((line) => line.includes('too many tools frames'))).toBe(true);
+    // A policy close is not a detach: the page sleeps and can resume with its attachments.
+    const back = await page({ resumeToken: opened.welcome?.resumeToken ?? '' });
+    expect(back.welcome?.resumed).toBe(true);
+    expect(back.welcome?.roster).toMatchObject([{ userId: 'alice' }]);
+  });
+
+  it('counts over a sliding window, so a page that spaces its changes out is never closed', async () => {
+    await setup({ rateLimits: { toolsFramesPerSocket: 2, toolsFramesWindowMs: 300 } });
+    const opened = await page();
+    for (let i = 0; i < 4; i += 1) {
+      await delay(200);
+      opened.send({ t: 'tools', tools: TOOLS });
+      await opened.sync();
+    }
+    expect(opened.ws.readyState).toBe(opened.ws.OPEN);
+  });
+});
+
 describe('page sockets (S9)', () => {
   it('refuses a socket past the per-address limit with 429, before upgrading', async () => {
     const { relay, lines } = await setup({ limits: { pageSocketsPerAddress: 2 } });
@@ -233,5 +272,176 @@ describe('page sockets (S9)', () => {
     const back = await page({ resumeToken: token });
     expect(back.welcome?.resumed).toBe(false);
     expect(awake.ws.readyState).toBe(awake.ws.OPEN);
+  });
+});
+
+/** A second remote address on the loopback, for per-address limits. */
+const OTHER_ADDRESS = '127.0.0.2';
+
+async function stateFor(who: Client, pageId: string): Promise<string | undefined> {
+  const listed = (await callTool(who, 'list_pages')).structured as {
+    pages: { page: string; state: string }[];
+  };
+  return listed.pages.find((entry) => entry.page === pageId)?.state;
+}
+
+/** Closes a page's socket and waits until the relay has seen it go. */
+async function drop(who: Client, opened: TestPage): Promise<void> {
+  await opened.close();
+  await eventually(async () => (await stateFor(who, opened.pageId)) === 'asleep');
+}
+
+describe('page sessions (S9)', () => {
+  it('lets one address churning page sockets end only its own pages, with page records bounded', async () => {
+    const store = createMemoryStore();
+    const { relay } = await setup({
+      store,
+      limits: { pageSessionsPerAddress: 3, pageSessions: 10 },
+      timings: { resumeWindowMs: 60_000, goneTombstoneMs: 60_000 },
+    });
+    const bobsPage = await page({ localAddress: OTHER_ADDRESS });
+    const bob = await client(BOB);
+    await pairAndApprove(bob, bobsPage);
+    const token = bobsPage.welcome?.resumeToken ?? '';
+    await drop(bob, bobsPage);
+
+    // Long title and url, as a hostile page would send; half detach, which skips the resume window.
+    for (let i = 0; i < 40; i += 1) {
+      const churned = await connectPage(relay.pageUrl, {
+        title: 'T'.repeat(300),
+        url: `${PAGE_ORIGIN}/${'u'.repeat(2000)}`,
+      });
+      churned.ws.close(i % 2 === 0 ? 1000 : CLOSE_DETACH);
+      await churned.closed;
+      await eventually(() => store.pages.get(churned.pageId)?.state !== 'awake');
+    }
+
+    const records = store.pages.all();
+    const sessions = records.filter((record) => record.state !== 'gone');
+    const gone = records.filter((record) => record.state === 'gone');
+    // The churner's own three, plus Bob's page; gone records at most one per page session.
+    expect(sessions.length).toBeLessThanOrEqual(4);
+    expect(gone.length).toBeLessThanOrEqual(10);
+    // A gone record keeps only what page_gone, list_pages and detach_page read.
+    for (const record of gone) {
+      expect(record.url).toBe('');
+      expect(record.tools).toEqual([]);
+      expect(record.policy.consequentialTools).toEqual([]);
+    }
+    expect(await stateFor(bob, bobsPage.pageId)).toBe('asleep');
+    const back = await page({ resumeToken: token, localAddress: OTHER_ADDRESS });
+    expect(back.welcome?.resumed).toBe(true);
+    expect(back.pageId).toBe(bobsPage.pageId);
+    expect(back.welcome?.roster).toMatchObject([{ userId: 'bob' }]);
+  });
+
+  it('ends its own page asleep longest for an address at its cap, and refuses with 1013 when none sleeps', async () => {
+    const { relay } = await setup({ limits: { pageSessionsPerAddress: 2 } });
+    const elsewhere = await page({ localAddress: OTHER_ADDRESS });
+    const first = await page();
+    await page();
+    const alice = await client();
+    const bob = await client(BOB);
+    await pairAndApprove(bob, elsewhere);
+    await pairAndApprove(alice, first);
+
+    // Both of this address's sessions are awake, so a third has nothing to make way.
+    const refused = new TestPage(await openSocket(relay.pageUrl));
+    pages.push(refused);
+    refused.send({
+      t: 'hello',
+      v: 1,
+      title: 't',
+      url: `${PAGE_ORIGIN}/`,
+      adapterVersion: 'test',
+      policy: {},
+    });
+    expect(await refused.closed).toEqual({
+      code: 1013,
+      reason: 'too many pages from this address; try again later',
+    });
+    expect(refused.all('welcome')).toEqual([]);
+
+    // The other address's page has slept longer, but only this address's own sleeper makes way.
+    await drop(bob, elsewhere);
+    await delay(20);
+    await drop(alice, first);
+    const newcomer = await page();
+    expect(newcomer.welcome?.resumed).toBe(false);
+    expect(await stateFor(alice, first.pageId)).toBe('gone');
+    expect(await stateFor(bob, elsewhere.pageId)).toBe('asleep');
+  });
+
+  it('lets a sleeper resume at the total cap without ending itself or any other sleeper', async () => {
+    await setup({ limits: { pageSessions: 3 } });
+    const older = await page();
+    const younger = await page();
+    await page();
+    const alice = await client();
+    const bob = await client(BOB);
+    await pairAndApprove(alice, older);
+    await pairAndApprove(bob, younger);
+    await drop(alice, older);
+    await delay(20);
+    await drop(bob, younger);
+
+    // Two asleep and one awake: the relay is at its cap, and a resume needs no room.
+    const youngerBack = await page({ resumeToken: younger.welcome?.resumeToken ?? '' });
+    expect(youngerBack.welcome?.resumed).toBe(true);
+    expect(youngerBack.pageId).toBe(younger.pageId);
+    expect(youngerBack.welcome?.roster).toMatchObject([{ userId: 'bob' }]);
+    expect(await stateFor(alice, older.pageId)).toBe('asleep');
+
+    // Now the only sleeper, which would once have ended itself on the way back.
+    const olderBack = await page({ resumeToken: older.welcome?.resumeToken ?? '' });
+    expect(olderBack.welcome?.resumed).toBe(true);
+    expect(olderBack.pageId).toBe(older.pageId);
+    expect(olderBack.welcome?.roster).toMatchObject([{ userId: 'alice' }]);
+    expect(await stateFor(bob, younger.pageId)).toBe('awake');
+  });
+
+  it('makes room for a new page at the total cap by ending the older of two sleepers', async () => {
+    await setup({ limits: { pageSessions: 3 } });
+    const older = await page({ localAddress: OTHER_ADDRESS });
+    const younger = await page({ localAddress: OTHER_ADDRESS });
+    await page({ localAddress: OTHER_ADDRESS });
+    const alice = await client();
+    const bob = await client(BOB);
+    await pairAndApprove(alice, older);
+    await pairAndApprove(bob, younger);
+    await drop(alice, older);
+    await delay(20);
+    await drop(bob, younger);
+
+    const newcomer = await page();
+    expect(newcomer.welcome?.resumed).toBe(false);
+    expect(await stateFor(alice, older.pageId)).toBe('gone');
+    expect(await stateFor(bob, younger.pageId)).toBe('asleep');
+    await newcomer.close();
+    const back = await page({
+      resumeToken: younger.welcome?.resumeToken ?? '',
+      localAddress: OTHER_ADDRESS,
+    });
+    expect(back.welcome?.resumed).toBe(true);
+    expect(back.pageId).toBe(younger.pageId);
+  });
+
+  it("ends the new page's own address's sleeper at the total cap before an older one from elsewhere", async () => {
+    await setup({ limits: { pageSessions: 3 } });
+    const elsewhere = await page({ localAddress: OTHER_ADDRESS });
+    const own = await page();
+    await page();
+    const alice = await client();
+    const bob = await client(BOB);
+    await pairAndApprove(bob, elsewhere);
+    await pairAndApprove(alice, own);
+    await drop(bob, elsewhere);
+    await delay(20);
+    await drop(alice, own);
+
+    const newcomer = await page();
+    expect(newcomer.welcome?.resumed).toBe(false);
+    expect(await stateFor(alice, own.pageId)).toBe('gone');
+    expect(await stateFor(bob, elsewhere.pageId)).toBe('asleep');
   });
 });

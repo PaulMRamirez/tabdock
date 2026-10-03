@@ -155,6 +155,73 @@ describe('attachment idle expiry', () => {
     expect(opened.all('invoke')).toHaveLength(0);
   });
 
+  it('names a client only once its call passes the tool and role checks', async () => {
+    const { relay } = await setup();
+    const opened = await page({ onInvoke: () => ({ ok: true, content: '{}' }) });
+    await pairAndApprove(await client(), opened, 'observer');
+    await opened.sync();
+    const before = opened.all('roster').length;
+    for (const [name, tool] of [
+      ['stranger-missing', 'no_such_tool'],
+      ['stranger-write', 'add_item'],
+    ] as const) {
+      const renamed = await connectClient(relay, ALICE, { name, modern: true });
+      clients.push(renamed);
+      const refused = await callTool(renamed, 'call_page_tool', {
+        page: opened.pageId,
+        tool,
+        arguments: { label: 'x' },
+      });
+      expect(refused.isError, refused.text).toBe(true);
+    }
+    await opened.sync();
+    // Nothing the operator sees changed: no roster went out, and none names the refused clients.
+    expect(opened.all('roster')).toHaveLength(before);
+    expect(JSON.stringify(opened.all('roster'))).not.toContain('stranger');
+    const reader = await connectClient(relay, ALICE, { name: 'reader', modern: true });
+    clients.push(reader);
+    expect((await getView(reader, opened.pageId)).isError).toBe(false);
+    await opened.sync();
+    expect(
+      opened
+        .all('roster')
+        .at(-1)
+        ?.attachments[0]?.clients.map((c) => c.name),
+    ).toEqual(['reader', 'relay-test']);
+  });
+
+  it('sends at most one roster per refresh step for new clients, and a trailing one carries the rest', async () => {
+    // A tenth of the idle time: a 1.5 s refresh step.
+    const { relay } = await setup({ timings: { attachmentIdleMs: 15_000 } });
+    const opened = await page({ onInvoke: () => ({ ok: true, content: '{}' }) });
+    await pairAndApprove(await client(), opened);
+    await opened.sync();
+    const before = opened.all('roster').length;
+    const started = Date.now();
+    for (let i = 1; i <= 8; i += 1) {
+      const renamed = await connectClient(relay, ALICE, { name: `c${String(i)}`, modern: true });
+      clients.push(renamed);
+      expect((await getView(renamed, opened.pageId)).isError).toBe(false);
+    }
+    await opened.sync();
+    // The burst fits well inside one step, so only the first new client went out at once.
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(opened.all('roster')).toHaveLength(before + 1);
+    expect(opened.all('roster').at(-1)?.attachments[0]?.clients[0]?.name).toBe('c1');
+    // The held-back changes still arrive, together, one step after that roster.
+    await eventually(() => opened.all('roster').length === before + 2, 3000);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1400);
+    expect(
+      opened
+        .all('roster')
+        .at(-1)
+        ?.attachments[0]?.clients.map((c) => c.name)
+        .slice(0, 8),
+    ).toEqual(['c8', 'c7', 'c6', 'c5', 'c4', 'c3', 'c2', 'c1']);
+    await delay(300);
+    expect(opened.all('roster')).toHaveLength(before + 2);
+  });
+
   it('formats idle times in the unit that divides them', () => {
     expect(formatDuration(8 * 60 * 60_000)).toBe('8 hours');
     expect(formatDuration(60 * 60_000)).toBe('1 hour');

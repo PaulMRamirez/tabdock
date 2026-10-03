@@ -59,6 +59,11 @@ export interface AttachRequestRecord {
   displayName: string;
   via: 'code' | 'qr';
   client: ClientInfo | null;
+  /**
+   * The same user's other clients whose pair_page joined this request, oldest
+   * first. They are told they are attached on approval, so the roster names them.
+   */
+  joined: ClientInfo[];
   expiresAt: number;
 }
 
