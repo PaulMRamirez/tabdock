@@ -65,6 +65,16 @@ export interface RelayRateLimits {
    * page re-sending large ones could keep the relay busy.
    */
   toolsFramesPerSocket: number;
+  /**
+   * tools frames all page sockets from one remote address may send per
+   * toolsFramesWindowMs, counted across reconnects; past it the socket that
+   * sent the frame is closed with 1008 (S9). One address may hold
+   * pageSocketsPerAddress sockets, so without this their budgets would add up.
+   * Room for every page an address may hold by default to list its tools once,
+   * as all of them do after a relay restart, and for one of them to use its
+   * whole toolsFramesPerSocket besides.
+   */
+  toolsFramesPerAddress: number;
   /** Short, so a burst is caught at once while a page that changes its tools now and then never is. */
   toolsFramesWindowMs: number;
 }
@@ -159,6 +169,7 @@ export const DEFAULT_RATE_LIMITS: RelayRateLimits = {
   callsPerUserPerPage: 120,
   windowMs: 60_000,
   toolsFramesPerSocket: 10,
+  toolsFramesPerAddress: 30,
   toolsFramesWindowMs: 10_000,
 };
 

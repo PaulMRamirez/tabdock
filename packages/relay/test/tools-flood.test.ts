@@ -1,0 +1,157 @@
+// A tools frame costs main-thread time: parsing it, and walking and hashing
+// the schemas in it for listing (S10) and for the argument check (ADR 0008,
+// ADR 0010). One address may hold 20 page sockets, so a budget per socket alone
+// let one address keep the relay's main loop busy for seconds on end. Here
+// twenty sockets from one address flood the relay with 1 MB tools frames, each
+// socket within its own budget, while the main loop and /healthz are timed. The
+// same flood in frames of a type the relay ignores, which it only parses, is
+// the yardstick: tools frames must cost no more than any frame of their size.
+
+import { afterEach, describe, expect, it } from 'vitest';
+import { connectPage, type TestPage } from './helpers/page-client.ts';
+import { delay, startRelay, type TestRelay } from './helpers/relay.ts';
+
+let current: TestRelay | undefined;
+const pages: TestPage[] = [];
+
+async function closeAll(): Promise<void> {
+  for (const opened of pages.splice(0)) opened.ws.terminate();
+  await current?.close();
+  current = undefined;
+}
+
+afterEach(closeAll);
+
+const SOCKETS = 20;
+/** Within the default budget of 10 tools frames per socket. */
+const FRAMES_PER_SOCKET = 5;
+/**
+ * Fixed bounds with room to spare. Bounded per socket only, this flood held
+ * the loop for about 23 s, with gaps of 9 s and /healthz waiting 13 s; bounded
+ * per address it holds it for about 2 s, less than the ignored frames do.
+ */
+const MAX_STALLED_MS = 6000;
+const MAX_GAP_MS = 4000;
+const MAX_HEALTH_MS = 4000;
+/** Noise allowed between the flood and its yardstick, which run one after the other. */
+const YARDSTICK_SLACK_MS = 1500;
+
+/**
+ * 128 tools, each an anyOf of empty schemas beside a patternProperties, in
+ * just under 1 MB: about 333,000 schema nodes, the costliest shape per byte
+ * the M2 review found. Each salt gives other tool names, so no frame repeats.
+ */
+function floodFrame(type: string, salt: number): string {
+  const anyOf = Array.from({ length: 2600 }, () => '{}').join(',');
+  const tools = Array.from(
+    { length: 128 },
+    (_, index) =>
+      `{"name":"f${String(salt)}_t${String(index)}","description":"d","inputSchema":{"type":"object","patternProperties":{"a":{}},"anyOf":[${anyOf}]},"annotations":{"readOnlyHint":true}}`,
+  );
+  return `{"t":"${type}","tools":[${tools.join(',')}]}`;
+}
+
+/** Time the main loop spent away from a 5 ms interval: the worst gap, and the sum of gaps over 20 ms. */
+function watchLoop(): { stop: () => { worst: number; stalled: number } } {
+  let last = performance.now();
+  let worst = 0;
+  let stalled = 0;
+  const timer = setInterval(() => {
+    const now = performance.now();
+    const gap = now - last;
+    worst = Math.max(worst, gap);
+    if (gap > 20) stalled += gap;
+    last = now;
+  }, 5);
+  return {
+    stop: () => {
+      clearInterval(timer);
+      return { worst, stalled };
+    },
+  };
+}
+
+/** Asks /healthz over and over until stopped; each answer's latency. */
+function sampleHealth(url: string): { stop: () => Promise<number[]> } {
+  const latencies: number[] = [];
+  const state = { running: true };
+  const sampling = (async () => {
+    while (state.running) {
+      const started = performance.now();
+      // A stalled server can drop a kept-alive connection; that answer counts as slow as it was.
+      await fetch(`${url}/healthz`).then(
+        (response) => response.text(),
+        () => undefined,
+      );
+      latencies.push(performance.now() - started);
+      await delay(50);
+    }
+  })();
+  return {
+    stop: async () => {
+      state.running = false;
+      await sampling;
+      return latencies;
+    },
+  };
+}
+
+/** Resolves once the relay has dealt with everything sent before: closed the socket, or answered a ping. */
+async function settled(opened: TestPage): Promise<void> {
+  opened.send({ t: 'ping' });
+  const pong = opened.next('pong', 120_000).then(
+    () => undefined,
+    () => undefined,
+  );
+  await Promise.race([opened.closed, pong]);
+}
+
+interface FloodCost {
+  stalled: number;
+  worst: number;
+  slowestHealth: number;
+  closedForBudget: number;
+}
+
+/** A fresh relay at its defaults, twenty sockets from one address, and the flood. */
+async function flood(type: string): Promise<FloodCost> {
+  current = await startRelay({ timings: { idleTimeoutMs: 600_000, pingIntervalMs: 600_000 } });
+  for (let index = 0; index < SOCKETS; index += 1) {
+    pages.push(await connectPage(current.relay.pageUrl));
+  }
+  const frames = Array.from({ length: FRAMES_PER_SOCKET }, (_, index) => floodFrame(type, index));
+  expect(frames[0]?.length).toBeGreaterThan(1_000_000);
+
+  const loop = watchLoop();
+  const health = sampleHealth(current.relay.url);
+  for (const opened of pages) for (const text of frames) opened.sendRaw(text);
+  await Promise.all(pages.map((opened) => settled(opened)));
+  const { worst, stalled } = loop.stop();
+  const latencies = await health.stop();
+  const cost = {
+    stalled,
+    worst,
+    slowestHealth: Math.max(...latencies),
+    closedForBudget: current.lines.filter((line) => line.includes('too many tools frames')).length,
+  };
+  process.stderr.write(
+    `${type} flood: loop stalled ${stalled.toFixed(0)} ms, worst gap ${worst.toFixed(0)} ms, /healthz slowest ${cost.slowestHealth.toFixed(0)} ms, sockets closed for budget ${String(cost.closedForBudget)}\n`,
+  );
+  await closeAll();
+  return cost;
+}
+
+describe('tools frames from one address (S9, ADR 0010)', () => {
+  it('twenty sockets flooding 1 MB tools frames cannot hold up the main loop or /healthz', async () => {
+    const ignored = await flood('not_a_frame_type');
+    const tools = await flood('tools');
+
+    expect(tools.stalled).toBeLessThan(MAX_STALLED_MS);
+    expect(tools.worst).toBeLessThan(MAX_GAP_MS);
+    expect(tools.slowestHealth).toBeLessThan(MAX_HEALTH_MS);
+    expect(tools.stalled).toBeLessThan(ignored.stalled + YARDSTICK_SLACK_MS);
+    // The address ran out of budget, and its sockets were closed for it.
+    expect(tools.closedForBudget).toBeGreaterThan(0);
+    expect(ignored.closedForBudget).toBe(0);
+  }, 180_000);
+});
