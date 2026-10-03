@@ -8,7 +8,7 @@ SPEC section 6 lists the close codes the relay uses (ADR 0007): 4001 for a super
 
 ## Decision
 
-The relay closes a new page's socket with 1013 (Try Again Later, the standard code for a temporary lack of capacity) when it cannot make room for the session; the adapter treats it like any other recoverable close and reconnects with its usual backoff. A page that sends more than 10 `tools` frames in 10 s is closed with 1008, the policy-violation code section 6 already uses for malformed frames, and sleeps for its resume window like any other non-detach close.
+The relay closes a new page's socket with 1013 (Try Again Later, the standard code for a temporary lack of capacity) when it cannot make room for the session; the adapter treats it like any other recoverable close and reconnects with its usual backoff. A page that sends more than 10 `tools` frames in 10 s, or whose address sends more than 30 across its sockets, is closed with 1008, the policy-violation code section 6 already uses for malformed frames, and sleeps for its resume window like any other non-detach close.
 
 ## Consequences
 
