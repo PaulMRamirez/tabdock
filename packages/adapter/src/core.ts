@@ -296,6 +296,13 @@ export const ACTIVITY_LIMIT = 50;
  */
 export const MAX_WAITING_WRITES = 32;
 
+/**
+ * How long past its deadline a write keeps the page once the runtime has
+ * stopped watching its handler (see holdUnwatched); the relay gives a
+ * running call the same grace.
+ */
+export const UNWATCHED_HANDLER_GRACE_MS = 2000;
+
 /** Results are cut this far under the cap so the truncation marker fits under it too. */
 const MARKER_ROOM = 100;
 
@@ -318,6 +325,17 @@ const LOCK_PREFIX = 'tabdock:';
  * given to executeTool, it only races the call against it (ADR 0001).
  */
 const POLYFILL_MARKER = '__isWebMCPPolyfill';
+
+/**
+ * The polyfill 5.1 also races each handler against its tool's registration
+ * signal and, when the page unregisters the tool mid-run, rejects executeTool
+ * with this UnknownError while the handler runs on (its dist/index.js,
+ * #invokeToolByName).
+ */
+const POLYFILL_UNREGISTERED = 'Tool unregistered';
+
+/** Its UnknownError for a tool already gone when the call starts, before any handler runs. */
+const POLYFILL_NOT_FOUND = /^Tool not found/;
 
 const POLYFILL_HINT =
   'document.modelContext is missing, so Tabdock stays idle. Load a WebMCP polyfill first ' +
@@ -1265,7 +1283,10 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   // Calls
 
   function onInvoke(frame: InvokeFrame): void {
-    if (calls.has(frame.callId)) {
+    // A write answered early still holds the page under its id until its
+    // handler ends; a relay reusing that id meanwhile is confused about which
+    // call it means, so the page takes no second call by it.
+    if (calls.has(frame.callId) || writing?.frame.callId === frame.callId) {
       log.warn(`ignored a repeated invoke for call ${frame.callId}`);
       return;
     }
@@ -1358,7 +1379,9 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    * the runtime settles it.
    */
   function release(call: CallRecord): void {
-    calls.delete(call.frame.callId);
+    // The second release, when a lingering handler ends, may find a newer
+    // call under the same id, which revoke, cancel and pause must still reach.
+    if (calls.get(call.frame.callId) === call) calls.delete(call.frame.callId);
     const queued = queue.indexOf(call);
     if (queued !== -1) queue.splice(queued, 1);
     if (writing === call && !call.executing) writing = null;
@@ -1541,11 +1564,19 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     call.stage = 'running';
     call.executing = true;
     let outcome: Outcome;
+    let unwatched = false;
     try {
       const value = await execute(tool.runtime, frame.arguments, call);
       outcome = { ok: true, content: resultText(value) };
     } catch (error) {
       outcome = { ok: false, code: 'tool_error', message: errorParts(error).message };
+      unwatched = await lostSightOfHandler(call, tool, error);
+    }
+    if (unwatched) {
+      holdUnwatched(call);
+      // The relay still hears the runtime's answer, unless something answered first.
+      if (!isDone(call)) finish(call, outcome);
+      return;
     }
     call.executing = false;
     if (isDone(call)) {
@@ -1556,6 +1587,48 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       return;
     }
     finish(call, outcome);
+  }
+
+  /**
+   * Whether a write's rejection says only that the runtime stopped watching a
+   * handler that may still be running. On the polyfill a write's executeTool
+   * gets a signal nothing aborts, so it settles early only when the page ends
+   * the tool's registration mid-run: its 'Tool unregistered', or, should
+   * that text change, a tool missing from the list afterwards. A tool
+   * already missing when the call started never ran its handler.
+   */
+  async function lostSightOfHandler(
+    call: CallRecord,
+    tool: NormalisedTool,
+    error: unknown,
+  ): Promise<boolean> {
+    if (abortReachesHandlers || writing !== call) return false;
+    const { name, message } = errorParts(error);
+    if (name === 'UnknownError' && message === POLYFILL_UNREGISTERED) return true;
+    if (name === 'UnknownError' && POLYFILL_NOT_FOUND.test(message)) return false;
+    // A list that cannot be read cannot show the tool is still there either.
+    const snapshot = await readTools();
+    return snapshot === null || !snapshot.byName.has(tool.page.name);
+  }
+
+  /**
+   * Keeps the page for a write whose handler the runtime no longer watches.
+   * Nothing will say when that handler ends (the polyfill neither hands it
+   * a signal nor reports its end), so time is the only bound there is: the
+   * call's deadline plus a grace, or a grace from now when the handler has
+   * already outrun its deadline. Then the next write may start, possibly
+   * beside it.
+   */
+  function holdUnwatched(call: CallRecord): void {
+    const until = Math.max(call.deadlineAt, clock()) + UNWATCHED_HANDLER_GRACE_MS;
+    timers.setTimeout(() => {
+      call.executing = false;
+      if (call.entry.handlerRunning) updateEntry(call, { handlerRunning: false });
+      log.warn(
+        `call ${call.frame.callId}: stopped waiting for a handler whose tool was unregistered while it ran`,
+      );
+      release(call);
+    }, until - clock());
   }
 
   /**

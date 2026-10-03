@@ -4,7 +4,12 @@
 
 import { RECONNECT_MIN_MS } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
-import { ACTIVITY_LIMIT, MAX_WAITING_WRITES, type RuntimeTool } from '../src/core.ts';
+import {
+  ACTIVITY_LIMIT,
+  MAX_WAITING_WRITES,
+  type RuntimeTool,
+  UNWATCHED_HANDLER_GRACE_MS,
+} from '../src/core.ts';
 import {
   attachRequest,
   attachment,
@@ -296,6 +301,157 @@ describe('the write queue', () => {
     await held.release('set_value');
     expect(h.context.runs).toHaveLength(2);
     expect(held.mostAtOnce).toBe(1);
+  });
+
+  // The polyfill 5.1 also races each handler against its tool's registration,
+  // so a page that unregisters a tool mid-run (a view going away in a
+  // single-page app) makes executeTool reject at once while the handler runs on.
+  it.each([
+    ['while it runs', 'tool_error', 5000 + UNWATCHED_HANDLER_GRACE_MS],
+    ['after a cancel', 'cancelled', 5000 + UNWATCHED_HANDLER_GRACE_MS],
+    // Past its deadline the handler gets the grace from the moment it was lost.
+    ['after its deadline', 'timeout', 3000 + UNWATCHED_HANDLER_GRACE_MS],
+  ] as const)(
+    'on the polyfill, a write whose tool is unregistered %s keeps the page until its deadline and a grace',
+    async (when, code, freedAt) => {
+      const h = setup({ polyfill: true, tools: queueTools() });
+      holdHandlers(h, ['set_value', 'add_item']);
+      const socket = await link(h);
+      const deadlineMs = when === 'after its deadline' ? 1000 : 5000;
+      socket.deliver(invoke('set_value', { callId: 'first', deadlineMs }));
+      socket.deliver(invoke('add_item', { callId: 'second' }));
+      await flush();
+      if (when === 'after a cancel') socket.deliver({ t: 'cancel', callId: 'first' });
+      await h.clock.advance(3000);
+      expect(h.context.runs.map((run) => run.tool)).toEqual(['set_value']);
+
+      h.context.unregister('set_value');
+      await flush();
+      // The relay hears how the call ended, but nothing will say when the handler does.
+      expect(outcomes(socket)).toEqual({ first: code });
+      if (when === 'while it runs') {
+        expect(results(socket)[0]?.error?.message).toBe('Tool unregistered');
+      }
+      expect(h.dock.state.activity.find((entry) => entry.callId === 'first')).toMatchObject({
+        outcome: code,
+        handlerRunning: true,
+      });
+      await h.clock.advance(freedAt - 3000 - 1);
+      expect(h.context.runs.map((run) => run.tool)).toEqual(['set_value']);
+      expect(h.dock.state.activity.find((entry) => entry.callId === 'first')).toMatchObject({
+        handlerRunning: true,
+      });
+
+      await h.clock.advance(1);
+      expect(h.context.runs.map((run) => run.tool)).toEqual(['set_value', 'add_item']);
+      expect(h.dock.state.activity.find((entry) => entry.callId === 'first')).toMatchObject({
+        handlerRunning: false,
+      });
+      // One line, with nothing the page wrote in it.
+      const released = h.logs.filter((line) => line.includes('stopped waiting'));
+      expect(released).toEqual([
+        'warn call first: stopped waiting for a handler whose tool was unregistered while it ran',
+      ]);
+    },
+  );
+
+  it.each([
+    ['its handler throws', 'tool_error'],
+    ['its tool is gone before the handler starts', 'tool_error'],
+  ] as const)(
+    'on the polyfill, a write whose runtime rejects because %s lets the next write go at once',
+    async (how, code) => {
+      const h = setup({ polyfill: true, tools: queueTools() });
+      const held = holdHandlers(h, ['add_item']);
+      h.context.handlers.set('set_value', () => {
+        throw new Error('the page refused');
+      });
+      const socket = await link(h);
+      // wipe is consequential, so the operator's prompt leaves time for the page to drop it.
+      const first = how === 'its handler throws' ? 'set_value' : 'wipe';
+      socket.deliver(invoke(first, { callId: 'first' }));
+      socket.deliver(invoke('add_item', { callId: 'second' }));
+      await flush();
+      if (first === 'wipe') {
+        h.context.unregister('wipe');
+        await flush();
+        expect(h.dock.confirm('first', true)).toBe(true);
+      }
+      await flush();
+      expect(outcomes(socket)).toEqual({ first: code });
+      expect(h.context.runs.map((run) => run.tool)).toEqual(
+        first === 'wipe' ? ['add_item'] : ['set_value', 'add_item'],
+      );
+      expect(h.dock.state.activity.find((entry) => entry.callId === 'first')).toMatchObject({
+        handlerRunning: false,
+      });
+      await held.release('add_item');
+      expect(outcomes(socket)).toEqual({ first: code, second: 'ok' });
+    },
+  );
+});
+
+describe('call ids a relay reuses', () => {
+  it.each([
+    ['a revoke', 'cancelled'],
+    ['a cancel', 'cancelled'],
+    ['a pause', 'page_busy'],
+  ] as const)(
+    'a call reusing the id of a cancelled call whose handler lingers still answers to %s after that handler ends',
+    async (how, code) => {
+      // A runtime that never settles early keeps even a cancelled read's handler in view.
+      const h = setup({ tools: queueTools() });
+      h.context.honoursAbort = false;
+      const held = holdHandlers(
+        h,
+        ['get_value', 'set_value', 'add_item'],
+        ['set_value', 'add_item'],
+      );
+      const socket = await link(h, {}, { alice: 'driver', bob: 'driver' });
+      socket.deliver(invoke('get_value', { callId: 'X' }));
+      socket.deliver(invoke('add_item', { callId: 'busy', caller: caller('bob') }));
+      await flush();
+      socket.deliver({ t: 'cancel', callId: 'X' });
+      await flush();
+      // The relay reuses the id while the read's handler runs on; the new call waits behind Bob's write.
+      socket.deliver(invoke('set_value', { callId: 'X' }));
+      await flush();
+      await held.release('get_value');
+      const before = results(socket).length;
+
+      if (how === 'a revoke') expect(h.dock.revoke('alice')).toBe(true);
+      if (how === 'a cancel') socket.deliver({ t: 'cancel', callId: 'X' });
+      if (how === 'a pause') h.dock.pause(true);
+      await flush();
+      expect(
+        results(socket)
+          .slice(before)
+          .map((frame) => [frame.callId, frame.error?.code]),
+      ).toEqual([['X', code]]);
+      await held.release('add_item');
+      expect(h.context.runs.filter((run) => run.tool === 'set_value')).toHaveLength(0);
+    },
+  );
+
+  it('ignores an invoke that reuses the id of a write whose handler still holds the page', async () => {
+    const h = setup({ polyfill: true });
+    const held = holdHandlers(h, ['set_value', 'get_value']);
+    const socket = await link(h);
+    socket.deliver(invoke('set_value', { callId: 'X' }));
+    await flush();
+    socket.deliver({ t: 'cancel', callId: 'X' });
+    await flush();
+    socket.deliver(invoke('get_value', { callId: 'X' }));
+    await flush();
+    expect(h.context.runs.map((run) => run.tool)).toEqual(['set_value']);
+    expect(h.logs).toContain('warn ignored a repeated invoke for call X');
+    expect(h.dock.state.activity.map((entry) => entry.callId)).toEqual(['X']);
+
+    // Once the handler lets go, the id is free again.
+    await held.release('set_value');
+    socket.deliver(invoke('get_value', { callId: 'X' }));
+    await flush();
+    expect(h.context.runs.map((run) => run.tool)).toEqual(['set_value', 'get_value']);
   });
 });
 

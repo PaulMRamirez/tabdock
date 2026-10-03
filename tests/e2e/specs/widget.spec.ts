@@ -358,6 +358,7 @@ function invokeFrame(
   callId: string,
   tool: string,
   client: { name: string; version: string } | null = null,
+  deadlineMs = 45_000,
 ): RelayFrame {
   return {
     t: 'invoke',
@@ -365,7 +366,7 @@ function invokeFrame(
     tool,
     arguments: {},
     caller: { userId: 'alice', displayName: 'Alice', client, role: 'driver' },
-    deadlineMs: 45_000,
+    deadlineMs,
   };
 }
 
@@ -583,6 +584,98 @@ test('the activity log names the user, client, tool and outcome of each call', a
   expect((await dockState(page))?.activity.map((entry) => entry.outcome)).toEqual([
     'tool_not_found',
     'ok',
+  ]);
+});
+
+test('on the MCP-B polyfill, a write whose tool the page unregisters mid-run holds the page until its deadline and a grace', async ({
+  page,
+}) => {
+  const relay = await openWithFakeRelay(page);
+  // A single-page app's view change: switch_view's handler ends the
+  // registration its own tool came with, then carries on for a second.
+  const polyfill = await page.evaluate(async () => {
+    const context = (
+      document as unknown as {
+        modelContext: {
+          registerTool(tool: object, options?: { signal?: AbortSignal }): Promise<void>;
+        };
+      }
+    ).modelContext;
+    const events: [string, number][] = [];
+    (window as unknown as { __viewEvents: [string, number][] }).__viewEvents = events;
+    const view = new AbortController();
+    await context.registerTool(
+      {
+        name: 'switch_view',
+        description: 'Moves to another view, whose tools replace this one.',
+        inputSchema: { type: 'object', properties: {} },
+        annotations: { readOnlyHint: false },
+        execute: async () => {
+          events.push(['switch_view start', performance.now()]);
+          view.abort();
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          events.push(['switch_view end', performance.now()]);
+          return 'switched';
+        },
+      },
+      { signal: view.signal },
+    );
+    await context.registerTool({
+      name: 'set_note',
+      description: 'Writes a note.',
+      inputSchema: { type: 'object', properties: {} },
+      annotations: { readOnlyHint: false },
+      execute: () => {
+        events.push(['set_note start', performance.now()]);
+        return 'noted';
+      },
+    });
+    return Reflect.get(context, '__isWebMCPPolyfill') === true;
+  });
+  expect(polyfill).toBe(true);
+  await expect
+    .poll(() =>
+      framesOf(relay, 'tools')
+        .at(-1)
+        ?.tools.map((tool) => tool.name),
+    )
+    .toEqual(expect.arrayContaining(['switch_view', 'set_note']));
+  await approveOnPage(page, relay, 'alice', 'driver');
+  relay.send({ t: 'roster', attachments: [attachment('alice', 'Alice')] });
+  await waitForDock(page, (state) => state.roster.length === 1);
+
+  relay.send(invokeFrame('call-1', 'switch_view', null, 1500));
+  relay.send(invokeFrame('call-2', 'set_note'));
+  const outcomes = () =>
+    framesOf(relay, 'result').map((frame) => [frame.callId, frame.error?.message ?? 'ok']);
+  // The polyfill answers the first call at once, though its handler runs on.
+  await expect.poll(outcomes).toEqual([['call-1', 'Tool unregistered']]);
+  await expect
+    .poll(() => widgetText(page, 'activity'))
+    .toMatch(/switch_view, tool_error in \d+ ms, but its handler is still running/);
+
+  // Nothing reports that handler's end, so set_note waits out the 1.5 s deadline plus 2 s.
+  await expect.poll(outcomes, { timeout: 10_000 }).toEqual([
+    ['call-1', 'Tool unregistered'],
+    ['call-2', 'ok'],
+  ]);
+  const events = await page.evaluate(
+    () => (window as unknown as { __viewEvents: [string, number][] }).__viewEvents,
+  );
+  expect(events.map(([event]) => event)).toEqual([
+    'switch_view start',
+    'switch_view end',
+    'set_note start',
+  ]);
+  const started = Object.fromEntries(events);
+  expect((started['set_note start'] ?? 0) - (started['switch_view start'] ?? 0)).toBeGreaterThan(
+    3000,
+  );
+  expect(
+    (await dockState(page))?.activity.map((entry) => [entry.callId, entry.handlerRunning]),
+  ).toEqual([
+    ['call-2', false],
+    ['call-1', false],
   ]);
 });
 
