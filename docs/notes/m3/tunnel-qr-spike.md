@@ -36,8 +36,8 @@ Consequences for the build:
 2. QR encodes `https://<public>/pair#<nonce>`. A fragment is "separated from the rest of the URI prior to a dereference" (RFC 3986 section 3.5), so it never reaches relay or tunnel logs (S11). Page script reads `location.hash`, clears it with `history.replaceState`, keeps it in `sessionStorage` through sign-in.
 3. `GET /pair` is static and consumes nothing; send `Cache-Control: no-store`, `Referrer-Policy: no-referrer`, `frame-ancestors 'none'`.
 4. Sign-in uses the same identity provider as the `oauth` plugin, so the browser user and Claude's token map to one `userId`. Session cookie `__Host-` (Secure, no Domain, Path=/), HttpOnly, `SameSite=Lax`, which survives the provider's top-level GET redirect but not cross-site POSTs (MDN Set-Cookie, 1 Sep 2026).
-5. Before claiming, show the page's origin (from the WebSocket `Origin` header), title and current pairing code to match against the widget: RFC 8628 sections 3.3.1 and 5.4 recommend this against remote phishing when a QR skips typing.
-6. `POST /pair/claim` (session cookie, `Origin` checked): consume atomically, rotate the ticket and push `pairing`, create an `AttachRequest` with `via: 'qr'`; rate limit per user and address; one generic error for unknown, used or expired.
+5. Before claiming, show the page's origin (from the WebSocket `Origin` header), title and current pairing code to match against the widget: RFC 8628 sections 3.3.1 and 5.4 recommend this against remote phishing when a QR skips typing. As built, the preview works before sign-in too, so the phone shows what it would join first; it shows only what the QR's own widget already shows.
+6. `POST /pair/claim` (session cookie, `Origin` checked): consume atomically, rotate the ticket and push `pairing`, create an `AttachRequest` with `via: 'qr'`; rate limit per user and per page, never per address (ADR 0016, since every tunnelled caller shares one); one generic error for unknown, used or expired.
 7. Operator approves on the page (60 s, default deny); the phone polls status rather than holding SSE.
 
 The nonce alone yields nothing; nonce plus session yields only a pending request.
