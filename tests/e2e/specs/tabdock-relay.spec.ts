@@ -29,9 +29,10 @@ import {
   type Tabdock,
 } from '../src/tabdock-harness.ts';
 
-// M1 in a real browser: the demo page runs the real adapter (bundled into the
-// page, over the MCP-B polyfill) and dials a Tabdock relay; an MCP client pairs
-// by the code on the page, and the operator answers by clicking the widget.
+// Tabdock in a real browser: the demo page runs the real adapter (bundled into
+// the page, over the MCP-B polyfill or native WebMCP) and dials a Tabdock
+// relay; MCP clients pair by the code on the page, and the operator answers by
+// clicking the widget. The M1 specs come first, then the M2 ones.
 
 declare global {
   interface Window {
@@ -125,13 +126,33 @@ test.afterEach(async () => {
         /^(error|pageerror):/.test(line) && !allowedErrors.some((allowed) => allowed.test(line)),
     ),
   ).toEqual([]);
-  const secrets = [tabdock.users.alice.token, tabdock.users.bob.token, ...codesSeen];
+  // Nor in the relay's own log, debug lines included. Only counts are compared, so a failure prints no secret.
+  const secrets = [
+    tabdock.users.alice.token,
+    tabdock.users.bob.token,
+    ...codesSeen,
+    ...secretsOnLink(),
+  ];
   for (const secret of secrets) {
-    expect(consoleLines.filter((line) => line.includes(secret))).toEqual([]);
-    // Nor in the relay's own log, debug lines included. Only a count is compared, so a failure prints no secret.
+    expect(consoleLines.filter((line) => line.includes(secret)).length).toBe(0);
     expect(relayLogs.filter((line) => line.includes(secret)).length).toBe(0);
   }
 });
+
+/**
+ * Every pairing code and resume token the relay sent the page, rotated codes
+ * no test step read included, so the log checks in afterEach cover them all.
+ */
+function secretsOnLink(): string[] {
+  return linkFrames.flatMap(({ from, text }) => {
+    if (from !== 'relay') return [];
+    const parsed = parseRelayFrame(text);
+    if (parsed.kind !== 'ok') return [];
+    const { frame } = parsed;
+    if (frame.t === 'welcome') return [frame.pairing.code, frame.resumeToken];
+    return frame.t === 'pairing' ? [frame.code] : [];
+  });
+}
 
 /**
  * Native WebMCP reports a handler that throws on the console as well
@@ -140,7 +161,9 @@ test.afterEach(async () => {
  */
 function allowHandlerError(message: string): void {
   const escaped = message.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  allowedErrors.push(new RegExp(`^error: WebMCP tool execution failed: Uncaught \\w+: ${escaped}$`));
+  allowedErrors.push(
+    new RegExp(`^error: WebMCP tool execution failed: Uncaught \\w+: ${escaped}$`),
+  );
 }
 
 async function openDemo(page: Page): Promise<{ pageId: string; code: string }> {
@@ -566,11 +589,9 @@ test.describe('M2: many clients, many users', () => {
     page,
   }) => {
     const { pageId, aliceModern, bob } = await attachTwoUsers(page);
-    for (const reader of [client, bob]) {
-      const read = await callTool(reader, 'call_page_tool', { page: pageId, tool: 'list_items' });
-      expect(read.isError, read.text).toBe(false);
-    }
-
+    // Read before any other call: a call from a client already listed moves it
+    // to the front at the relay without a new roster frame, so the order shown
+    // here is the one of the last frame, sent when her second client was new.
     expect(await rosterOf(page)).toEqual([
       ['alice', 'driver', [ALICE_MODERN_CLIENT, ALICE_CLIENT]],
       ['bob', 'observer', [BOB_CLIENT]],
@@ -583,7 +604,17 @@ test.describe('M2: many clients, many users', () => {
     expect(rows[0]?.text).toMatch(/Expires in 7 h 59 min|Expires in 8 h 0 min/);
     expect(rows[1]?.text).toContain('Bob (observer)');
     expect(rows[1]?.text).toContain(`Clients: ${BOB_CLIENT} 0.0.0`);
+    // Both eras are in play: the two 2025-era clients each opened a session on
+    // the relay's sessionful leg, and the 2026-07-28 one opened none (ADR 0009).
+    expect(relayLogEntries('MCP session opened').map((entry) => entry.userId)).toEqual([
+      'alice',
+      'bob',
+    ]);
 
+    for (const reader of [client, bob]) {
+      const read = await callTool(reader, 'call_page_tool', { page: pageId, tool: 'list_items' });
+      expect(read.isError, read.text).toBe(false);
+    }
     // Each client sees the page under its user's role.
     for (const [mcp, role] of [
       [client, 'driver'],
