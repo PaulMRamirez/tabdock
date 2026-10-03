@@ -39,6 +39,8 @@ export interface SocketOptions {
    * stand for a second remote address; per-address limits count by it.
    */
   localAddress?: string;
+  /** Extra request headers, such as the Host a tunnel would forward. */
+  headers?: Record<string, string>;
 }
 
 /** Opens a page socket; rejects with UpgradeRefused when the relay answers with an HTTP status. */
@@ -47,6 +49,7 @@ export function openSocket(url: string, options: SocketOptions = {}): Promise<We
   const ws = new WebSocket(url, options.protocols ?? [SUBPROTOCOL], {
     ...(origin === null ? {} : { origin }),
     ...(options.localAddress === undefined ? {} : { localAddress: options.localAddress }),
+    ...(options.headers === undefined ? {} : { headers: options.headers }),
   });
   return new Promise((resolve, reject) => {
     ws.once('open', () => {
