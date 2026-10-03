@@ -12,14 +12,24 @@ if (existsSync(envFile)) process.loadEnvFile(envFile);
 
 try {
   const relay = await createRelay(loadConfigFromEnv(process.env));
-  process.stdout.write(
-    [
-      `Tabdock relay on ${relay.url}`,
-      `  MCP endpoint (bearer token from TABDOCK_DEV_TOKENS): ${relay.mcpUrl}`,
-      `  Page socket for the adapter: ${relay.pageUrl}`,
-      '',
-    ].join('\n'),
-  );
+  const lines =
+    relay.publicMcpUrl === null
+      ? [
+          `Tabdock relay on ${relay.url}`,
+          `  MCP endpoint (bearer token from TABDOCK_DEV_TOKENS): ${relay.mcpUrl}`,
+          `  Page socket for the adapter: ${relay.pageUrl}`,
+        ]
+      : [
+          `Tabdock relay on ${relay.url}, public URL ${relay.publicUrl ?? ''}`,
+          `  Connector URL (OAuth sign-in through TABDOCK_OAUTH_ISSUER): ${relay.publicMcpUrl}`,
+          `  Page socket for the adapter, on this machine only: ${relay.pageUrl}`,
+          ...((process.env.TABDOCK_DEV_TOKENS?.trim() ?? '') === ''
+            ? []
+            : [
+                '  TABDOCK_DEV_TOKENS is ignored: a relay with a public URL accepts only OAuth tokens',
+              ]),
+        ];
+  process.stdout.write(`${lines.join('\n')}\n`);
   const stop = (): void => {
     relay.close().then(
       () => process.exit(0),

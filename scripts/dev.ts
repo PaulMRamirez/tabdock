@@ -1,6 +1,8 @@
 // pnpm dev: the relay and the demo page together, for working by hand.
 // Settings come from the repo-root .env (see .env.example); the relay refuses
 // to start without TABDOCK_DEV_TOKENS, and this script says how to make them.
+// With TABDOCK_PUBLIC_URL set the relay signs people in through OAuth instead
+// (ADR 0014), so the dev tokens are not needed and the hint names the connector.
 // Workspace packages export their TypeScript sources, so the root package
 // imports them by path rather than listing them as dependencies.
 
@@ -12,7 +14,10 @@ import { createRelay, loadConfigFromEnv, type Relay } from '../packages/relay/sr
 const envFile = resolve(import.meta.dirname, '../.env');
 if (existsSync(envFile)) process.loadEnvFile(envFile);
 
-if ((process.env.TABDOCK_DEV_TOKENS?.trim() ?? '') === '') {
+if (
+  (process.env.TABDOCK_PUBLIC_URL?.trim() ?? '') === '' &&
+  (process.env.TABDOCK_DEV_TOKENS?.trim() ?? '') === ''
+) {
   process.stderr.write(
     [
       'pnpm dev needs TABDOCK_DEV_TOKENS: one user=token pair per person, tokens of 24 or more random characters.',
@@ -55,16 +60,25 @@ if (allowedOrigins && !allowedOrigins.includes(demoOrigin)) {
 }
 // Readable rather than percent-encoded; browsers read the parameter the same way.
 const demoLink = `${demo.url}?relay=${relay.pageUrl}`;
+const howToConnect =
+  relay.publicMcpUrl === null
+    ? [
+        'Add the relay to Claude Code with a token from TABDOCK_DEV_TOKENS:',
+        `  claude mcp add --transport http tabdock ${relay.mcpUrl} --header "Authorization: Bearer <your token>"`,
+      ]
+    : [
+        `Public URL mode: add ${relay.publicMcpUrl} as a custom connector in Claude and sign in`,
+        'through TABDOCK_OAUTH_ISSUER with an account listed in TABDOCK_OAUTH_USERS (dev tokens are refused),',
+      ];
 process.stdout.write(
   [
     'Tabdock dev: relay and demo board',
     '',
     `  Demo board linked to the relay: ${demoLink}`,
-    `  MCP endpoint:                   ${relay.mcpUrl}`,
+    `  MCP endpoint:                   ${relay.publicMcpUrl ?? relay.mcpUrl}`,
     `  Page socket:                    ${relay.pageUrl}`,
     '',
-    'Add the relay to Claude Code with a token from TABDOCK_DEV_TOKENS:',
-    `  claude mcp add --transport http tabdock ${relay.mcpUrl} --header "Authorization: Bearer <your token>"`,
+    ...howToConnect,
     'then ask it to pair with the code in the Tabdock widget, and approve the request on the page.',
     'Relay logs follow as JSON lines; Ctrl-C stops both.',
     '',

@@ -1,7 +1,9 @@
 // Relay options, their defaults, and the checks that refuse an unsafe setup
 // before anything listens: loopback only until TLS arrives in M4 (S12), and an
-// explicit origin allowlist in production (S2). The section 9 limits and the
-// session and attachment lifetimes follow ADR 0009.
+// explicit origin allowlist in production (S2). Public URL mode (ADR 0014) puts
+// an https address in front of the loopback relay through a tunnel: it brings
+// production rules, and only OAuth sign-in for that address. The section 9
+// limits and the session and attachment lifetimes follow ADR 0009.
 
 import {
   ATTACH_REQUEST_TTL_MS,
@@ -14,6 +16,7 @@ import {
 } from '@tabdock/protocol';
 import { type AuthPlugin, createDevTokenAuth, parseDevTokens } from './auth.ts';
 import type { LogLevel, LogSink } from './log.ts';
+import { createOAuthAuth, parseOAuthUsers } from './oauth.ts';
 import type { RelayStore } from './store.ts';
 
 export type RelayEnv = 'development' | 'production';
@@ -119,6 +122,14 @@ export interface RelayOptions {
   allowedOrigins?: readonly string[] | undefined;
   /** Development only: accept page sockets with no Origin header (the Node sim page). */
   allowMissingOrigin?: boolean | undefined;
+  /**
+   * The https origin a tunnel serves the relay at, such as
+   * https://relay.example. Setting it switches on public URL mode (ADR 0014):
+   * its host passes the Host check, `<publicUrl>/mcp` is the resource OAuth
+   * tokens must be issued for, production rules apply, `auth` must be the
+   * oauth plugin for that resource, and /page refuses anything not local.
+   */
+  publicUrl?: string | undefined;
   timings?: { [K in keyof RelayTimings]?: number | undefined } | undefined;
   rateLimits?: { [K in keyof RelayRateLimits]?: number | undefined } | undefined;
   limits?: { [K in keyof RelayLimits]?: number | undefined } | undefined;
@@ -191,6 +202,15 @@ export interface ResolvedConfig {
   port: number;
   env: RelayEnv;
   loopback: boolean;
+  /**
+   * The public origin in public URL mode, else null. Also the base of the
+   * pairing URL a phone opens (M3 QR flow).
+   */
+  publicUrl: string | null;
+  /** `<publicUrl>/mcp`: the URL people add as a connector, and the token audience. */
+  publicMcpUrl: string | null;
+  /** Host names /mcp and the auth plugin's routes answer to (the DNS rebinding guard). */
+  allowedHosts: string[];
   allowMissingOrigin: boolean;
   isOriginAllowed: (origin: string) => boolean;
   /** For the startup log line: the list, or a note that the dev default applies. */
@@ -217,6 +237,46 @@ export function parseOrigin(value: string): string | null {
   return url.origin === value ? url.origin : null;
 }
 
+/** The Host names the SDK's localhost guard accepts, as its own helper lists them. */
+export const LOOPBACK_HOSTNAMES: readonly string[] = ['localhost', '127.0.0.1', '[::1]'];
+
+/**
+ * The public URL as an origin (https, no path, no credentials), or an error
+ * naming the variable. It is where Claude reaches the relay, so it must be
+ * https (S12) and must not name this machine, which would blur the line
+ * between local and tunnelled requests that /page relies on.
+ */
+export function parsePublicUrl(value: string): string {
+  const url = URL.parse(value.trim());
+  if (url?.protocol !== 'https:') {
+    throw new Error(
+      'publicUrl (TABDOCK_PUBLIC_URL) must be an https URL such as https://relay.example; the tunnel in front of the relay terminates TLS (SPEC S12, ADR 0014)',
+    );
+  }
+  if (
+    url.username !== '' ||
+    url.password !== '' ||
+    url.search !== '' ||
+    url.hash !== '' ||
+    url.pathname !== '/'
+  ) {
+    throw new Error(
+      'publicUrl (TABDOCK_PUBLIC_URL) must be an origin such as https://relay.example, with no path, query or credentials',
+    );
+  }
+  if (isLoopbackHost(url.hostname)) {
+    throw new Error(
+      'publicUrl (TABDOCK_PUBLIC_URL) names this machine; give the https address the tunnel serves',
+    );
+  }
+  return url.origin;
+}
+
+/** The MCP endpoint under a public origin: what people add as a connector. */
+export function publicMcpUrlOf(publicOrigin: string): string {
+  return new URL('/mcp', publicOrigin).href;
+}
+
 export function resolveConfig(options: RelayOptions): ResolvedConfig {
   const env = options.env ?? 'development';
   // Checked at run time too: JavaScript callers and env parsing can pass anything.
@@ -234,19 +294,38 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     throw new Error('port must be an integer from 0 to 65535');
   }
 
-  const allowMissingOrigin = options.allowMissingOrigin ?? false;
-  if (allowMissingOrigin && env === 'production') {
+  const publicUrl = options.publicUrl === undefined ? null : parsePublicUrl(options.publicUrl);
+  const publicMcpUrl = publicUrl === null ? null : publicMcpUrlOf(publicUrl);
+  // Only a plugin that checks provider tokens issued for this very address may
+  // answer for it; dev tokens never cross a tunnel (ADR 0014).
+  if (publicMcpUrl !== null && options.auth.resource !== publicMcpUrl) {
     throw new Error(
-      'allowMissingOrigin is a development flag; production requires an Origin header on every page socket (SPEC S1)',
+      `public URL mode accepts only OAuth sign-in for ${publicMcpUrl}, and the ${options.auth.name} plugin ${options.auth.resource === undefined ? 'checks no provider tokens' : `checks tokens for ${options.auth.resource}`}; set TABDOCK_OAUTH_ISSUER and TABDOCK_OAUTH_USERS (dev tokens are refused in public URL mode)`,
+    );
+  }
+  if (publicMcpUrl === null && options.auth.resource !== undefined) {
+    throw new Error(
+      `the ${options.auth.name} plugin checks tokens for ${options.auth.resource}, which needs public URL mode (TABDOCK_PUBLIC_URL)`,
+    );
+  }
+  // A public relay is reachable by anyone who learns the address, so it gets
+  // the production rules whatever env says.
+  const strict = env === 'production' || publicUrl !== null;
+  const strictName = env === 'production' ? 'production' : 'public URL mode';
+
+  const allowMissingOrigin = options.allowMissingOrigin ?? false;
+  if (allowMissingOrigin && strict) {
+    throw new Error(
+      `allowMissingOrigin is a development flag; ${strictName} requires an Origin header on every page socket (SPEC S1)`,
     );
   }
 
   let isOriginAllowed: (origin: string) => boolean;
   let originPolicy: string;
   if (options.allowedOrigins === undefined) {
-    if (env === 'production') {
+    if (strict) {
       throw new Error(
-        'production needs an explicit allowedOrigins list (TABDOCK_ALLOWED_ORIGINS); refusing to start (SPEC S2)',
+        `${strictName} needs an explicit allowedOrigins list (TABDOCK_ALLOWED_ORIGINS); refusing to start (SPEC S2)`,
       );
     }
     isOriginAllowed = (origin) => {
@@ -286,6 +365,12 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     port,
     env,
     loopback: true,
+    publicUrl,
+    publicMcpUrl,
+    allowedHosts:
+      publicUrl === null
+        ? [...LOOPBACK_HOSTNAMES]
+        : [...LOOPBACK_HOSTNAMES, new URL(publicUrl).hostname],
     allowMissingOrigin,
     isOriginAllowed,
     originPolicy,
@@ -344,10 +429,51 @@ function parseMinutes(name: string, value: string | undefined): number | undefin
 }
 
 /**
+ * The auth plugin the environment asks for. TABDOCK_PUBLIC_URL means OAuth
+ * through TABDOCK_OAUTH_ISSUER for the people in TABDOCK_OAUTH_USERS, and
+ * TABDOCK_DEV_TOKENS is then ignored (ADR 0014); without it, dev tokens as in
+ * M1. The OAuth settings alone mean nothing, since tokens are issued for the
+ * public URL, so they are refused rather than silently unused.
+ */
+function authFromEnv(env: NodeJS.ProcessEnv): { auth: AuthPlugin; publicUrl?: string } {
+  const publicText = env.TABDOCK_PUBLIC_URL?.trim() ?? '';
+  const issuer = env.TABDOCK_OAUTH_ISSUER?.trim() ?? '';
+  const oauthUsers = env.TABDOCK_OAUTH_USERS?.trim() ?? '';
+  if (publicText !== '') {
+    if (issuer === '' || oauthUsers === '') {
+      throw new Error(
+        'TABDOCK_PUBLIC_URL needs TABDOCK_OAUTH_ISSUER and TABDOCK_OAUTH_USERS: a relay with a public URL signs people in only through OAuth (ADR 0014)',
+      );
+    }
+    const publicUrl = parsePublicUrl(publicText);
+    return {
+      auth: createOAuthAuth({
+        issuer,
+        resource: publicMcpUrlOf(publicUrl),
+        users: parseOAuthUsers(oauthUsers),
+      }),
+      publicUrl,
+    };
+  }
+  if (issuer !== '' || oauthUsers !== '') {
+    throw new Error(
+      'TABDOCK_OAUTH_ISSUER and TABDOCK_OAUTH_USERS work only with TABDOCK_PUBLIC_URL, the https address tokens are issued for (ADR 0014)',
+    );
+  }
+  const tokens = env.TABDOCK_DEV_TOKENS?.trim() ?? '';
+  if (tokens === '') {
+    throw new Error(
+      'TABDOCK_DEV_TOKENS is not set; give it as user=token pairs, for example alice=<24+ random characters>',
+    );
+  }
+  return { auth: createDevTokenAuth(parseDevTokens(tokens)) };
+}
+
+/**
  * Reads the relay's settings from the environment (normally process.env after
- * the repo-root .env is loaded). Auth comes from TABDOCK_DEV_TOKENS, the only
- * plugin M1 has. Errors name the variable, never its value, since a token may
- * sit in the wrong place.
+ * the repo-root .env is loaded). Auth comes from TABDOCK_DEV_TOKENS, or from
+ * the OAuth settings in public URL mode. Errors name the variable, never its
+ * value, since a token may sit in the wrong place.
  */
 export function loadConfigFromEnv(env: NodeJS.ProcessEnv): RelayOptions {
   const portText = env.TABDOCK_PORT?.trim();
@@ -373,16 +499,12 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv): RelayOptions {
           .map((entry) => entry.trim())
           .filter((entry) => entry.length > 0);
 
-  const tokens = env.TABDOCK_DEV_TOKENS?.trim() ?? '';
-  if (tokens === '') {
-    throw new Error(
-      'TABDOCK_DEV_TOKENS is not set; give it as user=token pairs, for example alice=<24+ random characters>',
-    );
-  }
+  const { auth, publicUrl } = authFromEnv(env);
 
   const host = env.TABDOCK_HOST?.trim();
   return {
-    auth: createDevTokenAuth(parseDevTokens(tokens)),
+    auth,
+    publicUrl,
     host: host === undefined || host === '' ? undefined : host,
     port,
     env: envName === '' ? 'development' : envName,

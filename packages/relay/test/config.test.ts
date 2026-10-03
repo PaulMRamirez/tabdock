@@ -377,12 +377,12 @@ describe('dev-token auth', () => {
       { userId: 'bob', displayName: 'Bob', token: 'b'.repeat(40) },
     ]);
     expect(await two.authenticate(requestWith(`Bearer ${TOKEN}`))).toEqual({
-      userId: 'alice',
-      displayName: 'Alice',
+      kind: 'user',
+      user: { userId: 'alice', displayName: 'Alice' },
     });
     expect(await two.authenticate(requestWith(`bearer ${'b'.repeat(40)}`))).toEqual({
-      userId: 'bob',
-      displayName: 'Bob',
+      kind: 'user',
+      user: { userId: 'bob', displayName: 'Bob' },
     });
     for (const header of [
       undefined,
@@ -394,7 +394,14 @@ describe('dev-token auth', () => {
       `Bearer ${TOKEN} extra`,
       `Bearer ${'k'.repeat(5000)}`,
     ]) {
-      expect(await two.authenticate(requestWith(header)), String(header)).toBeNull();
+      // The same refusal as since M1: a 401 that names no metadata, since dev tokens need no sign-in.
+      expect(await two.authenticate(requestWith(header)), String(header)).toEqual({
+        kind: 'refused',
+        status: 401,
+        reason: 'no valid dev token',
+        body: 'Unauthorized',
+        headers: { 'WWW-Authenticate': 'Bearer realm="tabdock"' },
+      });
     }
   });
 });

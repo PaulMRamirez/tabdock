@@ -16,11 +16,14 @@
     "@modelcontextprotocol/node": "2.1.1",
     "@modelcontextprotocol/server": "2.3.0",
     "@tabdock/protocol": "workspace:*",
+    "jose": "6.2.12",
+    "openid-client": "6.8.8",
     "ws": "8.22.0",
     "zod": "4.6.5"
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "2.3.0",
-    "@types/ws": "8.18.2"
+    "@types/ws": "8.18.2",
+    "oauth2-mock-server": "9.2.0"
   }
 }
