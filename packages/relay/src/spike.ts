@@ -210,9 +210,18 @@ function metaClient(params: Record<string, unknown>): ClientInfo | null {
   return parseClientInfo((meta as Record<string, unknown>)[CLIENT_INFO_META_KEY]);
 }
 
+export interface SpikeOptions {
+  /**
+   * The wall clock for pairing milestones and stream lifetimes, in
+   * milliseconds; Date.now unless a test steps its own.
+   */
+  now?: () => number;
+}
+
 export class Spike implements SpikeControl, SpikeHooks {
   readonly #log: Logger;
   readonly #maxBodyBytes: number;
+  readonly #now: () => number;
   #marker: Marker | null = null;
   #generation = 0;
   /** Every 2025-era session's server, so a change reaches the sessions already open. */
@@ -225,9 +234,10 @@ export class Spike implements SpikeControl, SpikeHooks {
   readonly #tickets = new Map<string, IssuedTicket>();
   readonly #pairings = new Map<string, PendingPairing>();
 
-  constructor(log: Logger, maxBodyBytes: number) {
+  constructor(log: Logger, maxBodyBytes: number, options: SpikeOptions = {}) {
     this.#log = log;
     this.#maxBodyBytes = maxBodyBytes;
+    this.#now = options.now ?? Date.now;
   }
 
   // 1. The marker tool
@@ -401,10 +411,10 @@ export class Spike implements SpikeControl, SpikeHooks {
   }
 
   #trackStream(response: Response, signal: AbortSignal, fields: Record<string, unknown>): Response {
-    const opened = Date.now();
+    const opened = this.#now();
     this.#log.info('spike: client opened a stream', fields);
     return trackBody(response, signal, () => {
-      this.#log.info('spike: client stream ended', { ...fields, openMs: Date.now() - opened });
+      this.#log.info('spike: client stream ended', { ...fields, openMs: this.#now() - opened });
     });
   }
 
@@ -448,7 +458,7 @@ export class Spike implements SpikeControl, SpikeHooks {
     const trace = newId('tr');
     // Delete first so a page's re-issued ticket moves to the newest end for bound().
     this.#tickets.delete(pageId);
-    this.#tickets.set(pageId, { trace, issuedAt: Date.now(), scannedAt: null });
+    this.#tickets.set(pageId, { trace, issuedAt: this.#now(), scannedAt: null });
     bound(this.#tickets);
     this.#log.debug('spike: pairing milestone', { stage: 'issued', pageId, trace });
   }
@@ -460,7 +470,7 @@ export class Spike implements SpikeControl, SpikeHooks {
   pairingScanned(pageId: string): void {
     const ticket = this.#tickets.get(pageId);
     if (ticket === undefined || ticket.scannedAt !== null) return;
-    const now = Date.now();
+    const now = this.#now();
     ticket.scannedAt = now;
     this.#log.info('spike: pairing milestone', {
       stage: 'scanned',
@@ -472,7 +482,7 @@ export class Spike implements SpikeControl, SpikeHooks {
 
   /** pair_page matched a code, or /pair/claim consumed a nonce; the ticket is spent. */
   pairingClaimed(pageId: string, userId: string, via: PairingVia): void {
-    const now = Date.now();
+    const now = this.#now();
     this.#prune(now);
     const ticket = this.#tickets.get(pageId);
     this.#tickets.delete(pageId);
@@ -506,7 +516,7 @@ export class Spike implements SpikeControl, SpikeHooks {
     const key = `${pageId} ${userId}`;
     const pending = this.#pairings.get(key);
     if (!pending) return;
-    const now = Date.now();
+    const now = this.#now();
     this.#log.info('spike: pairing milestone', {
       stage: allowed ? 'approved' : 'refused',
       pageId,
@@ -526,7 +536,7 @@ export class Spike implements SpikeControl, SpikeHooks {
     const pending = this.#pairings.get(key);
     if (pending === undefined || pending.approvedAt === null) return;
     this.#pairings.delete(key);
-    const now = Date.now();
+    const now = this.#now();
     this.#log.info('spike: pairing milestone', {
       stage: 'first_call',
       pageId,

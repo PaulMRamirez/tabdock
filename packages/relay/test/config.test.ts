@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage } from 'node:http';
 import { DEFAULT_CALL_DEADLINE_MS } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
-import { isLoopbackHost, MAX_TIMER_MS, resolveConfig } from '../src/config.ts';
+import { isLoopbackHost, MAX_TIMER_MS, parseHostHeader, resolveConfig } from '../src/config.ts';
 import {
   createDevTokenAuth,
   createRelay,
@@ -47,6 +47,47 @@ describe('host binding (S12)', () => {
   it.each(['127.0.0.1', 'localhost', '::1', '[::1]', 'LOCALHOST'])('accepts %s', (host) => {
     expect(isLoopbackHost(host)).toBe(true);
     expect(resolveConfig({ auth, host }).host).toBe(host);
+  });
+});
+
+describe('Host headers (RFC 9110)', () => {
+  it.each<[string, string]>([
+    ['localhost', 'localhost'],
+    ['LocalHost:8787', 'localhost'],
+    ['127.0.0.1:0', '127.0.0.1'],
+    ['[::1]', '[::1]'],
+    ['[::1]:65535', '[::1]'],
+    ['Relay.Example', 'relay.example'],
+    ['my_relay.example', 'my_relay.example'],
+    // Well formed, so read as written; an allowlist then refuses them.
+    ['2130706433', '2130706433'],
+    ['localhost.', 'localhost.'],
+  ])('reads %j as %j', (header, host) => {
+    expect(parseHostHeader(header)).toBe(host);
+  });
+
+  it.each([
+    '',
+    ':8787',
+    'localhost:',
+    'localhost:65536',
+    'localhost:123456',
+    'evil.example@localhost',
+    'u:p@localhost',
+    'localhost/evil',
+    'localhost?evil',
+    'localhost#evil',
+    'localhost\\evil',
+    'loc%61lhost',
+    'local host',
+    'localhost,evil.example',
+    '[::1',
+    '[localhost]',
+    '[::1%25eth0]',
+    '[v1.fe]',
+    'bücher.example',
+  ])('refuses %j, which is no host', (header) => {
+    expect(parseHostHeader(header)).toBeNull();
   });
 
   it('refuses before listening, and defaults to 127.0.0.1 on a free port', async () => {
