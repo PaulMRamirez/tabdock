@@ -12,9 +12,12 @@
 // strict 2026-07-28 handler. In public URL mode (ADR 0014) the public host
 // passes the Host check for /mcp and the QR flow at /pair (pair.ts) is served
 // behind the same check, while /page still takes only requests made on this
-// machine. Requests are logged by route, never by raw path or query, so no
-// secret a URL carries reaches a log. The M3 spike's measurements (spike.ts)
-// hook in here when TABDOCK_SPIKE is on; nothing over HTTP controls them.
+// machine. Without a public URL, in local mode (ADR 0022) and with dev tokens
+// alike, /mcp and /page take only requests made on this machine, so a tunnel
+// pointed at a loopback relay, even one that rewrites Host, cannot expose it.
+// Requests are logged by route, never by raw path or query, so no secret a URL
+// carries reaches a log. The M3 spike's measurements (spike.ts) hook in here
+// when TABDOCK_SPIKE is on; nothing over HTTP controls them.
 
 import { createServer, type IncomingMessage, type ServerResponse, STATUS_CODES } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -82,10 +85,12 @@ function malformedHost(request: IncomingMessage): boolean {
 }
 
 /**
- * Whether a /page upgrade was made on this machine rather than through the
- * tunnel. The Host must be a loopback name exactly as written, and no proxy
+ * Whether a request was made on this machine rather than through a tunnel or
+ * proxy. The Host must be a loopback name exactly as written, and no proxy
  * header may be present: a tunnel told to rewrite Host still adds
- * X-Forwarded-For, while a browser's WebSocket can set neither.
+ * X-Forwarded-For, while a browser's WebSocket can set neither. Every /page
+ * upgrade must pass it (ADR 0014), and so must every /mcp request on a relay
+ * without a public URL (ADR 0022).
  */
 function madeLocally(request: IncomingMessage): boolean {
   const host = request.headers.host === undefined ? null : parseHostHeader(request.headers.host);
@@ -296,6 +301,14 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     // Where the spike's call timestamps start: before the Host check, sign-in and the SDK.
     const receivedAt = performance.now();
     if (config.loopback && !validateHost(request, response)) return;
+    // Before the plugin, so a proxied request never even gets a challenge.
+    if (config.publicUrl === null && !madeLocally(request)) {
+      log.info('mcp request refused: not made on this machine', {
+        address: request.socket.remoteAddress,
+      });
+      send(response, 403, 'This relay serves only clients on its own machine');
+      return;
+    }
     const outcome = await authenticate(request, response);
     if (outcome === null) return;
     if (outcome.kind === 'refused') {
@@ -397,8 +410,9 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     }
     // ADR 0014: every request through the tunnel arrives from loopback, so the
     // address says nothing; the Host and proxy headers do. Pages attach only
-    // from this machine until M4 brings a host and a trusted client address.
-    if (config.publicUrl !== null && !madeLocally(request)) {
+    // from this machine until M4 brings a host and a trusted client address,
+    // and a relay without a public URL never takes a proxied page (ADR 0022).
+    if (!madeLocally(request)) {
       log.info('page socket refused: not made on this machine', { address });
       refuseUpgrade(socket, 403, 'Pages attach only from the relay machine itself');
       return;

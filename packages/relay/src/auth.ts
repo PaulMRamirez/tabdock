@@ -5,7 +5,9 @@
 // starts sign-in only on a 401 whose challenge names the metadata document, so
 // the plugin, not the relay, has to write the challenge. A plugin may also serve
 // GET routes, such as that metadata document, and may need to start before the
-// relay listens. dev-token lives here; the OAuth plugin is in oauth.ts.
+// relay listens. dev-token lives here, and local mode's owner token (ADR 0022)
+// is a dev-token plugin with one user and the loopbackOnly mark; the OAuth
+// plugin is in oauth.ts.
 
 import type { IncomingMessage } from 'node:http';
 import { IdSchema, type User, UserSchema } from '@tabdock/protocol';
@@ -81,6 +83,13 @@ export interface AuthPlugin {
   readonly routes?: ReadonlyMap<string, AuthRoute> | undefined;
   /** Present on a plugin that signs people in at a provider; public URL mode needs it for /pair. */
   readonly browserSignIn?: BrowserSignIn | undefined;
+  /**
+   * Set on a plugin whose credential is good only on this machine, as local
+   * mode's owner token is (ADR 0022). resolveConfig refuses a plugin so
+   * marked, whatever its name, with a public URL, in production or off
+   * loopback, so no later mode or rename can carry it further.
+   */
+  readonly loopbackOnly?: boolean | undefined;
 }
 
 /** Header names as HTTP tokens, values without control characters, so node never throws on them. */
@@ -124,11 +133,19 @@ const DEV_TOKEN_REFUSAL: AuthRefusal = {
   headers: { 'WWW-Authenticate': 'Bearer realm="tabdock"' },
 };
 
+export interface DevTokenOptions {
+  /** Marks the plugin as local mode's (ADR 0022): it then never serves beyond loopback. */
+  loopbackOnly?: boolean | undefined;
+}
+
 /**
  * Error messages name the user, never the token, because they end up on a
- * terminal and in CI logs.
+ * terminal and in CI logs. Only each token's digest is kept.
  */
-export function createDevTokenAuth(users: readonly DevTokenUser[]): AuthPlugin {
+export function createDevTokenAuth(
+  users: readonly DevTokenUser[],
+  options: DevTokenOptions = {},
+): AuthPlugin {
   if (users.length === 0) throw new Error('dev-token auth needs at least one user');
   const seenUsers = new Set<string>();
   const entries = users.map((entry) => {
@@ -166,6 +183,7 @@ export function createDevTokenAuth(users: readonly DevTokenUser[]): AuthPlugin {
 
   return {
     name: 'dev-token',
+    ...(options.loopbackOnly === true ? { loopbackOnly: true } : {}),
     authenticate(request) {
       const presented = bearerToken(request.headers.authorization);
       if (presented === null) return Promise.resolve(DEV_TOKEN_REFUSAL);

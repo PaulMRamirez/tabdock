@@ -7,16 +7,20 @@ export {
   type AuthRoute,
   type BrowserSignIn,
   createDevTokenAuth,
+  type DevTokenOptions,
   type DevTokenUser,
   MIN_DEV_TOKEN_LENGTH,
   parseDevTokens,
 } from './auth.ts';
 export {
+  AUTH_SETTINGS,
   DEFAULT_CLI_PORT,
   DEFAULT_LIMITS,
   DEFAULT_RATE_LIMITS,
   DEFAULT_TIMINGS,
+  type EnvConfig,
   loadConfigFromEnv,
+  type LocalModeInfo,
   NO_ORIGIN,
   type PairClientOptions,
   pairRedirectUriOf,
@@ -28,6 +32,30 @@ export {
   type RelayRateLimits,
   type RelayTimings,
 } from './config.ts';
+export {
+  claudeAddCommand,
+  type LocalBanner,
+  LOCAL_SERVER_NAME,
+  localModeLines,
+  quotePosix,
+  quotePowerShell,
+  type Shell,
+  shellFor,
+} from './local-banner.ts';
+export {
+  drawOwnerToken,
+  type FileFacts,
+  LOCAL_USER,
+  loadOwnerToken,
+  type LocalTokenSystem,
+  OWNER_TOKEN_FILE,
+  type OwnerToken,
+  OwnerTokenError,
+  ownerTokenDirectory,
+  ownerTokenPath,
+  readOwnerToken,
+  type TokenEnv,
+} from './local-token.ts';
 export { createLogger, type Logger, type LogLevel, type LogSink, redact } from './log.ts';
 export {
   CLOCK_TOLERANCE_SECONDS,

@@ -1,14 +1,16 @@
 // pnpm dev and pnpm dev:public: the relay and the demo page together, for
-// working by hand. Settings come from the repo-root .env (see .env.example).
+// working by hand. Settings come from the repo-root .env when there is one
+// (see .env.example), and pnpm dev needs none.
 //
-// pnpm dev runs on this machine with dev tokens, and refuses to start without
-// TABDOCK_DEV_TOKENS, saying how to make them. pnpm dev:public (--public) runs
-// public URL mode (ADR 0014) for Claude on the phone: it names every missing
-// setting at once, then prints the connector URL and what to enter at the
-// identity provider, never a secret. pnpm dev with TABDOCK_PUBLIC_URL set
-// starts public URL mode too, since the relay reads the same .env.
-// Workspace packages export their TypeScript sources, so the root package
-// imports them by path rather than listing them as dependencies.
+// pnpm dev runs on this machine: with no settings in local mode (ADR 0022),
+// printing the owner token's path and a `claude mcp add` line that reads it,
+// never the token; with TABDOCK_DEV_TOKENS, with those users as in M1.
+// pnpm dev:public (--public) runs public URL mode (ADR 0014) for Claude on the
+// phone: it names every missing setting at once, then prints the connector URL
+// and what to enter at the identity provider, never a secret. pnpm dev with
+// TABDOCK_PUBLIC_URL set starts public URL mode too, since the relay reads the
+// same .env. Workspace packages export their TypeScript sources, so the root
+// package imports them by path rather than listing them as dependencies.
 
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -17,8 +19,11 @@ import {
   attachSpikeConsole,
   createRelay,
   loadConfigFromEnv,
+  type LocalModeInfo,
+  localModeLines,
   parseOAuthUsers,
   type Relay,
+  shellFor,
   SPIKE_CONSOLE_HELP,
 } from '../packages/relay/src/index.ts';
 import {
@@ -52,29 +57,18 @@ if (isPublic) {
   if (missing.length > 0) {
     fail(missingSettingsMessage(command, missing, process.env, expectedDemoOrigin));
   }
-} else if ((process.env.TABDOCK_DEV_TOKENS?.trim() ?? '') === '') {
-  fail(
-    [
-      'pnpm dev needs TABDOCK_DEV_TOKENS: one user=token pair per person, tokens of 24 or more random characters.',
-      'Create .env from .env.example and fill it in, for example:',
-      '',
-      '  cp .env.example .env',
-      `  node -e "console.log('TABDOCK_DEV_TOKENS=alice=' + require('node:crypto').randomBytes(24).toString('base64url'))" >> .env`,
-      '',
-      'Then run pnpm dev again. Keep .env to yourself; it is ignored by git.',
-      'For Claude on a phone, pnpm dev:public runs the relay behind a public https URL instead.',
-      '',
-    ].join('\n'),
-  );
 }
 
 let relay: Relay | undefined;
 let demo: DemoServer | undefined;
 let allowedOrigins: readonly string[] | undefined;
+let localMode: LocalModeInfo | undefined;
 try {
-  // Config errors name the variable at fault, never its value, so they are safe to print.
+  // Config and owner token errors name the variable or path at fault, never a
+  // secret, so they are safe to print.
   const config = loadConfigFromEnv(process.env);
   allowedOrigins = config.allowedOrigins;
+  localMode = config.localMode;
   relay = await createRelay(config);
   demo = await startDemoServer({ port: demoPort, watch: true });
 } catch (error) {
@@ -91,7 +85,23 @@ if (allowedOrigins && !allowedOrigins.includes(demoOrigin)) {
 // Readable rather than percent-encoded; browsers read the parameter the same way.
 const demoLink = `${demo.url}?relay=${relay.pageUrl}`;
 
-function localLines(live: Relay): string[] {
+function localModeBanner(live: Relay, local: LocalModeInfo): string[] {
+  return [
+    'Tabdock dev: relay and demo board',
+    '',
+    `  Demo board linked to the relay: ${demoLink}`,
+    '',
+    ...localModeLines({
+      mcpUrl: live.mcpUrl,
+      pageUrl: live.pageUrl,
+      tokenPath: local.tokenPath,
+      created: local.created,
+      shell: shellFor(process.platform),
+    }),
+  ];
+}
+
+function devTokenLines(live: Relay): string[] {
   return [
     'Tabdock dev: relay and demo board',
     '',
@@ -132,7 +142,12 @@ function publicLines(live: Relay, publicUrl: string): string[] {
   ];
 }
 
-const summary = relay.publicUrl === null ? localLines(relay) : publicLines(relay, relay.publicUrl);
+const summary =
+  relay.publicUrl !== null
+    ? publicLines(relay, relay.publicUrl)
+    : localMode !== undefined
+      ? localModeBanner(relay, localMode)
+      : devTokenLines(relay);
 process.stdout.write(
   [...summary, 'Relay logs follow as JSON lines; Ctrl-C stops both.', ''].join('\n'),
 );
