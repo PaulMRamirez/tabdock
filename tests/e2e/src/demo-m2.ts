@@ -1,5 +1,6 @@
 // pnpm demo:m2: many clients and many users on one page, narrated.
-//   --headed   watch the board and the Tabdock widget in a visible browser
+//   --headed       watch the board and the Tabdock widget in a visible browser
+//   --screenshot   also save the widget with both users and the burst to docs/tour/img/m2-board.png
 // The relay runs in this process with two throwaway dev users and keeps its
 // log in memory at debug level, where the write queue's 'call queued' lines
 // record the order calls reached it; the demo reads them back. It never prints
@@ -10,6 +11,9 @@
 // through the page's control handle, which the demo exposes only under ?e2e;
 // the widget's buttons call the same handle.
 
+import { mkdir } from 'node:fs/promises';
+import { dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { type Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import type { Browser, Page } from '@playwright/test';
 import type { ActivityEntry, DockState } from '@tabdock/adapter';
@@ -19,6 +23,7 @@ import { launchChromium } from './harness.ts';
 import {
   approveThroughHandle,
   callTool,
+  clickInWidget,
   connectMcp,
   demoPageUrl,
   dockState,
@@ -28,9 +33,13 @@ import {
   type ToolOutcome,
   waitForDock,
   waitForLink,
+  widgetVisible,
 } from './tabdock-harness.ts';
 
 const headed = process.argv.includes('--headed');
+const screenshotPath = fileURLToPath(
+  new URL('../../../docs/tour/img/m2-board.png', import.meta.url),
+);
 /** How many add_item calls the burst sends. */
 const BURST = 10;
 
@@ -358,6 +367,16 @@ try {
   say(
     '   each write ended before the next began, in the order the relay logged them arriving (its call queued lines)',
   );
+
+  if (process.argv.includes('--screenshot')) {
+    // Taken here, while both users are attached and the burst fills the activity list.
+    if (!(await widgetVisible(page, 'roster'))) await clickInWidget(page, { action: 'toggle' });
+    // Past the widget's 500 ms arming wait, so the buttons show as they take clicks.
+    await page.waitForTimeout(800);
+    await mkdir(dirname(screenshotPath), { recursive: true });
+    await page.screenshot({ path: screenshotPath, fullPage: true });
+    say(`   saved ${screenshotPath}`);
+  }
 
   say('\n8. Revoke in the middle of a call.');
   say('tools/call call_page_tool { tool: "clear_board" } from alice-phone');
