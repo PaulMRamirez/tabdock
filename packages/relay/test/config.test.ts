@@ -186,6 +186,22 @@ describe('origin policy (S1, S2)', () => {
     );
   });
 
+  it('gives each argument check 50 ms by default, bounded like every other timing (ADR 0010)', () => {
+    expect(resolveConfig({ auth }).timings.argumentCheckMs).toBe(50);
+    expect(resolveConfig({ auth, timings: { argumentCheckMs: 80 } }).timings.argumentCheckMs).toBe(
+      80,
+    );
+    expect(() => resolveConfig({ auth, timings: { argumentCheckMs: 0 } })).toThrow(
+      /argumentCheckMs must be a positive integer/,
+    );
+    expect(() => resolveConfig({ auth, timings: { argumentCheckMs: 12.5 } })).toThrow(
+      /argumentCheckMs must be a positive integer/,
+    );
+    expect(() => resolveConfig({ auth, timings: { argumentCheckMs: MAX_TIMER_MS + 1 } })).toThrow(
+      /argumentCheckMs must be at most 2147483647/,
+    );
+  });
+
   it('refuses a call deadline whose sum with the grace would not fit one setTimeout', () => {
     // A call's timer is armed for both together, and Node runs a longer one after 1 ms.
     expect(() =>

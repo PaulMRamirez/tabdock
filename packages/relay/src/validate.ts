@@ -1,17 +1,17 @@
-// Argument checks against a page tool's inputSchema (ADR 0008). One check is
-// compiled per tool from the page's own schema when its tools frame arrives,
-// with the SDK's CfWorker validator; never Ajv, which crashes on an $async
-// schema, shares validators between schemas with one $id and never shrinks its
-// cache. Before compiling, every regex the page wrote is removed: a pattern such
-// as ^(a+)+$ backtracks exponentially, and so does CfWorker's own url format on
-// a long string, so format goes too. Removing a rule can tighten a schema where
-// it sits under not, if, oneOf or maxContains, or beside additionalProperties and
-// unevaluated keywords, so those are loosened in turn: the relay never refuses
-// arguments the page's own schema accepts. Failures are described in the
-// relay's words only, because CfWorker's messages quote the schema (enum values,
-// required names, types).
+// Argument checks against a page tool's inputSchema (ADR 0008, ADR 0010): how
+// the relay's copy of a page schema is prepared, and how a failure is described.
+// CfWorker itself is never loaded here: it runs only in the check worker
+// (cfworker.ts, argument-worker.ts), so nothing a page or client sends can make
+// it hold up the main thread. Before the copy is compiled, every regex the page
+// wrote is removed: a pattern such as ^(a+)+$ backtracks exponentially, and so
+// does CfWorker's own url format on a long string, so format goes too.
+// uniqueItems goes as well, since CfWorker compares every pair of a client's
+// array. Removing a rule can tighten a schema where it sits under not, if, oneOf
+// or maxContains, or beside additionalProperties and unevaluated keywords, so
+// those are loosened in turn: the relay never refuses arguments the page's own
+// schema accepts. Failures are described in the relay's words only, because
+// CfWorker's messages quote the schema (enum values, required names, types).
 
-import { CfWorkerJsonSchemaValidator } from '@modelcontextprotocol/server/validators/cf-worker';
 import type { JsonObject } from '@tabdock/protocol';
 
 export type ArgumentCheck =
@@ -28,8 +28,12 @@ export type CheckArguments = (args: JsonObject) => ArgumentCheck;
  */
 export const MAX_CHECKED_SCHEMA_DEPTH = 64;
 
-/** Keywords that run a regex: pattern and patternProperties directly, format through CfWorker's checks. */
-const REGEX_KEYWORDS = new Set(['pattern', 'patternProperties', 'format']);
+/**
+ * Rules the relay's copy drops. pattern and patternProperties run a regex
+ * directly and format through CfWorker's checks; uniqueItems costs time
+ * quadratic in the client's array (ADR 0010).
+ */
+const REMOVED_KEYWORDS = new Set(['pattern', 'patternProperties', 'format', 'uniqueItems']);
 /** Without patternProperties beside them, these would refuse the properties it allowed. */
 const PATTERN_PROPERTIES_SIBLINGS = new Set(['additionalProperties', 'unevaluatedProperties']);
 /**
@@ -52,7 +56,7 @@ const DATA_KEYWORDS = new Set(['enum', 'const', 'required', 'type', '$vocabulary
 const NAME_MAPS = new Set(['properties', '$defs', 'definitions', 'dependentSchemas']);
 /**
  * Name maps that CfWorker also indexes as schemas, so a $ref into one reads its
- * names as keywords: an entry named like a regex keyword is removed.
+ * names as keywords: an entry named like a removed keyword is removed.
  */
 const KEYWORD_NAME_MAPS = new Set(['dependencies', 'dependentRequired']);
 /** A reference may land on a loosened schema anywhere, so it counts as loosened itself. */
@@ -80,7 +84,7 @@ interface Stripped {
 }
 
 class Stripper {
-  removedRegex = false;
+  removedRule = false;
   /** Set when an evaluation source went away, which unevaluated keywords anywhere could feel. */
   shrankEvaluation = false;
   readonly #refsLoosen: boolean;
@@ -110,8 +114,8 @@ class Stripper {
     let loosened = false;
     const entries: [string, unknown][] = [];
     for (const [name, item] of Object.entries(map)) {
-      if (keywordNames && REGEX_KEYWORDS.has(name)) {
-        this.removedRegex = true;
+      if (keywordNames && REMOVED_KEYWORDS.has(name)) {
+        this.removedRule = true;
         loosened = true;
         continue;
       }
@@ -129,8 +133,8 @@ class Stripper {
     const loosenedKeys = new Set<string>();
     const kept = new Map<string, unknown>();
     for (const [key, item] of Object.entries(schema)) {
-      if (REGEX_KEYWORDS.has(key)) {
-        this.removedRegex = true;
+      if (REMOVED_KEYWORDS.has(key)) {
+        this.removedRule = true;
         loosened = true;
         continue;
       }
@@ -193,14 +197,15 @@ function withoutUnevaluated(value: unknown, position: Position): unknown {
 }
 
 /**
- * The page's schema with every regex removed and every rule the removal could
- * have tightened loosened. Throws when the schema is nested too deep to check.
+ * The page's schema with every regex and uniqueItems removed and every rule the
+ * removal could have tightened loosened. Throws when the schema is nested too
+ * deep to check.
  */
 export function prepareSchema(schema: JsonObject): JsonObject {
   // References only matter once something was removed; without that, nothing is loosened.
   let stripper = new Stripper(false);
   let prepared = stripper.value(schema, 'schema', 0).value;
-  if (stripper.removedRegex) {
+  if (stripper.removedRule) {
     stripper = new Stripper(true);
     prepared = stripper.value(schema, 'schema', 0).value;
   }
@@ -265,7 +270,6 @@ const RULES: [RegExp, string, string][] = [
   [/^Items did not match schema\./, 'items', 'has an item that does not match its schema'],
   [/^Array (is empty|does not contain|must contain|has less)/, 'contains', 'lacks a required item'],
   [/^Array may contain at most /, 'maxContains', 'has too many matching items'],
-  [/^Duplicate items at indexes /, 'uniqueItems', 'has duplicate items'],
   [/^\S+ is less than /, 'minimum', 'is below the allowed range'],
   [/^\S+ is greater than /, 'maximum', 'is above the allowed range'],
   [/^\S+ is not a multiple of /, 'multipleOf', 'is not a multiple of the required step'],
@@ -355,31 +359,4 @@ export function describeFailure(tool: string, args: JsonObject, message: string)
   const rule = RULES.find(([pattern]) => pattern.test(chosen.text));
   const [, keyword, description] = rule ?? [null, 'schema', 'fails a schema rule'];
   return `${prefix}: ${where} ${description} (rule "${keyword}")`;
-}
-
-const provider = new CfWorkerJsonSchemaValidator();
-
-/**
- * One tool's check, or null when its schema cannot be checked (too deep, a
- * dialect CfWorker refuses, a reference it cannot resolve); calls to that tool
- * then go on unchecked, as they did before M2. Nothing here throws.
- */
-export function compileArgumentCheck(tool: string, schema: JsonObject): CheckArguments | null {
-  let validate: (input: unknown) => { valid: boolean; errorMessage?: string | undefined };
-  try {
-    // CfWorker annotates the schema object it is given, so it gets our own copy.
-    validate = provider.getValidator(prepareSchema(schema));
-  } catch {
-    return null;
-  }
-  return (args) => {
-    let result: ReturnType<typeof validate>;
-    try {
-      result = validate(args);
-    } catch {
-      return { kind: 'unchecked' };
-    }
-    if (result.valid) return { kind: 'valid' };
-    return { kind: 'invalid', message: describeFailure(tool, args, result.errorMessage ?? '') };
-  };
 }

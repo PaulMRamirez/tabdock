@@ -4,7 +4,8 @@
 // attachments, so an unknown page and someone else's page look the same (S13).
 // Mutating calls wait in a per-page queue and run one at a time in arrival
 // order (SPEC section 5); read-only calls go straight to the page. The section 9
-// limits and attachment idle expiry follow ADR 0009, argument checks ADR 0008.
+// limits and attachment idle expiry follow ADR 0009, argument checks ADR 0008
+// and ADR 0010: they run in a worker thread with a time budget, never here.
 
 import {
   type AttachmentView,
@@ -29,6 +30,12 @@ import {
   truncate,
 } from '@tabdock/protocol';
 import type { RawData, WebSocket } from 'ws';
+import {
+  ArgumentChecker,
+  type PreparedSchema,
+  prepareForCheck,
+  type UncheckedReason,
+} from './argument-checker.ts';
 import type { ResolvedConfig } from './config.ts';
 import type { Logger } from './log.ts';
 import { SlidingWindowLimiter } from './rate-limit.ts';
@@ -50,7 +57,6 @@ import type {
   PageState,
   RelayStore,
 } from './store.ts';
-import { type CheckArguments, compileArgumentCheck } from './validate.ts';
 
 type FrameOf<T extends PageFrame['t']> = Extract<PageFrame, { t: T }>;
 
@@ -135,10 +141,25 @@ interface PageQueue {
 }
 
 interface ArgCheckEntry {
-  /** null when the schema cannot be checked; calls then go on unchecked. */
-  check: CheckArguments | null;
-  /** Whether a check that failed to run has been logged, so it is logged once. */
-  warned: boolean;
+  /** The page's own schema prepared for the check worker; null when it is too deep to check. */
+  schema: PreparedSchema | null;
+  /** Set once the worker could not compile it; calls then go on unchecked without asking. */
+  uncompilable: boolean;
+  /** Why calls to this tool already went unchecked, so each reason is logged once. */
+  warned: Set<UncheckedReason>;
+}
+
+/** Logged once per tool and reason; fixed words, never the schema or the arguments. */
+const UNCHECKED_WARNINGS: Record<UncheckedReason, string> = {
+  failed: 'an argument check failed to run; calls it fails on go to the page unchecked',
+  timeout: 'an argument check ran out of time; calls it overruns go to the page unchecked',
+  busy: 'an argument check could not start in time behind another; calls go to the page unchecked while the checker is busy',
+  unavailable:
+    'no argument check worker was ready; calls go to the page unchecked until one starts',
+};
+
+function sameSchema(a: PreparedSchema | null, b: PreparedSchema | null): boolean {
+  return a === null || b === null ? a === b : a.hash === b.hash;
 }
 
 /** The page sessions one remote address created and still holds, awake or asleep. */
@@ -383,8 +404,10 @@ export class PageHub {
   readonly #queues = new Map<string, PageQueue>();
   /** Pages whose queue is being advanced right now, so a settle inside it does not advance it again. */
   readonly #pumping = new Set<string>();
-  /** Argument checks per page and tool, compiled from the page's own schemas (ADR 0008). */
+  /** Argument checks per page and tool, prepared from the page's own schemas (ADR 0008). */
   readonly #argChecks = new Map<string, Map<string, ArgCheckEntry>>();
+  /** The only place CfWorker runs: a worker thread with a time budget per check (ADR 0010). */
+  readonly #checker: ArgumentChecker;
   /** When each page last got a roster, for EXPIRY_ROSTER_REFRESH_MS. */
   readonly #rosterSentAt = new Map<string, number>();
   /** When each page last got a roster for what a call alone changed (expiry or a new client). */
@@ -405,6 +428,16 @@ export class PageHub {
     this.#userLimiter = new SlidingWindowLimiter(pairAttemptsPerUser, windowMs);
     this.#addressLimiter = new SlidingWindowLimiter(pairAttemptsPerAddress, windowMs);
     this.#callLimiter = new SlidingWindowLimiter(callsPerUserPerPage, windowMs);
+    this.#checker = new ArgumentChecker({ budgetMs: config.timings.argumentCheckMs, log });
+  }
+
+  /**
+   * Resolves once the argument check worker is ready, or has failed to start;
+   * the relay waits on it before listening so its first calls are checked. A
+   * worker that fails is restarted with backoff, and calls go on unchecked.
+   */
+  async ready(): Promise<void> {
+    await this.#checker.ready();
   }
 
   // Page side
@@ -707,9 +740,10 @@ export class PageHub {
   }
 
   /**
-   * A tools frame costs a compile per tool (ADR 0008), so each socket gets a
-   * budget of them (S9). Past it the socket is closed as a policy breach, which
-   * leaves the page asleep and resumable like any other close.
+   * A tools frame costs a walk and a hash of every tool's schema on the main
+   * thread (ADR 0008, ADR 0010), so each socket gets a budget of them (S9). Past
+   * it the socket is closed as a policy breach, which leaves the page asleep and
+   * resumable like any other close.
    */
   #toolsFrameAllowed(conn: Conn): boolean {
     const now = Date.now();
@@ -736,16 +770,17 @@ export class PageHub {
       if (seen.has(tool.name)) continue;
       seen.add(tool.name);
       tools.push(cutTool(tool));
-      // From the page's own schema, not the cut copy, so a long enum value still matches.
-      const check = compileArgumentCheck(tool.name, tool.inputSchema);
-      if (check === null && previous?.get(tool.name)?.check !== null) {
-        // Never the schema or the validator's message: both are page text.
-        this.#log.warn('a tool schema cannot be checked; calls to it go to the page unchecked', {
-          pageId,
-          tool: tool.name,
-        });
+      // From the page's own schema, not the cut copy, so a long enum value still
+      // matches. Prepared here and compiled in the worker, at the tool's first call.
+      const schema = prepareForCheck(tool.inputSchema);
+      const before = previous?.get(tool.name);
+      // The same schema again keeps what is known about it, so nothing is logged twice.
+      if (before && sameSchema(before.schema, schema)) {
+        checks.set(tool.name, before);
+        continue;
       }
-      checks.set(tool.name, { check, warned: false });
+      if (schema === null) this.#warnUncheckable(pageId, tool.name);
+      checks.set(tool.name, { schema, uncompilable: false, warned: new Set() });
     }
     if (tools.length !== frame.tools.length) {
       this.#log.warn('page listed a tool name twice; kept the first', { pageId });
@@ -1460,10 +1495,11 @@ export class PageHub {
   /**
    * Everything a call must pass on arrival, in order: access, the rate limit
    * (so a refused call still counts and nobody spins on invalid calls for free),
-   * the tool, the role, the frame size and the arguments. A mutating call then
-   * joins its page's queue; a read-only one goes to the page at once.
+   * the tool, the role, the frame size, the arguments and the queue depth. A
+   * mutating call then joins its page's queue; a read-only one goes to the page
+   * at once.
    */
-  #call(
+  async #call(
     caller: CallerIdentity,
     pageId: string,
     toolName: string,
@@ -1472,18 +1508,16 @@ export class PageHub {
   ): Promise<CallOutcome> {
     const arrivedAt = Date.now();
     const access = this.#access(caller.userId, pageId);
-    if (access.kind === 'error') return Promise.resolve(access);
+    if (access.kind === 'error') return access;
     const { page, attachment } = access;
 
     const rateKey = attachmentKey(pageId, caller.userId);
     if (!this.#callLimiter.allows(rateKey, arrivedAt)) {
       this.#log.warn('call rate limited', { pageId, userId: caller.userId });
       const { callsPerUserPerPage, windowMs } = this.#config.rateLimits;
-      return Promise.resolve(
-        hubError(
-          'rate_limited',
-          `more than ${String(callsPerUserPerPage)} calls to this page in ${formatDuration(windowMs)}; wait and try again`,
-        ),
+      return hubError(
+        'rate_limited',
+        `more than ${String(callsPerUserPerPage)} calls to this page in ${formatDuration(windowMs)}; wait and try again`,
       );
     }
     this.#callLimiter.record(rateKey, arrivedAt);
@@ -1495,18 +1529,12 @@ export class PageHub {
     // Every call moves the expiry, but only one that passes the tool and role
     // checks names its client: refused calls must not add names to the roster.
     this.#touchAttachment(attachment, allowed ? caller.client : null, arrivedAt);
-    if (!tool) {
-      return Promise.resolve(
-        hubError('tool_not_found', `page ${pageId} has no tool named ${toolName}`),
-      );
-    }
+    if (!tool) return hubError('tool_not_found', `page ${pageId} has no tool named ${toolName}`);
     // S5, relay half: observers run only tools the page marked read-only.
     if (attachment.role === 'observer' && tool.annotations?.readOnlyHint !== true) {
-      return Promise.resolve(
-        hubError(
-          'role_denied',
-          `you are an observer on this page, and ${toolName} is not marked read-only`,
-        ),
+      return hubError(
+        'role_denied',
+        `you are an observer on this page, and ${toolName} is not marked read-only`,
       );
     }
 
@@ -1527,19 +1555,26 @@ export class PageHub {
     };
     // Checked before anything waits: the size cannot grow later, as the role and deadline only shrink.
     const encoded = this.#encodeInvoke(call, attachment.role, this.#config.timings.callDeadlineMs);
-    if (encoded.kind === 'error') return Promise.resolve(encoded);
-    const argumentError = this.#checkArguments(pageId, tool.name, args);
-    if (argumentError) return Promise.resolve(argumentError);
+    if (encoded.kind === 'error') return encoded;
+    const argumentError = await this.#checkArguments(pageId, tool.name, args);
+    if (argumentError) return argumentError;
+
+    // The check waited on the worker (ADR 0010), so the operator may have revoked
+    // or demoted the caller, or the page changed its tools, meanwhile. They are
+    // looked at again here, before the call can join a queue or go out, and
+    // #dispatch looks once more just before the invoke is sent.
+    if (this.#closed) return hubError('page_asleep', 'the relay is shutting down');
+    const current = this.#recheck(call);
+    if (current.kind === 'error') return current;
+    call.mutating = current.tool.annotations?.readOnlyHint !== true;
 
     if (call.mutating) {
       const waiting = this.#queues.get(pageId)?.waiting.length ?? 0;
       if (waiting >= this.#config.limits.queueDepth) {
         this.#log.warn('call refused: the page queue is full', { pageId, userId: caller.userId });
-        return Promise.resolve(
-          hubError(
-            'page_busy',
-            `${String(waiting)} calls that change the page are already waiting their turn; try again shortly`,
-          ),
+        return hubError(
+          'page_busy',
+          `${String(waiting)} calls that change the page are already waiting their turn; try again shortly`,
         );
       }
     }
@@ -1621,23 +1656,48 @@ export class PageHub {
     return { kind: 'frame', text };
   }
 
-  /** ADR 0008: null when the arguments pass, or when the tool's schema cannot be checked. */
-  #checkArguments(pageId: string, toolName: string, args: JsonObject): HubError | null {
+  /**
+   * ADR 0008 and ADR 0010: null when the arguments pass, when the tool's schema
+   * cannot be checked, or when the worker did not answer within its budget.
+   */
+  async #checkArguments(
+    pageId: string,
+    toolName: string,
+    args: JsonObject,
+  ): Promise<HubError | null> {
     const entry = this.#argChecks.get(pageId)?.get(toolName);
-    if (!entry?.check) return null;
-    const result = entry.check(args);
-    if (result.kind === 'invalid') return hubError('invalid_arguments', result.message);
-    if (result.kind === 'unchecked' && !entry.warned) {
-      entry.warned = true;
-      this.#log.warn(
-        'an argument check failed to run; calls it fails on go to the page unchecked',
-        {
-          pageId,
-          tool: toolName,
-        },
-      );
+    if (!entry?.schema || entry.uncompilable) return null;
+    const result = await this.#checker.check(toolName, entry.schema, args);
+    switch (result.kind) {
+      case 'valid':
+        return null;
+      case 'invalid':
+        return hubError('invalid_arguments', result.message);
+      case 'uncompilable':
+        this.#markUncompilable(pageId, toolName, entry);
+        return null;
+      case 'unchecked':
+        if (!entry.warned.has(result.reason)) {
+          entry.warned.add(result.reason);
+          this.#log.warn(UNCHECKED_WARNINGS[result.reason], { pageId, tool: toolName });
+        }
+        return null;
     }
-    return null;
+  }
+
+  /** Calls checked at the same time all learn it; the first one logs it. */
+  #markUncompilable(pageId: string, toolName: string, entry: ArgCheckEntry): void {
+    if (entry.uncompilable) return;
+    entry.uncompilable = true;
+    this.#warnUncheckable(pageId, toolName);
+  }
+
+  /** Never the schema or the validator's message: both are page text. */
+  #warnUncheckable(pageId: string, toolName: string): void {
+    this.#log.warn('a tool schema cannot be checked; calls to it go to the page unchecked', {
+      pageId,
+      tool: toolName,
+    });
   }
 
   /**
@@ -1674,32 +1734,39 @@ export class PageHub {
   }
 
   /**
+   * What may have changed since a call arrived, looked at again: the
+   * attachment, the page, the tool and the role.
+   */
+  #recheck(
+    call: PendingCall,
+  ): { kind: 'ok'; attachment: AttachmentRecord; conn: Conn; tool: PageTool } | HubError {
+    const access = this.#access(call.caller.userId, call.pageId);
+    if (access.kind === 'error') return access;
+    const { page, attachment, conn } = access;
+    const tool = page.tools.find((candidate) => candidate.name === call.toolName);
+    if (!tool) {
+      return hubError('tool_not_found', `page ${call.pageId} has no tool named ${call.toolName}`);
+    }
+    if (attachment.role === 'observer' && tool.annotations?.readOnlyHint !== true) {
+      return hubError(
+        'role_denied',
+        `you are an observer on this page now, and ${call.toolName} is not marked read-only`,
+      );
+    }
+    return { kind: 'ok', attachment, conn, tool };
+  }
+
+  /**
    * Sends a call to its page, checking again what may have changed while it
    * waited: the attachment, the page, the tool and the role. True if it went out.
    */
   #dispatch(call: PendingCall): boolean {
-    const access = this.#access(call.caller.userId, call.pageId);
-    if (access.kind === 'error') {
-      call.settle(access);
+    const current = this.#recheck(call);
+    if (current.kind === 'error') {
+      call.settle(current);
       return false;
     }
-    const { page, attachment, conn } = access;
-    const tool = page.tools.find((candidate) => candidate.name === call.toolName);
-    if (!tool) {
-      call.settle(
-        hubError('tool_not_found', `page ${call.pageId} has no tool named ${call.toolName}`),
-      );
-      return false;
-    }
-    if (attachment.role === 'observer' && tool.annotations?.readOnlyHint !== true) {
-      call.settle(
-        hubError(
-          'role_denied',
-          `you are an observer on this page now, and ${call.toolName} is not marked read-only`,
-        ),
-      );
-      return false;
-    }
+    const { attachment, conn } = current;
     const { callDeadlineMs } = this.#config.timings;
     const remaining = call.waited ? callDeadlineMs - (Date.now() - call.arrivedAt) : callDeadlineMs;
     if (remaining <= 0) {
@@ -1871,9 +1938,14 @@ export class PageHub {
     map.delete(key);
   }
 
-  /** Cancels everything in flight or queued, closes every page socket and stops every timer. */
+  /**
+   * Cancels everything in flight or queued, closes every page socket, stops
+   * every timer and terminates the argument check worker.
+   */
   async shutdown(): Promise<void> {
     this.#closed = true;
+    // Checks still waiting on it come back unchecked, and their calls then see #closed.
+    const checkerClosed = this.#checker.close();
     for (const waiter of [...this.#pairWaiters.values()].flatMap((waiters) => [...waiters])) {
       waiter(hubError('timeout', 'the relay is shutting down'));
     }
@@ -1907,6 +1979,6 @@ export class PageHub {
       for (const timer of map.values()) clearTimeout(timer);
       map.clear();
     }
-    await Promise.all(closing);
+    await Promise.all([...closing, checkerClosed]);
   }
 }
