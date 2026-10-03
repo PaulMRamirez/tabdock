@@ -12,16 +12,19 @@
     "typecheck": "tsc -p tsconfig.json",
     "check:claude-code": "node src/claude-code-check.ts",
     "check:claude-code:m1": "node src/claude-code-check-m1.ts",
-    "demo:m1": "node src/demo-m1.ts"
+    "demo:m1": "node src/demo-m1.ts",
+    "demo:m2": "node src/demo-m2.ts"
   },
   "devDependencies": {
     "@mcp-b/webmcp-local-relay": "5.1.0",
     "@modelcontextprotocol/client": "2.3.0",
     "@playwright/test": "1.56.1",
-    "@tabdock/demo": "workspace:*",
-    "@tabdock/relay": "workspace:*",
     "@tabdock/adapter": "workspace:*",
+    "@tabdock/demo": "workspace:*",
+    "@tabdock/protocol": "workspace:*",
+    "@tabdock/relay": "workspace:*",
     "@tabdock/sim-page": "workspace:*",
-    "@tabdock/protocol": "workspace:*"
+    "@types/ws": "8.18.2",
+    "ws": "8.22.0"
   }
 }

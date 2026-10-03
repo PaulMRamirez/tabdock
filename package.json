@@ -19,7 +19,8 @@
     "test": "vitest run",
     "test:e2e": "pnpm --filter @tabdock/e2e test:e2e",
     "demo:m0": "pnpm --filter @tabdock/e2e demo:m0",
-    "demo:m1": "pnpm --filter @tabdock/e2e demo:m1"
+    "demo:m1": "pnpm --filter @tabdock/e2e demo:m1",
+    "demo:m2": "pnpm --filter @tabdock/e2e demo:m2"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
