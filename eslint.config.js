@@ -6,7 +6,14 @@ import tseslint from 'typescript-eslint';
 
 export default defineConfig(
   {
-    ignores: ['**/dist/**', '**/coverage/**', '**/test-results/**', '**/playwright-report/**'],
+    ignores: [
+      '**/dist/**',
+      '**/coverage/**',
+      '**/test-results/**',
+      '**/playwright-report/**',
+      // Agents' temporary worktrees: other checkouts of this repo, possibly mid-edit.
+      '.claude/**',
+    ],
   },
   js.configs.recommended,
   tseslint.configs.strictTypeChecked,

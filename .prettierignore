@@ -10,3 +10,5 @@ test-results/
 playwright-report/
 # Machine-written measurement output, kept as evidence.
 docs/notes/baseline.raw*.json
+# Agents' temporary worktrees: other checkouts of this repo.
+.claude/
