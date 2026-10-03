@@ -649,7 +649,7 @@ describe('schema nodes per tools frame and per tool (S9, ADR 0010)', () => {
     const big = wide('big', MAX_FRAME_SCHEMA_NODES);
     const frames = [
       [big, READ_TOOL, WRITE_TOOL],
-      // The same tools again: big is counted again, get_view and add_item are reused.
+      // The same tools again: all three are reused, big included, with no walk.
       [big, READ_TOOL, WRITE_TOOL],
       // get_view changed, so it is walked again, still behind big.
       [big, { ...READ_TOOL, description: 'The viewport, again.' }, WRITE_TOOL],
@@ -666,8 +666,32 @@ describe('schema nodes per tools frame and per tool (S9, ADR 0010)', () => {
       expect(await schemaOf(alice, opened.pageId, 'add_item')).toEqual(WRITE_TOOL.inputSchema);
       expect(await refused(alice, opened.pageId, 'add_item', { label: 5 })).toBe(true);
     }
-    expect(warnings(lines, 'more schema than the relay walks per tool')).toHaveLength(3);
+    // Walked once: an unchanged big tool is reused like any other, so only the first frame warns.
+    expect(warnings(lines, 'more schema than the relay walks per tool')).toHaveLength(1);
     expect(warnings(lines, 'more schema than the relay walks per frame')).toHaveLength(0);
+  });
+
+  it('reuses unchanged over-limit tools on a re-list, so tools stubbed behind four of them recover', async () => {
+    const { opened, alice } = await attached();
+    // Three over-limit tools use most of the frame and a fourth the rest, so
+    // get_view behind them is past the frame cap on the first frame.
+    const bigs = ['b1', 'b2', 'b3', 'b4'].map((name) => wide(name, 2 * MAX_TOOL_SCHEMA_NODES));
+    await relist(opened, [...bigs, READ_TOOL]);
+    expect(await schemaOf(alice, opened.pageId, 'get_view')).toEqual({
+      type: 'object',
+      description: CAPPED,
+    });
+    // Sent again unchanged, the three walked bigs cost nothing, so the fourth
+    // is walked on its own limit and get_view fits behind it.
+    await relist(opened, [...bigs, READ_TOOL]);
+    expect(await schemaOf(alice, opened.pageId, 'get_view')).toEqual(READ_TOOL.inputSchema);
+    expect(await refused(alice, opened.pageId, 'get_view', { unexpected: true })).toBe(true);
+    for (const name of ['b1', 'b4']) {
+      expect(await schemaOf(alice, opened.pageId, name)).toEqual({
+        type: 'object',
+        description: OVER_TOOL,
+      });
+    }
   });
 
   it('charges a tool over the per-tool limit no more than the limit, while the frame cap still holds', async () => {
@@ -681,10 +705,11 @@ describe('schema nodes per tools frame and per tool (S9, ADR 0010)', () => {
     expect(await schemaOf(alice, opened.pageId, 'get_view')).toEqual(READ_TOOL.inputSchema);
     expect(await refused(alice, opened.pageId, 'get_view', { unexpected: true })).toBe(true);
 
-    // One more uses up the rest of the frame, so a changed get_view after it is
-    // past the cap: no number of large tools makes one frame walk more.
+    // Changed, so walked again, and one more uses up the rest of the frame, so
+    // a changed get_view after them is past the cap: no number of large tools
+    // makes one frame walk more.
     await relist(opened, [
-      ...bigs,
+      ...bigs.map((big) => ({ ...big, description: `${big.description} Changed.` })),
       wide('one_more', 2 * MAX_TOOL_SCHEMA_NODES),
       { ...READ_TOOL, description: 'The viewport, again.' },
     ]);

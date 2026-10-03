@@ -448,8 +448,8 @@ export const MAX_FRAME_SCHEMA_NODES = 20_000;
 /**
  * The most of a frame's walk one tool may take. A tool over it is listed with a
  * stub and goes unchecked on its own, having cost the frame no more than this
- * and one node, so one large tool on an honest page cannot leave every tool
- * after it unchecked, on this frame or any re-list of it.
+ * and one node, and is reused by hash while unchanged, so large tools on an
+ * honest page cannot leave the tools after them unchecked once it re-lists.
  */
 export const MAX_TOOL_SCHEMA_NODES = 5_000;
 
@@ -937,7 +937,15 @@ export class PageHub {
           ),
         );
         const check = { schema: null, uncompilable: false, warned: new Set<UncheckedReason>() };
-        listed.set(tool.name, { raw: null, capped: true, tool: stub, check });
+        // Over its own limit it always will be, so it is kept by hash and reused
+        // unchanged without another walk, leaving the frame to the tools after it.
+        // One stubbed only for the frame's lack of room is walked again next time.
+        listed.set(tool.name, {
+          raw: own ? (raw ?? rawToolHash(tool)) : null,
+          capped: true,
+          tool: stub,
+          check,
+        });
         tools.push(stub);
         continue;
       }

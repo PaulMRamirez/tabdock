@@ -2,6 +2,7 @@
 // grant or last call, like a revoke, and each call moves that time.
 
 import type { Client } from '@modelcontextprotocol/client';
+import type { JsonObject, PageTool } from '@tabdock/protocol';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { formatDuration } from '../src/hub.ts';
 import {
@@ -291,6 +292,75 @@ describe('attachment idle expiry', () => {
       expect(opened.all('roster')).toHaveLength(before + 2);
       expect(opened.all('roster').at(-1)?.attachments[0]?.clients[0]?.name).toBe(name);
     }
+  });
+
+  it('holds a late name to the trailing roster when another call sent the last one, so a slow check adds no third roster to a step', async () => {
+    // Each level references the next twice, so the check runs its whole budget and gives up.
+    const $defs: Record<string, unknown> = {};
+    for (let level = 0; level < 24; level += 1) {
+      const next = { $ref: `#/$defs/d${String(level + 1)}` };
+      $defs[`d${String(level)}`] = { anyOf: [next, next] };
+    }
+    $defs.d24 = { type: 'object' };
+    const slowRead: PageTool = {
+      name: 'slow_read',
+      description: 'A read whose argument check runs its whole budget.',
+      inputSchema: { type: 'object', $defs, $ref: '#/$defs/d0' },
+      annotations: { readOnlyHint: true },
+    };
+    // Nested past what the relay prepares for a check, so its calls skip the worker entirely.
+    let deep: JsonObject = { type: 'string' };
+    for (let level = 0; level < 40; level += 1) {
+      deep = { type: 'object', properties: { a: deep } };
+    }
+    const quickRead: PageTool = {
+      name: 'quick_read',
+      description: 'A read whose schema is too deep to check, so it never waits on the worker.',
+      inputSchema: deep,
+      annotations: { readOnlyHint: true },
+    };
+    // A 1 s refresh step, and a check that outlasts it.
+    const { relay } = await setup({
+      timings: { attachmentIdleMs: 10_000, argumentCheckMs: 1500, callDeadlineMs: 10_000 },
+    });
+    const opened = await page({
+      tools: [...TOOLS, slowRead, quickRead],
+      onInvoke: () => ({ ok: true, content: '{}' }),
+    });
+    await pairAndApprove(await client(), opened);
+    const slow = await connectClient(relay, ALICE, { name: 'slow', modern: true });
+    const quick = await connectClient(relay, ALICE, { name: 'quick', modern: true });
+    clients.push(slow, quick);
+    await delay(1100);
+    await opened.sync();
+    const before = opened.all('roster').length;
+
+    // The slow call's arrival sends a roster; its name waits on its check.
+    const slowCall = callTool(slow, 'call_page_tool', {
+      page: opened.pageId,
+      tool: 'slow_read',
+      arguments: {},
+    });
+    await delay(1100);
+    // A step later the quick call's arrival sends one, and its name follows at once.
+    const quickCall = await callTool(quick, 'call_page_tool', {
+      page: opened.pageId,
+      tool: 'quick_read',
+      arguments: {},
+    });
+    expect(quickCall.isError, quickCall.text).toBe(false);
+    await opened.sync();
+    expect(opened.all('roster')).toHaveLength(before + 3);
+    const quickNamed = Date.now();
+
+    // The slow check gives up inside that step. Its name must wait for the
+    // trailing roster, or the step would carry a third roster.
+    expect((await slowCall).isError).toBe(false);
+    await opened.sync();
+    expect(Date.now() - quickNamed).toBeLessThan(900);
+    expect(opened.all('roster')).toHaveLength(before + 3);
+    await eventually(() => opened.all('roster').length === before + 4, 3000);
+    expect(opened.all('roster').at(-1)?.attachments[0]?.clients[0]?.name).toBe('slow');
   });
 
   it('after a quiet step, a burst of new clients sends the arrival roster and the first name at once, and one trailing roster for the rest', async () => {
