@@ -20,3 +20,9 @@ Short records of decisions that change or refine `SPEC.md`, or that a future con
 | [0014](0014-public-url-mode.md)                  | Public URL mode for the M3 spike                              | Accepted |
 | [0015](0015-refresh-spec-m3.md)                  | Refresh SPEC sections 3 and 12 with the facts verified for M3 | Accepted |
 | [0016](0016-invites-and-guest-access.md)         | Invites and guest access                                      | Accepted |
+| [0017](0017-invite-wire-format.md)               | Invite wire format and clarifications of ADR 0016             | Accepted |
+| [0018](0018-hosted-relay.md)                     | The relay on a host behind a TLS-terminating edge             | Accepted |
+| [0019](0019-audit-log-and-restart.md)            | The persistent audit log, and what a restart keeps            | Accepted |
+| [0020](0020-production-sign-in.md)               | Production sign-in                                            | Accepted |
+| [0021](0021-refresh-spec-m4.md)                  | Refresh SPEC sections 3, 10, 11 and 12 for M4                 | Accepted |
+| [0022](0022-local-mode-by-default.md)            | Local mode by default                                         | Accepted |
