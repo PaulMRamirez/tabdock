@@ -580,6 +580,32 @@ describe('roles and consequential tools', () => {
       expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: 'driver' } });
     });
 
+    it.each(['denies', 'leaves unanswered'] as const)(
+      "drops a grant the relay never applied when the operator %s the user's next request",
+      async (answer) => {
+        const h = setup();
+        const socket = await link(
+          h,
+          { limits: { ...welcome(h.clock).limits, idleTimeoutMs: 600_000 } },
+          {},
+        );
+        // Approved as driver just as the request expired: the relay drops the decision.
+        socket.deliver(attachRequest(h.clock, 'req-1'));
+        expect(h.dock.approve('req-1', 'driver')).toBe(true);
+        socket.deliver(attachRequest(h.clock, 'req-2'));
+        if (answer === 'denies') expect(h.dock.deny('req-2')).toBe(true);
+        else await h.clock.advance(60_000);
+        expect(socket.last()).toEqual({ t: 'attach_decision', requestId: 'req-2', allow: false });
+        // The latest decision stands, even if a relay lists Bob after all.
+        expect(h.storage.getItem(GRANTS_KEY)).toBeNull();
+        socket.deliver({ t: 'roster', attachments: [attachment('bob', 'driver')] });
+        socket.deliver(invoke('set_value', { caller: bob() }));
+        await flush();
+        expect(codes(socket)).toEqual(['role_denied']);
+        expect(h.context.runs).toHaveLength(0);
+      },
+    );
+
     it('leaves a user whose first request the operator denied with no grant', async () => {
       const h = setup();
       // The relay lists Bob anyway; only an approval on the page counts.

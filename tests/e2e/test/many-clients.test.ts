@@ -11,6 +11,7 @@ import {
   attachAs,
   callTool,
   deferred,
+  delay,
   eventually,
   inputField,
   listPages,
@@ -293,4 +294,96 @@ describe('A2.3: the write queue through the real adapter', () => {
       new Set(['alice-laptop', 'alice-phone', 'bob-tablet']),
     );
   }, 30_000);
+});
+
+describe('the write queue when a running write is answered early', () => {
+  it.each(['a client cancel', 'a revoke'] as const)(
+    'keeps the next write off the page until a write answered by %s has ended there (polyfill 5.1)',
+    async (how) => {
+      world = await startWorld({ timings: { callDeadlineMs: 15_000 } });
+      const w = world;
+      const log: string[] = [];
+      let running = 0;
+      let most = 0;
+      const gate = deferred();
+      const started = deferred();
+      const write = (name: string, body: () => Promise<void>): FakeToolDefinition => ({
+        name,
+        description: `${name} on the page`,
+        inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+        annotations: { readOnlyHint: false },
+        execute: async (_input, runtime) => {
+          running += 1;
+          most = Math.max(most, running);
+          // The polyfill calls a handler with its input alone, so nothing can tell it to stop.
+          log.push(runtime === undefined ? `${name} start` : `${name} start with a signal`);
+          await body();
+          log.push(`${name} end`);
+          running -= 1;
+          return { done: name };
+        },
+      });
+      const sim = await w.page({
+        profile: 'polyfill-5.1',
+        // The polyfill drops consequentialHint; an empty list says none of these is consequential.
+        policy: { maxDrivers: 2, consequentialTools: [] },
+        tools: (store) => [
+          ...createDefaultTools(store),
+          write('slow_write', async () => {
+            started.resolve();
+            await gate.promise;
+          }),
+          write('fast_write', () => delay(10)),
+        ],
+      });
+      const alice = await w.client(w.alice, 'alice-laptop');
+      const bob = await w.client(w.bob, 'bob-tablet');
+      const pageId = await attachAs(alice, sim, 'driver');
+      await attachAs(bob, sim, 'driver');
+      await waitForTools(alice, pageId, SIM_TOOL_COUNT + 2);
+
+      const abort = new AbortController();
+      const slow = alice
+        .callTool(
+          { name: 'call_page_tool', arguments: { page: pageId, tool: 'slow_write' } },
+          { signal: abort.signal },
+        )
+        .then(
+          (result) => (result.isError === true ? 'tool error' : 'answered'),
+          () => 'rejected',
+        );
+      await started.promise;
+      const fast = callTool(bob, 'call_page_tool', { page: pageId, tool: 'fast_write' });
+      await eventually(async () => Promise.resolve(queuedCallIds(w.relayLogs).length === 2));
+      if (how === 'a client cancel') abort.abort();
+      else expect(sim.revoke('alice')).toBe(true);
+      expect(await slow).toBe(how === 'a client cancel' ? 'rejected' : 'tool error');
+
+      // The relay answered Alice and sent Bob's write on; the page holds it
+      // while the slow handler, which never heard of the cancel, still runs.
+      await sim.waitFor((s) => s.activity.some((entry) => entry.tool === 'fast_write'));
+      await delay(100);
+      expect(log).toEqual(['slow_write start']);
+      expect(sim.activity.find((entry) => entry.tool === 'slow_write')).toMatchObject({
+        outcome: 'cancelled',
+        handlerRunning: true,
+      });
+
+      gate.resolve();
+      const after = await fast;
+      expect(after.isError, after.text).toBe(false);
+      expect(log).toEqual([
+        'slow_write start',
+        'slow_write end',
+        'fast_write start',
+        'fast_write end',
+      ]);
+      expect(most).toBe(1);
+      expect(sim.activity.find((entry) => entry.tool === 'slow_write')).toMatchObject({
+        outcome: 'cancelled',
+        handlerRunning: false,
+      });
+    },
+    20_000,
+  );
 });

@@ -15,6 +15,7 @@ import type {
   Dock,
   DockState,
   LinkState,
+  PageRole,
   PendingConfirm,
   PendingRequest,
 } from './core.ts';
@@ -87,6 +88,8 @@ li { padding: 2px 0; }
 .row { margin: 0 0 6px; padding: 6px 8px; border: 1px solid #e5e7eb; border-radius: 8px; }
 .row p { margin: 0; }
 .row .buttons { margin: 4px 0 0; }
+/* One line whatever the clients call themselves, so a growing list never moves a row. */
+.clients { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .who { font-weight: 600; }
 .activity { height: 6.5em; overflow-y: auto; padding: 2px 6px; border: 1px solid #e5e7eb; border-radius: 6px;
   font-size: 12px; }
@@ -134,9 +137,10 @@ interface RowView extends ArmedBox {
   readonly clients: HTMLElement;
   readonly expiry: HTMLElement;
   roleSwitch: HTMLButtonElement;
-  /** What the row says apart from its expiry; when it changes, the row waits again. */
+  /** Whom the buttons act on and what they do; when it changes, the row waits again. */
   key: string;
-  role: Role;
+  /** The role the page enforces, which the switch offers the other of; null hides the switch. */
+  role: Role | null;
   expiresAt: number | null;
 }
 
@@ -458,11 +462,11 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const view: RowView = {
       ...newBox(box),
       who: element('p', 'who'),
-      clients: element('p', 'muted'),
+      clients: element('p', 'muted clients'),
       expiry: element('p', 'muted'),
       roleSwitch: element('button'),
       key: '',
-      role: 'observer',
+      role: null,
       expiresAt: null,
     };
     view.roleSwitch = boxButton(view, 'Make driver', 'make-driver', () => {
@@ -480,25 +484,46 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     return view;
   }
 
-  function updateRow(view: RowView, attachment: AttachmentView): void {
+  function setText(node: HTMLElement, text: string): void {
+    if (node.textContent !== text) node.textContent = text;
+  }
+
+  /**
+   * The row shows the role the page enforces, not the relay's claim alone; a
+   * user the page runs nothing for gets Revoke only, since even Make
+   * observer would grant them something.
+   */
+  function updateRow(view: RowView, attachment: AttachmentView, access?: PageRole): void {
     view.expiresAt = attachment.expiresAt;
+    const role = access?.role ?? null;
+    const revoking = access?.revoked === true;
+    const status = role ?? (revoking ? 'revoke pending' : 'not approved on this page');
+    setText(view.who, `${attachment.displayName} (${status})`);
     const clients = attachment.clients.map(clientText).join(', ');
-    const key = JSON.stringify([attachment.displayName, attachment.role, clients]);
+    setText(view.clients, clients === '' ? 'No client seen yet' : `Clients: ${clients}`);
+    // Clients name themselves, on every call if they like, so their names
+    // never make the row wait again; the line keeps its height, and real
+    // movement is checkMoves' job.
+    const key = JSON.stringify([attachment.displayName, role, revoking]);
     if (key === view.key) return;
     const isNew = view.key === '';
     view.key = key;
-    view.role = attachment.role;
-    view.who.textContent = `${attachment.displayName} (${attachment.role})`;
-    view.clients.textContent = clients === '' ? 'No client seen yet' : `Clients: ${clients}`;
-    const promote = attachment.role !== 'driver';
+    view.role = role;
+    view.roleSwitch.hidden = role === null;
+    const promote = role !== 'driver';
     view.roleSwitch.textContent = promote ? 'Make driver' : 'Make observer';
     view.roleSwitch.dataset.action = promote ? 'make-driver' : 'make-observer';
-    // The role switch may now do the opposite of what the operator was reaching for.
+    // The role switch may now do the opposite of what the operator was reaching for, or be gone.
     if (!isNew) restartArming(view);
   }
 
   /** Rows are kept by user id and only reordered when the relay's order changes, like prompts. */
-  function syncRows(attachments: readonly AttachmentView[], linked: boolean): void {
+  function syncRows(
+    attachments: readonly AttachmentView[],
+    pageRoles: readonly PageRole[],
+    linked: boolean,
+  ): void {
+    const access = new Map(pageRoles.map((entry) => [entry.userId, entry]));
     const live = new Set(attachments.map((attachment) => attachment.userId));
     for (const [userId, view] of rowViews) {
       if (!live.has(userId)) {
@@ -513,7 +538,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
         rowViews.set(attachment.userId, view);
         boxes.add(view);
       }
-      updateRow(view, attachment);
+      updateRow(view, attachment, access.get(attachment.userId));
       // Role changes need the relay; revoking works offline and is sent on resume.
       view.roleSwitch.disabled = !linked;
       return view.element;
@@ -548,7 +573,9 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     line.dataset.outcome = entry.outcome;
     const via = entry.client ? ` via ${clientText(entry.client)}` : '';
     const took = entry.durationMs === null ? '' : ` in ${entry.durationMs} ms`;
-    line.textContent = `${timeText(entry.time)} ${entry.user.displayName}${via}: ${entry.tool}, ${entry.outcome}${took}`;
+    // A write answered early still holds the page while its handler runs on.
+    const lingering = entry.handlerRunning ? ', but its handler is still running' : '';
+    line.textContent = `${timeText(entry.time)} ${entry.user.displayName}${via}: ${entry.tool}, ${entry.outcome}${took}${lingering}`;
     return line;
   }
 
@@ -596,7 +623,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     code.textContent = state.pairing?.code ?? '';
     rotate.disabled = state.link !== 'linked';
 
-    syncRows(state.roster, state.link === 'linked');
+    syncRows(state.roster, state.pageRoles, state.link === 'linked');
     renderActivity(state.activity);
     updatePause(state.paused);
 

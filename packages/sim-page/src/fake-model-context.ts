@@ -147,6 +147,10 @@ export class FakeModelContext extends EventTarget {
     this.profile = options.profile ?? 'chrome-156';
     this.origin = options.origin ?? 'http://127.0.0.1:5173';
     this.window = options.window ?? { label: 'sim page window' };
+    // The polyfill 5.1 marks its context like this (dist/index.js), and the adapter reads it.
+    if (this.profile === 'polyfill-5.1') {
+      Object.defineProperty(this, '__isWebMCPPolyfill', { value: true });
+    }
   }
 
   #tools(window: object): Map<string, Entry> {
