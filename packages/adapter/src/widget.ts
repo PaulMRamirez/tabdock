@@ -20,7 +20,7 @@ import type {
   PendingConfirm,
   PendingRequest,
 } from './core.ts';
-import { createQrView } from './qr.ts';
+import { createQrView, QR_SIDE_PX } from './qr.ts';
 
 /** A valid custom element name needs no registration to host a shadow root, so nothing is defined globally. */
 const HOST_TAG = 'tabdock-dock';
@@ -80,8 +80,9 @@ const STYLE = `
    line never moves the boxes around the pairing block. */
 .pair { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; }
 .pair-text { flex: 1 1 196px; min-width: 0; }
-/* Light ground in every theme, quiet zone included, as scanners need dark on light. */
-.qr { flex: none; width: 124px; height: 124px; background: #fff; }
+/* Light ground in every theme, quiet zone included, as scanners need dark on light.
+   The drawing carries its own ground and size too (qr.ts), should these styles not apply. */
+.qr { flex: none; width: ${QR_SIDE_PX}px; height: ${QR_SIDE_PX}px; background: #fff; }
 .qr svg { display: block; width: 100%; height: 100%; }
 .muted { margin: 2px 0; color: #6b7280; }
 .error { margin: 0 0 8px; color: #b91c1c; }
@@ -202,6 +203,32 @@ function timeText(epochMs: number): string {
   return new Date(epochMs).toLocaleTimeString([], { hour12: false });
 }
 
+/**
+ * Styles the shadow root, preferring a constructed stylesheet: a page's CSP
+ * refuses an inline <style> unless its style-src allows 'unsafe-inline', but
+ * no style-src governs a sheet built through the CSSOM, and the adapter runs
+ * on pages whose policy it does not control. The sheet comes from the
+ * document's own window, since a sheet constructed for another document
+ * cannot be adopted. Returns the <style> element to append instead, only
+ * where the browser cannot adopt sheets.
+ */
+function adoptStyle(root: ShadowRoot, doc: Document): HTMLStyleElement | null {
+  const Sheet = doc.defaultView?.CSSStyleSheet;
+  if (Sheet !== undefined && 'adoptedStyleSheets' in root) {
+    try {
+      const sheet = new Sheet();
+      sheet.replaceSync(STYLE);
+      root.adoptedStyleSheets = [sheet];
+      return null;
+    } catch {
+      // A browser that lists the API but will not build the sheet: the element still works.
+    }
+  }
+  const style = doc.createElement('style');
+  style.textContent = STYLE;
+  return style;
+}
+
 /** Mounts the widget for one Dock and returns a function that removes it. */
 export function mountWidget(dock: Dock, doc: Document = document): () => void {
   const host = doc.createElement(HOST_TAG);
@@ -303,8 +330,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     return { ...newBox(box), countdown: element('p', 'muted'), expiresAt };
   }
 
-  const style = element('style');
-  style.textContent = STYLE;
+  const style = adoptStyle(root, doc);
 
   const panel = element('section', 'panel');
   panel.hidden = true;
@@ -382,7 +408,8 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
 
   const wrap = element('div', 'wrap');
   wrap.append(panel, badge);
-  root.append(style, wrap);
+  if (style) root.append(style);
+  root.append(wrap);
 
   function setOpen(open: boolean): void {
     panel.hidden = !open;
