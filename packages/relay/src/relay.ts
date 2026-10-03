@@ -7,10 +7,12 @@
 // leg runs. /mcp has two legs behind those checks, composed as the SDK
 // documents (ADR 0009): 2025-era traffic goes to the sessionful leg in
 // sessions.ts, everything else to a strict 2026-07-28 handler. In public URL
-// mode (ADR 0014) the public host passes the Host check for /mcp, while /page
-// still takes only requests made on this machine. The M3 spike's measurements
-// (spike.ts) hook in here when TABDOCK_SPIKE is on; nothing over HTTP controls
-// them.
+// mode (ADR 0014) the public host passes the Host check for /mcp and the QR
+// flow at /pair (pair.ts) is served behind the same check, while /page still
+// takes only requests made on this machine. Requests are logged by route,
+// never by raw path or query, so no secret a URL carries reaches a log. The M3
+// spike's measurements (spike.ts) hook in here when TABDOCK_SPIKE is on;
+// nothing over HTTP controls them.
 
 import { createServer, type IncomingMessage, type ServerResponse, STATUS_CODES } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -34,6 +36,7 @@ import { LOOPBACK_HOSTNAMES, NO_ORIGIN, type RelayOptions, resolveConfig } from 
 import { PageHub } from './hub.ts';
 import { createLogger } from './log.ts';
 import { type AuthExtra, createMcpFactory, userIdOf } from './mcp.ts';
+import { createPairFlow, PAIR_ROUTES, type PairFlow } from './pair.ts';
 import { McpSessions } from './sessions.ts';
 import { Spike, type SpikeControl } from './spike.ts';
 import { type AuditRecord, createMemoryStore } from './store.ts';
@@ -76,6 +79,10 @@ function madeLocally(request: IncomingMessage): boolean {
  * most MAX_FRAME_BYTES, so a call cannot usefully carry more than about that.
  */
 const MAX_MCP_BODY_BYTES = 2 * MAX_FRAME_BYTES;
+
+/** Paths the relay answers whatever its mode; any other is logged as OTHER_ROUTE. */
+const FIXED_ROUTES: readonly string[] = ['/healthz', '/mcp', '/page', ...PAIR_ROUTES];
+const OTHER_ROUTE = '(other)';
 
 function pathOf(rawUrl: string | undefined): string | null {
   const raw = rawUrl ?? '/';
@@ -134,6 +141,26 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   const store = options.store ?? createMemoryStore();
   const spike = config.spike ? new Spike(log, MAX_MCP_BODY_BYTES) : null;
   const hub = new PageHub(config, store, log, spike);
+  let pair: PairFlow | null = null;
+  if (config.publicUrl !== null) {
+    try {
+      // resolveConfig refused public URL mode without either of these.
+      if (options.pairClient === undefined || auth.browserSignIn === undefined) {
+        throw new Error('public URL mode needs the /pair sign-in client and a provider plugin');
+      }
+      pair = createPairFlow({
+        publicUrl: config.publicUrl,
+        client: options.pairClient,
+        signIn: auth.browserSignIn,
+        hub,
+        config,
+        log,
+      });
+    } catch (error) {
+      await hub.shutdown();
+      throw error;
+    }
+  }
 
   const factory = createMcpFactory(hub, config, spike);
   const mcp = createMcpHandler(factory, {
@@ -180,6 +207,14 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   // loopback, plus the public host in public URL mode.
   const validateHost = hostHeaderValidation(config.allowedHosts);
   const authRoutes: ReadonlyMap<string, AuthRoute> = auth.routes ?? new Map();
+  const knownRoutes = new Set([...FIXED_ROUTES, ...authRoutes.keys()]);
+  /**
+   * The name a request is logged under: a route the relay knows, or one word
+   * for anything else, so a secret someone puts in a path or query (a nonce
+   * in the wrong place, a code in a link) never reaches a log line.
+   */
+  const routeOf = (path: string | null): string =>
+    path !== null && knownRoutes.has(path) ? path : OTHER_ROUTE;
 
   const wss = new WebSocketServer({
     noServer: true,
@@ -231,7 +266,6 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     const extra: AuthExtra = {
       userId: outcome.user.userId,
       displayName: outcome.user.displayName,
-      clientAddress: request.socket.remoteAddress ?? 'unknown',
     };
     // The SDK requires a token field; the real one stays out of everything downstream.
     const authInfo: AuthInfo = {
@@ -283,12 +317,16 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         send(response, 426, 'Upgrade required', { Upgrade: 'websocket' });
       } else if (authRoute !== undefined) {
         await handleAuthRoute(authRoute, path, request, response);
+      } else if (pair !== null && PAIR_ROUTES.includes(path)) {
+        // The DNS rebinding guard, as for /mcp: the public host or a loopback name.
+        if (!validateHost(request, response)) return;
+        await pair.handle(path, request, response);
       } else {
         send(response, 404, 'Not found');
       }
     };
     route().catch((error: unknown) => {
-      log.error('request failed', { path, error });
+      log.error('request failed', { route: routeOf(path), error });
       if (!response.headersSent) send(response, 500, 'Internal error');
       else response.destroy();
     });
@@ -358,6 +396,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     });
   } catch (error) {
     // A port in use must not leave the MCP handler, the socket server or the check worker behind.
+    pair?.close();
     wss.close();
     await hub.shutdown();
     await mcp.close();
@@ -393,6 +432,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     spike,
     close() {
       closing ??= (async () => {
+        pair?.close();
         await hub.shutdown();
         for (const ws of wss.clients) ws.terminate();
         await new Promise<void>((resolveClose) => {

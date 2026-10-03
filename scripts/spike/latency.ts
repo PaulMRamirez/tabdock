@@ -117,6 +117,9 @@ const callbackPort = count('callback-port', values['callback-port'], 0, 0);
 const era = values.modern ? '2026-07-28' : '2025 (the SDK default)';
 const envClientId = process.env.TABDOCK_SPIKE_CLIENT_ID?.trim() ?? '';
 const clientId = values['client-id'] ?? (envClientId === '' ? undefined : envClientId);
+// A client id given in advance belongs to the provider in .env, and goes to no other.
+const envIssuer = process.env.TABDOCK_OAUTH_ISSUER?.trim() ?? '';
+const clientIssuer = clientId === undefined || envIssuer === '' ? undefined : envIssuer;
 const loopbackHosts = ['127.0.0.1', 'localhost', '[::1]'];
 
 /** A dev token only ever goes to a relay on this machine, never across a network in the clear. */
@@ -144,6 +147,7 @@ try {
           modern: values.modern,
           callbackPort,
           ...(clientId === undefined ? {} : { clientId }),
+          ...(clientIssuer === undefined ? {} : { clientIssuer }),
           showSignIn: (signIn) => {
             process.stderr.write(
               `\nSign in to run the latency spike: open this URL in a browser on this machine.\n\n  ${signIn.href}\n\nWaiting for the browser to come back...\n`,

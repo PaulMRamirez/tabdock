@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createMemoryStore, type PageRecord } from '../src/index.ts';
+import { createMemoryStore, type PageRecord, type SingleUseTicketRecord } from '../src/index.ts';
 
 function pageRecord(pageId: string, resumeTokenHash: string): PageRecord {
   return {
@@ -90,5 +90,36 @@ describe('the in-memory store', () => {
     const [record] = audit.records();
     if (record) record.outcome = 'timeout';
     expect(audit.records()[0]?.outcome).toBe('ok');
+  });
+
+  it('keeps single-use tickets by digest and kind: found without using, taken once, gone with their page', () => {
+    const { singleUse } = createMemoryStore();
+    const ticket = (pageId: string, fill: number): SingleUseTicketRecord => ({
+      kind: 'pair',
+      secretHash: Buffer.alloc(32, fill),
+      pageId,
+      createdAt: fill,
+      expiresAt: fill + 1,
+    });
+    const hex = (fill: number): string => Buffer.alloc(32, fill).toString('hex');
+    singleUse.put(ticket('pg_A', 1));
+    singleUse.put(ticket('pg_A', 2));
+    singleUse.put(ticket('pg_B', 3));
+    // Looking leaves it in place; taking removes it, so a second take finds nothing.
+    expect(singleUse.find('pair', hex(1))?.createdAt).toBe(1);
+    expect(singleUse.find('pair', hex(1))?.createdAt).toBe(1);
+    expect(singleUse.take('pair', hex(1))?.createdAt).toBe(1);
+    expect(singleUse.take('pair', hex(1))).toBeUndefined();
+    expect(singleUse.find('pair', hex(1))).toBeUndefined();
+    // A page's tickets go together, and another page's stay.
+    singleUse.deleteForPage('pair', 'pg_A');
+    expect(singleUse.find('pair', hex(2))).toBeUndefined();
+    expect(singleUse.find('pair', hex(3))?.pageId).toBe('pg_B');
+    // A ticket put again under the same digest replaces the old one, page and all.
+    singleUse.put({ ...ticket('pg_C', 3), createdAt: 30 });
+    singleUse.deleteForPage('pair', 'pg_B');
+    expect(singleUse.find('pair', hex(3))?.createdAt).toBe(30);
+    singleUse.deleteForPage('pair', 'pg_C');
+    expect(singleUse.find('pair', hex(3))).toBeUndefined();
   });
 });

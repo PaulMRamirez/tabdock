@@ -31,6 +31,36 @@ export type AuthOutcome = { kind: 'user'; user: User } | AuthRefusal;
 /** A GET route a plugin serves, in web-standard form, like the SDK's metadata helpers. */
 export type AuthRoute = (request: Request) => Response | Promise<Response>;
 
+/**
+ * Who a signed-in account is to this relay (ADR 0016). A member is on the
+ * owner's allowlist and has a user. Anyone else who signs in at the provider
+ * is an invitee: refused everywhere until M4 lets invites in, and known only
+ * by an opaque key (a digest of the provider's subject), never by the subject.
+ */
+export type Account = { kind: 'member'; user: User } | { kind: 'invitee'; key: string };
+
+/** The provider endpoints a browser sign-in needs, as the plugin's start() checked them. */
+export interface ProviderEndpoints {
+  issuer: string;
+  authorization_endpoint: string;
+  token_endpoint: string;
+  jwks_uri: string;
+  response_types_supported: string[];
+  token_endpoint_auth_methods_supported?: string[] | undefined;
+}
+
+/**
+ * What a plugin backed by an identity provider offers the QR page at /pair,
+ * which signs a phone's browser in at the same provider (ADR 0013): where the
+ * provider is, and the one account mapping the plugin itself uses, so a person
+ * is the same user on /mcp and at /pair.
+ */
+export interface BrowserSignIn {
+  /** null until start() has read the provider's metadata. */
+  provider(): ProviderEndpoints | null;
+  accountOf(sub: string): Account;
+}
+
 export interface AuthPlugin {
   readonly name: string;
   /**
@@ -49,6 +79,8 @@ export interface AuthPlugin {
   authenticate(request: IncomingMessage): Promise<AuthOutcome>;
   /** GET (and HEAD) routes by exact path. */
   readonly routes?: ReadonlyMap<string, AuthRoute> | undefined;
+  /** Present on a plugin that signs people in at a provider; public URL mode needs it for /pair. */
+  readonly browserSignIn?: BrowserSignIn | undefined;
 }
 
 /** Header names as HTTP tokens, values without control characters, so node never throws on them. */

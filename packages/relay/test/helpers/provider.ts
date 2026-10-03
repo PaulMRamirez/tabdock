@@ -13,12 +13,30 @@ import { Events, OAuth2Server } from 'oauth2-mock-server';
 /** The subject the mock gives whoever signs in through its /authorize. */
 export const MOCK_SUBJECT = 'johndoe';
 
+/**
+ * The relay's own client for the browser sign-in at /pair. The mock checks
+ * no client secret, so this one proves only that the relay sends it.
+ */
+export const PAIR_CLIENT = {
+  clientId: 'tabdock-pair-test',
+  clientSecret: 'pair-client-secret-9d3f6a1c7e2b5048',
+};
+
 export interface TestProvider {
   readonly issuer: string;
   /** Served at /.well-known/oauth-authorization-server; null answers 404. */
   oauthMetadata: Record<string, unknown> | null;
   /** Served at /.well-known/openid-configuration; null answers 404. */
   oidcMetadata: Record<string, unknown> | null;
+  /**
+   * Who the next sign-ins are: the `sub` of every token the authorization
+   * code grant issues, ID tokens included. null keeps the mock's MOCK_SUBJECT.
+   */
+  signInSubject: string | null;
+  /** The client credentials each authorization code grant presented, oldest first. */
+  readonly codeGrants: { clientId: string | null; secretSent: boolean }[];
+  /** Every token its token endpoint handed out (access, ID and refresh), for log scans. */
+  readonly issuedTokens: string[];
   /**
    * An RS256 access token signed with the provider's key. `claims` are merged
    * into the mock's payload (iss, iat, nbf, and exp an hour on); a claim given
@@ -28,7 +46,11 @@ export interface TestProvider {
   stop(): Promise<void>;
 }
 
-/** Metadata a provider Claude can use: S256, and client ID metadata documents with `none`. */
+/**
+ * Metadata a provider Claude can use: S256, and client ID metadata documents
+ * with `none`. It also takes a client secret in the token request body, as
+ * the relay's own /pair client sends it.
+ */
 export function goodMetadata(issuer: string): Record<string, unknown> {
   return {
     issuer,
@@ -38,7 +60,7 @@ export function goodMetadata(issuer: string): Record<string, unknown> {
     response_types_supported: ['code'],
     grant_types_supported: ['authorization_code', 'refresh_token'],
     code_challenge_methods_supported: ['S256'],
-    token_endpoint_auth_methods_supported: ['none'],
+    token_endpoint_auth_methods_supported: ['none', 'client_secret_post'],
     client_id_metadata_document_supported: true,
   };
 }
@@ -58,6 +80,9 @@ export async function startProvider(): Promise<TestProvider> {
     oauth: Record<string, unknown> | null;
     oidc: Record<string, unknown> | null;
   } = { oauth: goodMetadata(issuer), oidc: null };
+  let signInSubject: string | null = null;
+  const codeGrants: { clientId: string | null; secretSent: boolean }[] = [];
+  const issuedTokens: string[] = [];
   const serve =
     (pick: () => Record<string, unknown> | null) =>
     (_request: unknown, response: ServerResponse): void => {
@@ -88,6 +113,41 @@ export async function startProvider(): Promise<TestProvider> {
       if (token.payload.aud === undefined && typeof body?.resource === 'string') {
         token.payload.aud = body.resource;
       }
+      if (body?.grant_type === 'authorization_code' && signInSubject !== null) {
+        token.payload.sub = signInSubject;
+      }
+    },
+  );
+  server.service.on(
+    Events.BeforeResponse,
+    (
+      response: { body?: unknown },
+      request: { body?: unknown; headers: Record<string, unknown> },
+    ) => {
+      const sent = response.body as Record<string, unknown> | undefined;
+      for (const name of ['access_token', 'id_token', 'refresh_token']) {
+        const token = sent?.[name];
+        if (typeof token === 'string') issuedTokens.push(token);
+      }
+      const body = request.body as Record<string, unknown> | undefined;
+      if (body?.grant_type !== 'authorization_code') return;
+      const basic = request.headers.authorization;
+      const decoded =
+        typeof basic === 'string' && basic.startsWith('Basic ')
+          ? Buffer.from(basic.slice(6), 'base64').toString('utf8')
+          : null;
+      const split = decoded?.indexOf(':') ?? -1;
+      codeGrants.push({
+        clientId:
+          decoded !== null && split > 0
+            ? decodeURIComponent(decoded.slice(0, split))
+            : typeof body.client_id === 'string'
+              ? body.client_id
+              : null,
+        secretSent:
+          (decoded !== null && split > 0 && split < decoded.length - 1) ||
+          typeof body.client_secret === 'string',
+      });
     },
   );
 
@@ -105,6 +165,14 @@ export async function startProvider(): Promise<TestProvider> {
     set oidcMetadata(value) {
       documents.oidc = value;
     },
+    get signInSubject() {
+      return signInSubject;
+    },
+    set signInSubject(value) {
+      signInSubject = value;
+    },
+    codeGrants,
+    issuedTokens,
     token(claims = {}) {
       return server.issuer.buildToken({
         scopesOrTransform: (_header, payload) => {

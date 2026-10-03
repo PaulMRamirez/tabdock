@@ -23,7 +23,7 @@ import {
   TOOLS,
   UpgradeRefused,
 } from './helpers/page-client.ts';
-import { startProvider, type TestProvider } from './helpers/provider.ts';
+import { PAIR_CLIENT, startProvider, type TestProvider } from './helpers/provider.ts';
 import { ALICE } from './helpers/relay.ts';
 import {
   PUBLIC_MCP_URL,
@@ -67,6 +67,7 @@ describe('public URL settings (ADR 0014)', () => {
       auth: offlinePlugin(),
       publicUrl: 'https://Relay.Test:443/',
       allowedOrigins: [PAGE_ORIGIN],
+      pairClient: PAIR_CLIENT,
     });
     expect(config.publicUrl).toBe(PUBLIC_ORIGIN);
     expect(config.publicMcpUrl).toBe(PUBLIC_MCP_URL);
@@ -118,6 +119,33 @@ describe('public URL settings (ADR 0014)', () => {
     expect(() => resolveConfig({ auth: offlinePlugin() })).toThrow(/needs public URL mode/);
   });
 
+  it('needs the /pair sign-in client in public URL mode and refuses it anywhere else, never echoing it', () => {
+    const base = { auth: offlinePlugin(), publicUrl: PUBLIC_ORIGIN, allowedOrigins: [PAGE_ORIGIN] };
+    expect(() => resolveConfig(base)).toThrow(
+      /needs the \/pair sign-in client .*https:\/\/relay\.test\/pair\/callback as its redirect URI/,
+    );
+    expect(() =>
+      resolveConfig({ auth: createDevTokenAuth([ALICE]), pairClient: PAIR_CLIENT }),
+    ).toThrow(/needs public URL mode/);
+    const secret = 'has a space-in-it';
+    for (const pairClient of [
+      { clientId: '', clientSecret: PAIR_CLIENT.clientSecret },
+      { clientId: 'with space', clientSecret: PAIR_CLIENT.clientSecret },
+      { clientId: PAIR_CLIENT.clientId, clientSecret: secret },
+      { clientId: PAIR_CLIENT.clientId, clientSecret: '' },
+    ]) {
+      let message = '';
+      try {
+        resolveConfig({ ...base, pairClient });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toMatch(/TABDOCK_PAIR_CLIENT_(ID|SECRET)/);
+      expect(message).not.toContain(secret);
+    }
+    expect(resolveConfig({ ...base, pairClient: PAIR_CLIENT }).publicUrl).toBe(PUBLIC_ORIGIN);
+  });
+
   it('reads TABDOCK_PUBLIC_URL with the OAuth settings, and then ignores dev tokens', () => {
     const options = loadConfigFromEnv({
       TABDOCK_PUBLIC_URL: ' https://relay.test ',
@@ -125,10 +153,13 @@ describe('public URL settings (ADR 0014)', () => {
       TABDOCK_OAUTH_USERS: 'user_01ABC=alice:Alice Smith, user_02DEF=bob',
       TABDOCK_ALLOWED_ORIGINS: PAGE_ORIGIN,
       TABDOCK_DEV_TOKENS: `alice=${'a'.repeat(30)}`,
+      TABDOCK_PAIR_CLIENT_ID: ` ${PAIR_CLIENT.clientId} `,
+      TABDOCK_PAIR_CLIENT_SECRET: PAIR_CLIENT.clientSecret,
     });
     expect(options.auth.name).toBe('oauth');
     expect(options.auth.resource).toBe(PUBLIC_MCP_URL);
     expect(options.publicUrl).toBe(PUBLIC_ORIGIN);
+    expect(options.pairClient).toEqual(PAIR_CLIENT);
     expect(resolveConfig(options).publicMcpUrl).toBe(PUBLIC_MCP_URL);
     // Dev tokens alone still work as in M1 when no public URL is set.
     expect(
@@ -161,6 +192,34 @@ describe('public URL settings (ADR 0014)', () => {
         TABDOCK_OAUTH_USERS: 's=alice',
       }),
     ).toThrow(/TABDOCK_OAUTH_ISSUER/);
+    for (const missing of ['TABDOCK_PAIR_CLIENT_ID', 'TABDOCK_PAIR_CLIENT_SECRET']) {
+      const env: Record<string, string> = {
+        TABDOCK_PUBLIC_URL: PUBLIC_ORIGIN,
+        TABDOCK_OAUTH_ISSUER: 'https://idp.example',
+        TABDOCK_OAUTH_USERS: 's=alice',
+        TABDOCK_PAIR_CLIENT_ID: PAIR_CLIENT.clientId,
+        TABDOCK_PAIR_CLIENT_SECRET: PAIR_CLIENT.clientSecret,
+      };
+      env[missing] = ' ';
+      let message = '';
+      try {
+        loadConfigFromEnv(env);
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message, missing).toMatch(
+        /TABDOCK_PUBLIC_URL needs TABDOCK_PAIR_CLIENT_ID and TABDOCK_PAIR_CLIENT_SECRET/,
+      );
+      expect(message).not.toContain(PAIR_CLIENT.clientSecret);
+    }
+    expect(() =>
+      loadConfigFromEnv({
+        TABDOCK_DEV_TOKENS: `alice=${'a'.repeat(30)}`,
+        TABDOCK_PAIR_CLIENT_SECRET: PAIR_CLIENT.clientSecret,
+      }),
+    ).toThrow(
+      /TABDOCK_PAIR_CLIENT_ID and TABDOCK_PAIR_CLIENT_SECRET work only with TABDOCK_PUBLIC_URL/,
+    );
   });
 });
 
@@ -198,6 +257,7 @@ describe('a relay with a public URL (ADR 0014)', () => {
     relay = await createRelay({
       auth: createOAuthAuth({ issuer: provider.issuer, resource: PUBLIC_MCP_URL, users: USERS }),
       publicUrl: PUBLIC_ORIGIN,
+      pairClient: PAIR_CLIENT,
       allowedOrigins: [PAGE_ORIGIN],
       logLevel: 'debug',
       logSink: (line) => {

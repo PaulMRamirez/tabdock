@@ -27,6 +27,7 @@ import { PAGE_ORIGIN } from './helpers/page-client.ts';
 import {
   goodMetadata,
   MOCK_SUBJECT,
+  PAIR_CLIENT,
   startProvider,
   type TestProvider,
 } from './helpers/provider.ts';
@@ -73,6 +74,7 @@ async function startPublicRelay(overrides: Partial<OAuthAuthOptions> = {}): Prom
   relay = await createRelay({
     auth: plugin(overrides),
     publicUrl: PUBLIC_ORIGIN,
+    pairClient: PAIR_CLIENT,
     allowedOrigins: [PAGE_ORIGIN],
     port: 0,
     logLevel: 'debug',
@@ -388,6 +390,31 @@ describe('tokens (ADR 0013)', () => {
       expect(answer.headers.get('www-authenticate')).toBeNull();
       expect(answer.body).toBe('This account is not allowed on this relay');
     }
+  });
+
+  it('maps a subject to its kind of account once, for /mcp and /pair alike (ADR 0016)', async () => {
+    const auth = plugin();
+    const signIn = auth.browserSignIn;
+    if (signIn === undefined) throw new Error('the oauth plugin offers no browser sign-in');
+    // Nothing to sign a browser in with until the provider's metadata is read.
+    expect(signIn.provider()).toBeNull();
+    await auth.start?.();
+    expect(signIn.provider()).toMatchObject({
+      issuer: provider.issuer,
+      authorization_endpoint: `${provider.issuer}/authorize`,
+      token_endpoint: `${provider.issuer}/token`,
+      jwks_uri: `${provider.issuer}/jwks`,
+    });
+    expect(signIn.accountOf('sub-alice')).toEqual({
+      kind: 'member',
+      user: { userId: 'alice', displayName: 'Alice' },
+    });
+    const stranger = signIn.accountOf('sub-stranger');
+    expect(stranger.kind).toBe('invitee');
+    // Known by a key that does not carry the subject, and the same key every time.
+    expect(JSON.stringify(stranger)).not.toContain('stranger');
+    expect(signIn.accountOf('sub-stranger')).toEqual(stranger);
+    expect(signIn.accountOf('sub-other')).not.toEqual(stranger);
   });
 
   it.each<[string, string | undefined]>([

@@ -6,12 +6,8 @@ import { createOAuthAuth, createRelay } from '@tabdock/relay';
 import { describe, expect, it } from 'vitest';
 // The relay's own stand-ins for an identity provider and a tunnel, so the
 // script's sign-in runs exactly as the relay's OAuth tests run Claude Code's.
-import { MOCK_SUBJECT, startProvider } from '../../../packages/relay/test/helpers/provider.ts';
-import {
-  PUBLIC_MCP_URL,
-  PUBLIC_ORIGIN,
-  tunnelFetch,
-} from '../../../packages/relay/test/helpers/tunnel.ts';
+import { MOCK_SUBJECT, PAIR_CLIENT, startProvider } from '@tabdock/relay/test/provider';
+import { PUBLIC_MCP_URL, PUBLIC_ORIGIN, tunnelFetch } from '@tabdock/relay/test/tunnel';
 import {
   choosePage,
   connectWithBearer,
@@ -170,6 +166,8 @@ async function startPublicRelay(): Promise<{
       users: [{ sub: MOCK_SUBJECT, userId: 'john', displayName: 'John' }],
     }),
     publicUrl: PUBLIC_ORIGIN,
+    // Public URL mode always serves the QR sign-in at /pair, with the relay's own client.
+    pairClient: PAIR_CLIENT,
     allowedOrigins: ['http://localhost:5173'],
     port: 0,
     spike: true,

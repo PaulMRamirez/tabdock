@@ -1,6 +1,6 @@
 import type { Client } from '@modelcontextprotocol/client';
 import { afterEach, describe, expect, it } from 'vitest';
-import { createLogger, redact } from '../src/index.ts';
+import { type AuthPlugin, createDevTokenAuth, createLogger, redact } from '../src/index.ts';
 import { connectPage, type TestPage, TOOLS } from './helpers/page-client.ts';
 import {
   ALICE,
@@ -164,5 +164,39 @@ describe('secrets never reach the logs (S11)', () => {
     ]) {
       expect(all, msg).toContain(msg);
     }
+  });
+
+  it('logs a request by its route, never by its raw path or query (ADR 0016)', async () => {
+    // A plugin route that fails, so the relay's own catch has something to log.
+    const plugin: AuthPlugin = {
+      ...createDevTokenAuth([ALICE, BOB]),
+      routes: new Map([
+        [
+          '/broken',
+          () => {
+            throw new Error('the route failed');
+          },
+        ],
+      ]),
+    };
+    current = await startRelay({ auth: plugin, logLevel: 'debug' });
+    const { relay, lines } = current;
+    const secret = 'q3Zf0_Wn-8xLr2TmB9cKpA';
+    expect((await fetch(`${relay.url}/broken?nonce=${secret}`)).status).toBe(500);
+    expect((await fetch(`${relay.url}/broken/${secret}`)).status).toBe(404);
+    expect((await fetch(`${relay.url}/pair?nonce=${secret}`)).status).toBe(404);
+    const refused = await fetch(`${relay.mcpUrl}?code=${secret}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    expect(refused.status).toBe(401);
+    const failed = lines
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((entry) => entry.msg === 'request failed');
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({ route: '/broken' });
+    expect(failed[0]).not.toHaveProperty('path');
+    expect(lines.join('\n')).not.toContain(secret);
   });
 });

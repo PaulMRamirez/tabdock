@@ -6,7 +6,9 @@
   "license": "Apache-2.0",
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./test/provider": "./test/helpers/provider.ts",
+    "./test/tunnel": "./test/helpers/tunnel.ts"
   },
   "scripts": {
     "start": "node src/main.ts",

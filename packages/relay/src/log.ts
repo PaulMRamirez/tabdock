@@ -21,6 +21,17 @@ export const REDACTED_FIELDS: readonly string[] = [
   'resumetoken',
   'authorization',
   'arguments',
+  // The QR flow's secrets (S11): its nonce, cookies, and the sign-in's own values.
+  'nonce',
+  'secret',
+  'clientsecret',
+  'cookie',
+  'set-cookie',
+  'verifier',
+  'idtoken',
+  'id_token',
+  'access_token',
+  'refresh_token',
 ];
 
 const REDACTED = '[redacted]';
