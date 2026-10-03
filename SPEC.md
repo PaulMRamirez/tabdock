@@ -131,7 +131,7 @@ A script-tag build reads the same options from data attributes. The adapter neve
 
 The widget lives in a closed shadow root: a badge with link state and attached count, and a panel with the pairing code and QR, the roster with role switch and revoke, an activity log of the last 50 calls, and a pause switch. Attach prompts and consequential-call prompts default to deny on timeout. Only the code that called `attach()` holds the control handle.
 
-Lifecycle: hold a Web Lock while attached, reconnect with backoff from 0.5 s to 30 s using the `resumeToken`, and enforce role and policy again locally before running any call.
+Lifecycle: hold a Web Lock while attached, reconnect with backoff from 0.5 s to 30 s using the `resumeToken`, and enforce role and policy again locally before running any call. The resume token, the operator's grants and the pause switch are kept per page, by relay URL plus the page's origin and path (ADR 0011).
 
 ## 9. Security requirements (each needs an automated test unless marked manual)
 

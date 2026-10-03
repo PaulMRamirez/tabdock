@@ -1,6 +1,6 @@
 # 0011: One approval covers one page
 
-Status: Accepted by the owner, 3 October 2026. Changes SPEC section 6.
+Status: Accepted by the owner, 3 October 2026. Changes SPEC sections 6 and 8.
 
 ## Context
 
@@ -13,3 +13,7 @@ One approval covers one page: a document at one origin and path, and its reloads
 ## Consequences
 
 Moving to another page that includes the adapter means pairing again there. Reloading the same page, as before, keeps its attachments.
+
+## Notes after the build
+
+The adapter fixes the page's address (origin and path) when `attach()` runs and sends it in every `hello`, so a single-page app that changes its path and later reconnects still resumes. Its storage keys pair the relay URL with that address; records an older adapter kept under the relay URL alone are removed unread, which also drops a pause made under the older build. The relay compares the origin and path of the `hello` url with the session's and, on a mismatch, starts a fresh session and leaves the old one asleep for its own page to resume.
