@@ -155,25 +155,55 @@ describe('attachment idle expiry', () => {
     expect(opened.all('invoke')).toHaveLength(0);
   });
 
-  it('names a client only once its call passes the tool and role checks', async () => {
-    const { relay } = await setup();
-    const opened = await page({ onInvoke: () => ({ ok: true, content: '{}' }) });
+  it('names a client only once its call passes every check', async () => {
+    const { relay, lines } = await setup({ limits: { queueDepth: 1 } });
+    const held: InvokeFrame[] = [];
+    const opened = await page({
+      policy: { maxDrivers: 2 },
+      onInvoke: (frame) => {
+        if (frame.tool === 'get_view') return { ok: true, content: '{}' };
+        held.push(frame);
+        return undefined;
+      },
+    });
     await pairAndApprove(await client(), opened, 'observer');
+    const bob = await client(BOB);
+    await pairAndApprove(bob, opened, 'driver');
+    const write = (who: Client) =>
+      callTool(who, 'call_page_tool', {
+        page: opened.pageId,
+        tool: 'add_item',
+        arguments: { label: 'x' },
+      });
+    // Bob fills the queue: one write on the page and one waiting behind it.
+    const writes = [write(bob), write(bob)];
+    await eventually(
+      () =>
+        held.length === 1 && lines.filter((line) => line.includes('"call queued"')).length === 2,
+    );
     await opened.sync();
     const before = opened.all('roster').length;
-    for (const [name, tool] of [
-      ['stranger-missing', 'no_such_tool'],
-      ['stranger-write', 'add_item'],
+    for (const [user, name, tool, args] of [
+      [ALICE, 'stranger-missing', 'no_such_tool', {}],
+      [ALICE, 'stranger-write', 'add_item', { label: 'x' }],
+      [ALICE, 'stranger-invalid', 'get_view', { label: 'x' }],
+      [BOB, 'stranger-busy', 'add_item', { label: 'x' }],
     ] as const) {
-      const renamed = await connectClient(relay, ALICE, { name, modern: true });
+      const renamed = await connectClient(relay, user, { name, modern: true });
       clients.push(renamed);
       const refused = await callTool(renamed, 'call_page_tool', {
         page: opened.pageId,
         tool,
-        arguments: { label: 'x' },
+        arguments: args,
       });
-      expect(refused.isError, refused.text).toBe(true);
+      expect(refused.text).toMatch(/^(tool_not_found|role_denied|invalid_arguments|page_busy): /);
     }
+    expect(
+      relay.audit
+        .records()
+        .slice(-4)
+        .map((record) => record.outcome),
+    ).toEqual(['tool_not_found', 'role_denied', 'invalid_arguments', 'page_busy']);
     await opened.sync();
     // Nothing the operator sees changed: no roster went out, and none names the refused clients.
     expect(opened.all('roster')).toHaveLength(before);
@@ -186,8 +216,15 @@ describe('attachment idle expiry', () => {
       opened
         .all('roster')
         .at(-1)
-        ?.attachments[0]?.clients.map((c) => c.name),
+        ?.attachments.find((entry) => entry.userId === 'alice')
+        ?.clients.map((c) => c.name),
     ).toEqual(['reader', 'relay-test']);
+    for (let i = 0; i < 2; i += 1) {
+      await eventually(() => held.length === i + 1);
+      opened.send({ t: 'result', callId: held[i]?.callId ?? '', ok: true, content: '{}' });
+    }
+    for (const outcome of await Promise.all(writes)) expect(outcome.isError).toBe(false);
+    expect(JSON.stringify(opened.all('roster'))).not.toContain('stranger');
   });
 
   it('sends at most one roster per refresh step for new clients, and a trailing one carries the rest', async () => {

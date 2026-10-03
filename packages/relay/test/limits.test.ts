@@ -1,10 +1,12 @@
 // The section 9 limits with ADR 0009's defaults, each shrunk here to a few:
-// users per page, calls per user per page per window, tools frames per socket,
-// page sockets and page sessions per address, and page sessions in total.
+// users per page, calls per user per page per window, tools frames per socket
+// and per address, schema nodes walked per tools frame, page sockets and page
+// sessions per address, and page sessions in total.
 
 import type { Client } from '@modelcontextprotocol/client';
-import { CLOSE_DETACH } from '@tabdock/protocol';
+import { CLOSE_DETACH, type PageTool } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
+import { MAX_FRAME_SCHEMA_NODES } from '../src/hub.ts';
 import { createMemoryStore, DEFAULT_LIMITS, DEFAULT_RATE_LIMITS } from '../src/index.ts';
 import {
   connectPage,
@@ -87,6 +89,7 @@ describe('ADR 0009 defaults', () => {
     expect(DEFAULT_RATE_LIMITS.callsPerUserPerPage).toBe(120);
     expect(DEFAULT_RATE_LIMITS.windowMs).toBe(60_000);
     expect(DEFAULT_RATE_LIMITS.toolsFramesPerSocket).toBe(10);
+    expect(DEFAULT_RATE_LIMITS.toolsFramesPerAddress).toBe(30);
     expect(DEFAULT_RATE_LIMITS.toolsFramesWindowMs).toBe(10_000);
   });
 });
@@ -372,6 +375,35 @@ describe('page sessions (S9)', () => {
     expect(await stateFor(bob, elsewhere.pageId)).toBe('asleep');
   });
 
+  it('still holds an address to its cap after one of its pages slept and resumed', async () => {
+    const { relay } = await setup({ limits: { pageSessionsPerAddress: 2 } });
+    const first = await page();
+    const alice = await client();
+    await pairAndApprove(alice, first);
+    await drop(alice, first);
+    const back = await page({ resumeToken: first.welcome?.resumeToken ?? '' });
+    expect(back.welcome?.resumed).toBe(true);
+    await page();
+
+    // Both of this address's sessions are awake again, so the resumed one must not make way.
+    const refused = new TestPage(await openSocket(relay.pageUrl));
+    pages.push(refused);
+    refused.send({
+      t: 'hello',
+      v: 1,
+      title: 't',
+      url: `${PAGE_ORIGIN}/`,
+      adapterVersion: 'test',
+      policy: {},
+    });
+    expect(await refused.closed).toEqual({
+      code: 1013,
+      reason: 'too many pages from this address; try again later',
+    });
+    expect(refused.all('welcome')).toEqual([]);
+    expect(await stateFor(alice, first.pageId)).toBe('awake');
+  });
+
   it('lets a sleeper resume at the total cap without ending itself or any other sleeper', async () => {
     await setup({ limits: { pageSessions: 3 } });
     const older = await page();
@@ -443,5 +475,165 @@ describe('page sessions (S9)', () => {
     expect(newcomer.welcome?.resumed).toBe(false);
     expect(await stateFor(alice, own.pageId)).toBe('gone');
     expect(await stateFor(bob, elsewhere.pageId)).toBe('asleep');
+  });
+});
+
+describe('tools frames per address (S9)', () => {
+  it('shares one budget across every socket from an address and across reconnects, closing past it with 1008', async () => {
+    const { relay, lines } = await setup({
+      rateLimits: {
+        toolsFramesPerSocket: 10,
+        toolsFramesPerAddress: 4,
+        toolsFramesWindowMs: 10_000,
+      },
+    });
+    // connectPage sends one tools frame each: two of this address's four.
+    const first = await page();
+    const second = await page();
+    const elsewhere = await page({ localAddress: OTHER_ADDRESS });
+    first.send({ t: 'tools', tools: TOOLS });
+    second.send({ t: 'tools', tools: TOOLS });
+    await first.sync();
+    await second.sync();
+    expect(first.ws.readyState).toBe(first.ws.OPEN);
+    expect(second.ws.readyState).toBe(second.ws.OPEN);
+
+    // Each socket is far inside its own budget, but the address has spent its own.
+    first.send({ t: 'tools', tools: TOOLS });
+    expect(await first.closed).toEqual({
+      code: 1008,
+      reason: 'too many tools frames from this address',
+    });
+    second.send({ t: 'tools', tools: TOOLS });
+    expect(await second.closed).toEqual({
+      code: 1008,
+      reason: 'too many tools frames from this address',
+    });
+    expect(lines.some((line) => line.includes('too many tools frames from its address'))).toBe(
+      true,
+    );
+
+    // Another address keeps a budget of its own.
+    for (let i = 0; i < 3; i += 1) elsewhere.send({ t: 'tools', tools: TOOLS });
+    await elsewhere.sync();
+    expect(elsewhere.ws.readyState).toBe(elsewhere.ws.OPEN);
+
+    // A page that reconnects from the address does not start over: it sleeps
+    // after the policy close and resumes, but its tools wait for the window.
+    const back = await connectPage(relay.pageUrl, {
+      resumeToken: first.welcome?.resumeToken ?? '',
+    });
+    pages.push(back);
+    expect(back.welcome?.resumed).toBe(true);
+    back.send({ t: 'tools', tools: TOOLS });
+    expect(await back.closed).toEqual({
+      code: 1008,
+      reason: 'too many tools frames from this address',
+    });
+  });
+});
+
+describe('schema nodes per tools frame (S9, ADR 0010)', () => {
+  /**
+   * A read-only tool requiring a string x beside `width` empty properties:
+   * width + 7 schema nodes, and far too long to show, so clients see a stub
+   * either way and only the argument check tells a walked tool from one that
+   * was not.
+   */
+  function wide(name: string, width: number, description = `${name}.`): PageTool {
+    const properties: Record<string, unknown> = { x: { type: 'string' } };
+    for (let i = 0; i < width; i += 1) properties[`p${String(i)}`] = {};
+    return {
+      name,
+      description,
+      inputSchema: { type: 'object', required: ['x'], properties },
+      annotations: { readOnlyHint: true },
+    };
+  }
+  /** Over half the cap, so two of these never fit in one frame. */
+  const WIDTH = Math.ceil(MAX_FRAME_SCHEMA_NODES * 0.6);
+  const CAPPED = `[tabdock: schema removed, the page's tools hold more than ${String(MAX_FRAME_SCHEMA_NODES)} schema nodes in all]`;
+
+  async function attached(): Promise<{ opened: TestPage; alice: Client; lines: string[] }> {
+    const { lines } = await setup();
+    const opened = await page({ tools: [], onInvoke: echo });
+    const alice = await client();
+    await pairAndApprove(alice, opened);
+    return { opened, alice, lines };
+  }
+
+  async function relist(opened: TestPage, tools: PageTool[]): Promise<void> {
+    opened.send({ t: 'tools', tools });
+    await opened.sync();
+  }
+
+  async function schemaOf(alice: Client, pageId: string, tool: string): Promise<unknown> {
+    const listed = (await callTool(alice, 'list_page_tools', { page: pageId })).structured as {
+      tools: { name: string; description: string; inputSchema: unknown }[];
+    };
+    return listed.tools.find((entry) => entry.name === tool)?.inputSchema;
+  }
+
+  /** Whether a call without the required x is refused by the relay's check. */
+  async function checked(alice: Client, pageId: string, tool: string): Promise<boolean> {
+    const outcome = await callTool(alice, 'call_page_tool', { page: pageId, tool, arguments: {} });
+    if (outcome.isError) expect(outcome.text).toMatch(/^invalid_arguments: /);
+    return outcome.isError;
+  }
+
+  it('lists tools past the cap with a stub and lets their calls through unchecked, while those before it are checked', async () => {
+    const { opened, alice, lines } = await attached();
+    await relist(opened, [wide('first', WIDTH), wide('second', WIDTH), TOOLS[0] as PageTool]);
+
+    expect(await checked(alice, opened.pageId, 'first')).toBe(true);
+    expect(await schemaOf(alice, opened.pageId, 'second')).toEqual({
+      type: 'object',
+      description: CAPPED,
+    });
+    expect(await checked(alice, opened.pageId, 'second')).toBe(false);
+    // Every tool after the one that crossed the cap is past it too, however small.
+    expect(await schemaOf(alice, opened.pageId, 'get_view')).toEqual({
+      type: 'object',
+      description: CAPPED,
+    });
+    const unexpected = await callTool(alice, 'call_page_tool', {
+      page: opened.pageId,
+      tool: 'get_view',
+      arguments: { unexpected: true },
+    });
+    expect(unexpected.isError, unexpected.text).toBe(false);
+    expect(
+      lines.filter((line) => line.includes('more schema than the relay walks per frame')),
+    ).toHaveLength(1);
+  });
+
+  it('walks only tools that changed, so one sent again unchanged costs nothing against the cap', async () => {
+    const { opened, alice } = await attached();
+    await relist(opened, [wide('first', WIDTH)]);
+    // first is the same as before, so only second is walked, and it fits.
+    await relist(opened, [wide('first', WIDTH), wide('second', WIDTH)]);
+    expect(await checked(alice, opened.pageId, 'first')).toBe(true);
+    expect(await checked(alice, opened.pageId, 'second')).toBe(true);
+
+    // A changed tool is walked again: first fits, and second, unchanged, is kept as it was.
+    await relist(opened, [wide('first', WIDTH, 'First, changed.'), wide('second', WIDTH)]);
+    let listed = (await callTool(alice, 'list_page_tools', { page: opened.pageId })).structured as {
+      tools: { name: string; description: string }[];
+    };
+    expect(listed.tools.map((tool) => tool.description)).toEqual(['First, changed.', 'second.']);
+    expect(await checked(alice, opened.pageId, 'second')).toBe(true);
+
+    // Both changed: the cap applies, and second goes unchecked.
+    await relist(opened, [wide('first', WIDTH, 'First, again.'), wide('second', WIDTH, 'Two.')]);
+    expect(await checked(alice, opened.pageId, 'first')).toBe(true);
+    expect(await checked(alice, opened.pageId, 'second')).toBe(false);
+
+    // Once first is unchanged again, second fits and is walked and checked once more.
+    await relist(opened, [wide('first', WIDTH, 'First, again.'), wide('second', WIDTH, 'Two.')]);
+    expect(await checked(alice, opened.pageId, 'second')).toBe(true);
+    listed = (await callTool(alice, 'list_page_tools', { page: opened.pageId })).structured as {
+      tools: { name: string; description: string }[];
+    };
+    expect(listed.tools.map((tool) => tool.description)).toEqual(['First, again.', 'Two.']);
   });
 });

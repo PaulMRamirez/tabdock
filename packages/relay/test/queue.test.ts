@@ -4,6 +4,7 @@
 // checked again when it reaches the front.
 
 import type { Client } from '@modelcontextprotocol/client';
+import type { JsonObject, PageTool } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   connectPage,
@@ -12,6 +13,7 @@ import {
   type PageOptions,
   type TestPage,
   TOOLS,
+  WRITE_TOOL,
 } from './helpers/page-client.ts';
 import {
   ALICE,
@@ -288,7 +290,9 @@ describe('the write queue (A2.3)', () => {
       write(alice, opened.pageId, '2'),
       write(alice, opened.pageId, '3'),
     ];
-    await eventually(() => queuedOrder(current?.lines ?? []).length === 3);
+    // A write is logged as queued when it arrives, before its argument check, so
+    // wait for the first to reach the page as well.
+    await eventually(() => held.length === 1 && queuedOrder(current?.lines ?? []).length === 3);
     opened.ws.terminate();
     for (const outcome of await Promise.all(calls)) {
       expect(outcome.text).toBe('page_asleep: the page disconnected before it answered');
@@ -329,5 +333,108 @@ describe('the write queue (A2.3)', () => {
     }
     for (const outcome of await Promise.all(calls)) expect(outcome.isError).toBe(false);
     expect(relay.audit.records().map((record) => record.outcome)).toContain('page_busy');
+  });
+});
+
+/**
+ * Each level references the next one twice, so checking any instance costs
+ * 2^levels steps: at 24 levels the check always runs out of its budget.
+ */
+function fanOut(levels: number): JsonObject {
+  const $defs: Record<string, unknown> = {};
+  for (let level = 0; level < levels; level += 1) {
+    const next = { $ref: `#/$defs/d${String(level + 1)}` };
+    $defs[`d${String(level)}`] = { anyOf: [next, next] };
+  }
+  $defs[`d${String(levels)}`] = { type: 'object' };
+  return { type: 'object', $defs, $ref: '#/$defs/d0' };
+}
+
+/** Nested past what the relay prepares for a check, so calls to its tool skip the check at once. */
+function tooDeep(levels: number): JsonObject {
+  let schema: JsonObject = { type: 'string' };
+  for (let level = 0; level < levels; level += 1) {
+    schema = { type: 'object', properties: { a: schema } };
+  }
+  return schema;
+}
+
+describe('the write queue while argument checks run (ADR 0010)', () => {
+  /** How long the fan-out check takes before it gives up: far longer than the gaps below. */
+  const CHECK_MS = 600;
+  const SLOW_WRITE: PageTool = {
+    name: 'slow_write',
+    description: 'A write whose argument check takes its whole budget.',
+    inputSchema: fanOut(24),
+    annotations: { readOnlyHint: false },
+  };
+  const DEEP_WRITE: PageTool = {
+    name: 'deep_write',
+    description: 'A write whose schema is too deep to check.',
+    inputSchema: tooDeep(40),
+    annotations: { readOnlyHint: false },
+  };
+  const SLOW_READ: PageTool = {
+    name: 'slow_read',
+    description: 'A read whose argument check takes its whole budget.',
+    inputSchema: fanOut(24),
+    annotations: { readOnlyHint: true },
+  };
+
+  it('keeps arrival order when a later write skips the check an earlier one still waits on', async () => {
+    await setup({ timings: { argumentCheckMs: CHECK_MS, callDeadlineMs: 5000 } });
+    const { held, onInvoke } = holdingPage();
+    const opened = await page({ tools: [SLOW_WRITE, DEEP_WRITE], onInvoke });
+    const alice = await client();
+    await pairAndApprove(alice, opened);
+    const call = (tool: string) =>
+      callTool(alice, 'call_page_tool', { page: opened.pageId, tool, arguments: {} });
+
+    const first = call('slow_write');
+    // Long enough for the first call to reach the relay, far shorter than its check.
+    await delay(100);
+    const second = call('deep_write');
+    await eventually(() => held.length === 1, 3000);
+    expect(held[0]?.tool).toBe('slow_write');
+    await delay(50);
+    expect(held).toHaveLength(1);
+    answer(opened, held[0]);
+    await eventually(() => held.length === 2);
+    expect(held[1]?.tool).toBe('deep_write');
+    answer(opened, held[1]);
+    expect((await first).isError).toBe(false);
+    expect((await second).isError).toBe(false);
+  });
+
+  it('queues a read behind the running write when the page re-lists its tool as mutating during the check', async () => {
+    const { lines } = await setup({ timings: { argumentCheckMs: CHECK_MS, callDeadlineMs: 5000 } });
+    const { held, onInvoke } = holdingPage();
+    const opened = await page({ tools: [WRITE_TOOL, SLOW_READ], onInvoke });
+    const alice = await client();
+    await pairAndApprove(alice, opened);
+    const running = write(alice, opened.pageId, 'first');
+    await eventually(() => held.length === 1);
+    const reading = callTool(alice, 'call_page_tool', {
+      page: opened.pageId,
+      tool: 'slow_read',
+      arguments: {},
+    });
+    await delay(100);
+    opened.send({
+      t: 'tools',
+      tools: [WRITE_TOOL, { ...SLOW_READ, annotations: { readOnlyHint: false } }],
+    });
+    await opened.sync();
+    // Its check gives up at the budget; the call is a write by then, so it waits its turn.
+    await eventually(() => lines.some((line) => line.includes('ran out of time')), 3000);
+    await eventually(() => queuedOrder(lines).length === 2);
+    await delay(50);
+    expect(held).toHaveLength(1);
+    answer(opened, held[0]);
+    await eventually(() => held.length === 2);
+    expect(held[1]?.tool).toBe('slow_read');
+    answer(opened, held[1]);
+    expect((await running).isError).toBe(false);
+    expect((await reading).isError).toBe(false);
   });
 });
