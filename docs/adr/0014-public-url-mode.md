@@ -13,3 +13,7 @@ M3 puts the relay on a public HTTPS address so hosted Claude, which connects fro
 ## Consequences
 
 SPEC section 2's relay-trust line names the tunnel, and S12 reads as "the relay binds loopback, and a public URL must be https". The connector URL is ngrok's until M4 moves the relay to a host, when the connector is added again once.
+
+## Notes after the build
+
+`TABDOCK_PUBLIC_URL` must be a bare https origin that does not name this machine, so the connector URL is always `<origin>/mcp`, and the OAuth settings are refused without it. In public mode `/page` accepts only upgrades with a loopback `Host` and no `Forwarded` or `X-Forwarded-*` header, which also covers a tunnel set to rewrite `Host`; whether ngrok passes the public `Host` and adds `X-Forwarded-For` is confirmed on the owner's first run.
