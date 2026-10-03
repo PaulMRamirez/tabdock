@@ -21,13 +21,7 @@ import { type PairClientOptions, pairRedirectUriOf, type ResolvedConfig } from '
 import type { PageHub, PairOutcome } from './hub.ts';
 import type { Logger } from './log.ts';
 import { SlidingWindowLimiter } from './rate-limit.ts';
-import {
-  digest,
-  newId,
-  newSessionSecret,
-  sameDigest,
-  SINGLE_USE_SECRET_PATTERN,
-} from './secrets.ts';
+import { digest, newId, newSessionSecret, sameDigest } from './secrets.ts';
 
 /** Every path this module answers; relay.ts also logs requests by these names (ADR 0016). */
 export const PAIR_ROUTES: readonly string[] = [
@@ -64,6 +58,8 @@ const SESSION_SECRET = /^[A-Za-z0-9_-]{43}$/;
 /** openid-client's random state, nonce and verifier: 32 bytes as base64url. */
 const LOGIN_PART = /^[A-Za-z0-9_-]{43}$/;
 const CLAIM_ID = /^qc_[0-9A-Z]{10}$/;
+/** The one key the code exchange limiter counts under. */
+const EXCHANGES = 'relay';
 
 /**
  * No inline script or style may run, nothing may frame the page, and with
@@ -183,6 +179,8 @@ interface LoginState {
  * than in memory: nobody can start an unbounded number of them here, and
  * nobody but this browser can hold its state. The values are compared, never
  * trusted: a forged cookie can only sign its own browser in as its own account.
+ * It can still make the relay ask the provider about a code, as can a real
+ * cookie fresh from /pair/login, so callback() bounds those requests.
  */
 function parseLogin(value: string | undefined): LoginState | null {
   const parts = value?.split('.') ?? [];
@@ -318,9 +316,13 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
     ['/pair/pair.js', loadAsset('pair.js', 'text/javascript; charset=utf-8', RESOURCE_CSP)],
     ['/pair/pair.css', loadAsset('pair.css', 'text/css; charset=utf-8', RESOURCE_CSP)],
   ]);
-  const { windowMs, pairPreviewsPerNonce } = config.rateLimits;
-  // Keyed by the digest of the nonce presented, never by address (ADR 0016).
+  const { windowMs, pairPreviewsPerNonce, pairSignIns } = config.rateLimits;
+  // Keyed by the digest of a live nonce, never by address (ADR 0016).
   const previewLimiter = new SlidingWindowLimiter(pairPreviewsPerNonce, windowMs);
+  // One key, the whole relay: every caller behind the tunnel shares an address.
+  const exchangeLimiter = new SlidingWindowLimiter(pairSignIns, windowMs);
+  /** Code exchanges waiting on the provider now. */
+  let exchanging = 0;
   /** Oldest first: a Map keeps insertion order, and sessions are only ever added at the end. */
   const sessions = new Map<string, PairSession>();
   const claims = new Map<string, Claim>();
@@ -523,11 +525,27 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
       failed();
       return;
     }
+    // Anyone can get this far with a cookie of their own making, and what
+    // follows is a request to the provider carrying the /pair client's
+    // secret, so the whole relay makes only so many at once and per window.
+    // Past either, the sign-in fails here and the provider hears nothing.
+    if (exchanging >= config.limits.pairSignInsInFlight) {
+      log.warn('pair sign-in refused: too many sign-ins waiting on the provider');
+      failed();
+      return;
+    }
+    if (!exchangeLimiter.allows(EXCHANGES, now)) {
+      log.warn('pair sign-in refused: too many sign-ins in this window');
+      failed();
+      return;
+    }
+    exchangeLimiter.record(EXCHANGES, now);
     // Rebuilt on the public URL, the redirect URI the provider was given;
     // only the query comes from the request, and the Host never does.
     const query = URL.parse(request.url ?? '', 'http://relay.invalid')?.search ?? '';
     const returned = new URL(`/pair/callback${query}`, publicUrl);
     let sub: string;
+    exchanging += 1;
     try {
       const tokens = await oidc.authorizationCodeGrant(configuration, returned, {
         pkceCodeVerifier: login.verifier,
@@ -542,6 +560,8 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
       log.info('pair sign-in failed', signInProblem(error));
       failed();
       return;
+    } finally {
+      exchanging -= 1;
     }
     const account = signIn.accountOf(sub);
     const secret = openSession(account, now);
@@ -564,22 +584,25 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
     }
     const { nonce } = body.data;
     const now = Date.now();
-    if (SINGLE_USE_SECRET_PATTERN.test(nonce)) {
-      // Looking uses nothing up, so it is bounded per nonce: a page polled to
-      // death would still answer its own operator.
-      const key = digest(nonce).toString('hex');
-      if (!previewLimiter.allows(key, now)) {
-        log.warn('pair preview rate limited');
-        refuse(response, 429, 'rate_limited', 'too many looks at this pairing link');
-        return;
-      }
-      previewLimiter.record(key, now);
-    }
+    // Looked up first: an unknown, used or expired nonce gets the one answer
+    // and leaves nothing behind, so nobody can fill the limiter with nonces
+    // of their own making, and a made-up nonce never reads as limited.
     const shown = hub.previewPairNonce(nonce);
     if (shown === null) {
       refuse(response, 404, 'pairing_expired', 'this pairing link is invalid or expired');
       return;
     }
+    // Looking uses nothing up, so a live nonce is bounded per nonce: a page
+    // polled to death would still answer its own operator. The key is the
+    // live ticket's own digest (the hub matched it), so keys stay as few as
+    // live tickets.
+    const key = digest(nonce).toString('hex');
+    if (!previewLimiter.allows(key, now)) {
+      log.warn('pair preview rate limited');
+      refuse(response, 429, 'rate_limited', 'too many looks at this pairing link');
+      return;
+    }
+    previewLimiter.record(key, now);
     const session = sessionOf(request, now);
     json(response, 200, {
       page: {

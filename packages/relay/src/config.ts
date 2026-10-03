@@ -67,6 +67,14 @@ export interface RelayRateLimits {
   pairAttemptsPerPage: number;
   /** Times one QR nonce may be looked at through /pair/preview per window; a preview uses nothing up. */
   pairPreviewsPerNonce: number;
+  /**
+   * Code exchanges /pair/callback may make per window for the whole relay,
+   * one for each sign-in that comes back from the provider. Each is a request
+   * carrying the /pair client's secret, and anyone can send a callback, so
+   * past this none goes out and the sign-in fails. Relay-wide, never per
+   * address: behind a tunnel every caller shares one (ADR 0016).
+   */
+  pairSignIns: number;
   /** call_page_tool calls one user may make to one page per window (S9). */
   callsPerUserPerPage: number;
   /** The window every limit above counts over. */
@@ -119,6 +127,8 @@ export interface RelayLimits {
    * ends the oldest session of an account that is not a member first.
    */
   pairSessions: number;
+  /** Code exchanges /pair/callback may have waiting on the provider at once, for the whole relay. */
+  pairSignInsInFlight: number;
 }
 
 /** The relay's own client at the identity provider, for the browser sign-in at /pair. */
@@ -216,6 +226,7 @@ export const DEFAULT_RATE_LIMITS: RelayRateLimits = {
   pairAttemptsPerUser: 10,
   pairAttemptsPerPage: 30,
   pairPreviewsPerNonce: 30,
+  pairSignIns: 60,
   callsPerUserPerPage: 120,
   windowMs: 60_000,
   toolsFramesPerSocket: 10,
@@ -232,6 +243,7 @@ export const DEFAULT_LIMITS: RelayLimits = {
   pageSessionsPerAddress: 20,
   pageSessions: 1000,
   pairSessions: 200,
+  pairSignInsInFlight: 8,
 };
 
 /** What a header-less page socket is recorded as when the dev flag lets it in. */
@@ -642,6 +654,10 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv): RelayOptions {
         'TABDOCK_MAX_CALLS_PER_MINUTE',
         env.TABDOCK_MAX_CALLS_PER_MINUTE,
       ),
+      pairSignIns: parseCount(
+        'TABDOCK_MAX_PAIR_SIGNINS_PER_MINUTE',
+        env.TABDOCK_MAX_PAIR_SIGNINS_PER_MINUTE,
+      ),
     },
     limits: {
       sessionsPerUser: parseCount(
@@ -660,6 +676,10 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv): RelayOptions {
         env.TABDOCK_MAX_PAGE_SESSIONS_PER_ADDRESS,
       ),
       pageSessions: parseCount('TABDOCK_MAX_PAGE_SESSIONS', env.TABDOCK_MAX_PAGE_SESSIONS),
+      pairSignInsInFlight: parseCount(
+        'TABDOCK_MAX_PAIR_SIGNINS_IN_FLIGHT',
+        env.TABDOCK_MAX_PAIR_SIGNINS_IN_FLIGHT,
+      ),
     },
   };
 }

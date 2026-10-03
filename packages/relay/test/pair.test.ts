@@ -7,6 +7,7 @@
 // must not happen: a nonce used twice or late, a claim without a session or
 // from another origin, a stranger's claim, and any secret in a log line.
 
+import { generateKeyPairSync, randomBytes, sign } from 'node:crypto';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -17,11 +18,18 @@ import {
   type RelayOptions,
   SESSION_COOKIE,
 } from '../src/index.ts';
+import { SlidingWindowLimiter } from '../src/rate-limit.ts';
 import { connectPage, PAGE_ORIGIN, type TestPage, TOOLS } from './helpers/page-client.ts';
 import { type JsonAnswer, Phone } from './helpers/phone.ts';
 import { MOCK_SUBJECT, PAIR_CLIENT, startProvider, type TestProvider } from './helpers/provider.ts';
 import { delay, eventually, startRelay } from './helpers/relay.ts';
-import { PUBLIC_MCP_URL, PUBLIC_ORIGIN, rawRequest, tunnelFetch } from './helpers/tunnel.ts';
+import {
+  PUBLIC_MCP_URL,
+  PUBLIC_ORIGIN,
+  type RawAnswer,
+  rawRequest,
+  tunnelFetch,
+} from './helpers/tunnel.ts';
 
 const USERS = [
   { sub: MOCK_SUBJECT, userId: 'alice', displayName: 'Alice' },
@@ -738,6 +746,54 @@ describe('sign-in at /pair', () => {
     const failures = events().filter((event) => event.msg === 'pair sign-in failed');
     expect(failures.length).toBeGreaterThanOrEqual(2);
   });
+
+  it("refuses an ID token whose signature the provider's published keys do not verify (ADR 0013)", async () => {
+    await start();
+    // An RSA key the provider never published, signing under the provider's own kid.
+    const outsider = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey;
+    const changes: Record<string, (idToken: string) => string> = {
+      'one bit of the signature flipped': (idToken) => {
+        const [header = '', payload = '', signature = ''] = idToken.split('.');
+        const bytes = Buffer.from(signature, 'base64url');
+        bytes[0] = (bytes[0] ?? 0) ^ 1;
+        return `${header}.${payload}.${bytes.toString('base64url')}`;
+      },
+      'signed by an unpublished key under the same kid': (idToken) => {
+        const [header = '', payload = ''] = idToken.split('.');
+        const signature = sign('sha256', Buffer.from(`${header}.${payload}`), outsider);
+        return `${header}.${payload}.${signature.toString('base64url')}`;
+      },
+    };
+    for (const [name, change] of Object.entries(changes)) {
+      provider.tamperTokenResponse = (body) => {
+        if (typeof body.id_token === 'string') body.id_token = change(body.id_token);
+      };
+      const browser = phone();
+      const { callback } = await browser.signIn();
+      expect(callback.status, name).toBe(303);
+      expect(callback.headers.get('location'), name).toBe('/pair?signin=failed');
+      expect(
+        browser.setCookies.some((cookie) => cookie.name === SESSION_COOKIE && cookie.value !== ''),
+        name,
+      ).toBe(false);
+      expect(browser.cookies.has(SESSION_COOKIE), name).toBe(false);
+      expect(browser.cookies.has(LOGIN_COOKIE), name).toBe(false);
+    }
+    // Everything else about those sign-ins was sound: untouched, the same flow signs in.
+    provider.tamperTokenResponse = null;
+    await signedIn();
+    expect(events().filter((event) => event.msg === 'pair sign-in failed')).toHaveLength(2);
+    expect(events().filter((event) => event.msg === 'pair signed in')).toHaveLength(1);
+    // No token, tampered or not, nor any part of one, reached the log.
+    const all = lines.join('\n');
+    expect(provider.issuedTokens.length).toBeGreaterThanOrEqual(6);
+    for (const token of provider.issuedTokens) {
+      expect(all, 'a token in the log').not.toContain(token);
+      for (const part of token.split('.')) {
+        if (part.length > 16) expect(all, 'a token part in the log').not.toContain(part);
+      }
+    }
+  });
 });
 
 describe('pairing limits on /pair (S3, ADR 0016)', () => {
@@ -767,6 +823,172 @@ describe('pairing limits on /pair (S3, ADR 0016)', () => {
     const limited = await browser.preview(opened.nonce);
     expect(limited).toMatchObject({ status: 429, data: { error: 'rate_limited' } });
     expect(limited.headers.get('retry-after')).toBe('60');
+  });
+
+  it('count only live nonces: a flood of made-up ones records nothing and reads expired', async () => {
+    await start({ rateLimits: { pairPreviewsPerNonce: 3 } });
+    const opened = await page();
+    const browser = phone();
+    // Spied only once the page is in, so nothing else is counting meanwhile.
+    const record = vi.spyOn(SlidingWindowLimiter.prototype, 'record');
+    const allows = vi.spyOn(SlidingWindowLimiter.prototype, 'allows');
+    try {
+      // Well formed, so each passes the pattern and is looked up, and none is live.
+      for (let i = 0; i < 200; i += 1) {
+        const madeUp = randomBytes(16).toString('base64url');
+        expect(await browser.preview(madeUp)).toMatchObject({ status: 404, data: EXPIRED });
+      }
+      expect(record).not.toHaveBeenCalled();
+      expect(allows).not.toHaveBeenCalled();
+      // The live nonce still has all its looks, and no more.
+      for (let i = 0; i < 3; i += 1) expect((await browser.preview(opened.nonce)).status).toBe(200);
+      expect(await browser.preview(opened.nonce)).toMatchObject({
+        status: 429,
+        data: { error: 'rate_limited' },
+      });
+      // Its key is the only one the limiter ever held.
+      const limiters = new Set(record.mock.contexts);
+      expect(limiters.size).toBe(1);
+      for (const limiter of limiters) expect((limiter as SlidingWindowLimiter).size).toBe(1);
+      // A made-up nonce is never the one limited: it reads expired, like any other.
+      expect(await browser.preview(randomBytes(16).toString('base64url'))).toMatchObject({
+        status: 404,
+        data: EXPIRED,
+      });
+    } finally {
+      record.mockRestore();
+      allows.mockRestore();
+    }
+  });
+});
+
+describe('code exchanges at /pair/callback (ADR 0013, ADR 0016)', () => {
+  /**
+   * Counts the relay's requests to the provider's token endpoint, each of
+   * which carries the /pair client's secret; while held, they wait unanswered.
+   */
+  function watchTokenEndpoint(): {
+    readonly count: number;
+    hold(): void;
+    release(): void;
+    restore(): void;
+  } {
+    const realFetch = globalThis.fetch;
+    let count = 0;
+    let gate: Promise<void> | null = null;
+    let open = (): void => undefined;
+    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url === `${provider.issuer}/token`) {
+        count += 1;
+        if (gate !== null) await gate;
+      }
+      return realFetch(input, init);
+    });
+    return {
+      get count() {
+        return count;
+      },
+      hold() {
+        gate = new Promise((resolve) => {
+          open = resolve;
+        });
+      },
+      release() {
+        open();
+        gate = null;
+      },
+      restore() {
+        spy.mockRestore();
+      },
+    };
+  }
+
+  /**
+   * A callback with a login cookie of the caller's own making: well formed,
+   * with the state its query repeats, as anyone can send without a browser.
+   */
+  function forgedCallback(i: number): Promise<RawAnswer> {
+    const browser = phone();
+    const part = (): string => randomBytes(32).toString('base64url');
+    const state = part();
+    browser.cookies.set(
+      LOGIN_COOKIE,
+      `${state}.${part()}.${part()}.${String(Date.now() + 600_000)}`,
+    );
+    return browser.request(`/pair/callback?code=made-up-${String(i)}&state=${state}`);
+  }
+
+  function refusals(): Record<string, unknown>[] {
+    return events().filter(
+      (event) => event.level === 'warn' && String(event.msg).startsWith('pair sign-in refused'),
+    );
+  }
+
+  it('makes only so many a window for the whole relay; past that the provider hears nothing', async () => {
+    await start({ rateLimits: { pairSignIns: 3 } });
+    const tokens = watchTokenEndpoint();
+    const realNow = Date.now.bind(Date);
+    try {
+      // A member's sign-in within the budget works.
+      await signedIn();
+      expect(tokens.count).toBe(1);
+      // Made-up callbacks spend the rest, one request to the provider each.
+      for (let i = 0; i < 2; i += 1) {
+        expect((await forgedCallback(i)).headers.get('location')).toBe('/pair?signin=failed');
+      }
+      expect(tokens.count).toBe(3);
+      // Then nobody's exchange goes out, made up or real, whatever address it came from.
+      for (let i = 2; i < 6; i += 1) {
+        expect((await forgedCallback(i)).headers.get('location')).toBe('/pair?signin=failed');
+      }
+      const late = phone();
+      const { callback } = await late.signIn();
+      expect(callback.headers.get('location')).toBe('/pair?signin=failed');
+      expect(late.cookies.has(SESSION_COOKIE)).toBe(false);
+      expect(tokens.count).toBe(3);
+      expect(refusals()).toHaveLength(5);
+      // A window later the budget is back.
+      const clock = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + 61_000);
+      try {
+        await signedIn();
+      } finally {
+        clock.mockRestore();
+      }
+      expect(tokens.count).toBe(4);
+    } finally {
+      tokens.restore();
+    }
+  });
+
+  it('holds only so many at once; past that the provider hears nothing until one is answered', async () => {
+    await start({ limits: { pairSignInsInFlight: 2 } });
+    const tokens = watchTokenEndpoint();
+    try {
+      tokens.hold();
+      const waiting = [forgedCallback(0), forgedCallback(1)];
+      await eventually(() => tokens.count === 2, 3000);
+      // A third, made up or real, is answered at once without the provider.
+      const third = await Promise.race([forgedCallback(2), delay(2000).then(() => null)]);
+      expect(third?.headers.get('location'), 'answered without waiting on the provider').toBe(
+        '/pair?signin=failed',
+      );
+      const member = phone();
+      const { callback } = await member.signIn();
+      expect(callback.headers.get('location')).toBe('/pair?signin=failed');
+      expect(tokens.count).toBe(2);
+      expect(refusals()).toHaveLength(2);
+      tokens.release();
+      for (const answer of await Promise.all(waiting)) {
+        expect(answer.headers.get('location')).toBe('/pair?signin=failed');
+      }
+      // Once those are answered, a member signs in as ever.
+      await signedIn();
+      expect(tokens.count).toBe(3);
+    } finally {
+      tokens.release();
+      tokens.restore();
+    }
   });
 });
 

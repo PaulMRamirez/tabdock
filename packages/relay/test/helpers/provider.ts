@@ -38,6 +38,12 @@ export interface TestProvider {
   /** Every token its token endpoint handed out (access, ID and refresh), for log scans. */
   readonly issuedTokens: string[];
   /**
+   * Changes each token response body before it is sent, as a provider or a
+   * network in between might; null sends what the mock built. Synchronous,
+   * since the mock sends the body as soon as its listeners return.
+   */
+  tamperTokenResponse: ((body: Record<string, unknown>) => void) | null;
+  /**
    * An RS256 access token signed with the provider's key. `claims` are merged
    * into the mock's payload (iss, iat, nbf, and exp an hour on); a claim given
    * as undefined is removed.
@@ -81,6 +87,7 @@ export async function startProvider(): Promise<TestProvider> {
     oidc: Record<string, unknown> | null;
   } = { oauth: goodMetadata(issuer), oidc: null };
   let signInSubject: string | null = null;
+  let tamperTokenResponse: ((body: Record<string, unknown>) => void) | null = null;
   const codeGrants: { clientId: string | null; secretSent: boolean }[] = [];
   const issuedTokens: string[] = [];
   const serve =
@@ -125,6 +132,7 @@ export async function startProvider(): Promise<TestProvider> {
       request: { body?: unknown; headers: Record<string, unknown> },
     ) => {
       const sent = response.body as Record<string, unknown> | undefined;
+      if (sent !== undefined) tamperTokenResponse?.(sent);
       for (const name of ['access_token', 'id_token', 'refresh_token']) {
         const token = sent?.[name];
         if (typeof token === 'string') issuedTokens.push(token);
@@ -173,6 +181,12 @@ export async function startProvider(): Promise<TestProvider> {
     },
     codeGrants,
     issuedTokens,
+    get tamperTokenResponse() {
+      return tamperTokenResponse;
+    },
+    set tamperTokenResponse(value) {
+      tamperTokenResponse = value;
+    },
     token(claims = {}) {
       return server.issuer.buildToken({
         scopesOrTransform: (_header, payload) => {
