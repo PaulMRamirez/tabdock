@@ -25,6 +25,12 @@ export const QR_QUIET_ZONE = 4;
 export const MAX_QR_URL_LENGTH = 256;
 
 /**
+ * The drawing's side in CSS pixels, quiet zone included: 2.5 to 3 px a module
+ * at the usual versions 4 to 6, which a phone reads from a laptop screen.
+ */
+export const QR_SIDE_PX = 124;
+
+/**
  * Printable ASCII and nothing else: the library keeps only the low byte of
  * each character, so anything wider would encode a different URL, and
  * whitespace or controls have no place in one the relay built.
@@ -36,11 +42,24 @@ const SVG_NS = 'http://www.w3.org/2000/svg';
 type QrCode = ReturnType<typeof qrcode>;
 
 /**
+ * The nonce in the fragment, as the relay draws it (secrets.ts,
+ * newSingleUseSecret): 128 bits as 22 base64url characters, no padding.
+ */
+const PAIRING_FRAGMENT = /^#[A-Za-z0-9_-]{22}$/;
+
+/**
  * The URL the widget may draw, or null. The relay builds it from its public
  * URL, which must be https (ADR 0014), so anything else is a misconfigured or
  * misbehaving relay, and a phone should never be sent there: no code is drawn
- * and the typed code still works. Credentials in a URL only serve to dress one
- * host up as another, so those are refused too.
+ * and the typed code still works.
+ *
+ * Only the shape the relay builds passes, `<origin>/pair#<nonce>`, spelled
+ * exactly as the parser spells it back: that shape rebuilt from the parsed
+ * origin and fragment must equal the text. The drawn text is what a scanner
+ * shows and opens, so it must be the text that was checked; a backslash or
+ * `https:host` makes one string read as one host and parse as another, and
+ * credentials only serve to dress one host up as another. The same equality
+ * refuses any other path, any query (even an empty one) and any other spelling.
  */
 export function pairingQrUrl(value: string | undefined): string | null {
   if (value === undefined || value.length > MAX_QR_URL_LENGTH || !PRINTABLE_ASCII.test(value)) {
@@ -52,8 +71,8 @@ export function pairingQrUrl(value: string | undefined): string | null {
   } catch {
     return null;
   }
-  if (parsed.protocol !== 'https:' || parsed.username !== '' || parsed.password !== '') return null;
-  return value;
+  if (parsed.protocol !== 'https:' || !PAIRING_FRAGMENT.test(parsed.hash)) return null;
+  return value === `${parsed.origin}/pair${parsed.hash}` ? value : null;
 }
 
 /** The library's code for text at error correction level M, or null if it will not encode. */
@@ -115,10 +134,20 @@ export function createQrView(doc: Document): QrView {
   svg.setAttribute('shape-rendering', 'crispEdges');
   svg.setAttribute('role', 'img');
   svg.setAttribute('aria-label', 'Pairing QR code: scan it with a phone to pair');
+  // The drawing carries its own size and light ground as attributes, which no
+  // style-src governs: a page whose CSP refuses the widget's stylesheet must
+  // not leave dark modules on its own dark background, stretched across it.
+  svg.setAttribute('width', String(QR_SIDE_PX));
+  svg.setAttribute('height', String(QR_SIDE_PX));
+  // Behind the modules, over the whole viewBox, quiet zone included.
+  const ground = doc.createElementNS(SVG_NS, 'rect');
+  ground.setAttribute('width', '100%');
+  ground.setAttribute('height', '100%');
   const path = doc.createElementNS(SVG_NS, 'path');
   // Fixed colours, as a scanner needs dark on light whatever the page's theme.
+  ground.setAttribute('fill', '#fff');
   path.setAttribute('fill', '#000');
-  svg.append(path);
+  svg.append(ground, path);
 
   let drawn: string | undefined;
   let showing = false;

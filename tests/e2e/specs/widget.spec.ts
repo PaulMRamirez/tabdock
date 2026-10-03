@@ -1,5 +1,6 @@
+import { createHash } from 'node:crypto';
 import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
-import { encodeQr } from '@tabdock/adapter/qr';
+import { encodeQr, QR_SIDE_PX } from '@tabdock/adapter/qr';
 import { startDemoServer, type DemoServer } from '@tabdock/demo/server';
 import {
   ATTACH_REQUEST_TTL_MS,
@@ -762,11 +763,29 @@ interface Violation {
 }
 
 /**
- * Serves the demo page with TRUSTED_TYPES_CSP added to the demo server's own
- * policy on its way to the browser, so the page is the real demo page under a
- * strict CSP, and records every violation the page reports.
+ * What a careful page sends for styles: its own inline <style> allowed by its
+ * hash and every other inline style refused, as on any page whose style-src
+ * leaves out 'unsafe-inline'. report-sample puts the start of a refused style
+ * in its report.
  */
-async function enforceTrustedTypes(page: Page): Promise<() => Promise<Violation[]>> {
+async function ownStylesOnly(): Promise<string> {
+  const html = await (await fetch(demo.url)).text();
+  const own = /<style>([\s\S]*?)<\/style>/.exec(html)?.[1];
+  if (own === undefined) throw new Error('the demo page has no <style>');
+  const hash = createHash('sha256').update(own, 'utf8').digest('base64');
+  return `style-src 'self' 'sha256-${hash}' 'report-sample'`;
+}
+
+/**
+ * Serves the demo page with `policy` (TRUSTED_TYPES_CSP unless a test asks for
+ * more) added to the demo server's own policy on its way to the browser, so
+ * the page is the real demo page under a strict CSP, and records every
+ * violation the page reports.
+ */
+async function enforceTrustedTypes(
+  page: Page,
+  policy = TRUSTED_TYPES_CSP,
+): Promise<() => Promise<Violation[]>> {
   await page.addInitScript(() => {
     const seen: Violation[] = [];
     Object.defineProperty(window, '__cspViolations', { value: seen });
@@ -785,7 +804,7 @@ async function enforceTrustedTypes(page: Page): Promise<() => Promise<Violation[
         response,
         headers: {
           ...headers,
-          'content-security-policy': own ? `${own}; ${TRUSTED_TYPES_CSP}` : TRUSTED_TYPES_CSP,
+          'content-security-policy': own ? `${own}; ${policy}` : policy,
         },
       });
     },
@@ -815,10 +834,16 @@ interface QrReading {
   inside: string[];
   viewBox: string | null;
   d: string | null;
+  /** The svg's own size attributes, which hold with no stylesheet at all. */
+  size: { width: string | null; height: string | null };
+  /** The light rectangle behind the modules, as its attributes give it. */
+  ground: { width: string | null; height: string | null; fill: string | null } | null;
   qr: Box;
   code: Box | null;
   /** How far the panel's content is wider than the panel; above 0 means it scrolls sideways. */
   panelOverflow: number;
+  /** Computed styles that only the widget's stylesheet sets. */
+  styled: { hostPosition: string; panelBackground: string; qrBackground: string };
 }
 
 interface CdpNode {
@@ -840,8 +865,11 @@ function nodeWithRole(node: CdpNode, role: string): CdpNode | null {
   return null;
 }
 
-/** Page script cannot reach into the closed shadow root; the DevTools protocol can. */
-async function readQr(page: Page): Promise<QrReading> {
+/**
+ * Runs a function with the widget's QR box as `this` and returns its value.
+ * Page script cannot reach into the closed shadow root; the DevTools protocol can.
+ */
+async function onQrBox<T>(page: Page, functionDeclaration: string): Promise<T> {
   const cdp = await page.context().newCDPSession(page);
   try {
     const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
@@ -851,30 +879,55 @@ async function readQr(page: Page): Promise<QrReading> {
     if (object.objectId === undefined) throw new Error('could not resolve the QR element');
     const { result } = await cdp.send('Runtime.callFunctionOn', {
       objectId: object.objectId,
-      functionDeclaration: `function () {
+      functionDeclaration,
+      returnByValue: true,
+    });
+    return result.value as T;
+  } finally {
+    await cdp.detach();
+  }
+}
+
+async function readQr(page: Page): Promise<QrReading> {
+  return onQrBox<QrReading>(
+    page,
+    `function () {
         const box = (element) => {
           if (!element) return null;
           const { left, top, right, bottom } = element.getBoundingClientRect();
           return { left, top, right, bottom };
         };
         const svg = this.firstElementChild;
+        const path = svg ? svg.querySelector('path') : null;
+        const rect = svg ? svg.querySelector('rect') : null;
         const panel = this.closest('.panel');
         return {
           namespace: svg ? svg.namespaceURI : null,
           inside: svg ? Array.from(svg.querySelectorAll('*'), (element) => element.localName) : [],
           viewBox: svg ? svg.getAttribute('viewBox') : null,
-          d: svg && svg.firstElementChild ? svg.firstElementChild.getAttribute('d') : null,
+          d: path ? path.getAttribute('d') : null,
+          size: {
+            width: svg ? svg.getAttribute('width') : null,
+            height: svg ? svg.getAttribute('height') : null,
+          },
+          ground: rect
+            ? {
+                width: rect.getAttribute('width'),
+                height: rect.getAttribute('height'),
+                fill: rect.getAttribute('fill'),
+              }
+            : null,
           qr: box(this),
           code: box(panel.querySelector('[data-role="pairing-code"]')),
           panelOverflow: panel.scrollWidth - panel.clientWidth,
+          styled: {
+            hostPosition: getComputedStyle(this.getRootNode().host).position,
+            panelBackground: getComputedStyle(panel).backgroundColor,
+            qrBackground: getComputedStyle(this).backgroundColor,
+          },
         };
       }`,
-      returnByValue: true,
-    });
-    return result.value as QrReading;
-  } finally {
-    await cdp.detach();
-  }
+  );
 }
 
 /** The dark modules a path draws, which must be nothing but one-module-tall runs. */
@@ -909,7 +962,10 @@ function libraryModules(url: string): { modules: number; size: number; dark: Set
 function expectDrawing(reading: QrReading, url: string): void {
   const expected = libraryModules(url);
   expect(reading.namespace).toBe('http://www.w3.org/2000/svg');
-  expect(reading.inside).toEqual(['path']);
+  // A light ground behind one path of dark modules, and nothing else.
+  expect(reading.inside).toEqual(['rect', 'path']);
+  expect(reading.ground).toEqual({ width: '100%', height: '100%', fill: '#fff' });
+  expect(reading.size).toEqual({ width: String(QR_SIDE_PX), height: String(QR_SIDE_PX) });
   expect(reading.viewBox).toBe(`0 0 ${expected.size} ${expected.size}`);
   const dark = drawnModules(reading.d ?? '');
   expect(dark.size).toBe(expected.dark.size);
@@ -1028,4 +1084,124 @@ test('at phone width the QR code and the typed code both fit the panel, and on a
   expect(beside.top).toBeGreaterThanOrEqual(laptop.qr.top);
   expect(beside.bottom).toBeLessThanOrEqual(laptop.qr.bottom);
   expect(beside.bottom - beside.top).toBeLessThan(ONE_LINE);
+});
+
+/**
+ * The QR drawing as a camera would see it: a screenshot of the svg, read back
+ * module by module, dark where the pixel at a module's centre is dark.
+ * dimmestLight is the darkest of the light modules, which must be near white
+ * whatever lies behind the widget. The svg is scrolled into view first, as
+ * without its styles the widget sits at the foot of the page.
+ */
+async function photographQr(
+  page: Page,
+  size: number,
+): Promise<{ width: number; height: number; dark: Set<string>; dimmestLight: number }> {
+  const svg = await onQrBox<Box>(
+    page,
+    `function () {
+        const svg = this.querySelector('svg');
+        svg.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        const { left, top, right, bottom } = svg.getBoundingClientRect();
+        return { left, top, right, bottom };
+      }`,
+  );
+  const width = svg.right - svg.left;
+  const height = svg.bottom - svg.top;
+  const shot = await page.screenshot({ clip: { x: svg.left, y: svg.top, width, height } });
+  // Decoded in a blank page of its own, out of reach of the demo page's policy.
+  const decoder = await page.context().newPage();
+  try {
+    const image = await decoder.evaluate(async (png) => {
+      const bytes = Uint8Array.from(atob(png), (char) => char.charCodeAt(0));
+      const bitmap = await createImageBitmap(new Blob([bytes], { type: 'image/png' }));
+      const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('no 2d canvas');
+      context.drawImage(bitmap, 0, 0);
+      const { data } = context.getImageData(0, 0, bitmap.width, bitmap.height);
+      const luma: number[] = [];
+      for (let i = 0; i < data.length; i += 4) {
+        const [red = 0, green = 0, blue = 0] = data.subarray(i, i + 3);
+        luma.push(Math.round((red * 299 + green * 587 + blue * 114) / 1000));
+      }
+      return { width: bitmap.width, height: bitmap.height, luma };
+    }, shot.toString('base64'));
+    const dark = new Set<string>();
+    let dimmestLight = 255;
+    for (let row = 0; row < size; row += 1) {
+      for (let col = 0; col < size; col += 1) {
+        const x = Math.floor(((col + 0.5) * image.width) / size);
+        const y = Math.floor(((row + 0.5) * image.height) / size);
+        const value = image.luma[y * image.width + x] ?? 0;
+        if (value < 128) dark.add(`${row},${col}`);
+        else dimmestLight = Math.min(dimmestLight, value);
+      }
+    }
+    return { width, height, dark, dimmestLight };
+  } finally {
+    await decoder.close();
+  }
+}
+
+test.describe('on a page whose CSP refuses inline styles', () => {
+  // A dark page, and two device pixels to the CSS pixel so every module spans several.
+  test.use({ colorScheme: 'dark', deviceScaleFactor: 2 });
+
+  test('the widget keeps its styles, and the QR code its white 124 px ground, on a dark page', async ({
+    page,
+  }) => {
+    const violations = await enforceTrustedTypes(
+      page,
+      `${TRUSTED_TYPES_CSP}; ${await ownStylesOnly()}`,
+    );
+    await openWithFakeRelay(page, { pairingUrl: PAIRING_URL });
+    // Through the CSSOM, which no policy governs: a dark page behind the widget.
+    await page.evaluate(() => {
+      document.documentElement.style.background = '#111';
+    });
+    await expect.poll(() => widgetVisible(page, 'pairing-qr')).toBe(true);
+    const reading = await readQr(page);
+    expectDrawing(reading, PAIRING_URL);
+
+    // What a phone would scan: the library's matrix, dark on white with its
+    // quiet zone, QR_SIDE_PX square. The drawing holds this on its own.
+    const expected = libraryModules(PAIRING_URL);
+    const photo = await photographQr(page, expected.size);
+    expect({ width: photo.width, height: photo.height }).toEqual({
+      width: QR_SIDE_PX,
+      height: QR_SIDE_PX,
+    });
+    expect(photo.dark).toEqual(expected.dark);
+    expect(photo.dimmestLight).toBeGreaterThanOrEqual(240);
+
+    // And the widget's stylesheet applied: fixed in its corner, in the dark
+    // theme's panel, the QR code in a white box of the same size.
+    expect(reading.styled).toEqual({
+      hostPosition: 'fixed',
+      panelBackground: 'rgb(17, 24, 39)',
+      qrBackground: 'rgb(255, 255, 255)',
+    });
+    expect(reading.qr.right - reading.qr.left).toBe(QR_SIDE_PX);
+    expect(reading.qr.bottom - reading.qr.top).toBe(QR_SIDE_PX);
+
+    // Nothing was refused (afterEach also finds no console error): the
+    // widget's sheet never goes through style-src.
+    expect(await violations()).toEqual([]);
+    // And the policy was in force: an inline <style> the page did not list is refused.
+    const refused = await page.evaluate(() => {
+      const style = document.createElement('style');
+      style.textContent = '.probe { color: red; }';
+      document.head.append(style);
+      return style.sheet === null;
+    });
+    expect(refused).toBe(true);
+    await expect
+      .poll(async () => (await violations()).map((violation) => violation.directive))
+      .toEqual(['style-src-elem']);
+    const refusedStyles = () =>
+      pageErrors.filter((line) => line.startsWith('Refused to apply inline style'));
+    await expect.poll(() => refusedStyles().length).toBe(1);
+    expectedErrors.push(...refusedStyles());
+  });
 });

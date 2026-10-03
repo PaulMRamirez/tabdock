@@ -401,10 +401,24 @@ try {
   }
   check(timing?.relayMs !== undefined, 'the spike flag should put timings in the result');
   say('tools/call call_page_tool { tool: "add_item" } from bob-phone');
-  report(
-    'add_item from bob-phone',
-    await call(bob.client, 'add_item', { label: 'From the phone', x: 120, y: 0 }),
-    'role_denied',
+  const observerWrite = await call(bob.client, 'add_item', {
+    label: 'From the phone',
+    x: 120,
+    y: 0,
+  });
+  report('add_item from bob-phone', observerWrite, 'role_denied');
+  // The page refuses an observer's write too, with the same code (S5 holds
+  // twice), so only the relay's own wording and a page that saw nothing show
+  // which of the two refused it.
+  check(
+    observerWrite.text.includes('you are an observer on this page'),
+    "the relay, not the page, should refuse the observer's write",
+  );
+  check(
+    (await stateOf(page)).activity.every(
+      (entry) => !(entry.user.userId === 'bob' && entry.tool === 'add_item'),
+    ),
+    "the observer's write should never reach the page's activity log",
   );
   say('   An observer reads but does not write; the relay refused it before the page saw it.');
 

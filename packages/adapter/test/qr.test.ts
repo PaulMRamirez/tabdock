@@ -1,6 +1,6 @@
 import qrcode from 'qrcode-generator';
 import { describe, expect, it } from 'vitest';
-import { createQrView, MAX_QR_URL_LENGTH, pairingQrUrl, qrPath } from '../src/qr.ts';
+import { createQrView, MAX_QR_URL_LENGTH, pairingQrUrl, QR_SIDE_PX, qrPath } from '../src/qr.ts';
 
 // Shaped like the relay's: its public URL, /pair#, and a 22-character base64url nonce.
 const SAMPLE_URL = 'https://tabdock-owner.ngrok-free.app/pair#q3Zf0_Wn-8xLr2TmB9cKpA';
@@ -98,14 +98,79 @@ describe('qrPath', () => {
     }
   });
 
+  it('draws nothing for a URL that would show one host and send the phone to another', () => {
+    for (const url of [
+      // WHATWG ends the authority at the backslash, so the host is evil.example
+      // and nothing counts as credentials, while the text still reads @<relay host>.
+      'https://evil.example\\@tabdock-owner.ngrok-free.app/pair#q3Zf0_Wn-8xLr2TmB9cKpA',
+      'https:\\\\evil.example/pair#q3Zf0_Wn-8xLr2TmB9cKpA',
+      'https:/\\evil.example/pair#q3Zf0_Wn-8xLr2TmB9cKpA',
+      'https:evil.example/pair#q3Zf0_Wn-8xLr2TmB9cKpA',
+      'https:tabdock-owner.ngrok-free.app/pair#q3Zf0_Wn-8xLr2TmB9cKpA',
+      'https:/tabdock-owner.ngrok-free.app/pair#q3Zf0_Wn-8xLr2TmB9cKpA',
+      'https://tabdock-owner.ngrok-free.app\\pair#q3Zf0_Wn-8xLr2TmB9cKpA',
+      // Spellings the relay never sends, each parsing to something other than its text.
+      'HTTPS://tabdock-owner.ngrok-free.app/pair#q3Zf0_Wn-8xLr2TmB9cKpA',
+      'https://Tabdock-Owner.ngrok-free.app/pair#q3Zf0_Wn-8xLr2TmB9cKpA',
+      'https://tabdock-owner.ngrok-free.app:443/pair#q3Zf0_Wn-8xLr2TmB9cKpA',
+      'https://tabdock-owner.ngrok-free.app/pair/../pair#q3Zf0_Wn-8xLr2TmB9cKpA',
+      'https://tabdock-owner.ngrok-free.app/./pair#q3Zf0_Wn-8xLr2TmB9cKpA',
+    ]) {
+      expect(pairingQrUrl(url), url).toBeNull();
+      expect(qrPath(url), url).toBeNull();
+    }
+  });
+
+  it('draws only <origin>/pair#<22 base64url characters>, the one shape the relay builds', () => {
+    const origin = 'https://tabdock-owner.ngrok-free.app';
+    const nonce = 'q3Zf0_Wn-8xLr2TmB9cKpA';
+    for (const url of [
+      // Any other path.
+      `${origin}/#${nonce}`,
+      `${origin}#${nonce}`,
+      `${origin}/pair/#${nonce}`,
+      `${origin}/Pair#${nonce}`,
+      `${origin}/%70air#${nonce}`,
+      `${origin}/pair/claim#${nonce}`,
+      `${origin}/x/pair#${nonce}`,
+      `${origin}/login#${nonce}`,
+      'https://evil.example/phish?x=1#q3Zf0_Wn-8xLr2TmB9cKpA',
+      // Any query, even an empty one.
+      `${origin}/pair?#${nonce}`,
+      `${origin}/pair?x=1#${nonce}`,
+      'https://evil.example/login?next=https://tabdock-owner.ngrok-free.app/pair',
+      // Any fragment but one nonce.
+      `${origin}/pair`,
+      `${origin}/pair#`,
+      `${origin}/pair#${nonce.slice(1)}`,
+      `${origin}/pair#${nonce}A`,
+      `${origin}/pair#${nonce.slice(2)}==`,
+      `${origin}/pair#q3Zf0/Wn+8xLr2TmB9cKpA`,
+      `${origin}/pair#q3Zf0.Wn-8xLr2TmB9cKpA`,
+      `${origin}/pair#q3Zf0_Wn-8xLr2T#B9cKpA`,
+      `${origin}/pair#${nonce}#${nonce}`,
+    ]) {
+      expect(pairingQrUrl(url), url).toBeNull();
+      expect(qrPath(url), url).toBeNull();
+    }
+    // What the relay builds from an origin with a port is still its shape.
+    const withPort = `https://relay.example:8443/pair#${nonce}`;
+    expect(pairingQrUrl(withPort)).toBe(withPort);
+    expect(pairingQrUrl(SAMPLE_URL)).toBe(SAMPLE_URL);
+  });
+
   it(`draws a URL of up to ${MAX_QR_URL_LENGTH} characters and nothing longer`, () => {
-    const base = 'https://tabdock-owner.ngrok-free.app/pair#';
-    const longest = base + 'a'.repeat(MAX_QR_URL_LENGTH - base.length);
+    // Only the host can make the relay's URL long: a public URL is a bare origin.
+    const urlWithHost = (extra: number) =>
+      `https://${'a'.repeat(63)}.${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(extra)}.example/pair#q3Zf0_Wn-8xLr2TmB9cKpA`;
+    const longest = urlWithHost(MAX_QR_URL_LENGTH - urlWithHost(0).length);
     expect(longest).toHaveLength(MAX_QR_URL_LENGTH);
     const path = qrPath(longest);
     expect(pathModules(path?.d ?? '')).toEqual(libraryModules(longest).dark);
-    expect(qrPath(`${longest}a`)).toBeNull();
-    expect(qrPath(base + 'a'.repeat(2048))).toBeNull();
+    const tooLong = urlWithHost(MAX_QR_URL_LENGTH - urlWithHost(0).length + 1);
+    expect(new URL(tooLong).href).toBe(tooLong);
+    expect(qrPath(tooLong)).toBeNull();
+    expect(qrPath(urlWithHost(2048))).toBeNull();
   });
 });
 
@@ -156,10 +221,11 @@ describe('createQrView', () => {
     const svg = view.element as unknown as FakeElement;
     expect(created.map((node) => [node.namespaceURI, node.localName])).toEqual([
       ['http://www.w3.org/2000/svg', 'svg'],
+      ['http://www.w3.org/2000/svg', 'rect'],
       ['http://www.w3.org/2000/svg', 'path'],
     ]);
-    expect(svg.children.map((node) => node.localName)).toEqual(['path']);
-    const path = svg.children[0];
+    expect(svg.children.map((node) => node.localName)).toEqual(['rect', 'path']);
+    const path = svg.children[1];
 
     expect(view.show(SAMPLE_URL)).toBe(true);
     const first = libraryModules(SAMPLE_URL);
@@ -180,7 +246,33 @@ describe('createQrView', () => {
       false,
     );
     expect(path?.attributes.has('d')).toBe(false);
-    // Only the two elements made at the start, ever.
-    expect(created).toHaveLength(2);
+    // Only the elements made at the start, ever.
+    expect(created).toHaveLength(3);
+  });
+
+  it('carries its own light ground and size, so it scans with no stylesheet at all', () => {
+    // A page whose CSP refuses the widget's styles must not leave dark modules
+    // on its own dark background, stretched to the page's width: presentation
+    // attributes are not styles, so no style-src applies to them.
+    const { doc } = fakeDocument();
+    const view = createQrView(doc);
+    const svg = view.element as unknown as FakeElement;
+    expect(svg.attributes.get('width')).toBe(String(QR_SIDE_PX));
+    expect(svg.attributes.get('height')).toBe(String(QR_SIDE_PX));
+    const [ground, path] = svg.children;
+    // Behind the path, covering the whole viewBox, quiet zone included.
+    expect(ground?.localName).toBe('rect');
+    expect(Object.fromEntries(ground?.attributes ?? [])).toEqual({
+      width: '100%',
+      height: '100%',
+      fill: '#fff',
+    });
+    expect(path?.attributes.get('fill')).toBe('#000');
+
+    view.show(SAMPLE_URL);
+    view.show(undefined);
+    // Clearing the drawing leaves the ground and size alone; they hold nothing of a URL.
+    expect(svg.attributes.get('width')).toBe(String(QR_SIDE_PX));
+    expect(ground?.attributes.get('fill')).toBe('#fff');
   });
 });
