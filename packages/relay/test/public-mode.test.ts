@@ -4,7 +4,9 @@
 // /page kept to this machine. Then a client through the stand-in tunnel drives
 // a local page, which is the M3 shape: phone in the cloud, page on the laptop.
 
+import { connect } from 'node:net';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import { SUBPROTOCOL } from '@tabdock/protocol';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { resolveConfig } from '../src/config.ts';
 import {
@@ -373,6 +375,74 @@ describe('a relay with a public URL (ADR 0014)', () => {
     }
     // A Host is never echoed into the log.
     expect(lines.join('\n')).not.toContain('evil');
+  });
+
+  /** The status line a raw request gets; only a raw socket can send two Host lines. */
+  const rawStatus = (head: readonly string[]): Promise<number> =>
+    new Promise((resolve, reject) => {
+      const socket = connect(Number(new URL(relay.url).port), '127.0.0.1', () => {
+        socket.write(`${head.join('\r\n')}\r\n\r\n`);
+      });
+      let received = '';
+      socket.on('data', (chunk: Buffer) => {
+        received += chunk.toString('latin1');
+        const status = /^HTTP\/1\.1 (\d{3})/.exec(received)?.[1];
+        if (status !== undefined) {
+          socket.destroy();
+          resolve(Number(status));
+        }
+      });
+      socket.on('error', reject);
+      socket.on('close', () => {
+        reject(new Error('the relay closed the socket without a status line'));
+      });
+    });
+
+  it('refuses a request with more than one Host line, whichever comes first (RFC 9112)', async () => {
+    const twoHosts = [
+      ['Host: localhost', `Host: ${PUBLIC_HOST}`],
+      [`Host: ${PUBLIC_HOST}`, 'Host: localhost'],
+      ['Host: localhost', 'Host: localhost'],
+    ];
+    for (const hosts of twoHosts) {
+      const mcp = await rawStatus([
+        'POST /mcp HTTP/1.1',
+        ...hosts,
+        'Content-Type: application/json',
+        'Content-Length: 2',
+        'Connection: close',
+        '',
+        '{}',
+      ]);
+      expect(mcp, hosts.join(' ')).toBe(400);
+      expect(await rawStatus(['GET /pair HTTP/1.1', ...hosts, 'Connection: close'])).toBe(400);
+      expect(
+        await rawStatus([
+          'GET /page HTTP/1.1',
+          ...hosts,
+          'Connection: Upgrade',
+          'Upgrade: websocket',
+          'Sec-WebSocket-Version: 13',
+          'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+          `Sec-WebSocket-Protocol: ${SUBPROTOCOL}`,
+          `Origin: ${PAGE_ORIGIN}`,
+        ]),
+        hosts.join(' '),
+      ).toBe(400);
+    }
+    // One Host line, the same request: the page link opens.
+    expect(
+      await rawStatus([
+        'GET /page HTTP/1.1',
+        'Host: localhost',
+        'Connection: Upgrade',
+        'Upgrade: websocket',
+        'Sec-WebSocket-Version: 13',
+        'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+        `Sec-WebSocket-Protocol: ${SUBPROTOCOL}`,
+        `Origin: ${PAGE_ORIGIN}`,
+      ]),
+    ).toBe(101);
   });
 
   it('refuses dev tokens on every request, local or through the tunnel', async () => {

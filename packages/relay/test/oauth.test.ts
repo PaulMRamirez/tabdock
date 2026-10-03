@@ -25,7 +25,7 @@ import {
   type OAuthUser,
   type Relay,
 } from '../src/index.ts';
-import { JWKS_RETRY_MS, STALE_KEYS_MAX_AGE_MS } from '../src/oauth.ts';
+import { JWKS_RETRY_MS } from '../src/oauth.ts';
 import { PAGE_ORIGIN } from './helpers/page-client.ts';
 import {
   goodMetadata,
@@ -573,20 +573,22 @@ describe("the provider's key set while it cannot be fetched", () => {
     expect(keySet.fetches).toBe(2);
   });
 
-  it('checks tokens with the last key set it fetched while a refresh fails, for a bounded time', async () => {
+  it('checks tokens with the keys jose still holds while a fetch waits, never past their cache life', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     const fetchedAt = Date.now();
     expect((await send(DISCOVER, `Bearer ${await aliceToken()}`)).status).toBe(200);
     expect(keySet.fetches).toBe(1);
 
-    // Past jose's cache life a refresh is due, and it fails.
+    // An unknown key sends jose to the provider, which fails: the wait begins.
     keySet.failing = true;
-    vi.setSystemTime(fetchedAt + JOSE_CACHE_MAX_AGE_MS + 1);
-    const token = `Bearer ${await aliceToken()}`;
-    const stale = await send(DISCOVER, token);
-    expect(stale.status, stale.body).toBe(200);
+    vi.setSystemTime(fetchedAt + 60_000);
+    const unknown = await send(DISCOVER, forged('published-since'));
+    expect(unknown.status).toBe(503);
+    expect(unknown.headers.get('retry-after')).toBe('5');
     expect(keySet.fetches).toBe(2);
-    // The old keys still check signatures: an altered token is the token's fault.
+    // Meanwhile the keys jose holds still check tokens, with no fetch: a valid
+    // token passes and an altered one is the token's fault.
+    expect((await send(DISCOVER, `Bearer ${await aliceToken()}`)).status).toBe(200);
     const [header, , signature] = (await aliceToken()).split('.');
     const altered = Buffer.from(
       JSON.stringify({
@@ -600,21 +602,40 @@ describe("the provider's key set while it cannot be fetched", () => {
       await send(DISCOVER, `Bearer ${header ?? ''}.${altered}.${signature ?? ''}`),
       /signature is invalid/,
     );
-    // A key they lack may be one published since: the provider's to answer, so 503, not a sign-in.
-    const unknown = await send(DISCOVER, forged('published-since'));
-    expect(unknown.status).toBe(503);
-    expect(unknown.headers.get('retry-after')).toBe('5');
     expect(keySet.fetches).toBe(2);
 
-    // Past the bound the old keys no longer stand in for the provider's.
-    vi.setSystemTime(fetchedAt + STALE_KEYS_MAX_AGE_MS + 1);
+    // Past jose's cache life the held keys are trusted no longer.
+    vi.setSystemTime(fetchedAt + JOSE_CACHE_MAX_AGE_MS + 1);
     expect((await send(DISCOVER, `Bearer ${await aliceToken()}`)).status).toBe(503);
     expect(keySet.fetches).toBe(3);
-    // And once a fetch succeeds again, the fresh keys take over.
+    expect((await send(DISCOVER, `Bearer ${await aliceToken()}`)).status).toBe(503);
+    expect(keySet.fetches).toBe(3);
+    // Once a fetch succeeds again, the fresh keys take over.
     keySet.failing = false;
     vi.setSystemTime(Date.now() + JWKS_RETRY_MS);
     expect((await send(DISCOVER, `Bearer ${await aliceToken()}`)).status).toBe(200);
     expect(keySet.fetches).toBe(4);
+  });
+
+  it('treats a clock set back as more waiting, not as a reason to fetch', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    keySet.failing = true;
+    const token = `Bearer ${await aliceToken()}`;
+    expect((await send(DISCOVER, token)).status).toBe(503);
+    expect(keySet.fetches).toBe(1);
+    for (let step = 0; step < 3; step += 1) {
+      vi.setSystemTime(Date.now() - 1);
+      expect((await send(DISCOVER, token)).status).toBe(503);
+    }
+    expect(keySet.fetches).toBe(1);
+    // The wait restarted at the earliest time seen, and runs its full length from there.
+    keySet.failing = false;
+    vi.setSystemTime(Date.now() + JWKS_RETRY_MS - 1);
+    expect((await send(DISCOVER, token)).status).toBe(503);
+    expect(keySet.fetches).toBe(1);
+    vi.setSystemTime(Date.now() + 1);
+    expect((await send(DISCOVER, token)).status).toBe(200);
+    expect(keySet.fetches).toBe(2);
   });
 });
 

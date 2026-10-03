@@ -65,11 +65,18 @@ export interface Relay {
 }
 
 /**
- * Whether a request's Host header, if it has one, is no host at all. Such a
- * request is malformed (400) before any route or allowlist reads its Host. A
+ * Whether a request's Host header, if it has one, is no host at all, or is
+ * one of several. Such a request is malformed (400, RFC 9112 section 3.2)
+ * before any route or allowlist reads its Host: Node keeps only the first of
+ * several Host lines, while a proxy in front may have routed on another. A
  * missing Host is left to the checks that need one, which refuse it.
  */
 function malformedHost(request: IncomingMessage): boolean {
+  let lines = 0;
+  for (let index = 0; index < request.rawHeaders.length; index += 2) {
+    if (request.rawHeaders[index]?.toLowerCase() === 'host') lines += 1;
+  }
+  if (lines > 1) return true;
   const host = request.headers.host;
   return host !== undefined && parseHostHeader(host) === null;
 }

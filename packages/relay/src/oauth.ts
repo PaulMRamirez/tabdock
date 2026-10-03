@@ -33,9 +33,6 @@ import {
   createLocalJWKSet,
   createRemoteJWKSet,
   errors,
-  type ExportedJWKSCache,
-  type JWKSCacheInput,
-  jwksCache,
   type JWTPayload,
   type JWTVerifyGetKey,
   jwtVerify,
@@ -78,12 +75,6 @@ export const JWKS_TIMEOUT_MS = 5000;
  * would be one more fetch at a provider already in trouble.
  */
 export const JWKS_RETRY_MS = 5000;
-/**
- * While fetches fail, the last key set fetched still checks tokens until it
- * is this old: long enough to ride out an outage, short enough that a key the
- * provider withdrew does not stay trusted for long.
- */
-export const STALE_KEYS_MAX_AGE_MS = 30 * 60_000;
 /** Small: enough for clocks a little apart, never enough to stretch a token's life. */
 export const CLOCK_TOLERANCE_SECONDS = 5;
 /** Provider tokens are a kilobyte or two; past this, a header is not a token. */
@@ -435,33 +426,18 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
       // The SDK's own checks on the issuer, once now rather than on the first request.
       buildOAuthProtectedResourceMetadata(metadataOptions);
 
-      // jose writes the last key set it fetched here, with when it did; it
-      // starts empty, which jose's own type allows only as Record<string, never>.
-      const fetched: Partial<ExportedJWKSCache> = {};
       const jwks = createRemoteJWKSet(new URL(metadata.jwks_uri), {
         timeoutDuration: JWKS_TIMEOUT_MS,
-        [jwksCache]: fetched as JWKSCacheInput,
       });
       let failedAt = Number.NEGATIVE_INFINITY;
-      let lastGood: { fetchedAt: number; keys: JWTVerifyGetKey } | null = null;
-      /** The last key set fetched, while it is young enough to stand in for the provider's. */
-      const standIn = (now: number): JWTVerifyGetKey | null => {
-        const { uat, jwks: set } = fetched;
-        if (uat === undefined || set === undefined || now - uat > STALE_KEYS_MAX_AGE_MS) {
-          return null;
-        }
-        if (lastGood?.fetchedAt !== uat) {
-          lastGood = { fetchedAt: uat, keys: createLocalJWKSet(set) };
-        }
-        return lastGood.keys;
-      };
       // A key that is not published is the token's fault (401); keys that
       // cannot be fetched at all are the provider's (503).
       const keys: JWTVerifyGetKey = async (header, token) => {
-        const sinceFailure = Date.now() - failedAt;
+        const now = Date.now();
+        // A clock set back restarts the wait rather than ending it.
+        if (now < failedAt) failedAt = now;
         let cause: unknown;
-        // A clock set back counts as still waiting, never as a reason to fetch.
-        if (!(sinceFailure >= 0 && sinceFailure < JWKS_RETRY_MS)) {
+        if (now - failedAt >= JWKS_RETRY_MS) {
           try {
             return await jwks(header, token);
           } catch (error) {
@@ -476,14 +452,16 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
             cause = error;
           }
         }
-        const stale = standIn(Date.now());
-        if (stale !== null) {
+        // While a fetch waits, keys jose still holds as fresh check tokens with
+        // no fetch at all, so nothing is trusted longer than jose would trust it.
+        const held = jwks.fresh ? jwks.jwks() : undefined;
+        if (held !== undefined) {
           try {
-            return await stale(header, token);
+            return await createLocalJWKSet(held)(header, token);
           } catch (error) {
             if (error instanceof errors.JWKSMultipleMatchingKeys) throw error;
-            // A key missing from the old set may have been published since; that
-            // is for the provider to answer once it is back, so not a 401.
+            // A key the held set lacks may have been published since; that is
+            // for the provider to answer once it is back, so not a 401.
             cause = error;
           }
         }
