@@ -3,7 +3,8 @@
 // explicit origin allowlist in production (S2). Public URL mode (ADR 0014) puts
 // an https address in front of the loopback relay through a tunnel: it brings
 // production rules, and only OAuth sign-in for that address. The section 9
-// limits and the session and attachment lifetimes follow ADR 0009.
+// limits and the session and attachment lifetimes follow ADR 0009. The M3
+// spike's measurement flag (ADR 0014) is refused in production.
 
 import {
   ATTACH_REQUEST_TTL_MS,
@@ -138,6 +139,14 @@ export interface RelayOptions {
   logLevel?: LogLevel | undefined;
   /** Storage; in memory when absent. M4 swaps in a persistent audit log here. */
   store?: RelayStore | undefined;
+  /**
+   * The M3 spike's measurements (ADR 0014, A3.3), off by default and refused
+   * in production: a marker tool that can be added beside the five fixed tools
+   * and announced to open sessions, a log line for every tools/list and every
+   * stream a client opens, timestamps for each call_page_tool, and pairing
+   * milestones. See spike.ts.
+   */
+  spike?: boolean | undefined;
 }
 
 export const DEFAULT_HOST = '127.0.0.1';
@@ -218,6 +227,8 @@ export interface ResolvedConfig {
   timings: RelayTimings;
   rateLimits: RelayRateLimits;
   limits: RelayLimits;
+  /** The spike's measurements are on (never in production). */
+  spike: boolean;
 }
 
 const DEV_ORIGIN_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
@@ -282,6 +293,16 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
   // Checked at run time too: JavaScript callers and env parsing can pass anything.
   if (!(['development', 'production'] as const).includes(env)) {
     throw new Error('env must be development or production');
+  }
+  // The spike changes what clients see (a sixth tool) and logs every list and
+  // stream, which is for measuring, never for serving people (ADR 0014). It is
+  // allowed in public URL mode, since hosted Claude is what it measures.
+  // Only true turns it on, so a stray value from JavaScript leaves it off.
+  const spike = options.spike === true;
+  if (spike && env === 'production') {
+    throw new Error(
+      'spike (TABDOCK_SPIKE) is the M3 spike measurement flag; production refuses to start with it (ADR 0014)',
+    );
   }
   const host = options.host ?? DEFAULT_HOST;
   if (!isLoopbackHost(host)) {
@@ -377,6 +398,7 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     timings,
     rateLimits: positiveIntegers(DEFAULT_RATE_LIMITS, options.rateLimits),
     limits: positiveIntegers(DEFAULT_LIMITS, options.limits),
+    spike,
   };
 }
 
@@ -510,6 +532,7 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv): RelayOptions {
     env: envName === '' ? 'development' : envName,
     allowedOrigins,
     allowMissingOrigin: parseFlag('TABDOCK_DEV_ALLOW_NO_ORIGIN', env.TABDOCK_DEV_ALLOW_NO_ORIGIN),
+    spike: parseFlag('TABDOCK_SPIKE', env.TABDOCK_SPIKE),
     timings: {
       sessionIdleMs: parseMinutes('TABDOCK_SESSION_IDLE_MINUTES', env.TABDOCK_SESSION_IDLE_MINUTES),
       attachmentIdleMs: parseMinutes(

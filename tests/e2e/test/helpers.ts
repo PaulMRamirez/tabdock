@@ -59,6 +59,8 @@ export interface WorldOptions {
   timings?: RelayOptions['timings'];
   limits?: RelayOptions['limits'];
   rateLimits?: RelayOptions['rateLimits'];
+  /** The M3 spike's measurements (ADR 0014); off unless a test asks. */
+  spike?: boolean;
 }
 
 export async function startWorld(options: WorldOptions = {}): Promise<World> {
@@ -77,6 +79,7 @@ export async function startWorld(options: WorldOptions = {}): Promise<World> {
     timings: options.timings,
     limits: options.limits,
     rateLimits: options.rateLimits,
+    spike: options.spike,
   });
   const pages: SimPage[] = [];
   const clients: Client[] = [];

@@ -8,7 +8,9 @@
 // documents (ADR 0009): 2025-era traffic goes to the sessionful leg in
 // sessions.ts, everything else to a strict 2026-07-28 handler. In public URL
 // mode (ADR 0014) the public host passes the Host check for /mcp, while /page
-// still takes only requests made on this machine.
+// still takes only requests made on this machine. The M3 spike's measurements
+// (spike.ts) hook in here when TABDOCK_SPIKE is on; nothing over HTTP controls
+// them.
 
 import { createServer, type IncomingMessage, type ServerResponse, STATUS_CODES } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -33,6 +35,7 @@ import { PageHub } from './hub.ts';
 import { createLogger } from './log.ts';
 import { type AuthExtra, createMcpFactory, userIdOf } from './mcp.ts';
 import { McpSessions } from './sessions.ts';
+import { Spike, type SpikeControl } from './spike.ts';
 import { type AuditRecord, createMemoryStore } from './store.ts';
 
 export interface Relay {
@@ -47,6 +50,11 @@ export interface Relay {
   /** `<publicUrl>/mcp`, the connector URL, in public URL mode; else null. */
   readonly publicMcpUrl: string | null;
   readonly audit: { records(): AuditRecord[] };
+  /**
+   * The spike's marker control while TABDOCK_SPIKE is on, else null. Reached
+   * from the relay's own process only (main.ts reads it from stdin).
+   */
+  readonly spike: SpikeControl | null;
   close(): Promise<void>;
 }
 
@@ -124,9 +132,10 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   // provider Claude could not sign in with, say) stops the relay from starting.
   await auth.start?.();
   const store = options.store ?? createMemoryStore();
-  const hub = new PageHub(config, store, log);
+  const spike = config.spike ? new Spike(log, MAX_MCP_BODY_BYTES) : null;
+  const hub = new PageHub(config, store, log, spike);
 
-  const factory = createMcpFactory(hub, config);
+  const factory = createMcpFactory(hub, config, spike);
   const mcp = createMcpHandler(factory, {
     legacy: 'reject',
     maxRequestBodySize: MAX_MCP_BODY_BYTES,
@@ -134,6 +143,9 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     onerror: (error) => {
       log.warn('mcp handler error', { error });
     },
+  });
+  spike?.setModernNotifier(() => {
+    mcp.notify.toolsChanged();
   });
   const sessions = new McpSessions({
     createServer: (authInfo, request) => factory({ era: 'legacy', authInfo, requestInfo: request }),
@@ -146,10 +158,17 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     log,
   });
   const legs = {
-    fetch: async (request: Request, options?: McpHandlerRequestOptions): Promise<Response> =>
-      (await isLegacyRequest(request, undefined, { maxRequestBodySize: MAX_MCP_BODY_BYTES }))
-        ? sessions.handle(request, options?.authInfo)
-        : mcp.fetch(request, options),
+    fetch: async (request: Request, options?: McpHandlerRequestOptions): Promise<Response> => {
+      const legacy = await isLegacyRequest(request, undefined, {
+        maxRequestBodySize: MAX_MCP_BODY_BYTES,
+      });
+      const forward = (forwarded: Request): Promise<Response> =>
+        legacy ? sessions.handle(forwarded, options?.authInfo) : mcp.fetch(forwarded, options);
+      const userId = userIdOf(options?.authInfo);
+      return spike && userId !== null
+        ? spike.observe(request, { userId, legacy }, forward)
+        : forward(request);
+    },
   };
   const mcpNode = toNodeHandler(legs, {
     maxRequestBodySize: MAX_MCP_BODY_BYTES,
@@ -192,6 +211,8 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   }
 
   async function handleMcp(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    // Where the spike's call timestamps start: before the Host check, sign-in and the SDK.
+    const receivedAt = performance.now();
     if (config.loopback && !validateHost(request, response)) return;
     const outcome = await authenticate(request, response);
     if (outcome === null) return;
@@ -217,7 +238,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       token: '',
       clientId: outcome.user.userId,
       scopes: [],
-      extra: { ...extra },
+      extra: { ...extra, ...(spike ? { receivedAt } : {}) },
     };
     // toNodeHandler forwards req.auth as authInfo. IncomingMessage needs the cast
     // under exactOptionalPropertyTypes (method is string | undefined there).
@@ -353,7 +374,13 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     auth: auth.name,
     origins: config.originPolicy,
     allowMissingOrigin: config.allowMissingOrigin,
+    spike: config.spike,
   });
+  if (spike) {
+    log.warn(
+      'spike measurements are on (TABDOCK_SPIKE): every tools/list, client stream, call timing and pairing milestone is logged, and a marker tool can be added from the terminal (ADR 0014)',
+    );
+  }
 
   let closing: Promise<void> | null = null;
   return {
@@ -363,6 +390,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     publicUrl: config.publicUrl,
     publicMcpUrl: config.publicMcpUrl,
     audit: { records: () => store.audit.records() },
+    spike,
     close() {
       closing ??= (async () => {
         await hub.shutdown();

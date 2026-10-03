@@ -34,6 +34,16 @@ export {
 } from './oauth.ts';
 export { createRelay, type Relay } from './relay.ts';
 export {
+  attachSpikeConsole,
+  type MarkerChange,
+  markerToolName,
+  SPIKE_CONSOLE_HELP,
+  SPIKE_TIMING_META_KEY,
+  type SpikeControl,
+  type SpikeTiming,
+  SpikeTimingSchema,
+} from './spike.ts';
+export {
   type AttachmentRecord,
   type AttachmentStore,
   type AttachRequestRecord,

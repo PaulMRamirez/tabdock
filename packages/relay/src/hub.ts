@@ -50,6 +50,7 @@ import {
   normalisePairingCode,
   sameDigest,
 } from './secrets.ts';
+import type { CallMarks, SpikeHooks } from './spike.ts';
 import type {
   AttachmentRecord,
   AttachRequestRecord,
@@ -141,6 +142,8 @@ interface PendingCall {
   checking: boolean;
   /** The socket its invoke went out on; null while it waits in the queue. */
   conn: Conn | null;
+  /** Filled in for the spike's timing (spike.ts); null otherwise. */
+  marks: CallMarks | null;
   timer: NodeJS.Timeout | null;
   done: boolean;
   settle: (outcome: CallOutcome) => void;
@@ -536,12 +539,20 @@ export class PageHub {
   readonly #callLimiter: SlidingWindowLimiter;
   /** Tools frames per remote address, shared by its sockets and kept across reconnects. */
   readonly #toolsFrameLimiter: SlidingWindowLimiter;
+  /** The M3 spike's pairing milestones (spike.ts), when TABDOCK_SPIKE is on. */
+  readonly #spike: SpikeHooks | null;
   #closed = false;
 
-  constructor(config: ResolvedConfig, store: RelayStore, log: Logger) {
+  constructor(
+    config: ResolvedConfig,
+    store: RelayStore,
+    log: Logger,
+    spike: SpikeHooks | null = null,
+  ) {
     this.#config = config;
     this.#store = store;
     this.#log = log;
+    this.#spike = spike;
     const {
       pairAttemptsPerUser,
       pairAttemptsPerAddress,
@@ -1115,6 +1126,7 @@ export class PageHub {
     this.#setTimer(this.#pairingTimers, pageId, pairingTtlMs, () => {
       this.#rotateTicket(pageId, 'expired');
     });
+    this.#spike?.pairingIssued(pageId);
     return { code: formatPairingCode(code), expiresAt };
   }
 
@@ -1160,6 +1172,7 @@ export class PageHub {
     }
     if (!frame.allow) {
       this.#log.info('attach request denied', { pageId, userId: request.userId });
+      this.#spike?.pairingDecided(pageId, request.userId, false);
       this.#endRequest(request.requestId, {
         kind: 'error',
         code: 'denied_by_operator',
@@ -1172,10 +1185,12 @@ export class PageHub {
         pageId,
         userId: request.userId,
       });
+      this.#spike?.pairingDecided(pageId, request.userId, false);
       this.#endRequest(request.requestId, this.#pageFullError('filled up meanwhile and has'));
       return;
     }
     const attachment = this.#grant(request, frame.role ?? 'observer');
+    this.#spike?.pairingDecided(pageId, request.userId, true);
     const page = this.#store.pages.get(pageId);
     this.#endRequest(request.requestId, {
       kind: 'attached',
@@ -1370,6 +1385,7 @@ export class PageHub {
       this.#log.debug('ignored a late or unknown result', { pageId });
       return;
     }
+    if (call.marks) call.marks.resultIn = performance.now();
     const origin = conn.origin;
     if (frame.ok) {
       call.settle({ kind: 'ok', origin, content: frame.content ?? '' });
@@ -1532,6 +1548,7 @@ export class PageHub {
       };
     }
 
+    this.#spike?.pairingClaimed(page.pageId, caller.userId, 'code');
     const request = {
       pageId: page.pageId,
       userId: caller.userId,
@@ -1575,6 +1592,7 @@ export class PageHub {
 
     if (page.policy.autoApprove === 'observer') {
       const attachment = this.#grant(request, 'observer');
+      this.#spike?.pairingDecided(page.pageId, caller.userId, true);
       return {
         kind: 'attached',
         pageId: page.pageId,
@@ -1598,6 +1616,7 @@ export class PageHub {
         pageId: record.pageId,
         userId: record.userId,
       });
+      this.#spike?.pairingDecided(record.pageId, record.userId, false);
       this.#endRequest(record.requestId, {
         kind: 'error',
         code: 'timeout',
@@ -1662,11 +1681,12 @@ export class PageHub {
     tool: string,
     args: JsonObject,
     signal: AbortSignal,
+    marks: CallMarks | null = null,
   ): Promise<CallOutcome> {
     const started = Date.now();
     let auditOutcome: AuditOutcome = 'relay_error';
     try {
-      const outcome = await this.#call(caller, pageId, tool, args, signal);
+      const outcome = await this.#call(caller, pageId, tool, args, signal, marks);
       auditOutcome = outcome.kind === 'error' ? outcome.code : outcome.kind;
       return outcome;
     } catch (error) {
@@ -1688,6 +1708,7 @@ export class PageHub {
       this.#store.audit.append(record);
       // Arguments are never part of the record (S7), and the logger redacts them anyway.
       this.#log.info('call', { audit: record });
+      this.#spike?.callFinished(pageId, caller.userId, auditOutcome);
     }
   }
 
@@ -1706,6 +1727,7 @@ export class PageHub {
     toolName: string,
     args: JsonObject,
     signal: AbortSignal,
+    marks: CallMarks | null,
   ): Promise<CallOutcome> {
     const arrivedAt = Date.now();
     const access = this.#access(caller.userId, pageId);
@@ -1749,6 +1771,7 @@ export class PageHub {
       waited: false,
       checking: false,
       conn: null,
+      marks,
       timer: null,
       done: false,
       settle: () => undefined,
@@ -2070,6 +2093,7 @@ export class PageHub {
     call.conn = conn;
     conn.inflight.set(call.callId, call);
     this.#armCallTimer(call);
+    if (call.marks) call.marks.invokeOut = performance.now();
     conn.ws.send(encoded.text);
     return true;
   }
