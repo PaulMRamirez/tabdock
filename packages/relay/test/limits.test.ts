@@ -87,8 +87,21 @@ describe('ADR 0009 defaults', () => {
       pageSocketsPerAddress: 20,
       pageSessionsPerAddress: 20,
       pageSessions: 1000,
+      pairSessions: 200,
+      pairSignInsInFlight: 8,
     });
     expect(DEFAULT_RATE_LIMITS.callsPerUserPerPage).toBe(120);
+    // Pairing counts per user and per page, never per address (S3, ADR 0016).
+    expect(DEFAULT_RATE_LIMITS.pairAttemptsPerUser).toBe(10);
+    expect(DEFAULT_RATE_LIMITS.pairAttemptsPerPage).toBe(30);
+    // Sign-ins at /pair/callback count for the whole relay, which every caller shares.
+    expect(DEFAULT_RATE_LIMITS.pairSignIns).toBe(60);
+    expect(Object.keys(DEFAULT_RATE_LIMITS).filter((key) => key.startsWith('pair'))).toEqual([
+      'pairAttemptsPerUser',
+      'pairAttemptsPerPage',
+      'pairPreviewsPerNonce',
+      'pairSignIns',
+    ]);
     expect(DEFAULT_RATE_LIMITS.windowMs).toBe(60_000);
     expect(DEFAULT_RATE_LIMITS.toolsFramesPerSocket).toBe(10);
     expect(DEFAULT_RATE_LIMITS.toolsFramesPerAddress).toBe(30);

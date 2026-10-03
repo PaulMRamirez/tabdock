@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage } from 'node:http';
 import { DEFAULT_CALL_DEADLINE_MS } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
-import { isLoopbackHost, MAX_TIMER_MS, resolveConfig } from '../src/config.ts';
+import { isLoopbackHost, MAX_TIMER_MS, parseHostHeader, resolveConfig } from '../src/config.ts';
 import {
   createDevTokenAuth,
   createRelay,
@@ -47,6 +47,47 @@ describe('host binding (S12)', () => {
   it.each(['127.0.0.1', 'localhost', '::1', '[::1]', 'LOCALHOST'])('accepts %s', (host) => {
     expect(isLoopbackHost(host)).toBe(true);
     expect(resolveConfig({ auth, host }).host).toBe(host);
+  });
+});
+
+describe('Host headers (RFC 9110)', () => {
+  it.each<[string, string]>([
+    ['localhost', 'localhost'],
+    ['LocalHost:8787', 'localhost'],
+    ['127.0.0.1:0', '127.0.0.1'],
+    ['[::1]', '[::1]'],
+    ['[::1]:65535', '[::1]'],
+    ['Relay.Example', 'relay.example'],
+    ['my_relay.example', 'my_relay.example'],
+    // Well formed, so read as written; an allowlist then refuses them.
+    ['2130706433', '2130706433'],
+    ['localhost.', 'localhost.'],
+  ])('reads %j as %j', (header, host) => {
+    expect(parseHostHeader(header)).toBe(host);
+  });
+
+  it.each([
+    '',
+    ':8787',
+    'localhost:',
+    'localhost:65536',
+    'localhost:123456',
+    'evil.example@localhost',
+    'u:p@localhost',
+    'localhost/evil',
+    'localhost?evil',
+    'localhost#evil',
+    'localhost\\evil',
+    'loc%61lhost',
+    'local host',
+    'localhost,evil.example',
+    '[::1',
+    '[localhost]',
+    '[::1%25eth0]',
+    '[v1.fe]',
+    'bücher.example',
+  ])('refuses %j, which is no host', (header) => {
+    expect(parseHostHeader(header)).toBeNull();
   });
 
   it('refuses before listening, and defaults to 127.0.0.1 on a free port', async () => {
@@ -160,11 +201,15 @@ describe('origin policy (S1, S2)', () => {
       pageSocketsPerAddress: 20,
       pageSessionsPerAddress: 20,
       pageSessions: 1000,
+      pairSessions: 200,
+      pairSignInsInFlight: 8,
     });
     expect(rateLimits.callsPerUserPerPage).toBe(120);
+    expect(rateLimits.pairSignIns).toBe(60);
     expect(timings.sessionIdleMs).toBe(30 * 60_000);
     expect(timings.attachmentIdleMs).toBe(8 * 60 * 60_000);
     expect(timings.sseKeepAliveMs).toBe(15_000);
+    expect(timings.pairSessionMs).toBe(15 * 60_000);
     expect(resolveConfig({ auth, limits: { usersPerPage: 3 } }).limits.usersPerPage).toBe(3);
     expect(() => resolveConfig({ auth, limits: { queueDepth: 0 } })).toThrow(/queueDepth/);
     expect(() => resolveConfig({ auth, limits: { sessions: 2.5 } })).toThrow(/sessions/);
@@ -258,6 +303,8 @@ describe('loadConfigFromEnv', () => {
       TABDOCK_MAX_PAGE_SESSIONS_PER_ADDRESS: '6',
       TABDOCK_MAX_PAGE_SESSIONS: '30',
       TABDOCK_MAX_CALLS_PER_MINUTE: '60',
+      TABDOCK_MAX_PAIR_SIGNINS_PER_MINUTE: '20',
+      TABDOCK_MAX_PAIR_SIGNINS_IN_FLIGHT: '4',
       TABDOCK_SESSION_IDLE_MINUTES: '10',
       TABDOCK_ATTACHMENT_IDLE_MINUTES: '120',
     });
@@ -270,19 +317,26 @@ describe('loadConfigFromEnv', () => {
       pageSocketsPerAddress: 3,
       pageSessionsPerAddress: 6,
       pageSessions: 30,
+      pairSessions: 200,
+      pairSignInsInFlight: 4,
     });
     expect(config.rateLimits.callsPerUserPerPage).toBe(60);
+    expect(config.rateLimits.pairSignIns).toBe(20);
     expect(config.timings.sessionIdleMs).toBe(10 * 60_000);
     expect(config.timings.attachmentIdleMs).toBe(120 * 60_000);
     const defaults = resolveConfig(
       loadConfigFromEnv({ TABDOCK_DEV_TOKENS: tokens, TABDOCK_MAX_QUEUE_DEPTH: '' }),
     );
     expect(defaults.limits.queueDepth).toBe(32);
+    expect(defaults.limits.pairSignInsInFlight).toBe(8);
+    expect(defaults.rateLimits.pairSignIns).toBe(60);
     expect(defaults.timings.attachmentIdleMs).toBe(8 * 60 * 60_000);
     for (const [name, value] of [
       ['TABDOCK_MAX_QUEUE_DEPTH', '0'],
       ['TABDOCK_MAX_USERS_PER_PAGE', 'ten'],
       ['TABDOCK_MAX_CALLS_PER_MINUTE', '1.5'],
+      ['TABDOCK_MAX_PAIR_SIGNINS_PER_MINUTE', '0'],
+      ['TABDOCK_MAX_PAIR_SIGNINS_IN_FLIGHT', 'eight'],
       ['TABDOCK_SESSION_IDLE_MINUTES', '-3'],
       ['TABDOCK_ATTACHMENT_IDLE_MINUTES', '99999'],
     ] as const) {
@@ -377,12 +431,12 @@ describe('dev-token auth', () => {
       { userId: 'bob', displayName: 'Bob', token: 'b'.repeat(40) },
     ]);
     expect(await two.authenticate(requestWith(`Bearer ${TOKEN}`))).toEqual({
-      userId: 'alice',
-      displayName: 'Alice',
+      kind: 'user',
+      user: { userId: 'alice', displayName: 'Alice' },
     });
     expect(await two.authenticate(requestWith(`bearer ${'b'.repeat(40)}`))).toEqual({
-      userId: 'bob',
-      displayName: 'Bob',
+      kind: 'user',
+      user: { userId: 'bob', displayName: 'Bob' },
     });
     for (const header of [
       undefined,
@@ -394,7 +448,14 @@ describe('dev-token auth', () => {
       `Bearer ${TOKEN} extra`,
       `Bearer ${'k'.repeat(5000)}`,
     ]) {
-      expect(await two.authenticate(requestWith(header)), String(header)).toBeNull();
+      // The same refusal as since M1: a 401 that names no metadata, since dev tokens need no sign-in.
+      expect(await two.authenticate(requestWith(header)), String(header)).toEqual({
+        kind: 'refused',
+        status: 401,
+        reason: 'no valid dev token',
+        body: 'Unauthorized',
+        headers: { 'WWW-Authenticate': 'Bearer realm="tabdock"' },
+      });
     }
   });
 });

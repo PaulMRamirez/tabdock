@@ -63,7 +63,7 @@ function sessionNotFound(): Response {
  * failed, or been abandoned by the client (the request's signal aborts when
  * the Node response closes early).
  */
-function trackBody(response: Response, signal: AbortSignal, done: () => void): Response {
+export function trackBody(response: Response, signal: AbortSignal, done: () => void): Response {
   let finished = false;
   const finish = (): void => {
     if (finished) return;

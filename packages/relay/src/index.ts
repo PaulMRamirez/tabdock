@@ -1,5 +1,11 @@
 export {
+  type Account,
+  type AuthOutcome,
+  AuthOutcomeSchema,
   type AuthPlugin,
+  type AuthRefusal,
+  type AuthRoute,
+  type BrowserSignIn,
   createDevTokenAuth,
   type DevTokenUser,
   MIN_DEV_TOKEN_LENGTH,
@@ -12,6 +18,10 @@ export {
   DEFAULT_TIMINGS,
   loadConfigFromEnv,
   NO_ORIGIN,
+  type PairClientOptions,
+  pairRedirectUriOf,
+  parsePublicUrl,
+  publicMcpUrlOf,
   type RelayEnv,
   type RelayLimits,
   type RelayOptions,
@@ -19,7 +29,25 @@ export {
   type RelayTimings,
 } from './config.ts';
 export { createLogger, type Logger, type LogLevel, type LogSink, redact } from './log.ts';
+export {
+  CLOCK_TOLERANCE_SECONDS,
+  createOAuthAuth,
+  type OAuthAuthOptions,
+  type OAuthUser,
+  parseOAuthUsers,
+} from './oauth.ts';
+export { LOGIN_COOKIE, PAIR_ROUTES, SESSION_COOKIE } from './pair.ts';
 export { createRelay, type Relay } from './relay.ts';
+export {
+  attachSpikeConsole,
+  type MarkerChange,
+  markerToolName,
+  SPIKE_CONSOLE_HELP,
+  SPIKE_TIMING_META_KEY,
+  type SpikeControl,
+  type SpikeTiming,
+  SpikeTimingSchema,
+} from './spike.ts';
 export {
   type AttachmentRecord,
   type AttachmentStore,
@@ -35,5 +63,8 @@ export {
   type PageStore,
   type PairingTicketRecord,
   type RelayStore,
+  type SingleUseKind,
+  type SingleUseTicketRecord,
+  type SingleUseTicketStore,
   type TicketStore,
 } from './store.ts';

@@ -16,3 +16,7 @@ Short records of decisions that change or refine `SPEC.md`, or that a future con
 | [0010](0010-bounded-argument-checks.md)          | The argument check runs off the main thread with a time limit | Accepted |
 | [0011](0011-one-approval-per-page.md)            | One approval covers one page                                  | Accepted |
 | [0012](0012-contract-clarifications-m2.md)       | Contract clarifications from the M2 review                    | Accepted |
+| [0013](0013-oauth-shape-m3.md)                   | OAuth in M3: WorkOS issues tokens, the relay checks them      | Accepted |
+| [0014](0014-public-url-mode.md)                  | Public URL mode for the M3 spike                              | Accepted |
+| [0015](0015-refresh-spec-m3.md)                  | Refresh SPEC sections 3 and 12 with the facts verified for M3 | Accepted |
+| [0016](0016-invites-and-guest-access.md)         | Invites and guest access                                      | Accepted |

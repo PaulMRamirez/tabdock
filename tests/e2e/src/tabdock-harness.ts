@@ -192,6 +192,7 @@ export async function approveThroughHandle(
 
 interface DomNode {
   backendNodeId: number;
+  localName?: string;
   attributes?: string[];
   children?: DomNode[];
   shadowRoots?: DomNode[];
@@ -434,4 +435,22 @@ export async function widgetItems(page: Page, role: string): Promise<WidgetItem[
 /** The demo page's own activity strip, newest first. */
 export async function activityStrip(page: Page): Promise<string[]> {
   return page.locator('[data-role="log"] li').allTextContents();
+}
+
+/**
+ * The widget's QR drawing as the operator sees it: the svg's viewBox and its
+ * one path, read through the DevTools protocol; null while there is none.
+ */
+export async function widgetQrDrawing(
+  page: Page,
+): Promise<{ viewBox: string | null; d: string | null } | null> {
+  return withCdp(page, async (cdp) => {
+    const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
+    const box = findNode(root, (n) => attribute(n, 'data-role') === 'pairing-qr');
+    const svg = box?.children?.find((child) => child.localName === 'svg');
+    // By name, as the light ground is drawn before it.
+    const path = svg?.children?.find((child) => child.localName === 'path');
+    if (!svg || !path) return null;
+    return { viewBox: attribute(svg, 'viewBox') ?? null, d: attribute(path, 'd') ?? null };
+  });
 }

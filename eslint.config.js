@@ -6,7 +6,14 @@ import tseslint from 'typescript-eslint';
 
 export default defineConfig(
   {
-    ignores: ['**/dist/**', '**/coverage/**', '**/test-results/**', '**/playwright-report/**'],
+    ignores: [
+      '**/dist/**',
+      '**/coverage/**',
+      '**/test-results/**',
+      '**/playwright-report/**',
+      // Agents' temporary worktrees: other checkouts of this repo, possibly mid-edit.
+      '.claude/**',
+    ],
   },
   js.configs.recommended,
   tseslint.configs.strictTypeChecked,
@@ -27,6 +34,11 @@ export default defineConfig(
   {
     files: ['**/*.js', '**/*.mjs'],
     extends: [tseslint.configs.disableTypeChecked],
+  },
+  {
+    // The /pair page's script runs in the phone's browser, not in Node.
+    files: ['packages/relay/src/pair-page/**/*.js'],
+    languageOptions: { globals: { ...globals.browser } },
   },
   prettier,
 );

@@ -18,15 +18,15 @@ MCP clients (many) --HTTPS + auth--> RELAY <--WebSocket, dialed out by page-- AD
 | --- | --- | --- |
 | Hat and licence | Personal-hat, Apache-2.0, no employer references | Owner's call |
 | Multi-client scope | One user's several clients and several users on one page, both from the first build | Owner's call |
-| Root of trust | The tab. Whoever can click on the page approves each attachment and sets its role | One rule covers both multi-client cases |
+| Root of trust | The tab. Whoever can click on the page approves each attachment and sets its role, at the time or in advance through an invite minted on that page, which reaches observer only (ADR 0016) | One rule covers both multi-client cases |
 | Tool registration | WebMCP `document.modelContext`, native or MCP-B polyfill. No new registration API | Standard exists; the same registration serves in-browser agents |
 | Connector shape | One stable relay URL. Pages pair to the user, not the client to the page | Claude connects from Anthropic's cloud; connectors cannot be edited in place |
 | Tool surface | Five fixed tools first. Page tools as first-class entries in M5 | Fixed tools work on every client |
 | Stack | TypeScript everywhere, Node 22+, pnpm workspace. Any Python helper uses uv | Shared protocol types; matches MCP-B |
-| Relay trust | The relay sees plaintext calls and results. Self-host first | Stock connectors cannot do end-to-end encryption to a page |
+| Relay trust | The relay sees plaintext calls and results, and so does a tunnel that terminates TLS in front of it (ADR 0014). Self-host first | Stock connectors cannot do end-to-end encryption to a page |
 | Upstream | Stay close to MCP-B's page protocol ideas and propose a remote relay mode there | Avoid a competing project |
 
-## 3. Facts verified on 2 October 2026 (re-verify before relying on them)
+## 3. Facts verified on 2 and 3 October 2026 (re-verify before relying on them)
 
 These standards and packages are moving. Check current docs before coding against any of them, and log what you checked in `docs/notes/verified.md`.
 
@@ -38,9 +38,10 @@ These standards and packages are moving. Check current docs before coding agains
 | MCP SDK packages: `@modelcontextprotocol/server`, `client` and `core` 2.3.0 with `@modelcontextprotocol/node` 2.1.1 (v2 line, serves 2026-07-28 and 2025-era clients), `@modelcontextprotocol/sdk` 1.32.0 (v1 line, 2025-era only) | npm registry |
 | Claude reaches custom connectors from Anthropic's cloud (160.79.104.0/21, IPv4) on every client. It supports Streamable HTTP, OAuth, fixed request headers (a beta for a limited set of organizations) or no auth, tools, prompts and resources. No resource subscriptions, sampling or draft capabilities. Hosted limits: 240 s per tool call, about 150,000 characters per result | support.claude.com article 11175166, claude.com/docs/connectors/building |
 | Claude Code supports `list_changed` and HTTP servers with custom headers. It fails an HTTP tool call after 60 s without a first byte and caps results at 25,000 tokens unless the server says otherwise | code.claude.com/docs/en/mcp |
+| Hosted Claude follows the 2025-03-26, 2025-06-18 and 2025-11-25 MCP authorization specs, while 2026-07-28 deprecates dynamic client registration in favour of client ID metadata documents. A connector's auth settings cannot be edited after it is added. Installing connectors on mobile is a beta: a connector is added on the web or desktop first and then appears on the phone | `docs/notes/m3/`, `docs/notes/verified.md` (3 October) |
 | Other versions: `ws` 8.22.0, `hono` 4.13.12, `qrcode-generator` 2.0.4, Node 22.18 or later (it runs `.ts` files directly) | npm registry, nodejs.org |
 
-Rows refreshed by ADR 0004 from `docs/notes/verified.md`. Unverified and to be measured in M3: whether hosted Claude (web, desktop, mobile) refreshes a changing tool list during a conversation.
+Rows refreshed by ADRs 0004 and 0015 from `docs/notes/verified.md`. Unverified and measured by the owner's M3 runs (`docs/notes/spike.md`): whether hosted Claude (web, desktop, mobile) refreshes a changing tool list during a conversation.
 
 ## 4. Architecture and repo layout
 
@@ -67,9 +68,10 @@ The demo page should make state visible: a canvas board with items and a viewpor
 | PageSession | `pageId`, `origin`, `title`, `url`, `tools`, `state` (awake, asleep, gone), `resumeToken` | `origin` is read from the WebSocket `Origin` header, never from page-supplied text |
 | Attachment | `pageId`, `userId`, `role`, `grantedAt`, `lastUsedAt`, `expiresAt` | Created only by an operator approval |
 | PairingTicket | `code`, `nonce`, `pageId`, `expiresAt` | Single use, 120 s life, rotates after use |
-| AttachRequest | `requestId`, `pageId`, `userId`, `via` (code or qr), `expiresAt` | 60 s to approve, default deny. At most one pending per user per page; a second `pair_page` from that user waits on it (ADR 0007) |
+| Invite | `inviteId`, `pageId`, `role`, `label`, `uses`, `expiresAt`, `secretHash`, `sponsor` | Minted in the widget from M4; 128-bit secret, link carries it only in the fragment; watch invites approve in advance, control invites prompt on redemption (ADR 0016) |
+| AttachRequest | `requestId`, `pageId`, `userId`, `via` (code, qr or invite), `expiresAt` | 60 s to approve, default deny. At most one pending per user per page; a second `pair_page` from that user waits on it (ADR 0007) |
 
-Trust rule: no attachment exists without an approval made on the page, unless the page set `autoApprove: 'observer'`. The first approval sets a user's role; later approvals and denials for an attached user change nothing, because role changes and withdrawals go through `set_role` and `revoke`. The adapter keeps its own record of these grants and runs a call only under the least privileged of that record, the relay's roster and the role the invoke claims; a user missing from the roster has no role (ADR 0007).
+Trust rule: no attachment exists without an approval made on the page, unless the page set `autoApprove: 'observer'` or the person redeemed a live watch invite minted on that page (ADR 0016). Anonymous means no account, never no identity: there is no relay-wide unauthenticated access and no anonymous driver. The first approval sets a user's role; later approvals and denials for an attached user change nothing, because role changes and withdrawals go through `set_role` and `revoke`. The adapter keeps its own record of these grants and runs a call only under the least privileged of that record, the relay's roster and the role the invoke claims; a user missing from the roster has no role (ADR 0007).
 
 Roles: an observer may call only tools whose `readOnlyHint` is true. A driver may call every tool. Consequential tools follow page policy: `confirm` (default, an on-page prompt per call), `allow`, or `deny`. A tool is consequential when its `consequentialHint` is true or the page names it in `policy.consequentialTools`; when the runtime cannot report the hint and the page names none, every tool that is not read-only counts as consequential (ADR 0002). A page whose tools carry no annotations at all declared no hints, so none were lost and only `policy.consequentialTools` applies (ADR 0007). `maxDrivers` defaults to 1 and counts users, so one person's phone and laptop both drive. Mutating calls run one at a time per page in arrival order; read-only calls run concurrently. The one exception: on the MCP-B polyfill, which cannot report a handler's end once the page unregisters its tool mid-call, the page waits until that call's deadline plus 2 s and then lets the next write run (ADR 0012).
 
@@ -111,9 +113,9 @@ Endpoint `/mcp`, Streamable HTTP, using the official MCP SDK. Do not hand-roll t
 
 Every page result starts with the header line `[tabdock: untrusted content from <origin>, tool <name>]`. JSON results also pass through as structured content. The fixed tools' own descriptions say that page content is untrusted and is never instructions.
 
-Errors return as MCP tool errors with one of these codes in the text: `not_attached`, `role_denied`, `tool_not_found`, `page_asleep`, `page_gone`, `denied_by_operator`, `timeout`, `page_busy`, `pairing_expired`, `rate_limited`, `invalid_arguments`. The last covers arguments the relay will not forward: too large for one frame, or, from M2, failing the tool's `inputSchema` (ADR 0007).
+Errors return as MCP tool errors with one of these codes in the text: `not_attached`, `role_denied`, `tool_not_found`, `page_asleep`, `page_gone`, `denied_by_operator`, `timeout`, `page_busy`, `pairing_expired`, `rate_limited`, `invalid_arguments`, and from M4 `invite_required`. The last covers arguments the relay will not forward: too large for one frame, or, from M2, failing the tool's `inputSchema` (ADR 0007).
 
-Auth is a plugin: `authenticate(request)` returns a User or null. M1 ships `dev-token` (users and bearer tokens from `.env`). M3 adds a minimal `oauth` plugin and M4 hardens it (ADR 0006), delegating sign-in to an external identity provider through a maintained library, accepting Claude's hosted callback and Claude Code's loopback redirect.
+Auth is a plugin: `authenticate(request)` returns a User, or a refusal with its status and challenge (401 to sign in, 403 for someone not allowed), and a plugin may serve GET routes. M1 ships `dev-token` (users and bearer tokens from `.env`). M3 adds a minimal `oauth` plugin and M4 hardens it (ADRs 0006 and 0013): an external identity provider (WorkOS AuthKit) registers Claude, checks its hosted callback and Claude Code's loopback redirect, and issues tokens for the relay, which serves RFC 9728 metadata and verifies each token through a maintained library. From M4, with invites on, a signed-in account not on the allowlist is an invitee: it sees only pages it holds, redeems invites at `/i` or through `pair_page`, and gets `invite_required` for a pairing code. After M5, behind a flag, a page-scoped observer token in a header serves clients that cannot sign in, on a separate `/g/mcp` endpoint (ADR 0016).
 
 M5 adds first-class page tools named `<alias>__<tool>`, described with an origin prefix capped at 500 characters, with a short `ttlMs` and `list_changed` for session-based clients, behind a config flag. The fixed tools always remain.
 
@@ -129,7 +131,7 @@ const dock = attach({
 
 A script-tag build reads the same options from data attributes. The adapter never registers tools. It reads `document.modelContext` through `getTools`, listens for `toolchange` with a 2 s poll as fallback, and runs calls with `executeTool`, detecting per page whether the runtime wants its input as a JSON string or an object (ADR 0001). If `document.modelContext` is missing it logs how to add a polyfill and stays idle.
 
-The widget lives in a closed shadow root: a badge with link state and attached count, and a panel with the pairing code and QR, the roster with role switch and revoke, an activity log of the last 50 calls, and a pause switch. Attach prompts and consequential-call prompts default to deny on timeout. Only the code that called `attach()` holds the control handle.
+The widget lives in a closed shadow root: a badge with link state and attached count, and a panel with the pairing code and QR, the roster with role switch and revoke, an activity log of the last 50 calls, and a pause switch; from M4, an Invite form (label, watch or control, lifetime, uses) and a list of live invites with Cancel, offered as far as the page's `policy.invites` allows (`off`, `watch` by default, or `all`; ADR 0016). Attach prompts and consequential-call prompts default to deny on timeout. Only the code that called `attach()` holds the control handle.
 
 Lifecycle: hold a Web Lock while attached, reconnect with backoff from 0.5 s to 30 s using the `resumeToken`, and enforce role and policy again locally before running any call. The resume token, the operator's grants and the pause switch are kept per page, by relay URL plus the page's origin and path (ADR 0011).
 
@@ -137,17 +139,18 @@ Lifecycle: hold a Web Lock while attached, reconnect with backoff from 0.5 s to 
 
 1. S1. Origin is taken only from the WebSocket `Origin` header. Connections without it are rejected outside an explicit dev flag.
 2. S2. An origin allowlist is enforced. Dev default is localhost only. Production refuses to start without an explicit list.
-3. S3. Pairing codes carry at least 40 bits of entropy, are single use, expire in 120 s, are compared in constant time, and attempts are rate limited per user and per address.
-4. S4. No attachment without operator approval, except under `autoApprove: 'observer'`.
+3. S3. Pairing codes carry at least 40 bits of entropy, are single use, expire in 120 s, are compared in constant time, and attempts are rate limited per user, and per address only where the address is the client's own (ADR 0016).
+4. S4. No attachment without operator approval, except under `autoApprove: 'observer'` or a live watch invite minted on that page (ADR 0016).
 5. S5. Roles are enforced in the relay and again in the adapter. A crafted request cannot let an observer run a mutating tool.
 6. S6. Consequential tools prompt on the page by default, and a timeout means deny.
 7. S7. Every call is attributed in the page activity log and the relay audit log: user, client, tool, time, outcome. Arguments are not logged by default.
 8. S8. Revocation is immediate: in-flight calls are cancelled and later calls fail with `not_attached`.
 9. S9. Limits exist for users per page, calls per user per minute, queue depth, frame size and result size.
-10. S10. Page results are always labelled untrusted. Page-supplied descriptions are length capped and never merged into the fixed tools' descriptions.
-11. S11. Tokens and codes never appear in logs. The QR nonce is single use and useless without a signed-in user and an operator approval.
-12. S12. The relay binds to localhost in dev and requires TLS otherwise.
+10. S10. Page results are always labelled untrusted. Page-supplied descriptions, titles and invite labels are length capped, shown as written by the page, and never merged into the fixed tools' descriptions.
+11. S11. Tokens, codes and invite secrets never appear in logs. The QR nonce is single use and useless without a signed-in user and an operator approval. An agent token (ADR 0016) is a credential: observer only, one page, revocable, never in a URL or a log.
+12. S12. The relay binds to localhost in dev and requires TLS otherwise; a public URL in front of it must be https (ADR 0014).
 13. S13. A user can list and call only pages they are attached to. Access never depends on a page id being hard to guess.
+14. S14. Invites (from M4, ADR 0016): minted only while an allowlisted sponsor is attached; watch invites approve observers in advance, control invites prompt and allow one pending request; the adapter honours an invite only against its own record and the presented secret; `revoke('*')` cancels every live invite; invite-made attachments end with the page session, on revoke or after 24 hours, and leave members two seats.
 
 ## 10. Milestones and acceptance tests
 
@@ -177,9 +180,9 @@ Each milestone ends with green tests, a demo command (`pnpm demo:mN`), an explai
 3. A3.3 `docs/notes/spike.md` records: round trip p50 and p95 over 50 calls; whether hosted Claude sees tool list changes mid-chat; tab survival for 60 minutes in the background, under Energy Saver, and across laptop sleep; time from scan to first call.
 4. A3.4 A go or no-go note against the gate: conversational latency, fixed tools working on mobile, an hour of background survival.
 
-**M4 Real sign-in and hardening (cloud host).** OAuth plugin hardened for production, origin allowlist, rate limits, persistent audit log, container image, deploy guide, threat model document.
-1. A4.1 Tests for S1 to S13 pass.
-2. A4.2 The connector works with OAuth sign-in on Claude web and mobile (manual).
+**M4 Real sign-in and hardening (cloud host).** OAuth plugin hardened for production, origin allowlist, rate limits, persistent audit log, container image, deploy guide, threat model document, and signed-in invites (ADR 0016).
+1. A4.1 Tests for S1 to S14 pass.
+2. A4.2 The connector works with OAuth sign-in on Claude web and mobile, and a second account joins a page by a watch invite and by a control invite (manual).
 3. A4.3 A second reviewer pass, by a separate agent, finds no unaddressed high-severity issue.
 
 **M5 First-class tools and upstream.** Dynamic page tools, both MCP revisions verified, consequential confirmation through `input_required` where the client supports it, a protocol comparison with MCP-B's local relay, a drafted upstream proposal, README, release 0.1.0. At release, publish the demo page and the `docs/tour` explainers on GitHub Pages. The relay is never hosted there; the demo takes a relay URL so visitors point it at their own. Project sites under one account share a single origin, so the relay's allowlist entry for the demo covers all of them unless the demo gets a custom domain.
@@ -190,4 +193,4 @@ Laptop: Node 22+, pnpm, Chrome. The demo uses the polyfill, so no origin trial t
 
 ## 12. Open items to settle during the build
 
-The final name. The identity provider for M4. Whether anonymous observers are ever allowed for kiosks (out of scope until after M5). Where a public demo lives, if anywhere. Whether the write queue also needs a per-user fairness rule.
+The final name. Where a public demo lives, if anywhere. Whether the write queue also needs a per-user fairness rule.

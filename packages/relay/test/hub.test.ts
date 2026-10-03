@@ -51,26 +51,22 @@ async function bench(): Promise<Bench> {
   return { hub, page };
 }
 
-const alice = (address: string): CallerIdentity => ({
+/** Alice; each pairPage call stands for one more of her devices joining the same request. */
+const alice: CallerIdentity = {
   userId: ALICE.userId,
   displayName: ALICE.displayName,
   client: null,
-  address,
-});
+};
 
 describe('pair_page waiters on one attach request', () => {
   it('a joiner that stops waiting leaves the others waiting, and they still attach', async () => {
     const { hub, page } = await bench();
-    const first = hub.pairPage(alice('10.0.0.1'), page.code, new AbortController().signal);
+    const first = hub.pairPage(alice, page.code, new AbortController().signal);
     const request = await page.next('attach_request');
     const leaving = new AbortController();
-    const joined = hub.pairPage(
-      alice('10.0.0.2'),
-      (await page.next('pairing')).code,
-      leaving.signal,
-    );
+    const joined = hub.pairPage(alice, (await page.next('pairing')).code, leaving.signal);
     const staying = hub.pairPage(
-      alice('10.0.0.3'),
+      alice,
       (await page.next('pairing')).code,
       new AbortController().signal,
     );
@@ -88,11 +84,11 @@ describe('pair_page waiters on one attach request', () => {
 
   it('shutdown answers every waiter on a request, joiners included', async () => {
     const { hub, page } = await bench();
-    const waiting = [hub.pairPage(alice('10.0.0.1'), page.code, new AbortController().signal)];
+    const waiting = [hub.pairPage(alice, page.code, new AbortController().signal)];
     await page.next('attach_request');
     for (let n = 2; n <= 4; n += 1) {
       const code = (await page.next('pairing')).code;
-      waiting.push(hub.pairPage(alice(`10.0.0.${String(n)}`), code, new AbortController().signal));
+      waiting.push(hub.pairPage(alice, code, new AbortController().signal));
     }
     await page.next('pairing');
     await page.sync();

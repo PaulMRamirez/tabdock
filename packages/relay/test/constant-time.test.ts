@@ -39,7 +39,10 @@ describe('constant-time comparisons', () => {
     const request = {
       headers: { authorization: `Bearer ${users[1]?.token ?? ''}` },
     } as unknown as IncomingMessage;
-    expect(await auth.authenticate(request)).toEqual({ userId: 'b', displayName: 'b' });
+    expect(await auth.authenticate(request)).toEqual({
+      kind: 'user',
+      user: { userId: 'b', displayName: 'b' },
+    });
     // No early exit: the match is in the middle, yet all three digests were compared.
     expect(spy).toHaveBeenCalledTimes(3);
     for (const [a, b] of spy.mock.calls) {

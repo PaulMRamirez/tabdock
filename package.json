@@ -12,15 +12,19 @@
   "scripts": {
     "build": "pnpm -r --if-present build",
     "dev": "node scripts/dev.ts",
+    "dev:public": "node scripts/dev.ts --public",
     "dev:demo": "pnpm --filter @tabdock/demo dev",
     "lint": "eslint . && prettier --check .",
     "format": "prettier --write .",
-    "typecheck": "tsc -p tsconfig.json && pnpm -r --if-present typecheck",
+    "typecheck": "tsc -p tsconfig.json && tsc -p scripts/spike/tsconfig.json && pnpm -r --if-present typecheck",
     "test": "vitest run",
     "test:e2e": "pnpm --filter @tabdock/e2e test:e2e",
     "demo:m0": "pnpm --filter @tabdock/e2e demo:m0",
     "demo:m1": "pnpm --filter @tabdock/e2e demo:m1",
-    "demo:m2": "pnpm --filter @tabdock/e2e demo:m2"
+    "demo:m2": "pnpm --filter @tabdock/e2e demo:m2",
+    "demo:m3": "pnpm --filter @tabdock/e2e demo:m3",
+    "spike:latency": "node scripts/spike/latency.ts",
+    "spike:soak": "node scripts/spike/soak.ts"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

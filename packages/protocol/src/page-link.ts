@@ -3,6 +3,8 @@
 // these schemas; the TypeScript types are inferred from them, so the wire format
 // is defined exactly once.
 
+// First, before zod builds anything: no eval probe on Trusted Types pages.
+import './zod-config.ts';
 import { z } from 'zod';
 import { MAX_TOOLS_PER_PAGE, PROTOCOL_VERSION } from './constants.ts';
 

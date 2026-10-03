@@ -47,9 +47,12 @@ import {
   newId,
   newPairingCode,
   newResumeToken,
+  newSingleUseSecret,
   normalisePairingCode,
   sameDigest,
+  SINGLE_USE_SECRET_PATTERN,
 } from './secrets.ts';
+import type { CallMarks, SpikeHooks } from './spike.ts';
 import type {
   AttachmentRecord,
   AttachRequestRecord,
@@ -57,6 +60,7 @@ import type {
   PageRecord,
   PageState,
   RelayStore,
+  SingleUseTicketRecord,
 } from './store.ts';
 
 type FrameOf<T extends PageFrame['t']> = Extract<PageFrame, { t: T }>;
@@ -66,8 +70,6 @@ export interface CallerIdentity {
   userId: string;
   displayName: string;
   client: ClientInfo | null;
-  /** The HTTP peer address, for per-address rate limits. */
-  address: string;
 }
 
 export interface HubError {
@@ -78,6 +80,41 @@ export interface HubError {
 
 export type PairOutcome =
   { kind: 'attached'; pageId: string; origin: string; role: Role; existing: boolean } | HubError;
+
+/** What /pair shows for a live QR nonce before anyone claims it; looking uses nothing up. */
+export interface PairPreview {
+  /** From the page socket's Origin header (S1), never from the page's own words. */
+  origin: string;
+  /** Written by the page (S10): capped here, and shown as the page's own words. */
+  title: string;
+  titleCut: boolean;
+  /** The code the widget shows beside the QR code, for the person to compare. */
+  code: string;
+  expiresAt: number;
+}
+
+/**
+ * A QR claim: refused at once, or claimed, with `settled` resolving when the
+ * operator decides, the request runs out, or the page goes (ADR 0005's wait
+ * does not apply: the phone polls instead of holding a request open).
+ */
+export type ClaimOutcome =
+  HubError | { kind: 'claimed'; pageId: string; settled: Promise<PairOutcome> };
+
+/** A page title longer than this is cut before /pair shows it (S10). */
+export const MAX_PAIR_TITLE_CHARS = 120;
+
+const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
+/** The first `max` characters as people see them, so no emoji or accent is cut in half. */
+function firstCharacters(text: string, max: number): { text: string; cut: boolean } {
+  let count = 0;
+  for (const { index } of GRAPHEMES.segment(text)) {
+    if (count === max) return { text: text.slice(0, index), cut: true };
+    count += 1;
+  }
+  return { text, cut: false };
+}
 
 export interface PageListing {
   page: string;
@@ -141,6 +178,8 @@ interface PendingCall {
   checking: boolean;
   /** The socket its invoke went out on; null while it waits in the queue. */
   conn: Conn | null;
+  /** Filled in for the spike's timing (spike.ts); null otherwise. */
+  marks: CallMarks | null;
   timer: NodeJS.Timeout | null;
   done: boolean;
   settle: (outcome: CallOutcome) => void;
@@ -531,27 +570,45 @@ export class PageHub {
   readonly #callRosterAt = new Map<string, number>();
   /** A roster held back by the refresh step, so a new client still reaches the page. */
   readonly #rosterTimers = new Map<string, NodeJS.Timeout>();
+  /**
+   * Each page's current code as its widget shows it, kept in public URL mode
+   * only and in memory only, so /pair can show it beside the page's title; the
+   * store keeps nothing but its digest.
+   */
+  readonly #liveCodes = new Map<string, string>();
+  /**
+   * Pairing attempts are counted per user and per page, never per address:
+   * behind a tunnel every caller arrives from the same one (S3, ADR 0016).
+   */
   readonly #userLimiter: SlidingWindowLimiter;
-  readonly #addressLimiter: SlidingWindowLimiter;
+  readonly #pageLimiter: SlidingWindowLimiter;
   readonly #callLimiter: SlidingWindowLimiter;
   /** Tools frames per remote address, shared by its sockets and kept across reconnects. */
   readonly #toolsFrameLimiter: SlidingWindowLimiter;
+  /** The M3 spike's pairing milestones (spike.ts), when TABDOCK_SPIKE is on. */
+  readonly #spike: SpikeHooks | null;
   #closed = false;
 
-  constructor(config: ResolvedConfig, store: RelayStore, log: Logger) {
+  constructor(
+    config: ResolvedConfig,
+    store: RelayStore,
+    log: Logger,
+    spike: SpikeHooks | null = null,
+  ) {
     this.#config = config;
     this.#store = store;
     this.#log = log;
+    this.#spike = spike;
     const {
       pairAttemptsPerUser,
-      pairAttemptsPerAddress,
+      pairAttemptsPerPage,
       callsPerUserPerPage,
       windowMs,
       toolsFramesPerAddress,
       toolsFramesWindowMs,
     } = config.rateLimits;
     this.#userLimiter = new SlidingWindowLimiter(pairAttemptsPerUser, windowMs);
-    this.#addressLimiter = new SlidingWindowLimiter(pairAttemptsPerAddress, windowMs);
+    this.#pageLimiter = new SlidingWindowLimiter(pairAttemptsPerPage, windowMs);
     this.#callLimiter = new SlidingWindowLimiter(callsPerUserPerPage, windowMs);
     this.#toolsFrameLimiter = new SlidingWindowLimiter(toolsFramesPerAddress, toolsFramesWindowMs);
     this.#checker = new ArgumentChecker({ budgetMs: config.timings.argumentCheckMs, log });
@@ -1032,8 +1089,7 @@ export class PageHub {
     this.#asleep.add(pageId);
     const creator = this.#pageAddress.get(pageId);
     if (creator !== undefined) this.#sessionsByAddress.get(creator)?.asleep.add(pageId);
-    this.#store.tickets.deleteForPage(pageId);
-    this.#clearTimer(this.#pairingTimers, pageId);
+    this.#dropTicket(pageId);
     // The welcome on resume carries the roster as it is by then.
     this.#clearTimer(this.#rosterTimers, pageId);
     this.#dropRequests(pageId);
@@ -1110,23 +1166,81 @@ export class PageHub {
   #issueTicket(pageId: string): Pairing {
     const code = newPairingCode();
     const { pairingTtlMs } = this.#config.timings;
-    const expiresAt = Date.now() + pairingTtlMs;
+    const now = Date.now();
+    const expiresAt = now + pairingTtlMs;
     this.#store.tickets.put({ pageId, codeHash: digest(code), expiresAt });
     this.#setTimer(this.#pairingTimers, pageId, pairingTtlMs, () => {
       this.#rotateTicket(pageId, 'expired');
     });
-    return { code: formatPairingCode(code), expiresAt };
+    const shown = formatPairingCode(code);
+    const url = this.#issuePairNonce(pageId, shown, now, expiresAt);
+    // One milestone for the code and its nonce, which live and die together.
+    this.#spike?.pairingIssued(pageId);
+    return { code: shown, ...(url === null ? {} : { url }), expiresAt };
+  }
+
+  /**
+   * In public URL mode, a QR nonce beside the code (S11): 128 bits, bound to
+   * the page, single use, living exactly as long as the code and replaced with
+   * it. Its URL carries it in the fragment, which a browser never sends, so it
+   * reaches no server or tunnel log. Null, and no URL, otherwise.
+   */
+  #issuePairNonce(pageId: string, shown: string, now: number, expiresAt: number): string | null {
+    this.#store.singleUse.deleteForPage('pair', pageId);
+    const { publicUrl } = this.#config;
+    if (publicUrl === null) return null;
+    const nonce = newSingleUseSecret();
+    this.#store.singleUse.put({
+      kind: 'pair',
+      secretHash: digest(nonce),
+      pageId,
+      createdAt: now,
+      expiresAt,
+    });
+    this.#liveCodes.set(pageId, shown);
+    return `${publicUrl}/pair#${nonce}`;
+  }
+
+  /** The page has no live code or nonce any more, until its next welcome. */
+  #dropTicket(pageId: string): void {
+    this.#store.tickets.deleteForPage(pageId);
+    this.#store.singleUse.deleteForPage('pair', pageId);
+    this.#liveCodes.delete(pageId);
+    this.#clearTimer(this.#pairingTimers, pageId);
   }
 
   #rotateTicket(pageId: string, reason: string): void {
     const conn = this.#live.get(pageId);
     if (!conn || conn.closing) {
-      this.#store.tickets.deleteForPage(pageId);
-      this.#clearTimer(this.#pairingTimers, pageId);
+      this.#dropTicket(pageId);
       return;
     }
     this.#send(conn, { t: 'pairing', ...this.#issueTicket(pageId) });
     this.#log.debug('pairing code rotated', { pageId, reason });
+  }
+
+  /**
+   * A live QR nonce, found by its digest and confirmed in constant time, as
+   * codes are (S3). `take` removes it in the same step, so two claims racing
+   * for one nonce cannot both have it. Unknown, used and expired look alike.
+   */
+  #pairTicket(nonce: string, now: number, take: boolean): SingleUseTicketRecord | null {
+    if (!SINGLE_USE_SECRET_PATTERN.test(nonce)) return null;
+    const hash = digest(nonce);
+    const hashHex = hash.toString('hex');
+    const ticket = take
+      ? this.#store.singleUse.take('pair', hashHex)
+      : this.#store.singleUse.find('pair', hashHex);
+    if (!ticket || !sameDigest(ticket.secretHash, hash) || ticket.expiresAt <= now) return null;
+    return ticket;
+  }
+
+  /** The page and its socket, while it is awake and its socket is not closing. */
+  #livePage(pageId: string): { page: PageRecord; conn: Conn } | null {
+    const page = this.#store.pages.get(pageId);
+    const conn = this.#live.get(pageId);
+    if (page?.state !== 'awake' || !conn || conn.closing) return null;
+    return { page, conn };
   }
 
   /** Looks the code up by its hash, then confirms in constant time (S3). */
@@ -1160,6 +1274,7 @@ export class PageHub {
     }
     if (!frame.allow) {
       this.#log.info('attach request denied', { pageId, userId: request.userId });
+      this.#spike?.pairingDecided(pageId, request.userId, false);
       this.#endRequest(request.requestId, {
         kind: 'error',
         code: 'denied_by_operator',
@@ -1172,10 +1287,12 @@ export class PageHub {
         pageId,
         userId: request.userId,
       });
+      this.#spike?.pairingDecided(pageId, request.userId, false);
       this.#endRequest(request.requestId, this.#pageFullError('filled up meanwhile and has'));
       return;
     }
     const attachment = this.#grant(request, frame.role ?? 'observer');
+    this.#spike?.pairingDecided(pageId, request.userId, true);
     const page = this.#store.pages.get(pageId);
     this.#endRequest(request.requestId, {
       kind: 'attached',
@@ -1370,6 +1487,7 @@ export class PageHub {
       this.#log.debug('ignored a late or unknown result', { pageId });
       return;
     }
+    if (call.marks) call.marks.resultIn = performance.now();
     const origin = conn.origin;
     if (frame.ok) {
       call.settle({ kind: 'ok', origin, content: frame.content ?? '' });
@@ -1490,31 +1608,113 @@ export class PageHub {
 
   async pairPage(caller: CallerIdentity, code: string, signal: AbortSignal): Promise<PairOutcome> {
     const now = Date.now();
-    if (
-      !this.#userLimiter.allows(caller.userId, now) ||
-      !this.#addressLimiter.allows(caller.address, now)
-    ) {
-      this.#log.warn('pairing attempt rate limited', {
-        userId: caller.userId,
-        address: caller.address,
-      });
-      return hubError('rate_limited', 'too many pairing attempts; wait a minute and try again');
-    }
-    this.#userLimiter.record(caller.userId, now);
-    this.#addressLimiter.record(caller.address, now);
+    const limited = this.#pairingLimited(caller.userId, now);
+    if (limited) return limited;
 
     const normalised = normalisePairingCode(code);
     const pageId = normalised === null ? null : this.#matchTicket(normalised, now);
-    const page = pageId === null ? undefined : this.#store.pages.get(pageId);
-    const conn = pageId === null ? undefined : this.#live.get(pageId);
+    const live = pageId === null ? null : this.#livePage(pageId);
     // Wrong and expired look the same: telling them apart would confirm a code once existed.
-    if (!page || page.state !== 'awake' || !conn || conn.closing) {
+    if (!live) {
       this.#log.info('pairing refused: no live code matched', { userId: caller.userId });
       return hubError('pairing_expired', 'code is invalid or expired');
     }
+    const started = this.#startPairing(caller, live.page, live.conn, 'code', now);
+    return started.kind === 'pending' ? this.#waitForDecision(started.record, signal) : started;
+  }
 
-    // Single use: the matched code dies here and the page gets a fresh one.
+  /**
+   * What /pair shows for a QR nonce: the page's origin, its title as the page
+   * wrote it, and the code its widget shows, so the person can check the phone
+   * is about to join the page in front of them. Uses nothing up; null for an
+   * unknown, used or expired nonce alike.
+   */
+  previewPairNonce(nonce: string): PairPreview | null {
+    const ticket = this.#pairTicket(nonce, Date.now(), false);
+    const live = ticket === null ? null : this.#livePage(ticket.pageId);
+    const code = ticket === null ? undefined : this.#liveCodes.get(ticket.pageId);
+    if (!ticket || !live || code === undefined) return null;
+    // The first look at a nonce is the phone's scan, where A3.3's figure starts.
+    this.#spike?.pairingScanned(ticket.pageId);
+    const title = firstCharacters(live.page.title, MAX_PAIR_TITLE_CHARS);
+    return {
+      origin: live.page.origin,
+      title: title.text,
+      titleCut: title.cut,
+      code,
+      expiresAt: ticket.expiresAt,
+    };
+  }
+
+  /**
+   * A signed-in member's QR claim from /pair: the nonce is used up at once
+   * and the page gets a fresh code and nonce, then everything goes as for
+   * pair_page (via 'qr'): the same limits, one pending request per user and
+   * page, the operator's approval, and silence as a denial.
+   */
+  claimPairNonce(caller: CallerIdentity, nonce: string): ClaimOutcome {
+    const now = Date.now();
+    const limited = this.#pairingLimited(caller.userId, now);
+    if (limited) return limited;
+    const ticket = this.#pairTicket(nonce, now, true);
+    const live = ticket === null ? null : this.#livePage(ticket.pageId);
+    if (!ticket || !live) {
+      this.#log.info('qr pairing refused: no live nonce matched', { userId: caller.userId });
+      return hubError('pairing_expired', 'this pairing link is invalid or expired');
+    }
+    const started = this.#startPairing(caller, live.page, live.conn, 'qr', now);
+    if (started.kind === 'error') return started;
+    return {
+      kind: 'claimed',
+      pageId: ticket.pageId,
+      settled:
+        started.kind === 'pending' ? this.#waitForEnd(started.record) : Promise.resolve(started),
+    };
+  }
+
+  /** Counts one pairing attempt for the user, or refuses it past the limit (S3). */
+  #pairingLimited(userId: string, now: number): HubError | null {
+    if (!this.#userLimiter.allows(userId, now)) {
+      this.#log.warn('pairing attempt rate limited', { userId });
+      return hubError('rate_limited', 'too many pairing attempts; wait a minute and try again');
+    }
+    this.#userLimiter.record(userId, now);
+    return null;
+  }
+
+  /**
+   * Everything after a live code or nonce matched: it is spent and replaced,
+   * the page's own pairing limit is counted, and then the caller is already
+   * attached, joins their pending request, is refused for a full page, is let
+   * in by autoApprove, or gets a new request the operator sees.
+   */
+  #startPairing(
+    caller: CallerIdentity,
+    page: PageRecord,
+    conn: Conn,
+    via: AttachRequestRecord['via'],
+    now: number,
+  ): PairOutcome | { kind: 'pending'; record: AttachRequestRecord } {
+    // Before the rotation below, which issues the next ticket: the spike times
+    // this claim from the ticket that matched, not from its replacement.
+    this.#spike?.pairingClaimed(page.pageId, caller.userId, via);
+    // Single use: the matched code or nonce dies here and the page gets a fresh pair.
     this.#rotateTicket(page.pageId, 'used');
+
+    // Every pairing that lands on a page counts against it, whoever sends it, so
+    // a page whose codes leak cannot be buried in prompts.
+    if (!this.#pageLimiter.allows(page.pageId, now)) {
+      this.#log.warn('pairing refused: too many pairings for one page', {
+        pageId: page.pageId,
+        userId: caller.userId,
+      });
+      this.#spike?.pairingDecided(page.pageId, caller.userId, false);
+      return hubError(
+        'rate_limited',
+        'too many pairing attempts on this page; wait a minute and try again',
+      );
+    }
+    this.#pageLimiter.record(page.pageId, now);
 
     this.#expireIfDue(page.pageId, caller.userId);
     const existing = this.#store.attachments.get(page.pageId, caller.userId);
@@ -1523,6 +1723,8 @@ export class PageHub {
       const named = this.#recordClient(existing, caller.client);
       this.#store.attachments.put(existing);
       if (named) this.#sendRoster(page.pageId);
+      // Already in: as good as approved, so the next call is this pairing's first.
+      this.#spike?.pairingDecided(page.pageId, caller.userId, true);
       return {
         kind: 'attached',
         pageId: page.pageId,
@@ -1556,12 +1758,13 @@ export class PageHub {
         pending.joined.push(joining);
         this.#store.requests.put(pending);
       }
-      this.#log.info('pair_page joined a pending attach request', {
+      this.#log.info('pairing joined a pending attach request', {
         pageId: pending.pageId,
         userId: pending.userId,
         requestId: pending.requestId,
+        via,
       });
-      return this.#waitForDecision(pending, signal);
+      return { kind: 'pending', record: pending };
     }
 
     // S9: a full page is refused before its operator is asked anything.
@@ -1570,11 +1773,13 @@ export class PageHub {
         pageId: page.pageId,
         userId: caller.userId,
       });
+      this.#spike?.pairingDecided(page.pageId, caller.userId, false);
       return this.#pageFullError('already has');
     }
 
     if (page.policy.autoApprove === 'observer') {
       const attachment = this.#grant(request, 'observer');
+      this.#spike?.pairingDecided(page.pageId, caller.userId, true);
       return {
         kind: 'attached',
         pageId: page.pageId,
@@ -1588,7 +1793,7 @@ export class PageHub {
     const record: AttachRequestRecord = {
       ...request,
       requestId: newId('rq'),
-      via: 'code',
+      via,
       joined: [],
       expiresAt: now + attachRequestTtlMs,
     };
@@ -1598,6 +1803,7 @@ export class PageHub {
         pageId: record.pageId,
         userId: record.userId,
       });
+      this.#spike?.pairingDecided(record.pageId, record.userId, false);
       this.#endRequest(record.requestId, {
         kind: 'error',
         code: 'timeout',
@@ -1616,8 +1822,31 @@ export class PageHub {
       pageId: record.pageId,
       userId: record.userId,
       requestId: record.requestId,
+      via,
     });
-    return this.#waitForDecision(record, signal);
+    return { kind: 'pending', record };
+  }
+
+  /**
+   * Waits for the request itself to end: approval, denial, its lifetime run
+   * out, the page gone or asleep, or shutdown. Every one of those calls
+   * #endRequest or answers the waiters directly, so this always settles.
+   */
+  #waitForEnd(record: AttachRequestRecord): Promise<PairOutcome> {
+    return new Promise((resolve) => {
+      const finish = (outcome: PairOutcome): void => {
+        const waiters = this.#pairWaiters.get(record.requestId);
+        waiters?.delete(finish);
+        if (waiters?.size === 0) this.#pairWaiters.delete(record.requestId);
+        resolve(outcome);
+      };
+      let waiters = this.#pairWaiters.get(record.requestId);
+      if (!waiters) {
+        waiters = new Set();
+        this.#pairWaiters.set(record.requestId, waiters);
+      }
+      waiters.add(finish);
+    });
   }
 
   #waitForDecision(record: AttachRequestRecord, signal: AbortSignal): Promise<PairOutcome> {
@@ -1662,11 +1891,12 @@ export class PageHub {
     tool: string,
     args: JsonObject,
     signal: AbortSignal,
+    marks: CallMarks | null = null,
   ): Promise<CallOutcome> {
     const started = Date.now();
     let auditOutcome: AuditOutcome = 'relay_error';
     try {
-      const outcome = await this.#call(caller, pageId, tool, args, signal);
+      const outcome = await this.#call(caller, pageId, tool, args, signal, marks);
       auditOutcome = outcome.kind === 'error' ? outcome.code : outcome.kind;
       return outcome;
     } catch (error) {
@@ -1688,6 +1918,7 @@ export class PageHub {
       this.#store.audit.append(record);
       // Arguments are never part of the record (S7), and the logger redacts them anyway.
       this.#log.info('call', { audit: record });
+      this.#spike?.callFinished(pageId, caller.userId, auditOutcome);
     }
   }
 
@@ -1706,6 +1937,7 @@ export class PageHub {
     toolName: string,
     args: JsonObject,
     signal: AbortSignal,
+    marks: CallMarks | null,
   ): Promise<CallOutcome> {
     const arrivedAt = Date.now();
     const access = this.#access(caller.userId, pageId);
@@ -1749,6 +1981,7 @@ export class PageHub {
       waited: false,
       checking: false,
       conn: null,
+      marks,
       timer: null,
       done: false,
       settle: () => undefined,
@@ -2070,6 +2303,7 @@ export class PageHub {
     call.conn = conn;
     conn.inflight.set(call.callId, call);
     this.#armCallTimer(call);
+    if (call.marks) call.marks.invokeOut = performance.now();
     conn.ws.send(encoded.text);
     return true;
   }
@@ -2290,6 +2524,7 @@ export class PageHub {
       for (const timer of map.values()) clearTimeout(timer);
       map.clear();
     }
+    this.#liveCodes.clear();
     await Promise.all([...closing, checkerClosed]);
   }
 }

@@ -1,15 +1,106 @@
-// Auth is a plugin (SPEC section 7): it turns an HTTP request into a User or
-// null. M1 ships dev-token, a fixed list of users and bearer tokens from .env;
-// M4 adds OAuth behind the same interface.
+// Auth is a plugin (SPEC section 7, ADR 0013). authenticate(request) gives a
+// user, or a refusal that carries its own HTTP status and challenge: 401 with
+// WWW-Authenticate asks the client to sign in, 403 turns away someone signed in
+// who is not allowed, 503 says the plugin cannot check anyone just now. Claude
+// starts sign-in only on a 401 whose challenge names the metadata document, so
+// the plugin, not the relay, has to write the challenge. A plugin may also serve
+// GET routes, such as that metadata document, and may need to start before the
+// relay listens. dev-token lives here; the OAuth plugin is in oauth.ts.
 
 import type { IncomingMessage } from 'node:http';
 import { IdSchema, type User, UserSchema } from '@tabdock/protocol';
+import { z } from 'zod';
 import { digest, sameDigest } from './secrets.ts';
+
+export interface AuthRefusal {
+  kind: 'refused';
+  status: 401 | 403 | 503;
+  /**
+   * Why, for the relay's log line: a fixed phrase written by the plugin, never
+   * a credential and never text the caller sent.
+   */
+  reason: string;
+  /** The response body: short and safe to show anyone. */
+  body: string;
+  /** Response headers, WWW-Authenticate above all; Content-Type defaults to plain text. */
+  headers: Record<string, string>;
+}
+
+export type AuthOutcome = { kind: 'user'; user: User } | AuthRefusal;
+
+/** A GET route a plugin serves, in web-standard form, like the SDK's metadata helpers. */
+export type AuthRoute = (request: Request) => Response | Promise<Response>;
+
+/**
+ * Who a signed-in account is to this relay (ADR 0016). A member is on the
+ * owner's allowlist and has a user. Anyone else who signs in at the provider
+ * is an invitee: refused everywhere until M4 lets invites in, and known only
+ * by an opaque key (a digest of the provider's subject), never by the subject.
+ */
+export type Account = { kind: 'member'; user: User } | { kind: 'invitee'; key: string };
+
+/** The provider endpoints a browser sign-in needs, as the plugin's start() checked them. */
+export interface ProviderEndpoints {
+  issuer: string;
+  authorization_endpoint: string;
+  token_endpoint: string;
+  jwks_uri: string;
+  response_types_supported: string[];
+  token_endpoint_auth_methods_supported?: string[] | undefined;
+}
+
+/**
+ * What a plugin backed by an identity provider offers the QR page at /pair,
+ * which signs a phone's browser in at the same provider (ADR 0013): where the
+ * provider is, and the one account mapping the plugin itself uses, so a person
+ * is the same user on /mcp and at /pair.
+ */
+export interface BrowserSignIn {
+  /** null until start() has read the provider's metadata. */
+  provider(): ProviderEndpoints | null;
+  accountOf(sub: string): Account;
+}
 
 export interface AuthPlugin {
   readonly name: string;
-  authenticate(request: IncomingMessage): Promise<User | null>;
+  /**
+   * The public MCP URL whose tokens this plugin accepts, for a plugin that
+   * checks tokens from an identity provider. Public URL mode requires it to
+   * equal the relay's own, so a plugin without one, like dev-token, can never
+   * answer for a public URL (ADR 0014).
+   */
+  readonly resource?: string | undefined;
+  /**
+   * Runs once before the relay listens. A plugin that cannot work, such as one
+   * whose identity provider is misconfigured, throws here and the relay does
+   * not start.
+   */
+  start?(): Promise<void>;
+  authenticate(request: IncomingMessage): Promise<AuthOutcome>;
+  /** GET (and HEAD) routes by exact path. */
+  readonly routes?: ReadonlyMap<string, AuthRoute> | undefined;
+  /** Present on a plugin that signs people in at a provider; public URL mode needs it for /pair. */
+  readonly browserSignIn?: BrowserSignIn | undefined;
 }
+
+/** Header names as HTTP tokens, values without control characters, so node never throws on them. */
+const HeaderNameSchema = z.string().regex(/^[A-Za-z0-9-]{1,64}$/);
+const HeaderValueSchema = z.string().regex(/^[\x20-\x7e]{0,2000}$/);
+
+/**
+ * The relay checks what a plugin returns before acting on it, as it checks
+ * every other boundary: a malformed outcome is refused, never half-trusted.
+ */
+export const AuthOutcomeSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('user'), user: UserSchema }),
+  z.object({
+    kind: z.literal('refused'),
+    status: z.union([z.literal(401), z.literal(403), z.literal(503)]),
+    reason: z.string().min(1).max(200),
+    body: z.string().max(2000),
+    headers: z.record(HeaderNameSchema, HeaderValueSchema),
+  }),
+]);
 
 export interface DevTokenUser {
   userId: string;
@@ -23,6 +114,15 @@ export const MIN_DEV_TOKEN_LENGTH = 24;
 const MAX_AUTHORIZATION_LENGTH = 4096;
 const BEARER = /^Bearer +([\x21-\x7e]+) *$/i;
 const TOKEN_CHARS = /^[\x21-\x7e]+$/;
+
+/** The dev-token answer to anyone without a valid token, the same since M1. */
+const DEV_TOKEN_REFUSAL: AuthRefusal = {
+  kind: 'refused',
+  status: 401,
+  reason: 'no valid dev token',
+  body: 'Unauthorized',
+  headers: { 'WWW-Authenticate': 'Bearer realm="tabdock"' },
+};
 
 /**
  * Error messages name the user, never the token, because they end up on a
@@ -68,7 +168,7 @@ export function createDevTokenAuth(users: readonly DevTokenUser[]): AuthPlugin {
     name: 'dev-token',
     authenticate(request) {
       const presented = bearerToken(request.headers.authorization);
-      if (presented === null) return Promise.resolve(null);
+      if (presented === null) return Promise.resolve(DEV_TOKEN_REFUSAL);
       // Hashing both sides gives equal-length buffers for timingSafeEqual, and
       // every entry is compared so the time taken does not say which user matched.
       const candidate = digest(presented);
@@ -76,7 +176,7 @@ export function createDevTokenAuth(users: readonly DevTokenUser[]): AuthPlugin {
       for (const entry of entries) {
         if (sameDigest(candidate, entry.digest) && match === null) match = entry.user;
       }
-      return Promise.resolve(match);
+      return Promise.resolve(match === null ? DEV_TOKEN_REFUSAL : { kind: 'user', user: match });
     },
   };
 }

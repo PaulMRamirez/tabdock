@@ -6,8 +6,9 @@
 // defence in depth, buttons ignore events whose isTrusted is false, so a
 // script that does reach one still cannot press Allow. Everything shown comes
 // from the Dock handle, every relay- or page-supplied string goes in through
-// textContent, and nothing lands on window. Buttons carry stable data-action
-// attributes for browser tests.
+// textContent (the pairing URL only as a QR drawing built with DOM calls; see
+// qr.ts), nothing goes through an HTML parser, and nothing lands on window.
+// Buttons carry stable data-action attributes for browser tests.
 
 import type { AttachmentView, Role } from '@tabdock/protocol';
 import type {
@@ -19,6 +20,7 @@ import type {
   PendingConfirm,
   PendingRequest,
 } from './core.ts';
+import { createQrView, QR_SIDE_PX } from './qr.ts';
 
 /** A valid custom element name needs no registration to host a shadow root, so nothing is defined globally. */
 const HOST_TAG = 'tabdock-dock';
@@ -72,6 +74,16 @@ const STYLE = `
 .label { margin: 10px 0 2px; font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; color: #6b7280; }
 .code { font: 600 26px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 0.08em;
   user-select: all; }
+/* The QR code beside the typed code, whose basis is the code's own width, so a
+   panel too narrow for both (a phone's) puts the code below the QR rather than
+   breaking it. The QR is taller than the text beside it, so a longer expiry
+   line never moves the boxes around the pairing block. */
+.pair { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; }
+.pair-text { flex: 1 1 196px; min-width: 0; }
+/* Light ground in every theme, quiet zone included, as scanners need dark on light.
+   The drawing carries its own ground and size too (qr.ts), should these styles not apply. */
+.qr { flex: none; width: ${QR_SIDE_PX}px; height: ${QR_SIDE_PX}px; background: #fff; }
+.qr svg { display: block; width: 100%; height: 100%; }
 .muted { margin: 2px 0; color: #6b7280; }
 .error { margin: 0 0 8px; color: #b91c1c; }
 .notice { margin: 0 0 8px; color: #92400e; }
@@ -191,6 +203,32 @@ function timeText(epochMs: number): string {
   return new Date(epochMs).toLocaleTimeString([], { hour12: false });
 }
 
+/**
+ * Styles the shadow root, preferring a constructed stylesheet: a page's CSP
+ * refuses an inline <style> unless its style-src allows 'unsafe-inline', but
+ * no style-src governs a sheet built through the CSSOM, and the adapter runs
+ * on pages whose policy it does not control. The sheet comes from the
+ * document's own window, since a sheet constructed for another document
+ * cannot be adopted. Returns the <style> element to append instead, only
+ * where the browser cannot adopt sheets.
+ */
+function adoptStyle(root: ShadowRoot, doc: Document): HTMLStyleElement | null {
+  const Sheet = doc.defaultView?.CSSStyleSheet;
+  if (Sheet !== undefined && 'adoptedStyleSheets' in root) {
+    try {
+      const sheet = new Sheet();
+      sheet.replaceSync(STYLE);
+      root.adoptedStyleSheets = [sheet];
+      return null;
+    } catch {
+      // A browser that lists the API but will not build the sheet: the element still works.
+    }
+  }
+  const style = doc.createElement('style');
+  style.textContent = STYLE;
+  return style;
+}
+
 /** Mounts the widget for one Dock and returns a function that removes it. */
 export function mountWidget(dock: Dock, doc: Document = document): () => void {
   const host = doc.createElement(HOST_TAG);
@@ -292,8 +330,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     return { ...newBox(box), countdown: element('p', 'muted'), expiresAt };
   }
 
-  const style = element('style');
-  style.textContent = STYLE;
+  const style = adoptStyle(root, doc);
 
   const panel = element('section', 'panel');
   panel.hidden = true;
@@ -310,7 +347,17 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   const rotate = button('New code', 'rotate', () => {
     dock.rotatePairing();
   });
-  pairing.append(element('div', 'label', 'Pairing code'), code, expiry, rotate);
+  // Shown only when the relay sent a pairing URL the QR module accepts.
+  const qr = createQrView(doc);
+  const qrBox = element('div', 'qr');
+  qrBox.dataset.role = 'pairing-qr';
+  qrBox.hidden = true;
+  qrBox.append(qr.element);
+  const pairText = element('div', 'pair-text');
+  pairText.append(code, expiry, rotate);
+  const pairRow = element('div', 'pair');
+  pairRow.append(qrBox, pairText);
+  pairing.append(element('div', 'label', 'Pairing code'), pairRow);
 
   const roster = element('ul');
   roster.dataset.role = 'roster';
@@ -361,7 +408,8 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
 
   const wrap = element('div', 'wrap');
   wrap.append(panel, badge);
-  root.append(style, wrap);
+  if (style) root.append(style);
+  root.append(wrap);
 
   function setOpen(open: boolean): void {
     panel.hidden = !open;
@@ -621,6 +669,8 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
 
     pairing.hidden = state.pairing === null;
     code.textContent = state.pairing?.code ?? '';
+    // A new pairing carries a new URL, so it redraws; one without a URL clears the code.
+    qrBox.hidden = !qr.show(state.pairing?.url);
     rotate.disabled = state.link !== 'linked';
 
     syncRows(state.roster, state.pageRoles, state.link === 'linked');

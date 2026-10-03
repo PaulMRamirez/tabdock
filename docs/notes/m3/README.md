@@ -1,0 +1,3 @@
+# M3 research notes
+
+What the M3 research found on 3 October 2026, behind the M3 rows of `docs/notes/verified.md` and ADRs 0013 to 0015: how Claude's connectors and Claude Code sign in (`connector-auth.md`), the MCP authorization spec and SDK v2 (`mcp-auth-sdk.md`), OAuth libraries and identity providers (`oauth-libs-idp.md`), and tunnels, the QR flow and the spike measurements (`tunnel-qr-spike.md`). Each claim names its source URL or file. The raw page copies and probe scripts they mention were kept in the research session's scratch space and are not in the repo; the probes are re-run as tests during M3.

@@ -1,8 +1,13 @@
 // Relay options, their defaults, and the checks that refuse an unsafe setup
 // before anything listens: loopback only until TLS arrives in M4 (S12), and an
-// explicit origin allowlist in production (S2). The section 9 limits and the
-// session and attachment lifetimes follow ADR 0009.
+// explicit origin allowlist in production (S2). Public URL mode (ADR 0014) puts
+// an https address in front of the loopback relay through a tunnel: it brings
+// production rules, only OAuth sign-in for that address, and the QR sign-in at
+// /pair, which needs a client of its own at the provider. The section 9 limits
+// and the session and attachment lifetimes follow ADR 0009. The M3 spike's
+// measurement flag (ADR 0014) is refused in production.
 
+import { isIPv6 } from 'node:net';
 import {
   ATTACH_REQUEST_TTL_MS,
   DEFAULT_CALL_DEADLINE_MS,
@@ -14,6 +19,7 @@ import {
 } from '@tabdock/protocol';
 import { type AuthPlugin, createDevTokenAuth, parseDevTokens } from './auth.ts';
 import type { LogLevel, LogSink } from './log.ts';
+import { createOAuthAuth, parseOAuthUsers } from './oauth.ts';
 import type { RelayStore } from './store.ts';
 
 export type RelayEnv = 'development' | 'production';
@@ -47,13 +53,29 @@ export interface RelayTimings {
    * waits at most about twice this for its check.
    */
   argumentCheckMs: number;
+  /** How long a browser stays signed in at /pair, counted from sign-in. */
+  pairSessionMs: number;
 }
 
 export interface RelayRateLimits {
-  /** pair_page attempts one user may make per window. */
+  /** Pairing attempts one user may make per window: pair_page and QR claims together (S3). */
   pairAttemptsPerUser: number;
-  /** pair_page attempts one client address may make per window, across users. */
-  pairAttemptsPerAddress: number;
+  /**
+   * Pairings one page may receive per window, counted when a live code or QR
+   * nonce of that page is used, whoever uses it. Never per address: behind a
+   * tunnel every caller shares one (ADR 0016).
+   */
+  pairAttemptsPerPage: number;
+  /** Times one QR nonce may be looked at through /pair/preview per window; a preview uses nothing up. */
+  pairPreviewsPerNonce: number;
+  /**
+   * Code exchanges /pair/callback may make per window for the whole relay,
+   * one for each sign-in that comes back from the provider. Each is a request
+   * carrying the /pair client's secret, and anyone can send a callback, so
+   * past this none goes out and the sign-in fails. Relay-wide, never per
+   * address: behind a tunnel every caller shares one (ADR 0016).
+   */
+  pairSignIns: number;
   /** call_page_tool calls one user may make to one page per window (S9). */
   callsPerUserPerPage: number;
   /** The window every limit above counts over. */
@@ -101,6 +123,19 @@ export interface RelayLimits {
    * open at once, and the most gone pages remembered for page_gone.
    */
   pageSessions: number;
+  /**
+   * Browser sessions signed in at /pair held at once. Past it a new sign-in
+   * ends the oldest session of an account that is not a member first.
+   */
+  pairSessions: number;
+  /** Code exchanges /pair/callback may have waiting on the provider at once, for the whole relay. */
+  pairSignInsInFlight: number;
+}
+
+/** The relay's own client at the identity provider, for the browser sign-in at /pair. */
+export interface PairClientOptions {
+  clientId: string;
+  clientSecret: string;
 }
 
 export interface RelayOptions {
@@ -119,6 +154,20 @@ export interface RelayOptions {
   allowedOrigins?: readonly string[] | undefined;
   /** Development only: accept page sockets with no Origin header (the Node sim page). */
   allowMissingOrigin?: boolean | undefined;
+  /**
+   * The https origin a tunnel serves the relay at, such as
+   * https://relay.example. Setting it switches on public URL mode (ADR 0014):
+   * its host passes the Host check, `<publicUrl>/mcp` is the resource OAuth
+   * tokens must be issued for, production rules apply, `auth` must be the
+   * oauth plugin for that resource, and /page refuses anything not local.
+   */
+  publicUrl?: string | undefined;
+  /**
+   * The client the QR page at /pair signs browsers in with, registered at the
+   * provider with `<publicUrl>/pair/callback` as its redirect URI. Required in
+   * public URL mode, refused without it.
+   */
+  pairClient?: PairClientOptions | undefined;
   timings?: { [K in keyof RelayTimings]?: number | undefined } | undefined;
   rateLimits?: { [K in keyof RelayRateLimits]?: number | undefined } | undefined;
   limits?: { [K in keyof RelayLimits]?: number | undefined } | undefined;
@@ -127,6 +176,14 @@ export interface RelayOptions {
   logLevel?: LogLevel | undefined;
   /** Storage; in memory when absent. M4 swaps in a persistent audit log here. */
   store?: RelayStore | undefined;
+  /**
+   * The M3 spike's measurements (ADR 0014, A3.3), off by default and refused
+   * in production: a marker tool that can be added beside the five fixed tools
+   * and announced to open sessions, a log line for every tools/list and every
+   * stream a client opens, timestamps for each call_page_tool, and pairing
+   * milestones. See spike.ts.
+   */
+  spike?: boolean | undefined;
 }
 
 export const DEFAULT_HOST = '127.0.0.1';
@@ -140,6 +197,8 @@ export const ATTACHMENT_IDLE_MS = 8 * 60 * 60_000;
 export const SSE_KEEP_ALIVE_MS = 15_000;
 /** ADR 0010: an ordinary check takes a millisecond or two, and a stall this short goes unnoticed. */
 export const ARGUMENT_CHECK_MS = 50;
+/** Long enough to sign in and scan a few codes, short enough that a forgotten phone is soon signed out. */
+export const PAIR_SESSION_MS = 15 * 60_000;
 /**
  * The longest delay setTimeout honours. Node runs a longer one after 1 ms
  * instead, which would expire every attachment at once.
@@ -161,11 +220,14 @@ export const DEFAULT_TIMINGS: RelayTimings = {
   attachmentIdleMs: ATTACHMENT_IDLE_MS,
   sseKeepAliveMs: SSE_KEEP_ALIVE_MS,
   argumentCheckMs: ARGUMENT_CHECK_MS,
+  pairSessionMs: PAIR_SESSION_MS,
 };
 
 export const DEFAULT_RATE_LIMITS: RelayRateLimits = {
   pairAttemptsPerUser: 10,
-  pairAttemptsPerAddress: 30,
+  pairAttemptsPerPage: 30,
+  pairPreviewsPerNonce: 30,
+  pairSignIns: 60,
   callsPerUserPerPage: 120,
   windowMs: 60_000,
   toolsFramesPerSocket: 10,
@@ -181,6 +243,8 @@ export const DEFAULT_LIMITS: RelayLimits = {
   pageSocketsPerAddress: 20,
   pageSessionsPerAddress: 20,
   pageSessions: 1000,
+  pairSessions: 200,
+  pairSignInsInFlight: 8,
 };
 
 /** What a header-less page socket is recorded as when the dev flag lets it in. */
@@ -191,6 +255,15 @@ export interface ResolvedConfig {
   port: number;
   env: RelayEnv;
   loopback: boolean;
+  /**
+   * The public origin in public URL mode, else null. Also the base of the
+   * pairing URL a phone opens (M3 QR flow).
+   */
+  publicUrl: string | null;
+  /** `<publicUrl>/mcp`: the URL people add as a connector, and the token audience. */
+  publicMcpUrl: string | null;
+  /** Host names /mcp and the auth plugin's routes answer to (the DNS rebinding guard). */
+  allowedHosts: string[];
   allowMissingOrigin: boolean;
   isOriginAllowed: (origin: string) => boolean;
   /** For the startup log line: the list, or a note that the dev default applies. */
@@ -198,6 +271,8 @@ export interface ResolvedConfig {
   timings: RelayTimings;
   rateLimits: RelayRateLimits;
   limits: RelayLimits;
+  /** The spike's measurements are on (never in production). */
+  spike: boolean;
 }
 
 const DEV_ORIGIN_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
@@ -217,11 +292,112 @@ export function parseOrigin(value: string): string | null {
   return url.origin === value ? url.origin : null;
 }
 
+/** The Host names the SDK's localhost guard accepts, as its own helper lists them. */
+export const LOOPBACK_HOSTNAMES: readonly string[] = ['localhost', '127.0.0.1', '[::1]'];
+
+/**
+ * RFC 9110's Host, uri-host [":" port], narrowed to what clients send: a
+ * reg-name of RFC 3986's unreserved characters (a dotted IPv4 address is one),
+ * or an IPv6 address in brackets, and a port of one to five digits.
+ */
+const HOST_HEADER = /^(?<host>[a-z0-9._~-]+|\[(?<ipv6>[0-9a-f:.]+)\])(?::(?<port>\d{1,5}))?$/i;
+
+/**
+ * The host a Host header names, lower-cased and without its port, or null
+ * when the header is not a host at all. The URL parser is no test of that: it
+ * drops userinfo, a path or a fragment and rewrites numeric and
+ * percent-encoded forms, so 'evil@localhost' or '2130706433' would read as
+ * loopback. Callers compare the result exactly, so only the names as written
+ * pass an allowlist.
+ */
+export function parseHostHeader(header: string): string | null {
+  const groups = HOST_HEADER.exec(header)?.groups;
+  const host = groups?.host;
+  if (host === undefined) return null;
+  if (groups?.ipv6 !== undefined && !isIPv6(groups.ipv6)) return null;
+  // The adapter rebuilds the request URL from Host, and the URL parser refuses a larger port.
+  if (groups?.port !== undefined && Number(groups.port) > 65_535) return null;
+  return host.toLowerCase();
+}
+
+/**
+ * The public URL as an origin (https, no path, no credentials), or an error
+ * naming the variable. It is where Claude reaches the relay, so it must be
+ * https (S12) and must not name this machine, which would blur the line
+ * between local and tunnelled requests that /page relies on.
+ */
+export function parsePublicUrl(value: string): string {
+  const url = URL.parse(value.trim());
+  if (url?.protocol !== 'https:') {
+    throw new Error(
+      'publicUrl (TABDOCK_PUBLIC_URL) must be an https URL such as https://relay.example; the tunnel in front of the relay terminates TLS (SPEC S12, ADR 0014)',
+    );
+  }
+  if (
+    url.username !== '' ||
+    url.password !== '' ||
+    url.search !== '' ||
+    url.hash !== '' ||
+    url.pathname !== '/'
+  ) {
+    throw new Error(
+      'publicUrl (TABDOCK_PUBLIC_URL) must be an origin such as https://relay.example, with no path, query or credentials',
+    );
+  }
+  if (isLoopbackHost(url.hostname)) {
+    throw new Error(
+      'publicUrl (TABDOCK_PUBLIC_URL) names this machine; give the https address the tunnel serves',
+    );
+  }
+  return url.origin;
+}
+
+/** The MCP endpoint under a public origin: what people add as a connector. */
+export function publicMcpUrlOf(publicOrigin: string): string {
+  return new URL('/mcp', publicOrigin).href;
+}
+
+/** Where the provider sends a browser back to after sign-in at /pair. */
+export function pairRedirectUriOf(publicOrigin: string): string {
+  return new URL('/pair/callback', publicOrigin).href;
+}
+
+/** OAuth client ids and secrets are opaque but printable (RFC 6749 appendix A); no spaces, so .env trimming cannot change one. */
+const CLIENT_ID = /^[\x21-\x7e]{1,255}$/;
+const CLIENT_SECRET = /^[\x21-\x7e]{1,1024}$/;
+
+/**
+ * The /pair client settings, checked without ever echoing them: the secret
+ * belongs in .env, and an id typed into the wrong variable may be one too.
+ */
+function checkPairClient(pairClient: PairClientOptions): void {
+  if (!CLIENT_ID.test(pairClient.clientId)) {
+    throw new Error(
+      'the /pair client id (TABDOCK_PAIR_CLIENT_ID) must be 1 to 255 printable characters without spaces',
+    );
+  }
+  if (!CLIENT_SECRET.test(pairClient.clientSecret)) {
+    throw new Error(
+      'the /pair client secret (TABDOCK_PAIR_CLIENT_SECRET) must be 1 to 1024 printable characters without spaces',
+    );
+  }
+}
+
 export function resolveConfig(options: RelayOptions): ResolvedConfig {
   const env = options.env ?? 'development';
   // Checked at run time too: JavaScript callers and env parsing can pass anything.
   if (!(['development', 'production'] as const).includes(env)) {
     throw new Error('env must be development or production');
+  }
+  // The spike changes what clients see (a sixth tool) and logs every list and
+  // stream, which is for measuring, never for serving people (ADR 0014). It is
+  // allowed in public URL mode, since hosted Claude is what it measures.
+  // Only true turns it on, so a stray value from JavaScript leaves it off.
+  const spike = options.spike === true;
+  if (spike && env === 'production') {
+    throw new Error(
+      'spike (TABDOCK_SPIKE) is the M3 spike measurement flag; production refuses to start with it (ADR 0014)',
+    );
   }
   const host = options.host ?? DEFAULT_HOST;
   if (!isLoopbackHost(host)) {
@@ -234,19 +410,38 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     throw new Error('port must be an integer from 0 to 65535');
   }
 
-  const allowMissingOrigin = options.allowMissingOrigin ?? false;
-  if (allowMissingOrigin && env === 'production') {
+  const publicUrl = options.publicUrl === undefined ? null : parsePublicUrl(options.publicUrl);
+  const publicMcpUrl = publicUrl === null ? null : publicMcpUrlOf(publicUrl);
+  // Only a plugin that checks provider tokens issued for this very address may
+  // answer for it; dev tokens never cross a tunnel (ADR 0014).
+  if (publicMcpUrl !== null && options.auth.resource !== publicMcpUrl) {
     throw new Error(
-      'allowMissingOrigin is a development flag; production requires an Origin header on every page socket (SPEC S1)',
+      `public URL mode accepts only OAuth sign-in for ${publicMcpUrl}, and the ${options.auth.name} plugin ${options.auth.resource === undefined ? 'checks no provider tokens' : `checks tokens for ${options.auth.resource}`}; set TABDOCK_OAUTH_ISSUER and TABDOCK_OAUTH_USERS (dev tokens are refused in public URL mode)`,
+    );
+  }
+  if (publicMcpUrl === null && options.auth.resource !== undefined) {
+    throw new Error(
+      `the ${options.auth.name} plugin checks tokens for ${options.auth.resource}, which needs public URL mode (TABDOCK_PUBLIC_URL)`,
+    );
+  }
+  // A public relay is reachable by anyone who learns the address, so it gets
+  // the production rules whatever env says.
+  const strict = env === 'production' || publicUrl !== null;
+  const strictName = env === 'production' ? 'production' : 'public URL mode';
+
+  const allowMissingOrigin = options.allowMissingOrigin ?? false;
+  if (allowMissingOrigin && strict) {
+    throw new Error(
+      `allowMissingOrigin is a development flag; ${strictName} requires an Origin header on every page socket (SPEC S1)`,
     );
   }
 
   let isOriginAllowed: (origin: string) => boolean;
   let originPolicy: string;
   if (options.allowedOrigins === undefined) {
-    if (env === 'production') {
+    if (strict) {
       throw new Error(
-        'production needs an explicit allowedOrigins list (TABDOCK_ALLOWED_ORIGINS); refusing to start (SPEC S2)',
+        `${strictName} needs an explicit allowedOrigins list (TABDOCK_ALLOWED_ORIGINS); refusing to start (SPEC S2)`,
       );
     }
     isOriginAllowed = (origin) => {
@@ -272,6 +467,27 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     originPolicy = [...allowed].join(', ');
   }
 
+  // The QR page signs phones in at the same provider as the plugin, with a
+  // client of the relay's own, so both are needed in public URL mode and the
+  // client means nothing without it.
+  if (publicUrl !== null) {
+    if (options.auth.browserSignIn === undefined) {
+      throw new Error(
+        `public URL mode serves the QR sign-in at /pair, and the ${options.auth.name} plugin cannot sign a browser in`,
+      );
+    }
+    if (options.pairClient === undefined) {
+      throw new Error(
+        `public URL mode needs the /pair sign-in client (TABDOCK_PAIR_CLIENT_ID and TABDOCK_PAIR_CLIENT_SECRET), registered at the provider with ${pairRedirectUriOf(publicUrl)} as its redirect URI`,
+      );
+    }
+    checkPairClient(options.pairClient);
+  } else if (options.pairClient !== undefined) {
+    throw new Error(
+      'the /pair sign-in client (TABDOCK_PAIR_CLIENT_ID and TABDOCK_PAIR_CLIENT_SECRET) needs public URL mode (TABDOCK_PUBLIC_URL)',
+    );
+  }
+
   // Every timing ends up in a setTimeout, so it must fit one.
   const timings = positiveIntegers(DEFAULT_TIMINGS, options.timings, MAX_TIMER_MS);
   // A call that reached its page is timed for both together.
@@ -286,12 +502,19 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     port,
     env,
     loopback: true,
+    publicUrl,
+    publicMcpUrl,
+    allowedHosts:
+      publicUrl === null
+        ? [...LOOPBACK_HOSTNAMES]
+        : [...LOOPBACK_HOSTNAMES, new URL(publicUrl).hostname],
     allowMissingOrigin,
     isOriginAllowed,
     originPolicy,
     timings,
     rateLimits: positiveIntegers(DEFAULT_RATE_LIMITS, options.rateLimits),
     limits: positiveIntegers(DEFAULT_LIMITS, options.limits),
+    spike,
   };
 }
 
@@ -344,10 +567,69 @@ function parseMinutes(name: string, value: string | undefined): number | undefin
 }
 
 /**
+ * The auth plugin the environment asks for. TABDOCK_PUBLIC_URL means OAuth
+ * through TABDOCK_OAUTH_ISSUER for the people in TABDOCK_OAUTH_USERS, and
+ * TABDOCK_DEV_TOKENS is then ignored (ADR 0014); without it, dev tokens as in
+ * M1. The OAuth settings alone mean nothing, since tokens are issued for the
+ * public URL, so they are refused rather than silently unused.
+ */
+function authFromEnv(env: NodeJS.ProcessEnv): {
+  auth: AuthPlugin;
+  publicUrl?: string;
+  pairClient?: PairClientOptions;
+} {
+  const publicText = env.TABDOCK_PUBLIC_URL?.trim() ?? '';
+  const issuer = env.TABDOCK_OAUTH_ISSUER?.trim() ?? '';
+  const oauthUsers = env.TABDOCK_OAUTH_USERS?.trim() ?? '';
+  const pairClientId = env.TABDOCK_PAIR_CLIENT_ID?.trim() ?? '';
+  const pairClientSecret = env.TABDOCK_PAIR_CLIENT_SECRET?.trim() ?? '';
+  if (publicText !== '') {
+    if (issuer === '' || oauthUsers === '') {
+      throw new Error(
+        'TABDOCK_PUBLIC_URL needs TABDOCK_OAUTH_ISSUER and TABDOCK_OAUTH_USERS: a relay with a public URL signs people in only through OAuth (ADR 0014)',
+      );
+    }
+    const publicUrl = parsePublicUrl(publicText);
+    const auth = createOAuthAuth({
+      issuer,
+      resource: publicMcpUrlOf(publicUrl),
+      users: parseOAuthUsers(oauthUsers),
+    });
+    if (pairClientId === '' || pairClientSecret === '') {
+      throw new Error(
+        'TABDOCK_PUBLIC_URL needs TABDOCK_PAIR_CLIENT_ID and TABDOCK_PAIR_CLIENT_SECRET: the client the QR page at /pair signs phones in with',
+      );
+    }
+    return {
+      auth,
+      publicUrl,
+      pairClient: { clientId: pairClientId, clientSecret: pairClientSecret },
+    };
+  }
+  if (issuer !== '' || oauthUsers !== '') {
+    throw new Error(
+      'TABDOCK_OAUTH_ISSUER and TABDOCK_OAUTH_USERS work only with TABDOCK_PUBLIC_URL, the https address tokens are issued for (ADR 0014)',
+    );
+  }
+  if (pairClientId !== '' || pairClientSecret !== '') {
+    throw new Error(
+      'TABDOCK_PAIR_CLIENT_ID and TABDOCK_PAIR_CLIENT_SECRET work only with TABDOCK_PUBLIC_URL, where the QR page signs phones in',
+    );
+  }
+  const tokens = env.TABDOCK_DEV_TOKENS?.trim() ?? '';
+  if (tokens === '') {
+    throw new Error(
+      'TABDOCK_DEV_TOKENS is not set; give it as user=token pairs, for example alice=<24+ random characters>',
+    );
+  }
+  return { auth: createDevTokenAuth(parseDevTokens(tokens)) };
+}
+
+/**
  * Reads the relay's settings from the environment (normally process.env after
- * the repo-root .env is loaded). Auth comes from TABDOCK_DEV_TOKENS, the only
- * plugin M1 has. Errors name the variable, never its value, since a token may
- * sit in the wrong place.
+ * the repo-root .env is loaded). Auth comes from TABDOCK_DEV_TOKENS, or from
+ * the OAuth settings in public URL mode. Errors name the variable, never its
+ * value, since a token may sit in the wrong place.
  */
 export function loadConfigFromEnv(env: NodeJS.ProcessEnv): RelayOptions {
   const portText = env.TABDOCK_PORT?.trim();
@@ -373,21 +655,19 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv): RelayOptions {
           .map((entry) => entry.trim())
           .filter((entry) => entry.length > 0);
 
-  const tokens = env.TABDOCK_DEV_TOKENS?.trim() ?? '';
-  if (tokens === '') {
-    throw new Error(
-      'TABDOCK_DEV_TOKENS is not set; give it as user=token pairs, for example alice=<24+ random characters>',
-    );
-  }
+  const { auth, publicUrl, pairClient } = authFromEnv(env);
 
   const host = env.TABDOCK_HOST?.trim();
   return {
-    auth: createDevTokenAuth(parseDevTokens(tokens)),
+    auth,
+    publicUrl,
+    pairClient,
     host: host === undefined || host === '' ? undefined : host,
     port,
     env: envName === '' ? 'development' : envName,
     allowedOrigins,
     allowMissingOrigin: parseFlag('TABDOCK_DEV_ALLOW_NO_ORIGIN', env.TABDOCK_DEV_ALLOW_NO_ORIGIN),
+    spike: parseFlag('TABDOCK_SPIKE', env.TABDOCK_SPIKE),
     timings: {
       sessionIdleMs: parseMinutes('TABDOCK_SESSION_IDLE_MINUTES', env.TABDOCK_SESSION_IDLE_MINUTES),
       attachmentIdleMs: parseMinutes(
@@ -399,6 +679,10 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv): RelayOptions {
       callsPerUserPerPage: parseCount(
         'TABDOCK_MAX_CALLS_PER_MINUTE',
         env.TABDOCK_MAX_CALLS_PER_MINUTE,
+      ),
+      pairSignIns: parseCount(
+        'TABDOCK_MAX_PAIR_SIGNINS_PER_MINUTE',
+        env.TABDOCK_MAX_PAIR_SIGNINS_PER_MINUTE,
       ),
     },
     limits: {
@@ -418,6 +702,10 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv): RelayOptions {
         env.TABDOCK_MAX_PAGE_SESSIONS_PER_ADDRESS,
       ),
       pageSessions: parseCount('TABDOCK_MAX_PAGE_SESSIONS', env.TABDOCK_MAX_PAGE_SESSIONS),
+      pairSignInsInFlight: parseCount(
+        'TABDOCK_MAX_PAIR_SIGNINS_IN_FLIGHT',
+        env.TABDOCK_MAX_PAIR_SIGNINS_IN_FLIGHT,
+      ),
     },
   };
 }

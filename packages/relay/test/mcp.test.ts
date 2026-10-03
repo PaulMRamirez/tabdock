@@ -17,11 +17,13 @@ import {
   connectPage,
   type InvokeFrame,
   type InvokeReply,
+  openSocket,
   PAGE_ORIGIN,
   READ_TOOL,
   type TestPage,
   TOOLS,
   UNMARKED_TOOL,
+  UpgradeRefused,
   WRITE_TOOL,
 } from './helpers/page-client.ts';
 import {
@@ -35,6 +37,7 @@ import {
   startRelay,
   type TestRelay,
 } from './helpers/relay.ts';
+import { rawRequest } from './helpers/tunnel.ts';
 
 let current: TestRelay | undefined;
 const pages: TestPage[] = [];
@@ -119,6 +122,42 @@ describe('the /mcp endpoint', () => {
       req.end('{}');
     });
     expect(status).toBe(403);
+  });
+
+  it('refuses a Host that is no host at all with 400, on every route and on /page, and a disguised loopback name with 403', async () => {
+    const { relay } = await setup();
+    const answer = (path: string, host: string): Promise<number> =>
+      rawRequest(relay.url, path, {
+        method: 'POST',
+        host,
+        headers: {
+          Authorization: `Bearer ${ALICE.token}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+        },
+        body: '{}',
+      }).then((response) => response.status);
+    for (const host of [
+      'evil.example@127.0.0.1',
+      '127.0.0.1/evil',
+      'localhost#x',
+      'u:p@localhost',
+    ]) {
+      expect(await answer('/mcp', host), host).toBe(400);
+      expect(await answer('/healthz', host), host).toBe(400);
+      const refused = await openSocket(relay.pageUrl, { headers: { Host: host } }).then(
+        (ws) => {
+          ws.terminate();
+          return null;
+        },
+        (error: unknown) => error,
+      );
+      expect(refused, host).toBeInstanceOf(UpgradeRefused);
+      expect((refused as UpgradeRefused).status, host).toBe(400);
+    }
+    for (const host of ['2130706433', '127.1', '[0:0:0:0:0:0:0:1]']) {
+      expect(await answer('/mcp', host), host).toBe(403);
+    }
   });
 
   it('lists exactly the five fixed tools, each saying page content is untrusted', async () => {

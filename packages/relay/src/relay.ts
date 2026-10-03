@@ -1,32 +1,47 @@
 // One node:http server for everything: /page upgrades to the page link through
-// `ws`, /mcp goes through the official MCP SDK, /healthz answers ok. Checks run
+// `ws`, /mcp goes through the official MCP SDK, /healthz answers ok, and the
+// auth plugin may add GET routes such as its metadata document. Checks run
 // before any protocol code sees a request: origin, subprotocol and the socket
-// limits for pages (S1, S2, S9), Host and the auth plugin for MCP clients. /mcp
-// has two legs behind those checks, composed as the SDK documents (ADR 0009):
-// 2025-era traffic goes to the sessionful leg in sessions.ts, everything else to
-// a strict 2026-07-28 handler.
+// limits for pages (S1, S2, S9), Host and the auth plugin for MCP clients, so
+// every unauthenticated /mcp request gets the plugin's challenge before either
+// leg runs. Before all of them, a Host header that is not a host and optional
+// port (RFC 9110) makes the request a 400, and an allowlist matches a Host
+// only as written, never as the URL parser would rewrite it. /mcp has two legs
+// behind those checks, composed as the SDK documents (ADR 0009): 2025-era
+// traffic goes to the sessionful leg in sessions.ts, everything else to a
+// strict 2026-07-28 handler. In public URL mode (ADR 0014) the public host
+// passes the Host check for /mcp and the QR flow at /pair (pair.ts) is served
+// behind the same check, while /page still takes only requests made on this
+// machine. Requests are logged by route, never by raw path or query, so no
+// secret a URL carries reaches a log. The M3 spike's measurements (spike.ts)
+// hook in here when TABDOCK_SPIKE is on; nothing over HTTP controls them.
 
 import { createServer, type IncomingMessage, type ServerResponse, STATUS_CODES } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { Duplex } from 'node:stream';
-import {
-  localhostHostValidation,
-  type NodeIncomingMessageLike,
-  toNodeHandler,
-} from '@modelcontextprotocol/node';
+import { type NodeIncomingMessageLike, toNodeHandler } from '@modelcontextprotocol/node';
 import {
   type AuthInfo,
   createMcpHandler,
   isLegacyRequest,
   type McpHandlerRequestOptions,
 } from '@modelcontextprotocol/server';
-import { MAX_FRAME_BYTES, SUBPROTOCOL, type User, UserSchema } from '@tabdock/protocol';
+import { MAX_FRAME_BYTES, SUBPROTOCOL } from '@tabdock/protocol';
 import { WebSocketServer } from 'ws';
-import { NO_ORIGIN, type RelayOptions, resolveConfig } from './config.ts';
+import { type AuthOutcome, AuthOutcomeSchema, type AuthRoute } from './auth.ts';
+import {
+  LOOPBACK_HOSTNAMES,
+  NO_ORIGIN,
+  parseHostHeader,
+  type RelayOptions,
+  resolveConfig,
+} from './config.ts';
 import { PageHub } from './hub.ts';
 import { createLogger } from './log.ts';
 import { type AuthExtra, createMcpFactory, userIdOf } from './mcp.ts';
+import { createPairFlow, PAIR_ROUTES, type PairFlow } from './pair.ts';
 import { McpSessions } from './sessions.ts';
+import { Spike, type SpikeControl } from './spike.ts';
 import { type AuditRecord, createMemoryStore } from './store.ts';
 
 export interface Relay {
@@ -36,8 +51,56 @@ export interface Relay {
   readonly pageUrl: string;
   /** http://127.0.0.1:<port>/mcp */
   readonly mcpUrl: string;
+  /** The public origin in public URL mode, else null. */
+  readonly publicUrl: string | null;
+  /** `<publicUrl>/mcp`, the connector URL, in public URL mode; else null. */
+  readonly publicMcpUrl: string | null;
   readonly audit: { records(): AuditRecord[] };
+  /**
+   * The spike's marker control while TABDOCK_SPIKE is on, else null. Reached
+   * from the relay's own process only (main.ts reads it from stdin).
+   */
+  readonly spike: SpikeControl | null;
   close(): Promise<void>;
+}
+
+/**
+ * Whether a request's Host header, if it has one, is no host at all, or is
+ * one of several. Such a request is malformed (400, RFC 9112 section 3.2)
+ * before any route or allowlist reads its Host: Node keeps only the first of
+ * several Host lines, while a proxy in front may have routed on another. A
+ * missing Host is left to the checks that need one, which refuse it.
+ */
+function malformedHost(request: IncomingMessage): boolean {
+  let lines = 0;
+  for (let index = 0; index < request.rawHeaders.length; index += 2) {
+    if (request.rawHeaders[index]?.toLowerCase() === 'host') lines += 1;
+  }
+  if (lines > 1) return true;
+  const host = request.headers.host;
+  return host !== undefined && parseHostHeader(host) === null;
+}
+
+/**
+ * Whether a /page upgrade was made on this machine rather than through the
+ * tunnel. The Host must be a loopback name exactly as written, and no proxy
+ * header may be present: a tunnel told to rewrite Host still adds
+ * X-Forwarded-For, while a browser's WebSocket can set neither.
+ */
+function madeLocally(request: IncomingMessage): boolean {
+  const host = request.headers.host === undefined ? null : parseHostHeader(request.headers.host);
+  if (host === null || !LOOPBACK_HOSTNAMES.includes(host)) return false;
+  return !Object.keys(request.headers).some(
+    (name) => name === 'forwarded' || name.startsWith('x-forwarded-'),
+  );
+}
+
+/**
+ * What kind of error reached a catch-all, for a log line that leaves out its
+ * message: a library's message may quote the request URL with its query.
+ */
+function errorClass(error: unknown): string {
+  return error instanceof Error ? error.name : typeof error;
 }
 
 /**
@@ -45,6 +108,10 @@ export interface Relay {
  * most MAX_FRAME_BYTES, so a call cannot usefully carry more than about that.
  */
 const MAX_MCP_BODY_BYTES = 2 * MAX_FRAME_BYTES;
+
+/** Paths the relay answers whatever its mode; any other is logged as OTHER_ROUTE. */
+const FIXED_ROUTES: readonly string[] = ['/healthz', '/mcp', '/page', ...PAIR_ROUTES];
+const OTHER_ROUTE = '(other)';
 
 function pathOf(rawUrl: string | undefined): string | null {
   const raw = rawUrl ?? '/';
@@ -97,10 +164,34 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     ...(options.logLevel ? { level: options.logLevel } : {}),
   });
   const auth = options.auth;
+  // First, before anything else exists: a plugin that cannot work (an identity
+  // provider Claude could not sign in with, say) stops the relay from starting.
+  await auth.start?.();
   const store = options.store ?? createMemoryStore();
-  const hub = new PageHub(config, store, log);
+  const spike = config.spike ? new Spike(log, MAX_MCP_BODY_BYTES) : null;
+  const hub = new PageHub(config, store, log, spike);
+  let pair: PairFlow | null = null;
+  if (config.publicUrl !== null) {
+    try {
+      // resolveConfig refused public URL mode without either of these.
+      if (options.pairClient === undefined || auth.browserSignIn === undefined) {
+        throw new Error('public URL mode needs the /pair sign-in client and a provider plugin');
+      }
+      pair = createPairFlow({
+        publicUrl: config.publicUrl,
+        client: options.pairClient,
+        signIn: auth.browserSignIn,
+        hub,
+        config,
+        log,
+      });
+    } catch (error) {
+      await hub.shutdown();
+      throw error;
+    }
+  }
 
-  const factory = createMcpFactory(hub, config);
+  const factory = createMcpFactory(hub, config, spike);
   const mcp = createMcpHandler(factory, {
     legacy: 'reject',
     maxRequestBodySize: MAX_MCP_BODY_BYTES,
@@ -108,6 +199,9 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     onerror: (error) => {
       log.warn('mcp handler error', { error });
     },
+  });
+  spike?.setModernNotifier(() => {
+    mcp.notify.toolsChanged();
   });
   const sessions = new McpSessions({
     createServer: (authInfo, request) => factory({ era: 'legacy', authInfo, requestInfo: request }),
@@ -120,19 +214,54 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     log,
   });
   const legs = {
-    fetch: async (request: Request, options?: McpHandlerRequestOptions): Promise<Response> =>
-      (await isLegacyRequest(request, undefined, { maxRequestBodySize: MAX_MCP_BODY_BYTES }))
-        ? sessions.handle(request, options?.authInfo)
-        : mcp.fetch(request, options),
+    fetch: async (request: Request, options?: McpHandlerRequestOptions): Promise<Response> => {
+      const legacy = await isLegacyRequest(request, undefined, {
+        maxRequestBodySize: MAX_MCP_BODY_BYTES,
+      });
+      const forward = (forwarded: Request): Promise<Response> =>
+        legacy ? sessions.handle(forwarded, options?.authInfo) : mcp.fetch(forwarded, options);
+      const userId = userIdOf(options?.authInfo);
+      return spike && userId !== null
+        ? spike.observe(request, { userId, legacy }, forward)
+        : forward(request);
+    },
   };
   const mcpNode = toNodeHandler(legs, {
     maxRequestBodySize: MAX_MCP_BODY_BYTES,
     onerror: (error) => {
-      log.error('mcp adapter error', { error });
+      // undici's message for a Request it cannot build quotes the URL, query and all.
+      log.error('mcp adapter error', { errorClass: errorClass(error) });
     },
   });
-  // DNS rebinding guard: a loopback relay only answers Host names that mean loopback.
-  const validateHost = localhostHostValidation();
+  /**
+   * The DNS rebinding guard: a loopback relay only answers Host names that
+   * mean loopback, plus the public host in public URL mode, each exactly as
+   * written. The answer keeps the shape of the SDK's own guard.
+   */
+  const validateHost = (request: IncomingMessage, response: ServerResponse): boolean => {
+    const host = request.headers.host === undefined ? null : parseHostHeader(request.headers.host);
+    if (host !== null && config.allowedHosts.includes(host)) return true;
+    send(
+      response,
+      403,
+      JSON.stringify({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Invalid Host' },
+        id: null,
+      }),
+      { 'Content-Type': 'application/json' },
+    );
+    return false;
+  };
+  const authRoutes: ReadonlyMap<string, AuthRoute> = auth.routes ?? new Map();
+  const knownRoutes = new Set([...FIXED_ROUTES, ...authRoutes.keys()]);
+  /**
+   * The name a request is logged under: a route the relay knows, or one word
+   * for anything else, so a secret someone puts in a path or query (a nonce
+   * in the wrong place, a code in a link) never reaches a log line.
+   */
+  const routeOf = (path: string | null): string =>
+    path !== null && knownRoutes.has(path) ? path : OTHER_ROUTE;
 
   const wss = new WebSocketServer({
     noServer: true,
@@ -141,35 +270,56 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     handleProtocols: (protocols) => (protocols.has(SUBPROTOCOL) ? SUBPROTOCOL : false),
   });
 
-  async function handleMcp(request: IncomingMessage, response: ServerResponse): Promise<void> {
-    if (config.loopback && !validateHost(request, response)) return;
-    let user: User | null;
+  /** The plugin's answer, checked like any other boundary; null after answering a broken plugin. */
+  async function authenticate(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<AuthOutcome | null> {
+    let outcome: unknown;
     try {
-      user = await auth.authenticate(request);
+      outcome = await auth.authenticate(request);
     } catch (error) {
       log.error('auth plugin failed', { plugin: auth.name, error });
       send(response, 500, 'Authentication failed');
-      return;
+      return null;
     }
-    const parsed = user === null ? null : UserSchema.safeParse(user);
-    if (!parsed?.success) {
-      log.info('mcp request refused: not authenticated', {
-        address: request.socket.remoteAddress,
-      });
-      send(response, 401, 'Unauthorized', { 'WWW-Authenticate': 'Bearer realm="tabdock"' });
+    const parsed = AuthOutcomeSchema.safeParse(outcome);
+    if (!parsed.success) {
+      log.error('auth plugin gave a malformed answer', { plugin: auth.name });
+      send(response, 500, 'Authentication failed');
+      return null;
+    }
+    return parsed.data;
+  }
+
+  async function handleMcp(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    // Where the spike's call timestamps start: before the Host check, sign-in and the SDK.
+    const receivedAt = performance.now();
+    if (config.loopback && !validateHost(request, response)) return;
+    const outcome = await authenticate(request, response);
+    if (outcome === null) return;
+    if (outcome.kind === 'refused') {
+      // The reason is the plugin's fixed phrase; the credential itself never gets here.
+      const event =
+        outcome.status === 401
+          ? 'mcp request refused: not authenticated'
+          : outcome.status === 403
+            ? 'mcp request refused: not allowed'
+            : 'mcp request refused: sign-in unavailable';
+      log.info(event, { reason: outcome.reason, address: request.socket.remoteAddress });
+      send(response, outcome.status, outcome.body, outcome.headers);
       return;
     }
     const extra: AuthExtra = {
-      userId: parsed.data.userId,
-      displayName: parsed.data.displayName,
-      clientAddress: request.socket.remoteAddress ?? 'unknown',
+      userId: outcome.user.userId,
+      displayName: outcome.user.displayName,
     };
     // The SDK requires a token field; the real one stays out of everything downstream.
     const authInfo: AuthInfo = {
       token: '',
-      clientId: parsed.data.userId,
+      clientId: outcome.user.userId,
       scopes: [],
-      extra: { ...extra },
+      extra: { ...extra, ...(spike ? { receivedAt } : {}) },
     };
     // toNodeHandler forwards req.auth as authInfo. IncomingMessage needs the cast
     // under exactOptionalPropertyTypes (method is string | undefined there).
@@ -178,10 +328,32 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     await mcpNode(withAuth as NodeIncomingMessageLike, response);
   }
 
+  /** A plugin's GET route, such as its metadata document, behind the same Host check as /mcp. */
+  async function handleAuthRoute(
+    handler: AuthRoute,
+    path: string,
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    if (config.loopback && !validateHost(request, response)) return;
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      send(response, 405, 'Method not allowed', { Allow: 'GET, HEAD' });
+      return;
+    }
+    // Only the path and method reach the plugin; the base is a placeholder.
+    const answer = await handler(
+      new Request(new URL(path, 'http://relay.invalid'), { method: request.method }),
+    );
+    const body = request.method === 'HEAD' ? undefined : Buffer.from(await answer.arrayBuffer());
+    response.writeHead(answer.status, Object.fromEntries(answer.headers.entries()));
+    response.end(body);
+  }
+
   const server = createServer((request, response) => {
     const path = pathOf(request.url);
     const route = async (): Promise<void> => {
-      if (path === null) {
+      const authRoute = path === null ? undefined : authRoutes.get(path);
+      if (path === null || malformedHost(request)) {
         send(response, 400, 'Bad request');
       } else if (path === '/healthz') {
         if (request.method === 'GET' || request.method === 'HEAD') send(response, 200, 'ok');
@@ -190,21 +362,45 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         await handleMcp(request, response);
       } else if (path === '/page') {
         send(response, 426, 'Upgrade required', { Upgrade: 'websocket' });
+      } else if (authRoute !== undefined) {
+        await handleAuthRoute(authRoute, path, request, response);
+      } else if (pair !== null && PAIR_ROUTES.includes(path)) {
+        // The DNS rebinding guard, as for /mcp: the public host or a loopback name.
+        if (!validateHost(request, response)) return;
+        await pair.handle(path, request, response);
       } else {
         send(response, 404, 'Not found');
       }
     };
     route().catch((error: unknown) => {
-      log.error('request failed', { path, error });
+      log.error('request failed', { route: routeOf(path), error });
       if (!response.headersSent) send(response, 500, 'Internal error');
       else response.destroy();
     });
   });
+  // Node stops collecting header lines past maxHeadersCount (2000 entries) and
+  // drops the rest unseen, so a second Host line or a proxy header placed after
+  // a thousand filler lines would slip past malformedHost and madeLocally. Count
+  // every line; maxHeaderSize still caps the whole header at 16 KiB (431).
+  server.maxHeadersCount = 0;
 
   server.on('upgrade', (request: IncomingMessage, socket: Duplex, head: Buffer) => {
     const address = request.socket.remoteAddress ?? 'unknown';
     if (pathOf(request.url) !== '/page') {
       refuseUpgrade(socket, 404, 'Not found');
+      return;
+    }
+    if (malformedHost(request)) {
+      log.info('page socket refused: malformed Host', { address });
+      refuseUpgrade(socket, 400, 'Bad request');
+      return;
+    }
+    // ADR 0014: every request through the tunnel arrives from loopback, so the
+    // address says nothing; the Host and proxy headers do. Pages attach only
+    // from this machine until M4 brings a host and a trusted client address.
+    if (config.publicUrl !== null && !madeLocally(request)) {
+      log.info('page socket refused: not made on this machine', { address });
+      refuseUpgrade(socket, 403, 'Pages attach only from the relay machine itself');
       return;
     }
     if (!offeredProtocols(request.headers['sec-websocket-protocol']).includes(SUBPROTOCOL)) {
@@ -257,6 +453,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     });
   } catch (error) {
     // A port in use must not leave the MCP handler, the socket server or the check worker behind.
+    pair?.close();
     wss.close();
     await hub.shutdown();
     await mcp.close();
@@ -268,20 +465,31 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   const url = `http://${hostPort}`;
   log.info('relay listening', {
     url,
+    publicUrl: config.publicUrl,
     env: config.env,
     auth: auth.name,
     origins: config.originPolicy,
     allowMissingOrigin: config.allowMissingOrigin,
+    spike: config.spike,
   });
+  if (spike) {
+    log.warn(
+      'spike measurements are on (TABDOCK_SPIKE): every tools/list, client stream, call timing and pairing milestone is logged, and a marker tool can be added from the terminal (ADR 0014)',
+    );
+  }
 
   let closing: Promise<void> | null = null;
   return {
     url,
     pageUrl: `ws://${hostPort}/page`,
     mcpUrl: `${url}/mcp`,
+    publicUrl: config.publicUrl,
+    publicMcpUrl: config.publicMcpUrl,
     audit: { records: () => store.audit.records() },
+    spike,
     close() {
       closing ??= (async () => {
+        pair?.close();
         await hub.shutdown();
         for (const ws of wss.clients) ws.terminate();
         await new Promise<void>((resolveClose) => {
