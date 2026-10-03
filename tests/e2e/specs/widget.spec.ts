@@ -23,6 +23,7 @@ import {
   waitForDock,
   widgetButtonCentre,
   widgetButtonNow,
+  widgetItems,
   widgetText,
   widgetVisible,
 } from '../src/tabdock-harness.ts';
@@ -337,6 +338,22 @@ function framesOf<T extends PageFrame['t']>(relay: FakeRelay, type: T) {
   return relay.frames.filter((frame): frame is Extract<PageFrame, { t: T }> => frame.t === type);
 }
 
+/**
+ * An attach request the operator approves through the page's handle. The
+ * scripted relay ignores the decision; the test sends the roster itself.
+ */
+async function approveOnPage(
+  page: Page,
+  relay: FakeRelay,
+  userId: string,
+  role: Role,
+): Promise<void> {
+  const requestId = `req-${userId}`;
+  relay.send(attachRequest(requestId, userId));
+  await waitForDock(page, (state) => state.pendingRequests.some((r) => r.requestId === requestId));
+  expect(await approveThroughHandle(page, requestId, role)).toBe(true);
+}
+
 function invokeFrame(
   callId: string,
   tool: string,
@@ -354,6 +371,8 @@ function invokeFrame(
 
 test('Make driver and Make observer send set_role for that row', async ({ page }) => {
   const relay = await openWithFakeRelay(page);
+  // The switch is only offered on rows the operator approved here.
+  await approveOnPage(page, relay, 'bob', 'observer');
   relay.send({
     t: 'roster',
     attachments: [attachment('alice', 'Alice'), attachment('bob', 'Bob', 'observer')],
@@ -403,6 +422,7 @@ test('Revoke ends one attachment and Revoke all ends every one', async ({ page }
 
 test('a roster row that moves disarms its buttons until it holds still', async ({ page }) => {
   const relay = await openWithFakeRelay(page);
+  await approveOnPage(page, relay, 'bob', 'observer');
   relay.send({
     t: 'roster',
     attachments: [attachment('bob', 'Bob', 'observer'), attachment('carol', 'Carol')],
@@ -445,6 +465,7 @@ test('a role switch the relay flips under the pointer waits again, though nothin
   page,
 }) => {
   const relay = await openWithFakeRelay(page);
+  await approveOnPage(page, relay, 'bob', 'driver');
   relay.send({ t: 'roster', attachments: [attachment('bob', 'Bob')] });
   const aimed = await widgetButtonCentre(page, { action: 'make-observer', userId: 'bob' });
 
@@ -457,6 +478,86 @@ test('a role switch the relay flips under the pointer waits again, though nothin
   await page.mouse.click(aimed.x, aimed.y);
   await page.clock.runFor(ARM_DELAY_MS);
   expect(framesOf(relay, 'set_role')).toEqual([]);
+});
+
+test('a client list that keeps changing neither moves a row nor makes its buttons wait again', async ({
+  page,
+}) => {
+  const relay = await openWithFakeRelay(page);
+  await approveOnPage(page, relay, 'alice', 'driver');
+  const withClients = (count: number, round: number): AttachmentView => ({
+    ...attachment('alice', 'Alice'),
+    clients: Array.from({ length: count }, (_, i) => ({
+      name: `a-client-that-renames-itself-${String(round)}-${String(i)}`,
+      version: '1.0.0',
+    })),
+  });
+  relay.send({ t: 'roster', attachments: [withClients(1, 0)] });
+  const target = { action: 'revoke', userId: 'alice' };
+  const before = await widgetButtonCentre(page, target);
+
+  await pauseClock(page);
+  // Any attached client names itself, on every call if it likes, and each new name is a new roster.
+  for (let round = 1; round <= 5; round += 1) {
+    relay.send({ t: 'roster', attachments: [withClients(round * 4, round)] });
+    await waitForDock(page, (state) => state.roster[0]?.clients.length === round * 4);
+    expect(await widgetButtonNow(page, target)).toEqual({ armed: true, ...before });
+  }
+  await page.mouse.click(before.x, before.y);
+  await expect.poll(() => framesOf(relay, 'revoke')).toEqual([{ t: 'revoke', userId: 'alice' }]);
+});
+
+test('a row the page never approved says so and offers only Revoke, and every row shows the role the page enforces', async ({
+  page,
+}) => {
+  const relay = await openWithFakeRelay(page);
+  await approveOnPage(page, relay, 'bob', 'observer');
+  // The relay claims both drive; only Bob was approved here, and as an observer.
+  relay.send({
+    t: 'roster',
+    attachments: [attachment('mallory', 'Mallory'), attachment('bob', 'Bob')],
+  });
+  await waitForDock(page, (state) => state.roster.length === 2);
+  const rows = await widgetItems(page, 'roster');
+  expect(rows[0]?.text).toContain('Mallory (not approved on this page)');
+  expect(rows[1]?.text).toContain('Bob (observer)');
+  for (const action of ['make-driver', 'make-observer']) {
+    expect(await widgetButtonNow(page, { action, userId: 'mallory' })).toBeNull();
+  }
+
+  // Bob's switch offers what he lacks on this page, whatever the relay says.
+  await clickInWidget(page, { action: 'make-driver', userId: 'bob' });
+  await expect
+    .poll(() => framesOf(relay, 'set_role'))
+    .toEqual([{ t: 'set_role', userId: 'bob', role: 'driver' }]);
+  await clickInWidget(page, { action: 'revoke', userId: 'mallory' });
+  await expect.poll(() => framesOf(relay, 'revoke')).toEqual([{ t: 'revoke', userId: 'mallory' }]);
+  // Until the relay drops her, her row says the revoke is on its way.
+  await expect
+    .poll(async () => (await widgetItems(page, 'roster'))[0]?.text)
+    .toContain('Mallory (revoke pending)');
+});
+
+test('the pause switch waits again after it flips, so a double click cannot pause and resume', async ({
+  page,
+}) => {
+  await openWithFakeRelay(page);
+  const aimed = await widgetButtonCentre(page, { action: 'pause' });
+
+  await pauseClock(page);
+  await page.mouse.click(aimed.x, aimed.y);
+  await waitForDock(page, (state) => state.paused);
+  expect((await widgetButtonNow(page, { action: 'resume' }))?.armed).toBe(false);
+  // The second click of a double click lands on Resume, which does nothing yet.
+  await page.mouse.click(aimed.x, aimed.y);
+  await page.clock.runFor(ARM_DELAY_MS - 100);
+  expect((await dockState(page))?.paused).toBe(true);
+  expect((await widgetButtonNow(page, { action: 'resume' }))?.armed).toBe(false);
+  await page.clock.runFor(100);
+  expect((await widgetButtonNow(page, { action: 'resume' }))?.armed).toBe(true);
+
+  await page.mouse.click(aimed.x, aimed.y);
+  await waitForDock(page, (state) => !state.paused);
 });
 
 test('the activity log names the user, client, tool and outcome of each call', async ({ page }) => {

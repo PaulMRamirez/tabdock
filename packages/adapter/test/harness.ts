@@ -31,6 +31,7 @@ import {
 export const RELAY_URL = 'ws://relay.test/page';
 export const RESUME_KEY = `tabdock:resume:${RELAY_URL}`;
 export const GRANTS_KEY = `tabdock:grants:${RELAY_URL}`;
+export const REVOKED_KEY = `tabdock:revoked:${RELAY_URL}`;
 export const PAGE_WINDOW = { label: 'page window' };
 export const FRAME_WINDOW = { label: 'iframe window' };
 export const HANDLER_FAILED =
@@ -176,8 +177,12 @@ export class TestContext implements ModelContextLike {
   readonly runs: { tool: string; args: unknown; signal: AbortSignal }[] = [];
   readonly #listeners = new Set<() => void>();
 
-  constructor(tools: RuntimeTool[]) {
+  constructor(tools: RuntimeTool[], polyfill = false) {
     this.tools = tools;
+    // The MCP-B polyfill 5.1 marks its context this way (dist/index.js), which
+    // tells the adapter that handlers never see the call's signal. Tests that
+    // play it use handlers that ignore theirs.
+    if (polyfill) Object.defineProperty(this, '__isWebMCPPolyfill', { value: true });
   }
 
   getTools(): Promise<readonly RuntimeTool[]> {
@@ -304,10 +309,12 @@ export function setup(
     browserCloseRules?: boolean;
     /** sessionStorage shared with an earlier harness, to play a page reload. */
     storage?: MapStorage;
+    /** Mark the runtime as the MCP-B polyfill 5.1, whose handlers never see the call's signal. */
+    polyfill?: boolean;
   } = {},
 ): Harness {
   const clock = new ManualClock();
-  const context = new TestContext(options.tools ?? chromeTools());
+  const context = new TestContext(options.tools ?? chromeTools(), options.polyfill);
   const storage = options.storage ?? new MapStorage();
   const sockets: FakeSocket[] = [];
   const logs: string[] = [];

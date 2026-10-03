@@ -15,6 +15,7 @@ import {
   link,
   RELAY_URL,
   results,
+  REVOKED_KEY,
   runtimeTool,
   setup,
   welcome,
@@ -209,7 +210,9 @@ describe('the write queue', () => {
     expect(h.context.runs).toHaveLength(1);
   });
 
-  it('lets the next write go when the running one is cancelled or times out', async () => {
+  it('lets the next write go once a runtime that hands handlers the signal gives up on a cancelled or timed-out one', async () => {
+    // The test runtime rejects at abort, as native WebMCP does after firing
+    // the handler's own signal; a handler that ignores that signal is the page's bug.
     const h = setup();
     holdHandlers(h, ['set_value']);
     const socket = await link(h);
@@ -219,10 +222,82 @@ describe('the write queue', () => {
     await flush();
     await h.clock.advance(500);
     expect(h.context.runs).toHaveLength(2);
+    expect(h.context.runs[0]?.signal.aborted).toBe(true);
     socket.deliver({ t: 'cancel', callId: 'two' });
     await flush();
     expect(h.context.runs).toHaveLength(3);
     expect(outcomes(socket)).toEqual({ one: 'timeout', two: 'cancelled' });
+    expect(h.dock.state.activity.map((entry) => entry.handlerRunning)).toEqual([
+      false,
+      false,
+      false,
+    ]);
+  });
+
+  it.each([
+    ['a client cancel', 'cancelled'],
+    ['its deadline', 'timeout'],
+    ['a revoke', 'cancelled'],
+  ] as const)(
+    'on the polyfill, whose handlers never see the signal, a write answered by %s keeps the page until its handler ends',
+    async (how, code) => {
+      const h = setup({ polyfill: true });
+      const held = holdHandlers(h, ['set_value']);
+      const socket = await link(h, {}, { alice: 'driver', bob: 'driver' });
+      socket.deliver(
+        invoke('set_value', { callId: 'first', caller: caller('bob'), deadlineMs: 500 }),
+      );
+      socket.deliver(invoke('set_value', { callId: 'second' }));
+      await flush();
+      expect(h.context.runs).toHaveLength(1);
+
+      if (how === 'a client cancel') socket.deliver({ t: 'cancel', callId: 'first' });
+      if (how === 'its deadline') await h.clock.advance(500);
+      if (how === 'a revoke') expect(h.dock.revoke('bob')).toBe(true);
+      await flush();
+      // The relay hears at once, but the handler still runs, so the next write waits.
+      expect(outcomes(socket)).toEqual({ first: code });
+      expect(h.context.runs).toHaveLength(1);
+      expect(h.dock.state.activity.find((entry) => entry.callId === 'first')).toMatchObject({
+        outcome: code,
+        handlerRunning: true,
+      });
+
+      await held.release('set_value');
+      expect(h.context.runs.map((run) => run.args)).toEqual([{}, {}]);
+      expect(h.dock.state.activity.find((entry) => entry.callId === 'first')).toMatchObject({
+        outcome: code,
+        handlerRunning: false,
+      });
+      await held.release('set_value');
+      expect(outcomes(socket)).toEqual({ first: code, second: 'ok' });
+      expect(held.mostAtOnce).toBe(1);
+    },
+  );
+
+  it('waits for a runtime that never settles early, whatever answered the write', async () => {
+    const h = setup();
+    h.context.honoursAbort = false;
+    const held = holdHandlers(h, ['set_value']);
+    const socket = await link(h);
+    socket.deliver(invoke('set_value', { callId: 'first' }));
+    socket.deliver(invoke('set_value', { callId: 'second' }));
+    await flush();
+    socket.deliver({ t: 'cancel', callId: 'first' });
+    await flush();
+    expect(h.context.runs).toHaveLength(1);
+    // A link that drops and comes back changes nothing: the handler still holds the page.
+    socket.drop(1006);
+    await h.clock.advance(RECONNECT_MIN_MS);
+    const again = h.socket();
+    again.accept();
+    again.deliver(welcome(h.clock, { resumed: true, roster: [attachment('alice', 'driver')] }));
+    again.deliver(invoke('set_value', { callId: 'third' }));
+    await flush();
+    expect(h.context.runs).toHaveLength(1);
+    await held.release('set_value');
+    expect(h.context.runs).toHaveLength(2);
+    expect(held.mostAtOnce).toBe(1);
   });
 });
 
@@ -247,6 +322,7 @@ describe('the activity log (S7)', () => {
         tool: 'get_value',
         outcome: 'running',
         durationMs: null,
+        handlerRunning: false,
       },
     ]);
     await h.clock.advance(250);
@@ -369,6 +445,64 @@ describe("the operator's role switch", () => {
     expect(outcomes(socket)).toEqual({ 'call-1': 'ok' });
   });
 
+  it('refuses a listed user the page never approved, so a demotion click cannot grant access', async () => {
+    const h = setup();
+    const socket = await link(h, { roster: [attachment('mallory', 'driver')] }, {});
+    expect(h.dock.setRole('mallory', 'observer')).toBe(false);
+    expect(h.dock.setRole('mallory', 'driver')).toBe(false);
+    expect(socket.framesOf('set_role')).toEqual([]);
+    expect(storedGrants(h)).toBeNull();
+    socket.deliver(invoke('get_value', { caller: caller('mallory') }));
+    await flush();
+    expect(outcomes(socket)).toEqual({ 'call-1': 'role_denied' });
+  });
+
+  it('shows the role the page enforces for each listed user, which only lowers what the relay says', async () => {
+    const h = setup();
+    const socket = await link(h, {}, { alice: 'driver', bob: 'observer' });
+    socket.deliver({
+      t: 'roster',
+      attachments: [
+        attachment('mallory', 'driver'),
+        attachment('alice', 'driver'),
+        attachment('bob', 'driver'),
+      ],
+    });
+    expect(h.dock.state.pageRoles).toEqual([
+      { userId: 'mallory', role: null, revoked: false },
+      { userId: 'alice', role: 'driver', revoked: false },
+      { userId: 'bob', role: 'observer', revoked: false },
+    ]);
+    // A demotion holds on the page before the relay applies it, and a revoke at once.
+    expect(h.dock.setRole('alice', 'observer')).toBe(true);
+    expect(h.dock.revoke('bob')).toBe(true);
+    expect(h.dock.state.pageRoles).toEqual([
+      { userId: 'mallory', role: null, revoked: false },
+      { userId: 'alice', role: 'observer', revoked: false },
+      { userId: 'bob', role: null, revoked: true },
+    ]);
+
+    const auto = setup({ core: { policy: { autoApprove: 'observer' } } });
+    await link(auto, { roster: [attachment('carol', 'driver')] }, {});
+    expect(auto.dock.state.pageRoles).toEqual([
+      { userId: 'carol', role: 'observer', revoked: false },
+    ]);
+  });
+
+  it('refuses a confirmed consequential call whose caller was demoted while the prompt was up', async () => {
+    const h = setup();
+    const socket = await link(h, {}, { alice: 'driver', bob: 'driver' });
+    socket.deliver(invoke('wipe', { callId: 'bob-wipe', caller: caller('bob') }));
+    await flush();
+    expect(h.dock.state.pendingConfirms.map((item) => item.callId)).toEqual(['bob-wipe']);
+    // The relay checked Bob as a driver before sending the call; only the page sees this.
+    expect(h.dock.setRole('bob', 'observer')).toBe(true);
+    expect(h.dock.confirm('bob-wipe', true)).toBe(true);
+    await flush();
+    expect(outcomes(socket)).toEqual({ 'bob-wipe': 'role_denied' });
+    expect(h.context.runs).toEqual([]);
+  });
+
   it('refuses a user the roster does not list, a role that is not one, and a page not linked', async () => {
     const h = setup();
     const socket = await link(h, {}, { bob: 'observer' });
@@ -483,6 +617,55 @@ describe('revoke (S8)', () => {
     second.deliver(invoke('get_value', { caller: caller('bob') }));
     await flush();
     expect(outcomes(second)).toEqual({ 'call-1': 'role_denied' });
+  });
+
+  it.each(['none', 'observer'] as const)(
+    "keeps a revoke made while the link is down across a reload, sends it on resume and refuses the user meanwhile (autoApprove '%s')",
+    async (autoApprove) => {
+      const policy = { autoApprove };
+      const first = setup({ core: { policy } });
+      const bob = [attachment('bob', 'observer')];
+      const socket =
+        autoApprove === 'observer'
+          ? await link(first, { roster: bob }, {})
+          : await link(first, {}, { bob: 'observer' });
+      socket.drop(1006);
+      expect(first.dock.revoke('bob')).toBe(true);
+      expect(JSON.parse(first.storage.getItem(REVOKED_KEY) ?? 'null')).toEqual({
+        pageId: 'page-1',
+        users: ['bob'],
+      });
+      first.core.close('unload');
+
+      // The reload resumes the session before the revoke ever reached the relay.
+      const reloaded = setup({ storage: first.storage, core: { policy } });
+      const second = await link(
+        reloaded,
+        { resumed: true, resumeToken: 'resume-2', roster: bob },
+        {},
+      );
+      expect(second.framesOf('revoke')).toEqual([{ t: 'revoke', userId: 'bob' }]);
+      second.deliver(invoke('get_value', { caller: caller('bob', 'observer') }));
+      await flush();
+      expect(outcomes(second)).toEqual({ 'call-1': 'role_denied' });
+      expect(reloaded.dock.setRole('bob', 'driver')).toBe(false);
+
+      // Once the relay drops Bob, nothing is pending any more.
+      second.deliver({ t: 'roster', attachments: [] });
+      expect(reloaded.storage.getItem(REVOKED_KEY)).toBeNull();
+    },
+  );
+
+  it('forgets a pending revoke when the next session is a new one', async () => {
+    const first = setup();
+    const socket = await link(first, {}, { bob: 'driver' });
+    socket.drop(1006);
+    expect(first.dock.revoke('bob')).toBe(true);
+    first.core.close('unload');
+    const reloaded = setup({ storage: first.storage });
+    const second = await link(reloaded, { roster: [attachment('bob', 'driver')] }, {});
+    expect(second.framesOf('revoke')).toEqual([]);
+    expect(reloaded.storage.getItem(REVOKED_KEY)).toBeNull();
   });
 
   it('lets an approval after a revoke bring the user back', async () => {

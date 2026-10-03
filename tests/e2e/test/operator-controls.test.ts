@@ -14,6 +14,7 @@ import {
   holdRecord,
   holdTool,
   listPages,
+  pairingCode,
   queuedCallIds,
   SIM_TOOL_COUNT,
   startWorld,
@@ -151,6 +152,42 @@ describe('A2.4: revoke cancels an in-flight call and blocks the next one', () =>
     }
     expect(sim.store.calls).toEqual([]);
   });
+});
+
+describe('a revoke made while the link is down', () => {
+  it.each(['none', 'observer'] as const)(
+    "survives a reload before the link is back: the relay ends the attachment and the next call is not_attached (autoApprove '%s')",
+    async (autoApprove) => {
+      world = await startWorld();
+      const sim = await world.page({ policy: { autoApprove } });
+      const bob = await world.client(world.bob, 'bob-tablet');
+      let pageId: string;
+      if (autoApprove === 'none') {
+        pageId = await attachAs(bob, sim, 'observer');
+      } else {
+        const paired = await callTool(bob, 'pair_page', { code: await pairingCode(sim) });
+        expect(paired.isError, paired.text).toBe(false);
+        pageId = (paired.structured as { page: string }).page;
+      }
+      await sim.waitFor((s) => s.roster.some((attachment) => attachment.userId === 'bob'));
+      await waitForTools(bob, pageId, SIM_TOOL_COUNT);
+      const read = await callTool(bob, 'call_page_tool', { page: pageId, tool: 'get_value' });
+      expect(read.isError, read.text).toBe(false);
+
+      // The link drops, the operator revokes Bob before it is back, then reloads the tab.
+      sim.socket?.terminate();
+      await sim.waitFor((s) => s.link === 'reconnecting');
+      expect(sim.revoke('bob')).toBe(true);
+      await sim.reload();
+
+      // The reloaded page resumes the session and sends the revoke the relay never heard.
+      await sim.waitFor((s) => s.link === 'linked' && s.roster.length === 0);
+      const next = await callTool(bob, 'call_page_tool', { page: pageId, tool: 'get_value' });
+      expect(next.text).toBe(`not_attached: you are not attached to page ${pageId}`);
+      expect(await listPages(bob)).toEqual([]);
+      expect(sim.store.calls.map((call) => call.tool)).toEqual(['get_value']);
+    },
+  );
 });
 
 describe('A2.5: a consequential tool prompts on the page', () => {

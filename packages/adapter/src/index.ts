@@ -22,6 +22,7 @@ export type {
   HintSupport,
   LinkState,
   ModelContextLike,
+  PageRole,
   PendingConfirm,
   PendingRequest,
   RuntimeTool,
