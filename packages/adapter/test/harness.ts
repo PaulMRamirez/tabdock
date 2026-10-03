@@ -179,6 +179,15 @@ export class TestContext implements ModelContextLike {
   /** Handler runs only. */
   readonly runs: { tool: string; args: unknown; signal: AbortSignal }[] = [];
   readonly #listeners = new Set<() => void>();
+  /**
+   * One registration per tool, as the MCP-B polyfill 5.1 keeps the signal
+   * each registerTool call was given. Its executeTool races the handler
+   * against that signal as well as the caller's (dist/index.js,
+   * #invokeToolByName), so this runtime does too, whatever honoursAbort says.
+   */
+  readonly #registrations = new Map<string, AbortController>();
+  /** Tools unregistered and not listed again, which the polyfill no longer finds. */
+  readonly #unregistered = new Set<string>();
 
   constructor(tools: RuntimeTool[], polyfill = false) {
     this.tools = tools;
@@ -199,6 +208,11 @@ export class TestContext implements ModelContextLike {
   ): Promise<unknown> {
     await Promise.resolve();
     this.attempts.push({ tool: tool.name, input });
+    if (this.#unregistered.has(tool.name) && !this.tools.some((each) => each.name === tool.name)) {
+      // The polyfill's text for a tool missing when the call starts, before any handler runs.
+      throw new DOMException(`Tool not found: ${tool.name}`, 'UnknownError');
+    }
+    const registration = this.#registration(tool.name).signal;
     if (this.inputForm === 'string' && typeof input !== 'string') {
       throw new DOMException('Failed to parse input arguments', 'UnknownError');
     }
@@ -210,7 +224,7 @@ export class TestContext implements ModelContextLike {
     const args: unknown = typeof input === 'string' ? JSON.parse(input) : input;
     const handler: Handler = this.handlers.get(tool.name) ?? ((value) => value);
     this.runs.push({ tool: tool.name, args, signal: options.signal });
-    const run = Promise.resolve()
+    const handled = Promise.resolve()
       .then(() => handler(args, options.signal))
       .then(
         (value) =>
@@ -225,6 +239,17 @@ export class TestContext implements ModelContextLike {
           );
         },
       );
+    // Unregistering rejects the call at once and leaves the handler running.
+    const run = new Promise<string>((resolve, reject) => {
+      registration.addEventListener(
+        'abort',
+        () => {
+          reject(new DOMException('Tool unregistered', 'UnknownError'));
+        },
+        { once: true },
+      );
+      handled.then(resolve, reject);
+    });
     if (!this.honoursAbort) return run;
     return new Promise((resolve, reject) => {
       options.signal.addEventListener('abort', () => {
@@ -244,6 +269,29 @@ export class TestContext implements ModelContextLike {
 
   fireToolChange(): void {
     for (const listener of this.#listeners) listener();
+  }
+
+  /**
+   * Ends a tool's registration the way a page aborting its registerTool
+   * signal does, as a single-page app does when a view goes away: the tool
+   * leaves the list, and a call running it is rejected with the polyfill's
+   * 'Tool unregistered' while its handler runs on.
+   */
+  unregister(name: string): void {
+    this.#registration(name).abort();
+    this.#registrations.delete(name);
+    this.#unregistered.add(name);
+    this.tools = this.tools.filter((tool) => tool.name !== name);
+    this.fireToolChange();
+  }
+
+  #registration(name: string): AbortController {
+    let registration = this.#registrations.get(name);
+    if (!registration) {
+      registration = new AbortController();
+      this.#registrations.set(name, registration);
+    }
+    return registration;
   }
 
   get listenerCount(): number {
