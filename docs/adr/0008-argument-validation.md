@@ -1,6 +1,6 @@
 # 0008: Checking call arguments at the relay
 
-Status: Accepted by the owner, 2 October 2026. No SPEC change; refines how `invalid_arguments` (ADR 0007) is produced.
+Status: Accepted by the owner, 2 October 2026; amended by ADR 0010 (the check runs off the main thread with a time limit). No SPEC change; refines how `invalid_arguments` (ADR 0007) is produced.
 
 ## Context
 

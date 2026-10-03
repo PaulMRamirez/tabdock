@@ -79,7 +79,7 @@ Transport: WebSocket at `/page`, subprotocol `tabdock.v1`, JSON text frames shap
 
 | Direction | Type | Payload | Meaning |
 | --- | --- | --- | --- |
-| page to relay | `hello` | `v`, `resumeToken?`, `title`, `url`, `adapterVersion`, `policy` | First frame. A valid `resumeToken` resumes a session after reload |
+| page to relay | `hello` | `v`, `resumeToken?`, `title`, `url`, `adapterVersion`, `policy` | First frame. A valid `resumeToken` resumes a session after a reload of the same page (same origin and path; ADR 0011) |
 | relay to page | `welcome` | `pageId`, `resumeToken`, `resumed`, `pairing`, `roster`, `limits` | Session accepted; `resumed` says whether the resume token was honoured |
 | page to relay | `tools` | `tools[]` with `name`, `description`, `inputSchema`, `annotations` | Full replacement on every change |
 | relay to page | `attach_request` | `requestId`, `user`, `via`, `client?`, `expiresAt` | Someone wants to attach |
