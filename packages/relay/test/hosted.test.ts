@@ -5,13 +5,13 @@
 // missing, repeated or not an address is a 400 where requests count by
 // address; IPv4-mapped forms count as IPv4 and native IPv6 by its /56; pages
 // attach through the public host, under hosted mode's per-address limits;
-// sign-ins through /pair get a per-address share of the relay-wide budget,
-// counted by the client the edge names, while outside hosted mode every
-// tunnelled sign-in shares the relay-wide budget alone; and the platform's
-// own name for the app gets 403 everywhere but /healthz. Outside hosted mode
-// M3's rules stay exactly as they were. Ends with a signed-in client and a page
-// through the stand-in edge, and a scan of the audit files for anything S11
-// keeps out of them.
+// sign-ins through /pair, those /i starts included, get a per-address share
+// of the relay-wide budget, counted by the client the edge names, while
+// outside hosted mode every tunnelled sign-in shares the relay-wide budget
+// alone; and the platform's own name for the app gets 403 everywhere but
+// /healthz. Outside hosted mode M3's rules stay exactly as they were. Ends
+// with a signed-in client and a page through the stand-in edge, and a scan
+// of the audit files for anything S11 keeps out of them.
 
 import { randomBytes } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
@@ -638,15 +638,21 @@ describe('a relay on a host (ADR 0018)', () => {
   /**
    * A callback through the edge for a sign-in of the caller's own making,
    * with the login cookie and state anyone can send without a browser, from
-   * the client the edge names (none when address is null).
+   * the client the edge names (none when address is null). A sign-in /i
+   * started carries a fifth part naming it, and returns there.
    */
-  function forgedCallback(relay: Relay, address: string | null): Promise<RawAnswer> {
+  function forgedCallback(
+    relay: Relay,
+    address: string | null,
+    startedAt: 'pair' | 'i' = 'pair',
+  ): Promise<RawAnswer> {
     const part = (): string => randomBytes(32).toString('base64url');
     const state = part();
+    const target = startedAt === 'i' ? '.i' : '';
     return rawRequest(relay.url, `/pair/callback?code=made-up-${part()}&state=${state}`, {
       host: PUBLIC_HOST,
       headers: {
-        Cookie: `${LOGIN_COOKIE}=${state}.${part()}.${part()}.${String(Date.now() + 600_000)}`,
+        Cookie: `${LOGIN_COOKIE}=${state}.${part()}.${part()}.${String(Date.now() + 600_000)}${target}`,
         ...(address === null ? {} : { [HEADER]: address }),
       },
     });
@@ -702,6 +708,61 @@ describe('a relay on a host (ADR 0018)', () => {
       expect(tokens.count).toBe(22);
     } finally {
       tokens.release();
+      tokens.restore();
+    }
+  });
+
+  it('serves /i behind the same client address rule as /pair, and counts the sign-ins it starts against the same share', async () => {
+    const relay = await hosted({ invites: true });
+    const atI = (path: string, headers: Record<string, string>, body?: string) =>
+      rawRequest(relay.url, path, {
+        method: body === undefined ? 'GET' : 'POST',
+        host: PUBLIC_HOST,
+        headers: {
+          ...headers,
+          ...(body === undefined
+            ? {}
+            : { 'Content-Type': 'application/json', Origin: PUBLIC_ORIGIN }),
+        },
+        ...(body === undefined ? {} : { body }),
+      });
+    // /i counts previews and claims, so a request whose client the edge did not name is malformed.
+    expect((await atI('/i', {})).status).toBe(400);
+    expect(
+      await rawStatus(relay, [
+        'GET /i HTTP/1.1',
+        `Host: ${PUBLIC_HOST}`,
+        'Fly-Client-IP: 203.0.113.7',
+        'fly-client-ip: 198.51.100.1',
+        'Connection: close',
+      ]),
+    ).toBe(400);
+    const preview = JSON.stringify({ secret: 'A'.repeat(22) });
+    expect((await atI('/i/preview', {}, preview)).status).toBe(400);
+    expect((await atI('/i', { [HEADER]: '203.0.113.7' })).status).toBe(200);
+    // Named, the unknown secret gets /i's own answer rather than the 400.
+    expect((await atI('/i/preview', { [HEADER]: '203.0.113.7' }, preview)).status).toBe(404);
+    expect(lines.join('\n')).toContain('pair request refused: no client address');
+
+    // /i signs in through /pair/callback: its sign-ins go back to /i and spend the same share.
+    const tokens = watchTokenEndpoint();
+    try {
+      for (let index = 0; index < 10; index += 1) {
+        const back = await forgedCallback(relay, '203.0.113.9', 'i');
+        expect(back.headers.get('location')).toBe('/i?signin=failed');
+      }
+      expect(tokens.count).toBe(10);
+      expect((await forgedCallback(relay, '203.0.113.9', 'i')).headers.get('location')).toBe(
+        '/i?signin=failed',
+      );
+      expect((await forgedCallback(relay, '203.0.113.9')).headers.get('location')).toBe(FAILED);
+      expect(tokens.count).toBe(10);
+      expect(lines.join('\n')).toContain('too many sign-ins from one address in this window');
+      await forgedCallback(relay, '198.51.100.9', 'i');
+      expect(tokens.count).toBe(11);
+      expect((await forgedCallback(relay, null, 'i')).status).toBe(400);
+      expect(tokens.count).toBe(11);
+    } finally {
       tokens.restore();
     }
   });
