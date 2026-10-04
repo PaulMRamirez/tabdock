@@ -145,7 +145,13 @@ describe('a relay with an audit directory (ADR 0019)', () => {
     await relay.close();
     await running.catch(() => undefined);
     const written = records(dir);
-    expect(written.map((record) => record.type)).toEqual(['relay_start', 'call', 'relay_stop']);
+    // The approval writes its attach record (ADR 0019) before the call the shutdown fails.
+    expect(written.map((record) => record.type)).toEqual([
+      'relay_start',
+      'attach',
+      'call',
+      'relay_stop',
+    ]);
     expect(written[0]).toMatchObject({
       type: 'relay_start',
       seq: 1,
@@ -154,7 +160,8 @@ describe('a relay with an audit directory (ADR 0019)', () => {
       mode: 'dev_tokens',
       invites: false,
     });
-    expect(written[1]).toMatchObject({ type: 'call', outcome: 'page_asleep', userId: 'alice' });
+    expect(written[1]).toMatchObject({ type: 'attach', userId: 'alice', via: 'code' });
+    expect(written[2]).toMatchObject({ type: 'call', outcome: 'page_asleep', userId: 'alice' });
     expect(verifyAuditLines(readAuditLines(dir)).problems).toEqual([]);
     // The stderr copy is the file line, seq and prev included.
     const copy = relay.lines.find((line) => line.includes('"msg":"relay_start"')) ?? '';
@@ -177,7 +184,7 @@ describe('a relay with an audit directory (ADR 0019)', () => {
     });
     await again.close();
     const report = verifyAuditLines(readAuditLines(dir));
-    expect(report).toMatchObject({ records: 5, lastSeq: 5, problems: [] });
+    expect(report).toMatchObject({ records: 6, lastSeq: 6, problems: [] });
   });
 
   it("keeps local mode's log in audit/ beside its owner token, 0700", async () => {
@@ -286,7 +293,11 @@ function rawEscapes(text: string): boolean {
 }
 
 describe('pnpm audit:log', () => {
-  /** A relay run with two users' calls, one of them from a client whose name holds escapes. */
+  /**
+   * A relay run with two users' calls, one of them from a client whose name
+   * holds escapes: relay_start, Alice's attach and call, Bob's refused call,
+   * relay_stop.
+   */
   async function populated(): Promise<string> {
     const dir = join(scratch(), 'audit');
     const relay = await startRelay({ audit: { dir } });
@@ -331,7 +342,7 @@ describe('pnpm audit:log', () => {
     const dir = await populated();
     const all = run(['--dir', dir]);
     expect(all.code).toBe(0);
-    expect(all.out).toHaveLength(4);
+    expect(all.out).toHaveLength(5);
     expect(all.out[0]).toMatch(/^1 \d{4}-\d\d-\d\dT.* relay_start /);
     // Neither the bidi override nor the escape sequence reaches the terminal as itself.
     const joined = all.out.join('\n');
@@ -342,20 +353,21 @@ describe('pnpm audit:log', () => {
     expect(run(['--dir', dir, '--user', 'bob']).out).toHaveLength(1);
     expect(run(['--dir', dir, '--type', 'relay_start,relay_stop']).out).toHaveLength(2);
     expect(run(['--dir', dir, '--outcome', 'not_attached']).out[0]).toContain('userId="bob"');
-    expect(run(['--dir', dir, '--since', '1h']).out).toHaveLength(4);
+    expect(run(['--dir', dir, '--since', '1h']).out).toHaveLength(5);
     // Each filter leaves something out: two hours on, the last hour holds nothing.
     expect(run(['--dir', dir, '--since', '1h'], {}, Date.now() + 2 * 3_600_000).out).toHaveLength(
       0,
     );
     const at = records(dir).map((record) => record.at);
     const since = new Date(Math.max(...at)).toISOString();
-    expect(run(['--dir', dir, '--since', since]).out.length).toBeLessThan(4);
-    // The page's calls, and nothing that names no page.
+    expect(run(['--dir', dir, '--since', since]).out.length).toBeLessThan(5);
+    // The page's attachment and calls, and nothing that names no page.
     const pageId = records(dir).find((record) => record.type === 'call' && 'pageId' in record);
     const page = pageId !== undefined && 'pageId' in pageId ? pageId.pageId : '';
     const onPage = run(['--dir', dir, '--page', page]).out;
-    expect(onPage).toHaveLength(2);
-    expect(onPage.every((line) => line.includes(' call ') && line.includes(page))).toBe(true);
+    expect(onPage).toHaveLength(3);
+    expect(onPage.map((line) => line.split(' ')[2])).toEqual(['attach', 'call', 'call']);
+    expect(onPage.every((line) => line.includes(page))).toBe(true);
     expect(run(['--dir', dir, '--page', 'pg_another']).out).toHaveLength(0);
     expect(run(['--dir', dir, '--until', '2000-01-01T00:00:00Z']).out).toHaveLength(0);
     const json = run(['--dir', dir, '--json', '--type', 'call']).out;
@@ -363,7 +375,7 @@ describe('pnpm audit:log', () => {
     expect(AuditLineSchema.parse(JSON.parse(json[0] ?? '{}'))).toMatchObject({ type: 'call' });
     expect(rawEscapes(json.join('\n'))).toBe(false);
     // The directory may come from the environment instead.
-    expect(run([], { TABDOCK_AUDIT_DIR: dir }).out).toHaveLength(4);
+    expect(run([], { TABDOCK_AUDIT_DIR: dir }).out).toHaveLength(5);
   });
 
   it('verifies the chain, against a checkpoint too, and exits 1 when it is broken', async () => {
@@ -371,20 +383,22 @@ describe('pnpm audit:log', () => {
     const ok = run(['--dir', dir, '--verify']);
     expect(ok.code).toBe(0);
     expect(ok.err.at(-1)).toMatch(
-      /^verify: chain intact; 4 records in 1 files, seq 1 to 4, head [0-9a-f]{64}$/,
+      /^verify: chain intact; 5 records in 1 files, seq 1 to 5, head [0-9a-f]{64}$/,
     );
     const head = /head ([0-9a-f]{64})/.exec(ok.err.at(-1) ?? '')?.[1] ?? '';
-    expect(run(['--dir', dir, '--verify', '--checkpoint', `4:${head}`]).code).toBe(0);
-    expect(run(['--dir', dir, '--verify', '--checkpoint', `4:${'0'.repeat(64)}`]).code).toBe(1);
+    expect(run(['--dir', dir, '--verify', '--checkpoint', `5:${head}`]).code).toBe(0);
+    expect(run(['--dir', dir, '--verify', '--checkpoint', `5:${'0'.repeat(64)}`]).code).toBe(1);
 
     const [file] = listAuditFiles(dir);
     const path = join(dir, file?.name ?? '');
     const lines = readFileSync(path, 'utf8').split('\n');
-    lines[1] = (lines[1] ?? '').replace('"get_view"', '"add_item"');
+    // Alice's call, after relay_start and her attach record.
+    expect(lines[2]).toContain('"get_view"');
+    lines[2] = (lines[2] ?? '').replace('"get_view"', '"add_item"');
     writeFileSync(path, lines.join('\n'));
     const broken = run(['--dir', dir, '--verify']);
     expect(broken.code).toBe(1);
-    expect(broken.err.join('\n')).toMatch(/line 3: prev is not the digest of the previous record/);
+    expect(broken.err.join('\n')).toMatch(/line 4: prev is not the digest of the previous record/);
     expect(broken.err.at(-1)).toMatch(/^verify: BROKEN/);
   });
 

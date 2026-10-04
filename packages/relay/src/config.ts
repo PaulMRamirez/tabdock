@@ -117,12 +117,12 @@ export interface RelayRateLimits {
   /**
    * Requests one member may make to /mcp per window, every tool counted,
    * checked right after sign-in and before the access check, so refusals
-   * count too (ADR 0018, workstream A).
+   * count too (ADR 0018).
    */
   requestsPerUser: number;
-  /** The same for an invitee, smaller since anyone can become one (ADR 0018, workstream A). */
+  /** The same for an invitee, smaller since anyone can become one (ADR 0018). */
   requestsPerInvitee: number;
-  /** Redemptions of one invite per window, whoever makes them (ADR 0017, workstream A). */
+  /** Redemptions of one invite per window, whoever makes them (ADR 0017). */
   redemptionsPerInvite: number;
   /**
    * Sign-ins one client address may start at /pair and /i per window in
@@ -148,13 +148,12 @@ export interface RelayLimits {
   sessions: number;
   /**
    * Of those, the sessions all invitees may hold together: their own small
-   * pool, whose idlest session goes first when the relay is full (ADR 0016,
-   * workstream A).
+   * pool, whose idlest session goes first when the relay is full (ADR 0016).
    */
   inviteeSessions: number;
   /**
    * Sessions one invitee may hold once it holds an attachment; until then it
-   * may hold one (ADR 0016, workstream A).
+   * may hold one (ADR 0016).
    */
   sessionsPerInvitee: number;
   /** Distinct users attached to one page. */
@@ -276,8 +275,8 @@ export interface RelayOptions {
    * Invites (TABDOCK_INVITES, ADRs 0016 and 0017), off unless exactly true:
    * signed-in accounts off the allowlist become invitees, and pages mint
    * invites in the widget. Refused with local mode's plugin, which serves one
-   * user, and when usersPerPage leaves invites no seat. Workstream A builds
-   * them; until it does, the relay knows no invites either way.
+   * user, and when usersPerPage leaves invites no seat. Off, the relay sends
+   * pages no invites frame and answers every invitee with M3's 403.
    */
   invites?: boolean | undefined;
   /**
@@ -437,7 +436,7 @@ export interface ResolvedConfig {
   spike: boolean;
   /** How the relay runs, for its relay_start record (ADR 0019). */
   mode: RelayMode;
-  /** Invites are on (ADR 0017); workstream A acts on it. */
+  /** Invites are on (ADR 0017): the invitee tier, /i, and minting in the widget. */
   invites: boolean;
   /** Production with a public URL behind an edge that names the client in clientAddressHeader (ADR 0018). */
   hosted: boolean;

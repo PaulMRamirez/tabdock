@@ -1,7 +1,7 @@
 // Relay state behind small interfaces (SPEC section 4). Everything but the
 // audit log lives in memory, and a restart ends it all (ADR 0019); the
 // persistent audit log (FileAuditLog, audit-file.ts) sits behind the same
-// AuditLog, and invites (workstream A) behind InviteStore. Interfaces are
+// AuditLog, and live invites behind InviteStore. Interfaces are
 // synchronous on purpose: a persistent audit log can write behind, and the hub
 // never has to reason about interleaved awaits while it changes attachments.
 
@@ -218,7 +218,7 @@ export interface AttachRequestStore {
 /**
  * Live invites (ADR 0017), beside the single-use tickets: an invite has many
  * uses, a sponsor and bars, so it is a record of its own rather than a kind
- * of ticket. Workstream A builds the lifecycle on this store.
+ * of ticket. The hub runs their lifecycle on this store.
  */
 export interface InviteStore {
   get(pageId: string, inviteId: string): InviteRecord | undefined;
@@ -471,7 +471,7 @@ class MemoryAttachRequestStore implements AttachRequestStore {
   }
 }
 
-/** In memory only; workstream A may add indexes (by sponsor, say) as the lifecycle needs them. */
+/** In memory only, like everything but the audit log (ADR 0019). */
 export class MemoryInviteStore implements InviteStore {
   /** Each page's invites by id, oldest first, as a Map keeps insertion order. */
   readonly #byPage = new Map<string, Map<string, InviteRecord>>();
