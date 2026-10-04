@@ -69,6 +69,32 @@ export async function startRelay(options: Partial<RelayOptions> = {}): Promise<T
   return { relay, lines, close: () => relay.close() };
 }
 
+/**
+ * Keeps what a timed-out test opens late out of the next test. Vitest runs
+ * afterEach once a test times out but leaves the test itself running, so a
+ * relay, page or client it was still opening would land in the slots the
+ * next test fills, and nothing would close it. A file calls `end()` first in
+ * its afterEach and opens through `keep`, which closes anything that arrives
+ * after an `end()` and throws instead of handing it back.
+ */
+export class TestFence {
+  #ended = 0;
+
+  end(): void {
+    this.#ended += 1;
+  }
+
+  async keep<T>(opening: Promise<T>, close: (late: T) => unknown): Promise<T> {
+    const started = this.#ended;
+    const opened = await opening;
+    if (this.#ended !== started) {
+      await close(opened);
+      throw new Error('opened after its test had ended');
+    }
+    return opened;
+  }
+}
+
 export interface ClientOptions {
   name?: string;
   version?: string;

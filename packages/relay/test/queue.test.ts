@@ -27,6 +27,7 @@ import {
   eventually,
   pairAndApprove,
   startRelay,
+  TestFence,
   type TestRelay,
   type ToolOutcome,
 } from './helpers/relay.ts';
@@ -34,32 +35,46 @@ import {
 let current: TestRelay | undefined;
 const pages: TestPage[] = [];
 const clients: Client[] = [];
+const fence = new TestFence();
 
 async function setup(options: Parameters<typeof startRelay>[0] = {}): Promise<TestRelay> {
-  current = await startRelay(options);
+  current = await fence.keep(startRelay(options), (late) => late.close());
   return current;
 }
 
 async function page(options: PageOptions = {}): Promise<TestPage> {
   if (!current) throw new Error('no relay');
-  const opened = await connectPage(current.relay.pageUrl, { tools: TOOLS, ...options });
+  const opened = await fence.keep(
+    connectPage(current.relay.pageUrl, { tools: TOOLS, ...options }),
+    (late) => {
+      late.ws.terminate();
+    },
+  );
   pages.push(opened);
   return opened;
 }
 
 async function client(user = ALICE, options: ClientOptions = {}): Promise<Client> {
   if (!current) throw new Error('no relay');
-  const connected = await connectClient(current.relay, user, options);
+  const connected = await fence.keep(connectClient(current.relay, user, options), (late) =>
+    late.close(),
+  );
   clients.push(connected);
   return connected;
 }
 
 afterEach(async () => {
+  fence.end();
   vi.restoreAllMocks();
-  for (const connected of clients.splice(0)) await connected.close();
-  for (const opened of pages.splice(0)) opened.ws.terminate();
-  await current?.close();
+  const ending = current;
   current = undefined;
+  // The relay closes even if a client will not, so none outlives its test.
+  try {
+    for (const connected of clients.splice(0)) await connected.close();
+  } finally {
+    for (const opened of pages.splice(0)) opened.ws.terminate();
+    await ending?.close();
+  }
 });
 
 /** A page that holds every invoke until the test answers it. */
@@ -96,6 +111,10 @@ function queuedOrder(lines: string[]): string[] {
 }
 
 describe('the write queue (A2.3)', () => {
+  // A timeout of its own: three clients connect and two pair, then twenty
+  // writes run strictly one after another, each a round trip to the page and
+  // an audit line; about 0.7 s alone, and past vitest's default 5 s with
+  // three test runs sharing four cores.
   it('runs twenty concurrent mutating calls from three clients one at a time in arrival order, while reads interleave', async () => {
     const { relay, lines } = await setup({ timings: { callDeadlineMs: 10_000 } });
     let active = 0;
@@ -156,7 +175,7 @@ describe('the write queue (A2.3)', () => {
       ['bob', ['tablet']],
     ]);
     expect(relay.audit.records().filter((record) => record.tool === 'add_item')).toHaveLength(20);
-  });
+  }, 20_000);
 
   it("a queued call's deadline counts from arrival, not from when it reaches the page", async () => {
     await setup({ timings: { callDeadlineMs: 2000 } });

@@ -13,9 +13,13 @@ const audit = FileAuditLog.open({
   log: createLogger({ sink: (line) => process.stderr.write(`${line}\n`) }),
   lockStaleMs: staleMs === undefined ? undefined : Number(staleMs),
 });
-process.stdout.write('held\n');
 const alive = setInterval(() => undefined, 1000);
 process.once('SIGTERM', () => {
   clearInterval(alive);
   void audit.close();
 });
+// Only once the handler is in: a test may send SIGTERM the moment it reads
+// this line, and without a handler that signal kills the process outright,
+// leaving the lock behind as a crash would and failing a test that checks
+// close removed it.
+process.stdout.write('held\n');
