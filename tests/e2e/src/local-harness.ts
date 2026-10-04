@@ -114,6 +114,17 @@ export function runPnpm(args: string[], env: NodeJS.ProcessEnv): Run {
   };
 }
 
+/**
+ * Whether a `claude mcp list` line shows its server connected. Claude Code
+ * 2.1.288 draws the mark from the terminal's capabilities: a heavy check mark
+ * (U+2714) under TERM=xterm-256color, a square root sign (U+221A) under
+ * TERM=linux; the light check mark (U+2713) is allowed too, so the check
+ * holds whatever TERM it runs under.
+ */
+export function listsConnected(line: string): boolean {
+  return /[\u2713\u2714\u221a] Connected/u.test(line);
+}
+
 export interface PrintedBanner {
   mcpUrl: string;
   pageUrl: string;

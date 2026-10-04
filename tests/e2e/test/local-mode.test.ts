@@ -8,6 +8,7 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
@@ -16,10 +17,21 @@ import { leakIn } from '@tabdock/relay/test/secrecy';
 import { rawRequest } from '@tabdock/relay/test/tunnel';
 import { afterEach, describe, expect, it } from 'vitest';
 import { freePort } from '../src/harness.ts';
-import { blankEnv, readBanner, ROOT, type Run, runPnpm } from '../src/local-harness.ts';
+import {
+  blankEnv,
+  listsConnected,
+  readBanner,
+  ROOT,
+  type Run,
+  runPnpm,
+} from '../src/local-harness.ts';
 
 const scratches: string[] = [];
 const runs: Run[] = [];
+
+/** The step every local mode banner prints for an older tabdock-local entry in Claude Code. */
+const REMOVE_FIRST =
+  'If Claude Code says tabdock-local already exists, remove the old entry first: claude mcp remove --scope user tabdock-local';
 
 afterEach(async () => {
   for (const run of runs.splice(0)) await run.stop();
@@ -124,10 +136,49 @@ describe.skipIf(process.platform === 'win32')('local mode from a clean checkout'
     const again = readBanner(second.stdout());
     expect(again.created).toBe(false);
     expect(second.stdout()).toContain('(kept from an earlier start)');
-    expect(second.stdout()).not.toContain('claude mcp remove');
+    expect(second.stdout()).toContain(REMOVE_FIRST);
     expect(readFileSync(again.tokenPath).equals(bytes)).toBe(true);
     expect(await toolNames(again.mcpUrl, token)).toHaveLength(5);
     await stopAndScan(second, token);
+  }, 60_000);
+
+  it('a first start that cannot listen keeps the token it drew, and the next says how to replace an older entry', async () => {
+    const home = freshHome();
+    // Another relay, or one still closing after a rotation, holds the port.
+    const busy = createServer();
+    await new Promise<void>((resolve) => busy.listen(0, '127.0.0.1', resolve));
+    const address = busy.address();
+    const port = typeof address === 'object' && address !== null ? address.port : 0;
+    let failed: Run;
+    try {
+      failed = runPnpm(['relay'], {
+        ...blankEnv(),
+        TABDOCK_HOME: home,
+        TABDOCK_PORT: String(port),
+      });
+      runs.push(failed);
+      expect(await failed.exited).toBe(1);
+    } finally {
+      await new Promise((resolve) => busy.close(resolve));
+    }
+    expect(failed.stderr()).toContain('EADDRINUSE');
+    expect(failed.stdout()).not.toContain('claude mcp add');
+    // Left in place: a start racing this one may already serve it.
+    const bytes = readFileSync(join(home, 'owner-token'));
+    const token = bytes.toString('latin1').trim();
+
+    const next = start(['relay'], home);
+    await next.waitFor('claude mcp list');
+    const banner = readBanner(next.stdout());
+    expect(banner.created).toBe(false);
+    // No start served this token before, so Claude Code may hold an older one
+    // under tabdock-local, which claude mcp add will not overwrite.
+    expect(next.stdout()).toContain(REMOVE_FIRST);
+    expect(readFileSync(banner.tokenPath).equals(bytes)).toBe(true);
+    expect(await toolNames(banner.mcpUrl, token)).toHaveLength(5);
+    expect(leakIn(failed.stdout(), token), 'stdout').toBeNull();
+    expect(leakIn(failed.stderr(), token), 'stderr').toBeNull();
+    await stopAndScan(next, token);
   }, 60_000);
 
   it('pnpm dev adds the demo board, with the same banner and nothing secret', async () => {
@@ -205,4 +256,25 @@ describe.skipIf(process.platform === 'win32')('local mode from a clean checkout'
       await relay.close();
     }
   }, 60_000);
+});
+
+describe('reading claude mcp list, as check:claude-code:local does', () => {
+  it('sees a connected server whatever mark the terminal gets, and nothing else as connected', () => {
+    const line = (status: string): string =>
+      `tabdock-local: http://127.0.0.1:8787/mcp (HTTP) - ${status}`;
+    // U+2714 under TERM=xterm-256color and U+221A under TERM=linux, as
+    // Claude Code 2.1.288 printed them in the sandbox; U+2713 besides.
+    for (const mark of ['\u2714', '\u221a', '\u2713']) {
+      expect(listsConnected(line(`${mark} Connected`)), mark).toBe(true);
+    }
+    for (const status of [
+      '\u2718 Failed to connect',
+      '\u00d7 Failed to connect',
+      '! Needs authentication',
+      'Connected',
+    ]) {
+      expect(listsConnected(line(status)), status).toBe(false);
+    }
+    expect(listsConnected('(no line for the server)')).toBe(false);
+  });
 });

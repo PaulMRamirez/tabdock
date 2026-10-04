@@ -56,7 +56,14 @@ export interface LocalBanner {
   shell: Shell;
 }
 
-/** The local mode lines both banners share; the last one points the way to Claude in the cloud. */
+/**
+ * The local mode lines both banners share; the last one points the way to
+ * Claude in the cloud. The step for an older entry shows on every start, not
+ * only when the token is new: a start that drew the token and then could not
+ * listen leaves the next start reporting it kept, while Claude Code may still
+ * hold an earlier token under the same name, and `claude mcp add` refuses to
+ * replace an entry.
+ */
 export function localModeLines(banner: LocalBanner): string[] {
   return [
     'Local mode: this relay serves MCP clients on this computer only, and trusts every account on it (ADR 0022).',
@@ -66,11 +73,7 @@ export function localModeLines(banner: LocalBanner): string[] {
     '',
     'Add the relay to Claude Code; the command reads the token from that file, so it is never shown:',
     `  ${claudeAddCommand(banner.shell, banner.mcpUrl, banner.tokenPath)}`,
-    ...(banner.created
-      ? [
-          `Replacing an older ${LOCAL_SERVER_NAME} entry? Remove it first: claude mcp remove --scope user ${LOCAL_SERVER_NAME}`,
-        ]
-      : []),
+    `If Claude Code says ${LOCAL_SERVER_NAME} already exists, remove the old entry first: claude mcp remove --scope user ${LOCAL_SERVER_NAME}`,
     'Check the connection with: claude mcp list',
     'Then ask Claude to pair with the code in the Tabdock widget, and approve the request on the page.',
     'For Claude on the web, desktop or phone, which connect from the cloud, see the top of docs/deploy.md: a tunnel (pnpm dev:public) or a host.',

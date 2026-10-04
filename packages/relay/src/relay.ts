@@ -15,12 +15,16 @@
 // machine. Without a public URL, in local mode (ADR 0022) and with dev tokens
 // alike, /mcp and /page take only requests made on this machine, so a tunnel
 // pointed at a loopback relay, even one that rewrites Host, cannot expose it.
-// Requests are logged by route, never by raw path or query, so no secret a URL
-// carries reaches a log. The M3 spike's measurements (spike.ts) hook in here
-// when TABDOCK_SPIKE is on; nothing over HTTP controls them.
+// Those checks trust a Host header any program can write, so they hold only
+// while the relay listens on loopback: it resolves its host name itself and
+// listens on the address only when that is loopback (S12). Requests are
+// logged by route, never by raw path or query, so no secret a URL carries
+// reaches a log. The M3 spike's measurements (spike.ts) hook in here when
+// TABDOCK_SPIKE is on; nothing over HTTP controls them.
 
+import { lookup } from 'node:dns/promises';
 import { createServer, type IncomingMessage, type ServerResponse, STATUS_CODES } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { type AddressInfo, isIP } from 'node:net';
 import type { Duplex } from 'node:stream';
 import { type NodeIncomingMessageLike, toNodeHandler } from '@modelcontextprotocol/node';
 import {
@@ -33,10 +37,12 @@ import { MAX_FRAME_BYTES, SUBPROTOCOL } from '@tabdock/protocol';
 import { WebSocketServer } from 'ws';
 import { type AuthOutcome, AuthOutcomeSchema, type AuthRoute } from './auth.ts';
 import {
+  isLoopbackAddress,
   LOOPBACK_HOSTNAMES,
   NO_ORIGIN,
   parseHostHeader,
   type RelayOptions,
+  type ResolvedConfig,
   resolveConfig,
 } from './config.ts';
 import { PageHub } from './hub.ts';
@@ -160,6 +166,31 @@ function send(
 
 function formatHost(address: string): string {
   return address.includes(':') ? `[${address}]` : address;
+}
+
+/**
+ * The literal address to listen on. resolveConfig judged only a name, and
+ * localhost means whatever the hosts file or resolver says: one that maps it
+ * elsewhere, or a search domain added to a lookup that found no hosts entry,
+ * would put a loopback relay, local mode's above all, on the network, where
+ * any client can send the Host and headers madeLocally and validateHost look
+ * for. So the name is resolved once here, every address it gives must be
+ * loopback, and the relay listens on that literal, never on the name, which a
+ * second lookup could answer differently (S12, ADR 0022).
+ */
+async function listenAddress(config: ResolvedConfig): Promise<string> {
+  const host = config.host.replace(/^\[(.*)\]$/, '$1');
+  const addresses =
+    isIP(host) === 0 ? (await lookup(host, { all: true })).map((entry) => entry.address) : [host];
+  const offLoopback = addresses.find((address) => !isLoopbackAddress(address));
+  if (config.loopback && offLoopback !== undefined) {
+    throw new Error(
+      `refusing to listen on ${offLoopback}: the host ${config.host} (TABDOCK_HOST) resolves there, and the relay listens only on loopback (SPEC S12, ADR 0022); fix the hosts file or resolver, or set TABDOCK_HOST to 127.0.0.1 or ::1`,
+    );
+  }
+  const [first] = addresses;
+  if (first === undefined) throw new Error(`the host ${config.host} (TABDOCK_HOST) has no address`);
+  return first;
 }
 
 export async function createRelay(options: RelayOptions): Promise<Relay> {
@@ -458,15 +489,17 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     // first would let its first calls through unchecked. If it cannot start,
     // the relay serves anyway and keeps restarting it (ADR 0010).
     await hub.ready();
+    const address = await listenAddress(config);
     await new Promise<void>((resolveListen, rejectListen) => {
       server.once('error', rejectListen);
-      server.listen(config.port, config.host.replace(/^\[(.*)\]$/, '$1'), () => {
+      server.listen(config.port, address, () => {
         server.off('error', rejectListen);
         resolveListen();
       });
     });
   } catch (error) {
-    // A port in use must not leave the MCP handler, the socket server or the check worker behind.
+    // A port in use or a host off loopback must not leave the MCP handler,
+    // the socket server or the check worker behind.
     pair?.close();
     wss.close();
     await hub.shutdown();

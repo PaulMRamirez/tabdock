@@ -6,6 +6,11 @@ coverage/
 .env
 .env.*
 !.env.example
+# Local mode's owner token and its temporary name (ADR 0022). The relay refuses
+# a token directory inside the checkout; this keeps one a bug or a failed test
+# left behind from being staged.
+owner-token
+.owner-token.*.tmp
 test-results/
 playwright-report/
 blob-report/

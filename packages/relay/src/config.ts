@@ -10,7 +10,7 @@
 // owner token drawn into a private per-user file (local-token.ts), behind a
 // plugin marked loopbackOnly, which resolveConfig keeps on this machine.
 
-import { isIPv6 } from 'node:net';
+import { BlockList, isIP, isIPv6 } from 'node:net';
 import {
   ATTACH_REQUEST_TTL_MS,
   DEFAULT_CALL_DEADLINE_MS,
@@ -144,7 +144,10 @@ export interface PairClientOptions {
 
 export interface RelayOptions {
   auth: AuthPlugin;
-  /** Default 127.0.0.1. Anything but loopback is refused until M4 brings TLS. */
+  /**
+   * Default 127.0.0.1. Anything but loopback is refused until M4 brings TLS,
+   * and a name must resolve to loopback addresses alone (relay.ts).
+   */
   host?: string | undefined;
   /** Default 0, a free port; the CLI uses 8787. */
   port?: number | undefined;
@@ -287,6 +290,20 @@ const DEV_ORIGIN_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
  */
 export function isLoopbackHost(host: string): boolean {
   return ['localhost', '127.0.0.1', '::1', '[::1]'].includes(host.toLowerCase());
+}
+
+const LOOPBACK_ADDRESSES = new BlockList();
+LOOPBACK_ADDRESSES.addSubnet('127.0.0.0', 8, 'ipv4');
+LOOPBACK_ADDRESSES.addAddress('::1', 'ipv6');
+
+/**
+ * Whether an IP address is a loopback one: 127.0.0.0/8 or ::1, in any IPv6
+ * spelling, IPv4-mapped included. isLoopbackHost judges a name, which means
+ * whatever the hosts file says; this judges where the relay would listen.
+ */
+export function isLoopbackAddress(address: string): boolean {
+  const family = isIP(address);
+  return family !== 0 && LOOPBACK_ADDRESSES.check(address, family === 6 ? 'ipv6' : 'ipv4');
 }
 
 /** An Origin value must already be in serialised form: scheme, host, optional port, nothing else. */

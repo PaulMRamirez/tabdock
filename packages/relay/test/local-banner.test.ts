@@ -167,7 +167,9 @@ describe('the local mode banner', () => {
     expect(text).toContain('Page socket:   ws://127.0.0.1:8787/page');
     expect(text).toContain(`Owner token:   ${banner.tokenPath} (created just now)`);
     expect(text).toContain(`  ${claudeAddCommand('posix', MCP_URL, banner.tokenPath)}`);
-    expect(text).toContain('claude mcp remove --scope user tabdock-local');
+    expect(text).toMatch(
+      /If Claude Code says tabdock-local already exists, .*claude mcp remove --scope user tabdock-local/,
+    );
     expect(text).toContain('claude mcp list');
     // claude mcp get prints the header in full, so it is never suggested.
     expect(text).not.toContain('mcp get');
@@ -176,10 +178,14 @@ describe('the local mode banner', () => {
     );
   });
 
-  it('says when the token was kept from an earlier start, with no replacement step', () => {
+  it('says when the token was kept from an earlier start, and still how to replace an older entry', () => {
     const text = localModeLines({ ...banner, created: false }).join('\n');
     expect(text).toContain(`${banner.tokenPath} (kept from an earlier start)`);
-    expect(text).not.toContain('claude mcp remove');
+    // An earlier start that never listened may have drawn it, so Claude Code
+    // may hold an older token under the same name: the way out is always shown.
+    expect(text).toMatch(
+      /If Claude Code says tabdock-local already exists, .*claude mcp remove --scope user tabdock-local/,
+    );
   });
 
   it('prints the PowerShell form on Windows', () => {

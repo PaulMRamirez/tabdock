@@ -263,24 +263,43 @@ describe('the first start and the next', () => {
 describe('refusals: each names the path and the fix, never the contents', () => {
   it('a directory inside the checkout, compared by realpath, and nothing is created there', () => {
     const inside = join(CHECKOUT, `.tabdock-token-test-${String(process.pid)}`);
-    for (const load of [loadOwnerToken, readOwnerToken]) {
-      const message = refusal(() => load({ TABDOCK_HOME: inside }));
-      expect(message).toContain(inside);
-      expect(message).toMatch(
-        /inside the checkout.*set TABDOCK_HOME to an absolute path outside it/,
+    const docsHome = join(CHECKOUT, 'docs', 'tabdock');
+    const rootToken = join(CHECKOUT, OWNER_TOKEN_FILE);
+    const rootTokenBefore = existsSync(rootToken);
+    // What a regression would leave is removed before and after, so it fails
+    // once, leaves no token where git add could stage it, and a later run of
+    // the fixed code does not fail on what an earlier run left behind.
+    const tidy = (): void => {
+      rmSync(inside, { recursive: true, force: true });
+      rmSync(docsHome, { recursive: true, force: true });
+      if (!rootTokenBefore) rmSync(rootToken, { force: true });
+    };
+    tidy();
+    try {
+      for (const load of [loadOwnerToken, readOwnerToken]) {
+        const message = refusal(() => load({ TABDOCK_HOME: inside }));
+        expect(message).toContain(inside);
+        expect(message).toMatch(
+          /inside the checkout.*set TABDOCK_HOME to an absolute path outside it/,
+        );
+        expect(existsSync(inside)).toBe(false);
+      }
+      // Through a symlink from outside that leads back in.
+      const link = join(scratch(), 'link');
+      symlinkSync(join(CHECKOUT, 'docs'), link);
+      const through = join(link, 'tabdock');
+      expect(refusal(() => loadOwnerToken({ TABDOCK_HOME: through }))).toMatch(
+        /inside the checkout/,
       );
-      expect(existsSync(inside)).toBe(false);
+      expect(existsSync(docsHome)).toBe(false);
+      // The checkout itself counts.
+      expect(refusal(() => loadOwnerToken({ TABDOCK_HOME: CHECKOUT }))).toMatch(
+        /inside the checkout/,
+      );
+      expect(existsSync(rootToken)).toBe(rootTokenBefore);
+    } finally {
+      tidy();
     }
-    // Through a symlink from outside that leads back in.
-    const link = join(scratch(), 'link');
-    symlinkSync(join(CHECKOUT, 'docs'), link);
-    const through = join(link, 'tabdock');
-    expect(refusal(() => loadOwnerToken({ TABDOCK_HOME: through }))).toMatch(/inside the checkout/);
-    expect(existsSync(join(CHECKOUT, 'docs', 'tabdock'))).toBe(false);
-    // The checkout itself counts.
-    expect(refusal(() => loadOwnerToken({ TABDOCK_HOME: CHECKOUT }))).toMatch(
-      /inside the checkout/,
-    );
   });
 
   it('compares paths case-insensitively on macOS and Windows, and exactly elsewhere', () => {

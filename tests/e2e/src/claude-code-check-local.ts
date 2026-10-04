@@ -21,7 +21,7 @@ import { join } from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
 import { leakIn } from '@tabdock/relay/test/secrecy';
 import { freePort } from './harness.ts';
-import { blankEnv, readBanner, type Run, runPnpm } from './local-harness.ts';
+import { blankEnv, listsConnected, readBanner, type Run, runPnpm } from './local-harness.ts';
 
 const SERVER = 'tabdock-local';
 const say = (text: string): void => {
@@ -93,9 +93,6 @@ async function listUntil(env: NodeJS.ProcessEnv, want: (line: string) => boolean
   return line;
 }
 
-/** 2.1.288 marks a healthy server with a heavy check mark (U+2714); the light one is allowed too. */
-const connected = (line: string): boolean => /[\u2713\u2714] Connected/u.test(line);
-
 try {
   say(`Claude Code ${version.stdout.trim()}`);
   await mkdir(home);
@@ -125,7 +122,7 @@ try {
   say('\n2. The printed line, through sh -c, then claude mcp list:');
   const added = await run('sh', ['-c', banner.command], work, claudeEnv);
   show('   add: ', `exit ${String(added.code)}; ${added.output}`);
-  const line = await listUntil(claudeEnv, connected);
+  const line = await listUntil(claudeEnv, listsConnected);
   say(`   list: ${line}`);
   const config = JSON.parse(await readFile(join(home, '.claude.json'), 'utf8')) as {
     mcpServers?: Record<string, { type?: string; url?: string; headers?: Record<string, string> }>;
@@ -136,7 +133,7 @@ try {
   say(
     `   ~/.claude.json (mode ${mode.toString(8)}): user scope ${entry ? 'holds' : 'lacks'} ${SERVER} at ${entry?.url ?? '(none)'}, its header ${stored ? 'the token from the file' : 'NOT the token from the file'} (not shown)`,
   );
-  const firstOk = added.code === 0 && connected(line) && stored && entry.url === banner.mcpUrl;
+  const firstOk = added.code === 0 && listsConnected(line) && stored && entry.url === banner.mcpUrl;
 
   say('\n3. Rotation: stop the relay, delete the token file, start again on the same port:');
   await first.stop();
@@ -150,7 +147,7 @@ try {
   say(
     `   the relay says the token was ${rotated.created ? 'created just now' : 'KEPT, which is wrong'}`,
   );
-  const stale = await listUntil(claudeEnv, (l) => !connected(l));
+  const stale = await listUntil(claudeEnv, (l) => !listsConnected(l));
   say(`   list with the old entry: ${stale}`);
   const removed = await run(
     'claude',
@@ -161,16 +158,16 @@ try {
   show('   remove: ', `exit ${String(removed.code)}; ${removed.output}`);
   const readded = await run('sh', ['-c', rotated.command], work, claudeEnv);
   show('   add: ', `exit ${String(readded.code)}; ${readded.output}`);
-  const fresh = await listUntil(claudeEnv, connected);
+  const fresh = await listUntil(claudeEnv, listsConnected);
   say(`   list: ${fresh}`);
   await second.stop();
   const rotationOk =
     rotated.created &&
     newToken !== token &&
-    !connected(stale) &&
+    !listsConnected(stale) &&
     removed.code === 0 &&
     readded.code === 0 &&
-    connected(fresh);
+    listsConnected(fresh);
 
   const everything = [...relays.flatMap((r) => [r.stdout(), r.stderr()]), ...printed].join('\n');
   const leaks = tokens

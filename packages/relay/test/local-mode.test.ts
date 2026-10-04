@@ -2,16 +2,26 @@
 // only, with one user, `you`, behind a dev-token plugin marked loopbackOnly.
 // Which settings win, which are refused and where, the mark that keeps the
 // plugin on loopback whatever its name, the 401s and the operator's approval,
-// and the refusal of proxied requests on /mcp and /page whenever there is no
-// public URL, with dev tokens as much as in local mode.
+// the address the relay listens on, which must be loopback whatever a name
+// resolves to, and the refusal of proxied requests on /mcp and /page,
+// before the plugin answers, whenever there is no public URL, with dev tokens
+// as much as in local mode.
 
+import type * as Dns from 'node:dns';
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
+import { connect, createServer, isIP } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { afterEach, describe, expect, it } from 'vitest';
 import { type AuthPlugin, createDevTokenAuth } from '../src/auth.ts';
-import { AUTH_SETTINGS, loadConfigFromEnv, resolveConfig } from '../src/config.ts';
+import {
+  AUTH_SETTINGS,
+  isLoopbackAddress,
+  loadConfigFromEnv,
+  resolveConfig,
+} from '../src/config.ts';
 import { OWNER_TOKEN_FILE, readOwnerToken } from '../src/local-token.ts';
 import { createOAuthAuth, createRelay, type Relay } from '../src/index.ts';
 import {
@@ -229,6 +239,177 @@ describe('a plugin marked loopbackOnly, whatever its name', () => {
   });
 });
 
+/** The dns module's own object, whose functions node:net and node:dns/promises look up as they run. */
+const dns = createRequire(import.meta.url)('node:dns') as typeof Dns;
+
+/**
+ * Makes every resolver in this process answer `localhost` with `addresses`,
+ * as a hosts file that maps it elsewhere would (the review's probe bound one
+ * over /etc/hosts in a private mount namespace), until the returned function
+ * puts the real ones back. An address answers as itself, as the real lookup
+ * does (server.listen looks up even a literal); any other name fails, so a
+ * stray lookup shows.
+ */
+function resolveLocalhostTo(addresses: string[]): () => void {
+  const answerFor = (hostname: string): Dns.LookupAddress[] | Error => {
+    if (isIP(hostname) !== 0) return [{ address: hostname, family: isIP(hostname) }];
+    if (hostname !== 'localhost' || addresses.length === 0) {
+      return Object.assign(new Error(`unexpected lookup of ${hostname}`), { code: 'ENOTFOUND' });
+    }
+    return addresses.map((address) => ({ address, family: isIP(address) }));
+  };
+  const wantsAll = (options: unknown): boolean =>
+    typeof options === 'object' && options !== null && 'all' in options && options.all === true;
+  type Reply = (
+    error: Error | null,
+    address?: string | Dns.LookupAddress[],
+    family?: number,
+  ) => void;
+  const { lookup } = dns;
+  const promised = dns.promises.lookup;
+  dns.lookup = ((hostname: string, options: unknown, callback?: Reply) => {
+    const reply = (typeof options === 'function' ? options : callback) as Reply;
+    const answer = answerFor(hostname);
+    process.nextTick(() => {
+      if (answer instanceof Error) reply(answer);
+      else if (wantsAll(options)) reply(null, answer);
+      else reply(null, answer[0]?.address, answer[0]?.family);
+    });
+  }) as unknown as typeof dns.lookup;
+  dns.promises.lookup = ((hostname: string, options?: unknown) => {
+    const answer = answerFor(hostname);
+    if (answer instanceof Error) return Promise.reject(answer);
+    return Promise.resolve(wantsAll(options) ? answer : answer[0]);
+  }) as unknown as typeof dns.promises.lookup;
+  syncBuiltinESMExports();
+  return () => {
+    dns.lookup = lookup;
+    dns.promises.lookup = promised;
+    syncBuiltinESMExports();
+  };
+}
+
+/** A port nothing listens on, found by listening on it once. */
+function vacantPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      server.close(() => {
+        resolve(typeof address === 'object' && address !== null ? address.port : 0);
+      });
+    });
+  });
+}
+
+/** Whether anything takes a connection at 127.0.0.1 on `port`; a wildcard listener would. */
+function accepts(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = connect(port, '127.0.0.1');
+    socket.once('connect', () => {
+      socket.destroy();
+      resolve(true);
+    });
+    socket.once('error', () => {
+      resolve(false);
+    });
+  });
+}
+
+describe('the address the relay listens on (S12, ADR 0022)', () => {
+  /** createRelay's error message, or 'started' after closing a relay that should not have started. */
+  async function outcome(options: Parameters<typeof createRelay>[0]): Promise<string> {
+    return createRelay(options).then(
+      async (relay) => {
+        await relay.close();
+        return 'started';
+      },
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    );
+  }
+
+  it('is checked, not the name: localhost resolving off loopback is refused before anything listens', async () => {
+    for (const addresses of [['0.0.0.0'], ['192.0.2.2'], ['127.0.0.1', '0.0.0.0'], ['::']]) {
+      const label = addresses.join();
+      const port = await vacantPort();
+      const local = loadConfigFromEnv({
+        TABDOCK_HOME: freshHome(),
+        TABDOCK_HOST: 'localhost',
+        TABDOCK_PORT: String(port),
+      });
+      expect(local.auth.loopbackOnly).toBe(true);
+      const restore = resolveLocalhostTo(addresses);
+      let refused: string;
+      let refusedWithDevTokens: string;
+      try {
+        refused = await outcome(local);
+        // S12 is the same rule with dev tokens: no relay listens off loopback.
+        refusedWithDevTokens = await outcome({
+          auth: createDevTokenAuth([ALICE]),
+          host: 'localhost',
+          port,
+        });
+      } finally {
+        restore();
+      }
+      for (const message of [refused, refusedWithDevTokens]) {
+        expect(message, label).toMatch(
+          /^refusing to listen on (0\.0\.0\.0|192\.0\.2\.2|::): the host localhost \(TABDOCK_HOST\) resolves there.*listens only on loopback.*set TABDOCK_HOST to 127\.0\.0\.1 or ::1/,
+        );
+      }
+      expect(await accepts(port), label).toBe(false);
+    }
+  });
+
+  it('localhost that resolves to loopback still serves, on the very address it resolved to', async () => {
+    const restore = resolveLocalhostTo(['127.0.0.1']);
+    let relay: Relay;
+    try {
+      relay = await createRelay(
+        loadConfigFromEnv({
+          TABDOCK_HOME: freshHome(),
+          TABDOCK_HOST: 'localhost',
+          TABDOCK_PORT: '0',
+        }),
+      );
+    } finally {
+      restore();
+    }
+    relays.push(relay);
+    expect(relay.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+    // And through this machine's own resolver, whatever loopback address it gives.
+    const real = await createRelay({ auth: createDevTokenAuth([ALICE]), host: 'localhost' });
+    relays.push(real);
+    expect(isLoopbackAddress(new URL(real.url).hostname.replace(/^\[(.*)\]$/, '$1'))).toBe(true);
+  });
+
+  it('counts 127.0.0.0/8 and ::1 as loopback in any spelling, and nothing else', () => {
+    for (const address of [
+      '127.0.0.1',
+      '127.255.0.9',
+      '::1',
+      '0:0:0:0:0:0:0:1',
+      '::ffff:127.0.0.1',
+    ]) {
+      expect(isLoopbackAddress(address), address).toBe(true);
+    }
+    for (const address of [
+      '0.0.0.0',
+      '::',
+      '192.0.2.2',
+      '128.0.0.1',
+      '::ffff:192.0.2.2',
+      'fe80::1',
+      'localhost',
+      '[::1]',
+      '',
+    ]) {
+      expect(isLoopbackAddress(address), address).toBe(false);
+    }
+  });
+});
+
 /** A 2026-07-28 request that needs nothing but authentication; 200 means the caller got in. */
 function discover(
   relay: Relay,
@@ -348,10 +529,20 @@ describe('a relay in local mode', () => {
     const { relay, token, lines } = await startLocal();
     for (const headers of PROXIED) {
       const label = Object.keys(headers).join();
-      const mcp = await discover(relay, { ...headers, Authorization: `Bearer ${token}` });
-      expect(mcp.status, label).toBe(403);
-      // Refused before the plugin, so a proxy never even sees a challenge.
-      expect(mcp.headers.get('www-authenticate'), label).toBeNull();
+      for (const authorization of [
+        undefined,
+        `Bearer tabdock_${'A'.repeat(43)}`,
+        `Bearer ${token}`,
+      ]) {
+        const mcp = await discover(relay, {
+          ...headers,
+          ...(authorization === undefined ? {} : { Authorization: authorization }),
+        });
+        expect(mcp.status, label).toBe(403);
+        // Refused before the plugin, so a proxy never even sees a challenge,
+        // which the plugin would send with no token or a wrong one.
+        expect(mcp.headers.get('www-authenticate'), label).toBeNull();
+      }
       expect(await upgradeStatus(relay, headers), label).toBe(403);
     }
     expect(await upgradeStatus(relay, {})).toBe(101);
@@ -368,11 +559,18 @@ describe('a relay with dev tokens and no public URL', () => {
     testRelays.push(test);
     for (const headers of PROXIED) {
       const label = Object.keys(headers).join();
-      const mcp = await discover(test.relay, {
-        ...headers,
-        Authorization: `Bearer ${ALICE.token}`,
-      });
-      expect(mcp.status, label).toBe(403);
+      for (const authorization of [
+        undefined,
+        `Bearer ${'x'.repeat(32)}`,
+        `Bearer ${ALICE.token}`,
+      ]) {
+        const mcp = await discover(test.relay, {
+          ...headers,
+          ...(authorization === undefined ? {} : { Authorization: authorization }),
+        });
+        expect(mcp.status, label).toBe(403);
+        expect(mcp.headers.get('www-authenticate'), label).toBeNull();
+      }
       expect(await upgradeStatus(test.relay, headers), label).toBe(403);
     }
     expect((await discover(test.relay, { Authorization: `Bearer ${ALICE.token}` })).status).toBe(
