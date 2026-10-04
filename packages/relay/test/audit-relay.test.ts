@@ -14,6 +14,7 @@ import {
   mkdtempSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -21,13 +22,15 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Client } from '@modelcontextprotocol/client';
-import { AuditLineSchema } from '@tabdock/protocol';
-import { afterEach, describe, expect, it } from 'vitest';
+import { AUDIT_VERSION, AuditLineSchema } from '@tabdock/protocol';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { escapeForTerminal, runAuditCli } from '../src/audit-cli.ts';
 import {
   createDevTokenAuth,
+  createLogger,
   createMemoryStore,
   createRelay,
+  FileAuditLog,
   lineHash,
   listAuditFiles,
   loadConfigFromEnv,
@@ -185,6 +188,55 @@ describe('a relay with an audit directory (ADR 0019)', () => {
     await again.close();
     const report = verifyAuditLines(readAuditLines(dir));
     expect(report).toMatchObject({ records: 6, lastSeq: 6, problems: [] });
+  });
+
+  it('keeps the line of a call the wall clock stepped back during, timing it on a clock that only runs forward (S7)', async () => {
+    const dir = join(scratch(), 'audit');
+    const relay = await startRelay({
+      env: 'production',
+      allowedOrigins: [PAGE_ORIGIN],
+      audit: { dir },
+    });
+    relays.push(relay);
+    const wall = Date.now.bind(Date);
+    let offset = 0;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => wall() + offset);
+    try {
+      const page = await connectPage(relay.relay.pageUrl, {
+        tools: TOOLS,
+        onInvoke: () => {
+          // NTP steps the clock back 2 s while the page runs the tool.
+          offset = -2000;
+          return { ok: true, content: 'done' };
+        },
+      });
+      pages.push(page);
+      const alice = await connectClient(relay.relay, ALICE);
+      clients.push(alice);
+      await pairAndApprove(alice, page, 'driver');
+      const result = await callTool(alice, 'call_page_tool', {
+        page: page.pageId,
+        tool: 'add_item',
+        arguments: { label: 'x' },
+      });
+      expect(result.isError).toBe(false);
+      await relay.close();
+      relays.splice(0);
+    } finally {
+      clock.mockRestore();
+    }
+    const written = records(dir);
+    // The call that reached the page and ran has its own line, never an audit_gap in its place.
+    expect(written.map((record) => record.type)).toEqual([
+      'relay_start',
+      'attach',
+      'call',
+      'relay_stop',
+    ]);
+    const call = written[2];
+    expect(call).toMatchObject({ type: 'call', tool: 'add_item', outcome: 'ok' });
+    expect(call?.type === 'call' ? call.durationMs : -1).toBeGreaterThanOrEqual(0);
+    expect(relay.lines.join('\n')).not.toContain('does not match its schema');
   });
 
   it("keeps local mode's log in audit/ beside its owner token, 0700", async () => {
@@ -400,6 +452,80 @@ describe('pnpm audit:log', () => {
     expect(broken.code).toBe(1);
     expect(broken.err.join('\n')).toMatch(/line 4: prev is not the digest of the previous record/);
     expect(broken.err.at(-1)).toMatch(/^verify: BROKEN/);
+  });
+
+  it('names each audit_gap and each start after no relay_stop, holes that leave the chain whole', async () => {
+    const dir = join(scratch(), 'audit');
+    const audit = FileAuditLog.open({
+      dir,
+      retentionDays: 30,
+      maxBytes: 64 * 1024 * 1024,
+      log: createLogger({ sink: quiet }),
+    });
+    const at = Date.parse('2026-10-04T12:00:00.000Z');
+    const start = {
+      v: AUDIT_VERSION,
+      type: 'relay_start',
+      at,
+      version: 'test',
+      env: 'production',
+      mode: 'hosted',
+      invites: false,
+    } as const;
+    audit.append(start);
+    audit.append({ v: AUDIT_VERSION, type: 'relay_stop', at: at + 1 });
+    audit.append({ ...start, at: at + 2 });
+    // A disk failed, then the relay stopped; its next start wrote the count first.
+    audit.append({
+      v: AUDIT_VERSION,
+      type: 'audit_gap',
+      at: at + 5,
+      lost: 4,
+      firstAt: at + 3,
+      lastAt: at + 4,
+    });
+    audit.append({ ...start, at: at + 6 });
+    // A crash: the next start follows a start, with no relay_stop between.
+    audit.append({ ...start, at: at + 7 });
+    await audit.close();
+    const result = run(['--dir', dir, '--verify']);
+    expect(result.code).toBe(0);
+    expect(result.err).toEqual([
+      expect.stringMatching(
+        /line 4: audit_gap: the file missed 4 records from 2026-10-04T12:00:00\.003Z to 2026-10-04T12:00:00\.004Z/,
+      ),
+      expect.stringMatching(/line 6: relay_start follows no relay_stop/),
+      expect.stringMatching(
+        /^verify: chain intact; 6 records in 1 files, .*, 1 audit_gap records counting 4 missed records, 1 starts after no relay_stop$/,
+      ),
+    ]);
+  });
+
+  it('fails on records removed from the start of the log, by the file name or by the checkpoint', async () => {
+    const dir = await populated();
+    const ok = run(['--dir', dir, '--verify']);
+    const head = /head ([0-9a-f]{64})/.exec(ok.err.at(-1) ?? '')?.[1] ?? '';
+    // The checkpoint as the stop line names it: seq, head and the first record kept.
+    expect(run(['--dir', dir, '--verify', '--checkpoint', `5:${head}:1`]).code).toBe(0);
+
+    const [file] = listAuditFiles(dir);
+    const path = join(dir, file?.name ?? '');
+    const kept = readFileSync(path, 'utf8').split('\n').slice(2).join('\n');
+    writeFileSync(path, kept);
+    const cut = run(['--dir', dir, '--verify']);
+    expect(cut.code).toBe(1);
+    expect(cut.err.join('\n')).toMatch(
+      /line 1: the file's name says its first record is seq 1, but it is seq 3/,
+    );
+    // Renamed to match, the file passes alone, and only the checkpoint shows the loss.
+    const renamed = join(dir, (file?.name ?? '').replace(/\d{12}\.jsonl$/, '000000000003.jsonl'));
+    renameSync(path, renamed);
+    expect(run(['--dir', dir, '--verify']).code).toBe(0);
+    const checked = run(['--dir', dir, '--verify', '--checkpoint', `5:${head}:1`]);
+    expect(checked.code).toBe(1);
+    expect(checked.err.join('\n')).toMatch(
+      /the log starts at seq 3, but the checkpoint says it kept every record from seq 1/,
+    );
   });
 
   it('answers a usage error with 2 and the reason, never echoing a hostile argument raw', () => {

@@ -2,7 +2,8 @@
 // audit log (ADR 0019). pnpm's own `audit` command shadows that name, so the
 // script is audit:log. It filters by user, page, type, outcome and time,
 // checks the hash chain with --verify (and a checkpoint from the platform's
-// logs with --checkpoint), validates every line against the protocol's schema
+// logs with --checkpoint), names each audit_gap and each start that followed
+// no relay_stop, validates every line against the protocol's schema
 // and prints nothing a line holds without escaping control and bidirectional
 // characters, so a hostile client id cannot rewrite the operator's terminal.
 // On a host it runs inside the container with the image's node, since the
@@ -15,7 +16,12 @@ import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { AUDIT_EVENT_TYPES, type AuditLine } from '@tabdock/protocol';
-import { readAuditLines, type ReadLine, verifyAuditLines } from './audit-file.ts';
+import {
+  type AuditCheckpoint,
+  readAuditLines,
+  type ReadLine,
+  verifyAuditLines,
+} from './audit-file.ts';
 import { LOCAL_AUDIT_DIR } from './config.ts';
 import { ownerTokenDirectory } from './local-token.ts';
 
@@ -33,9 +39,10 @@ Reads the relay's audit log (ADR 0019) and prints its records, oldest first.
   --until <time>       records before this time
   --json               print each record as one JSON line
   --verify             check every line, the sequence and the hash chain; exit 1 on a break
-  --checkpoint <seq>:<head>
-                       with --verify, also check the line with that seq against a
-                       checkpoint from the platform's logs
+  --checkpoint <seq>:<head>:<first>
+                       with --verify, also check the line with that seq against the
+                       newest checkpoint in the platform's logs, and that the log
+                       still starts at its first (which may be left off)
   --help               this text`;
 
 /**
@@ -182,7 +189,7 @@ export function runAuditCli(
     return 0;
   }
   let filter: AuditFilter;
-  let checkpoint: { seq: number; head: string } | undefined;
+  let checkpoint: AuditCheckpoint | undefined;
   let dir: string;
   try {
     const types = list(values.type);
@@ -199,10 +206,17 @@ export function runAuditCli(
       until: values.until === undefined ? null : parseTime(values.until, now),
     };
     if (values.checkpoint !== undefined) {
-      const match = /^(\d{1,15}):([0-9a-f]{64})$/.exec(values.checkpoint.trim());
-      if (match === null) throw new UsageError('--checkpoint takes <seq>:<64 hex characters>');
+      const match = /^(\d{1,15}):([0-9a-f]{64})(?::(\d{1,15}))?$/.exec(values.checkpoint.trim());
+      if (match === null) {
+        throw new UsageError('--checkpoint takes <seq>:<64 hex characters>:<first>');
+      }
       if (values.verify !== true) throw new UsageError('--checkpoint needs --verify');
-      checkpoint = { seq: Number(match[1]), head: match[2] ?? '' };
+      const seq = Number(match[1]);
+      const first = match[3] === undefined ? undefined : Number(match[3]);
+      if (first !== undefined && first > seq) {
+        throw new UsageError("--checkpoint's first cannot come after its seq");
+      }
+      checkpoint = { seq, head: match[2] ?? '', first };
     }
     dir = auditDir(values.dir, env);
   } catch (error) {
@@ -249,6 +263,22 @@ export function runAuditCli(
       escapeForTerminal(`${problem.file} line ${String(problem.lineNumber)}: ${problem.problem}`),
     );
   }
+  // Not breaks, since ADR 0019 fails open, but holes the operator must know of.
+  for (const gap of report.gaps) {
+    io.err(
+      escapeForTerminal(
+        `${gap.file} line ${String(gap.lineNumber)}: audit_gap: the file missed ${String(gap.lost)} records from ${new Date(gap.firstAt).toISOString()} to ${new Date(gap.lastAt).toISOString()}; their copies reached only stderr`,
+      ),
+    );
+  }
+  for (const stop of report.uncleanStops) {
+    io.err(
+      escapeForTerminal(
+        `${stop.file} line ${String(stop.lineNumber)}: relay_start follows no relay_stop: the relay before stopped without one (a crash, a kill or a failing disk), so its last records may be missing here, uncounted; the platform's logs keep their copies`,
+      ),
+    );
+  }
+  const missed = report.gaps.reduce((sum, gap) => sum + gap.lost, 0);
   const summary = [
     `${String(report.records)} records in ${String(report.files)} files`,
     report.firstSeq === null
@@ -256,6 +286,12 @@ export function runAuditCli(
       : `seq ${String(report.firstSeq)} to ${String(report.lastSeq)}`,
     report.head === null ? null : `head ${report.head}`,
     report.torn.length === 0 ? null : `${String(report.torn.length)} torn lines skipped`,
+    report.gaps.length === 0
+      ? null
+      : `${String(report.gaps.length)} audit_gap records counting ${String(missed)} missed records`,
+    report.uncleanStops.length === 0
+      ? null
+      : `${String(report.uncleanStops.length)} starts after no relay_stop`,
   ]
     .filter((part) => part !== null)
     .join(', ');
