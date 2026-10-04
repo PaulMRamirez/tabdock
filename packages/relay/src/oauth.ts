@@ -7,13 +7,15 @@
 // and checks each token with the SDK's verifyBearerToken over a jose verifier:
 // RS256 only, the provider's published keys, issuer, audience and expiry. Any
 // bad token becomes the SDK's 401 challenge with resource_metadata, which is the
-// only answer that makes Claude sign in; a token's `sub` must then map to a
-// member, or the answer is a plain 403, which Claude treats as final. Keys that
-// cannot be fetched are the provider's fault, not the token's: a 503 with
-// Retry-After, no new fetch until then, and meanwhile the last key set fetched,
-// while it is young, still checks tokens. The same mapping, which says what
-// kind of account a subject is (ADR 0016), serves the browser sign-in at /pair,
-// so a person is one user on both.
+// only answer that makes Claude sign in. A good token's `sub` maps to a member
+// or an invitee; the plugin says which and the relay decides whether to admit
+// an invitee, answering a plain 403, which Claude treats as final, whenever it
+// does not (ADR 0020's notes). Keys that cannot be fetched are the provider's
+// fault, not the token's: a 503 with Retry-After, no new fetch until then, and
+// meanwhile the last key set fetched, while it is young, still checks tokens.
+// The same mapping, which says what kind of account a subject is and what it
+// is called (ADRs 0016 and 0017), serves the browser sign-in at /pair and /i,
+// so a person is one user on all of them.
 
 import type { IncomingMessage } from 'node:http';
 import {
@@ -28,7 +30,7 @@ import {
   oauthMetadataResponse,
   verifyBearerToken,
 } from '@modelcontextprotocol/server';
-import { IdSchema, type User, UserSchema } from '@tabdock/protocol';
+import { IdSchema, OAuthClientIdSchema, type User, UserSchema } from '@tabdock/protocol';
 import {
   createLocalJWKSet,
   createRemoteJWKSet,
@@ -38,13 +40,17 @@ import {
   jwtVerify,
 } from 'jose';
 import { z } from 'zod';
-import type {
-  Account,
-  AuthOutcome,
-  AuthPlugin,
-  AuthRefusal,
-  AuthRoute,
-  ProviderEndpoints,
+import {
+  type Account,
+  type AuthOutcome,
+  type AuthPlugin,
+  type AuthRefusal,
+  type AuthRoute,
+  type AuthUser,
+  inviteeUser,
+  isInviteePrefixed,
+  MEMBER_ACCOUNT,
+  type ProviderEndpoints,
 } from './auth.ts';
 import { digestHex } from './secrets.ts';
 
@@ -60,8 +66,74 @@ export interface OAuthAuthOptions {
   issuer: string;
   /** The relay's public MCP URL: the resource tokens are issued for, and so their audience. */
   resource: string;
-  /** Who may use the relay, by subject. Anyone else who signs in gets 403. */
+  /**
+   * The members, by subject. Anyone else who signs in is an invitee, whom the
+   * relay answers with 403 unless it admits invitees (ADR 0020).
+   */
   users: readonly OAuthUser[];
+  /**
+   * The longest a token may live, from its iat to its exp, and the oldest its
+   * iat may be, in minutes (TABDOCK_OAUTH_MAX_TOKEN_AGE): DEFAULT_MAX_TOKEN_AGE_MINUTES
+   * unless set, never above MAX_TOKEN_AGE_CEILING_MINUTES (ADR 0020).
+   * Workstream A checks tokens against it; until then only the setting is checked.
+   */
+  maxTokenAgeMinutes?: number | undefined;
+  /**
+   * The OAuth clients whose tokens the relay accepts, by RFC 9068 client_id
+   * (TABDOCK_OAUTH_CLIENT_IDS); any client when absent (ADR 0020).
+   * Workstream A refuses other clients' tokens with 401; until then only the
+   * setting is checked.
+   */
+  clientIds?: readonly string[] | undefined;
+}
+
+/** ADR 0020: a token lives at most 2 hours unless TABDOCK_OAUTH_MAX_TOKEN_AGE says otherwise. */
+export const DEFAULT_MAX_TOKEN_AGE_MINUTES = 120;
+/** ADR 0020: the cap may be raised for a provider's real lifetime, never past a day. */
+export const MAX_TOKEN_AGE_CEILING_MINUTES = 1440;
+/** ADR 0020: jose's key cache and refetch cooldown, pinned at its defaults so an upgrade cannot move them. */
+export const JWKS_CACHE_MAX_AGE_MS = 10 * 60_000;
+export const JWKS_COOLDOWN_MS = 30_000;
+/** ADR 0020: how often the provider's metadata is read again; a new issuer or key URL is refused. */
+export const METADATA_REFRESH_MS = 60 * 60_000;
+/** ADR 0020: token sessions (sid) remembered, so each first sighting logs its lifetime once. */
+export const SEEN_SESSIONS = 1000;
+
+/** Refuses a token age cap outside 1 to MAX_TOKEN_AGE_CEILING_MINUTES minutes. */
+function checkMaxTokenAge(minutes: number | undefined): void {
+  if (minutes === undefined) return;
+  if (!Number.isInteger(minutes) || minutes < 1 || minutes > MAX_TOKEN_AGE_CEILING_MINUTES) {
+    throw new Error(
+      `the OAuth token age cap (TABDOCK_OAUTH_MAX_TOKEN_AGE) must be 1 to ${String(MAX_TOKEN_AGE_CEILING_MINUTES)} minutes (ADR 0020)`,
+    );
+  }
+}
+
+/** Refuses an empty client list, or an entry that is no client_id; never echoes one. */
+function checkClientIds(clientIds: readonly string[] | undefined): void {
+  if (clientIds === undefined) return;
+  if (clientIds.length === 0) {
+    throw new Error(
+      'the OAuth client list (TABDOCK_OAUTH_CLIENT_IDS) names no client; leave it unset to accept any (ADR 0020)',
+    );
+  }
+  clientIds.forEach((clientId, index) => {
+    if (!OAuthClientIdSchema.safeParse(clientId).success || clientId.includes(',')) {
+      throw new Error(
+        `TABDOCK_OAUTH_CLIENT_IDS entry ${String(index + 1)} is not an OAuth client_id: 1 to 512 printable characters without spaces or commas`,
+      );
+    }
+  });
+}
+
+/** Parses TABDOCK_OAUTH_CLIENT_IDS: comma-separated client_id values, such as metadata document URLs. */
+export function parseOAuthClientIds(envValue: string): string[] {
+  const clientIds = envValue
+    .split(',')
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+  checkClientIds(clientIds);
+  return [...new Set(clientIds)];
 }
 
 /** Claude gives discovery 10 s too (docs/notes/m3/connector-auth.md). */
@@ -291,6 +363,9 @@ export function parseOAuthUsers(envValue: string): OAuthUser[] {
     if (!IdSchema.safeParse(userId).success) {
       throw new Error(`${entry} has a user id that is not 1 to 64 letters, digits, '_' or '-'`);
     }
+    if (isInviteePrefixed(userId)) {
+      throw new Error(`${entry} has a user id starting g_, which only an invitee's may (ADR 0017)`);
+    }
     users.push({ sub, userId, displayName });
   });
   if (users.length === 0) throw new Error('TABDOCK_OAUTH_USERS lists no users');
@@ -325,6 +400,8 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
   if (options.users.length === 0) {
     throw new Error('OAuth sign-in needs at least one user (TABDOCK_OAUTH_USERS)');
   }
+  checkMaxTokenAge(options.maxTokenAgeMinutes);
+  checkClientIds(options.clientIds);
   const bySub = new Map<string, User>();
   const userIds = new Set<string>();
   for (const entry of options.users) {
@@ -343,14 +420,19 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
     if (userIds.has(user.data.userId)) {
       throw new Error(`the OAuth user id ${user.data.userId} is listed twice`);
     }
+    if (isInviteePrefixed(user.data.userId)) {
+      throw new Error(
+        `the OAuth user id ${user.data.userId} starts with g_, which only an invitee's may (ADR 0017)`,
+      );
+    }
     bySub.set(entry.sub, user.data);
     userIds.add(user.data.userId);
   }
 
   /**
    * The one account mapping (ADR 0016): an allowlisted subject is a member;
-   * anyone else the provider signs in is an invitee, whom every caller refuses
-   * until M4 lets invites in. The key stands in for the subject, which never
+   * anyone else the provider signs in is an invitee, whom the relay refuses
+   * unless it admits invitees. The key stands in for the subject, which never
    * leaves this function.
    */
   const accountOf = (sub: string): Account => {
@@ -358,6 +440,19 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
     return user === undefined
       ? { kind: 'invitee', key: digestHex(`invitee ${sub}`).slice(0, 32) }
       : { kind: 'member', user };
+  };
+  const memberNames = [...bySub.values()].map((user) => user.displayName);
+  /**
+   * The user behind a subject, named once for /mcp, /pair and /i alike (ADR
+   * 0017): a member as the owner listed them, with no email kept, since the
+   * owner's own settings name them; an invitee by inviteeUser, from the email
+   * the provider verified or none.
+   */
+  const userOf = (sub: string, email: string | null): AuthUser => {
+    const account = accountOf(sub);
+    return account.kind === 'member'
+      ? { ...account.user, account: { ...MEMBER_ACCOUNT } }
+      : inviteeUser(account.key, email, memberNames);
   };
 
   const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(resourceUrl);
@@ -387,6 +482,9 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
         'Content-Type': response.headers.get('content-type') ?? 'application/json',
         'WWW-Authenticate': response.headers.get('www-authenticate') ?? 'Bearer',
       },
+      // A token that failed its checks says nothing trustworthy about anyone.
+      accountKind: null,
+      oauthClientId: null,
     };
   };
 
@@ -401,7 +499,7 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
     name: 'oauth',
     resource,
     routes: new Map([[new URL(resourceMetadataUrl).pathname, metadataRoute]]),
-    browserSignIn: { provider: () => provider, accountOf },
+    browserSignIn: { provider: () => provider, accountOf, userOf },
 
     async start() {
       const metadata = await discover(issuer);
@@ -531,24 +629,26 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
             reason: 'identity provider keys unreachable',
             body: 'Sign-in cannot be checked right now; try again shortly',
             headers: { 'Retry-After': String(Math.ceil(JWKS_RETRY_MS / 1000)) },
+            accountKind: null,
+            oauthClientId: null,
           };
         }
         return challenge(error);
       }
       const sub = info.extra?.sub;
-      const account = typeof sub === 'string' ? accountOf(sub) : undefined;
-      if (account?.kind !== 'member') {
-        // Not insufficient_scope: Claude would only sign in again and land here once more.
-        // M4 admits invitees here instead (ADR 0016); until then only members get in.
-        return {
-          kind: 'refused',
-          status: 403,
-          reason: 'signed-in account is not on the allowlist',
-          body: 'This account is not allowed on this relay',
-          headers: {},
-        };
-      }
-      return { kind: 'user', user: account.user };
+      // verifyAccessToken required a string sub; this only keeps the type honest.
+      if (typeof sub !== 'string') return challenge(new Error('no subject'));
+      // A client_id that is no client_id is left out rather than refused: the
+      // token itself checked out, and the id is kept for the audit log alone.
+      const clientId = OAuthClientIdSchema.safeParse(info.clientId);
+      // A member or an invitee, which the relay admits or answers with 403
+      // (ADR 0020). Until workstream A reads ADR 0020's email claims from the
+      // token, every invitee here is named as unverified.
+      return {
+        kind: 'user',
+        user: userOf(sub, null),
+        oauthClientId: clientId.success ? clientId.data : null,
+      };
     },
   };
 }

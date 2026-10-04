@@ -9,6 +9,11 @@
 
 import {
   type AttachmentView,
+  AUDIT_VERSION,
+  type AuditCallEvent,
+  type AuditEvent,
+  auditPageId,
+  auditToolName,
   type ClientInfo,
   CLOSE_DETACH,
   CLOSE_REPLACED,
@@ -37,6 +42,7 @@ import {
   prepareForCheck,
   type UncheckedReason,
 } from './argument-checker.ts';
+import type { UserAccount } from './auth.ts';
 import type { ResolvedConfig } from './config.ts';
 import type { Logger } from './log.ts';
 import { SlidingWindowLimiter } from './rate-limit.ts';
@@ -53,14 +59,15 @@ import {
   SINGLE_USE_SECRET_PATTERN,
 } from './secrets.ts';
 import type { CallMarks, SpikeHooks } from './spike.ts';
-import type {
-  AttachmentRecord,
-  AttachRequestRecord,
-  AuditOutcome,
-  PageRecord,
-  PageState,
-  RelayStore,
-  SingleUseTicketRecord,
+import {
+  type AttachmentRecord,
+  type AttachRequestRecord,
+  type AuditOutcome,
+  type PageRecord,
+  type PageState,
+  recordAudit,
+  type RelayStore,
+  type SingleUseTicketRecord,
 } from './store.ts';
 
 type FrameOf<T extends PageFrame['t']> = Extract<PageFrame, { t: T }>;
@@ -69,6 +76,10 @@ type FrameOf<T extends PageFrame['t']> = Extract<PageFrame, { t: T }>;
 export interface CallerIdentity {
   userId: string;
   displayName: string;
+  /** Member or invitee, and any verified email, as the auth plugin said (ADRs 0017 and 0020). */
+  account: UserAccount;
+  /** The access token's client_id, for the audit log's attach records (ADR 0019); null for none. */
+  oauthClientId: string | null;
   client: ClientInfo | null;
 }
 
@@ -79,7 +90,19 @@ export interface HubError {
 }
 
 export type PairOutcome =
-  { kind: 'attached'; pageId: string; origin: string; role: Role; existing: boolean } | HubError;
+  | {
+      kind: 'attached';
+      pageId: string;
+      origin: string;
+      role: Role;
+      existing: boolean;
+      /**
+       * For an attachment an invite made, the sponsor's display name, so
+       * pair_page can say "shared by <sponsor>" as /i does (ADR 0016).
+       */
+      sponsor?: string;
+    }
+  | HubError;
 
 /** What /pair shows for a live QR nonce before anyone claims it; looking uses nothing up. */
 export interface PairPreview {
@@ -100,6 +123,55 @@ export interface PairPreview {
  */
 export type ClaimOutcome =
   HubError | { kind: 'claimed'; pageId: string; settled: Promise<PairOutcome> };
+
+/** What /i shows for a live invite before anyone joins (ADR 0016); looking uses nothing up. */
+export interface InvitePreview {
+  /** From the page socket's Origin header (S1), never from the page's own words. */
+  origin: string;
+  /** Written by the page (S10): capped, and shown as the page's own words. */
+  title: string;
+  titleCut: boolean;
+  /** The operator's label for the invite, page-written like the title. */
+  label: string;
+  /** observer for Can watch, driver for Can control. */
+  role: Role;
+  /** "Shared by": the sponsor's name, fixed when the invite was minted. */
+  sponsor: string;
+  expiresAt: number;
+}
+
+/**
+ * The hub's invite surface (ADRs 0016 and 0017), which workstream A builds
+ * on the page hub; /i, pair_page and the invitee session pool call it. The
+ * page side arrives as invite_create and invite_cancel frames, which the hub
+ * ignores until then, since no relay without invites ever offers them. The
+ * rules A builds to are in ADR 0017's notes: every redemption reaches the
+ * page as an attach_request via invite with the presented secret, autoApprove
+ * or not; a relay with invites off sends no invites frame, and one with them
+ * on sends one after every welcome and answers every invite_create with one;
+ * and a revoke of one user never cancels an invite.
+ */
+export interface InviteHub {
+  /**
+   * pair_page's invite input: a link minted for one use, or its secret.
+   * Counted like a code per user and per page, and per invite; waits for the
+   * operator like pairPage when the invite needs a prompt.
+   */
+  redeemInvite(caller: CallerIdentity, invite: string, signal: AbortSignal): Promise<PairOutcome>;
+  /** What /i shows; null for an unknown, used, cancelled or expired secret alike. */
+  previewInvite(secret: string): InvitePreview | null;
+  /** /i's Join, like claimPairNonce: refused at once, or claimed with the outcome to come. */
+  claimInvite(caller: CallerIdentity, secret: string): ClaimOutcome;
+  /** Whether the user holds any attachment, which decides an invitee's session pool and audit budget. */
+  holds(userId: string): boolean;
+}
+
+/** What #grant takes from an attach request, or from a caller let in without one. */
+type GrantRequest = Pick<
+  AttachRequestRecord,
+  'pageId' | 'userId' | 'displayName' | 'account' | 'oauthClientId' | 'client'
+> &
+  Partial<Pick<AttachRequestRecord, 'joined'>>;
 
 /** A page title longer than this is cut before /pair shows it (S10). */
 export const MAX_PAIR_TITLE_CHARS = 120;
@@ -777,6 +849,10 @@ export class PageHub {
       case 'rotate_pairing':
         this.#rotateTicket(pageId, 'asked by page');
         return;
+      case 'invite_create':
+      case 'invite_cancel':
+        this.#inviteFrame(pageId, frame);
+        return;
       case 'result':
         this.#result(conn, pageId, frame);
         return;
@@ -786,6 +862,19 @@ export class PageHub {
       case 'pong':
         return;
     }
+  }
+
+  /**
+   * A page minting or cancelling an invite. Workstream A answers these
+   * (ADR 0017); until then the relay mints none and sends no invites frame
+   * (ADR 0017's notes: a relay with invites off sends none at all), so a page
+   * that sends one anyway is ignored as before, its secret's hash unlogged.
+   */
+  #inviteFrame(pageId: string, frame: FrameOf<'invite_create' | 'invite_cancel'>): void {
+    this.#log.warn('ignored an invite frame: this relay mints no invites', {
+      pageId,
+      frameType: frame.t,
+    });
   }
 
   #hello(conn: Conn, frame: FrameOf<'hello'>): void {
@@ -1303,11 +1392,7 @@ export class PageHub {
     });
   }
 
-  #grant(
-    request: Pick<AttachRequestRecord, 'pageId' | 'userId' | 'displayName' | 'client'> &
-      Partial<Pick<AttachRequestRecord, 'joined'>>,
-    wanted: Role,
-  ): AttachmentRecord {
+  #grant(request: GrantRequest, wanted: Role): AttachmentRecord {
     const existing = this.#store.attachments.get(request.pageId, request.userId);
     if (existing) return existing;
     const now = Date.now();
@@ -1318,11 +1403,20 @@ export class PageHub {
       pageId: request.pageId,
       userId: request.userId,
       displayName: request.displayName,
+      kind: request.account.kind,
       role: this.#cappedRole(request.pageId, request.userId, wanted),
       grantedAt: now,
       lastUsedAt: null,
       expiresAt: now + this.#config.timings.attachmentIdleMs,
       clients: clients.slice(0, MAX_ROSTER_CLIENTS),
+      // Invite-made attachments, with their end, cap, sponsor and email
+      // digest, and the attach record naming request.oauthClientId, come with
+      // workstream A (ADRs 0017 and 0019).
+      inviteId: null,
+      endsAt: null,
+      inviteRole: null,
+      sponsorId: null,
+      emailHash: null,
     };
     this.#store.attachments.put(attachment);
     this.#armExpiry(attachment);
@@ -1455,11 +1549,14 @@ export class PageHub {
     return this.#store.attachments.listForPage(pageId).map((attachment) => ({
       userId: attachment.userId,
       displayName: attachment.displayName,
+      kind: attachment.kind,
       role: attachment.role,
       grantedAt: attachment.grantedAt,
       lastUsedAt: attachment.lastUsedAt,
       expiresAt: attachment.expiresAt,
       clients: attachment.clients.slice(0, MAX_ROSTER_CLIENTS),
+      inviteId: attachment.inviteId,
+      endsAt: attachment.endsAt,
     }));
   }
 
@@ -1516,6 +1613,15 @@ export class PageHub {
   }
 
   // MCP side
+
+  /**
+   * Whether the user holds an attachment to any page (InviteHub.holds). An
+   * invitee's session pool and audit budget turn on it (ADRs 0016 and 0019),
+   * and relay.ts hands it to the MCP sessions for that.
+   */
+  holds(userId: string): boolean {
+    return this.#store.attachments.listForUser(userId).length > 0;
+  }
 
   listPages(userId: string): PageListing[] {
     const listings: PageListing[] = [];
@@ -1734,10 +1840,12 @@ export class PageHub {
       };
     }
 
-    const request = {
+    const request: GrantRequest = {
       pageId: page.pageId,
       userId: caller.userId,
       displayName: caller.displayName,
+      account: caller.account,
+      oauthClientId: caller.oauthClientId,
       client: caller.client,
     };
 
@@ -1794,6 +1902,8 @@ export class PageHub {
       ...request,
       requestId: newId('rq'),
       via,
+      // Redemptions, which name their invite, come with workstream A (ADR 0017).
+      inviteId: null,
       joined: [],
       expiresAt: now + attachRequestTtlMs,
     };
@@ -1814,6 +1924,11 @@ export class PageHub {
       t: 'attach_request',
       requestId: record.requestId,
       user: { userId: record.userId, displayName: record.displayName },
+      // A member's name comes from the owner's own settings; an invitee's is verified only with an email.
+      account: {
+        kind: record.account.kind,
+        verified: record.account.kind === 'member' || record.account.email !== null,
+      },
       via: record.via,
       client: record.client,
       expiresAt: record.expiresAt,
@@ -1905,21 +2020,32 @@ export class PageHub {
       throw error;
     } finally {
       // In finally, so every attempt leaves a record even when the relay itself fails (S7).
-      const record = {
+      const record: AuditCallEvent = {
+        v: AUDIT_VERSION,
+        type: 'call',
         at: started,
-        pageId,
+        // The client's own text: kept when it is an id or a tool name, else only its length (ADR 0019).
+        pageId: auditPageId(pageId),
         origin: this.#store.pages.get(pageId)?.origin ?? null,
         userId: caller.userId,
         client: caller.client,
-        tool,
+        tool: auditToolName(tool),
         outcome: auditOutcome,
         durationMs: Date.now() - started,
       };
-      this.#store.audit.append(record);
-      // Arguments are never part of the record (S7), and the logger redacts them anyway.
-      this.#log.info('call', { audit: record });
+      this.#audit(record);
       this.#spike?.callFinished(pageId, caller.userId, auditOutcome);
     }
+  }
+
+  /**
+   * Every audit record the hub writes goes through here: into the audit log
+   * and, as its off-host copy with whatever the file line added, to the log,
+   * whose redaction drops an invitee's email (recordAudit, ADR 0019).
+   * Arguments are never part of a record (S7).
+   */
+  #audit(event: AuditEvent): void {
+    recordAudit(this.#store.audit, this.#log, event);
   }
 
   /**

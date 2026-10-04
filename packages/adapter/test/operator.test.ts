@@ -553,7 +553,7 @@ describe("the operator's role switch", () => {
     const h = setup();
     const socket = await link(h, {}, { bob: 'observer' });
     expect(h.dock.setRole('bob', 'driver')).toBe(true);
-    expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: 'driver' } });
+    expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: { role: 'driver' } } });
     expect(socket.last()).toEqual({ t: 'set_role', userId: 'bob', role: 'driver' });
 
     // Until the relay lists Bob as a driver, the lesser role holds.
@@ -665,7 +665,7 @@ describe("the operator's role switch", () => {
     socket.drop(1006);
     expect(h.dock.setRole('bob', 'driver')).toBe(false);
     expect(socket.framesOf('set_role')).toEqual([]);
-    expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: 'observer' } });
+    expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: { role: 'observer' } } });
   });
 });
 
@@ -703,7 +703,7 @@ describe('revoke (S8)', () => {
     expect(h.context.runs.find((run) => run.tool === 'get_value')?.signal.aborted).toBe(true);
     expect(h.dock.state.pendingConfirms).toEqual([]);
     expect(h.dock.state.pendingRequests).toEqual([]);
-    expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { alice: 'driver' } });
+    expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { alice: { role: 'driver' } } });
 
     // The relay has not sent its new roster yet, and Bob still gets nothing.
     socket.deliver(invoke('get_value', { callId: 'bob-later', caller: caller('bob') }));
@@ -725,7 +725,7 @@ describe('revoke (S8)', () => {
       user: { userId: 'carol', displayName: 'Carol' },
     });
     expect(h.dock.approve('carol-1', 'observer')).toBe(true);
-    expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { carol: 'observer' } });
+    expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { carol: { role: 'observer' } } });
     expect(h.dock.revoke('*')).toBe(true);
   });
 

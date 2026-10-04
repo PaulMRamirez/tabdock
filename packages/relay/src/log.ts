@@ -32,6 +32,15 @@ export const REDACTED_FIELDS: readonly string[] = [
   'id_token',
   'access_token',
   'refresh_token',
+  // Invites (ADR 0017): a link or its secret as pair_page takes it, and the
+  // digest the relay keeps, which ADR 0019 keeps out of every record too.
+  'invite',
+  'link',
+  'secrethash',
+  // People (ADR 0020): an invitee's address reaches its page and the audit
+  // file's attach record, never stderr or a platform's logs.
+  'email',
+  'displayname',
 ];
 
 const REDACTED = '[redacted]';

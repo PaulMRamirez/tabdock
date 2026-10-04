@@ -14,11 +14,13 @@ import {
   type StoredOAuthTokens,
   StreamableHTTPClientTransport,
 } from '@modelcontextprotocol/client';
-import { createServer, type Server } from 'node:http';
+import { createServer, type IncomingMessage, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { generateKeyPair, SignJWT, UnsecuredJWT } from 'jose';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  AuthOutcomeSchema,
+  createLogger,
   createOAuthAuth,
   createRelay,
   type OAuthAuthOptions,
@@ -51,6 +53,8 @@ const USERS: OAuthUser[] = [
 let provider: TestProvider;
 let relay: Relay | undefined;
 let lines: string[] = [];
+/** What the relay hands a plugin's start(); a test that starts one by hand passes this. */
+const START = { log: createLogger({ sink: () => undefined }) };
 
 beforeEach(async () => {
   provider = await startProvider();
@@ -276,7 +280,7 @@ describe('the provider the relay will start with (ADR 0013)', () => {
   });
 
   it('refuses a provider it cannot reach', async () => {
-    await expect(plugin({ issuer: 'http://127.0.0.1:1' }).start?.()).rejects.toThrow(
+    await expect(plugin({ issuer: 'http://127.0.0.1:1' }).start?.(START)).rejects.toThrow(
       /cannot reach the identity provider/,
     );
   });
@@ -401,7 +405,7 @@ describe('tokens (ADR 0013)', () => {
     if (signIn === undefined) throw new Error('the oauth plugin offers no browser sign-in');
     // Nothing to sign a browser in with until the provider's metadata is read.
     expect(signIn.provider()).toBeNull();
-    await auth.start?.();
+    await auth.start?.(START);
     expect(signIn.provider()).toMatchObject({
       issuer: provider.issuer,
       authorization_endpoint: `${provider.issuer}/authorize`,
@@ -418,6 +422,51 @@ describe('tokens (ADR 0013)', () => {
     expect(JSON.stringify(stranger)).not.toContain('stranger');
     expect(signIn.accountOf('sub-stranger')).toEqual(stranger);
     expect(signIn.accountOf('sub-other')).not.toEqual(stranger);
+    // The user a subject signs in as, named once for /mcp, /pair and /i (ADR 0017).
+    expect(signIn.userOf('sub-alice', 'alice@example.com')).toEqual({
+      userId: 'alice',
+      displayName: 'Alice',
+      account: { kind: 'member', email: null },
+    });
+    if (stranger.kind !== 'invitee') throw new Error('expected an invitee');
+    expect(signIn.userOf('sub-stranger', 'guest@example.com')).toEqual({
+      userId: `g_${stranger.key}`,
+      displayName: 'guest@example.com',
+      account: { kind: 'invitee', email: 'guest@example.com' },
+    });
+    expect(signIn.userOf('sub-stranger', null)).toMatchObject({
+      displayName: 'unverified account',
+      account: { kind: 'invitee', email: null },
+    });
+    // A name that folds to a member's shows the short id instead.
+    const lookalike = createOAuthAuth({
+      issuer: provider.issuer,
+      resource: PUBLIC_MCP_URL,
+      users: [{ sub: 'sub-alice', userId: 'alice', displayName: 'ALICE@Example.com' }],
+    }).browserSignIn;
+    expect(lookalike?.userOf('sub-stranger', 'alice@example.com').displayName).toBe(
+      `invitee ${stranger.key.slice(0, 8)}`,
+    );
+  });
+
+  it('vouches for an account off the allowlist as an invitee, and leaves admitting it to the relay (ADR 0020)', async () => {
+    const auth = plugin();
+    await auth.start?.(START);
+    const token = await provider.token({
+      sub: 'sub-stranger',
+      aud: PUBLIC_MCP_URL,
+      client_id: 'client_01ABC',
+    });
+    const outcome = await auth.authenticate({
+      headers: { authorization: `Bearer ${token}` },
+    } as unknown as IncomingMessage);
+    expect(AuthOutcomeSchema.parse(outcome)).toEqual(outcome);
+    expect(outcome).toMatchObject({
+      kind: 'user',
+      user: { displayName: 'unverified account', account: { kind: 'invitee', email: null } },
+      oauthClientId: 'client_01ABC',
+    });
+    expect(JSON.stringify(outcome)).not.toContain('sub-stranger');
   });
 
   it.each<[string, string | undefined]>([
@@ -463,6 +512,8 @@ describe('tokens (ADR 0013)', () => {
       ['mcp request refused: not allowed', 'signed-in account is not on the allowlist'],
       ['mcp request refused: not authenticated', 'Missing Authorization header'],
     ]);
+    // Each names the client address the relay resolved, here the socket's peer.
+    for (const entry of refusals) expect(entry.address).toBe('127.0.0.1');
   });
 
   it("answers 503, not 401, when the provider's keys cannot be fetched", async () => {

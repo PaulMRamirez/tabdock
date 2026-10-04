@@ -4,19 +4,25 @@
 // timers and the operator's prompts all arrive through CoreOptions.
 
 import {
+  type Account,
   ATTACH_REQUEST_TTL_MS,
   type AttachmentView,
+  type AttachVia,
   type Caller,
   type ClientInfo,
   CLOSE_DETACH,
   CLOSE_INVALID_FRAME_PAGE,
   CLOSE_REPLACED,
   CLOSE_SILENT,
+  CONTROL_INVITE_USES,
   encodeFrame,
   IdSchema,
   IDLE_TIMEOUT_MS,
+  InviteLabelSchema,
+  type InviteRefusalReason,
   JsonObjectSchema,
   MAX_FRAME_BYTES,
+  MAX_INVITE_USES,
   MAX_RESULT_CHARS,
   type PageErrorCode,
   type PageFrameInput,
@@ -32,6 +38,8 @@ import {
   type RelayFrame,
   type Role,
   RoleSchema,
+  type StoredGrant,
+  StoredGrantSchema,
   SUBPROTOCOL,
   TOOL_POLL_MS,
   truncate,
@@ -48,6 +56,7 @@ import {
 } from './tools.ts';
 
 export type { HintSupport, RuntimeTool } from './tools.ts';
+export type { StoredGrant, StoredInvite, StoredInvites } from '@tabdock/protocol';
 
 // Ports: everything the core needs from its environment.
 
@@ -168,11 +177,93 @@ export type LinkState = 'idle' | 'connecting' | 'linked' | 'reconnecting' | 'clo
 export interface PendingRequest {
   readonly requestId: string;
   readonly user: User;
-  readonly via: 'code' | 'qr';
+  /** Member or invitee, and whether an invitee's name is a verified email (ADR 0017). */
+  readonly account: Account;
+  readonly via: AttachVia;
+  /**
+   * The invite a redemption came through, as the relay names it; never its
+   * secret, which stays inside the adapter. null for a code or QR request.
+   */
+  readonly invite: { readonly inviteId: string; readonly label: string } | null;
   readonly client: ClientInfo | null;
   /** Local epoch milliseconds at which silence becomes a denial. */
   readonly expiresAt: number;
 }
+
+/** How long an invite works: 15 minutes, an hour, or while the page is open (ADR 0016). */
+export type InviteLifetime = '15m' | '1h' | 'open';
+
+export const INVITE_LIFETIMES: readonly InviteLifetime[] = ['15m', '1h', 'open'];
+
+/** What the operator asks for when minting an invite (ADR 0017). */
+export interface InviteOptions {
+  /** 1 to 60 characters; shown wherever the invite is, as the page's own words. */
+  readonly label: string;
+  /** observer for Can watch; driver for Can control, which needs policy.invites 'all'. */
+  readonly role: Role;
+  /** An hour unless set; never past 24 hours, whatever is chosen. */
+  readonly lifetime?: InviteLifetime;
+  /** Can watch only: 1 (unless set) to 20. A Can control invite always has exactly one. */
+  readonly uses?: number;
+}
+
+/**
+ * Why no link came back: the relay's own reasons (ADR 0017), or the
+ * adapter's: options it cannot mint (invalid), no link to the relay
+ * (link_down), or a relay that offers no invites (unavailable).
+ */
+export type InviteRefusal = InviteRefusalReason | 'invalid' | 'link_down' | 'unavailable';
+
+/**
+ * One live invite this page minted, as the widget's list shows it (ADR
+ * 0017): the relay's listing of an invite this page's own record holds.
+ * expiresAt is the operator's choice on this page's clock, as the relay echoes
+ * it back; null is "while the page is open", which still ends 24 hours after
+ * minting.
+ */
+export interface InviteView {
+  readonly inviteId: string;
+  /** observer for Can watch, driver for Can control. */
+  readonly role: Role;
+  /** Written on this page: shown as its own words (S10). */
+  readonly label: string;
+  readonly uses: number;
+  readonly usesLeft: number;
+  readonly expiresAt: number | null;
+  /** The member the relay named as sponsor at minting; fixed, since /i shows the name. */
+  readonly sponsor: User;
+  /** A redemption waits on the operator; a control invite allows one at a time. */
+  readonly pending: boolean;
+  /** Refusals and timeouts so far; three burn a control invite. */
+  readonly refusals: number;
+}
+
+/** What a relay that offers invites said in its last invites frame. */
+export interface InvitesOffered {
+  /** `<public URL>/i`, where links start; null when this relay mints none, having no public URL. */
+  readonly linkBase: string | null;
+}
+
+/** Options for Revoke (ADR 0017). */
+export interface RevokeOptions {
+  /**
+   * For someone an invite let in, also close that invite's link
+   * (invite_cancel), so nobody else joins by it. The widget checks it by
+   * default for a multi-use invite; revoke('*') closes every link anyway.
+   */
+  readonly closeInvite?: boolean;
+}
+
+/** The link shows here once, and is never stored: only its secret's hash is. */
+export type InviteResult =
+  | {
+      readonly ok: true;
+      readonly inviteId: string;
+      readonly link: string;
+      /** Local epoch milliseconds; null while the page is open, which still ends after 24 hours. */
+      readonly expiresAt: number | null;
+    }
+  | { readonly ok: false; readonly reason: InviteRefusal };
 
 export interface PendingConfirm {
   readonly callId: string;
@@ -238,6 +329,17 @@ export interface DockState {
   readonly paused: boolean;
   /** The last ACTIVITY_LIMIT calls, newest first. */
   readonly activity: readonly ActivityEntry[];
+  /**
+   * This page's live invites, oldest first (ADR 0017): empty until a relay
+   * offers invites, and holding only those this page's own record knows.
+   */
+  readonly invites: readonly InviteView[];
+  /**
+   * null until an invites frame arrives, which only a relay with invites on
+   * sends, right after each welcome (ADR 0017's notes); a relay with them off
+   * never sends one, so the widget then offers no Invite form at all.
+   */
+  readonly invitesOffered: InvitesOffered | null;
 }
 
 /** The only control handle. Each method returns false when there was nothing to act on. */
@@ -255,8 +357,26 @@ export interface Dock {
    * choice and the relay's roster either way.
    */
   setRole(userId: string, role: Role): boolean;
-  /** Ends one user's attachment, or everyone's with '*' (S8). */
-  revoke(userId: string): boolean;
+  /**
+   * Ends one user's attachment, or everyone's with '*' (S8), which also
+   * cancels every live invite. Revoking someone an invite let in bars them
+   * from it; options.closeInvite also closes its link (ADR 0017).
+   */
+  revoke(userId: string, options?: RevokeOptions): boolean;
+  /**
+   * Closes one live invite's link (invite_cancel); the attachments it already
+   * made stay until revoked (ADR 0017's notes). False when this page holds no
+   * such invite.
+   */
+  cancelInvite(inviteId: string): boolean;
+  /**
+   * Mints an invite on this page as far as policy.invites allows (ADR 0017):
+   * a 128-bit secret whose hash alone goes to the relay and into this page's
+   * own record, and a link that resolves here once. Workstream B mints; until
+   * then every relay offers none, so this resolves unavailable once the
+   * options and the page's policy check out.
+   */
+  invite(options: InviteOptions): Promise<InviteResult>;
   /** Pauses or resumes calls on this page. Only false resumes, and the choice survives a reload. */
   pause(paused: boolean): void;
   close(): void;
@@ -312,10 +432,20 @@ const MAX_ERROR_CHARS = 2000;
 /** The smallest frame limit honoured from a relay, so a truncated result always fits. */
 const MIN_FRAME_BYTES = 4096;
 
-/** What the adapter keeps in the tab's storage, each for one relay and one page. */
-export type StoredRecord = 'resume' | 'grants' | 'revoked' | 'paused';
+/**
+ * What the adapter keeps in the tab's storage, each for one relay and one
+ * page: from M4 also its invite records (StoredInvites, ADR 0017), beside
+ * the grants and dropped with them.
+ */
+export type StoredRecord = 'resume' | 'grants' | 'revoked' | 'paused' | 'invites';
 
-const STORED_RECORDS: readonly StoredRecord[] = ['resume', 'grants', 'revoked', 'paused'];
+const STORED_RECORDS: readonly StoredRecord[] = [
+  'resume',
+  'grants',
+  'revoked',
+  'paused',
+  'invites',
+];
 
 const LOCK_PREFIX = 'tabdock:';
 
@@ -440,18 +570,22 @@ function overByteLimit(text: string, limit: number): boolean {
 /**
  * Reads the grants stored beside the resume token with the protocol's own
  * schemas. Other code on the page shares that storage, so anything malformed
- * reads as no grants at all rather than as a partial list.
+ * reads as no grants at all rather than as a partial list. Each grant is
+ * `{ role, inviteId?, endsAt? }` from M4; a bare role, as an older adapter
+ * stored it, reads as a grant with neither (ADR 0017).
  */
-function parseGrants(text: string): { pageId: string; grants: [string, Role][] } | null {
+export function parseGrants(
+  text: string,
+): { pageId: string; grants: [string, StoredGrant][] } | null {
   const record = JsonObjectSchema.safeParse(parseJson(text));
   if (!record.success) return null;
   const pageId = IdSchema.safeParse(record.data.pageId);
   const stored = JsonObjectSchema.safeParse(record.data.grants);
   if (!pageId.success || !stored.success) return null;
-  const grants: [string, Role][] = [];
-  for (const [userId, role] of Object.entries(stored.data)) {
+  const grants: [string, StoredGrant][] = [];
+  for (const [userId, grant] of Object.entries(stored.data)) {
     const user = IdSchema.safeParse(userId);
-    const granted = RoleSchema.safeParse(role);
+    const granted = StoredGrantSchema.safeParse(grant);
     if (!user.success || !granted.success) return null;
     grants.push([user.data, granted.data]);
   }
@@ -638,6 +772,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     error: null,
     paused: readPaused(),
     activity: [],
+    invites: [],
+    invitesOffered: null,
   });
   const listeners = new Set<(state: DockState) => void>();
 
@@ -664,9 +800,11 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   /**
    * The roles the operator granted on this page, by user id: the root of S5's
    * second check. The relay's roster and the role an invoke claims can only
-   * lower them, so a relay cannot run a tool for someone nobody approved.
+   * lower them, so a relay cannot run a tool for someone nobody approved. An
+   * invite-made grant also names its invite and end, which workstream B
+   * enforces (ADR 0017); no grant has either until it does.
    */
-  const grants = new Map<string, Role>();
+  const grants = new Map<string, StoredGrant>();
   /** The page session the grants belong to; they mean nothing on another. */
   let grantsPage: string | null = null;
   /**
@@ -739,7 +877,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     if (text !== null && !stored) log.warn('ignored stored grants that did not parse');
     if (stored) {
       grantsPage = stored.pageId;
-      for (const [userId, role] of stored.grants) grants.set(userId, role);
+      for (const [userId, grant] of stored.grants) grants.set(userId, grant);
     }
     // Pending revokes belong to the same page session, which is the only page a
     // record of revokes alone (the user revoked held the last grant) can name.
@@ -781,9 +919,9 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     if (JSON.stringify(rolesFor(state.roster)) !== JSON.stringify(state.pageRoles)) setState({});
   }
 
-  /** The operator's approvals go through here, so storage always matches memory. */
-  function setGrant(userId: string, role: Role): void {
-    grants.set(userId, role);
+  /** The operator's approvals and role changes go through here, so storage always matches memory. */
+  function setGrant(userId: string, grant: StoredGrant): void {
+    grants.set(userId, grant);
     saveGrants();
   }
 
@@ -856,7 +994,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   function pageRole(userId: string, listed: Role): Role | null {
     if (revoked.has(userId)) return null;
     const granted =
-      grants.get(userId) ?? (policy.autoApprove === 'observer' ? 'observer' : undefined);
+      grants.get(userId)?.role ?? (policy.autoApprove === 'observer' ? 'observer' : undefined);
     if (granted === undefined) return null;
     return granted === 'observer' || listed === 'observer' ? 'observer' : 'driver';
   }
@@ -1023,6 +1161,10 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
             ...(frame.url === undefined ? {} : { url: frame.url }),
           },
         });
+        return;
+      case 'invites':
+        // Workstream B shows these and mints against linkBase (ADR 0017). A
+        // relay sends them only once invites are on, which none is yet.
         return;
       case 'invoke':
         onInvoke(frame);
@@ -1726,7 +1868,13 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     const request: PendingRequest = Object.freeze({
       requestId: frame.requestId,
       user: frame.user,
+      account: frame.account,
       via: frame.via,
+      // Never the secret: workstream B checks it against this page's own record, and no state shows it (ADR 0017).
+      invite:
+        frame.invite === undefined
+          ? null
+          : { inviteId: frame.invite.inviteId, label: frame.invite.label },
       client: frame.client,
       expiresAt,
     });
@@ -1781,7 +1929,9 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     const listed = state.roster.some((attachment) => attachment.userId === userId);
     // An approval after a revoke lets the user back in; the relay applies the two in that order too.
     if (allow) forgetRevokes([userId]);
-    if (allow && role !== undefined && (!listed || !grants.has(userId))) setGrant(userId, role);
+    if (allow && role !== undefined && (!listed || !grants.has(userId))) {
+      setGrant(userId, { role });
+    }
     if (!allow && !listed) pruneGrants([userId]);
     const who = record.request.user.displayName;
     log.info(allow ? `allowed ${who} as ${String(role)}` : `denied ${who}`);
@@ -1812,7 +1962,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     // otherwise even Make observer would be the approval S4 asks for, made by
     // a click meant to lower access. Revoke is what such a row needs.
     if (!grants.has(userId) && policy.autoApprove !== 'observer') return false;
-    setGrant(userId, role);
+    // A role change keeps whatever else the grant names, such as the invite that made it.
+    setGrant(userId, { ...grants.get(userId), role });
     log.info(`set ${attachment.displayName} to ${role}`);
     return send({ t: 'set_role', userId, role });
   }
@@ -1849,6 +2000,50 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       }
     }
     return true;
+  }
+
+  /**
+   * Whether these options name an invite this page could mint: a label, a
+   * role, a known lifetime, and uses only a Can watch invite may have more
+   * than one of. Checked at run time, since a page script can pass anything.
+   */
+  function validInvite(options: InviteOptions): boolean {
+    const uses: unknown = options.uses;
+    const lifetime: unknown = options.lifetime;
+    return (
+      InviteLabelSchema.safeParse(options.label).success &&
+      RoleSchema.safeParse(options.role).success &&
+      (lifetime === undefined || INVITE_LIFETIMES.some((known) => known === lifetime)) &&
+      (uses === undefined ||
+        (typeof uses === 'number' &&
+          Number.isInteger(uses) &&
+          uses >= 1 &&
+          uses <= (options.role === 'driver' ? CONTROL_INVITE_USES : MAX_INVITE_USES)))
+    );
+  }
+
+  function invite(options: InviteOptions): Promise<InviteResult> {
+    const refuse = (reason: InviteRefusal): Promise<InviteResult> =>
+      Promise.resolve(Object.freeze({ ok: false, reason }));
+    if (typeof options !== 'object' || !validInvite(options)) return refuse('invalid');
+    // ADR 0016: watch by default, so Can control needs a page that opted into 'all'.
+    if (policy.invites === 'off' || (options.role === 'driver' && policy.invites !== 'all')) {
+      return refuse('policy');
+    }
+    if (!isLinked()) return refuse('link_down');
+    // Workstream B mints from here once a relay offers invites with its
+    // invites frame (ADR 0017); none does before workstream A.
+    return refuse('unavailable');
+  }
+
+  /**
+   * Closes the link of an invite this page lists. Workstream B also drops it
+   * from the page's own record (ADR 0017); until a relay offers invites the
+   * page lists none, so this finds nothing.
+   */
+  function cancelInvite(inviteId: string): boolean {
+    if (closed || !state.invites.some((view) => view.inviteId === inviteId)) return false;
+    return isLinked() && send({ t: 'invite_cancel', inviteId });
   }
 
   /** Calls already in the page's hands finish; every other call, now or later, is answered page_busy. */
@@ -1933,7 +2128,11 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     confirm: (callId: string, allow: boolean) => confirmCall(callId, (allow as unknown) === true),
     rotatePairing: () => isLinked() && send({ t: 'rotate_pairing' }),
     setRole: (userId: string, role: Role) => setRole(userId, role),
+    // Workstream B honours RevokeOptions.closeInvite (ADR 0017); until a
+    // relay offers invites no grant names one, so there is no link to close.
     revoke: (userId: string) => revoke(userId),
+    cancelInvite: (inviteId: string) => cancelInvite(inviteId),
+    invite: (options: InviteOptions) => invite(options),
     // Only false resumes: resuming lets calls run again, so a script's 'false' or 0 keeps the pause.
     pause: (paused: boolean) => {
       pause((paused as unknown) !== false);

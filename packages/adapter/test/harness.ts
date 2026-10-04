@@ -470,16 +470,19 @@ export function grant(harness: Harness, socket: FakeSocket, userId: string, role
   if (!harness.dock.approve(requestId, role)) throw new Error(`could not approve ${userId}`);
 }
 
-/** A roster entry as the relay would send it. */
+/** A roster entry as the relay would send it: a member's, made by an approval. */
 export function attachment(userId: string, role: Role, grantedAt = 0) {
   return {
     userId,
     displayName: userId.charAt(0).toUpperCase() + userId.slice(1),
+    kind: 'member' as const,
     role,
     grantedAt,
     lastUsedAt: null,
     expiresAt: null,
     clients: [],
+    inviteId: null,
+    endsAt: null,
   };
 }
 
@@ -503,6 +506,7 @@ export function attachRequest(clock: ManualClock, requestId = 'req-1'): AttachRe
     t: 'attach_request',
     requestId,
     user: { userId: 'bob', displayName: 'Bob' },
+    account: { kind: 'member', verified: true },
     via: 'code',
     client: { name: 'claude-code', version: '2.1.287' },
     expiresAt: clock.now + ATTACH_REQUEST_TTL_MS,

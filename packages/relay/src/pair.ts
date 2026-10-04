@@ -9,19 +9,24 @@
 // attach request via 'qr', which the operator approves on the page like any
 // other while the phone polls for the answer. A nonce alone yields only that
 // preview; with a session it yields only a pending request. No nonce, code,
-// cookie, state, verifier or token is ever logged, and nothing here counts by
-// address, since behind the tunnel every request comes from the same one.
+// cookie, state, verifier or token is ever logged. The one count that may go
+// by address is the sign-in gate's (sign-in-gate.ts), which relay.ts hands in
+// with the address it resolved, since behind a tunnel every request comes
+// from the same one and only a host edge names the client (ADR 0018).
+// Workstream A owns this module, /i beside it and the sign-in flow (ADRs 0017
+// and 0020); /i signs in through /pair/login and /pair/callback.
 
 import { readFileSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import * as oidc from 'openid-client';
 import { z } from 'zod';
-import type { Account, BrowserSignIn } from './auth.ts';
+import { type Account, type BrowserSignIn, MEMBER_ACCOUNT } from './auth.ts';
 import { type PairClientOptions, pairRedirectUriOf, type ResolvedConfig } from './config.ts';
 import type { PageHub, PairOutcome } from './hub.ts';
 import type { Logger } from './log.ts';
 import { SlidingWindowLimiter } from './rate-limit.ts';
 import { digest, newId, newSessionSecret, sameDigest } from './secrets.ts';
+import type { SignInGate } from './sign-in-gate.ts';
 
 /** Every path this module answers; relay.ts also logs requests by these names (ADR 0016). */
 export const PAIR_ROUTES: readonly string[] = [
@@ -58,8 +63,6 @@ const SESSION_SECRET = /^[A-Za-z0-9_-]{43}$/;
 /** openid-client's random state, nonce and verifier: 32 bytes as base64url. */
 const LOGIN_PART = /^[A-Za-z0-9_-]{43}$/;
 const CLAIM_ID = /^qc_[0-9A-Z]{10}$/;
-/** The one key the code exchange limiter counts under. */
-const EXCHANGES = 'relay';
 
 /**
  * No inline script or style may run, nothing may frame the page, and with
@@ -251,11 +254,22 @@ export interface PairFlowOptions {
   hub: PageHub;
   config: ResolvedConfig;
   log: Logger;
+  /** Admits each code exchange with the provider, for the whole relay and per client address. */
+  signInGate: SignInGate;
 }
 
 export interface PairFlow {
-  /** Answers one request for a path in PAIR_ROUTES; the Host check has already passed. */
-  handle(path: string, request: IncomingMessage, response: ServerResponse): Promise<void>;
+  /**
+   * Answers one request for a path in PAIR_ROUTES. The Host check has already
+   * passed, and `address` is the client address's limit key, which relay.ts
+   * resolved, answering 400 itself when the edge's header named none.
+   */
+  handle(
+    path: string,
+    request: IncomingMessage,
+    response: ServerResponse,
+    address: string,
+  ): Promise<void>;
   close(): void;
 }
 
@@ -308,7 +322,7 @@ function signInConfiguration(signIn: BrowserSignIn, client: PairClientOptions): 
 }
 
 export function createPairFlow(options: PairFlowOptions): PairFlow {
-  const { publicUrl, client, signIn, hub, config, log } = options;
+  const { publicUrl, client, signIn, hub, config, log, signInGate } = options;
   const configuration = signInConfiguration(signIn, client);
   const redirectUri = pairRedirectUriOf(publicUrl);
   const assets = new Map<string, Asset>([
@@ -316,13 +330,9 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
     ['/pair/pair.js', loadAsset('pair.js', 'text/javascript; charset=utf-8', RESOURCE_CSP)],
     ['/pair/pair.css', loadAsset('pair.css', 'text/css; charset=utf-8', RESOURCE_CSP)],
   ]);
-  const { windowMs, pairPreviewsPerNonce, pairSignIns } = config.rateLimits;
+  const { windowMs, pairPreviewsPerNonce } = config.rateLimits;
   // Keyed by the digest of a live nonce, never by address (ADR 0016).
   const previewLimiter = new SlidingWindowLimiter(pairPreviewsPerNonce, windowMs);
-  // One key, the whole relay: every caller behind the tunnel shares an address.
-  const exchangeLimiter = new SlidingWindowLimiter(pairSignIns, windowMs);
-  /** Code exchanges waiting on the provider now. */
-  let exchanging = 0;
   /** Oldest first: a Map keeps insertion order, and sessions are only ever added at the end. */
   const sessions = new Map<string, PairSession>();
   const claims = new Map<string, Claim>();
@@ -514,7 +524,11 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
     ]);
   }
 
-  async function callback(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  async function callback(
+    request: IncomingMessage,
+    response: ServerResponse,
+    address: string,
+  ): Promise<void> {
     const now = Date.now();
     const failed = (): void => {
       redirect(response, '/pair?signin=failed', [clearCookie(LOGIN_COOKIE)]);
@@ -525,27 +539,21 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
       failed();
       return;
     }
-    // Anyone can get this far with a cookie of their own making, and what
-    // follows is a request to the provider carrying the /pair client's
-    // secret, so the whole relay makes only so many at once and per window.
-    // Past either, the sign-in fails here and the provider hears nothing.
-    if (exchanging >= config.limits.pairSignInsInFlight) {
-      log.warn('pair sign-in refused: too many sign-ins waiting on the provider');
-      failed();
-      return;
-    }
-    if (!exchangeLimiter.allows(EXCHANGES, now)) {
-      log.warn('pair sign-in refused: too many sign-ins in this window');
-      failed();
-      return;
-    }
-    exchangeLimiter.record(EXCHANGES, now);
     // Rebuilt on the public URL, the redirect URI the provider was given;
     // only the query comes from the request, and the Host never does.
     const query = URL.parse(request.url ?? '', 'http://relay.invalid')?.search ?? '';
     const returned = new URL(`/pair/callback${query}`, publicUrl);
     let sub: string;
-    exchanging += 1;
+    // Anyone can get this far with a cookie of their own making, and what
+    // follows is a request to the provider carrying the /pair client's
+    // secret, so the gate admits only so many at once and per window. Past
+    // either, the sign-in fails here and the provider hears nothing. Admitted
+    // last, so nothing can throw between here and the finally that leaves.
+    const pass = signInGate.enter(address, now);
+    if (pass === null) {
+      failed();
+      return;
+    }
     try {
       const tokens = await oidc.authorizationCodeGrant(configuration, returned, {
         pkceCodeVerifier: login.verifier,
@@ -561,7 +569,7 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
       failed();
       return;
     } finally {
-      exchanging -= 1;
+      pass.leave();
     }
     const account = signIn.accountOf(sub);
     const secret = openSession(account, now);
@@ -654,8 +662,16 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
       return;
     }
     const { user } = session.account;
+    // A browser sign-in carries no access token, so no client_id; its verified
+    // email comes when workstream A asks for openid email here (ADR 0020).
     const outcome = hub.claimPairNonce(
-      { userId: user.userId, displayName: user.displayName, client: null },
+      {
+        userId: user.userId,
+        displayName: user.displayName,
+        account: { ...MEMBER_ACCOUNT },
+        oauthClientId: null,
+        client: null,
+      },
       body.data.nonce,
     );
     if (outcome.kind === 'error') {
@@ -729,7 +745,7 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
   };
 
   return {
-    async handle(path, request, response) {
+    async handle(path, request, response, address) {
       const allowed = methods[path];
       if (allowed === undefined) {
         refuse(response, 404, 'not_found', 'not found');
@@ -747,7 +763,7 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
           await login(response);
           return;
         case '/pair/callback':
-          await callback(request, response);
+          await callback(request, response, address);
           return;
         case '/pair/preview':
           await preview(request, response);

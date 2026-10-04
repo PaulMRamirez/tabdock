@@ -20,20 +20,35 @@ export type {
   Dock,
   DockState,
   HintSupport,
+  InviteLifetime,
+  InviteOptions,
+  InviteRefusal,
+  InviteResult,
+  InvitesOffered,
+  InviteView,
   LinkState,
   ModelContextLike,
   PageRole,
   PendingConfirm,
   PendingRequest,
+  RevokeOptions,
   RuntimeTool,
+  StoredGrant,
+  StoredInvite,
+  StoredInvites,
 } from './core.ts';
+export { INVITE_LIFETIMES } from './core.ts';
 export type {
+  Account,
   AttachmentView,
+  AttachVia,
   ClientInfo,
+  InvitePolicy,
   Pairing,
   PolicyInput,
   Role,
   User,
+  UserKind,
 } from '@tabdock/protocol';
 export { ADAPTER_VERSION };
 

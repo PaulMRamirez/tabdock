@@ -9,21 +9,30 @@
 // at all the relay runs in local mode (ADR 0022): one user, `you`, holding an
 // owner token drawn into a private per-user file (local-token.ts), behind a
 // plugin marked loopbackOnly, which resolveConfig keeps on this machine.
+// M4's settings are read here too, each refused by name outside the mode
+// where it means something: invites (ADR 0017), hosted mode's client address
+// header and proxy ranges with its limits (ADR 0018), the audit log's
+// directory and bounds (ADR 0019), and the OAuth token age cap and client
+// list (ADR 0020). Workstreams A and C put them to work.
 
 import { BlockList, isIP, isIPv6 } from 'node:net';
+import { dirname, isAbsolute, join } from 'node:path';
 import {
   ATTACH_REQUEST_TTL_MS,
   DEFAULT_CALL_DEADLINE_MS,
   IDLE_TIMEOUT_MS,
+  MAX_FRAME_BYTES,
+  MEMBER_RESERVED_SEATS,
   PAIR_WAIT_MS,
   PAIRING_TTL_MS,
   PING_INTERVAL_MS,
+  type RelayMode,
   RESUME_WINDOW_MS,
 } from '@tabdock/protocol';
 import { type AuthPlugin, createDevTokenAuth, parseDevTokens } from './auth.ts';
 import { LOCAL_USER, type LocalTokenSystem, loadOwnerToken } from './local-token.ts';
 import type { LogLevel, LogSink } from './log.ts';
-import { createOAuthAuth, parseOAuthUsers } from './oauth.ts';
+import { createOAuthAuth, parseOAuthClientIds, parseOAuthUsers } from './oauth.ts';
 import type { RelayStore } from './store.ts';
 
 export type RelayEnv = 'development' | 'production';
@@ -103,6 +112,30 @@ export interface RelayRateLimits {
   toolsFramesPerAddress: number;
   /** Short, so a burst is caught at once while a page that changes its tools now and then never is. */
   toolsFramesWindowMs: number;
+  /**
+   * Requests one member may make to /mcp per window, every tool counted,
+   * checked right after sign-in and before the access check, so refusals
+   * count too (ADR 0018, workstream A).
+   */
+  requestsPerUser: number;
+  /** The same for an invitee, smaller since anyone can become one (ADR 0018, workstream A). */
+  requestsPerInvitee: number;
+  /** Redemptions of one invite per window, whoever makes them (ADR 0017, workstream A). */
+  redemptionsPerInvite: number;
+  /**
+   * Sign-ins one client address may start at /pair and /i per window in
+   * hosted mode, under the relay-wide pairSignIns; sized for carrier NAT
+   * (ADR 0018, workstream C).
+   */
+  signInsPerAddress: number;
+  /**
+   * Refused requests that never reached a page which one member, or an
+   * account holding an attachment, may write audit lines for per window;
+   * past it they are counted in a refused_summary (ADR 0019).
+   */
+  auditRefusalsPerUser: number;
+  /** The same, shared by every account holding no attachment (ADR 0019). */
+  auditRefusalsForStrangers: number;
 }
 
 /** Capacities (S9, ADR 0009). Past one, the relay refuses rather than grows. */
@@ -111,6 +144,17 @@ export interface RelayLimits {
   sessionsPerUser: number;
   /** 2025-era MCP sessions the relay holds in total. */
   sessions: number;
+  /**
+   * Of those, the sessions all invitees may hold together: their own small
+   * pool, whose idlest session goes first when the relay is full (ADR 0016,
+   * workstream A).
+   */
+  inviteeSessions: number;
+  /**
+   * Sessions one invitee may hold once it holds an attachment; until then it
+   * may hold one (ADR 0016, workstream A).
+   */
+  sessionsPerInvitee: number;
   /** Distinct users attached to one page. */
   usersPerPage: number;
   /** Mutating calls waiting behind the running one on one page. */
@@ -134,6 +178,34 @@ export interface RelayLimits {
   pairSessions: number;
   /** Code exchanges /pair/callback may have waiting on the provider at once, for the whole relay. */
   pairSignInsInFlight: number;
+  /** The same for one client address in hosted mode, across /pair and /i (ADR 0018, workstream C). */
+  signInsInFlightPerAddress: number;
+  /**
+   * Bytes all pages' tool lists and prepared schemas may hold together; a
+   * tools frame that would pass it is refused with 1008 and counted against
+   * its address (S9, ADR 0018, workstream C). At least one whole frame.
+   */
+  toolBytes: number;
+}
+
+/**
+ * The persistent audit log's place and bounds (ADR 0019). With no directory
+ * the relay keeps the memory ring alone, as tests and dev tokens do; local
+ * mode puts it beside its owner token, and production needs one.
+ */
+export interface ResolvedAudit {
+  dir: string | null;
+  /** Files older than this many days are deleted, never the current one. */
+  retentionDays: number;
+  /** The oldest files go once all of them pass this many bytes, never the current one. */
+  maxBytes: number;
+}
+
+/** A range of trusted proxy addresses in hosted mode, as TABDOCK_TRUSTED_PROXY_CIDR lists them. */
+export interface ProxyRange {
+  address: string;
+  prefix: number;
+  family: 'ipv4' | 'ipv6';
 }
 
 /** The relay's own client at the identity provider, for the browser sign-in at /pair. */
@@ -191,6 +263,33 @@ export interface RelayOptions {
    * milestones. See spike.ts.
    */
   spike?: boolean | undefined;
+  /**
+   * Invites (TABDOCK_INVITES, ADRs 0016 and 0017), off unless exactly true:
+   * signed-in accounts off the allowlist become invitees, and pages mint
+   * invites in the widget. Refused with local mode's plugin, which serves one
+   * user, and when usersPerPage leaves invites no seat. Workstream A builds
+   * them; until it does, the relay knows no invites either way.
+   */
+  invites?: boolean | undefined;
+  /**
+   * Hosted mode (ADR 0018): the one header a host edge in front of the relay
+   * sets to the client's address, replacing any value a client sent. Only in
+   * production with a public URL. Workstream C reads it.
+   */
+  clientAddressHeader?: string | undefined;
+  /**
+   * Hosted mode: the address ranges the edge connects from, in CIDR form;
+   * the header is believed only from a peer inside one. RFC 1918 by default.
+   */
+  trustedProxyCidr?: readonly string[] | undefined;
+  /** The persistent audit log (ADR 0019): its directory, an absolute path, and its bounds. */
+  audit?:
+    | {
+        dir?: string | undefined;
+        retentionDays?: number | undefined;
+        maxMb?: number | undefined;
+      }
+    | undefined;
 }
 
 export const DEFAULT_HOST = '127.0.0.1';
@@ -240,11 +339,19 @@ export const DEFAULT_RATE_LIMITS: RelayRateLimits = {
   toolsFramesPerSocket: 10,
   toolsFramesPerAddress: 30,
   toolsFramesWindowMs: 10_000,
+  requestsPerUser: 240,
+  requestsPerInvitee: 60,
+  redemptionsPerInvite: 30,
+  signInsPerAddress: 10,
+  auditRefusalsPerUser: 10,
+  auditRefusalsForStrangers: 30,
 };
 
 export const DEFAULT_LIMITS: RelayLimits = {
   sessionsPerUser: 20,
   sessions: 1000,
+  inviteeSessions: 50,
+  sessionsPerInvitee: 2,
   usersPerPage: 10,
   queueDepth: 32,
   pageSocketsPerAddress: 20,
@@ -252,7 +359,37 @@ export const DEFAULT_LIMITS: RelayLimits = {
   pageSessions: 1000,
   pairSessions: 200,
   pairSignInsInFlight: 8,
+  signInsInFlightPerAddress: 2,
+  // Provisional: integration sizes it, with Node's heap flag, so the most
+  // pages at the largest tool lists stay under a fixed ceiling (ADR 0018).
+  toolBytes: 64 * 1024 * 1024,
 };
+
+/**
+ * Hosted mode's defaults where they differ, sized for the reference
+ * deployment's 512 MB (ADR 0018); each setting still overrides its own.
+ */
+export const HOSTED_LIMITS: Readonly<Partial<RelayLimits>> = Object.freeze({
+  pageSessions: 100,
+  pageSocketsPerAddress: 5,
+  pageSessionsPerAddress: 5,
+});
+
+/** The ranges a host edge's proxy is trusted from unless TABDOCK_TRUSTED_PROXY_CIDR narrows them: RFC 1918. */
+export const DEFAULT_TRUSTED_PROXY_CIDR: readonly string[] = [
+  '10.0.0.0/8',
+  '172.16.0.0/12',
+  '192.168.0.0/16',
+];
+
+/** ADR 0019's bounds for the audit files: 30 days, 64 MiB in all, rotation at 8 MiB. */
+export const AUDIT_RETENTION_DAYS = 30;
+export const AUDIT_MAX_MB = 64;
+export const AUDIT_ROTATE_MB = 8;
+/** Ten years: past this a retention setting is a typo, not a policy. */
+export const MAX_AUDIT_RETENTION_DAYS = 3650;
+/** Local mode's audit directory, beside its owner token (ADR 0019, ADR 0022). */
+export const LOCAL_AUDIT_DIR = 'audit';
 
 /** What a header-less page socket is recorded as when the dev flag lets it in. */
 export const NO_ORIGIN = '(no origin header)';
@@ -280,6 +417,17 @@ export interface ResolvedConfig {
   limits: RelayLimits;
   /** The spike's measurements are on (never in production). */
   spike: boolean;
+  /** How the relay runs, for its relay_start record (ADR 0019). */
+  mode: RelayMode;
+  /** Invites are on (ADR 0017); workstream A acts on it. */
+  invites: boolean;
+  /** Production with a public URL behind an edge that names the client in clientAddressHeader (ADR 0018). */
+  hosted: boolean;
+  /** The edge's client address header, lower-cased; null outside hosted mode. */
+  clientAddressHeader: string | null;
+  /** The ranges the edge is trusted from; empty outside hosted mode. */
+  trustedProxies: readonly ProxyRange[];
+  audit: ResolvedAudit;
 }
 
 const DEV_ORIGIN_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
@@ -442,6 +590,11 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     if (!isLoopbackHost(host)) {
       throw new Error(`${name} and refuses to bind ${host}; it listens only on loopback`);
     }
+    if (options.invites === true) {
+      throw new Error(
+        `${name} and serves one user, so it mints no invites (TABDOCK_INVITES); invites need dev tokens or a public URL (ADR 0017)`,
+      );
+    }
   }
   if (!isLoopbackHost(host)) {
     throw new Error(
@@ -531,6 +684,25 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     );
   }
 
+  // Hosted mode (ADR 0018): only a host edge in front of a production relay
+  // with a public URL sets a client address header the relay can believe.
+  const clientAddressHeader =
+    options.clientAddressHeader === undefined ? null : parseHeaderName(options.clientAddressHeader);
+  if (clientAddressHeader !== null && (env !== 'production' || publicUrl === null)) {
+    throw new Error(
+      'clientAddressHeader (TABDOCK_CLIENT_ADDRESS_HEADER) is for hosted mode only: production (TABDOCK_ENV=production) with a public URL (TABDOCK_PUBLIC_URL), behind a host edge that sets the header (ADR 0018)',
+    );
+  }
+  const hosted = clientAddressHeader !== null;
+  if (options.trustedProxyCidr !== undefined && !hosted) {
+    throw new Error(
+      "trustedProxyCidr (TABDOCK_TRUSTED_PROXY_CIDR) names a host edge's addresses and is for hosted mode only, with TABDOCK_CLIENT_ADDRESS_HEADER (ADR 0018)",
+    );
+  }
+  const trustedProxies = hosted
+    ? parseProxyRanges(options.trustedProxyCidr ?? DEFAULT_TRUSTED_PROXY_CIDR)
+    : [];
+
   // Every timing ends up in a setTimeout, so it must fit one.
   const timings = positiveIntegers(DEFAULT_TIMINGS, options.timings, MAX_TIMER_MS);
   // A call that reached its page is timed for both together.
@@ -539,6 +711,30 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
       `callDeadlineMs plus callDeadlineGraceMs must be at most ${String(MAX_TIMER_MS)}`,
     );
   }
+  const limits = positiveIntegers(
+    hosted ? { ...DEFAULT_LIMITS, ...HOSTED_LIMITS } : DEFAULT_LIMITS,
+    options.limits,
+  );
+  if (limits.toolBytes < MAX_FRAME_BYTES) {
+    throw new Error(
+      `toolBytes (TABDOCK_MAX_TOOL_BYTES) must be at least ${String(MAX_FRAME_BYTES)}, so one page can list a whole frame of tools (ADR 0018)`,
+    );
+  }
+  // Only true turns invites on, so a stray value from JavaScript leaves them off.
+  const invites = options.invites === true;
+  if (invites && limits.usersPerPage <= MEMBER_RESERVED_SEATS) {
+    throw new Error(
+      `invites (TABDOCK_INVITES) always leave members ${String(MEMBER_RESERVED_SEATS)} seats of usersPerPage (TABDOCK_MAX_USERS_PER_PAGE), so it must be at least ${String(MEMBER_RESERVED_SEATS + 1)} (ADR 0017)`,
+    );
+  }
+  const mode: RelayMode =
+    loopbackOnly !== undefined && loopbackOnly !== false
+      ? 'local'
+      : hosted
+        ? 'hosted'
+        : publicUrl !== null
+          ? 'public'
+          : 'dev_tokens';
 
   return {
     host,
@@ -556,8 +752,102 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     originPolicy,
     timings,
     rateLimits: positiveIntegers(DEFAULT_RATE_LIMITS, options.rateLimits),
-    limits: positiveIntegers(DEFAULT_LIMITS, options.limits),
+    limits,
     spike,
+    mode,
+    invites,
+    hosted,
+    clientAddressHeader,
+    trustedProxies,
+    audit: resolveAudit(options.audit),
+  };
+}
+
+/** HTTP header names are tokens; the relay compares the lower-cased form, as node stores headers. */
+const HEADER_NAME = /^[a-z0-9-]{1,64}$/;
+
+function parseHeaderName(value: string): string {
+  const name = value.trim().toLowerCase();
+  if (!HEADER_NAME.test(name)) {
+    throw new Error(
+      'clientAddressHeader (TABDOCK_CLIENT_ADDRESS_HEADER) must be one header name of letters, digits and hyphens, such as fly-client-ip',
+    );
+  }
+  return name;
+}
+
+/** One `address/prefix` range, IPv4 or IPv6, or null when it is not one. */
+export function parseProxyRange(entry: string): ProxyRange | null {
+  const parts = entry.trim().split('/');
+  const [address, prefixText] = parts;
+  if (parts.length !== 2 || address === undefined || prefixText === undefined) return null;
+  if (!/^\d{1,3}$/.test(prefixText)) return null;
+  const family = isIP(address);
+  if (family === 0) return null;
+  const prefix = Number(prefixText);
+  if (prefix > (family === 4 ? 32 : 128)) return null;
+  return { address, prefix, family: family === 4 ? 'ipv4' : 'ipv6' };
+}
+
+function parseProxyRanges(entries: readonly string[]): ProxyRange[] {
+  if (entries.length === 0) {
+    throw new Error(
+      'trustedProxyCidr (TABDOCK_TRUSTED_PROXY_CIDR) lists no range; leave it unset for the RFC 1918 ranges (ADR 0018)',
+    );
+  }
+  return entries.map((entry, index) => {
+    const range = parseProxyRange(entry);
+    if (range === null) {
+      throw new Error(
+        `TABDOCK_TRUSTED_PROXY_CIDR entry ${String(index + 1)} is not an address range such as 10.0.0.0/8 or fdaa::/16`,
+      );
+    }
+    return range;
+  });
+}
+
+/** The audit log's settings, checked; the bounds mean nothing without a directory to bound. */
+function resolveAudit(audit: RelayOptions['audit']): ResolvedAudit {
+  const dir = audit?.dir;
+  if (dir !== undefined && !isAbsolute(dir)) {
+    throw new Error('the audit directory (TABDOCK_AUDIT_DIR) must be an absolute path');
+  }
+  const retentionDays = audit?.retentionDays;
+  const maxMb = audit?.maxMb;
+  if (dir === undefined) {
+    if (retentionDays !== undefined) {
+      throw new Error(
+        'auditRetentionDays (TABDOCK_AUDIT_RETENTION_DAYS) bounds the audit files, and without an audit directory (TABDOCK_AUDIT_DIR) the relay keeps none (ADR 0019)',
+      );
+    }
+    if (maxMb !== undefined) {
+      throw new Error(
+        'auditMaxMb (TABDOCK_AUDIT_MAX_MB) bounds the audit files, and without an audit directory (TABDOCK_AUDIT_DIR) the relay keeps none (ADR 0019)',
+      );
+    }
+  }
+  if (
+    retentionDays !== undefined &&
+    (!Number.isInteger(retentionDays) ||
+      retentionDays < 1 ||
+      retentionDays > MAX_AUDIT_RETENTION_DAYS)
+  ) {
+    throw new Error(
+      `auditRetentionDays (TABDOCK_AUDIT_RETENTION_DAYS) must be 1 to ${String(MAX_AUDIT_RETENTION_DAYS)} days`,
+    );
+  }
+  if (
+    maxMb !== undefined &&
+    (!Number.isInteger(maxMb) || maxMb < AUDIT_ROTATE_MB || maxMb > 1024 * 1024)
+  ) {
+    throw new Error(
+      `auditMaxMb (TABDOCK_AUDIT_MAX_MB) must be ${String(AUDIT_ROTATE_MB)} to ${String(1024 * 1024)} MiB, ${String(AUDIT_ROTATE_MB)} being the size at which a file rotates`,
+    );
+  }
+  return {
+    dir: dir ?? null,
+    retentionDays: retentionDays ?? AUDIT_RETENTION_DAYS,
+    maxBytes: (maxMb ?? AUDIT_MAX_MB) * 1024 * 1024,
   };
 }
 
@@ -655,6 +945,7 @@ function authFromEnv(
   env: NodeJS.ProcessEnv,
   envName: RelayEnv,
   host: string | undefined,
+  invites: boolean,
   system: Partial<LocalTokenSystem>,
 ): EnvAuth {
   const publicText = env.TABDOCK_PUBLIC_URL?.trim() ?? '';
@@ -669,10 +960,16 @@ function authFromEnv(
       );
     }
     const publicUrl = parsePublicUrl(publicText);
+    const clientIds = env.TABDOCK_OAUTH_CLIENT_IDS?.trim() ?? '';
     const auth = createOAuthAuth({
       issuer,
       resource: publicMcpUrlOf(publicUrl),
       users: parseOAuthUsers(oauthUsers),
+      maxTokenAgeMinutes: parseCount(
+        'TABDOCK_OAUTH_MAX_TOKEN_AGE',
+        env.TABDOCK_OAUTH_MAX_TOKEN_AGE,
+      ),
+      clientIds: clientIds === '' ? undefined : parseOAuthClientIds(clientIds),
     });
     if (pairClientId === '' || pairClientSecret === '') {
       throw new Error(
@@ -696,7 +993,17 @@ function authFromEnv(
     );
   }
   const tokens = env.TABDOCK_DEV_TOKENS?.trim() ?? '';
-  if (tokens !== '') return { auth: createDevTokenAuth(parseDevTokens(tokens)) };
+  if (tokens !== '') {
+    const users = parseDevTokens(tokens);
+    // An invitee entry means nothing while the relay admits no invitees (ADR 0017).
+    const invitee = users.findIndex((user) => user.kind === 'invitee');
+    if (invitee !== -1 && !invites) {
+      throw new Error(
+        `TABDOCK_DEV_TOKENS entry ${String(invitee + 1)} names an invitee (a g_ user id), and there are none unless TABDOCK_INVITES is on (ADR 0017)`,
+      );
+    }
+    return { auth: createDevTokenAuth(users) };
+  }
   if (envName === 'production') {
     throw new Error(
       'production needs auth settings, such as TABDOCK_PUBLIC_URL with TABDOCK_OAUTH_ISSUER and TABDOCK_OAUTH_USERS; it never falls back to local mode, which serves only this machine (ADR 0022)',
@@ -713,6 +1020,57 @@ function authFromEnv(
     auth: createDevTokenAuth([{ ...LOCAL_USER, token: owner.token }], { loopbackOnly: true }),
     localMode: { tokenPath: owner.path, created: owner.created },
   };
+}
+
+/**
+ * M4's settings that mean something in one mode only, each refused by name
+ * elsewhere (ADR 0022) rather than silently unused, and before local mode
+ * draws a token for a relay that cannot start. resolveConfig checks the same
+ * rules again for options given in code.
+ */
+function refuseSettingsOutOfMode(
+  env: NodeJS.ProcessEnv,
+  relayEnv: RelayEnv,
+  invites: boolean,
+): void {
+  const isSet = (name: string): boolean => (env[name]?.trim() ?? '') !== '';
+  const publicMode = isSet('TABDOCK_PUBLIC_URL');
+  const localMode = !AUTH_SETTINGS.some(isSet) && relayEnv !== 'production';
+  for (const name of ['TABDOCK_OAUTH_MAX_TOKEN_AGE', 'TABDOCK_OAUTH_CLIENT_IDS']) {
+    if (isSet(name) && !publicMode) {
+      throw new Error(
+        `${name} tunes OAuth sign-in, which only public URL mode uses (TABDOCK_PUBLIC_URL with TABDOCK_OAUTH_ISSUER); refusing a setting that would mean nothing (ADR 0020)`,
+      );
+    }
+  }
+  const hostedMode = publicMode && relayEnv === 'production';
+  if (isSet('TABDOCK_CLIENT_ADDRESS_HEADER') && !hostedMode) {
+    throw new Error(
+      'TABDOCK_CLIENT_ADDRESS_HEADER is for hosted mode only: TABDOCK_ENV=production with TABDOCK_PUBLIC_URL, behind a host edge that sets the header (ADR 0018)',
+    );
+  }
+  if (isSet('TABDOCK_TRUSTED_PROXY_CIDR') && !isSet('TABDOCK_CLIENT_ADDRESS_HEADER')) {
+    throw new Error(
+      "TABDOCK_TRUSTED_PROXY_CIDR names a host edge's addresses and is for hosted mode only, with TABDOCK_CLIENT_ADDRESS_HEADER (ADR 0018)",
+    );
+  }
+  if (invites && localMode) {
+    throw new Error(
+      'TABDOCK_INVITES does not apply to local mode, which serves one user and mints no invites; invites need dev tokens or a public URL (ADR 0017)',
+    );
+  }
+  if (isSet('TABDOCK_MAX_REQUESTS_PER_INVITEE') && !invites) {
+    throw new Error(
+      'TABDOCK_MAX_REQUESTS_PER_INVITEE limits invitees, and there are none unless TABDOCK_INVITES is on (ADR 0018)',
+    );
+  }
+  for (const name of ['TABDOCK_AUDIT_RETENTION_DAYS', 'TABDOCK_AUDIT_MAX_MB']) {
+    if (isSet(name) && !isSet('TABDOCK_AUDIT_DIR') && !localMode) {
+      throw new Error(
+        `${name} bounds the audit files, and without TABDOCK_AUDIT_DIR, or local mode's directory beside its token, the relay keeps none (ADR 0019)`,
+      );
+    }
+  }
 }
 
 /**
@@ -774,6 +1132,11 @@ export function loadConfigFromEnv(
       'TABDOCK_MAX_PAIR_SIGNINS_PER_MINUTE',
       env.TABDOCK_MAX_PAIR_SIGNINS_PER_MINUTE,
     ),
+    requestsPerUser: parseCount('TABDOCK_MAX_REQUESTS_PER_USER', env.TABDOCK_MAX_REQUESTS_PER_USER),
+    requestsPerInvitee: parseCount(
+      'TABDOCK_MAX_REQUESTS_PER_INVITEE',
+      env.TABDOCK_MAX_REQUESTS_PER_INVITEE,
+    ),
   };
   const limits = {
     sessionsPerUser: parseCount('TABDOCK_MAX_SESSIONS_PER_USER', env.TABDOCK_MAX_SESSIONS_PER_USER),
@@ -793,10 +1156,34 @@ export function loadConfigFromEnv(
       'TABDOCK_MAX_PAIR_SIGNINS_IN_FLIGHT',
       env.TABDOCK_MAX_PAIR_SIGNINS_IN_FLIGHT,
     ),
+    toolBytes: parseCount('TABDOCK_MAX_TOOL_BYTES', env.TABDOCK_MAX_TOOL_BYTES),
   };
+  const invites = parseFlag('TABDOCK_INVITES', env.TABDOCK_INVITES);
+  const headerText = env.TABDOCK_CLIENT_ADDRESS_HEADER?.trim() ?? '';
+  const cidrText = env.TABDOCK_TRUSTED_PROXY_CIDR?.trim() ?? '';
+  const auditDirText = env.TABDOCK_AUDIT_DIR?.trim() ?? '';
+  const retentionDays = parseCount(
+    'TABDOCK_AUDIT_RETENTION_DAYS',
+    env.TABDOCK_AUDIT_RETENTION_DAYS,
+  );
+  const maxMb = parseCount('TABDOCK_AUDIT_MAX_MB', env.TABDOCK_AUDIT_MAX_MB);
+  refuseSettingsOutOfMode(env, relayEnv, invites);
 
   // Last, so a mistake in any other setting is reported before local mode draws a token.
-  const { auth, publicUrl, pairClient, localMode } = authFromEnv(env, relayEnv, host, system);
+  const { auth, publicUrl, pairClient, localMode } = authFromEnv(
+    env,
+    relayEnv,
+    host,
+    invites,
+    system,
+  );
+  // Local mode keeps its audit files beside its owner token unless told otherwise (ADR 0019).
+  const auditDir =
+    auditDirText !== ''
+      ? auditDirText
+      : localMode === undefined
+        ? undefined
+        : join(dirname(localMode.tokenPath), LOCAL_AUDIT_DIR);
   return {
     auth,
     publicUrl,
@@ -811,5 +1198,15 @@ export function loadConfigFromEnv(
     timings,
     rateLimits,
     limits,
+    invites,
+    clientAddressHeader: headerText === '' ? undefined : headerText,
+    trustedProxyCidr:
+      cidrText === ''
+        ? undefined
+        : cidrText
+            .split(',')
+            .map((entry) => entry.trim())
+            .filter((entry) => entry.length > 0),
+    audit: { dir: auditDir, retentionDays, maxMb },
   };
 }

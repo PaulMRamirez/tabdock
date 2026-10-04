@@ -19,8 +19,12 @@
 // while the relay listens on loopback: it resolves its host name itself and
 // listens on the address only when that is loopback (S12). Requests are
 // logged by route, never by raw path or query, so no secret a URL carries
-// reaches a log. The M3 spike's measurements (spike.ts) hook in here when
-// TABDOCK_SPIKE is on; nothing over HTTP controls them.
+// reaches a log. The client address that /page and /pair count by, and that
+// /mcp's refusal line names, comes from one place (client-address.ts), which
+// answers 400 on a route that counts by address when a host edge names no
+// client (ADR 0018). The plugin says who someone is and the relay decides
+// whether an invitee may in (ADR 0020). The M3 spike's measurements (spike.ts)
+// hook in here when TABDOCK_SPIKE is on; nothing over HTTP controls them.
 
 import { lookup } from 'node:dns/promises';
 import { createServer, type IncomingMessage, type ServerResponse, STATUS_CODES } from 'node:http';
@@ -33,9 +37,23 @@ import {
   isLegacyRequest,
   type McpHandlerRequestOptions,
 } from '@modelcontextprotocol/server';
-import { MAX_FRAME_BYTES, SUBPROTOCOL } from '@tabdock/protocol';
+import {
+  type AuditCallEvent,
+  type AuditEvent,
+  InviteeIdSchema,
+  MAX_FRAME_BYTES,
+  SUBPROTOCOL,
+} from '@tabdock/protocol';
 import { WebSocketServer } from 'ws';
-import { type AuthOutcome, AuthOutcomeSchema, type AuthRoute } from './auth.ts';
+import { createAuthRefusalLog } from './auth-log.ts';
+import {
+  type AuthOutcome,
+  AuthOutcomeSchema,
+  type AuthRefusal,
+  type AuthRoute,
+  notAllowedRefusal,
+} from './auth.ts';
+import { createClientAddresses, loggedAddress } from './client-address.ts';
 import {
   isLoopbackAddress,
   LOOPBACK_HOSTNAMES,
@@ -50,8 +68,9 @@ import { createLogger } from './log.ts';
 import { type AuthExtra, createMcpFactory, userIdOf } from './mcp.ts';
 import { createPairFlow, PAIR_ROUTES, type PairFlow } from './pair.ts';
 import { McpSessions } from './sessions.ts';
+import { createSignInGate } from './sign-in-gate.ts';
 import { Spike, type SpikeControl } from './spike.ts';
-import { type AuditRecord, createMemoryStore } from './store.ts';
+import { callRecords, createMemoryStore } from './store.ts';
 
 export interface Relay {
   /** http://127.0.0.1:<port> */
@@ -64,7 +83,8 @@ export interface Relay {
   readonly publicUrl: string | null;
   /** `<publicUrl>/mcp`, the connector URL, in public URL mode; else null. */
   readonly publicMcpUrl: string | null;
-  readonly audit: { records(): AuditRecord[] };
+  /** The newest audit records: records() its calls, as before ADR 0019, and events() every type. */
+  readonly audit: { records(): AuditCallEvent[]; events(): AuditEvent[] };
   /**
    * The spike's marker control while TABDOCK_SPIKE is on, else null. Reached
    * from the relay's own process only (main.ts reads it from stdin).
@@ -202,10 +222,18 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   const auth = options.auth;
   // First, before anything else exists: a plugin that cannot work (an identity
   // provider Claude could not sign in with, say) stops the relay from starting.
-  await auth.start?.();
+  try {
+    await auth.start?.({ log });
+  } catch (error) {
+    // Anything it set going before it threw, such as a timer, stops with it.
+    auth.stop?.();
+    throw error;
+  }
   const store = options.store ?? createMemoryStore();
   const spike = config.spike ? new Spike(log, MAX_MCP_BODY_BYTES) : null;
   const hub = new PageHub(config, store, log, spike);
+  const addresses = createClientAddresses(config, log);
+  const refusals = createAuthRefusalLog(log);
   let pair: PairFlow | null = null;
   if (config.publicUrl !== null) {
     try {
@@ -220,9 +248,12 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         hub,
         config,
         log,
+        signInGate: createSignInGate(config, log),
       });
     } catch (error) {
       await hub.shutdown();
+      await store.audit.close?.();
+      auth.stop?.();
       throw error;
     }
   }
@@ -244,6 +275,12 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     ownerOf: userIdOf,
     perUser: config.limits.sessionsPerUser,
     total: config.limits.sessions,
+    invitees: {
+      pool: config.limits.inviteeSessions,
+      perInvitee: config.limits.sessionsPerInvitee,
+      isInvitee: (userId) => InviteeIdSchema.safeParse(userId).success,
+      holds: (userId) => hub.holds(userId),
+    },
     idleMs: config.timings.sessionIdleMs,
     keepAliveMs: config.timings.sseKeepAliveMs,
     maxRequestBodySize: MAX_MCP_BODY_BYTES,
@@ -328,35 +365,55 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     return parsed.data;
   }
 
+  /**
+   * The relay's own refusal of a user the plugin vouched for: ADR 0020 admits
+   * an invitee only with invites on (config.invites), and only once workstream
+   * A's invitee tier exists (ADR 0017), so until then every invitee gets M3's
+   * 403 whatever TABDOCK_INVITES says, and invites stay off.
+   */
+  function notAdmitted(outcome: Extract<AuthOutcome, { kind: 'user' }>): AuthRefusal | null {
+    return outcome.user.account.kind === 'invitee'
+      ? notAllowedRefusal(outcome.oauthClientId)
+      : null;
+  }
+
   async function handleMcp(request: IncomingMessage, response: ServerResponse): Promise<void> {
     // Where the spike's call timestamps start: before the Host check, sign-in and the SDK.
     const receivedAt = performance.now();
     if (config.loopback && !validateHost(request, response)) return;
+    // Named in refusal lines only: /mcp never counts by address (ADR 0016),
+    // so a header that names no client is no reason to refuse it.
+    const client = addresses.of(request);
     // Before the plugin, so a proxied request never even gets a challenge.
     if (config.publicUrl === null && !madeLocally(request)) {
       log.info('mcp request refused: not made on this machine', {
-        address: request.socket.remoteAddress,
+        address: loggedAddress(client),
       });
       send(response, 403, 'This relay serves only clients on its own machine');
       return;
     }
     const outcome = await authenticate(request, response);
     if (outcome === null) return;
+    const refuse = (refusal: AuthRefusal): void => {
+      // The reason is a fixed phrase; the credential itself never gets here.
+      refusals.refused(refusal, client);
+      send(response, refusal.status, refusal.body, refusal.headers);
+    };
     if (outcome.kind === 'refused') {
-      // The reason is the plugin's fixed phrase; the credential itself never gets here.
-      const event =
-        outcome.status === 401
-          ? 'mcp request refused: not authenticated'
-          : outcome.status === 403
-            ? 'mcp request refused: not allowed'
-            : 'mcp request refused: sign-in unavailable';
-      log.info(event, { reason: outcome.reason, address: request.socket.remoteAddress });
-      send(response, outcome.status, outcome.body, outcome.headers);
+      refuse(outcome);
+      return;
+    }
+    const notIn = notAdmitted(outcome);
+    if (notIn !== null) {
+      refuse(notIn);
       return;
     }
     const extra: AuthExtra = {
       userId: outcome.user.userId,
       displayName: outcome.user.displayName,
+      kind: outcome.user.account.kind,
+      email: outcome.user.account.email,
+      oauthClientId: outcome.oauthClientId,
     };
     // The SDK requires a token field; the real one stays out of everything downstream.
     const authInfo: AuthInfo = {
@@ -411,7 +468,15 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       } else if (pair !== null && PAIR_ROUTES.includes(path)) {
         // The DNS rebinding guard, as for /mcp: the public host or a loopback name.
         if (!validateHost(request, response)) return;
-        await pair.handle(path, request, response);
+        // /pair counts sign-ins by address, so a request whose client the
+        // edge did not name is malformed here (ADR 0018).
+        const client = addresses.of(request);
+        if (!client.ok) {
+          log.info('pair request refused: no client address', { problem: client.problem });
+          send(response, 400, 'Bad request');
+          return;
+        }
+        await pair.handle(path, request, response, client.key);
       } else {
         send(response, 404, 'Not found');
       }
@@ -429,16 +494,25 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   server.maxHeadersCount = 0;
 
   server.on('upgrade', (request: IncomingMessage, socket: Duplex, head: Buffer) => {
-    const address = request.socket.remoteAddress ?? 'unknown';
+    // What the per-address page limits count by (S9); the socket's peer until hosted mode (ADR 0018).
+    const client = addresses.of(request);
     if (pathOf(request.url) !== '/page') {
       refuseUpgrade(socket, 404, 'Not found');
       return;
     }
     if (malformedHost(request)) {
-      log.info('page socket refused: malformed Host', { address });
+      log.info('page socket refused: malformed Host', { address: loggedAddress(client) });
       refuseUpgrade(socket, 400, 'Bad request');
       return;
     }
+    // /page counts by address, so a client the edge did not name is a malformed request.
+    if (!client.ok) {
+      log.info('page socket refused: no client address', { problem: client.problem });
+      refuseUpgrade(socket, 400, 'Bad request');
+      return;
+    }
+    // Logged as the address, counted by its limit key, which in hosted mode groups an IPv6 /56.
+    const { address, key } = client;
     // ADR 0014: every request through the tunnel arrives from loopback, so the
     // address says nothing; the Host and proxy headers do. Pages attach only
     // from this machine until M4 brings a host and a trusted client address,
@@ -474,13 +548,13 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       origin = header;
     }
     // S9: refused before upgrading, so the page gets a plain HTTP status.
-    const refusal = hub.admitSocket(address);
+    const refusal = hub.admitSocket(key);
     if (refusal) {
       refuseUpgrade(socket, refusal.status, refusal.message);
       return;
     }
     wss.handleUpgrade(request, socket, head, (ws) => {
-      hub.acceptSocket(ws, origin, address);
+      hub.acceptSocket(ws, origin, key);
     });
   });
 
@@ -503,8 +577,10 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     pair?.close();
     wss.close();
     await hub.shutdown();
+    await store.audit.close?.();
     await mcp.close();
     await sessions.closeAll();
+    auth.stop?.();
     throw error;
   }
   const bound = server.address() as AddressInfo;
@@ -532,12 +608,17 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     mcpUrl: `${url}/mcp`,
     publicUrl: config.publicUrl,
     publicMcpUrl: config.publicMcpUrl,
-    audit: { records: () => store.audit.records() },
+    audit: {
+      records: () => callRecords(store.audit.records()),
+      events: () => store.audit.records(),
+    },
     spike,
     close() {
       closing ??= (async () => {
         pair?.close();
         await hub.shutdown();
+        // After the hub, whose shutdown audits the calls it fails (ADR 0019).
+        await store.audit.close?.();
         for (const ws of wss.clients) ws.terminate();
         await new Promise<void>((resolveClose) => {
           wss.close(() => {
@@ -546,6 +627,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         });
         await mcp.close();
         await sessions.closeAll();
+        auth.stop?.();
         server.closeAllConnections();
         await new Promise<void>((resolveClose) => {
           server.close(() => {

@@ -38,7 +38,7 @@ import {
   readRequestBody,
   type RegisteredTool,
 } from '@modelcontextprotocol/server';
-import type { ClientInfo } from '@tabdock/protocol';
+import type { AttachVia, ClientInfo } from '@tabdock/protocol';
 import { z } from 'zod';
 import type { Logger } from './log.ts';
 import { parseClientInfo } from './mcp.ts';
@@ -99,7 +99,8 @@ export interface CallTimer {
   marks: CallMarks;
 }
 
-export type PairingVia = 'code' | 'qr';
+/** How a pairing came in; from M4 an invite redemption is one too (ADR 0017). */
+export type PairingVia = AttachVia;
 
 /**
  * The hub's side of the spike: pairing milestones, and the end of each call.

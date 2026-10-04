@@ -46,10 +46,11 @@ describe('protocol constants', () => {
     for (const code of codes) expect(code >= 3000 && code <= 4999).toBe(true);
   });
 
-  it('recognise exactly the ten error codes from SPEC.md section 7', () => {
-    expect(ERROR_CODES).toHaveLength(11);
-    expect(new Set(ERROR_CODES).size).toBe(11);
+  it('recognise exactly the error codes from SPEC.md section 7, invite_required included from M4', () => {
+    expect(ERROR_CODES).toHaveLength(12);
+    expect(new Set(ERROR_CODES).size).toBe(12);
     expect(isErrorCode('page_gone')).toBe(true);
+    expect(isErrorCode('invite_required')).toBe(true);
     expect(isErrorCode('PAGE_GONE')).toBe(false);
     expect(isErrorCode('')).toBe(false);
   });
