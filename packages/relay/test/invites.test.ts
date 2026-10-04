@@ -35,7 +35,7 @@ import {
 } from './helpers/invites.ts';
 import { connectPage } from './helpers/page-client.ts';
 import { Phone } from './helpers/phone.ts';
-import { startRelay, type TestRelay } from './helpers/relay.ts';
+import { atWindowStart, startRelay, type TestRelay } from './helpers/relay.ts';
 
 let current: InviteRelay | undefined;
 let plain: TestRelay | undefined;
@@ -1410,6 +1410,9 @@ describe('S7: a page cannot flush the audit log with operator frames (ADR 0019)'
   });
 
   it('holds back the lines of a page that keeps sending promotions and mints past its grants, and keeps it open (ADR 0023)', async () => {
+    // The address's held lines are counted per minute of the clock's own, so
+    // the test starts one: one ending mid-flood would split the count in two.
+    atWindowStart();
     const relay = await setup();
     const page = await relay.page({ policy: { invites: 'all', maxDrivers: 3 } });
     await attachMember(await relay.claude('sub-alice'), page, 'observer');

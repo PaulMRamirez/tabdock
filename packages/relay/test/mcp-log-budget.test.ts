@@ -27,6 +27,7 @@ import {
 } from './helpers/raw-mcp.ts';
 import {
   ALICE,
+  atWindowStart,
   BOB,
   CAROL,
   callTool,
@@ -70,6 +71,10 @@ afterEach(async () => {
 });
 
 async function setup(options: Parameters<typeof startRelay>[0] = {}): Promise<TestRelay> {
+  // The tests here count what one window wrote, and the window is the clock's
+  // own minute, so each starts one: one ending mid-test would write a second
+  // first line and split the count.
+  atWindowStart();
   current = await startRelay({
     auth: createDevTokenAuth([ALICE, G1, G2]),
     invites: true,
@@ -124,6 +129,9 @@ function tally(lines: readonly string[], message: string): { written: number; re
 }
 
 describe('lines a signed-in account can make /mcp write (A4.3)', () => {
+  // A timeout of its own: thirty bodies of 2 MB, each sent, read and parsed
+  // before the SDK refuses it, take about 2 s alone and went past vitest's
+  // default 5 s beside two other runs of this package's tests on four cores.
   it('writes the SDK refusals of large requests once a window, cut short, and counts the rest', async () => {
     const { lines } = await setup();
     const before = lines.length;
@@ -160,7 +168,7 @@ describe('lines a signed-in account can make /mcp write (A4.3)', () => {
     expect(written).toBeLessThanOrEqual(cases.length);
     // Every refusal is either written or counted.
     expect(written + repeated).toBe(30);
-  });
+  }, 30_000);
 
   it('writes small SDK refusals once a window too, however many come', async () => {
     const { lines } = await setup();

@@ -5,7 +5,7 @@
 
 import type { Client } from '@modelcontextprotocol/client';
 import { CLOSE_DETACH, type PageTool } from '@tabdock/protocol';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { MAX_FRAME_SCHEMA_NODES, MAX_TOOL_SCHEMA_NODES } from '../src/hub.ts';
 import {
   createMemoryStore,
@@ -28,6 +28,7 @@ import {
 } from './helpers/page-client.ts';
 import {
   ALICE,
+  atWindowStart,
   BOB,
   callTool,
   connectClient,
@@ -613,6 +614,13 @@ describe('tools frames per address (S9)', () => {
 describe('frames that change nothing, per socket and per address (S9, ADR 0023)', () => {
   const HELD = 'page frames that changed nothing went unlogged';
 
+  // The address budget and the counts held back turn with the clock's own
+  // minute, so each test starts one, and a minute that ends mid-flood can no
+  // longer split a count or hand an address a second budget.
+  beforeEach(() => {
+    atWindowStart();
+  });
+
   interface Summary {
     msg: string;
     address?: string;
@@ -818,6 +826,11 @@ describe('frames that change nothing, per socket and per address (S9, ADR 0023)'
 // connectionLinesPerAddress of them a window, and the rest are counted.
 describe('lines each page connection writes, per address (S9, ADR 0023)', () => {
   const HELD = 'page connection lines went unlogged';
+
+  // As above: the budget is the clock's minute's, so the test starts one.
+  beforeEach(() => {
+    atWindowStart();
+  });
 
   interface Summary {
     msg: string;

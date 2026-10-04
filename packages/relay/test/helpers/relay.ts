@@ -8,10 +8,11 @@ import {
   StreamableHTTPClientTransport,
 } from '@modelcontextprotocol/client';
 import type { Role } from '@tabdock/protocol';
-import { expect } from 'vitest';
+import { expect, onTestFinished } from 'vitest';
 import {
   createDevTokenAuth,
   createRelay,
+  DEFAULT_RATE_LIMITS,
   type DevTokenUser,
   type Relay,
   type RelayOptions,
@@ -164,6 +165,32 @@ export function delay(ms: number): Promise<void> {
 export function sessionIdOf(client: Client): string | undefined {
   const transport = client.transport;
   return transport instanceof StreamableHTTPClientTransport ? transport.sessionId : undefined;
+}
+
+/**
+ * Starts the rest of this test at the start of a window of the relay's line
+ * budgets. Those budgets (repeated-lines.ts, auth-log.ts) turn with the wall
+ * clock's own windows, Math.floor(now / windowMs), not with a test, so a test
+ * that counts what one window wrote or held back would find its counts split
+ * in two whenever a window happened to end while it ran. Date.now() is set
+ * back to the start of the window it is in and runs on at the real pace from
+ * there, so the relay's timers and its clock still agree and the test has the
+ * whole window. Back, not forward: a stand-in provider's token takes its iat
+ * from Date.now(), which jose checks against new Date(), so a clock set
+ * forward would mint tokens from the future. Wrapping whatever Date.now is,
+ * rather than spying on it, lets a test still spy on it later. Call it before
+ * the relay starts; the clock is put back once the test and its afterEach
+ * hooks, which close the relay, are done.
+ */
+export function atWindowStart(windowMs: number = DEFAULT_RATE_LIMITS.windowMs): void {
+  const own = Object.getOwnPropertyDescriptor(Date, 'now');
+  if (own === undefined) throw new Error('Date.now is not an own property of Date');
+  const clock = Date.now.bind(Date);
+  const offset = -(clock() % windowMs);
+  Object.defineProperty(Date, 'now', { ...own, value: () => clock() + offset });
+  onTestFinished(() => {
+    Object.defineProperty(Date, 'now', own);
+  });
 }
 
 /** Polls until `check` holds, for effects that land a few event loop turns later. */

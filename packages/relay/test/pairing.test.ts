@@ -9,6 +9,7 @@ import {
   callTool,
   connectClient,
   delay,
+  eventually,
   pairAndApprove,
   startRelay,
   type TestRelay,
@@ -65,12 +66,20 @@ describe('pair_page (A1.4, S3, S4)', () => {
   it('an expired code gives the same pairing_expired, and the page already shows a new one', async () => {
     await setup({ timings: { pairingTtlMs: 150 } });
     const opened = await page();
+    // The welcome's code, not opened.code after the client connects: under
+    // load that can take longer than a code lives, and opened.code would then
+    // be a later code, still live when pair_page ran.
+    const old = opened.welcome?.pairing;
+    if (!old) throw new Error('no welcome');
     const alice = await client();
-    const old = opened.code;
-    await opened.next('pairing', 1000);
-    const outcome = await callTool(alice, 'pair_page', { code: old });
+    // The relay replaces a code before it sends the page the next one, so
+    // with that frame here the welcome's code is gone; and past its own
+    // expiresAt, the relay's check on it refuses it too.
+    await opened.next('pairing');
+    await eventually(() => Date.now() > old.expiresAt);
+    const outcome = await callTool(alice, 'pair_page', { code: old.code });
     expect(outcome).toMatchObject({ isError: true, text: EXPIRED });
-    expect(opened.code).not.toBe(old);
+    expect(opened.code).not.toBe(old.code);
   });
 
   it('refuses a code past its own expiresAt even when the rotation timer has not fired yet', async () => {

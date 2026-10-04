@@ -64,6 +64,9 @@ describe('RepeatedLines', () => {
 
 describe('createRepeatedLog', () => {
   it('writes the first line of each kind a window in full, then one count of the rest', () => {
+    // Inside one minute of the clock's own, as the counts below assume.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-04T00:00:10Z'));
     const written: Record<string, unknown>[] = [];
     const log = createRepeatedLog(
       createLogger({ sink: (line) => written.push(JSON.parse(line) as Record<string, unknown>) }),
