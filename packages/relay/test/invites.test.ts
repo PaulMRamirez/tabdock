@@ -708,6 +708,154 @@ describe("S14: when a sponsor's attachment ends, so do its invites and the attac
     },
     15_000,
   );
+
+  it.each(['pair_page', '/i'] as const)(
+    "and refuse a stranger's redemption through %s while the sponsor is past their end, before its timer fires",
+    async (route) => {
+      // The same gap, with someone other than the sponsor redeeming: an
+      // attachment past its time sponsors nothing, so the lookup ends Alice as
+      // her timer would, and the invite with her, before /i shows it or the
+      // page hears of it.
+      const idleMs = 30 * 60_000;
+      const { relay, page } = await sharedPage({ timings: { attachmentIdleMs: idleMs } });
+      const minted = await mintOk(page, { uses: route === 'pair_page' ? 1 : 3 });
+      await page.sync();
+      const asked = page.all('attach_request').length;
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(Date.now() + idleMs + 60_000);
+      if (route === 'pair_page') {
+        const guest = await relay.claude(GUEST, GUEST_EMAIL);
+        expect((await call(guest, 'pair_page', { invite: minted.link })).text).toBe(
+          'pairing_expired: this invite is invalid, used up or expired',
+        );
+      } else {
+        const guest = await signedInAtI(relay, GUEST, GUEST_EMAIL);
+        expect((await guest.post('/i/preview', { secret: minted.secret })).status).toBe(404);
+        expect((await guest.post('/i/claim', { secret: minted.secret })).status).toBe(404);
+      }
+      await page.sync();
+      expect(page.all('attach_request')).toHaveLength(asked);
+      expect(relay.store.invites.get(page.pageId, minted.inviteId)).toBeUndefined();
+      expect((await latest(page, 'invites')).invites).toEqual([]);
+      expect(relay.store.attachments.listForPage(page.pageId)).toEqual([]);
+      const events = relay.relay.audit.events();
+      expect(events).toContainEqual(
+        expect.objectContaining({ type: 'expire', userId: 'alice', reason: 'idle' }),
+      );
+      expect(
+        events.filter(
+          (event) => event.type === 'invite_closed' && event.inviteId === minted.inviteId,
+        ),
+      ).toEqual([expect.objectContaining({ reason: 'sponsor_gone' })]);
+      expect(events.filter((event) => event.type === 'invite_redeemed')).toEqual([]);
+      expect(events.flatMap((event) => (event.type === 'attach' ? [event.userId] : []))).toEqual([
+        'alice',
+      ]);
+    },
+    15_000,
+  );
+
+  it.each(['pair_page', '/i'] as const)(
+    'and refuse on approval a redemption through %s that waited while the sponsor passed their end',
+    async (route) => {
+      // Under the 15 minutes a /pair session lasts, so the /i browser can still
+      // read its claim once the clock has stepped past Alice's end.
+      const idleMs = 10 * 60_000;
+      const { relay, page } = await sharedPage({ timings: { attachmentIdleMs: idleMs } });
+      const minted = await mintOk(page, { uses: route === 'pair_page' ? 1 : 3 });
+      vi.useFakeTimers({ toFake: ['Date'] });
+      let settled: () => Promise<unknown>;
+      if (route === 'pair_page') {
+        const guest = await relay.claude(GUEST, GUEST_EMAIL);
+        const pending = call(guest, 'pair_page', { invite: minted.link });
+        settled = async () => (await pending).text;
+      } else {
+        const guest = await signedInAtI(relay, GUEST, GUEST_EMAIL);
+        const claimed = await guest.post('/i/claim', { secret: minted.secret });
+        expect(claimed.status, JSON.stringify(claimed.data)).toBe(200);
+        settled = () => settledAtI(guest, String(claimed.data.claim));
+      }
+      const request = await page.next('attach_request');
+      // Alice passes her end while the operator decides, and her timer has not fired.
+      vi.setSystemTime(Date.now() + idleMs + 60_000);
+      page.send({ t: 'attach_decision', requestId: request.requestId, allow: true });
+      expect(await settled()).toEqual(
+        route === 'pair_page'
+          ? 'denied_by_operator: the member who shared this invite is no longer attached, so it closed'
+          : { status: 'denied' },
+      );
+      expect(relay.store.invites.get(page.pageId, minted.inviteId)).toBeUndefined();
+      expect((await latest(page, 'invites')).invites).toEqual([]);
+      expect(relay.store.attachments.listForPage(page.pageId)).toEqual([]);
+      const events = relay.relay.audit.events();
+      expect(events).toContainEqual(
+        expect.objectContaining({ type: 'expire', userId: 'alice', reason: 'idle' }),
+      );
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: 'attach_refused',
+          userId: request.user.userId,
+          inviteId: minted.inviteId,
+          outcome: 'denied_by_operator',
+        }),
+      );
+      expect(events.filter((event) => event.type === 'invite_redeemed')).toEqual([]);
+      expect(events.flatMap((event) => (event.type === 'attach' ? [event.userId] : []))).toEqual([
+        'alice',
+      ]);
+    },
+    15_000,
+  );
+
+  it('and refuse a redemption while the member whose invite let the sponsor in is past their end', async () => {
+    // A member let in by another member's invite lasts only while that member
+    // does (S14), so the lookup walks up the chain. Bob, let in by Alice's
+    // invite, calls halfway through, which moves his own end on, and so
+    // sponsors once Alice is past hers; a redemption of his invite ends Alice,
+    // Bob with her, and his invite with him.
+    const idleMs = 30 * 60_000;
+    const { relay, page } = await sharedPage({ timings: { attachmentIdleMs: idleMs } });
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const start = Date.now();
+    const bob = await relay.claude('sub-bob');
+    const first = await mintOk(page);
+    expect((await redeem(bob, page, first.link)).outcome.isError).toBe(false);
+    expect(relay.store.attachments.get(page.pageId, 'bob')?.sponsorId).toBe('alice');
+    vi.setSystemTime(start + idleMs / 2);
+    expect((await call(bob, 'call_page_tool', getView(page.pageId))).isError).toBe(false);
+    vi.setSystemTime(start + idleMs + 60_000);
+    const second = await mintOk(page);
+    expect(
+      second.answer.invites.find((invite) => invite.inviteId === second.inviteId)?.sponsor.userId,
+    ).toBe('bob');
+    await page.sync();
+    const asked = page.all('attach_request').length;
+    const guest = await relay.claude(GUEST, GUEST_EMAIL);
+    expect((await call(guest, 'pair_page', { invite: second.link })).text).toBe(
+      'pairing_expired: this invite is invalid, used up or expired',
+    );
+    await page.sync();
+    expect(page.all('attach_request')).toHaveLength(asked);
+    expect(relay.store.invites.get(page.pageId, second.inviteId)).toBeUndefined();
+    expect(relay.store.attachments.listForPage(page.pageId)).toEqual([]);
+    const events = relay.relay.audit.events();
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: 'expire', userId: 'alice', reason: 'idle' }),
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: 'expire', userId: 'bob', reason: 'sponsor_gone' }),
+    );
+    expect(
+      events.filter(
+        (event) => event.type === 'invite_closed' && event.inviteId === second.inviteId,
+      ),
+    ).toEqual([expect.objectContaining({ reason: 'sponsor_gone' })]);
+    expect(
+      events.filter(
+        (event) => event.type === 'invite_redeemed' && event.inviteId === second.inviteId,
+      ),
+    ).toEqual([]);
+  }, 15_000);
 });
 
 describe('S14: invite-made attachments end with the page session, on revoke or after 24 hours', () => {

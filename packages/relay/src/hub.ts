@@ -213,7 +213,7 @@ export interface InviteHub {
    * operator like pairPage when the invite needs a prompt.
    */
   redeemInvite(caller: CallerIdentity, invite: string, signal: AbortSignal): Promise<PairOutcome>;
-  /** What /i shows; null for an unknown, used, cancelled or expired secret alike. */
+  /** What /i shows; null for an unknown, used, cancelled, expired or unsponsored secret alike. */
   previewInvite(secret: string): InvitePreview | null;
   /** /i's Join, like claimPairNonce: refused at once, or claimed with the outcome to come. */
   claimInvite(caller: CallerIdentity, secret: string): ClaimOutcome;
@@ -1348,8 +1348,9 @@ export class PageHub {
 
   /**
    * A live invite by its presented secret: found by digest and confirmed in
-   * constant time, as codes and nonces are (S3), unexpired and with a use
-   * left. Unknown, spent, cancelled and expired look alike.
+   * constant time, as codes and nonces are (S3), unexpired, with a use left
+   * and still sponsored (#sponsored). Unknown, spent, cancelled, expired and
+   * unsponsored look alike.
    */
   #findInvite(secret: string, now: number): InviteRecord | null {
     if (!InviteSecretSchema.safeParse(secret).success) return null;
@@ -1357,7 +1358,29 @@ export class PageHub {
     const invite = this.#store.invites.findBySecretHash(hash.toString('hex'));
     if (!invite || !sameDigest(Buffer.from(invite.secretHash, 'hex'), hash)) return null;
     if (invite.expiresAt <= now || invite.usesLeft <= 0) return null;
-    return invite;
+    return this.#sponsored(invite) ? invite : null;
+  }
+
+  /**
+   * Whether the invite still has its sponsor. An expiry timer may run late,
+   * and an attachment past its time sponsors nothing (#sponsorOf), so the
+   * sponsor, and each member above them whose invite let them in, is ended
+   * here if due, as the timer would end them; any one of those ends closes
+   * this invite and answers what waits on it (#loseSponsors). Otherwise a
+   * redemption in that gap would reach the page and could be approved.
+   */
+  #sponsored(invite: InviteRecord): boolean {
+    const { pageId } = invite;
+    const seen = new Set<string>();
+    let userId: string | null = invite.sponsor.userId;
+    while (userId !== null && !seen.has(userId)) {
+      seen.add(userId);
+      const attachment = this.#store.attachments.get(pageId, userId);
+      // A sponsor's end closes its invites, so a missing one is only a guard.
+      if (attachment === undefined || this.#expireIfDue(pageId, userId)) return false;
+      userId = attachment.sponsorId;
+    }
+    return true;
   }
 
   /** A control invite's prompt was refused or ran out: three burn it (ADR 0016). */
@@ -1977,6 +2000,18 @@ export class PageHub {
         request.requestId,
         hubError('pairing_expired', 'this invite is no longer live'),
       );
+      return;
+    }
+    // The sponsor may have passed their end while the operator decided, with
+    // the timer not yet run; ending them now closes the invite, which answers
+    // this request as any sponsor's end does, so nothing is granted under it.
+    if (!this.#sponsored(invite)) {
+      if (this.#store.requests.get(request.requestId) !== undefined) {
+        this.#endRequest(
+          request.requestId,
+          hubError('pairing_expired', 'this invite is no longer live'),
+        );
+      }
       return;
     }
     if (this.#pageFull(pageId) || this.#inviteSeatsFull(pageId, 0)) {
@@ -2647,8 +2682,9 @@ export class PageHub {
   /**
    * pair_page's invite: a link minted for one use, or its secret. A link
    * this relay did not mint, a secret minted for several uses (a link pasted
-   * into a chat stays in its history), and an unknown, spent, cancelled or
-   * expired one all get one answer, so no answer says a secret is live.
+   * into a chat stays in its history), and an unknown, spent, cancelled,
+   * expired or unsponsored one all get one answer, so no answer says a
+   * secret is live.
    */
   async redeemInvite(
     caller: CallerIdentity,
@@ -2663,8 +2699,9 @@ export class PageHub {
   /**
    * What /i shows for a live invite: the page's origin, its title and the
    * invite's label as the page wrote them, what it lets someone do, and who
-   * shared it. Uses nothing up; null for an unknown, spent, cancelled or
-   * expired secret alike, and while its page is not linked.
+   * shared it. Uses nothing up; null for an unknown, spent, cancelled,
+   * expired or unsponsored secret alike (#findInvite), and while its page is
+   * not linked.
    */
   previewInvite(secret: string): InvitePreview | null {
     const invite = this.#findInvite(secret, Date.now());
@@ -2699,13 +2736,15 @@ export class PageHub {
   /**
    * Everything a redemption must pass before its page hears of it: the
    * user's pairing limit, a live invite (minted for one use, when pair_page
-   * asks), the invite's own limit, its bars, a linked page, the page's
-   * pairing limit, and the invite still live once the caller's own lapsed
-   * attachment has ended; then the caller is already attached, joins the
-   * request they have waiting, is refused while the invite's one prompt or
-   * its last uses are taken or the seats invites may use are full, or raises
-   * a new request. Never autoApprove: the adapter honours an invite only
-   * against its own record and the presented secret (ADR 0017's notes).
+   * asks, and still sponsored: #sponsored ends a sponsor, or a member above
+   * them, past their time as the timer would), the invite's own limit, its
+   * bars, a linked page, the page's pairing limit, and the invite still live
+   * once the caller's own lapsed attachment has ended; then the caller is
+   * already attached, joins the request they have waiting, is refused while
+   * the invite's one prompt or its last uses are taken or the seats invites
+   * may use are full, or raises a new request. Never autoApprove: the
+   * adapter honours an invite only against its own record and the presented
+   * secret (ADR 0017's notes).
    */
   #redeem(caller: CallerIdentity, secret: string | null, oneUse: boolean, now: number): Started {
     const limited = this.#pairingLimited(caller, 'invite', now);
@@ -2775,10 +2814,10 @@ export class PageHub {
     }
     this.#pageLimiter.record(page.pageId, now);
 
-    // Ending the caller's own lapsed attachment can close this very invite
-    // (sponsor_gone, ADR 0017), and the put below would then bring it back
-    // with no sponsor and no timer, so a closed one gets the answer every
-    // dead invite gets.
+    // A caller whose end would close this invite (sponsor_gone, ADR 0017)
+    // is its sponsor or above them, so #findInvite has already ended them if
+    // due. The put below would bring a closed invite back with no sponsor and
+    // no timer, though, so a closed one still gets every dead invite's answer.
     this.#expireIfDue(page.pageId, caller.userId);
     if (this.#store.invites.get(invite.pageId, invite.inviteId) === undefined) {
       this.#log.info('redemption refused: the invite closed as the caller expired', {
