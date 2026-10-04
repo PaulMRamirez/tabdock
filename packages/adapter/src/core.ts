@@ -197,7 +197,9 @@ export interface CoreOptions {
   /**
    * WebCrypto, for minting invites and checking redemptions; the global
    * crypto unless set. Without a usable one (a page outside a secure context)
-   * the page mints nothing and honours no invite.
+   * the page mints nothing and honours no invite. Its two functions are
+   * taken once, when the core is created, so a script that replaces them
+   * later can neither predict a secret nor see one hashed.
    */
   crypto?: CryptoLike | undefined;
 }
@@ -352,6 +354,24 @@ export interface PageRole {
   readonly inviteRole: Role | null;
 }
 
+/**
+ * Someone this page let in by an invite: its own honour decision, made
+ * against its record and the presented secret, never the relay's roster
+ * (ADR 0017). The widget's join notice (ADR 0016) reads these, so a relay
+ * cannot announce a join the page never honoured.
+ */
+export interface InviteJoin {
+  /** Counts up from 1 with every join this core honours, so a notice is given once. */
+  readonly seq: number;
+  readonly user: User;
+  readonly account: Account;
+  readonly inviteId: string;
+  /** The invite's label as this page's record holds it: the page's own words. */
+  readonly label: string;
+  /** Local epoch milliseconds of the decision. */
+  readonly time: number;
+}
+
 export interface DockState {
   readonly link: LinkState;
   readonly pageId: string | null;
@@ -386,6 +406,12 @@ export interface DockState {
    * null whenever the link drops, until the next one.
    */
   readonly invitesOffered: InvitesOffered | null;
+  /**
+   * Who this page let in by invite and still lets in, newest first: one
+   * entry per invite-made grant this page made itself, gone with the grant.
+   * What the page runs their calls under now is pageRoles' to say.
+   */
+  readonly joins: readonly InviteJoin[];
   /**
    * The page's policy as attach() was given it, defaults filled in: what
    * policy.invites lets the operator offer, and maxDrivers, for a prompt to
@@ -606,9 +632,15 @@ interface Grant {
   readonly inviteRole?: Role | undefined;
 }
 
+/**
+ * One attach request while it waits. Every decision names the record, never
+ * only its id: a relay may reuse an id once a request is answered, and an
+ * answer meant for the old request must not settle the new one.
+ */
 interface RequestRecord {
   readonly request: PendingRequest;
-  readonly timer: unknown;
+  /** Silence until expiresAt denies; set once, right after the record is made. */
+  timer: unknown;
   readonly port: AbortController;
   /**
    * Put before the operator: listed in pendingRequests and asked through
@@ -618,6 +650,8 @@ interface RequestRecord {
   shown: boolean;
   /** The secret a redemption presented, held only until it is checked. */
   secret: string | null;
+  /** A redemption whose secret hashed to this page's record; nothing approves one before. */
+  verified: boolean;
 }
 
 /**
@@ -653,10 +687,18 @@ const defaultTimers: Timers = {
   },
 };
 
+/**
+ * Taken when this module loads, which is before attach(): a script that runs
+ * later and replaces TextEncoder's encode or the Uint8Array constructor
+ * would otherwise be handed an invite secret's text or bytes as the core
+ * draws and hashes it. WebCrypto's functions are taken in usableCrypto.
+ */
 const encoder = new TextEncoder();
+const encodeUtf8 = encoder.encode.bind(encoder);
+const ByteArray = Uint8Array;
 
 function byteLength(text: string): number {
-  return encoder.encode(text).length;
+  return encodeUtf8(text).length;
 }
 
 const BASE64URL_DIGITS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
@@ -676,7 +718,11 @@ export function base64url(bytes: Uint8Array): string {
 
 /**
  * The page's WebCrypto, when it has one it can use: browsers leave subtle
- * out outside a secure context, where invites then stay off.
+ * out outside a secure context, where invites then stay off. Its functions
+ * are bound here, once, into an object of the core's own: Crypto.prototype
+ * and SubtleCrypto.prototype stay open to page scripts, and one that ran
+ * after attach() and patched them could otherwise make every secret
+ * predictable, or read each one as it is hashed.
  */
 function usableCrypto(given: CryptoLike | undefined): CryptoLike | null {
   const candidate: unknown = given ?? Reflect.get(globalThis, 'crypto');
@@ -685,19 +731,24 @@ function usableCrypto(given: CryptoLike | undefined): CryptoLike | null {
   if (typeof getRandomValues !== 'function' || typeof subtle !== 'object' || subtle === null) {
     return null;
   }
-  return typeof (subtle as { digest?: unknown }).digest === 'function'
-    ? (candidate as CryptoLike)
-    : null;
+  const digest: unknown = (subtle as { digest?: unknown }).digest;
+  if (typeof digest !== 'function') return null;
+  return Object.freeze({
+    getRandomValues: (getRandomValues as CryptoLike['getRandomValues']).bind(candidate),
+    subtle: Object.freeze({
+      digest: (digest as CryptoLike['subtle']['digest']).bind(subtle),
+    }),
+  });
 }
 
 /** SHA-256 of the text's UTF-8 bytes as 64 lower-case hex characters, matching the relay's digestHex. */
 async function sha256Hex(crypto: CryptoLike, text: string): Promise<string> {
-  const hash = await crypto.subtle.digest('SHA-256', encoder.encode(text));
-  return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  const hash = await crypto.subtle.digest('SHA-256', encodeUtf8(text));
+  return Array.from(new ByteArray(hash), (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
 function randomText(crypto: CryptoLike, bytes: number): string {
-  return base64url(crypto.getRandomValues(new Uint8Array(bytes)));
+  return base64url(crypto.getRandomValues(new ByteArray(bytes)));
 }
 
 /** An invitee's id is the prefix and its account key; their kind follows from it (ADR 0017's notes). */
@@ -952,6 +1003,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     activity: [],
     invites: [],
     invitesOffered: null,
+    joins: [],
     policy: { ...policy, consequentialTools: [...policy.consequentialTools] },
   });
   const listeners = new Set<(state: DockState) => void>();
@@ -1029,6 +1081,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   const cancelSent = new Set<string>();
   /** Fires when the next invite-made grant ends, so the roles shown change with it. */
   let grantEndTimer: unknown = null;
+  /** The seq of the last join this core honoured; see InviteJoin. */
+  let joinSeq = 0;
 
   function setState(patch: Partial<DockState>): void {
     const next = { ...state, ...patch };
@@ -1136,10 +1190,19 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     );
     armGrantEnd();
     const views = inviteViews();
-    if (JSON.stringify(views) !== JSON.stringify(state.invites)) {
-      setState({ invites: views });
-    } else if (JSON.stringify(rolesFor(state.roster)) !== JSON.stringify(state.pageRoles)) {
-      setState({});
+    // A join stays only while the grant it made does.
+    const joins = state.joins.filter(
+      (join) => grants.get(join.user.userId)?.inviteId === join.inviteId,
+    );
+    const patch = {
+      ...(JSON.stringify(views) === JSON.stringify(state.invites) ? {} : { invites: views }),
+      ...(joins.length === state.joins.length ? {} : { joins }),
+    };
+    if (
+      Object.keys(patch).length > 0 ||
+      JSON.stringify(rolesFor(state.roster)) !== JSON.stringify(state.pageRoles)
+    ) {
+      setState(patch);
     }
   }
 
@@ -2162,20 +2225,20 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       client: frame.client,
       expiresAt,
     });
-    const port = new AbortController();
-    const timer = timers.setTimeout(
+    const record: RequestRecord = {
+      request,
+      timer: null,
+      port: new AbortController(),
+      shown: false,
+      secret: frame.invite?.secret ?? null,
+      verified: false,
+    };
+    record.timer = timers.setTimeout(
       () => {
-        decide(frame.requestId, false, undefined, 'timeout');
+        decide(record, false, undefined, 'timeout');
       },
       Math.max(0, expiresAt - now),
     );
-    const record: RequestRecord = {
-      request,
-      timer,
-      port,
-      shown: false,
-      secret: frame.invite?.secret ?? null,
-    };
     requests.set(frame.requestId, record);
     log.info(`attach request from ${logName(frame.user)} via ${frame.via}`);
     if (frame.invite !== undefined) {
@@ -2189,7 +2252,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       log.warn(
         `refused a ${frame.via} request from ${logName(frame.user)}: an invitee joins only by invite`,
       );
-      decide(frame.requestId, false, undefined, 'rule');
+      decide(record, false, undefined, 'rule');
       return;
     }
     show(record);
@@ -2206,8 +2269,17 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       .then(() => ui.askAttach?.(request, record.port.signal))
       .then(
         (answer) => {
-          if (answer === 'deny') decide(request.requestId, false, undefined, 'operator');
-          else if (answer !== undefined) decide(request.requestId, true, answer, 'operator');
+          if (answer === undefined) return;
+          // Only while this very request still waits. A port that ignores its
+          // signal can answer after the prompt was settled, by then perhaps
+          // under an id the relay has reused for a redemption whose secret is
+          // still being checked; that answer was never about it.
+          if (record.port.signal.aborted || requests.get(request.requestId) !== record) {
+            log.warn('ignored a UI port answer to an attach request that was already settled');
+            return;
+          }
+          if (answer === 'deny') decide(record, false, undefined, 'operator');
+          else decide(record, true, answer, 'operator');
         },
         (error: unknown) => {
           log.warn(`the UI port failed to ask about an attach request: ${describe(error)}`);
@@ -2252,11 +2324,12 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       log.warn(
         `refused a redemption of invite ${inviteId} by ${logName(request.user)}: ${problem ?? 'this page holds no record of it'}`,
       );
-      decide(request.requestId, false, undefined, 'rule');
+      decide(record, false, undefined, 'rule');
       return;
     }
+    record.verified = true;
     if (kept.role === 'observer') {
-      decide(request.requestId, true, 'observer', 'invite');
+      decide(record, true, 'observer', 'invite');
       return;
     }
     show(record);
@@ -2301,33 +2374,45 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     return null;
   }
 
-  function isShown(requestId: string): boolean {
-    return requests.get(requestId)?.shown === true;
+  /** The waiting request under this id, if the operator was shown it; nothing else is theirs to answer. */
+  function shownRecord(requestId: string): RequestRecord | null {
+    const record = requests.get(requestId);
+    return record?.shown === true ? record : null;
   }
 
+  /**
+   * Answers one request, which must be the very record still waiting under
+   * its id: anything that took longer to answer than the request lived, such
+   * as a UI port or a timer, holds a record the relay may since have
+   * replaced with another under the same id.
+   */
   function decide(
-    requestId: string,
+    record: RequestRecord,
     allow: boolean,
     role?: Role,
     cause: DecisionCause = 'operator',
   ): boolean {
-    const record = requests.get(requestId);
-    if (!record) return false;
+    const { request } = record;
+    const { requestId } = request;
+    if (requests.get(requestId) !== record) return false;
     if (allow && !RoleSchema.safeParse(role).success) {
       log.warn('ignored an approval without a valid role');
       return false;
     }
-    const { request } = record;
     const inviteId = request.invite?.inviteId;
     const invite = inviteId === undefined ? undefined : invites.get(inviteId);
     let granted = role;
     if (allow && inviteId !== undefined) {
-      const problem = redemptionProblem(request);
+      // S14: never a redemption whose secret this page has not matched to its
+      // record, whoever approves it, and never past the record's terms now.
+      const problem = record.verified
+        ? redemptionProblem(request)
+        : 'its secret has not been checked';
       if (problem !== null || !invite) {
         log.warn(
           `refused a redemption of invite ${inviteId} by ${logName(request.user)}: ${problem ?? 'this page holds no record of it'}`,
         );
-        return decide(requestId, false, undefined, 'rule');
+        return decide(record, false, undefined, 'rule');
       }
       // Never above the invite's role, whatever the operator or a UI port chose (S14).
       if (invite.role === 'observer') granted = 'observer';
@@ -2337,7 +2422,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     record.port.abort();
     if (record.shown) {
       setState({
-        pendingRequests: state.pendingRequests.filter((item) => item.requestId !== requestId),
+        pendingRequests: state.pendingRequests.filter((item) => item !== request),
       });
     }
     // The first approval wins, as on the relay, which keeps an existing
@@ -2355,13 +2440,25 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       // An invite-made grant ends 24 hours after redemption and names the
       // invite's role as its cap (ADR 0017); its use is spent here, on the
       // page's own count, whatever the relay counts.
+      const now = clock();
       setGrant(userId, {
         role: granted,
         inviteId,
-        endsAt: clock() + MAX_INVITE_LIFETIME_MS,
+        endsAt: now + MAX_INVITE_LIFETIME_MS,
         inviteRole: invite.role,
       });
       updateInvite({ ...invite, usesLeft: invite.usesLeft - 1 });
+      // The widget's notice comes from here, the page's own decision, never from the roster.
+      joinSeq += 1;
+      const join: InviteJoin = Object.freeze({
+        seq: joinSeq,
+        user: Object.freeze({ ...request.user }),
+        account: Object.freeze({ ...request.account }),
+        inviteId,
+        label: invite.label,
+        time: now,
+      });
+      setState({ joins: [join, ...state.joins] });
     } else if (allow && granted !== undefined) {
       // An approval after a revoke lets the user back in; the relay applies
       // the two in that order too. A redemption never does (redemptionProblem).
@@ -2430,7 +2527,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     }
     for (const record of [...requests.values()]) {
       if (record.request.invite?.inviteId === inviteId) {
-        decide(record.request.requestId, false, undefined, 'rule');
+        decide(record, false, undefined, 'rule');
       }
     }
     if (had) saveGrants();
@@ -2533,8 +2630,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       const invite = invites.get(inviteId);
       if (!invite || invite.barred.includes(userId)) continue;
       if (invite.barred.length >= MAX_INVITE_USES) {
-        // More revokes than the invite has uses: the relay is making up who
-        // it let in. Closing it bars everyone.
+        // More revokes than any invite can have uses: the relay is making up
+        // who it let in, and the record could hold no more. Closing it bars everyone.
         cancelInvite(inviteId);
         continue;
       }
@@ -2621,7 +2718,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       if (everyone) forgetInvite(inviteId, 'cancelled');
       else cancelInvite(inviteId);
     }
-    for (const record of asking) decide(record.request.requestId, false, undefined, 'revoke');
+    for (const record of asking) decide(record, false, undefined, 'revoke');
     for (const call of running) {
       if (call.confirm) {
         finish(call, { ok: false, code: 'denied_by_operator', message: REVOKED_MESSAGE });
@@ -2770,8 +2867,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   function close(mode: CloseMode = 'detach'): void {
     if (closed) return;
     if (mode === 'detach' && isLinked()) {
-      for (const requestId of [...requests.keys()]) {
-        decide(requestId, false, undefined, 'detach');
+      for (const record of [...requests.values()]) {
+        decide(record, false, undefined, 'detach');
       }
       for (const call of [...calls.values()]) {
         // S6: a prompt left unanswered is a denial.
@@ -2818,10 +2915,14 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     },
     // Only a request the operator was shown: a redemption whose secret is
     // still being checked, or that is approved without a prompt, is not theirs to answer.
-    approve: (requestId: string, role: Role) =>
-      isShown(requestId) && decide(requestId, true, role, 'operator'),
-    deny: (requestId: string) =>
-      isShown(requestId) && decide(requestId, false, undefined, 'operator'),
+    approve: (requestId: string, role: Role) => {
+      const record = shownRecord(requestId);
+      return record !== null && decide(record, true, role, 'operator');
+    },
+    deny: (requestId: string) => {
+      const record = shownRecord(requestId);
+      return record !== null && decide(record, false, undefined, 'operator');
+    },
     // Strictly true: a script passing the string 'false' must not allow a consequential call.
     confirm: (callId: string, allow: boolean) => confirmCall(callId, (allow as unknown) === true),
     rotatePairing: () => isLinked() && send({ t: 'rotate_pairing' }),

@@ -21,7 +21,7 @@ import {
   type RelayFrame,
   RESUME_WINDOW_MS,
 } from '@tabdock/protocol';
-import { storageKey } from '@tabdock/adapter/core';
+import { type CryptoLike, storageKey } from '@tabdock/adapter/core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 import { DEFAULT_SIM_ORIGIN, RUNTIME_PROFILES, startSimPage, type SimPage } from '../src/index.ts';
@@ -273,6 +273,24 @@ describe('startSimPage', () => {
       ok: false,
       reason: 'invalid',
     });
+  });
+
+  it('passes its crypto option to the core: one without subtle, as outside a secure context, mints nothing', async () => {
+    const insecure = {
+      getRandomValues: <T extends Uint8Array<ArrayBuffer>>(array: T): T =>
+        globalThis.crypto.getRandomValues(array),
+    } as unknown as CryptoLike;
+    const { sim, connection } = await linked({ policy: { invites: 'all' }, crypto: insecure });
+    send(connection, { t: 'invites', linkBase: 'https://relay.example/i', invites: [] });
+    await sim.waitFor((state) => state.invitesOffered !== null);
+    expect(await sim.invite({ label: 'Friends', role: 'observer' })).toEqual({
+      ok: false,
+      reason: 'unavailable',
+    });
+    // A ping and its pong: everything the page sent before it has arrived.
+    send(connection, { t: 'ping' });
+    await frameOf(connection, 'pong');
+    expect(connection.frames.filter((frame) => frame.t === 'invite_create')).toEqual([]);
   });
 
   it("mints with Node's WebCrypto, keeps the record across a reload, and asks the operator about a Can control redemption", async () => {

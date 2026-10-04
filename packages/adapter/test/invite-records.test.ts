@@ -10,12 +10,19 @@ import {
   INVITE_SECRET_CHARS,
   type InviteRefusalReason,
   MAX_INVITE_LIFETIME_MS,
+  MAX_INVITE_USES,
   MAX_LIVE_INVITES_PER_PAGE,
   type PolicyInput,
   StoredInvitesSchema,
 } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
-import { type CryptoLike, MINT_ANSWER_MS } from '../src/core.ts';
+import {
+  type AttachAnswer,
+  type CryptoLike,
+  type InviteResult,
+  MINT_ANSWER_MS,
+  type UiPort,
+} from '../src/core.ts';
 import {
   attachment,
   attachRequest,
@@ -40,6 +47,7 @@ import {
   results,
   setup,
   sha256Hex,
+  SPONSOR,
   until,
 } from './harness.ts';
 
@@ -58,6 +66,8 @@ async function offering(
   socket.deliver(invitesFrame([]));
   return { h, socket, listed: [] };
 }
+
+type InviteCreate = Minted['create'];
 
 function decisions(socket: FakeSocket) {
   return socket.framesOf('attach_decision');
@@ -96,6 +106,28 @@ const guestCaller = (role: 'driver' | 'observer' = 'driver') => ({
   client: null,
   role,
 });
+
+/**
+ * Node's WebCrypto, counting the digests that have settled, so a test can
+ * act while a presented secret is still being hashed and then wait for the
+ * hash to settle without guessing how long it takes.
+ */
+function countingCrypto(): { crypto: CryptoLike; digests: () => number } {
+  let digests = 0;
+  return {
+    crypto: {
+      getRandomValues: (array) => globalThis.crypto.getRandomValues(array),
+      subtle: {
+        digest: async (algorithm, data) => {
+          const hash = await globalThis.crypto.subtle.digest(algorithm, data);
+          digests += 1;
+          return hash;
+        },
+      },
+    },
+    digests: () => digests,
+  };
+}
 
 describe('dock.invite() mints (ADR 0017)', () => {
   it('draws a 128-bit secret, sends only its hash, keeps a record without it and resolves with the link once listed', async () => {
@@ -298,6 +330,74 @@ describe('dock.invite() mints (ADR 0017)', () => {
       { t: 'invite_cancel', inviteId: create.inviteId },
     ]);
     expect(h.dock.state.invites).toEqual([]);
+  });
+});
+
+describe('dock.invite() against a relay that answers wrongly (S14)', () => {
+  it.each<[string, (create: InviteCreate) => Partial<InviteListing>]>([
+    ['another label', () => ({ label: 'Family' })],
+    ['another expiry', (create) => ({ expiresAt: (create.expiresAt ?? 0) + 60_000 })],
+    ['no expiry', () => ({ expiresAt: null })],
+    ['more uses', (create) => ({ uses: create.uses + 1, usesLeft: create.uses + 1 })],
+  ])(
+    'settles unavailable, shows nothing and closes the invite when the relay lists it with %s',
+    async (_name, other) => {
+      const { h, socket } = await offering();
+      const pending = h.dock.invite({ label: 'Friends', role: 'observer', uses: 2 });
+      await until(() => socket.framesOf('invite_create').length === 1);
+      const [create] = socket.framesOf('invite_create');
+      if (!create) throw new Error('no invite_create');
+      socket.deliver(invitesFrame([listingOf(create, other(create))]));
+      expect(await pending).toEqual({ ok: false, reason: 'unavailable' });
+      expect(socket.framesOf('invite_cancel')).toEqual([
+        { t: 'invite_cancel', inviteId: create.inviteId },
+      ]);
+      expect(h.dock.state.invites).toEqual([]);
+      expect(h.storage.getItem(INVITES_KEY)).toBeNull();
+    },
+  );
+
+  it('settles link_down at once, keeping no record, when invite_create cannot be sent', async () => {
+    const { h, socket } = await offering();
+    // The socket is closing and its close event has not arrived: the link still
+    // looks up, but nothing can be sent on it, so no relay will ever answer.
+    socket.readyState = 2;
+    const settled: { result?: InviteResult } = {};
+    void h.dock.invite({ label: 'Friends', role: 'observer' }).then((result) => {
+      settled.result = result;
+    });
+    await until(() => settled.result !== undefined, 'the mint to settle');
+    expect(settled.result).toEqual({ ok: false, reason: 'link_down' });
+    expect(socket.framesOf('invite_create')).toEqual([]);
+    expect(h.storage.getItem(INVITES_KEY)).toBeNull();
+  });
+
+  it('closes an invite it holds no record of once per link, and again on the next link', async () => {
+    const { h, socket } = await offering();
+    const stranger: InviteListing = {
+      inviteId: 'inv_not_minted_here',
+      role: 'observer',
+      label: 'Not ours',
+      uses: 1,
+      expiresAt: null,
+      usesLeft: 1,
+      sponsor: SPONSOR,
+      pending: false,
+      refusals: 0,
+    };
+    const cancel = { t: 'invite_cancel', inviteId: stranger.inviteId };
+    socket.deliver(invitesFrame([stranger]));
+    socket.deliver(invitesFrame([stranger]));
+    expect(socket.framesOf('invite_cancel')).toEqual([cancel]);
+    // A cancel sent on a link that then dropped may never have arrived.
+    socket.drop();
+    await h.clock.advance(1000);
+    const next = h.socket();
+    next.accept();
+    next.deliver(welcomeAgain(h));
+    next.deliver(invitesFrame([stranger]));
+    next.deliver(invitesFrame([stranger]));
+    expect(next.framesOf('invite_cancel')).toEqual([cancel]);
   });
 });
 
@@ -627,6 +727,72 @@ describe('honouring a redemption (S4, S14)', () => {
     expect(h.dock.approve(asked?.requestId ?? '', 'driver')).toBe(false);
   });
 
+  it('refuses an approval made after the Can control invite expired while its prompt was up, spending and counting nothing', async () => {
+    const { h, socket, listed } = await offering();
+    const minted = await mint(
+      h,
+      socket,
+      { label: 'Help', role: 'driver', lifetime: '15m' },
+      listed,
+    );
+    // Redeemed 30 s before the invite ends; its prompt lasts a minute.
+    h.clock.now += 15 * 60_000 - 30_000;
+    await redeem(h, socket, redemption(h.clock, minted));
+    const requestId = `redeem-${minted.inviteId}`;
+    socket.deliver({ t: 'ping' });
+    await h.clock.advance(31_000);
+    expect(h.dock.state.pendingRequests.map((request) => request.requestId)).toEqual([requestId]);
+    h.dock.approve(requestId, 'driver');
+    expect(decisions(socket).at(-1)).toEqual({ t: 'attach_decision', requestId, allow: false });
+    expect(h.dock.state.pendingRequests).toEqual([]);
+    expect(h.storage.getItem(GRANTS_KEY)).not.toContain(GUEST);
+    // Not the operator's refusal, so it burns nothing either.
+    expect(storedInvites(h.storage)?.invites[0]).toMatchObject({ usesLeft: 1, refusals: 0 });
+  });
+
+  it('refuses an approval for an account that got attached another way while its Can control prompt was up', async () => {
+    const { h, socket, listed } = await offering();
+    const control = await mint(h, socket, { label: 'Help', role: 'driver' }, listed);
+    const watch = await mint(h, socket, { label: 'Friends', role: 'observer', uses: 2 }, listed);
+    await redeem(h, socket, redemption(h.clock, control));
+    // Meanwhile the same guest joins by the Can watch link, and the relay lists them.
+    await redeem(h, socket, redemption(h.clock, watch));
+    expect(decisions(socket).at(-1)).toMatchObject({ allow: true, role: 'observer' });
+    socket.deliver({
+      t: 'roster',
+      attachments: [
+        attachment('alice', 'driver'),
+        invitedAttachment(GUEST, 'observer', watch.inviteId, h.clock.now + HOUR),
+      ],
+    });
+    const requestId = `redeem-${control.inviteId}`;
+    h.dock.approve(requestId, 'driver');
+    expect(decisions(socket).at(-1)).toEqual({ t: 'attach_decision', requestId, allow: false });
+    // Still the Can watch grant, capped at observer, and the Can control link unspent.
+    expect(h.dock.state.pageRoles[1]).toMatchObject({ role: 'observer', inviteRole: 'observer' });
+    const controlRecord = storedInvites(h.storage)?.invites.find(
+      (invite) => invite.inviteId === control.inviteId,
+    );
+    expect(controlRecord).toMatchObject({ usesLeft: 1, refusals: 0 });
+  });
+
+  it('leaves no prompt behind for a redemption revoked while its secret was being hashed', async () => {
+    const counted = countingCrypto();
+    const h = setup({ core: { policy: { invites: 'all' }, crypto: counted.crypto } });
+    const socket = await link(h);
+    socket.deliver(invitesFrame([]));
+    const minted = await mint(h, socket, { label: 'Help', role: 'driver' });
+    const hashed = counted.digests();
+    socket.deliver(redemption(h.clock, minted));
+    // Revoked before the hash settles: the request is denied at once.
+    expect(h.dock.revoke(GUEST)).toBe(true);
+    expect(decisions(socket).at(-1)).toMatchObject({ allow: false });
+    await until(() => counted.digests() > hashed, 'the presented secret to be hashed');
+    await flush();
+    expect(h.dock.state.pendingRequests).toEqual([]);
+    expect(decisions(socket).filter((frame) => frame.requestId !== 'grant-alice')).toHaveLength(1);
+  });
+
   it('gives the handle nothing to approve while a secret is still being checked', async () => {
     const { h, socket, listed } = await offering();
     const minted = await mint(h, socket, { label: 'Help', role: 'driver' }, listed);
@@ -864,6 +1030,70 @@ describe('Revoke and invites (S8, S14)', () => {
     });
   });
 
+  it('bars a revoked account from the invite the roster names, though its own grant names none', async () => {
+    const { h, socket, listed } = await offering();
+    const minted = await mint(h, socket, { label: 'Friends', role: 'observer', uses: 3 }, listed);
+    // Bob was approved by code; the relay says he came by the invite.
+    socket.deliver({
+      ...attachRequest(h.clock, 'bob-code'),
+      user: { userId: 'bob', displayName: 'Bob' },
+    });
+    expect(h.dock.approve('bob-code', 'observer')).toBe(true);
+    socket.deliver({
+      t: 'roster',
+      attachments: [
+        attachment('alice', 'driver'),
+        invitedAttachment('bob', 'observer', minted.inviteId, h.clock.now + HOUR, 'Bob'),
+      ],
+    });
+    expect(h.dock.revoke('bob', { closeInvite: false })).toBe(true);
+    expect(storedInvites(h.storage)?.invites[0]?.barred).toEqual(['bob']);
+    // The relay applies the revoke, and Bob comes back by the link.
+    socket.deliver({ t: 'roster', attachments: [attachment('alice', 'driver')] });
+    await redeem(
+      h,
+      socket,
+      redemption(h.clock, minted, {
+        requestId: 'bob-back',
+        user: { userId: 'bob', displayName: 'Bob' },
+        account: { kind: 'member', verified: true },
+      }),
+    );
+    expect(decisions(socket).at(-1)).toMatchObject({ requestId: 'bob-back', allow: false });
+  });
+
+  it('closes an invite once the relay names more accounts revoked from it than it has uses', async () => {
+    const { h, socket, listed } = await offering();
+    const minted = await mint(
+      h,
+      socket,
+      { label: 'Everyone', role: 'observer', uses: MAX_INVITE_USES },
+      listed,
+    );
+    const claimed = Array.from({ length: MAX_INVITE_USES + 1 }, (_, n) => `member${n}`);
+    socket.deliver({
+      t: 'roster',
+      attachments: [
+        attachment('alice', 'driver'),
+        ...claimed.map((userId) =>
+          invitedAttachment(userId, 'observer', minted.inviteId, h.clock.now + HOUR, userId),
+        ),
+      ],
+    });
+    for (const userId of claimed.slice(0, MAX_INVITE_USES)) {
+      expect(h.dock.revoke(userId, { closeInvite: false })).toBe(true);
+    }
+    expect(socket.framesOf('invite_cancel')).toEqual([]);
+    expect(storedInvites(h.storage)?.invites[0]?.barred).toHaveLength(MAX_INVITE_USES);
+    // One more than it could ever have let in: the relay is making them up.
+    expect(h.dock.revoke(claimed[MAX_INVITE_USES] ?? '', { closeInvite: false })).toBe(true);
+    expect(socket.framesOf('invite_cancel')).toEqual([
+      { t: 'invite_cancel', inviteId: minted.inviteId },
+    ]);
+    expect(h.dock.state.invites).toEqual([]);
+    expect(h.storage.getItem(INVITES_KEY)).toBeNull();
+  });
+
   it('Revoke all forgets every invite, settles a mint in flight as cancelled, and closes any a lying relay lists again', async () => {
     const { h, socket, listed } = await offering();
     const minted = await mint(h, socket, { label: 'Friends', role: 'observer', uses: 3 }, listed);
@@ -1010,5 +1240,169 @@ describe('the real WebCrypto', () => {
     const minted = await mint(h, socket, { label: 'Friends', role: 'observer' });
     expect(minted.create.secretHash).toBe(await sha256Hex(minted.secret));
     expect(minted.create.secretHash).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
+describe('a UI port answer counts only for the request it was asked about (S14)', () => {
+  /**
+   * A host dialog that resolves on a click and ignores its abort signal, as
+   * a UI port may: it keeps every answer it was asked for, to give later.
+   */
+  function lateDialog(requestId: string) {
+    const answers: ((answer: AttachAnswer) => void)[] = [];
+    const ui: UiPort = {
+      askAttach: (request) =>
+        request.requestId === requestId
+          ? new Promise<AttachAnswer>((resolve) => {
+              answers.push(resolve);
+            })
+          : undefined,
+    };
+    return { ui, answers };
+  }
+
+  it('drops an answer given after its prompt expired, when the relay reused its id for a forged redemption', async () => {
+    const dialog = lateDialog('R');
+    const h = setup({ core: { policy: { invites: 'all' }, ui: dialog.ui } });
+    const socket = await link(h);
+    socket.deliver(invitesFrame([]));
+    const minted = await mint(h, socket, { label: 'Help', role: 'driver' });
+    // A code request that expires at once: the dialog is asked, and silence denies it.
+    socket.deliver({ ...attachRequest(h.clock, 'R'), expiresAt: h.clock.now });
+    await h.clock.advance(1);
+    expect(dialog.answers).toHaveLength(1);
+    expect(decisions(socket).at(-1)).toEqual({
+      t: 'attach_decision',
+      requestId: 'R',
+      allow: false,
+    });
+    // The relay reuses R for a Can control redemption whose secret it never saw,
+    // and the old dialog answers while that secret is still being hashed.
+    socket.deliver(
+      redemption(h.clock, minted, {
+        requestId: 'R',
+        invite: { inviteId: minted.inviteId, secret: 'Z'.repeat(22), label: 'Help' },
+      }),
+    );
+    dialog.answers[0]?.('driver');
+    await until(() => decisions(socket).length === 3, 'an answer to the forged redemption');
+    await flush();
+    expect(decisions(socket).slice(1)).toEqual([
+      { t: 'attach_decision', requestId: 'R', allow: false },
+      { t: 'attach_decision', requestId: 'R', allow: false },
+    ]);
+    expect(h.storage.getItem(GRANTS_KEY)).not.toContain(GUEST);
+    expect(storedInvites(h.storage)?.invites[0]).toMatchObject({ usesLeft: 1, refusals: 0 });
+    expect(h.logs).toContain(
+      'warn ignored a UI port answer to an attach request that was already settled',
+    );
+    // And the guest a relay attached anyway runs nothing here.
+    socket.deliver({
+      t: 'roster',
+      attachments: [
+        attachment('alice', 'driver'),
+        invitedAttachment(GUEST, 'driver', minted.inviteId, h.clock.now + HOUR),
+      ],
+    });
+    socket.deliver(invoke('set_value', { callId: 'forged-write', caller: guestCaller() }));
+    await flush();
+    expect(codes(socket)).toEqual(['role_denied']);
+  });
+
+  it('never lets a stale answer decide a later request that reuses its id', async () => {
+    const dialog = lateDialog('R');
+    const h = setup({ core: { ui: dialog.ui } });
+    const socket = await link(h);
+    socket.deliver({ ...attachRequest(h.clock, 'R'), expiresAt: h.clock.now });
+    await h.clock.advance(1);
+    socket.deliver({
+      ...attachRequest(h.clock, 'R'),
+      user: { userId: 'carol', displayName: 'Carol' },
+    });
+    await flush();
+    expect(dialog.answers).toHaveLength(2);
+    // The answer about Bob, given late, is not an answer about Carol.
+    dialog.answers[0]?.('driver');
+    await flush();
+    expect(decisions(socket).filter((frame) => frame.requestId === 'R')).toEqual([
+      { t: 'attach_decision', requestId: 'R', allow: false },
+    ]);
+    expect(h.dock.state.pendingRequests.map((request) => request.user.userId)).toEqual(['carol']);
+    // Carol's own answer still counts.
+    dialog.answers[1]?.('observer');
+    await flush();
+    expect(decisions(socket).at(-1)).toEqual({
+      t: 'attach_decision',
+      requestId: 'R',
+      allow: true,
+      role: 'observer',
+    });
+  });
+});
+
+describe("the joins this page honoured, which the widget's notice reads (ADR 0016)", () => {
+  it('records a join only for a redemption it honoured, with the label from its own record', async () => {
+    const { h, socket, listed } = await offering();
+    const minted = await mint(h, socket, { label: 'Friends', role: 'observer', uses: 3 }, listed);
+    await redeem(
+      h,
+      socket,
+      redemption(h.clock, minted, {
+        requestId: 'forged',
+        invite: { inviteId: minted.inviteId, secret: 'F'.repeat(22), label: 'Friends' },
+      }),
+    );
+    // A lying relay lists someone the page never let in, as a driver by the invite.
+    socket.deliver({
+      t: 'roster',
+      attachments: [
+        attachment('alice', 'driver'),
+        invitedAttachment(OTHER_GUEST, 'driver', minted.inviteId, h.clock.now + HOUR),
+      ],
+    });
+    expect(h.dock.state.joins).toEqual([]);
+    expect(h.dock.state.pageRoles[1]).toMatchObject({ userId: OTHER_GUEST, role: null });
+
+    await redeem(h, socket, redemption(h.clock, minted));
+    expect(h.dock.state.joins).toEqual([
+      {
+        seq: 1,
+        user: { userId: GUEST, displayName: 'guest@example.com' },
+        account: { kind: 'invitee', verified: true },
+        inviteId: minted.inviteId,
+        label: 'Friends',
+        time: h.clock.now,
+      },
+    ]);
+  });
+
+  it('forgets a join with its grant: on revoke, and when the relay drops them', async () => {
+    const { h, socket, listed } = await offering();
+    const minted = await mint(h, socket, { label: 'Friends', role: 'observer', uses: 3 }, listed);
+    await redeem(h, socket, redemption(h.clock, minted));
+    await redeem(
+      h,
+      socket,
+      redemption(h.clock, minted, {
+        requestId: 'other',
+        user: { userId: OTHER_GUEST, displayName: 'other@example.com' },
+      }),
+    );
+    expect(h.dock.state.joins.map((join) => [join.seq, join.user.userId])).toEqual([
+      [2, OTHER_GUEST],
+      [1, GUEST],
+    ]);
+    socket.deliver({
+      t: 'roster',
+      attachments: [
+        attachment('alice', 'driver'),
+        invitedAttachment(GUEST, 'observer', minted.inviteId, h.clock.now + HOUR),
+        invitedAttachment(OTHER_GUEST, 'observer', minted.inviteId, h.clock.now + HOUR),
+      ],
+    });
+    h.dock.revoke(GUEST, { closeInvite: false });
+    expect(h.dock.state.joins.map((join) => join.user.userId)).toEqual([OTHER_GUEST]);
+    socket.deliver({ t: 'roster', attachments: [attachment('alice', 'driver')] });
+    expect(h.dock.state.joins).toEqual([]);
   });
 });

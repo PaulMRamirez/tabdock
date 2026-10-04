@@ -1,16 +1,26 @@
 // The operator's widget (SPEC.md section 8), kept thin: a badge and a panel in
 // a closed shadow root. Scripts that run after attach(), and other frames,
-// cannot read the pairing code or reach the buttons inside it. A page script
-// that runs before attach() could (by patching attachShadow, say), which is
-// acceptable because the page itself is trusted (SPEC.md section 1). As
-// defence in depth, buttons ignore events whose isTrusted is false, so a
-// script that does reach one still cannot press Allow. Everything shown comes
-// from the Dock handle, every relay- or page-supplied string goes in through
-// textContent (the pairing URL only as a QR drawing built with DOM calls; see
-// qr.ts), nothing goes through an HTML parser, and nothing lands on window.
+// cannot reach into it for the pairing code or an invite link, or reach the
+// buttons inside it. A page script that runs before attach() could (by
+// patching attachShadow, say), which is acceptable because the page itself is
+// trusted (SPEC.md section 1). As defence in depth, buttons ignore events
+// whose isTrusted is false, so a script that does reach one still cannot press
+// Allow. Everything shown comes from the Dock handle, every relay- or
+// page-supplied string goes in through textContent (the pairing URL only as a
+// QR drawing built with DOM calls; see qr.ts), nothing goes through an HTML
+// parser, and nothing lands on window.
 // From M4 the panel also mints invites (ADR 0017): an invite link shows once,
 // as a QR drawing and as text to send, and only until the operator is done
-// with it or the invite ends; the adapter keeps no copy of its secret.
+// with it or the invite ends; the adapter keeps no copy of its secret. Against
+// scripts that run later, the boundary is what the adapter has taken once by
+// the time attach() returns: WebCrypto's two functions, TextEncoder's encode
+// and the Uint8Array constructor (core.ts), the WebSocket constructor
+// (index.ts) and the clipboard's writeText (here), so replacing any of them
+// afterwards neither predicts a secret nor catches one on its way to the
+// relay's hash or the clipboard. The built-ins the panel draws with stay the
+// page's: a later script that patches a DOM text setter, or a string method
+// the QR encoder calls, can still read what the panel shows, as a script that
+// ran first could, and the trusted page answers for both.
 // Buttons carry stable data-action attributes for browser tests.
 
 import {
@@ -29,6 +39,7 @@ import type {
   ActivityEntry,
   Dock,
   DockState,
+  InviteJoin,
   InviteLifetime,
   InviteRefusal,
   InviteView,
@@ -60,7 +71,11 @@ const HOST_TAG = 'tabdock-dock';
  */
 const ARM_DELAY_MS = 500;
 
-/** How long the line saying someone joined by a Can watch invite stays, the notice ADR 0016 asks for. */
+/**
+ * How long a line saying someone joined by invite stays, the notice ADR 0016
+ * asks for. It counts only while the panel is open on a visible tab, so no
+ * notice is gone before anyone could have read it.
+ */
 const JOIN_NOTICE_MS = 20_000;
 
 const LINK_LABELS: Record<LinkState, string> = {
@@ -225,6 +240,17 @@ interface PauseView extends ArmedBox {
   paused: boolean | null;
 }
 
+/** One join notice on show; see JOIN_NOTICE_MS. */
+interface JoinLine {
+  readonly element: HTMLElement;
+  /** Milliseconds it has been on screen before `since`. */
+  shownMs: number;
+  /** Since when it has been on screen without a break, or null while it is not. */
+  since: number | null;
+  /** Whether it has been on screen at all; until then the badge asks for attention. */
+  seen: boolean;
+}
+
 interface InviteRowView {
   readonly element: HTMLElement;
   readonly title: HTMLElement;
@@ -341,10 +367,28 @@ function adoptStyle(root: ShadowRoot, doc: Document): HTMLStyleElement | null {
   return style;
 }
 
+/**
+ * The clipboard's writeText, bound once, when the widget mounts:
+ * Clipboard.prototype stays open to page scripts, and one that ran after
+ * attach() and patched it would otherwise be handed every invite link the
+ * operator copies. null where the page has no clipboard, as outside a
+ * secure context.
+ */
+function clipboardWriter(doc: Document): ((text: string) => Promise<void>) | null {
+  const navigator = doc.defaultView?.navigator;
+  const clipboard: unknown = navigator ? Reflect.get(navigator, 'clipboard') : undefined;
+  if (typeof clipboard !== 'object' || clipboard === null) return null;
+  const write: unknown = Reflect.get(clipboard, 'writeText');
+  return typeof write === 'function'
+    ? (write as (text: string) => Promise<void>).bind(clipboard)
+    : null;
+}
+
 /** Mounts the widget for one Dock and returns a function that removes it. */
 export function mountWidget(dock: Dock, doc: Document = document): () => void {
   const host = doc.createElement(HOST_TAG);
   const root = host.attachShadow({ mode: 'closed' });
+  const writeClipboard = clipboardWriter(doc);
 
   function element<K extends keyof HTMLElementTagNameMap>(
     tag: K,
@@ -520,8 +564,8 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   const linkButtons = element('div', 'buttons');
   linkButtons.append(copyLink, doneLink);
   linkBox.append(linkHeading, linkQrBox, linkText, linkButtons);
-  /** The invite whose link is on show, or null. */
-  let shownLink: string | null = null;
+  /** The link on show and its invite, or null; Copy reads it here, never back from the tree. */
+  let shownLink: { readonly inviteId: string; readonly link: string } | null = null;
 
   const inviteList = element('ul');
   inviteList.dataset.role = 'invite-list';
@@ -688,10 +732,14 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   root.append(wrap);
 
   function setOpen(open: boolean): void {
+    // Time on screen so far counts for the join notices before the panel changes.
+    ageJoinLines();
     panel.hidden = !open;
     badgeButton.setAttribute('aria-expanded', String(open));
     // Opening moves every box from nowhere onto the screen, so each waits from now.
     checkMoves();
+    ageJoinLines();
+    updateAttention();
   }
 
   function requestView(request: PendingRequest, state: DockState): PromptView {
@@ -928,30 +976,85 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     revokeAll.hidden = state.roster.length === 0 && state.invites.length === 0;
   }
 
-  /** Roster entries seen so far, so someone new by invite gets their notice; null before the first render. */
-  let seenUsers: Set<string> | null = null;
-  const joinLines: { readonly element: HTMLElement; readonly until: number }[] = [];
+  /** The seq of the newest join already dealt with; null before the first render. */
+  let lastJoin: number | null = null;
+  /** Joins this page honoured that are not told of yet, by seq, until the relay lists them. */
+  const waitingJoins = new Map<number, InviteJoin>();
+  const joinLines: JoinLine[] = [];
 
-  /** ADR 0016: a Can watch invite lets its holder in without a prompt, but never unseen. */
-  function noticeJoins(state: DockState): void {
-    const listed = new Set(state.roster.map((attachment) => attachment.userId));
-    if (seenUsers !== null) {
-      for (const attachment of state.roster) {
-        if (seenUsers.has(attachment.userId) || attachment.inviteId === null) continue;
-        const label = state.invites.find((view) => view.inviteId === attachment.inviteId)?.label;
-        const by = label === undefined ? 'by invite' : `by your invite "${label}"`;
-        const line = element(
-          'p',
-          'join',
-          `${personText(attachment)} joined ${by} as ${attachment.role}`,
-        );
-        // Not data-user-id, which names roster rows.
-        line.dataset.joined = attachment.userId;
-        joins.prepend(line);
-        joinLines.push({ element: line, until: Date.now() + JOIN_NOTICE_MS });
+  /**
+   * ADR 0016: a Can watch invite lets its holder in without a prompt, but
+   * never unseen. The notice comes from the page's own honour decisions
+   * (DockState.joins), never from the roster, so a relay that lists someone
+   * the page never let in announces nothing; it waits until the relay lists
+   * them, and names the role the page runs their calls under. Returns
+   * whether a notice was added, which opens the panel.
+   */
+  function noticeJoins(state: DockState): boolean {
+    const newest = state.joins[0]?.seq ?? 0;
+    // Joins made before the widget mounted are not news.
+    if (lastJoin === null) {
+      lastJoin = newest;
+      return false;
+    }
+    for (const join of state.joins) if (join.seq > lastJoin) waitingJoins.set(join.seq, join);
+    lastJoin = Math.max(lastJoin, newest);
+    const current = new Set(state.joins.map((join) => join.seq));
+    const access = new Map(state.pageRoles.map((entry) => [entry.userId, entry]));
+    let added = false;
+    for (const [seq, join] of [...waitingJoins].sort(([a], [b]) => a - b)) {
+      // Its grant went before the relay listed them (revoked, say): there is no join to tell of.
+      if (!current.has(seq)) {
+        waitingJoins.delete(seq);
+        continue;
+      }
+      const role = access.get(join.user.userId);
+      if (role === undefined || role.role === null || role.inviteRole === null) continue;
+      waitingJoins.delete(seq);
+      const line = element(
+        'p',
+        'join',
+        `${personText(join.user, join.account)} joined by your invite "${join.label}" as ${role.role}`,
+      );
+      // Not data-user-id, which names roster rows.
+      line.dataset.joined = join.user.userId;
+      joins.prepend(line);
+      joinLines.push({ element: line, shownMs: 0, since: null, seen: false });
+      added = true;
+    }
+    return added;
+  }
+
+  /**
+   * Counts the time each join notice has been on screen, the panel open on a
+   * visible tab, and removes those shown for JOIN_NOTICE_MS. Called on every
+   * tick and whenever the panel or the tab's visibility changes, so time off
+   * screen never counts.
+   */
+  function ageJoinLines(): void {
+    const now = Date.now();
+    const onScreen = !panel.hidden && doc.visibilityState === 'visible';
+    for (let i = joinLines.length - 1; i >= 0; i -= 1) {
+      const line = joinLines[i];
+      if (!line) continue;
+      if (!onScreen) {
+        if (line.since !== null) line.shownMs += now - line.since;
+        line.since = null;
+        continue;
+      }
+      line.seen = true;
+      line.since ??= now;
+      if (line.shownMs + now - line.since >= JOIN_NOTICE_MS) {
+        line.element.remove();
+        joinLines.splice(i, 1);
       }
     }
-    seenUsers = listed;
+  }
+
+  /** The badge asks for attention while a prompt waits or a join notice has not been seen. */
+  function updateAttention(): void {
+    const waiting = requestViews.size + confirmViews.size > 0;
+    badgeButton.classList.toggle('attention', waiting || joinLines.some((line) => !line.seen));
   }
 
   function inviteRow(view: InviteView): InviteRowView {
@@ -994,9 +1097,12 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     if (current.length !== ordered.length || current.some((node, i) => node !== ordered[i])) {
       inviteList.replaceChildren(...ordered);
     }
-    noInvites.hidden = state.invites.length > 0;
+    // Between links the page lists nothing, which says nothing about what is live.
+    noInvites.hidden = state.invites.length > 0 || state.link !== 'linked';
     // A link whose invite the relay no longer lists (used up, cancelled, expired) is dead: it goes.
-    if (shownLink !== null && state.invitesOffered !== null && !live.has(shownLink)) hideLink();
+    if (shownLink !== null && state.invitesOffered !== null && !live.has(shownLink.inviteId)) {
+      hideLink();
+    }
   }
 
   /** Why Create cannot work now, or null. */
@@ -1026,8 +1132,18 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     return Number.isInteger(uses) && uses >= 1 && uses <= MAX_INVITE_USES ? uses : null;
   }
 
+  /** Whether a relay has offered invites on this page since the widget mounted; see updateForm. */
+  let everOffered = false;
+
   function updateForm(state: DockState): void {
-    const offered = state.invitesOffered !== null && state.policy.invites !== 'off';
+    if (state.invitesOffered !== null) everOffered = true;
+    // A relay offers invites in a frame of each link (ADR 0017's notes), so
+    // between links nothing is offered. A relay that did offer them keeps the
+    // block while its link is down, so the operator reads why Create waits
+    // instead of seeing it vanish; one that linked and offers none hides it.
+    const offered =
+      state.policy.invites !== 'off' &&
+      (state.invitesOffered !== null || (everOffered && state.link !== 'linked'));
     invitesBlock.hidden = !offered;
     // Can control only where the page opted into it (ADR 0016).
     controlChoice.label.hidden = state.policy.invites !== 'all';
@@ -1083,7 +1199,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
 
   /** The link, once: as a QR drawing and as text to send, until Done or until its invite ends. */
   function showLink(inviteId: string, link: string, label: string): void {
-    shownLink = inviteId;
+    shownLink = { inviteId, link };
     linkHeading.textContent = `Send this link to ${label}. It shows only now, and anyone who holds it can join as the invite says.`;
     linkText.textContent = link;
     linkQrBox.hidden = !linkQr.show(link);
@@ -1102,21 +1218,15 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   }
 
   function copyShownLink(): void {
-    const link = linkText.textContent;
-    const navigator = doc.defaultView?.navigator;
-    const clipboard: unknown = navigator ? Reflect.get(navigator, 'clipboard') : undefined;
-    const write =
-      typeof clipboard === 'object' && clipboard !== null
-        ? (clipboard as { writeText?: unknown }).writeText
-        : undefined;
     const fallback = (): void => {
       copyLink.textContent = 'Select the link to copy it';
     };
-    if (link === '' || typeof write !== 'function') {
+    if (shownLink === null || writeClipboard === null) {
       fallback();
       return;
     }
-    (write as (text: string) => Promise<void>).call(clipboard, link).then(() => {
+    // Only through the writeText taken at mount; see clipboardWriter.
+    writeClipboard(shownLink.link).then(() => {
       copyLink.textContent = 'Copied';
     }, fallback);
   }
@@ -1169,14 +1279,8 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     }
     for (const view of rowViews.values()) view.expiry.textContent = expiryText(view.expiresAt);
     for (const row of inviteRows.values()) setText(row.detail, inviteDetail(row.view));
-    const now = Date.now();
-    for (let i = joinLines.length - 1; i >= 0; i -= 1) {
-      const line = joinLines[i];
-      if (line && line.until <= now) {
-        line.element.remove();
-        joinLines.splice(i, 1);
-      }
-    }
+    ageJoinLines();
+    updateAttention();
     const current = dock.state.pairing;
     if (current) {
       const left = secondsLeft(current.expiresAt);
@@ -1208,7 +1312,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
 
     syncInvites(state);
     syncRows(state);
-    noticeJoins(state);
+    const joined = noticeJoins(state);
     updateForm(state);
     renderActivity(state.activity);
     updatePause(state.paused);
@@ -1225,10 +1329,9 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       (c) => c.callId,
       confirmView,
     );
-    const waiting = requestViews.size + confirmViews.size > 0;
-    badgeButton.classList.toggle('attention', waiting);
-    // A new prompt opens the panel: the operator has a deadline to meet.
-    if (newRequest || newConfirm) setOpen(true);
+    // A new prompt opens the panel, as the operator has a deadline to meet, and
+    // so does a join notice, as nobody was asked about that join.
+    if (newRequest || newConfirm || joined) setOpen(true);
     // The code is how anyone attaches, so show it without a click while nobody has.
     // Only once on the way in, so the badge can still close the panel: a link that
     // drops and resumes with nobody attached leaves the panel as the operator left it.
@@ -1252,6 +1355,8 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     for (const box of boxes) restartArming(box);
   }
   const onVisibility = (): void => {
+    ageJoinLines();
+    updateAttention();
     if (doc.visibilityState === 'visible') rearmAll();
   };
   const win = doc.defaultView;

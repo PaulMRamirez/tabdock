@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto';
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
 import { encodeQr } from '@tabdock/adapter/qr';
 import { startDemoServer, type DemoServer } from '@tabdock/demo/server';
 import {
   ATTACH_REQUEST_TTL_MS,
   type AttachmentView,
   encodeFrame,
+  type InviteRefusalReason,
   MAX_DESCRIPTION_CHARS,
   MAX_FRAME_BYTES,
   MAX_INVITE_LIFETIME_MS,
@@ -88,9 +89,15 @@ interface InviteRelay {
   readonly connections: number;
   /** What the relay lists, by invite id. */
   readonly listings: Map<string, Listing>;
+  /** When set, the relay refuses every invite_create with this reason instead of listing it. */
+  refuse: InviteRefusalReason | null;
+  /** While true, the relay closes every new link at once, so the page stays unlinked. */
+  hold: boolean;
   send(frame: RelayFrame): void;
   /** The invites frame for what is listed now. */
   list(): void;
+  /** Closes the current link from the relay's side; the page reconnects. */
+  drop(): void;
 }
 
 function member(userId: string, displayName: string, role: Role = 'driver'): AttachmentView {
@@ -126,13 +133,21 @@ function guest(userId: string, displayName: string, role: Role, inviteId: string
  */
 async function openWithInviteRelay(
   page: Page,
-  options: { query?: string; roster?: AttachmentView[]; linkBase?: string | null } = {},
+  options: {
+    query?: string;
+    roster?: AttachmentView[];
+    linkBase?: string | null;
+    /** false for a page whose policy offers no invites, so the block never shows. */
+    expectInvites?: boolean;
+  } = {},
 ): Promise<InviteRelay> {
   const frames: PageFrame[] = [];
   const listings = new Map<string, Listing>();
   const linkBase = options.linkBase === undefined ? LINK_BASE : options.linkBase;
   let connections = 0;
   let send: ((frame: RelayFrame) => void) | null = null;
+  let current: WebSocketRoute | null = null;
+  const control = { refuse: null as InviteRefusalReason | null, hold: false };
   const list = (): void => {
     send?.({ t: 'invites', linkBase, invites: [...listings.values()] });
   };
@@ -140,6 +155,11 @@ async function openWithInviteRelay(
   await page.clock.install();
   await page.routeWebSocket(FAKE_RELAY, (ws) => {
     connections += 1;
+    if (control.hold) {
+      void ws.close();
+      return;
+    }
+    current = ws;
     send = (frame) => {
       ws.send(encodeFrame(frame));
     };
@@ -168,6 +188,13 @@ async function openWithInviteRelay(
           },
         });
         list();
+      } else if (frame.t === 'invite_create' && control.refuse !== null) {
+        send?.({
+          t: 'invites',
+          linkBase,
+          invites: [...listings.values()],
+          refused: { inviteId: frame.inviteId, reason: control.refuse },
+        });
       } else if (frame.t === 'invite_create') {
         listings.set(frame.inviteId, {
           inviteId: frame.inviteId,
@@ -196,18 +223,37 @@ async function openWithInviteRelay(
   await waitForDock(page, (state) => state.link === 'linked' && state.invitesOffered !== null);
   // The panel opens by itself only while nobody is attached.
   if (!(await widgetVisible(page, 'pause-box'))) await clickInWidget(page, { action: 'toggle' });
-  await expect.poll(() => widgetVisible(page, 'invites')).toBe(true);
+  if (options.expectInvites !== false) {
+    await expect.poll(() => widgetVisible(page, 'invites')).toBe(true);
+  }
   return {
     frames,
     listings,
     get connections() {
       return connections;
     },
+    get refuse() {
+      return control.refuse;
+    },
+    set refuse(reason) {
+      control.refuse = reason;
+    },
+    get hold() {
+      return control.hold;
+    },
+    set hold(value) {
+      control.hold = value;
+    },
     send(frame) {
       if (!send) throw new Error('the page has not connected');
       send(frame);
     },
     list,
+    drop() {
+      send = null;
+      void current?.close();
+      current = null;
+    },
   };
 }
 
@@ -362,7 +408,7 @@ function findByAttribute(node: DomNode, name: string, value: string): DomNode | 
 async function widgetProperty(
   page: Page,
   path: readonly (readonly [string, string])[],
-  property: 'textContent' | 'checked' | 'disabled',
+  property: 'textContent' | 'checked' | 'disabled' | 'className',
 ): Promise<unknown> {
   const cdp = await page.context().newCDPSession(page);
   try {
@@ -670,4 +716,513 @@ test('the board does not link to a relay inside a frame, so a framing site canno
   await expect(frame.locator('html')).toHaveAttribute('data-link', 'refused');
   expect(await frame.locator('tabdock-dock').count()).toBe(0);
   expect(connections).toBe(0);
+});
+
+// What a reviewer found the specs above left open: the join notice's source
+// and visibility, the boundary against scripts that run after attach(), and
+// the form, list, prompt and activity rules ADRs 0016 and 0017 set.
+
+/** The badge's classes, which carry 'attention' while something waits for the operator. */
+async function badgeClass(page: Page): Promise<string> {
+  return String(await widgetProperty(page, [['data-action', 'toggle']], 'className'));
+}
+
+/** Headless tabs never hide, so a test stands in for the browser's visibility state, as widget.spec.ts does. */
+async function hideTab(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    let visibility: DocumentVisibilityState = 'hidden';
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      get: () => visibility,
+    });
+    Object.defineProperty(document, 'hidden', {
+      configurable: true,
+      get: () => visibility === 'hidden',
+    });
+    (window as unknown as { showTab: () => void }).showTab = () => {
+      visibility = 'visible';
+      document.dispatchEvent(new Event('visibilitychange'));
+    };
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+}
+
+async function showTab(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    (window as unknown as { showTab: () => void }).showTab();
+  });
+}
+
+function invokeFrame(
+  callId: string,
+  tool: string,
+  caller: { userId: string; displayName: string; role: Role },
+): RelayFrame {
+  return {
+    t: 'invoke',
+    callId,
+    tool,
+    arguments: {},
+    caller: { ...caller, client: { name: 'claude-ai', version: '1.0' } },
+    deadlineMs: 45_000,
+  };
+}
+
+/** Lets a Can watch guest in by `minted` and has the relay list them beside Alice. */
+async function watchGuestJoins(
+  page: Page,
+  relay: InviteRelay,
+  minted: { inviteId: string; secret: string },
+): Promise<void> {
+  const before = framesOf(relay, 'attach_decision').length;
+  relay.send(redemption('watch', minted, 'Friends'));
+  await expect
+    .poll(() => framesOf(relay, 'attach_decision').slice(before))
+    .toEqual([{ t: 'attach_decision', requestId: 'watch', allow: true, role: 'observer' }]);
+  relay.send({
+    t: 'roster',
+    attachments: [
+      member('alice', 'Alice'),
+      guest(GUEST, 'guest@example.com', 'observer', minted.inviteId),
+    ],
+  });
+  await waitForDock(page, (state) => state.roster.length === 2);
+}
+
+test('a Can watch join opens a closed panel, and its notice stays until it has been on screen for 20 s', async ({
+  page,
+}) => {
+  const relay = await openWithInviteRelay(page);
+  const minted = await mintByHandle(page, { label: 'Friends', role: 'observer', uses: 3 });
+  await clickInWidget(page, { action: 'toggle' });
+  expect(await widgetVisible(page, 'pause-box')).toBe(false);
+  await pauseClock(page);
+
+  await watchGuestJoins(page, relay, minted);
+  // Nobody was asked about this join, so the panel opens to tell of it.
+  await expect.poll(() => widgetVisible(page, 'pause-box')).toBe(true);
+  const notice = 'guest@example.com (1a2b3c4d) joined by your invite "Friends" as observer';
+  expect(await widgetText(page, 'joins')).toBe(notice);
+
+  // Closed again at once: time off screen does not count.
+  await clickInWidget(page, { action: 'toggle' });
+  expect(await widgetVisible(page, 'pause-box')).toBe(false);
+  await page.clock.runFor(25_000);
+  expect(await widgetText(page, 'joins')).toBe(notice);
+  // Open again: 20 s on screen and it goes.
+  await clickInWidget(page, { action: 'toggle' });
+  await page.clock.runFor(18_000);
+  expect(await widgetText(page, 'joins')).toBe(notice);
+  await page.clock.runFor(3_000);
+  expect(await widgetText(page, 'joins')).toBe('');
+});
+
+test('a Can watch join while the tab is hidden keeps the badge asking for attention, and its notice, until the tab is seen', async ({
+  page,
+}) => {
+  const relay = await openWithInviteRelay(page);
+  const minted = await mintByHandle(page, { label: 'Friends', role: 'observer', uses: 3 });
+  await clickInWidget(page, { action: 'toggle' });
+  await pauseClock(page);
+  await hideTab(page);
+
+  await watchGuestJoins(page, relay, minted);
+  await expect.poll(() => badgeClass(page)).toContain('attention');
+  await page.clock.runFor(30_000);
+  expect(await badgeClass(page)).toContain('attention');
+  expect(await widgetText(page, 'joins')).toContain('joined by your invite "Friends"');
+
+  await showTab(page);
+  await expect.poll(() => badgeClass(page)).not.toContain('attention');
+  expect(await widgetText(page, 'joins')).toContain('joined by your invite "Friends"');
+  await page.clock.runFor(21_000);
+  expect(await widgetText(page, 'joins')).toBe('');
+});
+
+test('no notice for someone a lying relay lists by invite, though the page never honoured a redemption', async ({
+  page,
+}) => {
+  const relay = await openWithInviteRelay(page);
+  const minted = await mintByHandle(page, { label: 'Friends', role: 'observer', uses: 3 });
+  await clickInWidget(page, { action: 'toggle' });
+  // A forged redemption first, refused, and then the relay lists the guest as a driver anyway.
+  relay.send(
+    redemption('forged', { inviteId: minted.inviteId, secret: 'A'.repeat(22) }, 'Friends'),
+  );
+  await expect
+    .poll(() => framesOf(relay, 'attach_decision'))
+    .toEqual([{ t: 'attach_decision', requestId: 'forged', allow: false }]);
+  relay.send({
+    t: 'roster',
+    attachments: [
+      member('alice', 'Alice'),
+      guest(GUEST, 'guest@example.com', 'driver', minted.inviteId),
+    ],
+  });
+  await waitForDock(page, (state) => state.roster.length === 2);
+  await page.clock.runFor(1_000);
+  expect(await widgetText(page, 'joins')).toBe('');
+  expect(await widgetVisible(page, 'pause-box')).toBe(false);
+  expect(await badgeClass(page)).not.toContain('attention');
+  // The page runs nothing for them, and holds no join of theirs.
+  const state = await dockState(page);
+  expect(state?.pageRoles[1]).toMatchObject({ userId: GUEST, role: null });
+  expect(state?.joins).toEqual([]);
+});
+
+test('the join notice names the role the page runs a guest under, not the one a lying relay lists', async ({
+  page,
+}) => {
+  const relay = await openWithInviteRelay(page);
+  const minted = await mintByHandle(page, { label: 'Friends', role: 'observer', uses: 3 });
+  relay.send(redemption('watch', minted, 'Friends'));
+  await expect
+    .poll(() => framesOf(relay, 'attach_decision'))
+    .toEqual([{ t: 'attach_decision', requestId: 'watch', allow: true, role: 'observer' }]);
+  // Honoured as observer; the relay lists them as a driver.
+  relay.send({
+    t: 'roster',
+    attachments: [
+      member('alice', 'Alice'),
+      guest(GUEST, 'guest@example.com', 'driver', minted.inviteId),
+    ],
+  });
+  await waitForDock(page, (state) => state.roster.length === 2);
+  await expect
+    .poll(() => widgetText(page, 'joins'))
+    .toBe('guest@example.com (1a2b3c4d) joined by your invite "Friends" as observer');
+});
+
+test('a script that runs after attach() and patches WebCrypto, TextEncoder, Uint8Array, the clipboard and WebSocket neither predicts nor sees an invite link', async ({
+  page,
+}) => {
+  const relay = await openWithInviteRelay(page);
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+  // The board called attach() as it loaded; everything below runs later.
+  await page.evaluate(() => {
+    const seen: { kind: string; value: string }[] = [];
+    const made: Uint8Array[] = [];
+    Object.defineProperty(window, '__seen', { value: seen });
+    Object.defineProperty(window, '__made', { value: made });
+    const patch = (target: object, name: string, value: unknown): void => {
+      Object.defineProperty(target, name, { value, configurable: true, writable: true });
+    };
+    /** The original, to call through as the page's own code still would. */
+    const original = (target: object, name: string) =>
+      Reflect.get(target, name) as (...args: unknown[]) => unknown;
+    // Predictable randomness: every byte zero.
+    patch(Crypto.prototype, 'getRandomValues', (array: Uint8Array) => {
+      seen.push({ kind: 'random', value: '' });
+      return array.fill(0);
+    });
+    const digest = original(SubtleCrypto.prototype, 'digest');
+    patch(
+      SubtleCrypto.prototype,
+      'digest',
+      function (this: SubtleCrypto, algorithm: AlgorithmIdentifier, data: BufferSource) {
+        seen.push({ kind: 'digest', value: new TextDecoder().decode(data) });
+        return Reflect.apply(digest, this, [algorithm, data]);
+      },
+    );
+    const encode = original(TextEncoder.prototype, 'encode');
+    patch(TextEncoder.prototype, 'encode', function (this: TextEncoder, input?: string) {
+      seen.push({ kind: 'encode', value: String(input) });
+      return Reflect.apply(encode, this, [input]);
+    });
+    const writeText = original(Clipboard.prototype, 'writeText');
+    patch(Clipboard.prototype, 'writeText', function (this: Clipboard, data: string) {
+      seen.push({ kind: 'clipboard', value: data });
+      return Reflect.apply(writeText, this, [data]);
+    });
+    // Every byte array made from here on is kept, to be read once the secret is drawn.
+    const RealBytes = Uint8Array;
+    function Bytes(...args: unknown[]): Uint8Array {
+      const bytes = Reflect.construct(RealBytes, args) as Uint8Array;
+      made.push(bytes);
+      return bytes;
+    }
+    Object.setPrototypeOf(Bytes, RealBytes);
+    Bytes.prototype = RealBytes.prototype;
+    patch(window, 'Uint8Array', Bytes);
+    const RealSocket = WebSocket;
+    patch(window, 'WebSocket', function (url: string, protocols?: string | string[]) {
+      seen.push({ kind: 'socket', value: url });
+      return new RealSocket(url, protocols);
+    });
+  });
+
+  await clickInWidget(page, { action: 'invite-open' });
+  await typeInWidget(page, 'invite-label', 'Friends');
+  await clickInWidget(page, { action: 'invite-create' });
+  await expect.poll(() => widgetVisible(page, 'invite-link')).toBe(true);
+  const link = (await widgetText(page, 'invite-link-text')) ?? '';
+  const secret = SECRET_LINK.exec(link)?.[1] ?? '';
+  const [create] = framesOf(relay, 'invite_create');
+  // Not the patched zeros, and the relay holds the hash of the very secret the link carries.
+  expect(secret).toHaveLength(22);
+  expect(secret).not.toBe('A'.repeat(22));
+  expect(create?.inviteId).not.toBe(`inv_${'A'.repeat(12)}`);
+  expect(create?.secretHash).toBe(sha256Hex(secret));
+
+  await clickInWidget(page, { action: 'invite-copy' });
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(link);
+  const seenNow = () =>
+    page.evaluate(
+      () => (window as unknown as { __seen: { kind: string; value: string }[] }).__seen,
+    );
+  // Read before the reconnect below, as Playwright's own WebSocket stand-in draws random ids.
+  const minting = await seenNow();
+  expect(minting.filter((entry) => ['random', 'clipboard'].includes(entry.kind))).toEqual([]);
+
+  // A dropped link reconnects through the WebSocket taken at attach().
+  relay.drop();
+  await expect.poll(() => relay.connections).toBe(2);
+  await waitForDock(page, (state) => state.link === 'linked');
+
+  const seen = await seenNow();
+  expect(seen.filter((entry) => entry.kind === 'socket')).toEqual([]);
+  expect(seen.filter((entry) => entry.value.includes(secret))).toEqual([]);
+  // No byte array made after the patch ever held the secret's 16 bytes.
+  const bytes = Array.from(Buffer.from(secret, 'base64url')).join(',');
+  const made = await page.evaluate(() =>
+    (window as unknown as { __made: Uint8Array[] }).__made.map((array) =>
+      Array.from(array).join(','),
+    ),
+  );
+  expect(made.filter((array) => array.includes(bytes))).toEqual([]);
+});
+
+test('Create offers 1 hour unless the operator picks another lifetime, and "while the page is open" sends no expiry', async ({
+  page,
+}) => {
+  const relay = await openWithInviteRelay(page);
+  await clickInWidget(page, { action: 'invite-open' });
+  await typeInWidget(page, 'invite-label', 'Friends');
+  const before = await page.evaluate(() => Date.now());
+  await clickInWidget(page, { action: 'invite-create' });
+  await expect.poll(() => framesOf(relay, 'invite_create')).toHaveLength(1);
+  const [hour] = framesOf(relay, 'invite_create');
+  expect(hour?.expiresAt).toBeGreaterThanOrEqual(before + 60 * 60_000);
+  expect(hour?.expiresAt).toBeLessThan(before + 61 * 60_000);
+  await clickInWidget(page, { action: 'invite-done' });
+
+  await clickInWidget(page, { action: 'invite-open' });
+  await typeInWidget(page, 'invite-label', 'Family');
+  await clickInWidget(page, { action: 'invite-lifetime-open' });
+  await clickInWidget(page, { action: 'invite-create' });
+  await expect.poll(() => framesOf(relay, 'invite_create')).toHaveLength(2);
+  expect(framesOf(relay, 'invite_create')[1]).toMatchObject({ label: 'Family', expiresAt: null });
+  await expect
+    .poll(async () => (await widgetItems(page, 'invite-list'))[1]?.text)
+    .toContain('open while this page is, 24 h at most');
+});
+
+test("a guest's calls carry the short id and the invited badge, in the activity log and on a confirm prompt", async ({
+  page,
+}) => {
+  const relay = await openWithInviteRelay(page, { query: 'invites=all' });
+  const minted = await mintByHandle(page, { label: 'Help', role: 'driver' });
+  relay.send(redemption('control', minted, 'Help'));
+  await waitForDock(page, (state) => state.pendingRequests.length === 1);
+  await clickInWidget(page, { action: 'approve-driver', requestId: 'control' });
+  await expect
+    .poll(() => framesOf(relay, 'attach_decision'))
+    .toEqual([{ t: 'attach_decision', requestId: 'control', allow: true, role: 'driver' }]);
+  relay.send({
+    t: 'roster',
+    attachments: [
+      member('alice', 'Alice'),
+      guest(GUEST, 'guest@example.com', 'driver', minted.inviteId),
+    ],
+  });
+  await waitForDock(page, (state) => state.pageRoles[1]?.role === 'driver');
+  const caller = { userId: GUEST, displayName: 'guest@example.com', role: 'driver' as const };
+  relay.send(invokeFrame('alice-read', 'get_view', { ...ALICE, role: 'driver' }));
+  relay.send(invokeFrame('guest-read', 'get_view', caller));
+  await expect.poll(() => framesOf(relay, 'result')).toHaveLength(2);
+  const lines = await widgetItems(page, 'activity');
+  const guestLine = lines.find((line) => line.data.activityId === 'guest-read')?.text ?? '';
+  expect(guestLine).toContain('guest@example.com (1a2b3c4d)');
+  expect(guestLine).toContain('invited');
+  expect(lines.find((line) => line.data.activityId === 'alice-read')?.text).not.toContain(
+    'invited',
+  );
+
+  relay.send(invokeFrame('guest-wipe', 'clear_board', caller));
+  await waitForDock(page, (state) => state.pendingConfirms.length === 1);
+  const prompt = String(
+    await widgetProperty(page, [['data-call-id', 'guest-wipe']], 'textContent'),
+  );
+  expect(prompt).toContain('guest@example.com (1a2b3c4d) wants to run clear_board');
+  expect(prompt).toContain('invited');
+  await clickInWidget(page, { action: 'confirm-deny', callId: 'guest-wipe' });
+  await expect
+    .poll(
+      () => framesOf(relay, 'result').find((frame) => frame.callId === 'guest-wipe')?.error?.code,
+    )
+    .toBe('denied_by_operator');
+});
+
+test('a Can control prompt says the guest joins as observer while the driver seats are full', async ({
+  page,
+}) => {
+  const relay = await openWithInviteRelay(page, { query: 'invites=all' });
+  const seatsFull = 'The driver seats are full, so they join as observer for now.';
+  const minted = await mintByHandle(page, { label: 'Help', role: 'driver' });
+  // One driver of the board's two seats: no note.
+  relay.send(redemption('one-seat-free', minted, 'Help'));
+  await waitForDock(page, (state) => state.pendingRequests.length === 1);
+  expect(
+    String(await widgetProperty(page, [['data-request-id', 'one-seat-free']], 'textContent')),
+  ).not.toContain(seatsFull);
+  await clickInWidget(page, { action: 'deny', requestId: 'one-seat-free' });
+  await waitForDock(page, (state) => state.pendingRequests.length === 0);
+
+  relay.send({
+    t: 'roster',
+    attachments: [member('alice', 'Alice'), member('bob', 'Bob')],
+  });
+  await waitForDock(page, (state) => state.roster.length === 2);
+  relay.send(redemption('seats-full', minted, 'Help'));
+  await waitForDock(page, (state) => state.pendingRequests.length === 1);
+  expect(
+    String(await widgetProperty(page, [['data-request-id', 'seats-full']], 'textContent')),
+  ).toContain(seatsFull);
+});
+
+test('a prompt names an unverified account "unverified account", whatever name the relay gives it', async ({
+  page,
+}) => {
+  const relay = await openWithInviteRelay(page, { query: 'invites=all' });
+  const minted = await mintByHandle(page, { label: 'Help', role: 'driver' });
+  relay.send(
+    redemption(
+      'unverified',
+      minted,
+      'Help',
+      { userId: GUEST, displayName: 'alice@example.com' },
+      false,
+    ),
+  );
+  await waitForDock(page, (state) => state.pendingRequests.length === 1);
+  const text = String(
+    await widgetProperty(page, [['data-request-id', 'unverified']], 'textContent'),
+  );
+  expect(text).toContain('unverified account (1a2b3c4d) wants to join by your invite "Help"');
+  expect(text).not.toContain('alice@example.com');
+});
+
+test('?invites=off offers no Invite form, though the relay offers invites', async ({ page }) => {
+  await openWithInviteRelay(page, { query: 'invites=off', expectInvites: false });
+  expect((await dockState(page))?.policy.invites).toBe('off');
+  expect(await widgetVisible(page, 'pause-box')).toBe(true);
+  expect(await widgetVisible(page, 'invites')).toBe(false);
+  expect(
+    await page.evaluate(() => window.__tabdockDock?.invite({ label: 'Friends', role: 'observer' })),
+  ).toEqual({ ok: false, reason: 'policy' });
+});
+
+test('Create says the link is down while it is, and works again once the page has linked', async ({
+  page,
+}) => {
+  const relay = await openWithInviteRelay(page);
+  await clickInWidget(page, { action: 'invite-open' });
+  await typeInWidget(page, 'invite-label', 'Friends');
+  expect(await widgetProperty(page, [['data-action', 'invite-create']], 'disabled')).toBe(false);
+  relay.hold = true;
+  relay.drop();
+  await waitForDock(page, (state) => state.link !== 'linked');
+  await expect
+    .poll(() => widgetText(page, 'invite-reason'))
+    .toBe('The link to the relay is down. Try again once it is back.');
+  expect(await widgetProperty(page, [['data-action', 'invite-create']], 'disabled')).toBe(true);
+  relay.hold = false;
+  await waitForDock(
+    page,
+    (state) => state.link === 'linked' && state.invitesOffered !== null,
+    30_000,
+  );
+  await expect.poll(() => widgetText(page, 'invite-reason')).toBe('');
+  expect(await widgetProperty(page, [['data-action', 'invite-create']], 'disabled')).toBe(false);
+});
+
+test('Create says why it waits while the page holds ten live invites', async ({ page }) => {
+  await openWithInviteRelay(page);
+  for (let n = 0; n < 10; n += 1) {
+    await mintByHandle(page, { label: `Guest ${n}`, role: 'observer' });
+  }
+  await clickInWidget(page, { action: 'invite-open' });
+  await typeInWidget(page, 'invite-label', 'One more');
+  await expect
+    .poll(() => widgetText(page, 'invite-reason'))
+    .toBe('This page already has 10 live invites. Cancel one first.');
+  expect(await widgetProperty(page, [['data-action', 'invite-create']], 'disabled')).toBe(true);
+});
+
+test("a mint the relay refuses shows the relay's reason and no link", async ({ page }) => {
+  const relay = await openWithInviteRelay(page);
+  relay.refuse = 'no_sponsor';
+  await clickInWidget(page, { action: 'invite-open' });
+  await typeInWidget(page, 'invite-label', 'Friends');
+  await clickInWidget(page, { action: 'invite-create' });
+  await expect
+    .poll(() => widgetText(page, 'invite-error'))
+    .toBe('The relay found no member attached to sponsor it. Pair one first.');
+  expect(await widgetVisible(page, 'invite-error')).toBe(true);
+  expect(await widgetVisible(page, 'invite-link')).toBe(false);
+});
+
+test('the live list shows how long a link lasts, that someone is waiting, and the refusals a Can control link has had', async ({
+  page,
+}) => {
+  const relay = await openWithInviteRelay(page, { query: 'invites=all' });
+  const minted = await mintByHandle(page, { label: 'Help', role: 'driver' });
+  const listing = relay.listings.get(minted.inviteId);
+  if (!listing) throw new Error('the relay does not list the invite');
+  relay.listings.set(minted.inviteId, { ...listing, pending: true, refusals: 1 });
+  relay.list();
+  await expect
+    .poll(async () => (await widgetItems(page, 'invite-list'))[0]?.text)
+    .toContain('someone is waiting');
+  const text = (await widgetItems(page, 'invite-list'))[0]?.text ?? '';
+  expect(text).toContain('"Help", Can control');
+  expect(text).toMatch(/expires in (1 h 0|59) min/);
+  expect(text).toContain('1 of 3 refusals');
+});
+
+test('Revoke all shows while invites are live though nobody is attached, and closes them', async ({
+  page,
+}) => {
+  const relay = await openWithInviteRelay(page, { roster: [] });
+  expect(await widgetButtonNow(page, { action: 'revoke-all' })).toBeNull();
+  await mintByHandle(page, { label: 'Friends', role: 'observer' });
+  await expect.poll(() => widgetItems(page, 'invite-list')).toHaveLength(1);
+  await clickInWidget(page, { action: 'revoke-all' });
+  await expect.poll(() => framesOf(relay, 'revoke')).toEqual([{ t: 'revoke', userId: '*' }]);
+  await expect.poll(() => widgetItems(page, 'invite-list')).toEqual([]);
+});
+
+test('an https copy of the board refuses a ws: relay off this machine, as relayFromQuery asks', async ({
+  page,
+}) => {
+  let dialled = 0;
+  await page.routeWebSocket(/.*/, () => {
+    dialled += 1;
+  });
+  // The demo server's own bytes, served as if from an https host.
+  const httpsCopy = 'https://board.example';
+  await page.route(`${httpsCopy}/**`, async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    const response = await route.fetch({ url: new URL(path, demo.url).href });
+    await route.fulfill({ response });
+  });
+  const url = new URL(`${httpsCopy}/`);
+  url.searchParams.set('relay', 'ws://relay.example/page');
+  await page.goto(url.href);
+  await page.waitForSelector('html[data-tools="ready"]');
+  await expect(page.locator('[data-role="status"]')).toHaveText(
+    /not linked: \?relay must be a wss: URL on an https page/,
+  );
+  expect(await page.locator('tabdock-dock').count()).toBe(0);
+  expect(dialled).toBe(0);
 });
