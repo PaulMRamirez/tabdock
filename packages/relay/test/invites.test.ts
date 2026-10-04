@@ -17,6 +17,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { OPERATOR_GRANTS_PER_PAGE } from '../src/hub.ts';
 import { DEFAULT_RATE_LIMITS, emailBarDigest } from '../src/index.ts';
 import {
+  type AttachRequestFrame,
   attachMember,
   call,
   type InviteRelay,
@@ -542,6 +543,71 @@ describe('S14: the relay grants nothing without the page, and no more than the i
     expect(again.text).toContain('You were already attached.');
     expect(relay.store.invites.get(page.pageId, unspent.inviteId)?.usesLeft).toBe(1);
   });
+
+  it.each(['pair_page', '/i'] as const)(
+    'and treats a member past their own end, before its timer fires, as not attached when they redeem through %s',
+    async (route) => {
+      // Bob's code-made attachment passes its idle end with its timer not yet
+      // run, while Alice, who sponsors the invite, calls halfway through and
+      // stays in time. An attachment past its time is over, so the redemption
+      // ends Bob's as his timer would before it looks for one: the page hears
+      // the redemption and Bob gets an invite-made attachment, rather than an
+      // answer that he was attached already and not_attached on his next call.
+      const idleMs = 30 * 60_000;
+      const { relay, page, alice } = await sharedPage({ timings: { attachmentIdleMs: idleMs } });
+      vi.useFakeTimers({ toFake: ['Date'] });
+      const start = Date.now();
+      const bob = await relay.claude('sub-bob');
+      await attachMember(bob, page, 'observer');
+      const minted = await mintOk(page, { uses: route === 'pair_page' ? 1 : 3 });
+      expect(
+        minted.answer.invites.find((invite) => invite.inviteId === minted.inviteId)?.sponsor.userId,
+      ).toBe('alice');
+      vi.setSystemTime(start + idleMs / 2);
+      expect((await call(alice, 'call_page_tool', getView(page.pageId))).isError).toBe(false);
+      vi.setSystemTime(start + idleMs + 60_000);
+      await page.sync();
+      const asked = page.all('attach_request').length;
+      let request: AttachRequestFrame;
+      if (route === 'pair_page') {
+        const redeemed = await redeem(bob, page, minted.link);
+        request = redeemed.request;
+        expect(redeemed.outcome.isError, redeemed.outcome.text).toBe(false);
+        expect(redeemed.outcome.text).not.toContain('You were already attached.');
+        expect(redeemed.outcome.text).toContain('Shared by Alice.');
+      } else {
+        // Signed in after the step, since a /pair session lasts 15 minutes.
+        const phone = await signedInAtI(relay, 'sub-bob', null);
+        const joined = await joinAtI(phone, page, minted.secret);
+        request = joined.request;
+        expect(joined.settled).toEqual({ status: 'approved', role: 'observer' });
+      }
+      expect(request).toMatchObject({
+        via: 'invite',
+        user: { userId: 'bob' },
+        invite: { inviteId: minted.inviteId },
+      });
+      await page.sync();
+      expect(page.all('attach_request')).toHaveLength(asked + 1);
+      expect(relay.store.attachments.get(page.pageId, 'bob')).toMatchObject({
+        kind: 'member',
+        inviteId: minted.inviteId,
+        sponsorId: 'alice',
+        endsAt: expect.any(Number) as number,
+      });
+      expect((await call(bob, 'call_page_tool', getView(page.pageId))).isError).toBe(false);
+      const events = relay.relay.audit.events();
+      expect(
+        events
+          .filter((event) => event.type === 'expire')
+          .map((event) => [event.userId, event.reason]),
+      ).toEqual([['bob', 'idle']]);
+      expect(events.filter((event) => event.type === 'invite_redeemed')).toEqual([
+        expect.objectContaining({ inviteId: minted.inviteId, userId: 'bob' }),
+      ]);
+    },
+    15_000,
+  );
 });
 
 describe('S14: pair_page accepts only an invite minted for one use', () => {

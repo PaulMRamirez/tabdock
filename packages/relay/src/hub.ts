@@ -2835,11 +2835,13 @@ export class PageHub {
     this.#pageLimiter.record(page.pageId, now);
 
     // Someone attached keeps what they hold only while it, and each member's
-    // above it, is in time. An end here that would close this invite
-    // (sponsor_gone, ADR 0017) is its sponsor's or one above them, which
-    // #findInvite has already ended if due; the put below would bring a closed
-    // invite back with no sponsor and no timer, though, so a closed one still
-    // gets every dead invite's answer.
+    // above it, is in time, so a caller past their own end with the timer not
+    // yet run is ended here as the timer would end them, and the page is asked
+    // rather than the caller told they were attached already. An end here
+    // that would close this invite (sponsor_gone, ADR 0017) is its sponsor's
+    // or one above them, which #findInvite has already ended if due; the put
+    // below would bring a closed invite back with no sponsor and no timer,
+    // though, so a closed one still gets every dead invite's answer.
     this.#chainInTime(page.pageId, caller.userId);
     if (this.#store.invites.get(invite.pageId, invite.inviteId) === undefined) {
       this.#log.info('redemption refused: the invite closed as the caller expired', {
