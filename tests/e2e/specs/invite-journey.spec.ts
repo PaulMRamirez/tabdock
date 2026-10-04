@@ -350,13 +350,12 @@ test('a watch invite and a control invite from the widget, joined at /i and thro
     [bobId, 'get_view', 'not_attached'],
     [carolId, 'add_item', 'not_attached'],
   ]);
-  expect(ofType('revoke').map((record) => [record.userId, record.everyone])).toEqual(
-    expect.arrayContaining([
-      ['alice', true],
-      [bobId, true],
-      [carolId, true],
-    ]),
-  );
+  // Revoke all: one line per attachment it ended, in the order they were made.
+  expect(ofType('revoke').map((record) => [record.userId, record.everyone])).toEqual([
+    ['alice', true],
+    [bobId, true],
+    [carolId, true],
+  ]);
   expect(ofType('invite_closed').map((record) => [record.inviteId, record.reason])).toEqual([
     [control.inviteId, 'used_up'],
     [watch.inviteId, 'revoked'],
