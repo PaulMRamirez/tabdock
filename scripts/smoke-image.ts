@@ -1,8 +1,10 @@
 // node scripts/smoke-image.ts <image>: runs the relay's container image the
 // way a host would, against a stand-in identity provider, and checks what CI
 // must prove before an image is published (.github/workflows/image.yml):
-// the image starts in hosted mode with a read-only root file system, no
-// capabilities and only its audit volume writable; /healthz answers 200 for
+// the relay's user (uid 65532) owns nothing under /app and cannot write
+// there even on a writable root file system, as Fly runs it, so it can never
+// swap its own code; the image starts in hosted mode with a read-only root
+// file system, no capabilities and only its audit volume writable; /healthz answers 200 for
 // any Host, as a platform's health check sends; /mcp answers 401 naming its
 // resource_metadata for the public host and 403 for any other; SIGTERM ends it
 // within 5 s with exit code 0; and its audit log, read back by the image's own
@@ -30,6 +32,40 @@ const STOP_WITHIN_MS = 5000;
 const START_WITHIN_MS = 30_000;
 const run = `tabdock-smoke-${String(process.pid)}`;
 const volume = `${run}-audit`;
+
+/**
+ * Run inside the image by its own user, on a root file system left writable
+ * as Fly leaves it (no --read-only): every path from /app down, links not
+ * followed, and those the relay's user owns; then a write into /app and one
+ * into the relay's sources, each of which must fail. Owning /app alone would
+ * let that user move a root-owned tree aside and copy it back as its own,
+ * with any file changed, such as the audit reader the owner runs as root.
+ */
+const APP_PROBE = `
+const fs = require('node:fs');
+const owned = [];
+let paths = 0;
+function walk(path) {
+  const stat = fs.lstatSync(path);
+  paths += 1;
+  if (stat.uid === 65532) owned.push(path);
+  if (stat.isDirectory()) for (const name of fs.readdirSync(path)) walk(path + '/' + name);
+}
+walk('/app');
+const writes = [];
+for (const attempt of [
+  () => fs.writeFileSync('/app/smoke-probe.js', ''),
+  () => fs.writeFileSync('/app/packages/relay/src/smoke-probe.ts', ''),
+]) {
+  try {
+    attempt();
+    writes.push('written');
+  } catch (error) {
+    writes.push(error.code);
+  }
+}
+process.stdout.write(JSON.stringify({ uid: process.getuid(), paths, owned, writes }) + '\\n');
+`;
 
 function docker(
   args: string[],
@@ -101,6 +137,35 @@ const scratch = mkdtempSync(join(tmpdir(), 'tabdock-smoke-'));
 const provider = await startProvider();
 let failed = false;
 try {
+  // The image's own user, no --read-only and no volume: what the relay could change on Fly's root.
+  const probe = docker([
+    'run',
+    '--rm',
+    '--network',
+    'none',
+    '--entrypoint',
+    '/nodejs/bin/node',
+    image,
+    '-e',
+    APP_PROBE,
+  ]);
+  const app = JSON.parse(probe.out.trim().split('\n').at(-1) ?? '{}') as {
+    uid?: number;
+    paths?: number;
+    owned: string[];
+    writes: string[];
+  };
+  check(
+    app.uid === 65532 && app.owned.length === 0,
+    `uid 65532 owns none of the ${String(app.paths ?? 0)} paths under /app, /app included${
+      app.owned.length === 0 ? '' : ` (it owns ${app.owned.slice(0, 5).join(', ')})`
+    }`,
+  );
+  check(
+    app.writes.every((code) => code === 'EACCES'),
+    `uid 65532 cannot write into /app or the relay's sources on a writable root (${app.writes.join(', ')})`,
+  );
+
   const port = await freePort();
   // Settings go in through a file, never a command line; the secret is the stand-in provider's.
   const envFile = join(scratch, 'relay.env');

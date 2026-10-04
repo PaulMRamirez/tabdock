@@ -501,6 +501,16 @@ export type ParsedFrame<F> =
   /** Not JSON, not an object, or a known type with a bad shape. */
   | { kind: 'invalid'; reason: string };
 
+/**
+ * JSON.parse as it was when this module loaded, which in the adapter's
+ * bundle is before attach(): a page script that replaced JSON.parse later
+ * would otherwise be handed every relay frame's text, a redemption's invite
+ * secret with it. The schema check that follows still runs on the page's
+ * built-ins (zod's regex checks call RegExp.prototype), so this narrows what
+ * a later script can read rather than closing it (docs/threat-model.md, B5).
+ */
+const parseJson = JSON.parse;
+
 function parseWith<F>(
   schema: z.ZodType<F>,
   known: readonly string[],
@@ -508,7 +518,7 @@ function parseWith<F>(
 ): ParsedFrame<F> {
   let value: unknown;
   try {
-    value = JSON.parse(text);
+    value = parseJson(text);
   } catch {
     return { kind: 'invalid', reason: 'not JSON' };
   }

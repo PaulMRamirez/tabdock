@@ -14,6 +14,7 @@
 
 import { INVITE_PATH } from '@tabdock/protocol';
 import qrcode from 'qrcode-generator';
+import { apply, taken } from './taken.ts';
 
 /** The QR spec's quiet zone: four light modules on every side, which scanners need to find the code. */
 export const QR_QUIET_ZONE = 4;
@@ -178,6 +179,11 @@ export function createQrView(doc: Document, options: QrViewOptions = {}): QrView
   ground.setAttribute('fill', '#fff');
   path.setAttribute('fill', '#000');
   svg.append(ground, path);
+  // Taken now, as the widget mounts, for show() to use later: a page script
+  // that ran after attach() and patched either would be handed these nodes,
+  // and through them the widget's closed shadow root (dom.ts).
+  const setAttribute = taken(svg, 'setAttribute', 'value');
+  const removeAttribute = taken(svg, 'removeAttribute', 'value');
 
   let drawn: string | undefined;
   let showing = false;
@@ -190,11 +196,11 @@ export function createQrView(doc: Document, options: QrViewOptions = {}): QrView
       showing = next !== null;
       if (next === null) {
         // Nothing of an old or refused URL stays in the tree.
-        path.removeAttribute('d');
-        svg.removeAttribute('viewBox');
+        apply(removeAttribute, path, ['d']);
+        apply(removeAttribute, svg, ['viewBox']);
       } else {
-        svg.setAttribute('viewBox', `0 0 ${next.size} ${next.size}`);
-        path.setAttribute('d', next.d);
+        apply(setAttribute, svg, ['viewBox', `0 0 ${next.size} ${next.size}`]);
+        apply(setAttribute, path, ['d', next.d]);
       }
       return showing;
     },
