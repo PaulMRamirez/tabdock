@@ -35,6 +35,7 @@ export const RESUME_KEY = 'tabdock:resume:["ws://relay.test/page","http://127.0.
 export const GRANTS_KEY = 'tabdock:grants:["ws://relay.test/page","http://127.0.0.1:5173/board"]';
 export const REVOKED_KEY = 'tabdock:revoked:["ws://relay.test/page","http://127.0.0.1:5173/board"]';
 export const PAUSED_KEY = 'tabdock:paused:["ws://relay.test/page","http://127.0.0.1:5173/board"]';
+export const INVITES_KEY = 'tabdock:invites:["ws://relay.test/page","http://127.0.0.1:5173/board"]';
 export const PAGE_WINDOW = { label: 'page window' };
 export const FRAME_WINDOW = { label: 'iframe window' };
 export const HANDLER_FAILED =
@@ -147,6 +148,25 @@ export class ManualClock {
     this.now = end;
     await flush();
   }
+}
+
+/** SHA-256 hex of a secret's UTF-8 text, as the relay's digestHex computes it. */
+export async function sha256Hex(text: string): Promise<string> {
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Waits, in real time, until check() holds: the adapter hashes with the
+ * real WebCrypto, whose digest settles on a worker thread, not on the next
+ * tick. Throws after a couple of seconds.
+ */
+export async function until(check: () => boolean, what = 'the expected state'): Promise<void> {
+  for (let tries = 0; tries < 400; tries += 1) {
+    if (check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`gave up waiting for ${what}`);
 }
 
 export class MapStorage implements StorageLike {
@@ -516,4 +536,107 @@ export function attachRequest(clock: ManualClock, requestId = 'req-1'): AttachRe
 /** The result frames a socket carried, in order. */
 export function results(socket: FakeSocket) {
   return socket.framesOf('result');
+}
+
+// Invites (ADR 0017): the relay's side of minting and redeeming.
+
+export const LINK_BASE = 'https://relay.example/i';
+export const SPONSOR = { userId: 'alice', displayName: 'Alice' };
+/** An invitee's id: g_ and the 32 hex characters of its account key. */
+export const GUEST = `g_${'1a2b3c4d'.repeat(4)}`;
+export const OTHER_GUEST = `g_${'5e6f7a8b'.repeat(4)}`;
+
+type InviteCreateFrame = Extract<PageFrame, { t: 'invite_create' }>;
+type InvitesFrame = Extract<RelayFrame, { t: 'invites' }>;
+export type InviteListing = InvitesFrame['invites'][number];
+
+/** How the relay lists an invite the page asked for: its terms back, its uses left and the sponsor. */
+export function listingOf(
+  create: InviteCreateFrame,
+  overrides: Partial<InviteListing> = {},
+): InviteListing {
+  return {
+    inviteId: create.inviteId,
+    role: create.role,
+    label: create.label,
+    uses: create.uses,
+    expiresAt: create.expiresAt,
+    usesLeft: create.uses,
+    sponsor: SPONSOR,
+    pending: false,
+    refusals: 0,
+    ...overrides,
+  };
+}
+
+export function invitesFrame(
+  invites: InviteListing[],
+  overrides: Partial<InvitesFrame> = {},
+): InvitesFrame {
+  return { t: 'invites', linkBase: LINK_BASE, invites, ...overrides };
+}
+
+export interface Minted {
+  readonly inviteId: string;
+  readonly link: string;
+  /** Read from the link, as whoever was sent it would. */
+  readonly secret: string;
+  readonly create: InviteCreateFrame;
+}
+
+/**
+ * Mints an invite through the Dock against a relay that lists every invite
+ * it is asked for. `listed` holds what the relay lists already, and gains
+ * the new one, so earlier invites stay on the list each answer carries.
+ */
+export async function mint(
+  harness: Harness,
+  socket: FakeSocket,
+  options: Parameters<Dock['invite']>[0],
+  listed: InviteListing[] = [],
+): Promise<Minted> {
+  const before = socket.framesOf('invite_create').length;
+  const pending = harness.dock.invite(options);
+  await until(() => socket.framesOf('invite_create').length > before, 'an invite_create frame');
+  const create = socket.framesOf('invite_create')[before];
+  if (!create) throw new Error('the page sent no invite_create');
+  listed.push(listingOf(create));
+  socket.deliver(invitesFrame([...listed]));
+  const result = await pending;
+  if (!result.ok) throw new Error(`the invite was refused: ${result.reason}`);
+  const secret = result.link.slice(result.link.indexOf('#') + 1);
+  return { inviteId: result.inviteId, link: result.link, secret, create };
+}
+
+/** A redemption as the relay forwards it: via invite, with the secret it was shown. */
+export function redemption(
+  clock: ManualClock,
+  minted: { inviteId: string; secret: string; create: { label: string } },
+  overrides: Partial<AttachRequestFrame> = {},
+): AttachRequestFrame {
+  return {
+    ...attachRequest(clock, `redeem-${minted.inviteId}`),
+    user: { userId: GUEST, displayName: 'guest@example.com' },
+    account: { kind: 'invitee', verified: true },
+    via: 'invite',
+    invite: { inviteId: minted.inviteId, secret: minted.secret, label: minted.create.label },
+    ...overrides,
+  };
+}
+
+/** A roster entry for someone an invite let in, as the relay would send it. */
+export function invitedAttachment(
+  userId: string,
+  role: Role,
+  inviteId: string,
+  endsAt: number,
+  displayName = 'guest@example.com',
+) {
+  return {
+    ...attachment(userId, role),
+    displayName,
+    kind: userId.startsWith('g_') ? ('invitee' as const) : ('member' as const),
+    inviteId,
+    endsAt,
+  };
 }

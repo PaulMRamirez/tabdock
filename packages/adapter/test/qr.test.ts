@@ -1,6 +1,13 @@
 import qrcode from 'qrcode-generator';
 import { describe, expect, it } from 'vitest';
-import { createQrView, MAX_QR_URL_LENGTH, pairingQrUrl, QR_SIDE_PX, qrPath } from '../src/qr.ts';
+import {
+  createQrView,
+  inviteQrUrl,
+  MAX_QR_URL_LENGTH,
+  pairingQrUrl,
+  QR_SIDE_PX,
+  qrPath,
+} from '../src/qr.ts';
 
 // Shaped like the relay's: its public URL, /pair#, and a 22-character base64url nonce.
 const SAMPLE_URL = 'https://tabdock-owner.ngrok-free.app/pair#q3Zf0_Wn-8xLr2TmB9cKpA';
@@ -159,6 +166,36 @@ describe('qrPath', () => {
     expect(pairingQrUrl(SAMPLE_URL)).toBe(SAMPLE_URL);
   });
 
+  it('draws an invite link only as <origin>/i#<22 base64url characters>, and never a pairing URL as one', () => {
+    const origin = 'https://relay.example';
+    const secret = 'AbCdEfGhIjKlMnOpQrStU_';
+    const link = `${origin}/i#${secret}`;
+    expect(inviteQrUrl(link)).toBe(link);
+    expect(inviteQrUrl(`https://relay.example:8443/i#${secret}`)).toBe(
+      `https://relay.example:8443/i#${secret}`,
+    );
+    expect(pathModules(qrPath(link, inviteQrUrl)?.d ?? '')).toEqual(libraryModules(link).dark);
+    for (const url of [
+      `http://relay.example/i#${secret}`,
+      `${origin}/i/#${secret}`,
+      `${origin}/I#${secret}`,
+      `${origin}/i?#${secret}`,
+      `${origin}/i?x=1#${secret}`,
+      `${origin}/x/i#${secret}`,
+      `${origin}/i#${secret}A`,
+      `${origin}/i#${secret.slice(1)}`,
+      `${origin}/i#${secret}#${secret}`,
+      `https://user@relay.example/i#${secret}`,
+      'https://evil.example\\@relay.example/i#AbCdEfGhIjKlMnOpQrStU_',
+      `${origin}/pair#${secret}`,
+    ]) {
+      expect(inviteQrUrl(url), url).toBeNull();
+      expect(qrPath(url, inviteQrUrl), url).toBeNull();
+    }
+    // Each drawing takes its own shape only: a pairing view draws no invite link.
+    expect(qrPath(link)).toBeNull();
+  });
+
   it(`draws a URL of up to ${MAX_QR_URL_LENGTH} characters and nothing longer`, () => {
     // Only the host can make the relay's URL long: a public URL is a bare origin.
     const urlWithHost = (extra: number) =>
@@ -248,6 +285,20 @@ describe('createQrView', () => {
     expect(path?.attributes.has('d')).toBe(false);
     // Only the elements made at the start, ever.
     expect(created).toHaveLength(3);
+  });
+
+  it('draws what its check accepts, with its own label: an invite view draws invite links only', () => {
+    const { doc } = fakeDocument();
+    const view = createQrView(doc, { accept: inviteQrUrl, label: 'Invite QR code' });
+    const svg = view.element as unknown as FakeElement;
+    expect(svg.attributes.get('aria-label')).toBe('Invite QR code');
+    const link = 'https://relay.example/i#AbCdEfGhIjKlMnOpQrStU_';
+    expect(view.show(link)).toBe(true);
+    expect(pathModules(svg.children[1]?.attributes.get('d') ?? '')).toEqual(
+      libraryModules(link).dark,
+    );
+    expect(view.show(SAMPLE_URL)).toBe(false);
+    expect(svg.children[1]?.attributes.has('d')).toBe(false);
   });
 
   it('carries its own light ground and size, so it scans with no stylesheet at all', () => {

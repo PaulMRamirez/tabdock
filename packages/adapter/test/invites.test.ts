@@ -1,11 +1,10 @@
-// The adapter's M4 interfaces (ADR 0017) before workstream B builds on them:
-// stored grants as { role, inviteId?, endsAt?, inviteRole? } with the bare
-// role an older adapter stored still read; an attach request's account and
-// invite, never its presented secret; the invites frame, which nothing acts on
-// yet; the live list and Cancel, empty and refusing until a relay offers
-// invites; Revoke's closeInvite option; and dock.invite(), which checks its
-// options and the page's policy and then, with no relay offering invites,
-// answers unavailable.
+// The adapter's M4 interfaces (ADR 0017): stored grants as { role, inviteId?,
+// endsAt?, inviteRole? } with the bare role an older adapter stored still
+// read; an attach request's account and invite, never its presented secret;
+// the invites frame; the live list and Cancel, empty and refusing until a
+// relay offers invites; Revoke's closeInvite option; and dock.invite()'s
+// checks of its options and the page's policy, and its answer when no relay
+// offers invites. invite-records.test.ts covers minting and honouring.
 
 import { describe, expect, it } from 'vitest';
 import { INVITE_LIFETIMES, type InviteOptions } from '../src/core.ts';
@@ -14,15 +13,19 @@ import {
   attachRequest,
   flush,
   GRANTS_KEY,
+  GUEST,
+  invitesFrame,
   invoke,
   link,
+  LINK_BASE,
   MapStorage,
+  mint,
+  redemption,
   results,
   setup,
+  SPONSOR,
+  until,
 } from './harness.ts';
-
-const SECRET = 'AbCdEfGhIjKlMnOpQrStU_';
-const GUEST = `g_${'0'.repeat(32)}`;
 
 const caller = (userId: string, role: 'driver' | 'observer' = 'driver') => ({
   userId,
@@ -55,10 +58,11 @@ describe('stored grants from M4 (ADRs 0011 and 0017)', () => {
 
   it("keeps an invite-made grant's invite, end and cap across a reload and a role change", async () => {
     const storage = new MapStorage();
+    // An invite-made grant ends 24 hours after redemption; this one has 12 to go.
     const invited = {
       role: 'observer',
       inviteId: 'inv_1',
-      endsAt: 86_400_000,
+      endsAt: Date.UTC(2026, 9, 3),
       inviteRole: 'observer',
     };
     storage.setItem(GRANTS_KEY, JSON.stringify({ pageId: 'page-1', grants: { bob: invited } }));
@@ -101,26 +105,29 @@ describe('stored grants from M4 (ADRs 0011 and 0017)', () => {
 });
 
 describe('attach requests from M4', () => {
-  it('show the account and the invite, and never the secret the relay presented', async () => {
-    const h = setup();
+  it('show the account and the invite of a Can control redemption, and never its secret', async () => {
+    const h = setup({ core: { policy: { invites: 'all' } } });
     const socket = await link(h);
+    socket.deliver(invitesFrame([]));
+    const minted = await mint(h, socket, { label: 'Friends', role: 'driver' });
     socket.deliver({
-      ...attachRequest(h.clock),
+      ...redemption(h.clock, minted),
       user: { userId: GUEST, displayName: 'guest@example.com' },
       account: { kind: 'invitee', verified: true },
-      via: 'invite',
-      invite: { inviteId: 'inv_1', secret: SECRET, label: 'Friends' },
     });
+    await until(() => h.dock.state.pendingRequests.length === 1, 'the prompt');
     expect(h.dock.state.pendingRequests).toMatchObject([
       {
         user: { userId: GUEST },
         account: { kind: 'invitee', verified: true },
         via: 'invite',
-        invite: { inviteId: 'inv_1', label: 'Friends' },
+        invite: { inviteId: minted.inviteId, label: 'Friends' },
       },
     ]);
-    expect(JSON.stringify(h.dock.state)).not.toContain(SECRET);
-    expect(h.logs.join('\n')).not.toContain(SECRET);
+    expect(JSON.stringify(h.dock.state)).not.toContain(minted.secret);
+    expect(h.logs.join('\n')).not.toContain(minted.secret);
+    // Nor the email, which belongs on the operator's screen and in no log (ADR 0020).
+    expect(h.logs.join('\n')).not.toContain('guest@example.com');
   });
 
   it('show a code request as from a verified member with no invite', async () => {
@@ -134,19 +141,35 @@ describe('attach requests from M4', () => {
 });
 
 describe('an invites frame', () => {
-  it('changes nothing yet, and leaves the link up', async () => {
+  it('offers invites at its link base, lists only what the page minted, and leaves the link up', async () => {
     const h = setup();
     const socket = await link(h);
-    const before = h.dock.state;
-    socket.deliver({
-      t: 'invites',
-      linkBase: 'https://relay.example/i',
-      invites: [],
-      refused: { inviteId: 'inv_1', reason: 'no_sponsor' },
-    });
+    socket.deliver(
+      invitesFrame(
+        [
+          {
+            inviteId: 'inv_1',
+            role: 'observer',
+            label: 'Not ours',
+            uses: 1,
+            usesLeft: 1,
+            expiresAt: null,
+            sponsor: SPONSOR,
+            pending: false,
+            refusals: 0,
+          },
+        ],
+        { refused: { inviteId: 'inv_2', reason: 'no_sponsor' } },
+      ),
+    );
     await flush();
-    expect(h.dock.state).toBe(before);
-    expect(h.dock.state).toMatchObject({ link: 'linked', invites: [], invitesOffered: null });
+    expect(h.dock.state).toMatchObject({
+      link: 'linked',
+      invites: [],
+      invitesOffered: { linkBase: LINK_BASE },
+    });
+    // An invite this page holds no record of can never be honoured here, so it is closed.
+    expect(socket.framesOf('invite_cancel')).toEqual([{ t: 'invite_cancel', inviteId: 'inv_1' }]);
     expect(socket.closedWith).toBeNull();
   });
 });

@@ -17,6 +17,7 @@ describe('readScriptOptions', () => {
         maxDrivers: '2',
         consequential: 'deny',
         consequentialTools: 'clear_board, wipe,,',
+        invites: ' all ',
       }),
     ).toEqual({
       ok: true,
@@ -26,6 +27,7 @@ describe('readScriptOptions', () => {
         maxDrivers: 2,
         consequential: 'deny',
         consequentialTools: ['clear_board', 'wipe'],
+        invites: 'all',
       },
     });
   });
@@ -47,6 +49,7 @@ describe('readScriptOptions', () => {
       { maxDrivers: '' },
       { consequential: 'sometimes' },
       { consequentialTools: 'has space' },
+      { invites: 'everyone' },
     ]) {
       const result = readScriptOptions({ relay: 'ws://127.0.0.1:8787/page', ...data });
       expect(result.ok).toBe(false);

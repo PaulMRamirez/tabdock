@@ -22,4 +22,6 @@ await sim.navigate('/settings'); // another page of the origin in the tab: its o
 await sim.close();
 ```
 
+From M4 `sim.invite({ label, role, lifetime, uses })` mints an invite for real with Node's WebCrypto against a relay that offers invites (ADR 0017), `sim.cancelInvite(id)` closes one and `sim.revoke(userId, { closeInvite })` revokes someone an invite let in; the page keeps its invite records across `sim.reload()` while the relay resumes the session, honours a Can watch redemption without asking, and puts a Can control one to `operator.askAttach`, whose request names the invite. `crypto` swaps the WebCrypto, so a test can play a page outside a secure context.
+
 The default tools are `get_value` (read-only), `set_value` (mutating), `wipe` (consequential), and the read-only helpers `echo`, `slow` and `fail`. Without an operator, prompts wait for `sim.dock`, and silence until the deadline denies.

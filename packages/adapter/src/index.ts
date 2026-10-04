@@ -17,9 +17,11 @@ export type {
   ActivityEntry,
   ActivityOutcome,
   AttachAnswer,
+  CryptoLike,
   Dock,
   DockState,
   HintSupport,
+  InviteJoin,
   InviteLifetime,
   InviteOptions,
   InviteRefusal,
@@ -63,11 +65,15 @@ export interface AttachOptions {
 }
 
 export function attach(options: AttachOptions): Dock {
+  // Taken now, not at each reconnect: a script that runs after attach() and
+  // replaces window.WebSocket would otherwise sit inside the page link from
+  // the next reconnect on, seeing every redemption's secret and playing relay.
+  const Socket = WebSocket;
   const core = createAdapterCore({
     relayUrl: options.relay,
     policy: options.policy,
     modelContext: options.modelContext ?? pageModelContext(),
-    socketFactory: (url, protocols) => new WebSocket(url, [...protocols]),
+    socketFactory: (url, protocols) => new Socket(url, [...protocols]),
     storage: sessionStorageIfAllowed(),
     locks: 'locks' in navigator ? (navigator.locks satisfies LocksLike) : undefined,
     ownWindow: window,
