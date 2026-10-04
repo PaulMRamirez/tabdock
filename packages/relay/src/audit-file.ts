@@ -10,28 +10,33 @@
 //
 // Each line carries a sequence number and the SHA-256 of the previous line as
 // written (its UTF-8 text without the newline), chained across files and
-// restarts, and a checkpoint line goes to stderr every 15 minutes, at
-// rotation, after retention deletes a file and at stop: the last seq, its
-// line's digest (head) and the seq the oldest file kept starts at (first).
-// That is tamper evidence, not prevention: whoever holds the disk can rewrite
-// everything after the newest checkpoint the platform's logs still keep, but
-// cannot edit or drop a line from its first to its seq unseen, since the
-// newest checkpoint names where the log starts. A file whose first record is
-// not the one its name gives shows lines cut from its start even without a
-// checkpoint. It uses node:crypto's SHA-256 and no key.
+// restarts, and a checkpoint line goes to stderr at open, every 15 minutes,
+// at rotation, after retention deletes a file and at stop: the last seq, its
+// line's digest (head) and the seq the log starts at (first). first moves
+// only when retention deletes the oldest file, so a file removed from the
+// start any other way while the log is open stays missing in every later
+// checkpoint, and the open's checkpoint shows one removed while it was
+// closed against the stop's before it. That is tamper evidence, not
+// prevention: whoever holds the disk can rewrite everything after the newest
+// checkpoint the platform's logs still keep, but cannot edit or drop a line
+// from its first to its seq unseen. A file whose first record is not the one
+// its name gives shows lines cut from its start even without a checkpoint. It
+// uses node:crypto's SHA-256 and no key.
 //
 // append never throws and never waits, so no call fails for a disk: a write
 // that fails leaves the record on stderr only (recordAudit writes that copy),
 // and once a write works again an audit_gap record counts what the file
-// missed. A gap still owed at close is tried once more, then left in
-// audit.gap, whose audit_gap the next open writes first, and on stderr
-// either way; a relay_start that follows neither relay_stop nor audit_gap
-// shows --verify a stop that left no count on disk (a crash, or a disk that
-// took nothing at all). Failing closed would let a full disk stop every page;
-// a write that lands every byte but the newline is a whole record, kept as
-// one. Every line is checked against AuditLineSchema and the checked record
-// is what is written, so a field no record type lists, such as a token,
-// cannot reach the file even by a bug, nested inside another field or not.
+// missed. A gap still owed at close is tried once more, then written over
+// audit.gap, padding the log wrote at open while the disk worked, which takes
+// no new blocks even on a full disk; the next open writes that audit_gap
+// first, and stderr has the count either way. --verify names every
+// relay_start that follows no relay_stop, since only the platform's logs may
+// count what the run before lost last. Failing closed would let a full disk
+// stop every page; a write that lands every byte but the newline is a whole
+// record, kept as one. Every line is checked against AuditLineSchema and the
+// checked record is what is written, so a field no record type lists, such
+// as a token, cannot reach the file even by a bug, nested inside another
+// field or not.
 // One log holds its directory's lock (audit.lock) from open to close,
 // refreshing it, so a second relay on the same directory, in this container
 // or another on the same volume, refuses to start rather than fork the chain.
@@ -222,13 +227,15 @@ export interface VerifyReport {
     lastAt: number;
   }[];
   /**
-   * relay_start records that follow neither a relay_stop nor an audit_gap:
-   * the relay before stopped without writing relay_stop (a crash, a kill, or
-   * a disk that took nothing until it stopped), so records it made just
-   * before may be missing here, with no count on disk; the platform's logs
-   * keep their copies. Named, but no failure, since the chain is whole.
+   * relay_start records that follow no relay_stop: the run before ended
+   * without one on disk (a crash, a kill, or a disk that failed), so records
+   * it made last may be missing here, and only the platform's logs may count
+   * them. afterGap says an audit_gap comes just before: that gap counts what
+   * the file missed up to when it was written, perhaps the relay_stop among
+   * them, and anything lost after it is counted on stderr alone. Named, but
+   * no failure, since the chain is whole.
    */
-  uncleanStops: { file: string; lineNumber: number; seq: number }[];
+  uncleanStops: { file: string; lineNumber: number; seq: number; afterGap: boolean }[];
   /** Anything that breaks the log: a line that is JSON but no record, a gap in seq, a broken chain, a checkpoint that does not match, records cut from the start. */
   problems: VerifyProblem[];
 }
@@ -249,9 +256,9 @@ export interface AuditCheckpoint {
  * first record is not the seq its name gives lost lines from its start. A
  * checkpoint from the platform's logs, when given, must match the line of its
  * seq, which also shows an edit to the last lines that no later line could
- * reveal; and the log must still start at or before its first, since
- * retention checkpoints after every deletion, so the newest checkpoint always
- * names where the log starts.
+ * reveal; and the log must still start at or before its first, since a
+ * relay moves first only when its retention deletes the oldest file, and
+ * checkpoints at once when it does.
  */
 export function verifyAuditLines(
   lines: Iterable<ReadLine>,
@@ -328,13 +335,14 @@ export function verifyAuditLines(
       const { seq, lost, firstAt, lastAt } = record;
       report.gaps.push({ ...where(line), seq, lost, firstAt, lastAt });
     }
-    if (
-      record.type === 'relay_start' &&
-      previousType !== null &&
-      previousType !== 'relay_stop' &&
-      previousType !== 'audit_gap'
-    ) {
-      report.uncleanStops.push({ ...where(line), seq: record.seq });
+    // An audit_gap just before is no clean stop: it may be one written mid-run,
+    // with more lost after it than the disk ever counted.
+    if (record.type === 'relay_start' && previousType !== null && previousType !== 'relay_stop') {
+      report.uncleanStops.push({
+        ...where(line),
+        seq: record.seq,
+        afterGap: previousType === 'audit_gap',
+      });
     }
     previousType = record.type;
     start ??= where(line);
@@ -420,10 +428,17 @@ export class FileAuditLog implements AuditLog {
   #syncTimer: NodeJS.Timeout | null = null;
   readonly #intervals: NodeJS.Timeout[] = [];
   #closed = false;
-  /** The seq the oldest file kept starts at, which each checkpoint names. */
+  /**
+   * The seq the log starts at, which each checkpoint names: where the oldest
+   * file started at open, moved on only by this log's own retention.
+   */
   #first: number;
-  /** Whether #gap came from AUDIT_GAP_NAME, which goes once its record is written. */
+  /** The range of seqs last reported missing from the log's start, so a hole is logged once. */
+  #missingReported: string | null = null;
+  /** Whether #gap came from AUDIT_GAP_NAME, which is cleared once its record is written. */
   #gapOwed = false;
+  /** AUDIT_GAP_NAME, open from open to close, so close can write an owed gap over it in place. */
+  #gapFile: number | null = null;
   /** Held from open to close, so no second relay writes this directory meanwhile. */
   readonly #lock: AuditLock;
   readonly #lockRefreshMs: number;
@@ -436,10 +451,7 @@ export class FileAuditLog implements AuditLog {
 
   private constructor(options: FileAuditLogOptions, recovered: Recovered, lock: AuditLock) {
     this.#lock = lock;
-    this.#lockRefreshMs = Math.max(
-      1,
-      Math.floor((options.lockStaleMs ?? AUDIT_LOCK_STALE_MS) / LOCK_REFRESHES_PER_STALE),
-    );
+    this.#lockRefreshMs = lockRefreshMs(options.lockStaleMs ?? AUDIT_LOCK_STALE_MS);
     this.#lockCheckedAt = performance.now();
     this.#dir = options.dir;
     this.#retentionMs = options.retentionDays * DAY_MS;
@@ -481,6 +493,11 @@ export class FileAuditLog implements AuditLog {
       audit.#gap = owed;
       audit.#gapOwed = true;
     }
+    // Now, while the disk works: a full disk at close could make no new file.
+    audit.#gapFile = openGapFile(options.dir, fs, options.log, owed !== null);
+    // Where this start found the log starting, before retention moves it: a
+    // file removed while no relay ran shows as a first past the stop's.
+    audit.#checkpoint();
     audit.#retain();
     const checkpoints = setInterval(() => {
       audit.#checkpoint();
@@ -558,6 +575,7 @@ export class FileAuditLog implements AuditLog {
     this.#closed = true;
     for (const interval of this.#intervals) clearInterval(interval);
     if (this.#gap !== null) this.#owe(this.#gap);
+    this.#closeGapFile();
     this.sync();
     this.#checkpoint();
     this.#closeCurrent();
@@ -569,7 +587,11 @@ export class FileAuditLog implements AuditLog {
    * Keeps the count of a gap this log is closing without writing: in
    * AUDIT_GAP_NAME, which the next open turns into the audit_gap record
    * before anything else, and on stderr whatever happens, so a restart
-   * while the disk fails leaves no silent hole (S7, ADR 0019).
+   * while the disk fails leaves no silent hole (S7, ADR 0019). The count
+   * goes over the padding open wrote, in place, since a full disk takes no
+   * new file; failing that, into a new file renamed over it; failing both,
+   * the file goes, since an older count left in it would have the next start
+   * write that as if it were the whole.
    */
   #owe(gap: Gap): void {
     const line: AuditLine = {
@@ -582,14 +604,44 @@ export class FileAuditLog implements AuditLog {
       lastAt: gap.lastAt,
       prev: this.#head,
     };
+    const fields = { lost: gap.lost, firstAt: gap.firstAt, lastAt: gap.lastAt };
     // Never into a directory another relay holds now.
-    const kept = !this.#lockLost && writeOwedGap(this.#dir, this.#fs, line);
+    if (this.#lockLost) {
+      this.#log.error(
+        'audit file missed records, and another relay holds the audit directory now, so this relay counts them nowhere on disk; only this line keeps the count (ADR 0019)',
+        fields,
+      );
+      return;
+    }
+    const text = gapFileText(line);
+    let kept =
+      text !== null && this.#gapFile !== null && writeGapOver(this.#gapFile, this.#fs, text);
+    // Closed before a rename over it or its removal, which a file held open blocks on some systems.
+    this.#closeGapFile();
+    if (!kept && text !== null) kept = writeGapFile(this.#dir, this.#fs, text);
+    if (kept) {
+      this.#log.error(
+        `audit file missed records and the log is closing before it could count them there; ${AUDIT_GAP_NAME} keeps the count, and the next start writes it as an audit_gap before anything else (ADR 0019)`,
+        fields,
+      );
+      return;
+    }
     this.#log.error(
-      kept
-        ? `audit file missed records and the log is closing before it could count them there; ${AUDIT_GAP_NAME} keeps the count, and the next start writes its audit_gap first (ADR 0019)`
-        : 'audit file missed records and the log is closing before it could count them anywhere on disk; this line keeps the count, and --verify names the start that follows no relay_stop (ADR 0019)',
-      { lost: gap.lost, firstAt: gap.firstAt, lastAt: gap.lastAt },
+      removeGapFile(this.#dir, this.#fs)
+        ? 'audit file missed records and the log is closing before it could count them anywhere on disk; only this line keeps the count, and --verify names the next start as one that follows no relay_stop (ADR 0019)'
+        : `audit file missed records and the log is closing before it could count them anywhere on disk; only this line keeps the whole count: ${AUDIT_GAP_NAME}, which may hold an older, smaller one, could not be removed, and the next start writes any it holds as an audit_gap; --verify names that start as one that follows no relay_stop (ADR 0019)`,
+      fields,
     );
+  }
+
+  #closeGapFile(): void {
+    if (this.#gapFile === null) return;
+    try {
+      this.#fs.closeSync(this.#gapFile);
+    } catch {
+      // Nothing written through it is owed a flush: every write there was synced.
+    }
+    this.#gapFile = null;
   }
 
   /**
@@ -627,6 +679,8 @@ export class FileAuditLog implements AuditLog {
       );
       this.sync();
       this.#closeCurrent();
+      // AUDIT_GAP_NAME is that relay's now too.
+      this.#closeGapFile();
     }
   }
 
@@ -708,19 +762,42 @@ export class FileAuditLog implements AuditLog {
       this.#gapOwed = false;
       // On disk before the count it replaces goes, so a power loss keeps one or the other.
       this.sync();
-      try {
-        this.#fs.unlinkSync(join(this.#dir, AUDIT_GAP_NAME));
-      } catch (error) {
-        // Harmless: the next open sees the file's record past the seq it names and drops it.
-        if (codeOf(error) !== 'ENOENT') {
-          this.#log.warn('could not remove the audit_gap a closed log owed, now written', {
-            file: AUDIT_GAP_NAME,
-            error: codeOf(error),
-          });
-        }
-      }
+      this.#clearGapFile();
     }
     return true;
+  }
+
+  /**
+   * Puts AUDIT_GAP_NAME back to padding alone once its count is in the log,
+   * in place where the file is padding's size, so the padding stays ready
+   * for a full disk; otherwise in a new file renamed over it; otherwise it
+   * goes.
+   */
+  #clearGapFile(): void {
+    const padding = gapFileText(null);
+    if (this.#gapFile !== null && padding !== null) {
+      try {
+        if (
+          this.#fs.fstatSync(this.#gapFile).size === GAP_FILE_BYTES &&
+          writeGapOver(this.#gapFile, this.#fs, padding)
+        ) {
+          return;
+        }
+      } catch {
+        // Tried below another way.
+      }
+    }
+    this.#closeGapFile();
+    if (padding !== null && writeGapFile(this.#dir, this.#fs, padding)) {
+      this.#gapFile = openGapFile(this.#dir, this.#fs, this.#log, false);
+      return;
+    }
+    // Harmless if this fails too: the next open sees the file's record past the seq it names and clears it.
+    if (!removeGapFile(this.#dir, this.#fs)) {
+      this.#log.warn('could not clear the audit_gap a closed log owed, now written', {
+        file: AUDIT_GAP_NAME,
+      });
+    }
   }
 
   #lose(event: AuditEvent): void {
@@ -841,9 +918,10 @@ export class FileAuditLog implements AuditLog {
   /**
    * Deletes files past the retention, then the oldest past the size cap;
    * never the current file. A deletion moves where the log starts, so a
-   * checkpoint follows at once: the newest checkpoint then always names the
-   * first record kept, and --verify can tell retention's deletions from any
-   * other.
+   * checkpoint follows at once. Only this log's own deletions move first: a
+   * log whose oldest file starts after first lost the files between some
+   * other way, so first stays and the hole is logged, and every checkpoint
+   * from then on still shows it to --verify (ADR 0019).
    */
   #retain(): void {
     if (this.#lockLost) return;
@@ -889,9 +967,27 @@ export class FileAuditLog implements AuditLog {
       if (total <= this.#maxBytes) break;
       if (file.name !== current) remove(file, 'size');
     }
-    // With no file left on disk, the next line starts the log.
-    this.#first = files.find((file) => !deleted.has(file.name))?.firstSeq ?? this.#nextSeq;
+    // Where the files started before this pass, which only a hole puts past first.
+    const start = files[0]?.firstSeq;
+    if (this.#head !== null && (start === undefined || start > this.#first)) {
+      this.#reportMissing(start ?? this.#nextSeq);
+    } else {
+      // With no file left on disk, the next line starts the log.
+      const oldest = files.find((file) => !deleted.has(file.name))?.firstSeq ?? this.#nextSeq;
+      this.#first = Math.max(this.#first, oldest);
+    }
     if (deleted.size > 0) this.#checkpoint();
+  }
+
+  /** Logs, once for each hole, seqs gone from the log's start that retention did not delete. */
+  #reportMissing(start: number): void {
+    const range = `${String(this.#first)}-${String(start - 1)}`;
+    if (this.#missingReported === range) return;
+    this.#missingReported = range;
+    this.#log.error(
+      'audit records are missing from the start of the log, removed by something other than its retention; each checkpoint this relay writes goes on naming the seq the log started at, so --verify against it reports the hole (ADR 0019)',
+      { from: this.#first, to: start - 1 },
+    );
   }
 }
 
@@ -910,15 +1006,29 @@ export class FileAuditLog implements AuditLog {
  * every relay in a container is pid 1. While the log is open its holder sets
  * the lock's mtime every sixth of AUDIT_LOCK_STALE_MS, which is how a relay
  * that cannot see the holder's pid, in another container on the same volume,
- * still tells a live lock from one a crash left.
+ * still tells a live lock from one a crash left: by watching it change.
  */
 export const AUDIT_LOCK_NAME = 'audit.lock';
 
 /** How long a lock may go without its holder's refresh before it counts as left by a relay that is gone. */
 export const AUDIT_LOCK_STALE_MS = 30_000;
 const LOCK_REFRESHES_PER_STALE = 6;
+/**
+ * How many of the holder's refresh intervals a relay watches a lock it
+ * cannot judge by pid, on its own monotonic clock, before it may break it,
+ * however old the lock's mtime looks: an mtime is the holder's clock, which
+ * may run far behind this one's, so a live lock can look abandoned at first
+ * sight, but its holder refreshes it once an interval, and two leave room
+ * for a refresh a busy holder runs late.
+ */
+const LOCK_WATCH_REFRESHES = 2;
 /** How many locks open tries to take or break before it gives up. */
 const LOCK_ATTEMPTS = 10;
+
+/** How often a holder refreshes its lock, for a given stale interval. */
+function lockRefreshMs(staleMs: number): number {
+  return Math.max(1, Math.floor(staleMs / LOCK_REFRESHES_PER_STALE));
+}
 
 /** A lock this process holds: its path, its text, and the directory it is held for. */
 interface AuditLock {
@@ -988,13 +1098,14 @@ type Verdict = { kind: 'live'; pid: number } | { kind: 'gone' } | { kind: 'unsee
  * and is not this process's holds the lock, and any other is gone, this
  * process's own included, since heldHere stands for this process. A relay in
  * another container on the same host is pid 1 there as here, so its pid says
- * nothing, and its lock is judged by its refreshes alone, as is a lock that
- * cannot be read. A lock in the format before owner ids (`<pid> <boot>`)
- * names no namespace: a pid it names that runs on this boot, not this
- * process's, still refuses, as it did then; otherwise it too goes by its
- * refreshes, which such a relay never made.
+ * nothing, and its lock is unseen: judged by watching for its refreshes
+ * (waitOut), never at first sight, as is a lock that cannot be read. A lock
+ * in the format before owner ids (`<pid> <boot>`) names no namespace: a pid
+ * it names that runs on this boot, not this process's, still refuses, as it
+ * did then; otherwise it too is watched for refreshes, which such a relay
+ * never made.
  */
-function judge(seen: SeenLock, view: LockView, staleMs: number): Verdict {
+function judge(seen: SeenLock, view: LockView): Verdict {
   const current = /^(\d{1,10}) ([0-9a-f-]{1,64}) (\d{1,20}|-) [0-9a-f]{32}\n$/.exec(seen.text);
   if (current !== null) {
     const pid = Number(current[1]);
@@ -1014,7 +1125,8 @@ function judge(seen: SeenLock, view: LockView, staleMs: number): Verdict {
     const sameBoot = boot === view.boot || boot === '-' || view.boot === '-';
     if (sameBoot && pid !== process.pid && running(pid)) return { kind: 'live', pid };
   }
-  return Date.now() - seen.mtimeMs >= staleMs ? { kind: 'gone' } : { kind: 'unseen' };
+  // Never gone by its mtime alone, which is the holder's clock, not this one's.
+  return { kind: 'unseen' };
 }
 
 /** The lock at path as it is now, text and stat from one descriptor so both describe one file; null when there is none. */
@@ -1121,11 +1233,16 @@ function pause(ms: number): void {
 
 /**
  * Watches a lock whose pid says nothing here until it shows its relay runs
- * (a refresh, or another lock in its place), goes, or has gone staleMs
- * without a refresh, by its mtime or by this relay's own watch, whichever
- * comes first, so a clock that differs cannot stretch the wait. A container
- * restarted after a crash waits here, up to staleMs, for the lock its last
- * run left; a graceful stop releases its lock and costs no wait.
+ * (a refresh, or another lock in its place), goes, or counts as stale: this
+ * relay has watched it unchanged for LOCK_WATCH_REFRESHES of the holder's
+ * refresh intervals on its own monotonic clock, and it has gone staleMs
+ * without a refresh, by that watch or by its mtime. An old mtime may so
+ * shorten the wait but never skip the watch, since a holder whose clock runs
+ * behind this one's writes mtimes that look old while it is live; and a
+ * clock that runs ahead cannot stretch the wait past staleMs. A container
+ * restarted after a crash waits here, between the watch and staleMs, for the
+ * lock its last run left; a graceful stop releases its lock and costs no
+ * wait.
  */
 function waitOut(
   path: string,
@@ -1134,16 +1251,22 @@ function waitOut(
   fs: AuditFs,
   log: Logger,
 ): 'released' | 'refreshed' | 'stale' {
-  log.warn(
-    'the audit directory lock was left by a relay this one cannot see, perhaps in another container on the same volume; waiting for it to go unrefreshed before taking it (ADR 0019)',
-    { lock: AUDIT_LOCK_NAME, waitMs: staleMs },
-  );
+  const watch = Math.min(staleMs, LOCK_WATCH_REFRESHES * lockRefreshMs(staleMs));
   const since = performance.now();
+  const remaining = (): number => {
+    const watched = performance.now() - since;
+    const unrefreshed = Math.max(Date.now() - seen.mtimeMs, watched);
+    return Math.max(watch - watched, staleMs - unrefreshed, 0);
+  };
+  log.warn(
+    'the audit directory lock was left by a relay this one cannot see, perhaps in another container on the same volume; watching it for a refresh before taking it (ADR 0019)',
+    { lock: AUDIT_LOCK_NAME, waitMs: Math.ceil(remaining()) },
+  );
   const poll = Math.max(10, Math.min(100, Math.floor(staleMs / 8)));
   for (;;) {
-    const unrefreshed = Math.max(Date.now() - seen.mtimeMs, performance.now() - since);
-    if (unrefreshed >= staleMs) return 'stale';
-    pause(Math.min(poll, staleMs - unrefreshed));
+    const left = remaining();
+    if (left <= 0) return 'stale';
+    pause(Math.max(1, Math.min(poll, Math.ceil(left))));
     const now = look(path, fs);
     if (now === null) return 'released';
     if (!sameLock(now, seen)) return 'refreshed';
@@ -1186,7 +1309,7 @@ function takeLock(dir: string, fs: AuditFs, log: Logger, staleMs: number): Audit
     const seen = look(path, fs);
     // Released between the link and the look: try again.
     if (seen === null) continue;
-    const verdict = judge(seen, view, staleMs);
+    const verdict = judge(seen, view);
     if (verdict.kind === 'live') throw inUse(`pid ${String(verdict.pid)}, which holds ${path}`);
     if (verdict.kind === 'unseen') {
       const waited = waitOut(path, seen, staleMs, fs, log);
@@ -1250,18 +1373,60 @@ function releaseLock(lock: AuditLock, fs: AuditFs): void {
  * fails (on Fly a restart is how an extended volume is picked up), and
  * without this the next start would chain relay_start to the last good
  * line, and nothing on disk would show what the file missed.
+ *
+ * The file is GAP_FILE_BYTES of real bytes, kept between runs: spaces and a
+ * newline while nothing is owed, or the owed line padded with spaces. Each
+ * open makes it, or checks it, while the disk works, and keeps it open, so a
+ * close on a full disk writes its count over bytes already there, which
+ * takes no new blocks, where a new file would fail for want of space.
  */
 export const AUDIT_GAP_NAME = 'audit.gap';
 
+/** AUDIT_GAP_NAME's size: one sector, more than twice the longest audit_gap line. */
+const GAP_FILE_BYTES = 512;
+
 /**
- * Leaves the audit_gap a closing log could not write in AUDIT_GAP_NAME:
- * written whole to a file of its own and synced, then renamed over any older
- * one, so the next open finds a whole line or none. False when the disk
- * takes not even that.
+ * What AUDIT_GAP_NAME holds: an owed audit_gap line, schema-checked, padded
+ * with spaces to GAP_FILE_BYTES, or the padding alone for null; null when the
+ * line fails its schema. A line too long for the padding goes whole, longer.
  */
-function writeOwedGap(dir: string, fs: AuditFs, line: AuditLine): boolean {
-  const checked = AuditLineSchema.safeParse(line);
-  if (!checked.success) return false;
+function gapFileText(line: AuditLine | null): Buffer | null {
+  let text = '';
+  if (line !== null) {
+    const checked = AuditLineSchema.safeParse(line);
+    if (!checked.success) return null;
+    text = JSON.stringify(checked.data);
+  }
+  const pad = Math.max(0, GAP_FILE_BYTES - 1 - Buffer.byteLength(text, 'utf8'));
+  return Buffer.from(`${text}${' '.repeat(pad)}\n`, 'utf8');
+}
+
+/** The first line of AUDIT_GAP_NAME's text, without its padding; empty when nothing is owed. */
+function gapFileLine(text: string): string {
+  return (text.split('\n')[0] ?? '').trimEnd();
+}
+
+/**
+ * Writes AUDIT_GAP_NAME's new text over the old, in place from its start,
+ * and syncs it: on bytes the file already holds this needs no new blocks.
+ * False when the disk refused.
+ */
+function writeGapOver(fd: number, fs: AuditFs, text: Buffer): boolean {
+  try {
+    if (fs.writeSync(fd, text, 0, text.length, 0) !== text.length) return false;
+    fs.fdatasyncSync(fd);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Puts AUDIT_GAP_NAME's text in place whole or not at all: written to a file
+ * of its own and synced, then renamed over the old, so the next open finds a
+ * whole line or none. Throws when the disk takes not even that.
+ */
+function replaceGapFile(dir: string, fs: AuditFs, text: Buffer): void {
   const temp = join(dir, `${AUDIT_GAP_NAME}.${randomBytes(6).toString('hex')}`);
   try {
     const fd = fs.openSync(
@@ -1270,16 +1435,14 @@ function writeOwedGap(dir: string, fs: AuditFs, line: AuditLine): boolean {
       FILE_MODE,
     );
     try {
-      const buffer = Buffer.from(`${JSON.stringify(checked.data)}\n`, 'utf8');
-      if (fs.writeSync(fd, buffer) !== buffer.length) return false;
+      if (fs.writeSync(fd, text) !== text.length) {
+        throw Object.assign(new Error('short write'), { code: 'ESHORT' });
+      }
       fs.fdatasyncSync(fd);
     } finally {
       fs.closeSync(fd);
     }
     fs.renameSync(temp, join(dir, AUDIT_GAP_NAME));
-    return true;
-  } catch {
-    return false;
   } finally {
     try {
       fs.unlinkSync(temp);
@@ -1289,13 +1452,94 @@ function writeOwedGap(dir: string, fs: AuditFs, line: AuditLine): boolean {
   }
 }
 
+function writeGapFile(dir: string, fs: AuditFs, text: Buffer): boolean {
+  try {
+    replaceGapFile(dir, fs, text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Removes AUDIT_GAP_NAME, which needs no space. True when no count is left
+ * in it for the next open to write: it is gone, or what stayed holds no
+ * audit_gap record.
+ */
+function removeGapFile(dir: string, fs: AuditFs): boolean {
+  const path = join(dir, AUDIT_GAP_NAME);
+  try {
+    fs.unlinkSync(path);
+    return true;
+  } catch (error) {
+    if (codeOf(error) === 'ENOENT') return true;
+  }
+  try {
+    const line = gapFileLine(fs.readFileSync(path, 'utf8'));
+    return line === '' || readLine(AUDIT_GAP_NAME, 1, line).record?.type !== 'audit_gap';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Opens AUDIT_GAP_NAME for the log's run, to read and write, never through a
+ * symlink: as it stands while it holds a gap still owed, which close may
+ * write over; otherwise as padding alone, made or rewritten now, while the
+ * disk works. Null, with a warning, when the disk refuses: close can then
+ * only try a new file, which a full disk refuses too, and the count is left
+ * on stderr alone.
+ */
+function openGapFile(dir: string, fs: AuditFs, log: Logger, owed: boolean): number | null {
+  const path = join(dir, AUDIT_GAP_NAME);
+  const padding = gapFileText(null) ?? Buffer.alloc(0);
+  const openIt = (): number => {
+    const fd = fs.openSync(path, nodeFs.constants.O_RDWR | noFollow());
+    try {
+      if (!fs.fstatSync(fd).isFile()) {
+        throw Object.assign(new Error('not a regular file'), { code: 'ENOTREG' });
+      }
+      fs.fchmodSync(fd, FILE_MODE);
+    } catch (error) {
+      fs.closeSync(fd);
+      throw error;
+    }
+    return fd;
+  };
+  try {
+    let fd: number | null = null;
+    try {
+      fd = openIt();
+    } catch (error) {
+      if (codeOf(error) !== 'ENOENT') throw error;
+    }
+    if (fd !== null) {
+      if (owed) return fd;
+      if (fs.fstatSync(fd).size === padding.length) {
+        const now = Buffer.alloc(padding.length);
+        fs.readSync(fd, now, 0, now.length, 0);
+        if (now.equals(padding) || writeGapOver(fd, fs, padding)) return fd;
+      }
+      fs.closeSync(fd);
+    }
+    replaceGapFile(dir, fs, padding);
+    return openIt();
+  } catch (error) {
+    log.warn(
+      `could not make ${AUDIT_GAP_NAME} ready, so a log that closes on a full disk before it can write an audit_gap leaves the count on stderr alone (ADR 0019)`,
+      { file: AUDIT_GAP_NAME, error: codeOf(error) },
+    );
+    return null;
+  }
+}
+
 /**
  * The gap a closed log still owes, from AUDIT_GAP_NAME; null when there is
- * none. One whose seq the log has passed was written already (by an open
- * that could not remove the file after) and goes now, so no gap counts
- * twice. One that does not follow the log's last line means lines went from
- * the log's end since it was left: its count still stands, and the warning
- * says so.
+ * none, as when it holds padding alone. One whose seq the log has passed was
+ * written already (by an open that could not clear the file after), so no
+ * gap counts twice: openGapFile clears it. One that does not follow the
+ * log's last line means lines went from the log's end since it was left:
+ * its count still stands, and the warning says so.
  */
 function owedGap(dir: string, fs: AuditFs, log: Logger, recovered: Recovered): Gap | null {
   const path = join(dir, AUDIT_GAP_NAME);
@@ -1314,23 +1558,19 @@ function owedGap(dir: string, fs: AuditFs, log: Logger, recovered: Recovered): G
     }
     return null;
   }
-  const record = readLine(AUDIT_GAP_NAME, 1, text.trimEnd()).record;
-  if (record?.type !== 'audit_gap' || record.seq < recovered.nextSeq) {
-    if (record?.type !== 'audit_gap') {
-      log.warn(
-        'the audit_gap file a closed log left holds no audit_gap record; it was removed unused',
-        {
-          file: AUDIT_GAP_NAME,
-        },
-      );
-    }
-    try {
-      fs.unlinkSync(path);
-    } catch {
-      // A later open tries again.
-    }
+  const line = gapFileLine(text);
+  if (line === '') return null;
+  const record = readLine(AUDIT_GAP_NAME, 1, line).record;
+  if (record?.type !== 'audit_gap') {
+    log.warn(
+      'the audit_gap file a closed log left holds no audit_gap record; it is cleared unused',
+      {
+        file: AUDIT_GAP_NAME,
+      },
+    );
     return null;
   }
+  if (record.seq < recovered.nextSeq) return null;
   if (record.seq !== recovered.nextSeq || record.prev !== recovered.head) {
     log.warn(
       'the audit log does not end where the audit_gap a closed log owes says it did: lines were removed from its end since; the gap is still written',

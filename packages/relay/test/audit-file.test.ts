@@ -27,6 +27,7 @@ import {
   AUDIT_VERSION,
   type AuditEvent,
   type AuditEventOf,
+  type AuditLine,
   AuditLineSchema,
 } from '@tabdock/protocol';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -358,29 +359,49 @@ describe('the audit files (ADR 0019)', () => {
   });
 
   it('syncs on demand, and on close after the last record', async () => {
-    let syncs = 0;
-    const fs: AuditFs = {
-      ...nodeFs,
-      fdatasyncSync: (fd: number) => {
-        syncs += 1;
-        nodeFs.fdatasyncSync(fd);
-      },
-    };
-    const { audit } = open(scratch(), { fs });
+    const disk = countingSyncs();
+    const { audit } = open(scratch(), { fs: disk.fs });
     expect(audit.sync()).toBe(false);
     audit.append(call(T0));
     expect(audit.sync()).toBe(true);
-    expect(syncs).toBe(1);
+    expect(disk.syncs).toBe(1);
     // Nothing new: no second sync.
     expect(audit.sync()).toBe(true);
-    expect(syncs).toBe(1);
+    expect(disk.syncs).toBe(1);
     audit.append(call(T0 + 1));
     await audit.close();
-    expect(syncs).toBe(2);
+    expect(disk.syncs).toBe(2);
     // A closed log takes nothing more into its files.
     expect(audit.append(call(T0 + 2))).toBeNull();
   });
 });
+
+/** An fs that counts fdatasync calls on the audit files, leaving out audit.gap's, which open makes and syncs. */
+function countingSyncs(): { fs: AuditFs; readonly syncs: number } {
+  let syncs = 0;
+  const auditFds = new Set<number>();
+  return {
+    fs: {
+      ...nodeFs,
+      openSync: (...args: Parameters<typeof nodeFs.openSync>) => {
+        const fd = nodeFs.openSync(...args);
+        if (/audit-[^/\\]*\.jsonl$/.test(String(args[0]))) auditFds.add(fd);
+        return fd;
+      },
+      closeSync: (fd: number) => {
+        auditFds.delete(fd);
+        nodeFs.closeSync(fd);
+      },
+      fdatasyncSync: (fd: number) => {
+        if (auditFds.has(fd)) syncs += 1;
+        nodeFs.fdatasyncSync(fd);
+      },
+    },
+    get syncs() {
+      return syncs;
+    },
+  };
+}
 
 describe('verify (pnpm audit:log --verify)', () => {
   async function written(count: number): Promise<string> {
@@ -492,16 +513,83 @@ describe('verify (pnpm audit:log --verify)', () => {
 
   it('checkpoints after retention deletes a file, so the newest checkpoint names where the log now starts', async () => {
     const { audit, dir, lines } = open(scratch(), { rotateBytes: 600, maxBytes: 1500 });
-    for (let index = 0; index < 12; index += 1) audit.append(call(T0 + index));
+    let passes = 0;
+    for (let index = 0; index < 12; index += 1) {
+      const before = lines.length;
+      const seq = audit.append(call(T0 + index))?.seq ?? 0;
+      const added = lines.slice(before);
+      const deleted = added.findLastIndex((line) => line.includes('deleted by retention'));
+      if (deleted === -1) continue;
+      passes += 1;
+      // The very next line, before any other record or rotation could write one: a
+      // checkpoint naming the last record before this one and the new oldest file.
+      const next = JSON.parse(added[deleted + 1] ?? '{}') as Record<string, unknown>;
+      expect(next).toMatchObject({
+        msg: 'audit checkpoint',
+        seq: seq - 1,
+        first: listAuditFiles(dir)[0]?.firstSeq,
+      });
+    }
+    expect(passes).toBeGreaterThan(0);
     await audit.close();
-    const deleted = lines.findLastIndex((line) => line.includes('deleted by retention'));
-    expect(deleted).toBeGreaterThan(-1);
-    const after = lines.slice(deleted).find((line) => line.includes('"msg":"audit checkpoint"'));
-    const first = listAuditFiles(dir)[0]?.firstSeq;
-    expect(first).toBeGreaterThan(1);
-    expect(JSON.parse(after ?? '{}')).toMatchObject({ first });
+    expect(listAuditFiles(dir)[0]?.firstSeq).toBeGreaterThan(1);
     // Retention removed whole files and said so, so the newest checkpoint finds nothing missing.
     expect(verifyAuditLines(readAuditLines(dir), checkpoints(lines).at(-1)).problems).toEqual([]);
+  });
+
+  it('keeps naming where the log started when a file goes from its start other than by retention, so every later checkpoint shows the hole', async () => {
+    const { audit, dir, lines } = open(scratch(), { rotateBytes: 600 });
+    for (let index = 0; index < 9; index += 1) audit.append(call(T0 + index));
+    const files = listAuditFiles(dir);
+    expect(files.length).toBeGreaterThan(2);
+    // Whoever holds the disk deletes the oldest file while the relay runs, 30 days early.
+    rmSync(join(dir, files[0]?.name ?? ''));
+    const second = files[1]?.firstSeq ?? 0;
+    // Later records rotate the file, and each rotation runs retention, which reads the directory again.
+    for (let index = 9; index < 15; index += 1) audit.append(call(T0 + index));
+    await audit.close();
+    expect(lines.filter((line) => line.includes('deleted by retention'))).toEqual([]);
+    // The relay said so as soon as retention looked, naming what went.
+    const missing = lines.find((line) => line.includes('"level":"error"'));
+    expect(missing).toMatch(/missing from the start of the log/);
+    expect(JSON.parse(missing ?? '{}')).toMatchObject({ from: 1, to: second - 1 });
+    // Every checkpoint since still says the log keeps every record from seq 1.
+    const newest = checkpoints(lines).at(-1);
+    expect(newest).toMatchObject({ seq: 15, first: 1 });
+    expect(verifyAuditLines(readAuditLines(dir), newest).problems).toEqual([
+      expect.objectContaining({
+        problem: expect.stringMatching(
+          new RegExp(
+            `the log starts at seq ${String(second)}, but the checkpoint says it kept every record from seq 1`,
+          ),
+        ) as string,
+      }),
+    ]);
+  });
+
+  it('checkpoints right after it opens, naming where it found the log starting, so a file removed while it was stopped shows against the checkpoint before', async () => {
+    const dir = scratch();
+    const first = open(dir, { rotateBytes: 600 });
+    for (let index = 0; index < 9; index += 1) first.audit.append(call(T0 + index));
+    await first.audit.close();
+    opened.splice(opened.indexOf(first.audit), 1);
+    const stop = checkpoints(first.lines).at(-1);
+    expect(stop).toMatchObject({ seq: 9, first: 1 });
+    const files = listAuditFiles(dir);
+    rmSync(join(dir, files[0]?.name ?? ''));
+    const second = open(dir, { rotateBytes: 600 });
+    // Before any record and with no retention line, the start names the log's start as it found it.
+    expect(second.lines.filter((line) => line.includes('deleted by retention'))).toEqual([]);
+    expect(checkpoints(second.lines)).toEqual([
+      { seq: 9, head: stop?.head, first: files[1]?.firstSeq },
+    ]);
+    expect(verifyAuditLines(readAuditLines(dir), stop).problems).toEqual([
+      expect.objectContaining({
+        problem: expect.stringMatching(
+          /but the checkpoint says it kept every record from seq 1/,
+        ) as string,
+      }),
+    ]);
   });
 });
 
@@ -516,15 +604,23 @@ function checkpoints(lines: string[]): { seq: number; head: string; first: numbe
 }
 
 describe('a gap still owed when the log closes (ADR 0019)', () => {
+  interface FailingDisk {
+    fs: AuditFs;
+    fail: 'none' | 'files' | 'all';
+    /** Writes to the audit files that go through whatever fail says, as a disk that flaps lets one by. */
+    allow: number;
+  }
+
   /**
    * A disk whose writes can be made to fail: to the audit files alone, as a
    * file the disk broke fails while the directory still takes a small new
-   * file, or to everything, as a full disk does.
+   * file, or to everything, as a disk that errors does.
    */
-  function failingDisk(): { fs: AuditFs; fail: 'none' | 'files' | 'all' } {
+  function failingDisk(): FailingDisk {
     const auditFds = new Set<number>();
-    const disk: { fs: AuditFs; fail: 'none' | 'files' | 'all' } = {
+    const disk: FailingDisk = {
       fail: 'none',
+      allow: 0,
       fs: {
         ...nodeFs,
         openSync: (...args: Parameters<typeof nodeFs.openSync>) => {
@@ -537,10 +633,53 @@ describe('a gap still owed when the log closes (ADR 0019)', () => {
           nodeFs.closeSync(fd);
         },
         writeSync: ((fd: number, ...rest: [NodeJS.ArrayBufferView]) => {
+          if (disk.allow > 0 && auditFds.has(fd)) {
+            disk.allow -= 1;
+            return nodeFs.writeSync(fd, ...rest);
+          }
           if (disk.fail === 'all' || (disk.fail === 'files' && auditFds.has(fd))) {
             throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
           }
           return nodeFs.writeSync(fd, ...rest);
+        }) as typeof nodeFs.writeSync,
+      },
+    };
+    return disk;
+  }
+
+  /**
+   * A disk with no free blocks once full is set, as a filled volume is: no
+   * new file can be made and no write may grow a file, but bytes already
+   * written can be written over in place, which takes no new blocks.
+   */
+  function fullDisk(): { fs: AuditFs; full: boolean } {
+    const enospc = (): Error =>
+      Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+    const disk: { fs: AuditFs; full: boolean } = {
+      full: false,
+      fs: {
+        ...nodeFs,
+        openSync: (...args: Parameters<typeof nodeFs.openSync>) => {
+          const [path, flags] = args;
+          const creates = typeof flags === 'number' && (flags & nodeFs.constants.O_CREAT) !== 0;
+          if (disk.full && creates && !existsSync(path)) throw enospc();
+          return nodeFs.openSync(...args);
+        },
+        writeSync: ((
+          fd: number,
+          buffer: NodeJS.ArrayBufferView,
+          offset?: number,
+          length?: number,
+          position?: number | null,
+        ) => {
+          if (disk.full) {
+            const from = offset ?? 0;
+            const bytes = length ?? buffer.byteLength - from;
+            // A write with no position appends, so it always grows the file.
+            const end = typeof position === 'number' ? position + bytes : Number.POSITIVE_INFINITY;
+            if (end > nodeFs.fstatSync(fd).size) throw enospc();
+          }
+          return nodeFs.writeSync(fd, buffer, offset, length, position);
         }) as typeof nodeFs.writeSync,
       },
     };
@@ -566,7 +705,7 @@ describe('a gap still owed when the log closes (ADR 0019)', () => {
   /** A run that loses 50 calls and its relay_stop to the disk, then closes. */
   async function stopWhileFailing(
     dir: string,
-    disk: ReturnType<typeof failingDisk>,
+    disk: FailingDisk,
     fail: 'files' | 'all',
   ): Promise<string[]> {
     const run = open(dir, { fs: disk.fs });
@@ -602,21 +741,55 @@ describe('a gap still owed when the log closes (ADR 0019)', () => {
     // Whatever the disk does, the platform's logs keep the count.
     expect(
       lines.find((line) => line.includes('"level":"error"') && line.includes('"lost":51')),
-    ).toMatch(/audit file missed records and the log is closing/);
-    expect(existsSync(join(dir, AUDIT_GAP_NAME))).toBe(true);
+    ).toMatch(/audit file missed records and the log is closing.*audit\.gap keeps the count/);
+    expect(owes(dir)).toMatchObject({ type: 'audit_gap', seq: 3, lost: 51 });
     await restart(dir);
     expect(typesIn(dir)).toEqual(['relay_start', 'call', 'audit_gap', 'relay_start', 'call']);
     const gap = AuditLineSchema.parse(JSON.parse(fileLines(dir)[2] ?? '{}'));
     expect(gap).toMatchObject({ seq: 3, lost: 51, firstAt: T0 + 10, lastAt: T0 + 100 });
     // Written and synced, so the count is no longer owed.
-    expect(existsSync(join(dir, AUDIT_GAP_NAME))).toBe(false);
+    expect(owes(dir)).toBeNull();
     const report = verifyAuditLines(readAuditLines(dir));
     expect(report.problems).toEqual([]);
     expect(report.gaps).toEqual([
       expect.objectContaining({ seq: 3, lost: 51, firstAt: T0 + 10, lastAt: T0 + 100 }),
     ]);
-    // The audit_gap accounts for the missing relay_stop.
-    expect(report.uncleanStops).toEqual([]);
+    // The start follows no relay_stop, and the audit_gap just before it counts the one the disk lost.
+    expect(report.uncleanStops).toEqual([expect.objectContaining({ seq: 4, afterGap: true })]);
+  });
+
+  it('keeps the count on a full disk, which takes no new file, by writing over the audit.gap it made at start', async () => {
+    const dir = scratch();
+    const disk = fullDisk();
+    const run = open(dir, { fs: disk.fs });
+    // Made while the disk worked, of real bytes, and owing nothing yet.
+    expect(existsSync(join(dir, AUDIT_GAP_NAME))).toBe(true);
+    expect(owes(dir)).toBeNull();
+    expect(run.audit.append(start(T0))?.seq).toBe(1);
+    expect(run.audit.append(call(T0 + 1))?.seq).toBe(2);
+    disk.full = true;
+    for (let index = 0; index < 50; index += 1) {
+      expect(run.audit.append(call(T0 + 10 + index))).toBeNull();
+    }
+    expect(run.audit.append(stop(T0 + 100))).toBeNull();
+    await run.audit.close();
+    opened.splice(opened.indexOf(run.audit), 1);
+    expect(
+      run.lines.find((line) => line.includes('"level":"error"') && line.includes('"lost":51')),
+    ).toMatch(/audit\.gap keeps the count/);
+    expect(owes(dir)).toMatchObject({ type: 'audit_gap', seq: 3, lost: 51 });
+    // The volume grows, and the relay starts again.
+    disk.full = false;
+    await restart(dir);
+    expect(typesIn(dir)).toEqual(['relay_start', 'call', 'audit_gap', 'relay_start', 'call']);
+    expect(AuditLineSchema.parse(JSON.parse(fileLines(dir)[2] ?? '{}'))).toMatchObject({
+      seq: 3,
+      lost: 51,
+      firstAt: T0 + 10,
+      lastAt: T0 + 100,
+    });
+    expect(owes(dir)).toBeNull();
+    expect(verifyAuditLines(readAuditLines(dir)).problems).toEqual([]);
   });
 
   it('names the hole when nothing could be written at close: stderr keeps the count, and verify reports the stop without relay_stop', async () => {
@@ -624,14 +797,80 @@ describe('a gap still owed when the log closes (ADR 0019)', () => {
     const disk = failingDisk();
     const lines = await stopWhileFailing(dir, disk, 'all');
     expect(
-      lines.some((line) => line.includes('"level":"error"') && line.includes('"lost":51')),
-    ).toBe(true);
+      lines.find((line) => line.includes('"level":"error"') && line.includes('"lost":51')),
+    ).toMatch(/only this line keeps the count/);
+    expect(owes(dir)).toBeNull();
     await restart(dir);
     expect(typesIn(dir)).toEqual(['relay_start', 'call', 'relay_start', 'call']);
     const report = verifyAuditLines(readAuditLines(dir));
     expect(report.problems).toEqual([]);
     expect(report.gaps).toEqual([]);
-    expect(report.uncleanStops).toEqual([expect.objectContaining({ seq: 3, lineNumber: 1 })]);
+    expect(report.uncleanStops).toEqual([
+      expect.objectContaining({ seq: 3, lineNumber: 1, afterGap: false }),
+    ]);
+  });
+
+  it('names a start that follows an audit_gap, since records lost after that gap may be counted only on stderr', async () => {
+    const dir = scratch();
+    const disk = failingDisk();
+    const run = open(dir, { fs: disk.fs });
+    run.audit.append(start(T0));
+    run.audit.append(call(T0 + 1));
+    disk.fail = 'all';
+    for (let index = 0; index < 3; index += 1) {
+      expect(run.audit.append(call(T0 + 10 + index))).toBeNull();
+    }
+    // The disk lets one line by, the audit_gap counting those three, then fails until the relay stops.
+    disk.allow = 1;
+    for (let index = 0; index < 40; index += 1) {
+      expect(run.audit.append(call(T0 + 20 + index))).toBeNull();
+    }
+    expect(run.audit.append(stop(T0 + 100))).toBeNull();
+    await run.audit.close();
+    opened.splice(opened.indexOf(run.audit), 1);
+    disk.fail = 'none';
+    await restart(dir);
+    expect(typesIn(dir)).toEqual(['relay_start', 'call', 'audit_gap', 'relay_start', 'call']);
+    const report = verifyAuditLines(readAuditLines(dir));
+    expect(report.problems).toEqual([]);
+    // The file counts three; the forty calls and the relay_stop after them are counted only on stderr.
+    expect(report.gaps).toEqual([expect.objectContaining({ seq: 3, lost: 3 })]);
+    expect(
+      run.lines.some((line) => line.includes('"level":"error"') && line.includes('"lost":41')),
+    ).toBe(true);
+    expect(report.uncleanStops).toEqual([expect.objectContaining({ seq: 4, afterGap: true })]);
+  });
+
+  it('removes an older audit.gap it cannot write over, so the next start writes no short count', async () => {
+    const dir = scratch();
+    const disk = failingDisk();
+    await stopWhileFailing(dir, disk, 'files');
+    expect(owes(dir)).toMatchObject({ seq: 3, lost: 51 });
+    // The next run starts while the files still fail, so it cannot write that gap either,
+    // loses its own records, and stops on a disk that takes nothing at all.
+    disk.fail = 'files';
+    const second = open(dir, { fs: disk.fs }, { now: T0 + 500 });
+    expect(second.audit.append(start(T0 + 500))).toBeNull();
+    for (let index = 0; index < 10; index += 1) {
+      expect(second.audit.append(call(T0 + 510 + index))).toBeNull();
+    }
+    expect(second.audit.append(stop(T0 + 600))).toBeNull();
+    disk.fail = 'all';
+    await second.audit.close();
+    opened.splice(opened.indexOf(second.audit), 1);
+    disk.fail = 'none';
+    // Its count covers the first run's 51 and its own 12, and only stderr has it.
+    expect(
+      second.lines.find((line) => line.includes('"level":"error"') && line.includes('"lost":63')),
+    ).toMatch(/only this line keeps the count/);
+    expect(owes(dir)).toBeNull();
+    await restart(dir);
+    // No audit_gap claiming 51 as if that were all.
+    expect(typesIn(dir)).toEqual(['relay_start', 'call', 'relay_start', 'call']);
+    const report = verifyAuditLines(readAuditLines(dir));
+    expect(report.problems).toEqual([]);
+    expect(report.gaps).toEqual([]);
+    expect(report.uncleanStops).toEqual([expect.objectContaining({ seq: 3, afterGap: false })]);
   });
 
   it('writes the gap at close when the disk came back after the last record', async () => {
@@ -649,27 +888,41 @@ describe('a gap still owed when the log closes (ADR 0019)', () => {
       firstAt: T0 + 1,
       lastAt: T0 + 2,
     });
-    expect(existsSync(join(dir, AUDIT_GAP_NAME))).toBe(false);
+    expect(owes(dir)).toBeNull();
   });
 
-  it('counts an owed gap once, even when audit.gap could not be removed after its record was written', async () => {
+  it('counts an owed gap once, even when audit.gap could not be cleared after its record was written', async () => {
     const dir = scratch();
     const disk = failingDisk();
     await stopWhileFailing(dir, disk, 'files');
+    const gapFds = new Set<number>();
+    const refuse = (code: string): Error => Object.assign(new Error(code), { code });
+    // A disk that will neither write over audit.gap, nor replace it, nor remove it.
     const stuck: AuditFs = {
       ...nodeFs,
+      openSync: (...args: Parameters<typeof nodeFs.openSync>) => {
+        const fd = nodeFs.openSync(...args);
+        if (String(args[0]).endsWith(AUDIT_GAP_NAME)) gapFds.add(fd);
+        return fd;
+      },
+      writeSync: ((fd: number, ...rest: [NodeJS.ArrayBufferView]) => {
+        if (gapFds.has(fd)) throw refuse('EIO');
+        return nodeFs.writeSync(fd, ...rest);
+      }) as typeof nodeFs.writeSync,
+      renameSync: (from: nodeFs.PathLike, to: nodeFs.PathLike) => {
+        if (String(to).endsWith(AUDIT_GAP_NAME)) throw refuse('EIO');
+        nodeFs.renameSync(from, to);
+      },
       unlinkSync: (path: nodeFs.PathLike) => {
-        if (String(path).endsWith(AUDIT_GAP_NAME)) {
-          throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
-        }
+        if (String(path).endsWith(AUDIT_GAP_NAME)) throw refuse('EPERM');
         nodeFs.unlinkSync(path);
       },
     };
     await restart(dir, { fs: stuck });
-    expect(existsSync(join(dir, AUDIT_GAP_NAME))).toBe(true);
-    // The next start sees the file's record already past the gap it names, and drops it.
+    expect(owes(dir)).toMatchObject({ seq: 3, lost: 51 });
+    // The next start sees the file's record already past the gap it names, and clears it.
     await restart(dir);
-    expect(existsSync(join(dir, AUDIT_GAP_NAME))).toBe(false);
+    expect(owes(dir)).toBeNull();
     expect(typesIn(dir)).toEqual([
       'relay_start',
       'call',
@@ -692,6 +945,14 @@ function typesIn(dir: string): string[] {
       return 'torn';
     }
   });
+}
+
+/** The audit_gap a closed log left owing in audit.gap, read as the next start reads it; null when none is owed. */
+function owes(dir: string): AuditLine | null {
+  const path = join(dir, AUDIT_GAP_NAME);
+  if (!existsSync(path)) return null;
+  const first = readFileSync(path, 'utf8').split('\n')[0]?.trimEnd() ?? '';
+  return first === '' ? null : AuditLineSchema.parse(JSON.parse(first));
 }
 
 describe('a short write that leaves only the newline out (ADR 0019)', () => {
@@ -808,13 +1069,33 @@ describe('one writer per directory (ADR 0019)', () => {
     };
   }
 
-  /** A process that sets a file's mtime to now every 50 ms, as a live relay refreshes its lock. */
-  function refresher(path: string): Promise<{ pid: number; stop(): Promise<void> }> {
+  /**
+   * A process that sets a file's mtime to now every 50 ms, as a live relay
+   * refreshes its lock; behindMs sets it that far in the past instead, as a
+   * relay whose clock runs behind this one's does.
+   */
+  function refresher(path: string, behindMs = 0): Promise<{ pid: number; stop(): Promise<void> }> {
     return otherProcess([
       '-e',
-      'const fs = require("node:fs"); setInterval(() => { const t = new Date(); try { fs.utimesSync(process.argv[1], t, t); } catch {} }, 50);',
+      'const fs = require("node:fs"); setInterval(() => { const t = new Date(Date.now() - Number(process.argv[2])); try { fs.utimesSync(process.argv[1], t, t); } catch {} }, 50);',
       path,
+      String(behindMs),
     ]);
+  }
+
+  /**
+   * The file system as a relay in another pid namespace on the same machine
+   * sees it, as a second container on the same host and volume does: the
+   * holder's pid names no process it can check.
+   */
+  function elsewhere(): AuditFs {
+    return {
+      ...nodeFs,
+      readlinkSync: ((path: nodeFs.PathLike, options?: unknown) =>
+        String(path) === '/proc/self/ns/pid'
+          ? 'pid:[4026500002]'
+          : nodeFs.readlinkSync(path, options as 'utf8')) as typeof nodeFs.readlinkSync,
+    };
   }
 
   /** A relay's log open in another process, holding the directory's lock as a relay does. */
@@ -982,13 +1263,59 @@ describe('one writer per directory (ADR 0019)', () => {
       await log.audit.close();
       opened.splice(opened.indexOf(log.audit), 1);
     }
-    // A lock nobody refreshed for longer than that goes at once.
+    // A lock whose mtime is long past goes sooner, but never before this relay
+    // has watched it unchanged for two refresh intervals (1 s of a 3 s stale interval).
     writeFileSync(lock, `1 ${boot} 4026500001 ${owner('ef')}\n`);
     aged(lock, 10 * 60_000);
-    const started = Date.now();
-    const log = open(dir);
-    expect(Date.now() - started).toBeLessThan(1000);
+    const started = performance.now();
+    const log = open(dir, { lockStaleMs: 3000 });
+    const waited = performance.now() - started;
+    expect(waited).toBeGreaterThanOrEqual(1000);
+    expect(waited).toBeLessThan(2500);
+    expect(log.lines.join('\n')).toContain('replaced an audit directory lock');
     await log.audit.close();
+  }, 20_000);
+
+  it("never breaks a refreshed lock at first sight, even when its relay's clock runs a minute behind this one's", async () => {
+    const view = await ownView();
+    const boot = view.split(' ')[0] ?? '-';
+    const dir = scratch();
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const lock = join(dir, AUDIT_LOCK_NAME);
+    // A relay in another container on a volume shared across hosts, whose clock is a minute
+    // behind: by this relay's clock its every refresh looks a minute old.
+    const text = `1 ${boot} 4026500001 ${owner('ef')}\n`;
+    writeFileSync(lock, text);
+    const live = await refresher(lock, 60_000);
+    try {
+      // Until that relay has refreshed it at least once, the lock still looks new.
+      for (let waited = 0; statSync(lock).mtimeMs > Date.now() - 30_000; waited += 10) {
+        if (waited > 10_000) throw new Error('the refresher never refreshed the lock');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(() => open(dir, { lockStaleMs: 600 })).toThrow(/refreshed or replaced/);
+    } finally {
+      await live.stop();
+    }
+    expect(readFileSync(lock, 'utf8')).toBe(text);
+    expect(listAuditFiles(dir)).toEqual([]);
+  }, 20_000);
+
+  it('keeps refreshing its lock while it writes nothing, so a relay that cannot see its pid refuses it however long it sat idle', async () => {
+    const dir = scratch();
+    const held = await holder(dir, 600);
+    try {
+      const lock = join(dir, AUDIT_LOCK_NAME);
+      const text = readFileSync(lock, 'utf8');
+      // Idle for more than twice the stale interval: only the holder's own timer refreshes the lock.
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      expect(() => open(dir, { lockStaleMs: 600, fs: elsewhere() })).toThrow(
+        /in use by another relay/,
+      );
+      expect(readFileSync(lock, 'utf8')).toBe(text);
+    } finally {
+      await held.stop();
+    }
   }, 20_000);
 
   it('breaks a stale lock in one step, so a relay that read it never removes the lock another relay took meanwhile', async () => {
@@ -1004,7 +1331,7 @@ describe('one writer per directory (ADR 0019)', () => {
     /** This relay has read the stale lock and is about to break it; another starts now and gets there first. */
     const interleave = (path: nodeFs.PathLike): void => {
       if (race.other !== null || String(path) !== lock) return;
-      race.other = holder(dir);
+      race.other = holder(dir, 600);
       for (let waited = 0; waited < 15_000; waited += 20) {
         pause(20);
         let text = stale;
@@ -1028,7 +1355,8 @@ describe('one writer per directory (ADR 0019)', () => {
       },
     };
     try {
-      expect(() => open(dir, { fs })).toThrow(/in use by another relay/);
+      // A short stale interval for both, since neither can check the pid the stale lock names.
+      expect(() => open(dir, { fs, lockStaleMs: 600 })).toThrow(/in use by another relay/);
       const taken = await (race.other ?? Promise.reject(new Error('no other relay started')));
       // The other relay's lock is where it put it, whole.
       expect(readFileSync(lock, 'utf8')).toMatch(new RegExp(`^${String(taken.pid)} `));
@@ -1069,6 +1397,24 @@ describe('one writer per directory (ADR 0019)', () => {
     expect(readFileSync(lock, 'utf8')).toBe(theirs);
   });
 
+  it('checks its lock before a write once a refresh is overdue, so a relay whose loop stalled writes nothing into a directory another took meanwhile', async () => {
+    const { audit, dir, lines } = open(scratch(), { lockStaleMs: 600 });
+    expect(audit.append(call(T0))?.seq).toBe(1);
+    // The loop stalls past a refresh (100 ms here), so no timer runs, and meanwhile another relay takes the directory.
+    pause(250);
+    const lock = join(dir, AUDIT_LOCK_NAME);
+    const theirs = readFileSync(lock, 'utf8').replace(/ [0-9a-f]{32}\n$/, ` ${owner('9a')}\n`);
+    rmSync(lock);
+    writeFileSync(lock, theirs);
+    // Still no timer has run: only append's own check can find the lock gone.
+    expect(audit.append(call(T0 + 1))).toBeNull();
+    expect(lines.join('\n')).toMatch(/audit directory's lock is another relay's now/);
+    expect(fileLines(dir)).toHaveLength(1);
+    await audit.close();
+    expect(fileLines(dir)).toHaveLength(1);
+    expect(readFileSync(lock, 'utf8')).toBe(theirs);
+  });
+
   it('takes its lock again when it was deleted while the log was open, and keeps writing', async () => {
     const { audit, dir, lines } = open(scratch(), { lockStaleMs: 600 });
     audit.append(call(T0));
@@ -1085,26 +1431,9 @@ describe('one writer per directory (ADR 0019)', () => {
 });
 
 describe('the timers and defaults ADR 0019 sets', () => {
-  /** An fs that counts fdatasync calls. */
-  function counting(): { fs: AuditFs; readonly syncs: number } {
-    let syncs = 0;
-    return {
-      fs: {
-        ...nodeFs,
-        fdatasyncSync: (fd: number) => {
-          syncs += 1;
-          nodeFs.fdatasyncSync(fd);
-        },
-      },
-      get syncs() {
-        return syncs;
-      },
-    };
-  }
-
   it('syncs at most once a second, one sync for a burst, and none when nothing is new', () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
-    const disk = counting();
+    const disk = countingSyncs();
     const { audit } = open(scratch(), { fs: disk.fs });
     audit.append(call(T0));
     expect(disk.syncs).toBe(0);
