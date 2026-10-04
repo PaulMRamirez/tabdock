@@ -907,6 +907,97 @@ describe('what retention counts and keeps (ADR 0019)', () => {
     expect(verifyAuditLines(readAuditLines(dir), checkpoints(lines).at(-1)).problems).toEqual([]);
   });
 
+  it('counts a file it knows at the bytes it wrote there when it is cut in place, so size retention deletes just what it would have, and names it', async () => {
+    // A twin written the same way gives the bytes the log will know its files by, so the cap can sit one byte under them all.
+    const twin = open(scratch(), { rotateBytes: 600, maxBytes: CAP });
+    for (let index = 0; index < 10; index += 1) twin.audit.append(call(T0 + index));
+    const sizes = listAuditFiles(twin.dir).map((file) => statSync(join(twin.dir, file.name)).size);
+    const wrote = sizes.reduce((sum, size) => sum + size, 0);
+    const { audit, dir, lines } = open(scratch(), { rotateBytes: 600, maxBytes: wrote - 1 });
+    for (let index = 0; index < 10; index += 1) audit.append(call(T0 + index));
+    const files = listAuditFiles(dir);
+    expect(files.map((file) => statSync(join(dir, file.name)).size)).toEqual(sizes);
+    expect(lines.filter((line) => line.includes('deleted by retention'))).toEqual([]);
+    // The oldest file, cut to nothing in place while the relay runs.
+    const [cut, next] = files;
+    truncateSync(join(dir, cut?.name ?? ''), 0);
+    // The next record rotates, and the rotation's retention counts the cut file at the bytes the log wrote there.
+    audit.append(call(T0 + 10));
+    await audit.close();
+    expect(logged(lines, 'error')).toEqual([
+      expect.objectContaining({
+        msg: expect.stringMatching(/changed size other than by its own writes/) as string,
+        file: cut?.name,
+        bytes: 0,
+        knownBytes: sizes[0],
+      }),
+    ]);
+    // One byte past the cap; deleting the cut file, counted at those bytes, brings it under, so nothing else goes.
+    expect(
+      logged(lines, 'info').filter((line) => line.msg === 'audit file deleted by retention'),
+    ).toEqual([
+      expect.objectContaining({
+        file: cut?.name,
+        reason: 'size',
+        total: wrote,
+        maxBytes: wrote - 1,
+      }),
+    ]);
+    const newest = checkpoints(lines).at(-1);
+    expect(newest).toMatchObject({ seq: 11, first: next?.firstSeq });
+    expect(verifyAuditLines(readAuditLines(dir), newest).problems).toEqual([]);
+  });
+
+  it('counts the newlines it writes to close its own lines as its bytes, so a torn line or one short of its newline never reads as a file changed in place', async () => {
+    // The next record's write lands only its first bytes, or every byte but its newline, as a disk filling there leaves it.
+    const disk = { next: 'whole' as 'whole' | 'torn' | 'short' };
+    const fs: AuditFs = {
+      ...nodeFs,
+      writeSync: ((fd: number, buffer: NodeJS.ArrayBufferView) => {
+        const bytes = buffer as Buffer;
+        const write = disk.next;
+        disk.next = 'whole';
+        if (write === 'torn') return nodeFs.writeSync(fd, bytes, 0, 10);
+        if (write === 'short') return nodeFs.writeSync(fd, bytes, 0, bytes.length - 1);
+        return nodeFs.writeSync(fd, bytes);
+      }) as typeof nodeFs.writeSync,
+    };
+    const clock = { now: T0 };
+    // A cap of one byte, so the next rotation's retention deletes the closed file for size and names the bytes it counted.
+    const { audit, dir, lines } = open(scratch(), { fs, maxBytes: 1 }, clock);
+    audit.append(call(T0));
+    // A torn line: the next record's write opens the file again, closing the line with a newline of the log's own.
+    disk.next = 'torn';
+    expect(audit.append(call(T0 + 1))).toBeNull();
+    expect(audit.append(call(T0 + 2))).toMatchObject({ seq: 3 });
+    // A line short of its newline alone: the log writes the newline at once.
+    disk.next = 'short';
+    expect(audit.append(call(T0 + 3))).toMatchObject({ seq: 4 });
+    const [file] = listAuditFiles(dir);
+    const bytes = statSync(join(dir, file?.name ?? '')).size;
+    expect(verifyAuditLines(readAuditLines(dir))).toMatchObject({
+      records: 4,
+      lastSeq: 4,
+      problems: [],
+      torn: [expect.objectContaining({ file: file?.name })],
+    });
+    clock.now = T0 + DAY;
+    audit.append(call(clock.now));
+    await audit.close();
+    // Only the torn write's own error: the size the log knows is the size on disk, both newlines included.
+    expect(logged(lines, 'error')).toEqual([
+      expect.objectContaining({
+        msg: expect.stringMatching(/audit file write failed/) as string,
+        error: 'ESHORT',
+      }),
+    ]);
+    expect(
+      logged(lines, 'info').filter((line) => line.msg === 'audit file deleted by retention'),
+    ).toEqual([
+      expect.objectContaining({ file: file?.name, reason: 'size', total: bytes, maxBytes: 1 }),
+    ]);
+  });
+
   it('counts only its own bytes in a file it makes under a name something else took first', async () => {
     const clock = { now: T0 };
     const { audit, dir, lines } = open(scratch(), { maxBytes: CAP }, clock);
@@ -1002,6 +1093,58 @@ describe('what retention counts and keeps (ADR 0019)', () => {
       }),
     ]);
   });
+
+  it.each([
+    ['empty, with the seq of the second, sorting after it', 2, 4, ''],
+    ['empty, with a seq the second held', 1, 5, ''],
+    ['with the seq of the second and a line of its own, sorting after it', 2, 4, 'x\n'],
+  ])(
+    'names every record a run of files gone held, even beside a file planted before the start %s',
+    async (_, plantedDay, plantedSeq, plantedText) => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+      const start = Date.parse('2026-10-01T12:00:00.000Z');
+      const clock = { now: start };
+      const dir = scratch();
+      const first = open(dir, {}, clock);
+      for (let day = 0; day < 4; day += 1) {
+        clock.now = start + day * DAY;
+        for (let index = 0; index < 3; index += 1) first.audit.append(call(clock.now + index));
+      }
+      await first.audit.close();
+      opened.splice(opened.indexOf(first.audit), 1);
+      const stop = checkpoints(first.lines).at(-1);
+      const files = listAuditFiles(dir);
+      expect(files.map((file) => file.firstSeq)).toEqual([1, 4, 7, 10]);
+      // While no relay runs, a file beside the second, which holds seqs 4 to 6.
+      const planted = `audit-${utcDay(start + plantedDay * DAY)}-${String(plantedSeq).padStart(12, '0')}.jsonl`;
+      writeFileSync(join(dir, planted), plantedText, { mode: 0o600 });
+      const second = open(dir, {}, clock);
+      expect(checkpoints(second.lines)).toEqual([stop]);
+      // While it runs, the first two files, well inside the retention, are deleted by hand, and the hourly pass looks.
+      for (const file of files.slice(0, 2)) rmSync(join(dir, file.name));
+      vi.advanceTimersByTime(AUDIT_RETENTION_CHECK_MS);
+      second.audit.append(call(clock.now));
+      await second.audit.close();
+      // One hole, up to where the third file starts: an empty file says nothing of where the second's records end,
+      // and one that starts where the second did holds none of the seqs after it, so neither ends the hole.
+      expect(logged(second.lines, 'error')).toEqual([
+        expect.objectContaining({
+          msg: expect.stringMatching(/missing from the start of the log/) as string,
+          from: 1,
+          to: 6,
+        }),
+      ]);
+      const newest = checkpoints(second.lines).at(-1);
+      expect(newest).toMatchObject({ seq: 13, first: 1 });
+      expect(verifyAuditLines(readAuditLines(dir), newest).problems).toEqual([
+        expect.objectContaining({
+          problem: expect.stringMatching(
+            /the log starts at seq 7, but the checkpoint says it kept every record from seq 1/,
+          ) as string,
+        }),
+      ]);
+    },
+  );
 
   it('lets a file it made go without stopping first there when no line ever landed in it', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });

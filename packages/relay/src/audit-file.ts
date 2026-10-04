@@ -424,7 +424,8 @@ interface KnownFile {
   /**
    * Whether it may hold a record: found at open with any bytes in it, or
    * made here and a whole line landed in it. One gone that held none lost
-   * nothing; this, never the name of the file after it, says so.
+   * nothing; this, never the name of the file after it, says so. One that
+   * held none never says where the records of files gone before it end.
    */
   held: boolean;
   deleted: boolean;
@@ -1112,8 +1113,9 @@ export class FileAuditLog implements AuditLog {
    * never to a seq read from the directory: once retention has deleted the
    * oldest file it knows, first is where the next one it knows starts. A
    * file it knows that is gone from the directory, and that its retention
-   * did not delete, was removed some other way: the seqs from its start to
-   * the next file it knows that starts later are logged as missing, and
+   * did not delete, was removed some other way: the seqs from its start up
+   * to the next file it knows that may hold a record and starts after every
+   * file in that run of files gone are logged as missing, and
    * first never passes them for the rest of the run, so once it reaches
    * them every checkpoint names the hole and --verify against it fails. A
    * file this log does not know, planted under whatever name, moves first
@@ -1138,19 +1140,30 @@ export class FileAuditLog implements AuditLog {
     // With no file left that it knows, the next line starts the log.
     if (moved) this.#first = this.#known[0]?.firstSeq ?? this.#nextSeq;
     const holes = new Set<string>();
-    let hole: { from: number; atStart: boolean } | null = null;
+    /** A run of files gone: the seq its first starts at, and the seq its last starts at. */
+    let hole: { from: number; last: number; atStart: boolean } | null = null;
     // null after the last: a run of files gone at the end held up to the last line written.
     for (const file of [...this.#known, null]) {
       if (file !== null && gone(file)) {
         // At the start when no file it knows starts before it.
-        hole ??= { from: file.firstSeq, atStart: this.#known[0]?.firstSeq === file.firstSeq };
+        hole ??= {
+          from: file.firstSeq,
+          last: file.firstSeq,
+          atStart: this.#known[0]?.firstSeq === file.firstSeq,
+        };
+        hole.last = file.firstSeq;
         continue;
       }
-      // A file that starts where the hole does holds none of the seqs after
-      // it: the file gone held them, as an empty one planted beside it would
-      // otherwise hide.
-      if (hole === null || (file !== null && file.firstSeq <= hole.from)) continue;
-      // What a run of files gone held: up to the next file known that starts later, deleted by retention or not.
+      // Only a file that may hold a record and starts after every file in the
+      // run says where the run's records end. One that held none says nothing
+      // of where they end, and one that starts with a file gone holds none of
+      // the seqs after it, so a file planted beside the run, empty under any
+      // seq or sharing the seq of a file in it, would otherwise cut the hole
+      // short and hide the rest.
+      if (hole === null || (file !== null && (!file.held || file.firstSeq <= hole.last))) {
+        continue;
+      }
+      // What a run of files gone held: up to the next file known that starts later and may hold a record, deleted by retention or not.
       const to = (file?.firstSeq ?? this.#nextSeq) - 1;
       if (to >= hole.from) this.#reportMissing(hole.from, to, hole.atStart, holes);
       hole = null;
