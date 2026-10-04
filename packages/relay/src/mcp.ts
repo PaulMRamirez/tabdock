@@ -8,8 +8,10 @@
 // arguments are checked, so refusals and malformed calls count too: a member
 // has more than an invitee, and past it the answer is rate_limited with a
 // record within the refusal budget. The same budget counts each
-// subscriptions/listen a 2026-07-28 client sends (listen-streams.ts). Nothing here counts by address,
-// since all of hosted Claude arrives from one range (ADR 0016). An invitee
+// subscriptions/listen a 2026-07-28 client sends (listen-streams.ts), and
+// each 2026-07-28 request the SDK refuses before any tool runs (relay.ts).
+// Nothing here counts by address, since all of hosted Claude arrives from
+// one range (ADR 0016). An invitee
 // (ADR 0017) gets the same five tools on the pages it holds and pairs only
 // by invite. With the M3 spike flag on (spike.ts, ADR 0014) a marker tool may
 // sit beside the five for members, and call_page_tool results carry
@@ -303,8 +305,9 @@ export function userIdOf(authInfo: AuthInfo | undefined): string | null {
 
 /**
  * ADR 0018's per-user request budget. One per relay, shared by every server
- * the factory builds and by the listen streams (listen-streams.ts), so a
- * client cannot reset it by opening a new session, request or stream.
+ * the factory builds, by the listen streams (listen-streams.ts) and by the
+ * 2026-07-28 leg for the requests the SDK refuses (relay.ts), so a client
+ * cannot reset it by opening a new session, request or stream.
  */
 export interface RequestBudget {
   /** Counts one request for the user, or answers false, counting nothing, once it is past the budget. */

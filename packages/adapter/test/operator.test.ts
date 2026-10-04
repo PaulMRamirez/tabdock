@@ -685,8 +685,9 @@ describe('revoke (S8)', () => {
     expect(h.dock.revoke('bob')).toBe(true);
     const after = socket.frames().slice(before);
     expect(after[0]).toEqual({ t: 'revoke', userId: 'bob' });
+    // The relay ends Bob's request as it applies the revoke, so the page sends
+    // no decision for it: one would only reach a request already gone (A4.3).
     expect(after.slice(1)).toEqual([
-      { t: 'attach_decision', requestId: 'bob-again', allow: false },
       {
         t: 'result',
         callId: 'bob-read',
@@ -727,6 +728,23 @@ describe('revoke (S8)', () => {
     expect(h.dock.approve('carol-1', 'observer')).toBe(true);
     expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { carol: { role: 'observer' } } });
     expect(h.dock.revoke('*')).toBe(true);
+  });
+
+  it('sends one revoke for * and no decision for any request it ends, however many wait', async () => {
+    const h = setup();
+    const socket = await link(h, {}, { alice: 'driver' });
+    for (let i = 0; i < 21; i += 1) {
+      socket.deliver({
+        ...attachRequest(h.clock, `wait-${String(i)}`),
+        user: { userId: `user${String(i)}`, displayName: `User ${String(i)}` },
+      });
+    }
+    expect(h.dock.state.pendingRequests).toHaveLength(21);
+    const before = socket.sent.length;
+    expect(h.dock.revoke('*')).toBe(true);
+    // Each would reach a request the relay's revoke had already ended (A4.3).
+    expect(socket.frames().slice(before)).toEqual([{ t: 'revoke', userId: '*' }]);
+    expect(h.dock.state.pendingRequests).toEqual([]);
   });
 
   it('refuses a malformed id and a user with nothing to revoke', async () => {

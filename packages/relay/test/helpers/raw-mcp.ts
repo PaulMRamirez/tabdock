@@ -128,13 +128,44 @@ export interface OpenListen extends OpenStream {
 
 let nextListen = 0;
 
+/** What a test changes about a listen, to send one the SDK or the relay refuses. */
+export interface ListenOptions {
+  /** Spaces put inside the body, making it this many bytes larger. */
+  pad?: number;
+  /** In place of the usual params, notifications and _meta included. */
+  params?: Record<string, unknown>;
+  /** false sends it without an id, as a notification. */
+  id?: false;
+  /** Over the usual headers, such as another Content-Type. */
+  headers?: Record<string, string>;
+}
+
 /**
  * A 2026-07-28 subscriptions/listen, as the SDK client sends it, held open
  * until close(); an answer that is not a stream is read whole into `text`.
  */
-export async function openListen(relay: Relay, user: DevTokenUser): Promise<OpenListen> {
+export async function openListen(
+  relay: Relay,
+  user: DevTokenUser,
+  options: ListenOptions = {},
+): Promise<OpenListen> {
   nextListen += 1;
   const abort = new AbortController();
+  const message = {
+    jsonrpc: '2.0',
+    ...(options.id === false ? {} : { id: `listen:${String(nextListen)}` }),
+    method: 'subscriptions/listen',
+    params: options.params ?? {
+      _meta: {
+        'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+        'io.modelcontextprotocol/clientInfo': { name: 'raw-listen', version: '1.0.0' },
+        'io.modelcontextprotocol/clientCapabilities': {},
+      },
+      notifications: { toolsListChanged: true },
+    },
+  };
+  const json = JSON.stringify(message);
+  const body = options.pad === undefined ? json : `${json.slice(0, -1)}${' '.repeat(options.pad)}}`;
   const response = await fetch(relay.mcpUrl, {
     method: 'POST',
     headers: {
@@ -143,20 +174,9 @@ export async function openListen(relay: Relay, user: DevTokenUser): Promise<Open
       Accept: 'application/json, text/event-stream',
       'Mcp-Method': 'subscriptions/listen',
       'Mcp-Protocol-Version': '2026-07-28',
+      ...options.headers,
     },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: `listen:${String(nextListen)}`,
-      method: 'subscriptions/listen',
-      params: {
-        _meta: {
-          'io.modelcontextprotocol/protocolVersion': '2026-07-28',
-          'io.modelcontextprotocol/clientInfo': { name: 'raw-listen', version: '1.0.0' },
-          'io.modelcontextprotocol/clientCapabilities': {},
-        },
-        notifications: { toolsListChanged: true },
-      },
-    }),
+    body,
     signal: abort.signal,
   });
   const streaming = (response.headers.get('content-type') ?? '').startsWith('text/event-stream');

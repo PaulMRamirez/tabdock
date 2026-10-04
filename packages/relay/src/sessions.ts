@@ -5,7 +5,11 @@
 // session to the user who opened it: handed a stolen session id, it runs the
 // call on the owner's server. So every session records its owner, and anyone
 // else presenting its id gets the same 404 as an unknown id before the SDK sees
-// the request (S13). Idle expiry and the caps are ours as well.
+// the request (S13). Idle expiry and the caps are ours as well. Nothing here
+// spends a request budget (ADR 0018 counts tool calls, never initialize), so
+// the lines a client can cause at will, refusals and sessions it opens and
+// drops in a loop, go through the relay's budget for repeated lines
+// (repeated-lines.ts): one per kind a window, the rest counted (A4.3).
 
 import { randomUUID } from 'node:crypto';
 import {
@@ -16,7 +20,8 @@ import {
   readRequestBody,
   WebStandardStreamableHTTPServerTransport,
 } from '@modelcontextprotocol/server';
-import type { Logger } from './log.ts';
+import type { Logger, LogFields, LogLevel } from './log.ts';
+import type { RepeatedLog } from './repeated-lines.ts';
 
 /**
  * The invitee tier's sessions (ADRs 0016 and 0017): an invitee may hold one
@@ -76,6 +81,13 @@ export interface SessionOptions {
   keepAliveMs: number;
   maxRequestBodySize: number;
   log: Logger;
+  /**
+   * Where the lines a client can cause at will go: refusals, and sessions
+   * opened and dropped in a loop, none of which spends a request budget. The
+   * relay's own collapses repeats (repeated-lines.ts); without it every line
+   * goes to log.
+   */
+  lines?: RepeatedLog | undefined;
 }
 
 interface Session {
@@ -203,7 +215,7 @@ export class McpSessions {
       const session = this.#sessions.get(sessionId);
       if (!session?.ready || session.closed || session.userId !== userId) {
         if (session?.ready && session.userId !== userId) {
-          this.#options.log.warn('MCP session id presented by another user', { userId });
+          this.#line('warn', 'MCP session id presented by another user', { userId });
         }
         return sessionNotFound();
       }
@@ -246,7 +258,7 @@ export class McpSessions {
         if (opened) opened.ready = true;
       },
       onsessionclosed: () => {
-        this.#options.log.info('MCP session ended by the client', { userId });
+        this.#line('info', 'MCP session ended by the client', { userId });
       },
       maxRequestBodySize: this.#options.maxRequestBodySize,
       keepAliveMs: this.#options.keepAliveMs,
@@ -320,7 +332,7 @@ export class McpSessions {
 
   /** null when there is room for one more session of this user, else the refusal. */
   #makeRoom(userId: string): Response | null {
-    const { total, log, invitees } = this.#options;
+    const { total, invitees } = this.#options;
     const rank = rankOf(userId, invitees);
     // The tier's rules when this user is an invitee, else null.
     const tier = rank === MEMBER ? null : (invitees ?? null);
@@ -334,7 +346,9 @@ export class McpSessions {
     if (mine.length >= perUser) {
       const idle = this.#idlest(mine, true);
       if (!idle) {
-        log.warn('MCP session refused: the user holds the most sessions allowed', { userId });
+        this.#line('warn', 'MCP session refused: the user holds the most sessions allowed', {
+          userId,
+        });
         return jsonRpcError(
           429,
           -32000,
@@ -351,7 +365,9 @@ export class McpSessions {
       if (pool.length >= tier.pool) {
         const evicted = this.#giveWay(pool, rank);
         if (!evicted) {
-          log.warn('MCP session refused: invitees hold the most sessions allowed', { userId });
+          this.#line('warn', 'MCP session refused: invitees hold the most sessions allowed', {
+            userId,
+          });
           return jsonRpcError(503, -32000, 'Too many open sessions on this relay; try again later');
         }
         void this.#close(evicted, 'evicted for a newer invitee session');
@@ -363,7 +379,9 @@ export class McpSessions {
       const tiered = open().filter((session) => this.#isInvitee(session));
       const evicted = this.#giveWay(tiered, rank);
       if (evicted === undefined) {
-        log.warn('MCP session refused: the relay holds the most sessions allowed', { userId });
+        this.#line('warn', 'MCP session refused: the relay holds the most sessions allowed', {
+          userId,
+        });
         return jsonRpcError(503, -32000, 'Too many open sessions on this relay; try again later');
       }
       void this.#close(evicted, 'evicted for a newer session: the relay is full');
@@ -413,14 +431,22 @@ export class McpSessions {
   #close(session: Session, reason: string): Promise<void> {
     if (session.closed) return Promise.resolve();
     this.#forget(session);
-    this.#options.log.info('MCP session closed', {
-      userId: session.userId,
+    this.#line(
+      'info',
+      'MCP session closed',
+      { userId: session.userId, reason, sessions: this.#sessions.size },
       reason,
-      sessions: this.#sessions.size,
-    });
+    );
     return session.server.close().catch((error: unknown) => {
-      this.#options.log.warn('MCP session did not close cleanly', { error });
+      this.#line('warn', 'MCP session did not close cleanly', { error });
     });
+  }
+
+  /** A line a client can cause at will, through the relay's budget for them when it has one. */
+  #line(level: LogLevel, message: string, fields: LogFields, detail?: string): void {
+    const { lines, log } = this.#options;
+    if (lines) lines.write(level, message, fields, detail);
+    else log[level](message, fields);
   }
 
   async closeAll(): Promise<void> {

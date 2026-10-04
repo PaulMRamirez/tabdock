@@ -1,6 +1,7 @@
 import type { Client } from '@modelcontextprotocol/client';
 import { afterEach, describe, expect, it } from 'vitest';
 import { type AuthPlugin, createDevTokenAuth, createLogger, redact } from '../src/index.ts';
+import { MAX_ERROR_MESSAGE_CHARS } from '../src/log.ts';
 import { connectPage, type TestPage, TOOLS } from './helpers/page-client.ts';
 import {
   ALICE,
@@ -52,6 +53,19 @@ describe('the logger', () => {
       keep: 'visible',
       bytes: '[bytes]',
     });
+  });
+
+  it("cuts an error's message short, since a library's may quote a request's own text (A4.3)", () => {
+    const long = new Error(`Rejected inbound request (cell): method ${'A'.repeat(2_000_000)}`);
+    const redacted = redact({ error: long }) as { error: Record<string, unknown> };
+    expect(redacted.error).toEqual({
+      name: 'Error',
+      message: long.message.slice(0, MAX_ERROR_MESSAGE_CHARS),
+      messageChars: long.message.length,
+    });
+    expect(MAX_ERROR_MESSAGE_CHARS).toBe(200);
+    // A short one is kept whole, as before.
+    expect(redact(new Error('boom'))).toEqual({ name: 'Error', message: 'boom' });
   });
 
   it('survives a sink that throws and cyclic values', () => {

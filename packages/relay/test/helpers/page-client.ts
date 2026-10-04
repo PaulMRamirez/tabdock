@@ -89,6 +89,8 @@ export class TestPage {
   pairingUrl: string | undefined;
   onInvoke: PageOptions['onInvoke'];
   readonly #autoPong: boolean;
+  /** Pings sent through send(), each answered by one pong. */
+  #pings = 0;
   readonly #queue: RelayFrame[] = [];
   readonly #waiters: { type: string; resolve: (frame: RelayFrame) => void }[] = [];
 
@@ -174,6 +176,7 @@ export class TestPage {
   }
 
   send(frame: PageFrameInput | Record<string, unknown>): void {
+    if (frame.t === 'ping') this.#pings += 1;
     this.ws.send(encodeFrame(frame as PageFrameInput));
   }
 
@@ -181,10 +184,15 @@ export class TestPage {
     this.ws.send(data, { binary });
   }
 
-  /** A ping round trip: once the pong is back, the relay has handled every earlier frame. */
+  /**
+   * A ping round trip: once its own pong is back, the relay has handled every
+   * earlier frame. The relay answers pings in order, so that pong is the one
+   * that brings the pongs received up to the pings sent; a pong for an earlier
+   * ping, queued unclaimed or still on its way, is no barrier at all.
+   */
   async sync(): Promise<void> {
     this.send({ t: 'ping' });
-    await this.next('pong');
+    while (this.all('pong').length < this.#pings) await this.next('pong');
   }
 
   async close(): Promise<void> {

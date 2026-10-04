@@ -11,7 +11,10 @@
 // every redemption still goes to the page as an attach request carrying the
 // presented secret, since the adapter alone decides whether an invite is good.
 // Every audit record (S7, ADR 0019) is written here, and a refusal that never
-// reached a page passes the refusal budget first (audit-budget.ts).
+// reached a page passes the refusal budget first (audit-budget.ts). A page
+// frame that changes nothing writes its lines only within a budget per socket
+// and per address, past which they are counted, and never closes the page
+// (ADR 0023).
 
 import {
   type AttachmentView,
@@ -65,8 +68,9 @@ import {
 import { AuditRefusalBudget } from './audit-budget.ts';
 import { foldName, type UserAccount } from './auth.ts';
 import type { ResolvedConfig } from './config.ts';
-import type { Logger } from './log.ts';
+import type { LogFields, Logger, LogLevel } from './log.ts';
 import { SlidingWindowLimiter } from './rate-limit.ts';
+import { RepeatedLines } from './repeated-lines.ts';
 import {
   digest,
   digestHex,
@@ -400,6 +404,111 @@ interface Conn {
   toolsFrames: number[];
   /** When this socket's recent frames that changed nothing arrived, for ignoredFramesPerSocket. */
   ignoredFrames: number[];
+}
+
+/**
+ * Client addresses whose held-back lines one window tracks; past it the rest
+ * share one count, as auth-log.ts does, since behind a host edge every IPv6
+ * /56 is an address of its own.
+ */
+const MAX_ADDRESSES_HOLDING_LINES = 10_000;
+/**
+ * How long past a request's own lifetime a page's decision for it is still
+ * expected once the relay has ended it: the page's timer runs on its own
+ * clock and its answer crosses the network (#decision).
+ */
+const ENDED_REQUEST_GRACE_MS = 30_000;
+/** Ended requests remembered at once; pairing limits keep the real number far below. */
+const MAX_ENDED_REQUESTS = 10_000;
+
+/** One line a frame's handler wrote, held until it is known whether the frame changed anything. */
+interface HeldLine {
+  level: LogLevel;
+  message: string;
+  fields: LogFields | undefined;
+  /** An audit record's stderr copy, which is written whatever the frame did (ADR 0019). */
+  kept: boolean;
+}
+
+/**
+ * The hub's logger, which can hold the lines one page frame's handler writes
+ * (hold) and then write them all, or only those it must keep (write).
+ * Handlers run synchronously, so nothing else writes while lines are held.
+ */
+class FrameLog implements Logger {
+  readonly #inner: Logger;
+  #held: HeldLine[] | null = null;
+  /**
+   * The same logger for audit records' stderr copies, which are never held
+   * back: while the audit disk fails they are the only copy (ADR 0019).
+   */
+  readonly kept: Logger;
+
+  constructor(inner: Logger) {
+    this.#inner = inner;
+    this.kept = {
+      debug: (message, fields) => {
+        this.#line('debug', message, fields, true);
+      },
+      info: (message, fields) => {
+        this.#line('info', message, fields, true);
+      },
+      warn: (message, fields) => {
+        this.#line('warn', message, fields, true);
+      },
+      error: (message, fields) => {
+        this.#line('error', message, fields, true);
+      },
+    };
+  }
+
+  debug(message: string, fields?: LogFields): void {
+    this.#line('debug', message, fields, false);
+  }
+
+  info(message: string, fields?: LogFields): void {
+    this.#line('info', message, fields, false);
+  }
+
+  warn(message: string, fields?: LogFields): void {
+    this.#line('warn', message, fields, false);
+  }
+
+  error(message: string, fields?: LogFields): void {
+    this.#line('error', message, fields, false);
+  }
+
+  /**
+   * Runs a handler, holding every line it writes; its answer, and those
+   * lines. A handler that throws has its lines written first, as they would
+   * have been without holding them.
+   */
+  hold<T>(handle: () => T): { result: T; lines: HeldLine[] } {
+    const outer = this.#held;
+    const lines: HeldLine[] = [];
+    this.#held = lines;
+    try {
+      return { result: handle(), lines };
+    } catch (error) {
+      this.#held = outer;
+      this.write(lines, true);
+      throw error;
+    } finally {
+      this.#held = outer;
+    }
+  }
+
+  /** Writes held lines in order: all of them, or only those that must be kept. */
+  write(lines: readonly HeldLine[], all: boolean): void {
+    for (const { level, message, fields, kept } of lines) {
+      if (all || kept) this.#inner[level](message, fields);
+    }
+  }
+
+  #line(level: LogLevel, message: string, fields: LogFields | undefined, kept: boolean): void {
+    if (this.#held === null) this.#inner[level](message, fields);
+    else this.#held.push({ level, message, fields, kept });
+  }
 }
 
 const CLOSE_POLICY = 1008;
@@ -841,8 +950,19 @@ export class PageHub {
   readonly #callLimiter: SlidingWindowLimiter;
   /** Tools frames per remote address, shared by its sockets and kept across reconnects. */
   readonly #toolsFrameLimiter: SlidingWindowLimiter;
-  /** Frames that changed nothing per remote address, shared and kept the same way (#ignored). */
-  readonly #ignoredFrameLimiter: SlidingWindowLimiter;
+  /**
+   * Lines of frames that changed nothing, per remote address: written in full
+   * up to ignoredFramesPerAddress a window, across the address's sockets and
+   * reconnects, then held back and counted (#ignored, ADR 0023).
+   */
+  readonly #ignoredLines: RepeatedLines;
+  /** The hub's own lines, which a frame's handler can hold until it is known whether it changed anything. */
+  readonly #frameLog: FrameLog;
+  /**
+   * Requests each page just had ended, by id, oldest first: a decision the
+   * page sends for one is expected, since the page may not yet know (#decision).
+   */
+  readonly #endedRequests = new Map<string, { pageId: string; until: number }>();
   /**
    * Redemptions of one invite, whoever makes them (ADR 0017), keyed by page
    * and invite id, so only live invites, which a page holds ten of at most,
@@ -869,7 +989,8 @@ export class PageHub {
   ) {
     this.#config = config;
     this.#store = store;
-    this.#log = log;
+    this.#frameLog = new FrameLog(log);
+    this.#log = this.#frameLog;
     this.#spike = spike;
     const {
       pairAttemptsPerUser,
@@ -887,7 +1008,18 @@ export class PageHub {
     this.#pageLimiter = new SlidingWindowLimiter(pairAttemptsPerPage, windowMs);
     this.#callLimiter = new SlidingWindowLimiter(callsPerUserPerPage, windowMs);
     this.#toolsFrameLimiter = new SlidingWindowLimiter(toolsFramesPerAddress, toolsFramesWindowMs);
-    this.#ignoredFrameLimiter = new SlidingWindowLimiter(ignoredFramesPerAddress, windowMs);
+    this.#ignoredLines = new RepeatedLines({
+      linesPerKey: ignoredFramesPerAddress,
+      windowMs,
+      maxKeys: MAX_ADDRESSES_HOLDING_LINES,
+      summary: (address, held) => {
+        log.warn('page frames that changed nothing went unlogged', {
+          ...(address === null ? { addresses: 'more than tracked' } : { address }),
+          repeated: held.repeated,
+          frames: held.reasons,
+        });
+      },
+    });
     this.#inviteLimiter = new SlidingWindowLimiter(redemptionsPerInvite, windowMs);
     this.#grantLimiter = new SlidingWindowLimiter(OPERATOR_GRANTS_PER_PAGE, windowMs);
     this.#grantWarnings = new SlidingWindowLimiter(1, windowMs);
@@ -1023,11 +1155,20 @@ export class PageHub {
     const text = rawToText(data);
     const parsed = parsePageFrame(text);
     if (parsed.kind === 'unknown') {
-      this.#log.warn('ignored a frame of unknown type', {
-        pageId: conn.pageId,
-        frameType: parsed.type,
+      const { pageId } = conn;
+      // The first frame must be hello, whatever comes instead (ADR 0023).
+      if (pageId === null) {
+        this.#log.warn('closing page socket: first frame was not hello', {
+          frameType: parsed.type,
+        });
+        this.#closeSocket(conn, CLOSE_POLICY, 'first frame must be hello');
+        return;
+      }
+      // A newer adapter's frame, or junk: ignored, and logged within the budget.
+      this.#mayChangeNothing(conn, 'unknown type', () => {
+        this.#log.warn('ignored a frame of unknown type', { pageId, frameType: parsed.type });
+        return false;
       });
-      this.#ignored(conn);
       return;
     }
     if (parsed.kind === 'invalid') {
@@ -1059,20 +1200,20 @@ export class PageHub {
         return;
       // Each of these says whether it changed anything; one that did not counts (#ignored).
       case 'attach_decision':
-        if (!this.#decision(pageId, frame)) this.#ignored(conn);
+        this.#mayChangeNothing(conn, frame.t, () => this.#decision(pageId, frame));
         return;
       case 'set_role':
-        if (!this.#setRole(pageId, frame)) this.#ignored(conn);
+        this.#mayChangeNothing(conn, frame.t, () => this.#setRole(pageId, frame));
         return;
       case 'revoke':
-        if (!this.#revoke(pageId, frame)) this.#ignored(conn);
+        this.#mayChangeNothing(conn, frame.t, () => this.#revoke(pageId, frame));
         return;
       case 'rotate_pairing':
         this.#rotateTicket(pageId, 'asked by page');
         return;
       case 'invite_create':
       case 'invite_cancel':
-        if (!this.#inviteFrame(pageId, frame)) this.#ignored(conn);
+        this.#mayChangeNothing(conn, frame.t, () => this.#inviteFrame(pageId, frame));
         return;
       case 'result':
         this.#result(conn, pageId, frame);
@@ -1598,38 +1739,41 @@ export class PageHub {
   }
 
   /**
-   * Counts a frame the relay ignored or refused, which changed nothing and
-   * may have written a log line (ignoredFramesPerSocket lists them). /page
-   * needs no credential, so without a budget one socket could write a line
-   * to stderr for every 16-byte frame, the copy that keeps the audit
-   * checkpoints and, while the audit disk fails, the records themselves (ADR
-   * 0019). Each socket has a budget, and each remote address one across its
-   * sockets and reconnects; past either the socket is closed as a policy
-   * breach, so it writes at most its budget, the frame that passed it and
-   * one more line. A page that sleeps this way resumes like any other.
+   * Handles a frame that may change nothing. `handle` answers whether it
+   * changed something (or was a frame the page was expected to send), and
+   * every line it writes is held until then: written as usual if it did,
+   * and otherwise only within the budget for frames that change nothing.
    */
-  #ignored(conn: Conn): void {
-    if (conn.closing) return;
+  #mayChangeNothing(conn: Conn, kind: string, handle: () => boolean): void {
+    const { result: changed, lines } = this.#frameLog.hold(handle);
+    this.#frameLog.write(lines, changed || this.#ignored(conn, kind));
+  }
+
+  /**
+   * Whether the lines of a frame that changed nothing may be written; one
+   * that may not is counted by its kind, into a summary line for its address
+   * when the window ends (ADR 0023). /page needs no credential, so without
+   * a budget one socket could write a line to stderr for every 16-byte frame,
+   * to the copy that keeps the audit checkpoints and, while the audit disk
+   * fails, the records themselves (ADR 0019). Each socket may write the lines
+   * of ignoredFramesPerSocket such frames a window, and each remote address
+   * those of ignoredFramesPerAddress across its sockets and reconnects. Past
+   * either the lines are held back, never the page: a frame that only logs
+   * is no reason to close a socket, and whoever shares the page's address
+   * can at most spend the address's lines, never end the operator's page
+   * or the calls and requests waiting on it.
+   */
+  #ignored(conn: Conn, kind: string): boolean {
     const now = Date.now();
     const { ignoredFramesPerSocket, windowMs } = this.#config.rateLimits;
     conn.ignoredFrames = conn.ignoredFrames.filter((at) => at > now - windowMs);
     if (conn.ignoredFrames.length >= ignoredFramesPerSocket) {
-      this.#log.warn('closing page socket: too many frames that changed nothing', {
-        pageId: conn.pageId,
-      });
-      this.#closeSocket(conn, CLOSE_POLICY, 'too many ignored frames');
-      return;
+      this.#ignoredLines.hold(conn.address, kind, undefined, now);
+      return false;
     }
-    if (!this.#ignoredFrameLimiter.allows(conn.address, now)) {
-      this.#log.warn('closing page socket: too many frames that changed nothing from its address', {
-        pageId: conn.pageId,
-        address: conn.address,
-      });
-      this.#closeSocket(conn, CLOSE_POLICY, 'too many ignored frames from this address');
-      return;
-    }
-    this.#ignoredFrameLimiter.record(conn.address, now);
+    if (!this.#ignoredLines.take(conn.address, kind, undefined, now)) return false;
     conn.ignoredFrames.push(now);
+    return true;
   }
 
   #tools(conn: Conn, pageId: string, frame: FrameOf<'tools'>): void {
@@ -1995,11 +2139,22 @@ export class PageHub {
     );
   }
 
-  /** The page's answer to an attach request; false when it named none of the page's. */
+  /**
+   * The page's answer to an attach request; false when it named none of the
+   * page's, live or just ended. A decision for one the relay just ended (its
+   * time run out, a revoke, its invite closed, the page full) is expected:
+   * the page's own timer runs on its clock and an operator's click can cross
+   * the end on the wire, so it is ignored without a warning and changes
+   * nothing a budget counts.
+   */
   #decision(pageId: string, frame: FrameOf<'attach_decision'>): boolean {
     const request = this.#store.requests.get(frame.requestId);
     // A page may only answer its own requests; anything else is stale or forged.
     if (request?.pageId !== pageId) {
+      if (this.#justEnded(pageId, frame.requestId)) {
+        this.#log.debug('ignored a decision for an attach request that already ended', { pageId });
+        return true;
+      }
       this.#log.warn('ignored a decision for an unknown attach request', { pageId });
       return false;
     }
@@ -2501,6 +2656,37 @@ export class PageHub {
   }
 
   /**
+   * Remembers a request that just ended for as long as its page may still
+   * show it: the page's prompt lasts at most the request's lifetime from when
+   * it arrived, and a request never ends before it is made, so the end plus
+   * that lifetime and a grace for the page's clock and the wire covers it.
+   * Ends come in time order, so the oldest is always first.
+   */
+  #rememberEnded(pageId: string, requestId: string): void {
+    const now = Date.now();
+    this.#forgetEnded(now);
+    if (this.#endedRequests.size >= MAX_ENDED_REQUESTS) {
+      const oldest = this.#endedRequests.keys().next().value;
+      if (oldest !== undefined) this.#endedRequests.delete(oldest);
+    }
+    const until = now + this.#config.timings.attachRequestTtlMs + ENDED_REQUEST_GRACE_MS;
+    this.#endedRequests.set(requestId, { pageId, until });
+  }
+
+  /** Whether this page had this request ended recently enough that a decision for it is expected. */
+  #justEnded(pageId: string, requestId: string): boolean {
+    this.#forgetEnded(Date.now());
+    return this.#endedRequests.get(requestId)?.pageId === pageId;
+  }
+
+  #forgetEnded(now: number): void {
+    for (const [requestId, ended] of this.#endedRequests) {
+      if (ended.until > now) return;
+      this.#endedRequests.delete(requestId);
+    }
+  }
+
+  /**
    * A request the page saw ends, approved or not, and everyone waiting on it
    * hears how. A refusal writes its attach_refused record in full, since the
    * request reached the page, whose pairing limit bounds them (ADR 0019).
@@ -2509,6 +2695,7 @@ export class PageHub {
     const request = this.#store.requests.get(requestId);
     this.#store.requests.delete(requestId);
     this.#clearTimer(this.#requestTimers, requestId);
+    if (request !== undefined) this.#rememberEnded(request.pageId, requestId);
     if (request !== undefined && outcome.kind === 'error' && !this.#closed) {
       this.#audit({
         v: AUDIT_VERSION,
@@ -3420,7 +3607,7 @@ export class PageHub {
    * come here only through the refusal budget.
    */
   #audit(event: AuditEvent): void {
-    recordAudit(this.#store.audit, this.#log, event);
+    recordAudit(this.#store.audit, this.#frameLog.kept, event);
   }
 
   /**
@@ -4009,6 +4196,8 @@ export class PageHub {
   async shutdown(): Promise<void> {
     // The refusal counts still held go out first, while the audit log is open.
     this.#budget.close();
+    // So do the counts of page lines held back.
+    this.#ignoredLines.flush();
     this.#closed = true;
     // Checks still waiting on it come back unchecked, and their calls then see #closed.
     const checkerClosed = this.#checker.close();

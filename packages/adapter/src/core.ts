@@ -2513,6 +2513,11 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     }
     const who = logName(request.user);
     log.info(allow ? `allowed ${who} as ${String(granted)}` : `denied ${who}`);
+    // The relay ends every request a revoke names as it applies the revoke
+    // frame, which went first; a decision would only reach a request already
+    // gone there, and count against the page's budget for frames that change
+    // nothing (A4.3). While the link is down the relay dropped them anyway.
+    if (cause === 'revoke') return true;
     return send({
       t: 'attach_decision',
       requestId,

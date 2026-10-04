@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   attachAs,
   callTool,
+  delay,
   errorCode,
   eventually,
   holdRecord,
@@ -16,6 +17,7 @@ import {
   listPages,
   pairingCode,
   queuedCallIds,
+  relayEntries,
   SIM_TOOL_COUNT,
   startWorld,
   waitForTools,
@@ -151,6 +153,89 @@ describe('A2.4: revoke cancels an in-flight call and blocks the next one', () =>
       expect(await listPages(client)).toEqual([]);
     }
     expect(sim.store.calls).toEqual([]);
+  });
+});
+
+// The second A4.3 pass: the relay counted, and with the first pass's budget
+// closed the page for, frames the shipped adapter sends on its own in normal
+// use. Here the budget is one frame, so a single such frame would show.
+describe('frames the adapter sends on its own are expected (ADR 0023)', () => {
+  const IGNORED = 'ignored a decision for an unknown attach request';
+
+  it('requests left unanswered end on the relay and then on the page, with no warning and the page linked', async () => {
+    world = await startWorld({
+      timings: { attachRequestTtlMs: 1000, pairWaitMs: 200 },
+      rateLimits: { ignoredFramesPerSocket: 1 },
+    });
+    // The page's timers run a little late, as on a page whose clock is behind
+    // the relay's or across a slow network, so the relay's ends each request
+    // first and the page's own denial follows, as the review saw every time.
+    const sim = await world.page({
+      timers: {
+        setTimeout: (callback, ms) => setTimeout(callback, ms + 300),
+        clearTimeout: (handle) => {
+          clearTimeout(handle as NodeJS.Timeout);
+        },
+      },
+    });
+    const alice = await world.client(world.alice, 'alice-laptop');
+    const bob = await world.client(world.bob, 'bob-tablet');
+    for (const client of [alice, bob]) {
+      const code = await pairingCode(sim);
+      const asked = await callTool(client, 'pair_page', { code });
+      expect(errorCode(asked), asked.text).toBe('timeout');
+      // The code is single use; the next pairing takes its successor.
+      await sim.waitFor((s) => s.pairing !== null && s.pairing.code !== code);
+    }
+    await sim.waitFor((s) => s.pendingRequests.length === 2);
+    await sim.waitFor((s) => s.pendingRequests.length === 0, 4000);
+    const entries = relayEntries(world.relayLogs);
+    expect(
+      entries.filter((entry) => entry.msg === 'attach request expired unanswered'),
+    ).toHaveLength(2);
+    // Both denials came after, and were expected.
+    await eventually(async () =>
+      Promise.resolve(
+        relayEntries(world?.relayLogs ?? []).filter(
+          (entry) => entry.msg === 'ignored a decision for an attach request that already ended',
+        ).length === 2,
+      ),
+    );
+    expect(relayEntries(world.relayLogs).filter((entry) => entry.msg === IGNORED)).toEqual([]);
+    expect(sim.dock.state.link).toBe('linked');
+  }, 10_000);
+
+  it('Revoke all with requests waiting sends one revoke and no decision, and the page stays linked', async () => {
+    world = await startWorld({
+      timings: { pairWaitMs: 200 },
+      rateLimits: { ignoredFramesPerSocket: 1 },
+    });
+    const sim = await world.page();
+    const alice = await world.client(world.alice, 'alice-laptop');
+    const bob = await world.client(world.bob, 'bob-tablet');
+    for (const client of [alice, bob]) {
+      const code = await pairingCode(sim);
+      await callTool(client, 'pair_page', { code });
+      await sim.waitFor((s) => s.pairing !== null && s.pairing.code !== code);
+    }
+    await sim.waitFor((s) => s.pendingRequests.length === 2);
+    expect(sim.revoke('*')).toBe(true);
+    await sim.waitFor((s) => s.pendingRequests.length === 0);
+    await eventually(async () =>
+      Promise.resolve(
+        relayEntries(world?.relayLogs ?? []).some((entry) => entry.msg === 'attachments revoked'),
+      ),
+    );
+    await delay(200);
+    const entries = relayEntries(world.relayLogs);
+    expect(entries.filter((entry) => entry.msg === IGNORED)).toEqual([]);
+    // Not even a decision the relay would have expected: the page sent none.
+    expect(
+      entries.filter(
+        (entry) => entry.msg === 'ignored a decision for an attach request that already ended',
+      ),
+    ).toEqual([]);
+    expect(sim.dock.state.link).toBe('linked');
   });
 });
 
