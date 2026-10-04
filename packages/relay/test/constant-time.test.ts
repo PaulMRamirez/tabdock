@@ -41,7 +41,8 @@ describe('constant-time comparisons', () => {
     } as unknown as IncomingMessage;
     expect(await auth.authenticate(request)).toEqual({
       kind: 'user',
-      user: { userId: 'b', displayName: 'b' },
+      user: { userId: 'b', displayName: 'b', account: { kind: 'member', email: null } },
+      oauthClientId: null,
     });
     // No early exit: the match is in the middle, yet all three digests were compared.
     expect(spy).toHaveBeenCalledTimes(3);

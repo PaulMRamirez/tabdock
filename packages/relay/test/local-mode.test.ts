@@ -176,7 +176,11 @@ describe('which mode the environment gives', () => {
 
 describe('a plugin marked loopbackOnly, whatever its name', () => {
   const answer: AuthPlugin['authenticate'] = () =>
-    Promise.resolve({ kind: 'user', user: { userId: 'you', displayName: 'You' } });
+    Promise.resolve({
+      kind: 'user',
+      user: { userId: 'you', displayName: 'You', account: { kind: 'member', email: null } },
+      oauthClientId: null,
+    });
   const offline = createOAuthAuth({
     issuer: 'https://idp.example',
     resource: PUBLIC_MCP_URL,

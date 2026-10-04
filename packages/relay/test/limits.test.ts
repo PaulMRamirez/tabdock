@@ -7,7 +7,12 @@ import type { Client } from '@modelcontextprotocol/client';
 import { CLOSE_DETACH, type PageTool } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
 import { MAX_FRAME_SCHEMA_NODES, MAX_TOOL_SCHEMA_NODES } from '../src/hub.ts';
-import { createMemoryStore, DEFAULT_LIMITS, DEFAULT_RATE_LIMITS } from '../src/index.ts';
+import {
+  createMemoryStore,
+  DEFAULT_LIMITS,
+  DEFAULT_RATE_LIMITS,
+  HOSTED_LIMITS,
+} from '../src/index.ts';
 import {
   connectPage,
   type InvokeFrame,
@@ -89,6 +94,9 @@ describe('ADR 0009 defaults', () => {
       pageSessions: 1000,
       pairSessions: 200,
       pairSignInsInFlight: 8,
+      // ADR 0018: per address in hosted mode only, and the tool-list budget everywhere.
+      signInsInFlightPerAddress: 2,
+      toolBytes: 64 * 1024 * 1024,
     });
     expect(DEFAULT_RATE_LIMITS.callsPerUserPerPage).toBe(120);
     // Pairing counts per user and per page, never per address (S3, ADR 0016).
@@ -106,6 +114,28 @@ describe('ADR 0009 defaults', () => {
     expect(DEFAULT_RATE_LIMITS.toolsFramesPerSocket).toBe(10);
     expect(DEFAULT_RATE_LIMITS.toolsFramesPerAddress).toBe(30);
     expect(DEFAULT_RATE_LIMITS.toolsFramesWindowMs).toBe(10_000);
+  });
+});
+
+describe('M4 defaults (ADRs 0017, 0018 and 0019)', () => {
+  it('are the numbers the ADRs give', () => {
+    // ADR 0018: every tool counted per user a minute, smaller for invitees.
+    expect(DEFAULT_RATE_LIMITS.requestsPerUser).toBe(240);
+    expect(DEFAULT_RATE_LIMITS.requestsPerInvitee).toBe(60);
+    // ADR 0017: redemptions of one invite a minute, as previews of it already count.
+    expect(DEFAULT_RATE_LIMITS.redemptionsPerInvite).toBe(30);
+    // ADR 0018: sign-ins at /pair and /i per client address in hosted mode, under the relay-wide 60 and 8.
+    expect(DEFAULT_RATE_LIMITS.signInsPerAddress).toBe(10);
+    expect(DEFAULT_LIMITS.signInsInFlightPerAddress).toBe(2);
+    // ADR 0019: refusal lines a minute per member or holder, and for all strangers together.
+    expect(DEFAULT_RATE_LIMITS.auditRefusalsPerUser).toBe(10);
+    expect(DEFAULT_RATE_LIMITS.auditRefusalsForStrangers).toBe(30);
+    // ADR 0018: hosted mode's page limits for a 512 MB host.
+    expect(HOSTED_LIMITS).toEqual({
+      pageSessions: 100,
+      pageSocketsPerAddress: 5,
+      pageSessionsPerAddress: 5,
+    });
   });
 });
 

@@ -421,7 +421,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   function requestView(request: PendingRequest): PromptView {
     const box = element('div', 'prompt');
     box.dataset.requestId = request.requestId;
-    const via = request.via === 'qr' ? 'QR code' : 'code';
+    const via = request.via === 'qr' ? 'QR code' : request.via === 'invite' ? 'invite' : 'code';
     box.append(element('p', '', `${request.user.displayName} wants to attach via ${via}`));
     if (request.client) {
       box.append(element('p', 'muted', `Client: ${clientText(request.client)}`));

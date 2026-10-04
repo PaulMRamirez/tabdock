@@ -1,6 +1,7 @@
 import { request } from 'node:http';
 import type { Client } from '@modelcontextprotocol/client';
 import {
+  AuditEventSchema,
   CLOSE_DETACH,
   CLOSE_INVALID_FRAME_PAGE,
   CLOSE_SILENT,
@@ -929,14 +930,28 @@ describe('audit (S7)', () => {
       ['bob', 'get_view', 'not_attached'],
     ]);
     for (const record of records) {
+      // ADR 0019's call record, exactly: its version and type, then S7's fields.
       expect(Object.keys(record).sort()).toEqual(
-        ['at', 'client', 'durationMs', 'origin', 'outcome', 'pageId', 'tool', 'userId'].sort(),
+        [
+          'v',
+          'type',
+          'at',
+          'client',
+          'durationMs',
+          'origin',
+          'outcome',
+          'pageId',
+          'tool',
+          'userId',
+        ].sort(),
       );
+      expect(AuditEventSchema.parse(record)).toEqual(record);
       expect(record.at).toBeGreaterThanOrEqual(before);
       expect(record.durationMs).toBeGreaterThanOrEqual(0);
       expect(record.origin).toBe(PAGE_ORIGIN);
       expect(record.pageId).toBe(opened.pageId);
     }
+    expect(relay.audit.events()).toEqual(records);
     expect(JSON.stringify(records)).not.toContain(secret);
     expect(lines.filter((line) => line.includes('"msg":"call"'))).toHaveLength(3);
     expect(lines.join('\n')).not.toContain(secret);
@@ -997,6 +1012,8 @@ describe('audit (S7)', () => {
     const log = new MemoryAuditLog();
     for (let i = 0; i < 1005; i += 1) {
       log.append({
+        v: 1,
+        type: 'call',
         at: i,
         pageId: 'pg_x',
         origin: null,

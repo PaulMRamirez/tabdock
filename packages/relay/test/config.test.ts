@@ -203,6 +203,8 @@ describe('origin policy (S1, S2)', () => {
       pageSessions: 1000,
       pairSessions: 200,
       pairSignInsInFlight: 8,
+      signInsInFlightPerAddress: 2,
+      toolBytes: 64 * 1024 * 1024,
     });
     expect(rateLimits.callsPerUserPerPage).toBe(120);
     expect(rateLimits.pairSignIns).toBe(60);
@@ -319,6 +321,8 @@ describe('loadConfigFromEnv', () => {
       pageSessions: 30,
       pairSessions: 200,
       pairSignInsInFlight: 4,
+      signInsInFlightPerAddress: 2,
+      toolBytes: 64 * 1024 * 1024,
     });
     expect(config.rateLimits.callsPerUserPerPage).toBe(60);
     expect(config.rateLimits.pairSignIns).toBe(20);
@@ -439,13 +443,16 @@ describe('dev-token auth', () => {
       { userId: 'alice', displayName: 'Alice', token: TOKEN },
       { userId: 'bob', displayName: 'Bob', token: 'b'.repeat(40) },
     ]);
+    // A dev token names a member with no verified email and no OAuth client (ADRs 0017 and 0019).
     expect(await two.authenticate(requestWith(`Bearer ${TOKEN}`))).toEqual({
       kind: 'user',
-      user: { userId: 'alice', displayName: 'Alice' },
+      user: { userId: 'alice', displayName: 'Alice', account: { kind: 'member', email: null } },
+      oauthClientId: null,
     });
     expect(await two.authenticate(requestWith(`bearer ${'b'.repeat(40)}`))).toEqual({
       kind: 'user',
-      user: { userId: 'bob', displayName: 'Bob' },
+      user: { userId: 'bob', displayName: 'Bob', account: { kind: 'member', email: null } },
+      oauthClientId: null,
     });
     for (const header of [
       undefined,

@@ -28,7 +28,7 @@ import {
   oauthMetadataResponse,
   verifyBearerToken,
 } from '@modelcontextprotocol/server';
-import { IdSchema, type User, UserSchema } from '@tabdock/protocol';
+import { IdSchema, OAuthClientIdSchema, type User, UserSchema } from '@tabdock/protocol';
 import {
   createLocalJWKSet,
   createRemoteJWKSet,
@@ -38,13 +38,14 @@ import {
   jwtVerify,
 } from 'jose';
 import { z } from 'zod';
-import type {
-  Account,
-  AuthOutcome,
-  AuthPlugin,
-  AuthRefusal,
-  AuthRoute,
-  ProviderEndpoints,
+import {
+  type Account,
+  type AuthOutcome,
+  type AuthPlugin,
+  type AuthRefusal,
+  type AuthRoute,
+  MEMBER_ACCOUNT,
+  type ProviderEndpoints,
 } from './auth.ts';
 import { digestHex } from './secrets.ts';
 
@@ -62,6 +63,69 @@ export interface OAuthAuthOptions {
   resource: string;
   /** Who may use the relay, by subject. Anyone else who signs in gets 403. */
   users: readonly OAuthUser[];
+  /**
+   * The longest a token may live, from its iat to its exp, and the oldest its
+   * iat may be, in minutes (TABDOCK_OAUTH_MAX_TOKEN_AGE): DEFAULT_MAX_TOKEN_AGE_MINUTES
+   * unless set, never above MAX_TOKEN_AGE_CEILING_MINUTES (ADR 0020).
+   * Workstream A checks tokens against it; until then only the setting is checked.
+   */
+  maxTokenAgeMinutes?: number | undefined;
+  /**
+   * The OAuth clients whose tokens the relay accepts, by RFC 9068 client_id
+   * (TABDOCK_OAUTH_CLIENT_IDS); any client when absent (ADR 0020).
+   * Workstream A refuses other clients' tokens with 401; until then only the
+   * setting is checked.
+   */
+  clientIds?: readonly string[] | undefined;
+}
+
+/** ADR 0020: a token lives at most 2 hours unless TABDOCK_OAUTH_MAX_TOKEN_AGE says otherwise. */
+export const DEFAULT_MAX_TOKEN_AGE_MINUTES = 120;
+/** ADR 0020: the cap may be raised for a provider's real lifetime, never past a day. */
+export const MAX_TOKEN_AGE_CEILING_MINUTES = 1440;
+/** ADR 0020: jose's key cache and refetch cooldown, pinned at its defaults so an upgrade cannot move them. */
+export const JWKS_CACHE_MAX_AGE_MS = 10 * 60_000;
+export const JWKS_COOLDOWN_MS = 30_000;
+/** ADR 0020: how often the provider's metadata is read again; a new issuer or key URL is refused. */
+export const METADATA_REFRESH_MS = 60 * 60_000;
+/** ADR 0020: token sessions (sid) remembered, so each first sighting logs its lifetime once. */
+export const SEEN_SESSIONS = 1000;
+
+/** Refuses a token age cap outside 1 to MAX_TOKEN_AGE_CEILING_MINUTES minutes. */
+function checkMaxTokenAge(minutes: number | undefined): void {
+  if (minutes === undefined) return;
+  if (!Number.isInteger(minutes) || minutes < 1 || minutes > MAX_TOKEN_AGE_CEILING_MINUTES) {
+    throw new Error(
+      `the OAuth token age cap (TABDOCK_OAUTH_MAX_TOKEN_AGE) must be 1 to ${String(MAX_TOKEN_AGE_CEILING_MINUTES)} minutes (ADR 0020)`,
+    );
+  }
+}
+
+/** Refuses an empty client list, or an entry that is no client_id; never echoes one. */
+function checkClientIds(clientIds: readonly string[] | undefined): void {
+  if (clientIds === undefined) return;
+  if (clientIds.length === 0) {
+    throw new Error(
+      'the OAuth client list (TABDOCK_OAUTH_CLIENT_IDS) names no client; leave it unset to accept any (ADR 0020)',
+    );
+  }
+  clientIds.forEach((clientId, index) => {
+    if (!OAuthClientIdSchema.safeParse(clientId).success || clientId.includes(',')) {
+      throw new Error(
+        `TABDOCK_OAUTH_CLIENT_IDS entry ${String(index + 1)} is not an OAuth client_id: 1 to 512 printable characters without spaces or commas`,
+      );
+    }
+  });
+}
+
+/** Parses TABDOCK_OAUTH_CLIENT_IDS: comma-separated client_id values, such as metadata document URLs. */
+export function parseOAuthClientIds(envValue: string): string[] {
+  const clientIds = envValue
+    .split(',')
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+  checkClientIds(clientIds);
+  return [...new Set(clientIds)];
 }
 
 /** Claude gives discovery 10 s too (docs/notes/m3/connector-auth.md). */
@@ -325,6 +389,8 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
   if (options.users.length === 0) {
     throw new Error('OAuth sign-in needs at least one user (TABDOCK_OAUTH_USERS)');
   }
+  checkMaxTokenAge(options.maxTokenAgeMinutes);
+  checkClientIds(options.clientIds);
   const bySub = new Map<string, User>();
   const userIds = new Set<string>();
   for (const entry of options.users) {
@@ -548,7 +614,14 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
           headers: {},
         };
       }
-      return { kind: 'user', user: account.user };
+      // A client_id that is no client_id is left out rather than refused: the
+      // token itself checked out, and the id is kept for the audit log alone.
+      const clientId = OAuthClientIdSchema.safeParse(info.clientId);
+      return {
+        kind: 'user',
+        user: { ...account.user, account: { ...MEMBER_ACCOUNT } },
+        oauthClientId: clientId.success ? clientId.data : null,
+      };
     },
   };
 }

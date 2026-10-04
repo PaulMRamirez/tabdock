@@ -16,7 +16,7 @@ import { readFileSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import * as oidc from 'openid-client';
 import { z } from 'zod';
-import type { Account, BrowserSignIn } from './auth.ts';
+import { type Account, type BrowserSignIn, MEMBER_ACCOUNT } from './auth.ts';
 import { type PairClientOptions, pairRedirectUriOf, type ResolvedConfig } from './config.ts';
 import type { PageHub, PairOutcome } from './hub.ts';
 import type { Logger } from './log.ts';
@@ -654,8 +654,16 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
       return;
     }
     const { user } = session.account;
+    // A browser sign-in carries no access token, so no client_id; its verified
+    // email comes when workstream A asks for openid email here (ADR 0020).
     const outcome = hub.claimPairNonce(
-      { userId: user.userId, displayName: user.displayName, client: null },
+      {
+        userId: user.userId,
+        displayName: user.displayName,
+        account: { ...MEMBER_ACCOUNT },
+        oauthClientId: null,
+        client: null,
+      },
       body.data.nonce,
     );
     if (outcome.kind === 'error') {

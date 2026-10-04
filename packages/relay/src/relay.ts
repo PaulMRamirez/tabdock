@@ -33,9 +33,15 @@ import {
   isLegacyRequest,
   type McpHandlerRequestOptions,
 } from '@modelcontextprotocol/server';
-import { MAX_FRAME_BYTES, SUBPROTOCOL } from '@tabdock/protocol';
+import {
+  type AuditCallEvent,
+  type AuditEvent,
+  MAX_FRAME_BYTES,
+  SUBPROTOCOL,
+} from '@tabdock/protocol';
 import { WebSocketServer } from 'ws';
 import { type AuthOutcome, AuthOutcomeSchema, type AuthRoute } from './auth.ts';
+import { clientAddress } from './client-address.ts';
 import {
   isLoopbackAddress,
   LOOPBACK_HOSTNAMES,
@@ -51,7 +57,7 @@ import { type AuthExtra, createMcpFactory, userIdOf } from './mcp.ts';
 import { createPairFlow, PAIR_ROUTES, type PairFlow } from './pair.ts';
 import { McpSessions } from './sessions.ts';
 import { Spike, type SpikeControl } from './spike.ts';
-import { type AuditRecord, createMemoryStore } from './store.ts';
+import { callRecords, createMemoryStore } from './store.ts';
 
 export interface Relay {
   /** http://127.0.0.1:<port> */
@@ -64,7 +70,8 @@ export interface Relay {
   readonly publicUrl: string | null;
   /** `<publicUrl>/mcp`, the connector URL, in public URL mode; else null. */
   readonly publicMcpUrl: string | null;
-  readonly audit: { records(): AuditRecord[] };
+  /** The newest audit records: records() its calls, as before ADR 0019, and events() every type. */
+  readonly audit: { records(): AuditCallEvent[]; events(): AuditEvent[] };
   /**
    * The spike's marker control while TABDOCK_SPIKE is on, else null. Reached
    * from the relay's own process only (main.ts reads it from stdin).
@@ -223,6 +230,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       });
     } catch (error) {
       await hub.shutdown();
+      await store.audit.close?.();
       throw error;
     }
   }
@@ -357,6 +365,9 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     const extra: AuthExtra = {
       userId: outcome.user.userId,
       displayName: outcome.user.displayName,
+      kind: outcome.user.account.kind,
+      email: outcome.user.account.email,
+      oauthClientId: outcome.oauthClientId,
     };
     // The SDK requires a token field; the real one stays out of everything downstream.
     const authInfo: AuthInfo = {
@@ -429,7 +440,8 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   server.maxHeadersCount = 0;
 
   server.on('upgrade', (request: IncomingMessage, socket: Duplex, head: Buffer) => {
-    const address = request.socket.remoteAddress ?? 'unknown';
+    // What the per-address page limits count by (S9); the socket's peer until hosted mode (ADR 0018).
+    const address = clientAddress(request);
     if (pathOf(request.url) !== '/page') {
       refuseUpgrade(socket, 404, 'Not found');
       return;
@@ -503,6 +515,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     pair?.close();
     wss.close();
     await hub.shutdown();
+    await store.audit.close?.();
     await mcp.close();
     await sessions.closeAll();
     throw error;
@@ -532,12 +545,17 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     mcpUrl: `${url}/mcp`,
     publicUrl: config.publicUrl,
     publicMcpUrl: config.publicMcpUrl,
-    audit: { records: () => store.audit.records() },
+    audit: {
+      records: () => callRecords(store.audit.records()),
+      events: () => store.audit.records(),
+    },
     spike,
     close() {
       closing ??= (async () => {
         pair?.close();
         await hub.shutdown();
+        // After the hub, whose shutdown audits the calls it fails (ADR 0019).
+        await store.audit.close?.();
         for (const ws of wss.clients) ws.terminate();
         await new Promise<void>((resolveClose) => {
           wss.close(() => {

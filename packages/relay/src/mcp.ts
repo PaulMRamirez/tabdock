@@ -18,12 +18,16 @@ import {
 import {
   type ClientInfo,
   ClientInfoSchema,
+  EmailSchema,
   type ErrorCode,
   formatError,
   IdSchema,
+  MAX_DISPLAY_NAME_CHARS,
   MAX_RESULT_CHARS,
+  OAuthClientIdSchema,
   truncate,
   untrustedHeader,
+  UserKindSchema,
 } from '@tabdock/protocol';
 import { z } from 'zod';
 import type { ResolvedConfig } from './config.ts';
@@ -36,11 +40,16 @@ export const RELAY_VERSION = '0.0.0';
 /**
  * What the HTTP layer puts in authInfo.extra. The token itself is never
  * carried along, and neither is the peer address: behind a tunnel every
- * caller shares one, so nothing on /mcp may count by it (ADR 0016).
+ * caller shares one, so nothing on /mcp may count by it (ADR 0016). The
+ * account's kind and verified email, and the token's client_id, ride along
+ * for invites and the audit log (ADRs 0017, 0019 and 0020).
  */
 export const AuthExtraSchema = z.object({
   userId: IdSchema,
-  displayName: z.string().min(1).max(100),
+  displayName: z.string().min(1).max(MAX_DISPLAY_NAME_CHARS),
+  kind: UserKindSchema,
+  email: EmailSchema.nullable(),
+  oauthClientId: OAuthClientIdSchema.nullable(),
 });
 export type AuthExtra = z.infer<typeof AuthExtraSchema>;
 
@@ -200,6 +209,8 @@ function identityFrom(authInfo: AuthInfo | undefined): Omit<CallerIdentity, 'cli
   return {
     userId: extra.data.userId,
     displayName: extra.data.displayName,
+    account: { kind: extra.data.kind, email: extra.data.email },
+    oauthClientId: extra.data.oauthClientId,
   };
 }
 

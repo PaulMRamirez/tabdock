@@ -11,6 +11,8 @@ export const ERROR_CODES = [
   'pairing_expired',
   'rate_limited',
   'invalid_arguments',
+  // From M4: an invitee offered a pairing code, which only members may use (ADR 0017).
+  'invite_required',
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];

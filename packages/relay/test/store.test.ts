@@ -1,5 +1,12 @@
+import { AuditEventSchema } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
-import { createMemoryStore, type PageRecord, type SingleUseTicketRecord } from '../src/index.ts';
+import {
+  callRecords,
+  createMemoryStore,
+  type InviteRecord,
+  type PageRecord,
+  type SingleUseTicketRecord,
+} from '../src/index.ts';
 
 function pageRecord(pageId: string, resumeTokenHash: string): PageRecord {
   return {
@@ -13,6 +20,7 @@ function pageRecord(pageId: string, resumeTokenHash: string): PageRecord {
       maxDrivers: 1,
       consequential: 'confirm',
       consequentialTools: [],
+      invites: 'watch',
     },
     tools: [],
     toolsPending: false,
@@ -59,11 +67,14 @@ describe('the in-memory store', () => {
     const { attachments } = createMemoryStore();
     const base = {
       displayName: 'x',
+      kind: 'member' as const,
       role: 'observer' as const,
       grantedAt: 0,
       lastUsedAt: null,
       expiresAt: null,
       clients: [],
+      inviteId: null,
+      endsAt: null,
     };
     attachments.put({ ...base, pageId: 'pg_A', userId: 'alice' });
     attachments.put({ ...base, pageId: 'pg_A', userId: 'bob' });
@@ -78,18 +89,97 @@ describe('the in-memory store', () => {
   it('returns audit copies, so callers cannot rewrite history', () => {
     const { audit } = createMemoryStore();
     audit.append({
+      v: 1,
+      type: 'call',
       at: 1,
       pageId: 'pg_A',
       origin: null,
       userId: 'alice',
-      client: null,
+      client: { name: 'c', version: '1' },
       tool: 't',
       outcome: 'ok',
       durationMs: 0,
     });
-    const [record] = audit.records();
-    if (record) record.outcome = 'timeout';
-    expect(audit.records()[0]?.outcome).toBe('ok');
+    const [record] = callRecords(audit.records());
+    if (record) {
+      record.outcome = 'timeout';
+      if (record.client) record.client.name = 'rewritten';
+    }
+    expect(callRecords(audit.records())[0]).toMatchObject({
+      outcome: 'ok',
+      client: { name: 'c' },
+    });
+  });
+
+  it('keeps every audit record type and picks out the calls (ADR 0019)', () => {
+    const { audit } = createMemoryStore();
+    const call = {
+      v: 1,
+      type: 'call',
+      at: 1,
+      pageId: 'pg_A',
+      origin: 'http://localhost:5173',
+      userId: 'alice',
+      client: null,
+      tool: 't',
+      outcome: 'ok',
+      durationMs: 3,
+    } as const;
+    const detach = {
+      v: 1,
+      type: 'detach',
+      at: 2,
+      pageId: 'pg_A',
+      origin: 'http://localhost:5173',
+      userId: 'alice',
+    } as const;
+    audit.append(call);
+    audit.append(detach);
+    expect(audit.records()).toEqual([call, detach]);
+    expect(callRecords(audit.records())).toEqual([call]);
+    for (const event of audit.records()) expect(AuditEventSchema.parse(event)).toEqual(event);
+  });
+
+  it('keeps invites by page and id, finds them by digest, and forgets a digest it replaced', () => {
+    const { invites } = createMemoryStore();
+    const hash = (fill: string): string => fill.repeat(64);
+    const invite = (pageId: string, inviteId: string, fill: string): InviteRecord => ({
+      inviteId,
+      pageId,
+      role: 'observer',
+      label: 'Friends',
+      uses: 3,
+      usesLeft: 3,
+      createdAt: 0,
+      requestedExpiresAt: null,
+      expiresAt: 86_400_000,
+      secretHash: hash(fill),
+      sponsor: { userId: 'alice', displayName: 'Alice' },
+      pendingRequestId: null,
+      refusals: 0,
+      barredUserIds: [],
+      barredEmailHashes: [],
+    });
+    // Ids are the adapter's, so two pages may use the same one without meeting.
+    invites.put(invite('pg_A', 'inv_1', 'a'));
+    invites.put(invite('pg_A', 'inv_2', 'b'));
+    invites.put(invite('pg_B', 'inv_1', 'c'));
+    expect(invites.get('pg_A', 'inv_1')?.secretHash).toBe(hash('a'));
+    expect(invites.get('pg_B', 'inv_1')?.secretHash).toBe(hash('c'));
+    expect(invites.findBySecretHash(hash('c'))?.pageId).toBe('pg_B');
+    expect(invites.listForPage('pg_A').map((entry) => entry.inviteId)).toEqual(['inv_1', 'inv_2']);
+    // Replaced under a new digest, the old digest no longer finds it.
+    invites.put({ ...invite('pg_A', 'inv_1', 'd'), usesLeft: 2 });
+    expect(invites.findBySecretHash(hash('a'))).toBeUndefined();
+    expect(invites.findBySecretHash(hash('d'))?.usesLeft).toBe(2);
+    expect(invites.delete('pg_A', 'inv_1')).toBe(true);
+    expect(invites.delete('pg_A', 'inv_1')).toBe(false);
+    expect(invites.findBySecretHash(hash('d'))).toBeUndefined();
+    // A page's invites go together and come back for their records; another page's stay.
+    expect(invites.deleteForPage('pg_A').map((entry) => entry.inviteId)).toEqual(['inv_2']);
+    expect(invites.findBySecretHash(hash('b'))).toBeUndefined();
+    expect(invites.listForPage('pg_A')).toEqual([]);
+    expect(invites.get('pg_B', 'inv_1')).toBeDefined();
   });
 
   it('keeps single-use tickets by digest and kind: found without using, taken once, gone with their page', () => {

@@ -181,6 +181,7 @@ describe('A2.2: the adapter refuses when the relay check is bypassed', () => {
         t: 'attach_request',
         requestId,
         user: { userId, displayName },
+        account: { kind: 'member', verified: true },
         via: 'code',
         client: { name: 'stand-in-client', version: '0.0.0' },
         expiresAt: Date.now() + 60_000,
@@ -203,11 +204,14 @@ describe('A2.2: the adapter refuses when the relay check is bypassed', () => {
     const listed = (userId: string, displayName: string) => ({
       userId,
       displayName,
+      kind: 'member' as const,
       role: 'driver' as const,
       grantedAt: now,
       lastUsedAt: null,
       expiresAt: now + 3_600_000,
       clients: [],
+      inviteId: null,
+      endsAt: null,
     });
     relay.send({
       t: 'roster',

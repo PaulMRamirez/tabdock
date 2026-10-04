@@ -80,11 +80,14 @@ function attachment(userId: string, displayName: string, role: Role = 'driver'):
   return {
     userId,
     displayName,
+    kind: 'member',
     role,
     grantedAt: Date.now(),
     lastUsedAt: null,
     expiresAt: null,
     clients: [],
+    inviteId: null,
+    endsAt: null,
   };
 }
 
@@ -93,6 +96,7 @@ function attachRequest(requestId: string, userId: string): RelayFrame {
     t: 'attach_request',
     requestId,
     user: { userId, displayName: userId.charAt(0).toUpperCase() + userId.slice(1) },
+    account: { kind: 'member', verified: true },
     via: 'code',
     client: null,
     expiresAt: Date.now() + ATTACH_REQUEST_TTL_MS,

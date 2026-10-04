@@ -161,6 +161,7 @@ async function approveAlice(sim: SimPage, connection: Connection): Promise<void>
     t: 'attach_request',
     requestId: 'r-alice',
     user: { userId: 'alice', displayName: 'Alice' },
+    account: { kind: 'member', verified: true },
     via: 'code',
     client: null,
     expiresAt: Date.now() + 60_000,
@@ -173,11 +174,14 @@ async function approveAlice(sim: SimPage, connection: Connection): Promise<void>
       {
         userId: 'alice',
         displayName: 'Alice',
+        kind: 'member',
         role: 'driver',
         grantedAt: Date.now(),
         lastUsedAt: null,
         expiresAt: null,
         clients: [],
+        inviteId: null,
+        endsAt: null,
       },
     ],
   });
@@ -253,12 +257,26 @@ describe.each(RUNTIME_PROFILES)('the sim page as %s', (profile) => {
 });
 
 describe('startSimPage', () => {
+  it("passes the operator's Invite form to the current page's handle (ADR 0017)", async () => {
+    const { sim } = await linked({ policy: { invites: 'all' } });
+    // No relay offers invites before workstream A, so the answer is unavailable, after the checks.
+    expect(await sim.invite({ label: 'Friends', role: 'observer', uses: 3 })).toEqual({
+      ok: false,
+      reason: 'unavailable',
+    });
+    expect(await sim.invite({ label: '', role: 'observer' })).toEqual({
+      ok: false,
+      reason: 'invalid',
+    });
+  });
+
   it('lets a scripted operator answer attach requests', async () => {
     const { connection } = await linked({ operator: { askAttach: () => 'observer' } });
     send(connection, {
       t: 'attach_request',
       requestId: 'r1',
       user: { userId: 'bob', displayName: 'Bob' },
+      account: { kind: 'member', verified: true },
       via: 'code',
       client: { name: 'claude-code', version: '2.1.287' },
       expiresAt: Date.now() + 60_000,
@@ -277,6 +295,7 @@ describe('startSimPage', () => {
       t: 'attach_request',
       requestId: 'r1',
       user: { userId: 'bob', displayName: 'Bob' },
+      account: { kind: 'member', verified: true },
       via: 'code',
       client: null,
       expiresAt: Date.now() + 60_000,

@@ -1,5 +1,6 @@
 // Auth is a plugin (SPEC section 7, ADR 0013). authenticate(request) gives a
-// user, or a refusal that carries its own HTTP status and challenge: 401 with
+// user with its account, member or invitee and any verified email (ADRs 0017
+// and 0020), or a refusal that carries its own HTTP status and challenge: 401 with
 // WWW-Authenticate asks the client to sign in, 403 turns away someone signed in
 // who is not allowed, 503 says the plugin cannot check anyone just now. Claude
 // starts sign-in only on a 401 whose challenge names the metadata document, so
@@ -10,7 +11,16 @@
 // plugin is in oauth.ts.
 
 import type { IncomingMessage } from 'node:http';
-import { IdSchema, type User, UserSchema } from '@tabdock/protocol';
+import {
+  EmailSchema,
+  IdSchema,
+  InviteeIdSchema,
+  OAuthClientIdSchema,
+  type User,
+  type UserKind,
+  UserKindSchema,
+  UserSchema,
+} from '@tabdock/protocol';
 import { z } from 'zod';
 import { digest, sameDigest } from './secrets.ts';
 
@@ -28,7 +38,41 @@ export interface AuthRefusal {
   headers: Record<string, string>;
 }
 
-export type AuthOutcome = { kind: 'user'; user: User } | AuthRefusal;
+/**
+ * The account behind an authenticated user (ADRs 0017 and 0020): a member of
+ * the owner's allowlist or an invitee, and the email address the identity
+ * provider verified for it, or null when it vouched for none, or when the
+ * plugin has no provider at all, as dev-token has not. An address the
+ * provider did not verify is never kept.
+ */
+export interface UserAccount {
+  kind: UserKind;
+  email: string | null;
+}
+
+/** A user as a plugin vouches for one: who they are and what kind of account. */
+export interface AuthUser extends User {
+  account: UserAccount;
+}
+
+/** Every member a plugin without a provider knows; frozen, so no caller can turn it into an invitee. */
+export const MEMBER_ACCOUNT: Readonly<UserAccount> = Object.freeze({
+  kind: 'member',
+  email: null,
+});
+
+export type AuthOutcome =
+  | {
+      kind: 'user';
+      user: AuthUser;
+      /**
+       * The access token's client_id (RFC 9068), which the audit log's attach
+       * records name (ADR 0019); null for a credential with none, such as a
+       * dev token.
+       */
+      oauthClientId: string | null;
+    }
+  | AuthRefusal;
 
 /** A GET route a plugin serves, in web-standard form, like the SDK's metadata helpers. */
 export type AuthRoute = (request: Request) => Response | Promise<Response>;
@@ -97,11 +141,26 @@ const HeaderNameSchema = z.string().regex(/^[A-Za-z0-9-]{1,64}$/);
 const HeaderValueSchema = z.string().regex(/^[\x20-\x7e]{0,2000}$/);
 
 /**
+ * An invitee's user id is always `g_` and its account key, and a member's
+ * never is (ADR 0017), so no member can pass for an invitee or the reverse.
+ */
+const AuthUserSchema = UserSchema.extend({
+  account: z.object({ kind: UserKindSchema, email: EmailSchema.nullable() }),
+}).refine(
+  (user) => (user.account.kind === 'invitee') === InviteeIdSchema.safeParse(user.userId).success,
+  { message: "an invitee's user id is g_ and its account key, and only an invitee's is" },
+);
+
+/**
  * The relay checks what a plugin returns before acting on it, as it checks
  * every other boundary: a malformed outcome is refused, never half-trusted.
  */
 export const AuthOutcomeSchema = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('user'), user: UserSchema }),
+  z.object({
+    kind: z.literal('user'),
+    user: AuthUserSchema,
+    oauthClientId: OAuthClientIdSchema.nullable(),
+  }),
   z.object({
     kind: z.literal('refused'),
     status: z.union([z.literal(401), z.literal(403), z.literal(503)]),
@@ -194,7 +253,15 @@ export function createDevTokenAuth(
       for (const entry of entries) {
         if (sameDigest(candidate, entry.digest) && match === null) match = entry.user;
       }
-      return Promise.resolve(match === null ? DEV_TOKEN_REFUSAL : { kind: 'user', user: match });
+      return Promise.resolve(
+        match === null
+          ? DEV_TOKEN_REFUSAL
+          : {
+              kind: 'user',
+              user: { ...match, account: { ...MEMBER_ACCOUNT } },
+              oauthClientId: null,
+            },
+      );
     },
   };
 }

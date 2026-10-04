@@ -55,6 +55,8 @@ async function bench(): Promise<Bench> {
 const alice: CallerIdentity = {
   userId: ALICE.userId,
   displayName: ALICE.displayName,
+  account: { kind: 'member', email: null },
+  oauthClientId: null,
   client: null,
 };
 

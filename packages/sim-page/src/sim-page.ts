@@ -12,6 +12,8 @@ import {
   type AdapterCore,
   type Dock,
   type DockState,
+  type InviteOptions,
+  type InviteResult,
   type Logger,
   type SocketFactory,
   type StorageLike,
@@ -105,6 +107,11 @@ export interface SimPage {
   setRole(userId: string, role: Role): boolean;
   /** The operator's Revoke, or Revoke all with '*' (Dock.revoke). */
   revoke(userId: string): boolean;
+  /**
+   * The operator's Invite form on the current page (Dock.invite, ADR 0017):
+   * resolves with the link once, or the reason there is none.
+   */
+  invite(options: InviteOptions): Promise<InviteResult>;
   /** The operator's pause switch (Dock.pause); it survives reload(), as the adapter stores it. */
   pause(paused: boolean): void;
   /** Resolves with the first state, current or later, that matches; rejects after timeoutMs (5000). */
@@ -274,6 +281,9 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
     },
     revoke(userId) {
       return current.core.dock.revoke(userId);
+    },
+    invite(inviteOptions) {
+      return current.core.dock.invite(inviteOptions);
     },
     pause(paused) {
       current.core.dock.pause(paused);
