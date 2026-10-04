@@ -34,9 +34,9 @@ import {
 // into Allow there. The widget makes its DOM calls the same way, so patching
 // a DOM prototype afterwards hands it none of the widget's nodes, and so
 // never the closed shadow root that getRootNode() on one would return; and
-// it times and measures its boxes the same way, so patching setTimeout or
-// DOMRect's getters afterwards arms no box early and keeps no moved box
-// armed. What stays open (the page's other JavaScript built-ins, any toJSON,
+// it times and measures its boxes the same way, so patching setTimeout,
+// clearTimeout or DOMRect's getters afterwards arms no box early and keeps
+// no moved box armed. What stays open (the page's other JavaScript built-ins, any toJSON,
 // and covering the widget with a look-alike) is the trusted page's, as
 // docs/threat-model.md says.
 
@@ -594,6 +594,50 @@ test('a script that swaps setTimeout after attach() arms no box before it has he
   await page.mouse.click(shown?.x ?? 0, shown?.y ?? 0);
   await page.clock.runFor(ARM_DELAY_MS - 100);
   expect((await widgetButtonNow(page, target))?.armed).toBe(false);
+  await page.clock.runFor(100);
+  expect((await widgetButtonNow(page, target))?.armed).toBe(true);
+  expect(decisions(relay)).toEqual([]);
+
+  await page.mouse.click(shown?.x ?? 0, shown?.y ?? 0);
+  await expect
+    .poll(() => decisions(relay))
+    .toEqual([{ t: 'attach_decision', requestId: 'req-1', allow: true, role: 'driver' }]);
+});
+
+test('a script that swaps clearTimeout after attach() arms no box before it has held still since the click that restarted its wait', async ({
+  page,
+}) => {
+  await page.clock.install();
+  const relay = await openWithFakeRelay(page);
+  await pauseClock(page);
+
+  // A script that runs after attach(): clearing a timer cancels nothing, so
+  // the wait a click restarts would still end when the first one was due.
+  await page.evaluate(() => {
+    Reflect.defineProperty(window, 'clearTimeout', {
+      configurable: true,
+      writable: true,
+      value: function (): void {
+        // Cancels nothing.
+      },
+    });
+  });
+
+  relay.send(attachRequest('req-1'));
+  await waitForDock(page, (state) => state.pendingRequests.length === 1);
+  const target = { action: 'approve-driver', requestId: 'req-1' };
+  await page.clock.runFor(ARM_DELAY_MS - 100);
+  const shown = await widgetButtonNow(page, target);
+  expect(shown?.armed).toBe(false);
+
+  // A click on it before then lands nowhere and starts the wait again; the
+  // first wait, had it not been cancelled, would end 100 ms from here.
+  await page.mouse.click(shown?.x ?? 0, shown?.y ?? 0);
+  await page.clock.runFor(150);
+  expect((await widgetButtonNow(page, target))?.armed).toBe(false);
+  await page.clock.runFor(ARM_DELAY_MS - 100 - 150);
+  expect((await widgetButtonNow(page, target))?.armed).toBe(false);
+  expect(decisions(relay)).toEqual([]);
   await page.clock.runFor(100);
   expect((await widgetButtonNow(page, target))?.armed).toBe(true);
   expect(decisions(relay)).toEqual([]);
