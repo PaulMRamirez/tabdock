@@ -367,12 +367,12 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
 
   /**
    * The relay's own refusal of a user the plugin vouched for: ADR 0020 admits
-   * an invitee only with invites on (config.invites), and only once workstream
-   * A's invitee tier exists (ADR 0017), so until then every invitee gets M3's
-   * 403 whatever TABDOCK_INVITES says, and invites stay off.
+   * an invitee only with invites on (config.invites), into the invitee tier
+   * (ADRs 0016 and 0017), where it sees only the pages it holds and pairs
+   * only by invite. With invites off every invitee gets M3's 403.
    */
   function notAdmitted(outcome: Extract<AuthOutcome, { kind: 'user' }>): AuthRefusal | null {
-    return outcome.user.account.kind === 'invitee'
+    return outcome.user.account.kind === 'invitee' && !config.invites
       ? notAllowedRefusal(outcome.oauthClientId)
       : null;
   }
@@ -628,6 +628,8 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         await mcp.close();
         await sessions.closeAll();
         auth.stop?.();
+        // The counts of repeated refusals still held go out before the last line.
+        refusals.close();
         server.closeAllConnections();
         await new Promise<void>((resolveClose) => {
           server.close(() => {

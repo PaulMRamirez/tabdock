@@ -20,7 +20,18 @@ export {
   parseDevTokens,
   type UserAccount,
 } from './auth.ts';
-export { type AuthRefusalLog, createAuthRefusalLog } from './auth-log.ts';
+export {
+  type AuthRefusalLog,
+  createAuthRefusalLog,
+  MAX_TRACKED_REFUSALS,
+  REPEATED_REFUSAL_WINDOW_MS,
+} from './auth-log.ts';
+export {
+  type AuditBudgetOptions,
+  AuditRefusalBudget,
+  MAX_STRANGERS_COUNTED,
+  type RefusalEvent,
+} from './audit-budget.ts';
 export {
   type ClientAddress,
   type ClientAddresses,
@@ -60,8 +71,10 @@ export {
   type ResolvedAudit,
 } from './config.ts';
 export {
+  type BudgetRefusal,
   type CallerIdentity,
   type ClaimOutcome,
+  emailBarDigest,
   type InviteHub,
   type InvitePreview,
   type PairOutcome,
@@ -95,6 +108,8 @@ export {
   CLOCK_TOLERANCE_SECONDS,
   createOAuthAuth,
   DEFAULT_MAX_TOKEN_AGE_MINUTES,
+  EMAIL_CLAIM,
+  EMAIL_VERIFIED_CLAIM,
   JWKS_CACHE_MAX_AGE_MS,
   JWKS_COOLDOWN_MS,
   MAX_TOKEN_AGE_CEILING_MINUTES,
@@ -104,6 +119,7 @@ export {
   parseOAuthClientIds,
   parseOAuthUsers,
   SEEN_SESSIONS,
+  verifiedEmailOf,
 } from './oauth.ts';
 export { LOGIN_COOKIE, PAIR_ROUTES, SESSION_COOKIE } from './pair.ts';
 export { createRelay, type Relay } from './relay.ts';

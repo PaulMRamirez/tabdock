@@ -488,32 +488,43 @@ describe('tokens (ADR 0013)', () => {
     },
   );
 
+  // ADR 0020 changed what this pinned in M3: a second 401 from the same
+  // address within a minute is counted into one line rather than written.
   it('logs every refusal with its reason, and never a token or a subject', async () => {
-    const good = await aliceToken();
-    const expired = await aliceToken({ exp: now() - 60 });
-    const stranger = await provider.token({ sub: 'sub-stranger-7f3a', aud: PUBLIC_MCP_URL });
-    await send(DISCOVER, `Bearer ${good}`);
-    await send(DISCOVER, `Bearer ${expired}`);
-    await send(DISCOVER, `Bearer ${stranger}`);
-    await send(DISCOVER);
-    const all = lines.join('\n');
-    for (const token of [good, expired, stranger]) {
-      expect(all).not.toContain(token);
-      // Not even a piece of one: the signature is the secret part.
-      expect(all).not.toContain(token.split('.')[2]);
+    // Early in the next minute, so the refusals below share one collapsing window.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime((Math.floor(Date.now() / 60_000) + 1) * 60_000 + 5000);
+    try {
+      const good = await aliceToken();
+      const expired = await aliceToken({ exp: now() - 60 });
+      const stranger = await provider.token({ sub: 'sub-stranger-7f3a', aud: PUBLIC_MCP_URL });
+      await send(DISCOVER, `Bearer ${good}`);
+      await send(DISCOVER, `Bearer ${expired}`);
+      await send(DISCOVER, `Bearer ${stranger}`);
+      await send(DISCOVER);
+      await relay?.close();
+      relay = undefined;
+      const all = lines.join('\n');
+      for (const token of [good, expired, stranger]) {
+        expect(all).not.toContain(token);
+        // Not even a piece of one: the signature is the secret part.
+        expect(all).not.toContain(token.split('.')[2]);
+      }
+      expect(all).not.toContain('sub-stranger-7f3a');
+      expect(all).not.toContain('sub-alice');
+      const refusals = lines
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((entry) => String(entry.msg).startsWith('mcp request refused'));
+      expect(refusals.map((entry) => [entry.msg, entry.reason ?? entry.reasons])).toEqual([
+        ['mcp request refused: not authenticated', 'Token has expired'],
+        ['mcp request refused: not allowed', 'signed-in account is not on the allowlist'],
+        ['mcp request refused: not authenticated, repeated', { 'Missing Authorization header': 1 }],
+      ]);
+      // Each names the client address the relay resolved, here the socket's peer.
+      for (const entry of refusals) expect(entry.address).toBe('127.0.0.1');
+    } finally {
+      vi.useRealTimers();
     }
-    expect(all).not.toContain('sub-stranger-7f3a');
-    expect(all).not.toContain('sub-alice');
-    const refusals = lines
-      .map((line) => JSON.parse(line) as Record<string, unknown>)
-      .filter((entry) => String(entry.msg).startsWith('mcp request refused'));
-    expect(refusals.map((entry) => [entry.msg, entry.reason])).toEqual([
-      ['mcp request refused: not authenticated', 'Token has expired'],
-      ['mcp request refused: not allowed', 'signed-in account is not on the allowlist'],
-      ['mcp request refused: not authenticated', 'Missing Authorization header'],
-    ]);
-    // Each names the client address the relay resolved, here the socket's peer.
-    for (const entry of refusals) expect(entry.address).toBe('127.0.0.1');
   });
 
   it("answers 503, not 401, when the provider's keys cannot be fetched", async () => {

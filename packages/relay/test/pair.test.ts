@@ -285,7 +285,8 @@ describe('scan to first call', () => {
     expect(asked.get('response_type')).toBe('code');
     expect(asked.get('client_id')).toBe(PAIR_CLIENT.clientId);
     expect(asked.get('redirect_uri')).toBe(`${PUBLIC_ORIGIN}/pair/callback`);
-    expect(asked.get('scope')).toBe('openid');
+    // ADR 0020: the email claims too, which name an invitee; a member's are never kept.
+    expect(asked.get('scope')).toBe('openid email');
     expect(asked.get('code_challenge_method')).toBe('S256');
     for (const name of ['code_challenge', 'state', 'nonce']) {
       expect(asked.get(name), name).toMatch(/^[A-Za-z0-9_-]{43}$/);

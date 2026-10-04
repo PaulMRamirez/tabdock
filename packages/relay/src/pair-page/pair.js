@@ -93,6 +93,8 @@ const REFUSALS = {
   pairing_expired: 'This pairing link is used or expired. Scan the QR code on the page again.',
   sign_in_required: 'Your sign-in has run out. Sign in again to join.',
   not_allowed: 'This account is not allowed on this relay. Sign in with another account.',
+  invite_required:
+    "This account joins pages only by invite. Ask the page's operator for an invite link, or sign in with another account.",
   rate_limited: 'Too many attempts. Wait a minute, then scan the QR code again.',
   page_busy: 'The page cannot take anyone else right now.',
   network: 'The relay could not be reached. Check the connection and reload.',
@@ -189,7 +191,7 @@ async function start() {
     return;
   }
   if (who.member !== true) {
-    say('refused', REFUSALS.not_allowed);
+    say('refused', who.inviteRequired === true ? REFUSALS.invite_required : REFUSALS.not_allowed);
     signIn.textContent = 'Sign in with another account';
     signIn.hidden = false;
     return;

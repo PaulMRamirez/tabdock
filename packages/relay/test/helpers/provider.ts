@@ -5,8 +5,12 @@
 // documents nor a registration endpoint, and the relay rightly refuses such a
 // provider. Like WorkOS with a Resource Indicator, it puts the RFC 8707
 // `resource` a client asks for into the access token's `aud`; the mock alone
-// ignores that parameter.
+// ignores that parameter. Like WorkOS's Connect tokens, every token it issues
+// carries a jti, which the relay requires from M4 (ADR 0020). A test may add
+// claims to the ID tokens of its sign-ins, such as an email, and answer
+// UserInfo with them instead, as a provider does for scope `openid email`.
 
+import { randomUUID } from 'node:crypto';
 import type { ServerResponse } from 'node:http';
 import { Events, OAuth2Server } from 'oauth2-mock-server';
 
@@ -33,6 +37,17 @@ export interface TestProvider {
    * code grant issues, ID tokens included. null keeps the mock's MOCK_SUBJECT.
    */
   signInSubject: string | null;
+  /**
+   * Claims added to the ID token of each authorization code grant, such as
+   * `email` and `email_verified`; null adds none, as the mock alone does.
+   */
+  idTokenClaims: Record<string, unknown> | null;
+  /**
+   * Claims added to each UserInfo answer, beside the signed-in subject; null
+   * adds none. userInfoRequests counts the requests.
+   */
+  userInfo: Record<string, unknown> | null;
+  readonly userInfoRequests: number;
   /** The client credentials each authorization code grant presented, oldest first. */
   readonly codeGrants: { clientId: string | null; secretSent: boolean }[];
   /** Every token its token endpoint handed out (access, ID and refresh), for log scans. */
@@ -45,8 +60,8 @@ export interface TestProvider {
   tamperTokenResponse: ((body: Record<string, unknown>) => void) | null;
   /**
    * An RS256 access token signed with the provider's key. `claims` are merged
-   * into the mock's payload (iss, iat, nbf, and exp an hour on); a claim given
-   * as undefined is removed.
+   * into the mock's payload (iss, iat, nbf, a fresh jti, and exp an hour on);
+   * a claim given as undefined is removed.
    */
   token(claims?: Record<string, unknown>): Promise<string>;
   stop(): Promise<void>;
@@ -63,6 +78,7 @@ export function goodMetadata(issuer: string): Record<string, unknown> {
     authorization_endpoint: `${issuer}/authorize`,
     token_endpoint: `${issuer}/token`,
     jwks_uri: `${issuer}/jwks`,
+    userinfo_endpoint: `${issuer}/userinfo`,
     response_types_supported: ['code'],
     grant_types_supported: ['authorization_code', 'refresh_token'],
     code_challenge_methods_supported: ['S256'],
@@ -87,6 +103,9 @@ export async function startProvider(): Promise<TestProvider> {
     oidc: Record<string, unknown> | null;
   } = { oauth: goodMetadata(issuer), oidc: null };
   let signInSubject: string | null = null;
+  let idTokenClaims: Record<string, unknown> | null = null;
+  let userInfo: Record<string, unknown> | null = null;
+  let userInfoRequests = 0;
   let tamperTokenResponse: ((body: Record<string, unknown>) => void) | null = null;
   const codeGrants: { clientId: string | null; secretSent: boolean }[] = [];
   const issuedTokens: string[] = [];
@@ -117,14 +136,24 @@ export async function startProvider(): Promise<TestProvider> {
     Events.BeforeTokenSigning,
     (token: { payload: Record<string, unknown> }, request: { body?: unknown }) => {
       const body = request.body as Record<string, unknown> | undefined;
+      token.payload.jti ??= randomUUID();
+      // The mock gives an ID token its client as audience, never a scope.
+      const idToken = token.payload.aud !== undefined && !('scope' in token.payload);
       if (token.payload.aud === undefined && typeof body?.resource === 'string') {
         token.payload.aud = body.resource;
       }
       if (body?.grant_type === 'authorization_code' && signInSubject !== null) {
         token.payload.sub = signInSubject;
       }
+      if (body?.grant_type === 'authorization_code' && idToken && idTokenClaims !== null) {
+        Object.assign(token.payload, idTokenClaims);
+      }
     },
   );
+  server.service.on(Events.BeforeUserinfo, (response: { body: Record<string, unknown> }) => {
+    userInfoRequests += 1;
+    response.body = { sub: signInSubject ?? MOCK_SUBJECT, ...userInfo };
+  });
   server.service.on(
     Events.BeforeResponse,
     (
@@ -179,6 +208,21 @@ export async function startProvider(): Promise<TestProvider> {
     set signInSubject(value) {
       signInSubject = value;
     },
+    get idTokenClaims() {
+      return idTokenClaims;
+    },
+    set idTokenClaims(value) {
+      idTokenClaims = value;
+    },
+    get userInfo() {
+      return userInfo;
+    },
+    set userInfo(value) {
+      userInfo = value;
+    },
+    get userInfoRequests() {
+      return userInfoRequests;
+    },
     codeGrants,
     issuedTokens,
     get tamperTokenResponse() {
@@ -190,6 +234,7 @@ export async function startProvider(): Promise<TestProvider> {
     token(claims = {}) {
       return server.issuer.buildToken({
         scopesOrTransform: (_header, payload) => {
+          payload.jti = randomUUID();
           for (const [key, value] of Object.entries(claims)) {
             if (value === undefined) Reflect.deleteProperty(payload, key);
             else payload[key] = value;

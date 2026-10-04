@@ -1,4 +1,4 @@
-/* The QR page at /pair: read on a phone, so one narrow column and large targets. */
+/* The QR page at /pair and the invite page at /i: read on a phone, so one narrow column and large targets. */
 
 :root {
   --ink: #1b1f24;
@@ -125,6 +125,17 @@ dd {
 .button[disabled] {
   opacity: 0.6;
   cursor: default;
+}
+
+#connect {
+  margin: 16px 0 0;
+}
+
+/* A URL, which may be long: wrapped anywhere and smaller than a code. */
+#connector {
+  font-size: 1rem;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
 }
 
 [hidden] {

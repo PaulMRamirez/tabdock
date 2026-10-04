@@ -4,8 +4,9 @@
 // whether an invitee is admitted, and refusals that can name the account kind
 // and client (ADR 0020); the plugin's start context and stop hook; the
 // client_id an attach request keeps for its attach record (ADR 0019); the
-// sign-in gate (ADR 0018); and the hub's holds(). None changes behaviour:
-// every invitee still gets M3's 403, with TABDOCK_INVITES on or off.
+// sign-in gate (ADR 0018); and the hub's holds(). With TABDOCK_INVITES off
+// every invitee still gets M3's 403; with it on, workstream A admits them
+// into the invitee tier (invites.test.ts).
 
 import type { Client } from '@modelcontextprotocol/client';
 import { MAX_DISPLAY_NAME_CHARS } from '@tabdock/protocol';
@@ -143,23 +144,35 @@ describe('dev-token invitees (ADR 0017)', () => {
     expect(renamed).toMatchObject({ user: { displayName: `invitee ${KEY.slice(0, 8)}` } });
   });
 
-  it("get M3's 403 on /mcp with invites on or off, until workstream A admits them", async () => {
+  // ADR 0020 changes what this pinned at step 1: with invites on the relay now
+  // admits the invitee, so only the invites-off half still answers 403.
+  it("get M3's 403 on /mcp with invites off, and are admitted with them on", async () => {
     for (const invites of [false, true]) {
       const relay = await startRelay({ auth: createDevTokenAuth([ALICE, GUEST]), invites });
       relays.push(relay);
-      const answer = await mcpPost(relay.relay.mcpUrl, GUEST.token);
-      expect(answer.status, String(invites)).toBe(403);
-      expect(answer.headers.get('www-authenticate')).toBeNull();
-      expect(await answer.text()).toBe('This account is not allowed on this relay');
-      const refused = relay.lines
-        .map((line) => JSON.parse(line) as Record<string, unknown>)
-        .filter((entry) => entry.msg === 'mcp request refused: not allowed');
-      expect(refused).toEqual([
-        expect.objectContaining({
-          reason: 'signed-in account is not on the allowlist',
-          address: '127.0.0.1',
-        }),
-      ]);
+      const refused = (): Record<string, unknown>[] =>
+        relay.lines
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+          .filter((entry) => entry.msg === 'mcp request refused: not allowed');
+      if (invites) {
+        const guest = await connectClient(relay.relay, GUEST);
+        clients.push(guest);
+        expect((await callTool(guest, 'list_pages')).isError).toBe(false);
+        expect(refused()).toEqual([]);
+      } else {
+        const answer = await mcpPost(relay.relay.mcpUrl, GUEST.token);
+        expect(answer.status).toBe(403);
+        expect(answer.headers.get('www-authenticate')).toBeNull();
+        expect(await answer.text()).toBe('This account is not allowed on this relay');
+        expect(refused()).toEqual([
+          expect.objectContaining({
+            reason: 'signed-in account is not on the allowlist',
+            address: '127.0.0.1',
+            accountKind: 'invitee',
+            oauthClientId: null,
+          }),
+        ]);
+      }
       expect(relay.lines.join('\n')).not.toContain(GUEST.token);
       // A member on the same relay is served as ever.
       const alice = await connectClient(relay.relay, ALICE);

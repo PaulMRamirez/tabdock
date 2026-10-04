@@ -22,9 +22,9 @@ import type { Logger } from './log.ts';
  * The invitee tier's sessions (ADRs 0016 and 0017): an invitee may hold one
  * session until it holds an attachment and perInvitee after, all invitees
  * together hold at most pool of them, and when the relay is full an invitee's
- * session goes before anyone else is refused. relay.ts passes these now;
- * workstream A makes McpSessions enforce them, and until then an invitee's
- * sessions count as a member's, which the relay never admits yet anyway.
+ * session goes before anyone else is refused. With invites on, anyone who
+ * signs up at the provider is an invitee, so these keep strangers from
+ * filling the relay's sessions or pushing out the owner's people.
  */
 export interface InviteeSessionOptions {
   /** Sessions all invitees may hold together (RelayLimits.inviteeSessions). */
@@ -232,14 +232,33 @@ export class McpSessions {
     return response;
   }
 
+  /** Whether a session is an invitee's, which the tier's rules bound and evict first. */
+  #isInvitee(session: Session): boolean {
+    return this.#options.invitees?.isInvitee(session.userId) === true;
+  }
+
+  /** The least recently active of these sessions, idle ones before busy ones; undefined for none. */
+  #idlest(sessions: Session[], idleOnly: boolean): Session | undefined {
+    const ready = sessions.filter((session) => session.ready);
+    const idle = ready.filter((session) => session.open === 0);
+    const pick = idle.length > 0 || idleOnly ? idle : ready;
+    return pick.sort((a, b) => a.lastActive - b.lastActive)[0];
+  }
+
   /** null when there is room for one more session of this user, else the refusal. */
   #makeRoom(userId: string): Response | null {
-    const { perUser, total, log } = this.#options;
-    const mine = [...this.#sessions.values()].filter((session) => session.userId === userId);
+    const { total, log, invitees } = this.#options;
+    // The tier's rules when this user is an invitee, else null.
+    const tier = invitees?.isInvitee(userId) === true ? invitees : null;
+    // An invitee holds one session until it holds an attachment (ADR 0016).
+    const perUser =
+      tier === null
+        ? this.#options.perUser
+        : Math.min(this.#options.perUser, tier.holds(userId) ? tier.perInvitee : 1);
+    const all = [...this.#sessions.values()];
+    const mine = all.filter((session) => session.userId === userId);
     if (mine.length >= perUser) {
-      const idle = mine
-        .filter((session) => session.ready && session.open === 0)
-        .sort((a, b) => a.lastActive - b.lastActive)[0];
+      const idle = this.#idlest(mine, true);
       if (!idle) {
         log.warn('MCP session refused: the user holds the most sessions allowed', { userId });
         return jsonRpcError(
@@ -250,9 +269,28 @@ export class McpSessions {
       }
       void this.#close(idle, 'evicted for a newer session of the same user');
     }
+    const open = (): Session[] => [...this.#sessions.values()].filter((session) => !session.closed);
+    // Invitees share a small pool of their own, its idlest session making room first.
+    if (tier !== null) {
+      const pool = open().filter((session) => this.#isInvitee(session));
+      if (pool.length >= tier.pool) {
+        const idle = this.#idlest(pool, true);
+        if (!idle) {
+          log.warn('MCP session refused: invitees hold the most sessions allowed', { userId });
+          return jsonRpcError(503, -32000, 'Too many open sessions on this relay; try again later');
+        }
+        void this.#close(idle, 'evicted for a newer invitee session');
+      }
+    }
     if (this.#sessions.size >= total) {
-      log.warn('MCP session refused: the relay holds the most sessions allowed', { userId });
-      return jsonRpcError(503, -32000, 'Too many open sessions on this relay; try again later');
+      // When the relay is full an invitee's session goes before anyone is refused (ADR 0016).
+      const strangers = open().filter((session) => this.#isInvitee(session));
+      const evicted = invitees === undefined ? undefined : this.#idlest(strangers, false);
+      if (evicted === undefined) {
+        log.warn('MCP session refused: the relay holds the most sessions allowed', { userId });
+        return jsonRpcError(503, -32000, 'Too many open sessions on this relay; try again later');
+      }
+      void this.#close(evicted, 'evicted for a newer session: the relay is full');
     }
     return null;
   }
