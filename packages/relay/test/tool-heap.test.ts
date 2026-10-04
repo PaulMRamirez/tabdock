@@ -11,20 +11,20 @@
 // serving, rather than run out of heap.
 
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { encodeFrame, SUBPROTOCOL } from '@tabdock/protocol';
+import { encodeFrame } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
-import WebSocket from 'ws';
+import type WebSocket from 'ws';
 import { HOSTED_LIMITS } from '../src/index.ts';
+import { type FillOutcome, fillPage, imageHeapFlag } from './helpers/hosted-heap.ts';
 import { type MainProcess, startMain } from './helpers/main-process.ts';
 import { PAIR_CLIENT, startProvider, type TestProvider } from './helpers/provider.ts';
 import { rawRequest } from './helpers/tunnel.ts';
 import { framesFor, HEAP_SHAPES, type HeapShape } from './helpers/tool-shapes.ts';
 
 const PROBE = resolve(import.meta.dirname, 'fixtures/tool-heap-probe.ts');
-const DOCKERFILE = resolve(import.meta.dirname, '../../../Dockerfile');
 const PUBLIC_HOST = 'relay.heap.test';
 const PAGE_ORIGIN = 'https://demo.heap.test';
 
@@ -57,70 +57,6 @@ function probe(shape: HeapShape): Promise<{ heapPerPage: number; chargedPerPage:
       else resolveProbe(JSON.parse(line) as { heapPerPage: number; chargedPerPage: number });
     });
   });
-}
-
-/** The heap flag the image starts node with, read from the Dockerfile's CMD. */
-function imageHeapFlag(): string {
-  const cmd = readFileSync(DOCKERFILE, 'utf8')
-    .split('\n')
-    .find((line) => line.startsWith('CMD '));
-  const flag = (JSON.parse(cmd?.slice(4) ?? '[]') as string[]).find((arg) =>
-    arg.startsWith('--max-old-space-size='),
-  );
-  if (flag === undefined) throw new Error('the Dockerfile CMD sets no --max-old-space-size');
-  return flag;
-}
-
-/** What a page got: its tools listed, a close code, or no answer at all from a relay that is gone. */
-type Outcome = 'listed' | 'unreachable' | number;
-
-/**
- * A page through the stand-in edge: hello, then its tools frames, then a ping.
- * 'listed' when the pong comes back, so the relay took every frame; otherwise
- * the close code it was refused with.
- */
-async function fillPage(
-  port: number,
-  address: string,
-  frames: readonly string[],
-): Promise<Outcome> {
-  const ws = new WebSocket(`ws://127.0.0.1:${String(port)}/page`, [SUBPROTOCOL], {
-    origin: PAGE_ORIGIN,
-    headers: { Host: PUBLIC_HOST, 'Fly-Client-IP': address },
-  });
-  sockets.push(ws);
-  const closed = new Promise<number>((resolveClose) => {
-    ws.once('close', (code) => {
-      resolveClose(code);
-    });
-  });
-  const opened = await new Promise<void>((resolveOpen, reject) => {
-    ws.once('open', () => {
-      resolveOpen();
-    });
-    ws.once('error', reject);
-  }).catch(() => 'unreachable' as const);
-  if (opened === 'unreachable') return opened;
-  const ponged = new Promise<'listed'>((resolvePong) => {
-    ws.on('message', (data: Buffer) => {
-      const text = data.toString('utf8');
-      if (text.includes('"t":"ping"')) ws.send(encodeFrame({ t: 'pong' }));
-      if (text.includes('"t":"pong"')) resolvePong('listed');
-    });
-  });
-  ws.send(
-    encodeFrame({
-      t: 'hello',
-      v: 1,
-      title: 'Heap test',
-      url: `${PAGE_ORIGIN}/`,
-      adapterVersion: 'test',
-      policy: {},
-    }),
-  );
-  for (const frame of frames) ws.send(frame);
-  ws.send(encodeFrame({ t: 'ping' }));
-  return Promise.race([ponged, closed]);
 }
 
 describe('the tool list budget and the heap (S9, ADR 0018)', () => {
@@ -172,14 +108,15 @@ describe('the tool list budget and the heap (S9, ADR 0018)', () => {
     };
     const slots = HOSTED_LIMITS.pageSessions ?? 0;
     const perAddress = HOSTED_LIMITS.pageSessionsPerAddress ?? 1;
-    const outcomes: Outcome[] = [];
+    const target = { port, publicHost: PUBLIC_HOST, origin: PAGE_ORIGIN };
+    const outcomes: FillOutcome[] = [];
     for (let first = 0; first < slots; first += 20) {
       outcomes.push(
         ...(await Promise.all(
           Array.from({ length: Math.min(20, slots - first) }, (_, offset) => {
             const slot = first + offset;
             const address = `198.51.100.${String(Math.floor(slot / perAddress) + 1)}`;
-            return fillPage(port, address, slot % 2 === 0 ? frames.nodes : frames.text);
+            return fillPage(target, address, slot % 2 === 0 ? frames.nodes : frames.text, sockets);
           }),
         )),
       );

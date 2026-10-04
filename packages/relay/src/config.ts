@@ -232,6 +232,21 @@ export interface RelayLimits {
    * least MAX_FRAME_BYTES.
    */
   toolBytes: number;
+  /**
+   * Heap the /mcp requests that may wait on a page (call_page_tool, and
+   * pair_page while the operator decides) may hold together, each charged
+   * an upper bound on what its body and its parsed copy hold
+   * (request-heap.ts) until it is answered; past it a call is refused
+   * page_busy and a pairing rate_limited (S9, ADR 0018's notes). At least
+   * MIN_REQUEST_BYTES.
+   */
+  requestBytes: number;
+  /**
+   * The same for one user's requests, past which they are refused
+   * rate_limited, so one account cannot spend the whole of requestBytes.
+   * At least MIN_REQUEST_BYTES.
+   */
+  requestBytesPerUser: number;
 }
 
 /**
@@ -425,7 +440,20 @@ export const DEFAULT_LIMITS: RelayLimits = {
   // page slot filled up to it leaves the relay well inside that heap
   // (tool-heap.test.ts).
   toolBytes: 64 * 1024 * 1024,
+  // Sized with the same heap (ADR 0018's notes): charged an upper bound on
+  // what a waiting request holds, the whole of it filled beside a full tool
+  // budget leaves the image's relay serving (call-heap.test.ts), and one
+  // member's share holds seven calls of 1 MB string arguments.
+  requestBytes: 64 * 1024 * 1024,
+  requestBytesPerUser: 24 * 1024 * 1024,
 };
+
+/**
+ * The least requestBytes and requestBytesPerUser may be: one call of the
+ * largest arguments, a 1 MiB string charged for its body and its parsed
+ * copy, with room to spare.
+ */
+export const MIN_REQUEST_BYTES = 4 * MAX_FRAME_BYTES;
 
 /**
  * Hosted mode's defaults where they differ, sized for the reference
@@ -787,6 +815,16 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     throw new Error(
       `toolBytes (TABDOCK_MAX_TOOL_BYTES) must be at least ${String(MAX_FRAME_BYTES)}, so the budget holds at least one page of ordinary tools (ADR 0018)`,
     );
+  }
+  for (const [name, setting] of [
+    ['requestBytes', 'TABDOCK_MAX_REQUEST_BYTES'],
+    ['requestBytesPerUser', 'TABDOCK_MAX_REQUEST_BYTES_PER_USER'],
+  ] as const) {
+    if (limits[name] < MIN_REQUEST_BYTES) {
+      throw new Error(
+        `${name} (${setting}) must be at least ${String(MIN_REQUEST_BYTES)}, so one call of the largest arguments fits (ADR 0018)`,
+      );
+    }
   }
   // Only true turns invites on, so a stray value from JavaScript leaves them off.
   const invites = options.invites === true;
@@ -1225,6 +1263,11 @@ export function loadConfigFromEnv(
       env.TABDOCK_MAX_PAIR_SIGNINS_IN_FLIGHT,
     ),
     toolBytes: parseCount('TABDOCK_MAX_TOOL_BYTES', env.TABDOCK_MAX_TOOL_BYTES),
+    requestBytes: parseCount('TABDOCK_MAX_REQUEST_BYTES', env.TABDOCK_MAX_REQUEST_BYTES),
+    requestBytesPerUser: parseCount(
+      'TABDOCK_MAX_REQUEST_BYTES_PER_USER',
+      env.TABDOCK_MAX_REQUEST_BYTES_PER_USER,
+    ),
   };
   const invites = parseFlag('TABDOCK_INVITES', env.TABDOCK_INVITES);
   const headerText = env.TABDOCK_CLIENT_ADDRESS_HEADER?.trim() ?? '';

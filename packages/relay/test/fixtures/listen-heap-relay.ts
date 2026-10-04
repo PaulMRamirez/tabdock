@@ -1,6 +1,7 @@
 // node --expose-gc listen-heap-relay.ts: a relay with invites on, sixty
 // invitee accounts (invitee-<n>-dev-token-5a8c1e7f2b9d4063, n from 0) and one
-// member (member-heap-dev-token-7c2e9a4b1d6f8035), every other setting at its
+// member (member-heap-dev-token-7c2e9a4b1d6f8035), room for that member's
+// waiting calls to hold all their bodies, and every other setting at its
 // default. It prints its /mcp and /page URLs, space apart, as its first line,
 // then answers each IPC message with its memory after two collections, so
 // listen-heap.test.ts can measure what the listen streams it opens, and the
@@ -28,6 +29,8 @@ const relay = await createRelay({
   auth: createDevTokenAuth(users),
   port: 0,
   invites: true,
+  // The test counts copies of each body, not what the relay lets them hold.
+  limits: { requestBytesPerUser: 64 * 1024 * 1024 },
   logSink: () => undefined,
 });
 process.stdout.write(`${relay.mcpUrl} ${relay.pageUrl}\n`);

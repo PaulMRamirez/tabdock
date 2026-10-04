@@ -195,6 +195,26 @@ describe('M4 settings', () => {
         /TABDOCK_MAX_TOOL_BYTES/,
       );
     });
+
+    it('read what waiting requests may hold, in all and per user, never below one large call', () => {
+      const defaults = resolveEnv(DEV).limits;
+      expect([defaults.requestBytes, defaults.requestBytesPerUser]).toEqual([
+        64 * 1024 * 1024,
+        24 * 1024 * 1024,
+      ]);
+      const set = resolveEnv({
+        ...DEV,
+        TABDOCK_MAX_REQUEST_BYTES: '134217728',
+        TABDOCK_MAX_REQUEST_BYTES_PER_USER: '4194304',
+      }).limits;
+      expect([set.requestBytes, set.requestBytesPerUser]).toEqual([134_217_728, 4_194_304]);
+      for (const name of ['TABDOCK_MAX_REQUEST_BYTES', 'TABDOCK_MAX_REQUEST_BYTES_PER_USER']) {
+        expect(thrown(() => resolveEnv({ ...DEV, [name]: '4194303' }))).toMatch(
+          new RegExp(`${name}.*at least 4194304`),
+        );
+        expect(() => loadConfigFromEnv({ ...DEV, [name]: 'lots' })).toThrow(new RegExp(name));
+      }
+    });
   });
 
   describe('hosted mode (ADR 0018)', () => {

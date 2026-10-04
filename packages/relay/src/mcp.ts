@@ -335,11 +335,18 @@ export function createRequestBudget(config: ResolvedConfig): RequestBudget {
   };
 }
 
+/**
+ * `heldBytesOf` gives what a request holds on the heap (request-heap.ts),
+ * from the auth object relay.ts made for it; a call or pairing that waits
+ * on a page is charged that much (ADR 0018's notes). 0 where nothing
+ * measured it.
+ */
 export function createMcpFactory(
   hub: PageHub,
   config: ResolvedConfig,
   spike: Spike | null = null,
   budget: RequestBudget = createRequestBudget(config),
+  heldBytesOf: (authInfo: AuthInfo | undefined) => number = () => 0,
 ): (ctx: McpRequestContext) => McpServer {
   const waitSeconds = Math.round(config.timings.pairWaitMs / 1000);
   /**
@@ -375,6 +382,8 @@ export function createMcpFactory(
       ...identityOf(ctx),
       client: clientFrom(server, ctx),
     });
+    /** What this request's body holds while it waits, measured by relay.ts. */
+    const heldBytes = (ctx: ServerContext): number => heldBytesOf(ctx.http?.authInfo ?? authInfo);
 
     server.registerTool(
       'list_pages',
@@ -438,8 +447,8 @@ export function createMcpFactory(
         const { code, invite } = input.data;
         const outcome: PairOutcome =
           code !== undefined
-            ? await hub.pairPage(who, code, ctx.mcpReq.signal)
-            : await hub.redeemInvite(who, invite ?? '', ctx.mcpReq.signal);
+            ? await hub.pairPage(who, code, ctx.mcpReq.signal, heldBytes(ctx))
+            : await hub.redeemInvite(who, invite ?? '', ctx.mcpReq.signal, heldBytes(ctx));
         if (outcome.kind === 'error') return errorResult(outcome.code, outcome.message);
         const already = outcome.existing ? ' You were already attached.' : '';
         // A member's name from the owner's settings, never page text, as /i shows it (ADR 0016).
@@ -518,6 +527,7 @@ export function createMcpFactory(
           args,
           ctx.mcpReq.signal,
           timer?.marks ?? null,
+          heldBytes(ctx),
         );
         const result = callResult(tool, outcome);
         return spike && timer

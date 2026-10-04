@@ -95,6 +95,7 @@ import {
 } from './mcp.ts';
 import { createPairFlow, PAIR_ROUTES, type PairFlow } from './pair.ts';
 import { createRepeatedLog, errorKind } from './repeated-lines.ts';
+import { requestHeapBytes } from './request-heap.ts';
 import { type InviteeSessionOptions, McpSessions } from './sessions.ts';
 import { createSignInGate } from './sign-in-gate.ts';
 import { Spike, type SpikeControl } from './spike.ts';
@@ -442,7 +443,15 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   const budget = createRequestBudget(config);
   // Lines a signed-in client can cause at will on /mcp: one per kind a window, the rest counted (A4.3).
   const mcpLines = createRepeatedLog(log, config.rateLimits.windowMs);
-  const factory = createMcpFactory(hub, config, spike, budget);
+  // What each /mcp request's body holds on the heap, measured before either
+  // leg reads it, so a call or pairing that waits on a page is charged it
+  // (request-heap.ts, ADR 0018's notes). Keyed by the request's own auth
+  // object, which handleMcp makes once per request and the SDK hands each
+  // tool handler as ctx.http.authInfo.
+  const heldBytes = new WeakMap<AuthInfo, number>();
+  const factory = createMcpFactory(hub, config, spike, budget, (authInfo) =>
+    authInfo === undefined ? 0 : (heldBytes.get(authInfo) ?? 0),
+  );
   const mcp = createMcpHandler(factory, {
     legacy: 'reject',
     maxRequestBodySize: MAX_MCP_BODY_BYTES,
@@ -528,6 +537,34 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   };
   const legs = {
     fetch: async (request: Request, options?: McpHandlerRequestOptions): Promise<Response> => {
+      if (request.method === 'POST' && options?.authInfo !== undefined) {
+        // A copy, read here and dropped, since each leg reads the request itself.
+        // A body that fails midway is charged nothing: the leg's own read fails
+        // the same way and answers it before any tool runs.
+        const bytes = await request
+          .clone()
+          .arrayBuffer()
+          .catch(() => null);
+        const charge = bytes === null ? 0 : requestHeapBytes(new Uint8Array(bytes));
+        const { requestBytesPerUser } = config.limits;
+        const extra = AuthExtraSchema.safeParse(options.authInfo.extra);
+        if (charge > requestBytesPerUser && extra.success) {
+          // It could never wait on a page, and neither leg parses it: a body of
+          // empty objects holds twenty times its size once parsed. It costs a
+          // request of the budget, as any refused before a tool runs does.
+          await request.body?.cancel().catch(() => undefined);
+          budget.spend(extra.data.userId, extra.data.kind);
+          mcpLines.write('info', 'mcp request refused: it would hold more than one user may', {
+            userId: extra.data.userId,
+          });
+          return jsonRpcError(
+            413,
+            -32000,
+            `Payload Too Large: this request would hold ${String(Math.ceil(charge / 1024))} KiB of the relay's memory, more than one user's requests may hold together (${String(requestBytesPerUser / 1024)} KiB)`,
+          );
+        }
+        heldBytes.set(options.authInfo, charge);
+      }
       const legacy = await isLegacyRequest(request, undefined, {
         maxRequestBodySize: MAX_MCP_BODY_BYTES,
       });

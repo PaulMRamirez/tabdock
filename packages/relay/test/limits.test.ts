@@ -114,6 +114,9 @@ describe('ADR 0009 defaults', () => {
       // ADR 0018: per address in hosted mode only, and the tool-list budget everywhere.
       signInsInFlightPerAddress: 2,
       toolBytes: 64 * 1024 * 1024,
+      // ADR 0018's notes: what requests waiting on pages may hold, in all and per user.
+      requestBytes: 64 * 1024 * 1024,
+      requestBytesPerUser: 24 * 1024 * 1024,
     });
     expect(DEFAULT_RATE_LIMITS.callsPerUserPerPage).toBe(120);
     // Pairing counts per user and per page, never per address (S3, ADR 0016).

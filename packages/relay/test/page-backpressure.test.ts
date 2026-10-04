@@ -10,13 +10,27 @@
 // Now what the relay has queued for a page past what the kernel took is
 // capped, and past the cap the socket is closed with 1008 and cut off soon
 // after. hub.test.ts pins the cap's edges exactly.
+//
+// Calls are held to the same bound without closing anything (ADR 0024's
+// notes). Their invokes went out with no check at all: a page that stopped
+// reading held every one a member sent it, 56 MiB for 60 calls of 1 MB, and a
+// page that read everything over a phone's link was closed as not reading by
+// the next small frame once a burst of large invokes filled its queue, which
+// let an observer end the operator's page. Now an invoke that would fill the
+// queue waits for room, and only frames the page itself is not taking count
+// toward closing it.
 
 import { type ChildProcess, fork } from 'node:child_process';
+import { connect, createServer, type Server, type Socket } from 'node:net';
 import { resolve } from 'node:path';
-import { encodeFrame, type PageFrameInput, SUBPROTOCOL } from '@tabdock/protocol';
+import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import { encodeFrame, type PageFrameInput, type PageTool, SUBPROTOCOL } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
-import { PAGE_ORIGIN } from './helpers/page-client.ts';
+import { MAX_UNREAD_BYTES } from '../src/hub.ts';
+import type { RelayOptions } from '../src/index.ts';
+import { connectPage, PAGE_ORIGIN, type TestPage } from './helpers/page-client.ts';
+import { pairAndApprove } from './helpers/relay.ts';
 
 const RELAY = resolve(import.meta.dirname, 'fixtures/page-flood-relay.ts');
 const MIB = 1024 * 1024;
@@ -29,30 +43,42 @@ interface Report {
   rss: number;
   closes: string[];
   lines: number;
+  /** The most any page socket had queued past what the kernel took, since the last report. */
+  maxQueued: number;
 }
 
 let child: ChildProcess | undefined;
 const sockets: WebSocket[] = [];
+const pages: TestPage[] = [];
+const clients: Client[] = [];
+const servers: Server[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+  for (const client of clients.splice(0)) await client.close().catch(() => undefined);
+  for (const page of pages.splice(0)) page.ws.terminate();
   for (const ws of sockets.splice(0)) ws.terminate();
+  for (const server of servers.splice(0)) server.close();
   child?.kill('SIGKILL');
   child = undefined;
 });
 
 interface Fixture {
   url: string;
+  mcpUrl: string;
   /** Its memory after collecting garbage, and the closes it logged since the last report. */
   report: () => Promise<Report>;
   /** Whether it has closed a page socket yet. */
   closed: () => boolean;
 }
 
-/** The fixture relay in its own process. */
-async function startRelay(): Promise<Fixture> {
+/** The fixture relay in its own process, with these timings and limits. */
+async function startRelay(
+  options: Pick<RelayOptions, 'timings' | 'limits'> = {},
+): Promise<Fixture> {
   const started = fork(RELAY, [], {
     execArgv: ['--expose-gc'],
     stdio: ['ignore', 'pipe', 'inherit', 'ipc'],
+    env: { ...process.env, PAGE_FLOOD_OPTIONS: JSON.stringify(options) },
   });
   child = started;
   let closed = false;
@@ -61,9 +87,9 @@ async function startRelay(): Promise<Fixture> {
     if ('closing' in message) closed = true;
     else waiting?.(message);
   });
-  const url = await new Promise<string>((resolveUrl, reject) => {
+  const [url = '', mcpUrl = ''] = await new Promise<string[]>((resolveUrls, reject) => {
     started.stdout?.once('data', (chunk: Buffer) => {
-      resolveUrl(chunk.toString('utf8').trim());
+      resolveUrls(chunk.toString('utf8').trim().split(' '));
     });
     started.once('exit', (code) => {
       reject(new Error(`the fixture relay exited with ${String(code)}`));
@@ -74,7 +100,7 @@ async function startRelay(): Promise<Fixture> {
       waiting = resolveReport;
       started.send('measure');
     });
-  return { url, report, closed: () => closed };
+  return { url, mcpUrl, report, closed: () => closed };
 }
 
 /** A page that says hello and takes its welcome, then, if deaf, stops reading anything the relay sends. */
@@ -227,4 +253,188 @@ describe('a page that stops reading (S9, A4.3)', () => {
     expect((await relay.report()).closes).toEqual([]);
     expect(page.ws.readyState).toBe(WebSocket.OPEN);
   }, 60_000);
+});
+
+const SEARCH: PageTool = {
+  name: 'search',
+  description: 'Search the given text.',
+  inputSchema: { type: 'object', properties: { text: { type: 'string' } } },
+  annotations: { readOnlyHint: true },
+};
+/** An argument as large as one invoke frame can carry. */
+const LARGE = 'a'.repeat(1_000_000);
+/**
+ * Room for every call a test sends: what waiting requests may hold has its
+ * own tests (request-bytes.test.ts, call-heap.test.ts), and these are about
+ * the page link alone.
+ */
+const ROOM_FOR_CALLS = { requestBytes: 2 ** 40, requestBytesPerUser: 2 ** 40 };
+
+async function member(relay: Fixture, token: string): Promise<Client> {
+  const client = new Client({ name: 'backpressure', version: '1.0.0' });
+  await client.connect(
+    new StreamableHTTPClientTransport(new URL(relay.mcpUrl), {
+      requestInit: { headers: { Authorization: `Bearer ${token}` } },
+    }),
+  );
+  clients.push(client);
+  return client;
+}
+
+/** A call_page_tool call's answer: 'ok', or its error text. */
+async function search(
+  client: Client,
+  pageId: string,
+  text: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  try {
+    const result = await client.callTool(
+      {
+        name: 'call_page_tool',
+        arguments: { page: pageId, tool: SEARCH.name, arguments: { text } },
+      },
+      { timeout: 120_000, ...(signal === undefined ? {} : { signal }) },
+    );
+    if (result.isError !== true) return 'ok';
+    return result.content.map((block) => (block.type === 'text' ? block.text : '')).join('');
+  } catch (error) {
+    return `rejected: ${String(error)}`;
+  }
+}
+
+/**
+ * A TCP proxy in front of the relay whose relay-to-page direction carries
+ * `rate` bytes a second, like a phone's link; the page's port.
+ */
+async function slowLink(relayUrl: string, rate: number): Promise<number> {
+  const target = new URL(relayUrl);
+  const server = createServer((down: Socket) => {
+    const up = connect(Number(target.port), target.hostname);
+    down.pipe(up);
+    up.on('data', (chunk: Buffer) => {
+      up.pause();
+      down.write(chunk);
+      setTimeout(
+        () => {
+          up.resume();
+        },
+        (chunk.length / rate) * 1000,
+      );
+    });
+    up.on('close', () => down.destroy());
+    down.on('close', () => up.destroy());
+    up.on('error', () => undefined);
+    down.on('error', () => undefined);
+  });
+  servers.push(server);
+  await new Promise<void>((resolveListen) => {
+    server.listen(0, '127.0.0.1', resolveListen);
+  });
+  const address = server.address();
+  if (address === null || typeof address === 'string') throw new Error('the proxy has no port');
+  return address.port;
+}
+
+describe('calls to a page the relay cannot hand everything at once (S9, ADR 0024 notes)', () => {
+  it('holds a burst of large invokes back from a page that stops reading, and never closes it for them', async () => {
+    const relay = await startRelay({ timings: { callDeadlineMs: 8000 }, limits: ROOM_FOR_CALLS });
+    const page = await connectPage(relay.url, { tools: [SEARCH] });
+    pages.push(page);
+    const alice = await member(relay, 'page-flood-alice-token-5e2b7c9d1a4f8036');
+    await pairAndApprove(alice, page);
+    page.ws.pause();
+    await relay.report();
+    const calls: Promise<string>[] = [];
+    for (let n = 0; n < 30; n += 1) {
+      calls.push(search(alice, page.pageId, LARGE));
+      await new Promise((resolveTick) => setTimeout(resolveTick, 20));
+    }
+    await new Promise((resolveTick) => setTimeout(resolveTick, 2000));
+    const during = await relay.report();
+    const outcomes = await Promise.all(calls);
+    const report = JSON.stringify({
+      maxQueuedMiB: +(during.maxQueued / MIB).toFixed(2),
+      closes: during.closes,
+      outcomes: outcomes.map((outcome) => outcome.slice(0, 80)),
+    });
+    // Before, every invoke went onto the socket: about 26 MiB queued for a page that read none.
+    expect(during.maxQueued, report).toBeLessThanOrEqual(MAX_UNREAD_BYTES);
+    expect(during.closes, report).toEqual([]);
+    // The few that fit went out and found no answer; the rest never left the relay.
+    for (const outcome of outcomes) expect(outcome, report).toMatch(/^timeout:/);
+    expect(
+      outcomes.filter((outcome) => outcome.includes('never reached it')).length,
+      report,
+    ).toBeGreaterThan(20);
+    // The page still has its socket once it reads again.
+    page.ws.resume();
+    await page.sync();
+    expect(page.ws.readyState, report).toBe(WebSocket.OPEN);
+    expect((await relay.report()).closes, report).toEqual([]);
+  }, 60_000);
+
+  it('never closes a page that reads over a slow link, whoever fills its queue with large calls', async () => {
+    const relay = await startRelay({
+      // The relay's own heartbeat goes out while the burst is on its way, as a pong would.
+      timings: { callDeadlineMs: 30_000, pingIntervalMs: 2000, idleTimeoutMs: 60_000 },
+      limits: ROOM_FOR_CALLS,
+    });
+    const port = await slowLink(relay.url, 2 * MIB);
+    let answered = 0;
+    const page = await connectPage(`ws://127.0.0.1:${String(port)}/page`, {
+      tools: [SEARCH],
+      // A page that reads every frame and answers every call at once, but one of the operator's.
+      onInvoke: (frame) => {
+        answered += 1;
+        if (frame.arguments.text === 'slow') {
+          return new Promise((resolveSlow) => {
+            setTimeout(() => {
+              resolveSlow({ ok: true, content: 'found' });
+            }, 3000);
+          });
+        }
+        return { ok: true, content: 'found' };
+      },
+    });
+    pages.push(page);
+    // Alice drives the page; Bob is only an observer, and he sends the burst.
+    const alice = await member(relay, 'page-flood-alice-token-5e2b7c9d1a4f8036');
+    await pairAndApprove(alice, page);
+    const bob = await member(relay, 'page-flood-bob-token-0c6f3a8e2d7b5149');
+    await pairAndApprove(bob, page, 'observer');
+    await relay.report();
+    const own = search(alice, page.pageId, 'slow');
+    const leaving = new AbortController();
+    // Bob gives up on his fifth call a second in, while its invoke is most
+    // likely on its way, so the relay tells the page to stop it.
+    const GIVEN_UP = 4;
+    const burst = Array.from({ length: 10 }, (_, n) =>
+      search(bob, page.pageId, LARGE, n === GIVEN_UP ? leaving.signal : undefined),
+    );
+    await new Promise((resolveTick) => setTimeout(resolveTick, 1000));
+    leaving.abort();
+    const outcomes = await Promise.all(burst);
+    const after = await relay.report();
+    const report = JSON.stringify({
+      own: (await own).slice(0, 80),
+      answered,
+      maxQueuedMiB: +(after.maxQueued / MIB).toFixed(2),
+      closes: after.closes,
+      outcomes: outcomes.map((outcome) => outcome.slice(0, 80)),
+    });
+    // Before, the cancel or the heartbeat found the queue past 2 MiB and closed the page,
+    // failing Alice's call and most of Bob's with page_asleep.
+    expect(after.closes, report).toEqual([]);
+    expect(await own, report).toBe('ok');
+    // The one he gave up on was answered first or ended for him; every other was answered.
+    expect(
+      outcomes.filter((_, n) => n !== GIVEN_UP),
+      report,
+    ).toEqual(Array.from({ length: 9 }, () => 'ok'));
+    expect(outcomes[GIVEN_UP], report).toMatch(/^(ok|rejected: .*AbortError)/);
+    expect(after.maxQueued, report).toBeLessThanOrEqual(MAX_UNREAD_BYTES);
+    await page.sync();
+    expect(page.ws.readyState, report).toBe(WebSocket.OPEN);
+  }, 90_000);
 });

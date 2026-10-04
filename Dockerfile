@@ -49,5 +49,7 @@ EXPOSE 8787
 # since the relay starts only worker threads. The heap cap suits a 512 MB host
 # beside the argument worker's own 256 MB cap, and holds TABDOCK_MAX_TOOL_BYTES's
 # default with room to spare: packages/relay/test/tool-heap.test.ts reads this
-# flag and fills every hosted page slot up to that budget under it (ADR 0018).
+# flag and fills every hosted page slot up to that budget under it (ADR 0018),
+# and call-heap.test.ts adds members' waiting calls up to the default
+# TABDOCK_MAX_REQUEST_BYTES beside them.
 CMD ["--max-old-space-size=192", "packages/relay/src/main.ts"]

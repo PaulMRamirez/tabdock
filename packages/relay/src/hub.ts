@@ -16,7 +16,8 @@
 // and per address, past which they are counted, and never closes the page
 // (ADR 0023); the lines each page connection writes have a budget per address
 // too. What the hub sends a page that has stopped reading is held only up to
-// a bound, past which the socket is closed (ADR 0024).
+// a bound, past which the socket is closed, and a call whose invoke would
+// fill that bound waits for room instead (ADR 0024 and its notes).
 
 import {
   type AttachmentView,
@@ -218,7 +219,12 @@ export interface InviteHub {
    * Counted like a code per user and per page, and per invite; waits for the
    * operator like pairPage when the invite needs a prompt.
    */
-  redeemInvite(caller: CallerIdentity, invite: string, signal: AbortSignal): Promise<PairOutcome>;
+  redeemInvite(
+    caller: CallerIdentity,
+    invite: string,
+    signal: AbortSignal,
+    heldBytes?: number,
+  ): Promise<PairOutcome>;
   /** What /i shows; null for an unknown, used, cancelled, expired or unsponsored secret alike. */
   previewInvite(secret: string): InvitePreview | null;
   /** /i's Join, like claimPairNonce: refused at once, or claimed with the outcome to come. */
@@ -296,7 +302,12 @@ export interface SocketRefusal {
  */
 interface CallTrace {
   reached: boolean;
+  /** Returns what the call's request was charged against what waiting requests hold (#holdBytes). */
+  release: (() => void) | null;
 }
+
+/** Why the relay tells a page to stop a call. */
+type CancelReason = NonNullable<Extract<RelayFrame, { t: 'cancel' }>['reason']>;
 
 /** One call_page_tool call from arrival until it settles. */
 interface PendingCall {
@@ -321,8 +332,12 @@ interface PendingCall {
    * argument check runs; the queue stops at it until the check answers.
    */
   checking: boolean;
-  /** The socket its invoke went out on; null while it waits in the queue. */
+  /** The socket its invoke went out on; null while it waits in the queue or for room. */
   conn: Conn | null;
+  /** The socket whose queue it waits on for room to send its invoke (#hold); null otherwise. */
+  heldOn: Conn | null;
+  /** Its invoke frame's size when it arrived, for the room check while it is held. */
+  invokeBytes: number;
   /** Filled in for the spike's timing (spike.ts); null otherwise. */
   marks: CallMarks | null;
   /** Whether its invoke went out, which decides how its audit record is written. */
@@ -407,10 +422,16 @@ interface Conn {
   /** When this socket's recent frames that changed nothing arrived, for ignoredFramesPerSocket. */
   ignoredFrames: number[];
   /**
-   * Frames sent while the socket's queue was not empty, since it last was:
-   * an upper bound on the frames the page has left unread (#queueFor).
+   * Frames handed to ws that ws has not yet handed the kernel, counted
+   * exactly through each send's callback (#write): all of them, and those
+   * that count toward closing a page that is not reading, which is every
+   * frame but a call's invoke and cancel. Both counts start over, with a new
+   * epoch, whenever the socket's queue is seen empty, since a callback comes
+   * a tick after its bytes left (#observe).
    */
-  unread: number;
+  queue: { epoch: number; frames: number; counted: number };
+  /** Calls whose invoke waits for room on this socket, oldest first (#hold). */
+  held: PendingCall[];
 }
 
 /**
@@ -527,17 +548,27 @@ export const CLOSE_RESUMED_ELSEWHERE = CLOSE_REPLACED;
 const CLOSE_GRACE_MS = 2000;
 /**
  * What the relay keeps queued for one page that has not read it: the bytes
- * on its socket past what the kernel took, and the frames sent meanwhile
- * (ADR 0024). A page that reads empties that queue as fast as the relay
- * fills it, and one large frame always fits. /page takes no credential, and
- * the relay answers pings, revokes, invite frames and rotate_pairing with
- * frames of its own, so a socket that stopped reading while it sent them
- * held every answer in memory: 80 to 140 MiB of heap for a million pings.
- * Each small frame queued costs a few hundred bytes beside its own, so the
- * frames are counted as well as the bytes.
+ * on its socket past what the kernel took, and the frames among them that
+ * are not a call's (ADR 0024). /page takes no credential, and the relay
+ * answers pings, revokes, invite frames and rotate_pairing with frames of
+ * its own, so a socket that stopped reading while it sent them held every
+ * answer in memory: 80 to 140 MiB of heap for a million pings. Each small
+ * frame queued costs a few hundred bytes beside its own, so the frames are
+ * counted as well as the bytes. Past either the page is closed.
  */
 export const MAX_UNREAD_BYTES = 2 * MAX_FRAME_BYTES;
 export const MAX_UNREAD_FRAMES = 256;
+/**
+ * The most a page's queue may hold, its own invoke included, for an invoke
+ * to go out; one always goes onto an empty queue. Past it the call waits
+ * for room (#hold), so a member's calls never close a page: a page that
+ * stopped reading held every invoke sent it, 116 MiB for 120 calls of 1 MB,
+ * and a page reading on a slow link was closed by the next pong once
+ * invokes had filled its queue (ADR 0024's notes). Half MAX_UNREAD_BYTES,
+ * so what invokes hold leaves a frame of the largest size of room for
+ * everything else, and what else the relay sends a page is far smaller.
+ */
+export const INVOKE_ROOM = MAX_FRAME_BYTES;
 const MAX_ROSTER_CLIENTS = 20;
 /**
  * Each call moves its attachment's expiresAt, but the roster carrying it is
@@ -581,6 +612,14 @@ const PAGE_ERRORS: Record<Exclude<PageErrorCode, 'tool_error'>, HubError> = {
 function hubError(code: ErrorCode, message: string): HubError {
   return { kind: 'error', code, message };
 }
+
+/** "2.5 MiB", for messages about memory. */
+function mebibytes(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+/** A request's charge against what requests waiting on pages may hold, and its return. */
+type HeldBytes = { kind: 'held'; release: () => void } | HubError;
 
 function notAttached(pageId: string): HubError {
   return hubError('not_attached', `you are not attached to page ${pageId}`);
@@ -968,6 +1007,13 @@ export class PageHub {
   readonly #userLimiter: SlidingWindowLimiter;
   readonly #pageLimiter: SlidingWindowLimiter;
   readonly #callLimiter: SlidingWindowLimiter;
+  /**
+   * What the /mcp requests waiting on a page hold on the heap, by user and
+   * in all, each charged its body's upper bound (request-heap.ts) from
+   * when it may start waiting until it is answered (#holdBytes).
+   */
+  readonly #heldBytes = new Map<string, number>();
+  #heldTotal = 0;
   /** Tools frames per remote address, shared by its sockets and kept across reconnects. */
   readonly #toolsFrameLimiter: SlidingWindowLimiter;
   /**
@@ -1197,7 +1243,8 @@ export class PageHub {
       inflight: new Map(),
       toolsFrames: [],
       ignoredFrames: [],
-      unread: 0,
+      queue: { epoch: 0, frames: 0, counted: 0 },
+      held: [],
     };
     this.#conns.add(conn);
     this.#socketsByAddress.set(address, (this.#socketsByAddress.get(address) ?? 0) + 1);
@@ -1216,7 +1263,10 @@ export class PageHub {
     // own: its pong is queued like any frame the relay sends, within the same bound.
     ws.on('ping', (data) => {
       if (conn.closing || ws.readyState !== ws.OPEN) return;
-      if (this.#queueFor(conn, data.length)) ws.pong(data);
+      if (!this.#roomFor(conn, data.length)) return;
+      this.#write(conn, true, (written) => {
+        ws.pong(data, false, written);
+      });
     });
     ws.on('close', (code) => {
       this.#onClose(conn, code);
@@ -2688,9 +2738,13 @@ export class PageHub {
       if (users.has(call.caller.userId)) call.settle(outcome);
     }
     const conn = this.#live.get(pageId);
+    // Those waiting for room never reached the page either.
+    for (const call of [...(conn?.held ?? [])]) {
+      if (users.has(call.caller.userId)) call.settle(outcome);
+    }
     for (const call of [...(conn?.inflight.values() ?? [])]) {
       if (!users.has(call.caller.userId)) continue;
-      if (conn) this.#send(conn, { t: 'cancel', callId: call.callId, reason });
+      if (conn) this.#sendCancel(conn, call.callId, reason);
       call.settle(outcome);
     }
   }
@@ -2830,6 +2884,60 @@ export class PageHub {
     for (const waiter of [...(this.#pairWaiters.get(requestId) ?? [])]) waiter(outcome);
   }
 
+  // What requests waiting on a page hold
+
+  /**
+   * Charges a request that may wait on a page (a call, or a pairing waiting
+   * for the operator) its body's upper bound on the heap, `bytes`, until
+   * release. Past what one user's such requests may hold together
+   * (limits.requestBytesPerUser) it is refused rate_limited, and past what
+   * all may hold (limits.requestBytes) `relayFull`: the request budget
+   * alone let one member hold 120 calls of 1 MB arguments, about 2 MB of
+   * heap each, and crash a relay with the image's 192 MiB heap (ADR 0018's
+   * notes). A request charged nothing, as from a caller with no HTTP body,
+   * is always held.
+   */
+  #holdBytes(userId: string, bytes: number, relayFull: 'page_busy' | 'rate_limited'): HeldBytes {
+    if (bytes <= 0) return { kind: 'held', release: () => undefined };
+    const { requestBytes, requestBytesPerUser } = this.#config.limits;
+    const own = this.#heldBytes.get(userId) ?? 0;
+    if (bytes > requestBytesPerUser) {
+      this.#log.debug('request refused: it alone would hold more than a user may', { userId });
+      return hubError(
+        'rate_limited',
+        `this request would hold ${mebibytes(bytes)} of the relay's memory while it waits, more than one user's requests may hold together (${mebibytes(requestBytesPerUser)}); send less`,
+      );
+    }
+    if (own + bytes > requestBytesPerUser) {
+      this.#log.debug('request refused: the user holds too much in requests waiting', { userId });
+      return hubError(
+        'rate_limited',
+        `your requests waiting on pages already hold ${mebibytes(own)} of the relay's memory, and one user's may hold ${mebibytes(requestBytesPerUser)}; wait for some to finish`,
+      );
+    }
+    if (this.#heldTotal + bytes > requestBytes) {
+      this.#log.debug('request refused: requests waiting hold all the relay allows', { userId });
+      return hubError(
+        relayFull,
+        "requests waiting on pages hold as much of the relay's memory as it allows; try again shortly",
+      );
+    }
+    this.#heldBytes.set(userId, own + bytes);
+    this.#heldTotal += bytes;
+    let held = true;
+    return {
+      kind: 'held',
+      release: () => {
+        if (!held) return;
+        held = false;
+        this.#heldTotal -= bytes;
+        const left = (this.#heldBytes.get(userId) ?? bytes) - bytes;
+        if (left > 0) this.#heldBytes.set(userId, left);
+        else this.#heldBytes.delete(userId);
+      },
+    };
+  }
+
   // Calls
 
   #result(conn: Conn, pageId: string, frame: FrameOf<'result'>): void {
@@ -2864,6 +2972,8 @@ export class PageHub {
   }
 
   #failInflight(conn: Conn, outcome: CallOutcome): void {
+    // Those still waiting for room first, so a write settling cannot send one of them.
+    for (const call of [...conn.held]) call.settle(outcome);
     for (const call of [...conn.inflight.values()]) call.settle(outcome);
   }
 
@@ -2969,7 +3079,17 @@ export class PageHub {
     };
   }
 
-  async pairPage(caller: CallerIdentity, code: string, signal: AbortSignal): Promise<PairOutcome> {
+  /**
+   * `heldBytes` as for callPageTool: the request waits for the operator, so
+   * it is charged what it holds, and refused before its code is looked at
+   * past what waiting requests may hold.
+   */
+  async pairPage(
+    caller: CallerIdentity,
+    code: string,
+    signal: AbortSignal,
+    heldBytes = 0,
+  ): Promise<PairOutcome> {
     const now = Date.now();
     const limited = this.#pairingLimited(caller, 'code', now);
     if (limited) return limited;
@@ -2978,7 +3098,21 @@ export class PageHub {
     // strangers (ADR 0016).
     const required = this.#inviteRequired(caller, 'code');
     if (required) return required;
+    const held = this.#holdBytes(caller.userId, heldBytes, 'rate_limited');
+    if (held.kind === 'error') return this.#refusedBeforePage(caller, 'code', null, held);
+    try {
+      return await this.#pairByCode(caller, code, signal, now);
+    } finally {
+      held.release();
+    }
+  }
 
+  async #pairByCode(
+    caller: CallerIdentity,
+    code: string,
+    signal: AbortSignal,
+    now: number,
+  ): Promise<PairOutcome> {
     const normalised = normalisePairingCode(code);
     const pageId = normalised === null ? null : this.#matchTicket(normalised, now);
     const live = pageId === null ? null : this.#livePage(pageId);
@@ -3067,10 +3201,20 @@ export class PageHub {
     caller: CallerIdentity,
     invite: string,
     signal: AbortSignal,
+    heldBytes = 0,
   ): Promise<PairOutcome> {
-    const secret = inviteSecretOf(invite, this.#linkBase());
-    const started = this.#redeem(caller, secret, true, Date.now());
-    return started.kind === 'pending' ? this.#waitForDecision(started.record, signal) : started;
+    // As for pairPage, before anything is spent: the request may wait for the operator.
+    const held = this.#holdBytes(caller.userId, heldBytes, 'rate_limited');
+    if (held.kind === 'error') return this.#refusedBeforePage(caller, 'invite', null, held);
+    try {
+      const secret = inviteSecretOf(invite, this.#linkBase());
+      const started = this.#redeem(caller, secret, true, Date.now());
+      return started.kind === 'pending'
+        ? await this.#waitForDecision(started.record, signal)
+        : started;
+    } finally {
+      held.release();
+    }
   }
 
   /**
@@ -3579,6 +3723,11 @@ export class PageHub {
     });
   }
 
+  /**
+   * `heldBytes` is an upper bound on what the call's own request holds on
+   * the heap while it waits (request-heap.ts), which relay.ts measures from
+   * its body; 0 for a caller with none.
+   */
   async callPageTool(
     caller: CallerIdentity,
     pageId: string,
@@ -3586,6 +3735,7 @@ export class PageHub {
     args: JsonObject,
     signal: AbortSignal,
     marks: CallMarks | null = null,
+    heldBytes = 0,
   ): Promise<CallOutcome> {
     const started = Date.now();
     // The duration comes from a clock that only runs forward: a wall clock
@@ -3593,9 +3743,9 @@ export class PageHub {
     // record's schema refuses, and the call would lose its line (S7).
     const startedMono = performance.now();
     let auditOutcome: AuditOutcome = 'relay_error';
-    const trace: CallTrace = { reached: false };
+    const trace: CallTrace = { reached: false, release: null };
     try {
-      const outcome = await this.#call(caller, pageId, tool, args, signal, marks, trace);
+      const outcome = await this.#call(caller, pageId, tool, args, signal, marks, trace, heldBytes);
       auditOutcome = outcome.kind === 'error' ? outcome.code : outcome.kind;
       return outcome;
     } catch (error) {
@@ -3603,6 +3753,7 @@ export class PageHub {
       this.#log.error('call failed inside the relay', { pageId, error });
       throw error;
     } finally {
+      trace.release?.();
       // In finally, so every attempt leaves a record even when the relay itself fails (S7).
       const record: AuditCallEvent = {
         v: AUDIT_VERSION,
@@ -3720,12 +3871,13 @@ export class PageHub {
 
   /**
    * Everything a call must pass, in order: access, the rate limit (so a refused
-   * call still counts and nobody spins on invalid calls for free), the tool, the
-   * role, the frame size, the queue depth for a mutating call, and the
-   * arguments. A mutating call takes its place in its page's queue on arrival,
-   * before its argument check answers, so a later write whose check is quicker
-   * or skipped never overtakes it (SPEC section 5); a read-only one goes to the
-   * page once its check answers.
+   * call still counts and nobody spins on invalid calls for free), what its
+   * request may hold while it waits, the tool, the role, the frame size, the
+   * queue depth for a mutating call, and the arguments. A mutating call takes
+   * its place in its page's queue on arrival, before its argument check
+   * answers, so a later write whose check is quicker or skipped never
+   * overtakes it (SPEC section 5); a read-only one goes to the page once its
+   * check answers.
    */
   async #call(
     caller: CallerIdentity,
@@ -3735,6 +3887,7 @@ export class PageHub {
     signal: AbortSignal,
     marks: CallMarks | null,
     trace: CallTrace,
+    heldBytes: number,
   ): Promise<CallOutcome> {
     const arrivedAt = Date.now();
     const access = this.#access(caller.userId, pageId);
@@ -3751,6 +3904,9 @@ export class PageHub {
       );
     }
     this.#callLimiter.record(rateKey, arrivedAt);
+    const held = this.#holdBytes(caller.userId, heldBytes, 'page_busy');
+    if (held.kind === 'error') return held;
+    trace.release = held.release;
 
     // Every call moves the expiry, but only one that passes every check names
     // its client (#nameClient): refused calls must not add names to the roster.
@@ -3778,6 +3934,8 @@ export class PageHub {
       waited: false,
       checking: false,
       conn: null,
+      heldOn: null,
+      invokeBytes: 0,
       marks,
       trace,
       timer: null,
@@ -3787,6 +3945,7 @@ export class PageHub {
     // Checked before anything waits: the size cannot grow later, as the role and deadline only shrink.
     const encoded = this.#encodeInvoke(call, attachment.role, this.#config.timings.callDeadlineMs);
     if (encoded.kind === 'error') return encoded;
+    call.invokeBytes = encoded.bytes;
 
     if (!call.mutating) {
       // Read-only calls run side by side, so nothing is held while this one is checked.
@@ -3860,10 +4019,8 @@ export class PageHub {
   ): Promise<CallOutcome> {
     return new Promise((resolve) => {
       const onAbort = (): void => {
-        // A queued call simply leaves the queue; the page never heard of it.
-        if (call.conn) {
-          this.#send(call.conn, { t: 'cancel', callId: call.callId, reason: 'client' });
-        }
+        // A queued or held call simply leaves; the page never heard of it.
+        if (call.conn) this.#sendCancel(call.conn, call.callId, 'client');
         call.settle({ kind: 'cancelled' });
       };
       call.settle = (outcome) => {
@@ -3945,7 +4102,7 @@ export class PageHub {
     call: PendingCall,
     role: Role,
     deadlineMs: number,
-  ): { kind: 'frame'; text: string } | HubError {
+  ): { kind: 'frame'; text: string; bytes: number } | HubError {
     let text: string;
     try {
       text = encodeFrame({
@@ -3967,13 +4124,14 @@ export class PageHub {
     }
     // The adapter drops any frame over the cap by closing the socket, so an
     // oversized call must stop here rather than knock the page offline.
-    if (Buffer.byteLength(text, 'utf8') > MAX_FRAME_BYTES) {
+    const bytes = Buffer.byteLength(text, 'utf8');
+    if (bytes > MAX_FRAME_BYTES) {
       return hubError(
         'invalid_arguments',
         `the arguments are too large to forward; one page link frame carries at most ${String(MAX_FRAME_BYTES)} bytes`,
       );
     }
-    return { kind: 'frame', text };
+    return { kind: 'frame', text, bytes };
   }
 
   /**
@@ -4033,12 +4191,12 @@ export class PageHub {
     call.timer = setTimeout(
       () => {
         if (call.conn) {
-          this.#send(call.conn, { t: 'cancel', callId: call.callId, reason: 'timeout' });
+          this.#sendCancel(call.conn, call.callId, 'timeout');
           call.settle(
             hubError('timeout', `the page did not answer within ${String(callDeadlineMs)} ms`),
           );
         } else {
-          call.settle(this.#queuedTooLong());
+          call.settle(call.heldOn ? this.#heldTooLong() : this.#queuedTooLong());
         }
       },
       Math.max(0, due - Date.now()),
@@ -4050,6 +4208,13 @@ export class PageHub {
     return hubError(
       'timeout',
       `the call waited ${String(this.#config.timings.callDeadlineMs)} ms behind other calls that change the page and never ran`,
+    );
+  }
+
+  #heldTooLong(): HubError {
+    return hubError(
+      'timeout',
+      `the page did not take what the relay had already sent it within ${String(this.#config.timings.callDeadlineMs)} ms, so the call never reached it`,
     );
   }
 
@@ -4078,7 +4243,9 @@ export class PageHub {
 
   /**
    * Sends a call to its page, checking again what may have changed while it
-   * waited: the attachment, the page, the tool and the role. True if it went out.
+   * waited: the attachment, the page, the tool and the role. A call that
+   * finds no room on the page's socket, or calls already waiting for it,
+   * waits behind them (#hold). True if it went out or waits for room.
    */
   #dispatch(call: PendingCall): boolean {
     const current = this.#recheck(call);
@@ -4086,11 +4253,20 @@ export class PageHub {
       call.settle(current);
       return false;
     }
-    const { attachment, conn } = current;
+    const { conn } = current;
+    if (conn.held.length > 0 || !this.#roomForInvoke(conn, call.invokeBytes)) {
+      this.#hold(call, conn);
+      return true;
+    }
+    return this.#sendInvoke(call, current.attachment, conn);
+  }
+
+  /** The invoke itself, once every check has passed and the socket has room. True if it went out. */
+  #sendInvoke(call: PendingCall, attachment: AttachmentRecord, conn: Conn): boolean {
     const { callDeadlineMs } = this.#config.timings;
     const remaining = call.waited ? callDeadlineMs - (Date.now() - call.arrivedAt) : callDeadlineMs;
     if (remaining <= 0) {
-      call.settle(this.#queuedTooLong());
+      call.settle(call.heldOn ? this.#heldTooLong() : this.#queuedTooLong());
       return false;
     }
     const encoded = this.#encodeInvoke(call, attachment.role, remaining);
@@ -4098,13 +4274,54 @@ export class PageHub {
       call.settle(encoded);
       return false;
     }
+    call.heldOn = null;
     call.conn = conn;
     call.trace.reached = true;
     conn.inflight.set(call.callId, call);
     this.#armCallTimer(call);
     if (call.marks) call.marks.invokeOut = performance.now();
-    conn.ws.send(encoded.text);
+    this.#write(conn, false, (written) => {
+      conn.ws.send(encoded.text, written);
+    });
     return true;
+  }
+
+  /**
+   * A call whose invoke would take the page's queue past INVOKE_ROOM waits,
+   * holding nothing the call does not already hold, until the page takes
+   * enough of what it was sent (#sendHeld) or its deadline passes. Its
+   * deadline runs on meanwhile, as in the write queue.
+   */
+  #hold(call: PendingCall, conn: Conn): void {
+    call.heldOn = conn;
+    call.waited = true;
+    conn.held.push(call);
+    this.#log.debug('call waits for room on the page link', {
+      pageId: call.pageId,
+      callId: call.callId,
+      held: conn.held.length,
+    });
+  }
+
+  /**
+   * Sends the calls waiting for room on this socket, oldest first, while
+   * there is room for the next. Each is looked at once more as it goes,
+   * since its caller may have been revoked or demoted meanwhile.
+   */
+  #sendHeld(conn: Conn): void {
+    while (!conn.closing && conn.ws.readyState === conn.ws.OPEN) {
+      const call = conn.held[0];
+      if (call === undefined || !this.#roomForInvoke(conn, call.invokeBytes)) return;
+      conn.held.shift();
+      const current = this.#recheck(call);
+      if (current.kind === 'error') call.settle(current);
+      else if (current.conn === conn) this.#sendInvoke(call, current.attachment, conn);
+      else {
+        // The page resumed on another socket; the call follows it.
+        call.heldOn = null;
+        this.#dispatch(call);
+      }
+    }
   }
 
   /**
@@ -4134,9 +4351,14 @@ export class PageHub {
     }
   }
 
-  /** Takes a settled call out of its socket's in-flight set and its page's queue. */
+  /** Takes a settled call out of its socket's in-flight set or wait for room, and its page's queue. */
   #detachCall(call: PendingCall): void {
     call.conn?.inflight.delete(call.callId);
+    if (call.heldOn) {
+      const at = call.heldOn.held.indexOf(call);
+      if (at !== -1) call.heldOn.held.splice(at, 1);
+      call.heldOn = null;
+    }
     const queue = this.#queues.get(call.pageId);
     if (!queue) return;
     const at = queue.waiting.indexOf(call);
@@ -4252,37 +4474,94 @@ export class PageHub {
 
   // Plumbing
 
+  /** Any frame but an invoke (#sendInvoke) or a cancel (#sendCancel), within ADR 0024's bound. */
   #send(conn: Conn, frame: RelayFrame): void {
     if (conn.ws.readyState !== conn.ws.OPEN) return;
     const text = encodeFrame(frame);
-    if (this.#queueFor(conn, Buffer.byteLength(text, 'utf8'))) conn.ws.send(text);
+    const bytes = Buffer.byteLength(text, 'utf8');
+    if (!this.#roomFor(conn, bytes)) return;
+    this.#write(conn, true, (written) => {
+      conn.ws.send(text, written);
+    });
+  }
+
+  /**
+   * A cancel never closes a page: at most one follows each invoke that went
+   * out, so the call limits bound them, and a member cancelling a burst of
+   * calls must not end the page for everyone (ADR 0024's notes).
+   */
+  #sendCancel(conn: Conn, callId: string, reason: CancelReason): void {
+    if (conn.ws.readyState !== conn.ws.OPEN) return;
+    const text = encodeFrame({ t: 'cancel', callId, reason });
+    this.#write(conn, false, (written) => {
+      conn.ws.send(text, written);
+    });
+  }
+
+  /**
+   * Hands ws one frame and counts it in the socket's queue until ws reports
+   * it handed to the kernel; each such report is the page making progress,
+   * so calls waiting for room are looked at again.
+   */
+  #write(conn: Conn, counted: boolean, send: (written: () => void) => void): void {
+    this.#observe(conn);
+    const { queue } = conn;
+    const epoch = queue.epoch;
+    queue.frames += 1;
+    if (counted) queue.counted += 1;
+    send(() => {
+      if (queue.epoch === epoch) {
+        queue.frames -= 1;
+        if (counted) queue.counted -= 1;
+      }
+      if (conn.held.length > 0) this.#sendHeld(conn);
+    });
+  }
+
+  /**
+   * Starts the socket's counts over when its queue (bufferedAmount: what ws
+   * has not yet handed the kernel) is empty: nothing is unread then, though
+   * the callbacks of what just left may still be a tick away.
+   */
+  #observe(conn: Conn): void {
+    if (conn.ws.bufferedAmount !== 0) return;
+    conn.queue.epoch += 1;
+    conn.queue.frames = 0;
+    conn.queue.counted = 0;
+  }
+
+  /**
+   * Whether an invoke of this many bytes may go out now (INVOKE_ROOM): onto
+   * an empty queue always, otherwise while the queue and it stay within
+   * INVOKE_ROOM and the frames queued below MAX_UNREAD_FRAMES. Never closes.
+   */
+  #roomForInvoke(conn: Conn, bytes: number): boolean {
+    this.#observe(conn);
+    const queued = conn.ws.bufferedAmount;
+    return queued === 0 || (queued + bytes <= INVOKE_ROOM && conn.queue.frames < MAX_UNREAD_FRAMES);
   }
 
   /**
    * Whether a frame of this many bytes may be queued for the page (ADR 0024).
    * The socket's queue (bufferedAmount) holds only what the kernel has not
-   * taken yet, so it stays empty while the page reads; frames sent while it
-   * is not are counted until it empties again. Past MAX_UNREAD_FRAMES of
-   * them, or MAX_UNREAD_BYTES queued, the page is not reading what it asks
-   * for, and its socket is closed with 1008 and cut off after
-   * CLOSE_GRACE_MS, which frees what it held; the page sleeps and may
-   * resume like after any close.
+   * taken yet, so it stays empty while the page reads, and drains on a slow
+   * link as fast as the link takes it. Past MAX_UNREAD_FRAMES frames that
+   * count still in it, or MAX_UNREAD_BYTES queued in all, the page is not
+   * reading what it is sent, and its socket is closed with 1008 and cut off
+   * after CLOSE_GRACE_MS, which frees what it held; the page sleeps and may
+   * resume like after any close. Invokes never fill more than INVOKE_ROOM
+   * of it, so what a member's calls queue cannot close a page by itself.
    */
-  #queueFor(conn: Conn, bytes: number): boolean {
+  #roomFor(conn: Conn, bytes: number): boolean {
+    this.#observe(conn);
     const queued = conn.ws.bufferedAmount;
-    if (queued === 0) {
-      conn.unread = 0;
-      return true;
-    }
-    if (conn.unread < MAX_UNREAD_FRAMES && queued + bytes <= MAX_UNREAD_BYTES) {
-      conn.unread += 1;
-      return true;
-    }
+    if (queued === 0) return true;
+    if (conn.queue.counted < MAX_UNREAD_FRAMES && queued + bytes <= MAX_UNREAD_BYTES) return true;
     this.connectionLine(conn.address, 'warn', 'closing page socket: the page is not reading', {
       pageId: conn.pageId,
       address: conn.address,
       queuedBytes: queued,
-      queuedFrames: conn.unread,
+      queuedFrames: conn.queue.counted,
     });
     this.#closeSocket(conn, CLOSE_POLICY, 'page is not reading');
     return false;
@@ -4350,7 +4629,7 @@ export class PageHub {
     const closing: Promise<void>[] = [];
     for (const conn of [...this.#conns]) {
       for (const callId of [...conn.inflight.keys()]) {
-        this.#send(conn, { t: 'cancel', callId, reason: 'shutdown' });
+        this.#sendCancel(conn, callId, 'shutdown');
       }
       this.#failInflight(conn, shuttingDown);
       if (conn.ws.readyState === conn.ws.CLOSED) continue;
