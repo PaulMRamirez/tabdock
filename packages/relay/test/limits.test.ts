@@ -592,45 +592,81 @@ describe('tools frames per address (S9)', () => {
 // A4.3: /page takes no credential, and each frame the relay ignores or
 // refuses used to write a line, so one socket could write about a line per
 // 16-byte frame to stderr, the copy ADR 0019 keeps checkpoints and gap-time
-// records in.
-describe('frames that change nothing, per socket and per address (S9)', () => {
-  /** The socket's close, or null if it is still open after a short wait. */
-  async function closedSoon(opened: TestPage): Promise<{ code: number; reason: string } | null> {
-    return Promise.race([opened.closed, delay(2000).then(() => null)]);
+// records in. The first pass closed a socket past a budget of such frames;
+// the second (ADR 0023) holds their lines back instead, counted, so that no
+// page is closed for frames that only log, whoever on its address sent them.
+describe('frames that change nothing, per socket and per address (S9, ADR 0023)', () => {
+  const HELD = 'page frames that changed nothing went unlogged';
+
+  interface Summary {
+    msg: string;
+    address?: string;
+    repeated?: number;
+    frames?: Record<string, number>;
   }
 
-  it('closes a socket past its budget, so a flood of them writes a bounded number of lines', async () => {
-    const { lines } = await setup({ logLevel: 'info' });
+  /** The summary lines for held-back frames, which the relay writes as a window ends or it closes. */
+  async function summaries(relay: TestRelay): Promise<Summary[]> {
+    await relay.close();
+    return relay.lines
+      .map((line) => JSON.parse(line) as Summary)
+      .filter((entry) => entry.msg === HELD);
+  }
+
+  function count(lines: readonly string[], text: string): number {
+    return lines.filter((line) => line.includes(text)).length;
+  }
+
+  it('holds back the lines of a flood past its budget, counting them, and never closes the page for it', async () => {
+    const relay = await setup({ logLevel: 'info' });
     const opened = await page();
-    const before = lines.length;
+    const before = relay.lines.length;
     for (let i = 0; i < 2000; i += 1) opened.sendRaw('{"t":"zz"}');
-    expect(await closedSoon(opened)).toEqual({ code: 1008, reason: 'too many ignored frames' });
-    // The budget's 20, the frame that passed it, and the line naming the close.
-    expect(lines.length - before).toBeLessThanOrEqual(22);
-    expect(lines.some((line) => line.includes('too many frames that changed nothing'))).toBe(true);
+    await opened.sync();
+    expect(opened.ws.readyState).toBe(opened.ws.OPEN);
+    // The socket's budget of 20 written, nothing more.
+    expect(count(relay.lines.slice(before), 'ignored a frame of unknown type')).toBe(20);
+    expect(relay.lines.length - before).toBe(20);
+    expect(await summaries(relay)).toEqual([
+      expect.objectContaining({ repeated: 1980, frames: { 'unknown type': 1980 } }),
+    ]);
   });
 
-  it('counts frames sent before hello too', async () => {
-    const { relay, lines } = await setup({ logLevel: 'info' });
-    const raw = new TestPage(await openSocket(relay.pageUrl));
-    pages.push(raw);
-    for (let i = 0; i < 2000; i += 1) raw.sendRaw('{"t":"zz"}');
-    expect(await closedSoon(raw)).toEqual({ code: 1008, reason: 'too many ignored frames' });
-    expect(lines.filter((line) => line.includes('ignored a frame of unknown type'))).toHaveLength(
-      21,
-    );
+  it('closes a socket whose first frame is of an unknown type, as for any first frame but hello, spending nothing of its address', async () => {
+    const relay = await setup({ logLevel: 'info', rateLimits: { ignoredFramesPerAddress: 5 } });
+    const raws: TestPage[] = [];
+    for (let s = 0; s < 3; s += 1) {
+      const raw = new TestPage(await openSocket(relay.relay.pageUrl));
+      pages.push(raw);
+      raws.push(raw);
+      for (let i = 0; i < 20; i += 1) raw.sendRaw('{"t":"zz"}');
+    }
+    for (const raw of raws) {
+      expect(await raw.closed).toEqual({ code: 1008, reason: 'first frame must be hello' });
+    }
+    expect(count(relay.lines, 'ignored a frame of unknown type')).toBe(0);
+    expect(count(relay.lines, 'closing page socket: first frame was not hello')).toBe(3);
+    // A page from the same address still has its address's whole budget.
+    const opened = await page();
+    const before = relay.lines.length;
+    for (let i = 0; i < 5; i += 1) opened.sendRaw('{"t":"zz"}');
+    await opened.sync();
+    expect(count(relay.lines.slice(before), 'ignored a frame of unknown type')).toBe(5);
   });
 
   it('counts every kind of frame that changes nothing, and none that changes something', async () => {
-    await setup({ rateLimits: { ignoredFramesPerSocket: 6 } });
+    const relay = await setup({ rateLimits: { ignoredFramesPerSocket: 6 } });
     const opened = await page();
     await pairAndApprove(await client(), opened, 'driver');
+    const before = relay.lines.length;
     // Frames that act, and pings, cost nothing.
     for (let i = 0; i < 30; i += 1) opened.send({ t: 'ping' });
     opened.send({ t: 'rotate_pairing' });
     opened.send({ t: 'set_role', userId: 'alice', role: 'observer' });
     opened.send({ t: 'set_role', userId: 'alice', role: 'driver' });
-    // Six that change nothing: the budget, spent.
+    await opened.sync();
+    expect(count(relay.lines.slice(before), '"msg":"role changed"')).toBe(2);
+    // Six that change nothing: the budget, spent, every line of theirs written.
     opened.sendRaw('{"t":"zz"}');
     opened.send({ t: 'attach_decision', requestId: 'rq_NOPE000000', allow: true });
     opened.send({ t: 'set_role', userId: 'nobody', role: 'driver' });
@@ -639,7 +675,13 @@ describe('frames that change nothing, per socket and per address (S9)', () => {
     // This relay mints no invites.
     opened.send({ t: 'invite_cancel', inviteId: 'inv_NOPE000000' });
     await opened.sync();
-    expect(opened.ws.readyState).toBe(opened.ws.OPEN);
+    const spent = relay.lines.slice(before);
+    expect(count(spent, 'ignored a frame of unknown type')).toBe(1);
+    expect(count(spent, 'ignored a decision for an unknown attach request')).toBe(1);
+    expect(count(spent, 'ignored set_role for a user who is not attached')).toBe(1);
+    expect(count(spent, '"msg":"attachments revoked"')).toBe(1);
+    expect(count(spent, 'ignored an invite frame: this relay mints no invites')).toBe(1);
+    // The seventh, and only it, is held back; the page stays open.
     opened.send({
       t: 'invite_create',
       inviteId: 'inv_NOPE000001',
@@ -649,11 +691,16 @@ describe('frames that change nothing, per socket and per address (S9)', () => {
       expiresAt: null,
       secretHash: 'a'.repeat(64),
     });
-    expect(await closedSoon(opened)).toEqual({ code: 1008, reason: 'too many ignored frames' });
+    await opened.sync();
+    expect(count(relay.lines.slice(before), 'ignored an invite frame')).toBe(1);
+    expect(opened.ws.readyState).toBe(opened.ws.OPEN);
+    expect(await summaries(relay)).toEqual([
+      expect.objectContaining({ repeated: 1, frames: { invite_create: 1 } }),
+    ]);
   });
 
   it('counts an invite frame refused or naming no invite on a relay with invites on', async () => {
-    await setup({ invites: true, rateLimits: { ignoredFramesPerSocket: 2 } });
+    const relay = await setup({ invites: true, rateLimits: { ignoredFramesPerSocket: 2 } });
     const opened = await page();
     // Refused: without a public URL no invite can be minted.
     opened.send({
@@ -666,39 +713,85 @@ describe('frames that change nothing, per socket and per address (S9)', () => {
       secretHash: 'a'.repeat(64),
     });
     opened.send({ t: 'invite_cancel', inviteId: 'inv_NOPE000002' });
+    opened.send({ t: 'invite_cancel', inviteId: 'inv_NOPE000003' });
     await opened.sync();
     expect(opened.ws.readyState).toBe(opened.ws.OPEN);
-    opened.send({ t: 'invite_cancel', inviteId: 'inv_NOPE000003' });
-    expect(await closedSoon(opened)).toEqual({ code: 1008, reason: 'too many ignored frames' });
+    expect(await summaries(relay)).toEqual([
+      expect.objectContaining({ repeated: 1, frames: { invite_cancel: 1 } }),
+    ]);
   });
 
-  it('shares one budget across every socket from an address and across reconnects', async () => {
-    const { relay } = await setup({
+  it('shares one budget across every socket from an address and across reconnects, holding back lines and closing nothing', async () => {
+    const relay = await setup({
       rateLimits: { ignoredFramesPerSocket: 10, ignoredFramesPerAddress: 4 },
     });
     const first = await page();
     const second = await page();
     const elsewhere = await page({ localAddress: OTHER_ADDRESS });
+    const before = relay.lines.length;
     for (const opened of [first, second, first, second]) opened.sendRaw('{"t":"zz"}');
     await first.sync();
     await second.sync();
-    expect(first.ws.readyState).toBe(first.ws.OPEN);
-    expect(second.ws.readyState).toBe(second.ws.OPEN);
+    expect(count(relay.lines.slice(before), 'ignored a frame of unknown type')).toBe(4);
+    // Past the address's budget the line is held back, and the socket stays open.
     first.sendRaw('{"t":"zz"}');
-    const fromAddress = { code: 1008, reason: 'too many ignored frames from this address' };
-    expect(await closedSoon(first)).toEqual(fromAddress);
+    await first.sync();
+    expect(count(relay.lines.slice(before), 'ignored a frame of unknown type')).toBe(4);
+    expect(first.ws.readyState).toBe(first.ws.OPEN);
     // Another address keeps a budget of its own.
     for (let i = 0; i < 4; i += 1) elsewhere.sendRaw('{"t":"zz"}');
     await elsewhere.sync();
-    expect(elsewhere.ws.readyState).toBe(elsewhere.ws.OPEN);
+    expect(count(relay.lines.slice(before), 'ignored a frame of unknown type')).toBe(8);
     // A page that reconnects from the address does not start over.
-    const back = await connectPage(relay.pageUrl, {
+    first.ws.terminate();
+    await first.closed;
+    const back = await connectPage(relay.relay.pageUrl, {
       resumeToken: first.welcome?.resumeToken ?? '',
     });
     pages.push(back);
     expect(back.welcome?.resumed).toBe(true);
     back.sendRaw('{"t":"zz"}');
-    expect(await closedSoon(back)).toEqual(fromAddress);
+    await back.sync();
+    expect(count(relay.lines.slice(before), 'ignored a frame of unknown type')).toBe(8);
+    const held = await summaries(relay);
+    expect(held).toHaveLength(1);
+    expect(held[0]).toMatchObject({ repeated: 2, frames: { 'unknown type': 2 } });
+    expect(held[0]?.address).not.toBe(OTHER_ADDRESS);
+  });
+
+  it('expects a decision for a request the relay has just ended, and neither counts it nor warns', async () => {
+    const relay = await setup({
+      logLevel: 'info',
+      timings: { attachRequestTtlMs: 300, pairWaitMs: 100 },
+      rateLimits: { ignoredFramesPerSocket: 1 },
+    });
+    const opened = await page();
+    const alice = await client(ALICE);
+    const bob = await client(BOB);
+    // Alice's request runs out on the relay before the page's own denial arrives.
+    void callTool(alice, 'pair_page', { code: opened.code });
+    const timedOut = await opened.next('attach_request');
+    await eventually(() => count(relay.lines, 'attach request expired unanswered') === 1);
+    opened.send({ t: 'attach_decision', requestId: timedOut.requestId, allow: false });
+    // Bob's ends with the operator's revoke, which the page's denial follows.
+    await eventually(() => opened.all('pairing').length > 0);
+    void callTool(bob, 'pair_page', { code: opened.code });
+    const revoked = await opened.next('attach_request');
+    opened.send({ t: 'revoke', userId: 'bob' });
+    opened.send({ t: 'attach_decision', requestId: revoked.requestId, allow: false });
+    await opened.sync();
+    expect(count(relay.lines, 'ignored a decision')).toBe(0);
+    // The socket's budget of one is still whole, so this line is written.
+    opened.sendRaw('{"t":"zz"}');
+    await opened.sync();
+    expect(count(relay.lines, 'ignored a frame of unknown type')).toBe(1);
+    // A request id the page never had is still counted.
+    opened.send({ t: 'attach_decision', requestId: 'rq_NOPE000000', allow: false });
+    await opened.sync();
+    expect(count(relay.lines, 'ignored a decision')).toBe(0);
+    expect(await summaries(relay)).toEqual([
+      expect.objectContaining({ repeated: 1, frames: { attach_decision: 1 } }),
+    ]);
   });
 });
 

@@ -25,7 +25,9 @@
 // forwarding headers are expected there), and the Host allowlist still guards
 // /mcp, /pair and the plugin's routes, so the platform's own name for the app
 // gets 403 everywhere but /healthz. Requests are logged by route, never by raw
-// path or query, so no secret a URL carries reaches a log. The client address
+// path or query, so no secret a URL carries reaches a log, and a line a
+// signed-in client can cause at will on /mcp is written once per kind a window,
+// the rest counted (repeated-lines.ts, A4.3). The client address
 // that /page and /pair count by, and that /mcp's refusal line names, comes
 // from one place (client-address.ts), which answers 400 on a route that counts
 // by address when a host edge names no client (ADR 0018). With an audit
@@ -45,6 +47,7 @@ import { type NodeIncomingMessageLike, toNodeHandler } from '@modelcontextprotoc
 import {
   type AuthInfo,
   createMcpHandler,
+  isJsonContentType,
   isLegacyRequest,
   type McpHandlerRequestOptions,
   readRequestBody,
@@ -90,6 +93,7 @@ import {
   userIdOf,
 } from './mcp.ts';
 import { createPairFlow, PAIR_ROUTES, type PairFlow } from './pair.ts';
+import { createRepeatedLog, errorKind } from './repeated-lines.ts';
 import { type InviteeSessionOptions, McpSessions } from './sessions.ts';
 import { createSignInGate } from './sign-in-gate.ts';
 import { Spike, type SpikeControl } from './spike.ts';
@@ -174,26 +178,86 @@ function errorClass(error: unknown): string {
 const MAX_MCP_BODY_BYTES = 2 * MAX_FRAME_BYTES;
 
 /**
- * A 2026-07-28 request that opens a subscriptions/listen stream: its parsed
- * body, handed on to the SDK so it routes the very value read here, and its
- * JSON-RPC id. null for anything else, including a body too large or not
- * JSON, which the SDK answers itself.
+ * A subscriptions/listen body above this is refused before it costs anything.
+ * A real one is about 300 bytes; a stream lives as long as its client keeps
+ * it, and whatever the request carried may stay with it (A4.3).
  */
-async function listenRequest(
-  request: Request,
-): Promise<{ message: Record<string, unknown>; id: unknown } | null> {
-  if (request.method !== 'POST') return null;
-  const body = await readRequestBody(request.clone(), MAX_MCP_BODY_BYTES);
-  if (body.tooLarge) return null;
-  let message: unknown;
-  try {
-    message = JSON.parse(body.text);
-  } catch {
-    return null;
+const MAX_LISTEN_BODY_BYTES = 16 * 1024;
+
+/** A JSON-RPC error answer, shaped as the SDK shapes its own. */
+function jsonRpcError(status: number, code: number, message: string, id: unknown = null): Response {
+  const echoed = typeof id === 'string' || typeof id === 'number' ? id : null;
+  return Response.json({ jsonrpc: '2.0', error: { code, message }, id: echoed }, { status });
+}
+
+/** The SDK's own words for a body over a limit, so either answer reads the same. */
+function tooLarge(limit: number, id: unknown = null): Response {
+  return jsonRpcError(
+    413,
+    -32000,
+    `Payload Too Large: Request body must not exceed ${String(limit)} bytes`,
+    id,
+  );
+}
+
+/**
+ * A 2026-07-28 request's body, read once, here, so the SDK is handed the
+ * parsed value and never reads or copies the request again: 'unread' when
+ * the SDK should answer from the request itself (no POST, or a Content-Type
+ * it refuses before reading anything), 'answered' when the body is over the
+ * cap or not JSON.
+ */
+type ModernBody =
+  | { kind: 'unread' }
+  | { kind: 'answered'; response: Response }
+  | { kind: 'parsed'; message: unknown; bytes: number };
+
+async function readModernBody(request: Request): Promise<ModernBody> {
+  if (request.method !== 'POST' || !isJsonContentType(request.headers.get('content-type'))) {
+    return { kind: 'unread' };
   }
+  let read: Awaited<ReturnType<typeof readRequestBody>>;
+  try {
+    read = await readRequestBody(request, MAX_MCP_BODY_BYTES);
+  } catch {
+    // A body that failed midway: the SDK's own read fails the same way and answers it.
+    return { kind: 'unread' };
+  }
+  if (read.tooLarge) {
+    // The rest is never wanted; cancelled, it holds nothing while the answer goes out.
+    await request.body?.cancel().catch(() => undefined);
+    return { kind: 'answered', response: tooLarge(MAX_MCP_BODY_BYTES) };
+  }
+  try {
+    return {
+      kind: 'parsed',
+      message: JSON.parse(read.text) as unknown,
+      bytes: Buffer.byteLength(read.text),
+    };
+  } catch {
+    // isLegacyRequest sends a body that is not JSON to the 2025-era leg, so this is only defence.
+    return {
+      kind: 'answered',
+      response: jsonRpcError(400, -32700, 'Parse error: the request body is not valid JSON'),
+    };
+  }
+}
+
+/** A subscriptions/listen request's JSON-RPC id, or null for any other message. */
+function listenOf(message: unknown): { id: unknown } | null {
   if (typeof message !== 'object' || message === null || Array.isArray(message)) return null;
   const fields = message as Record<string, unknown>;
-  return fields.method === 'subscriptions/listen' ? { message: fields, id: fields.id } : null;
+  return fields.method === 'subscriptions/listen' ? { id: fields.id } : null;
+}
+
+/**
+ * Whether the 2026-07-28 handler refused a request before any tool ran: a
+ * 4xx, from its validation ladder, its body checks or its Content-Type check.
+ * 499 is the SDK's own word for a client gone mid-call, whose tool already
+ * counted it.
+ */
+function refusedBySdk(response: Response): boolean {
+  return response.status >= 400 && response.status < 500 && response.status !== 499;
 }
 
 /** Paths the relay answers whatever its mode; any other is logged as OTHER_ROUTE. */
@@ -372,18 +436,25 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     }
   }
 
-  // One request budget for the five tools and the listen streams alike (ADR 0018).
+  // One request budget for the five tools, the listen streams and the
+  // 2026-07-28 requests the SDK refuses alike (ADR 0018).
   const budget = createRequestBudget(config);
+  // Lines a signed-in client can cause at will on /mcp: one per kind a window, the rest counted (A4.3).
+  const mcpLines = createRepeatedLog(log, config.rateLimits.windowMs);
   const factory = createMcpFactory(hub, config, spike, budget);
   const mcp = createMcpHandler(factory, {
     legacy: 'reject',
     maxRequestBodySize: MAX_MCP_BODY_BYTES,
     keepAliveMs: config.timings.sseKeepAliveMs,
-    // The relay's own total for listen streams (listen-streams.ts), which
-    // refuses first; the SDK's 1024 would otherwise cap a larger setting.
-    maxSubscriptions: config.limits.sessions,
+    // The relay's own total for listen streams (listen-streams.ts) refuses
+    // first. A stream marked to give way stays open until the SDK has served
+    // the listen it gives way to, and each listen being answered marks at
+    // most one, so the SDK may hold up to twice the total for a moment; its
+    // default of 1024 would otherwise bind before a larger setting.
+    maxSubscriptions: 2 * config.limits.sessions,
     onerror: (error) => {
-      log.warn('mcp handler error', { error });
+      // Most are refusals of what a client sent, quoting it; redact() cuts the message short.
+      mcpLines.write('warn', 'mcp handler error', { error }, errorKind(error));
     },
   });
   spike?.setModernNotifier(() => {
@@ -406,28 +477,52 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     keepAliveMs: config.timings.sseKeepAliveMs,
     maxRequestBodySize: MAX_MCP_BODY_BYTES,
     log,
+    lines: mcpLines,
   });
   const listens = new ListenStreams({
     perUser: config.limits.sessionsPerUser,
     total: config.limits.sessions,
     invitees,
     budget,
-    windowMs: config.rateLimits.windowMs,
     log,
+    lines: mcpLines,
   });
-  /** The 2026-07-28 leg, with every listen stream through the relay's bounds first (A4.3). */
+  /**
+   * The 2026-07-28 leg (A4.3). The body is read once, here, and the SDK
+   * handed the parsed value, so no copy of a body stays queued in the
+   * request for as long as a stream it opened lives. A listen over its own
+   * cap is refused before it costs anything, and every other listen passes
+   * the relay's bounds (listen-streams.ts). A request the SDK refuses reached
+   * no tool, which would have spent the caller's budget itself, so it spends
+   * one here: refusals cost like calls, and a flood of them runs dry.
+   */
   const modern = async (
     request: Request,
     options?: McpHandlerRequestOptions,
   ): Promise<Response> => {
-    const listen = await listenRequest(request);
     const extra = AuthExtraSchema.safeParse(options?.authInfo?.extra);
     // Without an authenticated user the SDK's factory refuses the request anyway.
-    if (listen === null || !extra.success) return mcp.fetch(request, options);
+    if (!extra.success) return mcp.fetch(request, options);
     const caller = { userId: extra.data.userId, kind: extra.data.kind };
-    return listens.open(caller, listen.id, request.signal, () =>
-      mcp.fetch(request, { ...options, parsedBody: listen.message }),
-    );
+    const body = await readModernBody(request);
+    let response: Response;
+    if (body.kind === 'unread') {
+      response = await mcp.fetch(request, options);
+    } else if (body.kind === 'answered') {
+      response = body.response;
+    } else {
+      const listen = listenOf(body.message);
+      const parsed = { ...options, parsedBody: body.message };
+      if (listen === null) {
+        response = await mcp.fetch(request, parsed);
+      } else if (body.bytes > MAX_LISTEN_BODY_BYTES) {
+        response = tooLarge(MAX_LISTEN_BODY_BYTES, listen.id);
+      } else {
+        return listens.open(caller, listen.id, request.signal, () => mcp.fetch(request, parsed));
+      }
+    }
+    if (refusedBySdk(response)) budget.spend(caller.userId, caller.kind);
+    return response;
   };
   const legs = {
     fetch: async (request: Request, options?: McpHandlerRequestOptions): Promise<Response> => {
@@ -446,7 +541,8 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     maxRequestBodySize: MAX_MCP_BODY_BYTES,
     onerror: (error) => {
       // undici's message for a Request it cannot build quotes the URL, query and all.
-      log.error('mcp adapter error', { errorClass: errorClass(error) });
+      const kind = errorClass(error);
+      mcpLines.write('error', 'mcp adapter error', { errorClass: kind }, kind);
     },
   });
   /**
@@ -530,7 +626,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     const client = addresses.of(request);
     // Before the plugin, so a proxied request never even gets a challenge.
     if (config.publicUrl === null && !madeLocally(request)) {
-      log.info('mcp request refused: not made on this machine', {
+      mcpLines.write('info', 'mcp request refused: not made on this machine', {
         address: loggedAddress(client),
       });
       send(response, 403, 'This relay serves only clients on its own machine');
@@ -733,6 +829,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     await closeAudit(store.audit);
     await mcp.close();
     await sessions.closeAll();
+    mcpLines.close();
     auth.stop?.();
     throw error;
   }
@@ -787,6 +884,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         auth.stop?.();
         // The counts of repeated refusals still held go out before the last line.
         refusals.close();
+        mcpLines.close();
         server.closeAllConnections();
         await new Promise<void>((resolveClose) => {
           server.close(() => {

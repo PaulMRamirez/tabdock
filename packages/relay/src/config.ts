@@ -116,25 +116,32 @@ export interface RelayRateLimits {
   toolsFramesWindowMs: number;
   /**
    * Frames one page socket may send per windowMs that the relay ignores or
-   * refuses, changing nothing: a frame of unknown type, before hello too; a
-   * decision for no request of the page; a set_role for no one attached, or
-   * that leaves the role as it was; a revoke that ends nothing; an invite
-   * frame on a relay with invites off, an invite_create refused, and an
-   * invite_cancel naming no live invite. Each may write a log line, and
-   * /page needs no credential, so past this the socket is closed with 1008
-   * (S9, A4.3). A page asks for these only in a race or on a misclick.
+   * refuses, changing nothing, whose log lines are written: a frame of
+   * unknown type after hello; a decision for no request of the page, live or
+   * just ended; a set_role for no one attached, or that leaves the role as it
+   * was; a revoke that ends nothing; an invite frame on a relay with invites
+   * off, an invite_create refused, and an invite_cancel naming no live
+   * invite. /page needs no credential, so past this their lines are held
+   * back and counted into one line per address when the window ends; the
+   * socket stays open, since a frame that only logs is no reason to end a
+   * page (S9, ADR 0023). A decision for a request the relay just ended is
+   * expected and never counted: the page's timer and an operator's click can
+   * cross the end on the wire.
    */
   ignoredFramesPerSocket: number;
   /**
    * The same for all page sockets from one remote address, counted across
    * reconnects, so neither more sockets nor new ones start the count over;
-   * past it the socket that sent the frame is closed with 1008.
+   * past it the lines of the frame that passed it are held back, its socket
+   * left open. Frames before hello never count here: the first frame must be
+   * hello, and anything else closes its socket with 1008.
    */
   ignoredFramesPerAddress: number;
   /**
    * Requests one member may make to /mcp per window, every tool counted,
    * checked right after sign-in and before the access check, so refusals
-   * count too (ADR 0018), and every 2026-07-28 subscriptions/listen (A4.3).
+   * count too (ADR 0018), and every 2026-07-28 subscriptions/listen and
+   * every 2026-07-28 request the SDK refuses before a tool runs (A4.3).
    */
   requestsPerUser: number;
   /** The same for an invitee, smaller since anyone can become one (ADR 0018). */

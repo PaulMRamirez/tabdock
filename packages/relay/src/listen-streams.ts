@@ -13,12 +13,22 @@
 // else is refused as the SDK refuses at its own cap. Each listen also spends
 // one request of the user's budget, first of all, so streams opened in a loop
 // are bounded like calls (ADR 0018). A refusal writes at most one line per
-// reason a window, so a loop of them cannot flood the logs.
+// reason a window, the rest counted, so a loop of them cannot flood the logs.
+//
+// Whose stream gives way is settled when the listen arrives, but the stream
+// ends only once the SDK has answered that listen with an event stream: the
+// SDK still checks the request's headers, envelope and filter after this
+// gate, and a listen it refuses, or answers without a stream, must cost
+// nobody theirs, its own sender included (the second A4.3 pass). Until then
+// the stream marked to give way counts for nothing and cannot be marked
+// again, and the listen being answered counts in its place, so listens that
+// overlap still never overshoot a cap. The SDK's own cap therefore needs
+// room for those marked streams beside the total (relay.ts).
 
 import type { UserKind } from '@tabdock/protocol';
 import type { Logger } from './log.ts';
 import type { RequestBudget } from './mcp.ts';
-import { SlidingWindowLimiter } from './rate-limit.ts';
+import type { RepeatedLog } from './repeated-lines.ts';
 import {
   closableBody,
   type InviteeSessionOptions,
@@ -31,14 +41,14 @@ import {
 export interface ListenStreamOptions {
   /** Streams one user may hold (RelayLimits.sessionsPerUser). */
   perUser: number;
-  /** Streams the relay holds in all (RelayLimits.sessions); the SDK's own cap is set to it. */
+  /** Streams the relay holds in all (RelayLimits.sessions). */
   total: number;
   /** The invitee tier, shared with the 2025-era sessions; without it, every user's streams count alike. */
   invitees?: InviteeSessionOptions | undefined;
   budget: RequestBudget;
-  /** The window a refusal's line is written once in. */
-  windowMs: number;
   log: Logger;
+  /** Where refusals go, one line per reason a window and the rest counted (repeated-lines.ts). */
+  lines: RepeatedLog;
 }
 
 /** Who opens a stream, as the HTTP layer established it. */
@@ -51,6 +61,18 @@ interface Held {
   userId: string;
   /** Ends the stream; null while the SDK is still answering, when it cannot yet give way. */
   close: (() => void) | null;
+  /**
+   * The listen being answered that this stream gives way to if the SDK
+   * serves it; while set, this stream counts for nothing and cannot be
+   * marked again.
+   */
+  givingWayTo: Held | null;
+}
+
+/** One stream that gives way to a newcomer, and why, for the debug line once it ends. */
+interface GivingWay {
+  held: Held;
+  why: string;
 }
 
 /** As the SDK answers a listen it refuses: HTTP 200 carrying a JSON-RPC error for that request. */
@@ -78,22 +100,21 @@ export class ListenStreams {
   readonly #options: ListenStreamOptions;
   /** Every stream held or being answered, oldest first. */
   readonly #held = new Set<Held>();
-  readonly #warnings: SlidingWindowLimiter;
 
   constructor(options: ListenStreamOptions) {
     this.#options = options;
-    this.#warnings = new SlidingWindowLimiter(1, options.windowMs);
   }
 
-  /** Streams held or being answered. */
+  /** Streams held or being answered, those marked to give way included. */
   get size(): number {
     return this.#held.size;
   }
 
   /**
    * Serves one subscriptions/listen through `serve` (the SDK) if the caller
-   * has budget and there is room, ending whichever stream must give way;
-   * `id` is the request's JSON-RPC id, echoed in a refusal.
+   * has budget and there is room, ending whichever stream gives way once the
+   * SDK has answered with a stream; `id` is the request's JSON-RPC id, echoed
+   * in a refusal.
    */
   async open(
     caller: ListenCaller,
@@ -103,23 +124,30 @@ export class ListenStreams {
   ): Promise<Response> {
     const { budget } = this.#options;
     if (!budget.spend(caller.userId, caller.kind)) {
-      this.#warn('budget', 'listen stream refused: past the request budget', caller.userId);
+      this.#warn('listen stream refused: past the request budget', caller.userId);
       return listenError(id, BUDGET_CODE, budget.refusal(caller.kind));
     }
-    if (!this.#makeRoom(caller.userId)) return listenError(id, FULL_CODE, FULL_MESSAGE);
+    const held: Held = { userId: caller.userId, close: null, givingWayTo: null };
+    const givingWay = this.#makeRoom(held);
+    if (givingWay === null) return listenError(id, FULL_CODE, FULL_MESSAGE);
     // Counted from now, so listens that overlap cannot overshoot a cap together.
-    const held: Held = { userId: caller.userId, close: null };
     this.#held.add(held);
     let response: Response;
     try {
       response = await serve();
     } catch (error) {
-      this.#held.delete(held);
+      this.#release(held, givingWay);
       throw error;
     }
-    if (!isStream(response)) {
-      this.#held.delete(held);
+    // A refusal, a listen sent as a notification, or a client already gone: nobody gives way.
+    if (!isStream(response) || signal.aborted) {
+      this.#release(held, givingWay);
+      if (isStream(response)) await response.body?.cancel().catch(() => undefined);
       return response;
+    }
+    for (const { held: ending, why } of givingWay) {
+      ending.close?.();
+      this.#options.log.debug(why, { userId: caller.userId });
     }
     const body = closableBody(response, signal, () => {
       this.#held.delete(held);
@@ -129,6 +157,19 @@ export class ListenStreams {
     return body.response;
   }
 
+  /** Puts back what a listen the SDK did not serve had marked, and forgets the listen. */
+  #release(held: Held, givingWay: readonly GivingWay[]): void {
+    for (const { held: marked } of givingWay) {
+      if (marked.givingWayTo === held) marked.givingWayTo = null;
+    }
+    this.#held.delete(held);
+  }
+
+  /** Streams that count against the caps: every one but those marked to give way. */
+  #counted(among: (held: Held) => boolean = () => true): Held[] {
+    return [...this.#held].filter((held) => held.givingWayTo === null && among(held));
+  }
+
   /**
    * The stream to end for a newcomer of this rank: the oldest open one whose
    * holder ranks lowest, so long as that is below the newcomer; a stream
@@ -136,7 +177,7 @@ export class ListenStreams {
    */
   #below(rank: TierRank, among: (held: Held) => boolean): Held | undefined {
     const { invitees } = this.#options;
-    const open = [...this.#held].filter((held) => held.close !== null && among(held));
+    const open = this.#counted(among).filter((held) => held.close !== null);
     for (const lower of RANKS.filter((each) => each < rank)) {
       const found = open.find((held) => rankOf(held.userId, invitees) === lower);
       if (found !== undefined) return found;
@@ -144,70 +185,59 @@ export class ListenStreams {
     return undefined;
   }
 
-  /** Whether one more stream of this user now fits, ending what must give way. */
-  #makeRoom(userId: string): boolean {
+  /**
+   * Room for one more stream of the newcomer's user: the streams marked to
+   * give way to it if the SDK serves it, none when there is room already, or
+   * null, with nothing marked, when there is none.
+   */
+  #makeRoom(newcomer: Held): GivingWay[] | null {
     const { invitees, total } = this.#options;
+    const { userId } = newcomer;
     const rank = rankOf(userId, invitees);
     const tier = rank === MEMBER ? null : (invitees ?? null);
     const perUser =
       tier === null
         ? this.#options.perUser
         : Math.min(this.#options.perUser, tier.holds(userId) ? tier.perInvitee : 1);
-    const mine = [...this.#held].filter((held) => held.userId === userId);
+    const givingWay: GivingWay[] = [];
+    const giveWay = (held: Held, why: string): void => {
+      held.givingWayTo = newcomer;
+      givingWay.push({ held, why });
+    };
+    const refuse = (message: string): null => {
+      for (const { held } of givingWay) held.givingWayTo = null;
+      this.#warn(message, userId);
+      return null;
+    };
+    const mine = this.#counted((held) => held.userId === userId);
     if (mine.length >= perUser) {
       // A client that reconnects before its old stream is noticed gone keeps listening.
       const oldest = mine.find((held) => held.close !== null);
       if (oldest === undefined) {
-        this.#warn(
-          'user',
-          'listen stream refused: the user holds the most streams allowed',
-          userId,
-        );
-        return false;
+        return refuse('listen stream refused: the user holds the most streams allowed');
       }
-      oldest.close?.();
-      this.#options.log.debug('listen stream ended for a newer one of the same user', { userId });
+      giveWay(oldest, 'listen stream ended for a newer one of the same user');
     }
     const isInvitee = (held: Held): boolean => invitees?.isInvitee(held.userId) === true;
-    if (tier !== null) {
-      const pool = [...this.#held].filter(isInvitee);
-      if (pool.length >= tier.pool) {
-        const evicted = this.#below(rank, isInvitee);
-        if (evicted === undefined) {
-          this.#warn(
-            'pool',
-            'listen stream refused: invitees hold the most streams allowed',
-            userId,
-          );
-          return false;
-        }
-        evicted.close?.();
-        this.#options.log.debug('listen stream ended for a newer invitee stream', { userId });
-      }
-    }
-    if (this.#held.size >= total) {
+    if (tier !== null && this.#counted(isInvitee).length >= tier.pool) {
       const evicted = this.#below(rank, isInvitee);
       if (evicted === undefined) {
-        this.#warn(
-          'total',
-          'listen stream refused: the relay holds the most streams allowed',
-          userId,
-        );
-        return false;
+        return refuse('listen stream refused: invitees hold the most streams allowed');
       }
-      evicted.close?.();
-      this.#options.log.debug('listen stream ended for a newer stream: the relay is full', {
-        userId,
-      });
+      giveWay(evicted, 'listen stream ended for a newer invitee stream');
     }
-    return true;
+    if (this.#counted().length >= total) {
+      const evicted = this.#below(rank, isInvitee);
+      if (evicted === undefined) {
+        return refuse('listen stream refused: the relay holds the most streams allowed');
+      }
+      giveWay(evicted, 'listen stream ended for a newer stream: the relay is full');
+    }
+    return givingWay;
   }
 
-  /** One line per reason a window, naming the first user refused in it. */
-  #warn(reason: string, message: string, userId: string): void {
-    const now = Date.now();
-    if (!this.#warnings.allows(reason, now)) return;
-    this.#warnings.record(reason, now);
-    this.#options.log.warn(message, { userId });
+  /** One line per reason a window, naming the first user refused in it; the rest are counted. */
+  #warn(message: string, userId: string): void {
+    this.#options.lines.write('warn', message, { userId });
   }
 }

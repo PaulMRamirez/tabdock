@@ -16,7 +16,7 @@ import {
   type DevTokenUser,
   type RelayStore,
 } from '../src/index.ts';
-import { openListen, type OpenListen } from './helpers/raw-mcp.ts';
+import { type ListenOptions, openListen, type OpenListen } from './helpers/raw-mcp.ts';
 import {
   ALICE,
   BOB,
@@ -63,9 +63,9 @@ async function setup(options: Parameters<typeof startRelay>[0] = {}): Promise<Te
   return current;
 }
 
-async function listen(user: DevTokenUser): Promise<OpenListen> {
+async function listen(user: DevTokenUser, options: ListenOptions = {}): Promise<OpenListen> {
   if (!current) throw new Error('no relay');
-  const opened = await openListen(current.relay, user);
+  const opened = await openListen(current.relay, user, options);
   listens.push(opened);
   return opened;
 }
@@ -194,5 +194,61 @@ describe('listen streams on the 2026-07-28 leg (A4.3)', () => {
       'more than 1 requests to this relay in 1 minute; wait and try again',
     );
     expect(await ended(stranger)).toBe(false);
+  });
+
+  it("serves more streams than the SDK's own default cap of 1024 when the total allows them", async () => {
+    // The SDK's cap is set from the total in relay.ts; left at its default it would refuse the 1025th.
+    await setup({
+      limits: { sessions: 1100, sessionsPerUser: 1100 },
+      rateLimits: { requestsPerUser: 5000 },
+    });
+    const opened: OpenListen[] = [];
+    for (let first = 0; first < 1100; first += 100) {
+      opened.push(...(await Promise.all(Array.from({ length: 100 }, () => listen(ALICE)))));
+    }
+    const refused = opened.filter((stream) => !stream.streaming);
+    expect(refused.map((stream) => stream.text).slice(0, 1)).toEqual([]);
+    expect(opened).toHaveLength(1100);
+  }, 60_000);
+
+  // The second A4.3 pass: a listen that opens nothing must cost nobody a stream.
+  it('refuses a listen whose body is over its cap with 413 before it costs anyone a stream', async () => {
+    await setup();
+    const held = await listen(G1);
+    // A real listen is about 300 bytes; this one is padded past 20 kB.
+    const padded = await listen(G1, { pad: 20_000 });
+    expect(padded.status).toBe(413);
+    expect(padded.streaming).toBe(false);
+    expect(JSON.parse(padded.text)).toMatchObject({
+      error: { code: -32000, message: expect.stringMatching(/^Payload Too Large: /) as unknown },
+    });
+    expect(await ended(held)).toBe(false);
+    // Just under the cap it is an ordinary listen.
+    expect((await listen(G1, { pad: 15_000 })).streaming).toBe(true);
+    expect(await ended(held)).toBe(true);
+  });
+
+  it("ends no stream for a listen the SDK refuses, its own caller's or anyone ranked below", async () => {
+    const store = createMemoryStore();
+    await setup({ store, limits: { inviteeSessions: 3, sessions: 4, sessionsPerUser: 1 } });
+    const strangers = [await listen(G1), await listen(G2), await listen(G3)];
+    // A stranger at its own cap, with a Content-Type the SDK refuses.
+    expect((await listen(G1, { headers: { 'Content-Type': 'text/plain' } })).status).toBe(415);
+    // A guest at the full pool: params the SDK refuses, and a listen sent as a notification.
+    heldBy(store, G4);
+    expect((await listen(G4, { params: {} })).status).toBe(400);
+    expect((await listen(G4, { id: false })).status).toBe(202);
+    expect((await listen(G4, { params: { notifications: 'x' } })).status).toBe(400);
+    for (const stream of strangers) expect(await ended(stream)).toBe(false);
+    // A member at its own cap of one, and another at the relay total, the same.
+    const alice = await listen(ALICE);
+    expect(alice.streaming).toBe(true);
+    expect((await listen(ALICE, { params: {} })).status).toBe(400);
+    expect((await listen(BOB, { headers: { 'Content-Type': 'text/plain' } })).status).toBe(415);
+    expect(await ended(alice)).toBe(false);
+    for (const stream of strangers) expect(await ended(stream)).toBe(false);
+    // A listen the SDK serves still makes room as before.
+    expect((await listen(G4)).streaming).toBe(true);
+    expect(await ended(strangers[0])).toBe(true);
   });
 });

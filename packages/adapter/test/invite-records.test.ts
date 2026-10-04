@@ -784,13 +784,16 @@ describe('honouring a redemption (S4, S14)', () => {
     const minted = await mint(h, socket, { label: 'Help', role: 'driver' });
     const hashed = counted.digests();
     socket.deliver(redemption(h.clock, minted));
-    // Revoked before the hash settles: the request is denied at once.
+    // Revoked before the hash settles: the request ends at once, on the page
+    // and, through the revoke frame, on the relay, so the page sends no
+    // decision for it (A4.3), then or once the hash settles.
     expect(h.dock.revoke(GUEST)).toBe(true);
-    expect(decisions(socket).at(-1)).toMatchObject({ allow: false });
+    expect(socket.framesOf('revoke').at(-1)).toEqual({ t: 'revoke', userId: GUEST });
+    expect(h.dock.state.pendingRequests).toEqual([]);
     await until(() => counted.digests() > hashed, 'the presented secret to be hashed');
     await flush();
     expect(h.dock.state.pendingRequests).toEqual([]);
-    expect(decisions(socket).filter((frame) => frame.requestId !== 'grant-alice')).toHaveLength(1);
+    expect(decisions(socket).filter((frame) => frame.requestId !== 'grant-alice')).toEqual([]);
   });
 
   it('gives the handle nothing to approve while a secret is still being checked', async () => {

@@ -1,0 +1,214 @@
+// Lines a signed-in account can make /mcp write at will (A4.3, second pass).
+// Sign-up is open, so any stranger has an account, and requests the SDK
+// refuses, initializes the relay refuses or makes room for, and sessions
+// opened and dropped in a loop spend no request budget. Each wrote a line, and
+// the SDK's refusals quote the request's own method, version and headers, so
+// one account wrote 40 MB to stderr in two seconds: the copy that carries the
+// audit checkpoints and, while the audit disk fails, the records themselves
+// (ADR 0019). Now such lines are written once per kind a window, with the
+// rest counted, an error's message is cut short, and a 2026-07-28 request the
+// SDK refuses costs one request of its caller's budget.
+
+import type { Client } from '@modelcontextprotocol/client';
+import { afterEach, describe, expect, it } from 'vitest';
+import { createDevTokenAuth, type DevTokenUser } from '../src/index.ts';
+import {
+  initializeBody,
+  openSession,
+  openStream,
+  type OpenStream,
+  rawPost,
+} from './helpers/raw-mcp.ts';
+import { ALICE, callTool, connectClient, startRelay, type TestRelay } from './helpers/relay.ts';
+
+function invitee(n: number): DevTokenUser {
+  return {
+    userId: `g_${n.toString(16).padStart(32, '0')}`,
+    displayName: 'ignored',
+    token: `invitee-${String(n)}-dev-token-5a8c1e7f2b9d4063`,
+    kind: 'invitee',
+  };
+}
+const G1 = invitee(1);
+const G2 = invitee(2);
+
+const META = {
+  'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+  'io.modelcontextprotocol/clientInfo': { name: 'flood', version: '1.0.0' },
+  'io.modelcontextprotocol/clientCapabilities': {},
+};
+
+let current: TestRelay | undefined;
+const streams: OpenStream[] = [];
+const clients: Client[] = [];
+
+afterEach(async () => {
+  for (const stream of streams.splice(0)) stream.close();
+  for (const client of clients.splice(0)) await client.close().catch(() => undefined);
+  await current?.close();
+  current = undefined;
+});
+
+async function setup(options: Parameters<typeof startRelay>[0] = {}): Promise<TestRelay> {
+  current = await startRelay({
+    auth: createDevTokenAuth([ALICE, G1, G2]),
+    invites: true,
+    // The production default.
+    logLevel: 'info',
+    ...options,
+  });
+  return current;
+}
+
+/** A 2026-07-28 POST as G1, with these headers over the usual ones; its status. */
+async function modernPost(
+  user: DevTokenUser,
+  headers: Record<string, string>,
+  body: string,
+): Promise<number> {
+  if (!current) throw new Error('no relay');
+  const response = await fetch(current.relay.mcpUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${user.token}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+      'Mcp-Protocol-Version': '2026-07-28',
+      ...headers,
+    },
+    body,
+  });
+  await response.text();
+  return response.status;
+}
+
+interface Entry {
+  msg: string;
+  repeated?: number;
+  [field: string]: unknown;
+}
+
+function entries(lines: readonly string[]): Entry[] {
+  return lines.map((line) => JSON.parse(line) as Entry);
+}
+
+/** Lines written in full under this message, and the count the summaries carry for it. */
+function tally(lines: readonly string[], message: string): { written: number; repeated: number } {
+  const all = entries(lines);
+  return {
+    written: all.filter((entry) => entry.msg === message).length,
+    repeated: all
+      .filter((entry) => entry.msg.startsWith(message) && entry.msg.endsWith(', repeated'))
+      .reduce((sum, entry) => sum + (entry.repeated ?? 0), 0),
+  };
+}
+
+describe('lines a signed-in account can make /mcp write (A4.3)', () => {
+  it('writes the SDK refusals of large requests once a window, cut short, and counts the rest', async () => {
+    const { lines } = await setup();
+    const before = lines.length;
+    const big = 'A'.repeat(2 * 1024 * 1024 - 1000);
+    const cases: [Record<string, string>, string][] = [
+      // A method name that disagrees with Mcp-Method.
+      [
+        { 'Mcp-Method': 'x' },
+        JSON.stringify({ jsonrpc: '2.0', id: 1, method: big, params: { _meta: META } }),
+      ],
+      // A protocol version that disagrees with the header.
+      [
+        {},
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/list',
+          params: { _meta: { ...META, 'io.modelcontextprotocol/protocolVersion': big } },
+        }),
+      ],
+      // A method with no Mcp-Method header at all.
+      [{}, JSON.stringify({ jsonrpc: '2.0', id: 1, method: big, params: { _meta: META } })],
+    ];
+    for (const [headers, body] of cases) {
+      for (let i = 0; i < 10; i += 1) expect(await modernPost(G1, headers, body)).toBe(400);
+    }
+    const flood = lines.slice(before);
+    // About 40 MB before; a few short lines now.
+    expect(flood.join('\n').length).toBeLessThan(4096);
+    for (const line of flood) expect(line.length).toBeLessThan(1024);
+    await current?.close();
+    const { written, repeated } = tally(lines.slice(before), 'mcp handler error');
+    expect(written).toBeGreaterThan(0);
+    expect(written).toBeLessThanOrEqual(cases.length);
+    // Every refusal is either written or counted.
+    expect(written + repeated).toBe(30);
+  });
+
+  it('writes small SDK refusals once a window too, however many come', async () => {
+    const { lines } = await setup();
+    const before = lines.length;
+    const body = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/list',
+      params: { _meta: META },
+    });
+    const statuses = await Promise.all(
+      Array.from({ length: 200 }, () => modernPost(G1, { 'Mcp-Method': 'x' }, body)),
+    );
+    expect(new Set(statuses)).toEqual(new Set([400]));
+    expect(tally(lines.slice(before), 'mcp handler error').written).toBe(1);
+    await current?.close();
+    expect(tally(lines.slice(before), 'mcp handler error')).toEqual({ written: 1, repeated: 199 });
+  });
+
+  it("counts each 2026-07-28 request the SDK refuses against its caller's request budget", async () => {
+    const relay = await setup({ rateLimits: { requestsPerInvitee: 3 } });
+    const body = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/list',
+      params: { _meta: META },
+    });
+    for (let i = 0; i < 3; i += 1)
+      expect(await modernPost(G1, { 'Mcp-Method': 'x' }, body)).toBe(400);
+    const g1 = await connectClient(relay.relay, G1, { modern: true });
+    clients.push(g1);
+    expect((await callTool(g1, 'list_pages')).text).toMatch(/^rate_limited: /);
+    // Another account's budget is its own.
+    const g2 = await connectClient(relay.relay, G2, { modern: true });
+    clients.push(g2);
+    expect((await callTool(g2, 'list_pages')).isError).toBe(false);
+  });
+
+  it('writes refused 2025-era initializes once per reason a window, and counts the rest', async () => {
+    const { relay, lines } = await setup({
+      limits: { inviteeSessions: 1 },
+      // So the listening stream's headers go out at once.
+      timings: { sseKeepAliveMs: 50 },
+    });
+    // One stranger holds the pool's one session, busy with its listening stream.
+    const held = await openSession(relay, G1);
+    streams.push(await openStream(relay, G1, held));
+    const before = lines.length;
+    for (let i = 0; i < 50; i += 1) {
+      const response = await rawPost(relay, G2, initializeBody());
+      await response.text();
+      expect(response.status).toBe(503);
+    }
+    const message = 'MCP session refused: invitees hold the most sessions allowed';
+    expect(tally(lines.slice(before), message).written).toBe(1);
+    await current?.close();
+    expect(tally(lines.slice(before), message)).toEqual({ written: 1, repeated: 49 });
+  });
+
+  it('writes the sessions a loop of initializes opens and drops once per reason a window', async () => {
+    const { relay, lines } = await setup({ limits: { sessionsPerUser: 1 } });
+    const before = lines.length;
+    // Each new session of one user ends that user's idle one, which used to write a line.
+    for (let i = 0; i < 40; i += 1) await openSession(relay, ALICE);
+    const message = 'MCP session closed';
+    expect(tally(lines.slice(before), message).written).toBe(1);
+    await current?.close();
+    // The 39 the loop ended, and the last one at shutdown.
+    expect(tally(lines.slice(before), message)).toEqual({ written: 2, repeated: 38 });
+  });
+});

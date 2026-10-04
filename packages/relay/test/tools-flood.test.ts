@@ -4,11 +4,14 @@
 // let one address keep the relay's main loop busy for seconds on end. Here
 // twenty sockets from one address flood the relay with 1 MB tools frames, each
 // socket within its own budget, while the main loop and /healthz are timed. The
-// same flood in frames of a type the relay ignores, which it only parses, is
-// the yardstick: tools frames must cost about what any frame of their size
-// costs, never several times as much.
+// same flood in frames of a type the relay ignores, which it only parses and
+// logs, is the yardstick: tools frames must cost about what any frame of their
+// size costs, never several times as much. The yardstick's relay lifts the
+// budget for frames that change nothing (ADR 0023), so it does the same work
+// on every run: every frame parsed and logged, no line held back.
 
 import { afterEach, describe, expect, it } from 'vitest';
+import type { RelayOptions } from '../src/index.ts';
 import { connectPage, type TestPage } from './helpers/page-client.ts';
 import { delay, startRelay, type TestRelay } from './helpers/relay.ts';
 
@@ -120,11 +123,24 @@ interface FloodCost {
   worst: number;
   slowestHealth: number;
   closedForBudget: number;
+  /** Sockets the relay closed for any reason. */
+  closed: number;
+  /** Frames of unknown type the relay parsed and logged. */
+  ignoredLines: number;
 }
 
-/** A fresh relay at its defaults, twenty sockets from one address, and the flood. */
-async function flood(type: string): Promise<FloodCost> {
-  current = await startRelay({ timings: { idleTimeoutMs: 600_000, pingIntervalMs: 600_000 } });
+/**
+ * A fresh relay at its defaults, twenty sockets from one address, and the
+ * flood; rateLimits over the defaults, for the yardstick.
+ */
+async function flood(
+  type: string,
+  rateLimits: RelayOptions['rateLimits'] = {},
+): Promise<FloodCost> {
+  current = await startRelay({
+    timings: { idleTimeoutMs: 600_000, pingIntervalMs: 600_000 },
+    rateLimits,
+  });
   for (let index = 0; index < SOCKETS; index += 1) {
     pages.push(await connectPage(current.relay.pageUrl));
   }
@@ -142,9 +158,12 @@ async function flood(type: string): Promise<FloodCost> {
     worst,
     slowestHealth: Math.max(...latencies),
     closedForBudget: current.lines.filter((line) => line.includes('too many tools frames')).length,
+    closed: pages.filter((opened) => opened.ws.readyState !== opened.ws.OPEN).length,
+    ignoredLines: current.lines.filter((line) => line.includes('ignored a frame of unknown type'))
+      .length,
   };
   process.stderr.write(
-    `${type} flood: loop stalled ${stalled.toFixed(0)} ms, worst gap ${worst.toFixed(0)} ms, /healthz slowest ${cost.slowestHealth.toFixed(0)} ms, sockets closed for budget ${String(cost.closedForBudget)}\n`,
+    `${type} flood: loop stalled ${stalled.toFixed(0)} ms, worst gap ${worst.toFixed(0)} ms, /healthz slowest ${cost.slowestHealth.toFixed(0)} ms, sockets closed for budget ${String(cost.closedForBudget)}, closed ${String(cost.closed)}\n`,
   );
   await closeAll();
   return cost;
@@ -157,7 +176,13 @@ function bound(yardstick: number, ceiling: number): number {
 
 describe('tools frames from one address (S9, ADR 0010)', () => {
   it('twenty sockets flooding 1 MB tools frames cannot hold up the main loop or /healthz', async () => {
-    const ignored = await flood('not_a_frame_type');
+    const ignored = await flood('not_a_frame_type', {
+      ignoredFramesPerSocket: 10_000,
+      ignoredFramesPerAddress: 10_000,
+    });
+    // The yardstick did all its work: every frame parsed and logged, every socket open.
+    expect(ignored.ignoredLines).toBe(SOCKETS * FRAMES_PER_SOCKET);
+    expect(ignored.closed).toBe(0);
     const tools = await flood('tools');
 
     expect(tools.stalled).toBeLessThan(bound(ignored.stalled, MAX_STALLED_MS));
