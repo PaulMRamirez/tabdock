@@ -12,12 +12,16 @@ import { spawn } from 'node:child_process';
 import * as nodeFs from 'node:fs';
 import {
   chmodSync,
+  closeSync,
   existsSync,
+  ftruncateSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   rmSync,
   statSync,
+  truncateSync,
   utimesSync,
   writeFileSync,
 } from 'node:fs';
@@ -256,8 +260,16 @@ describe('the audit files (ADR 0019)', () => {
 
     // A cap of one byte deletes everything it may, which is never the file in use:
     // at a start, the newest, whose last line the chain goes on from.
+    const total = listAuditFiles(dir).reduce(
+      (sum, file) => sum + statSync(join(dir, file.name)).size,
+      0,
+    );
     const capped = open(dir, { maxBytes: 1 }, { now: Date.parse('2026-09-06T08:00:00.000Z') });
     expect(listAuditFiles(dir).map((file) => file.day)).toEqual(['2026-09-05']);
+    // The line names the count that drove the deletion and the cap.
+    expect(logged(capped.lines, 'info').filter((line) => line.reason === 'size')).toEqual([
+      expect.objectContaining({ msg: 'audit file deleted by retention', total, maxBytes: 1 }),
+    ]);
     capped.audit.append(call(Date.parse('2026-09-06T08:00:00.000Z')));
     capped.audit.append(call(Date.parse('2026-09-06T08:00:01.000Z')));
     // Rotation runs retention again; force one with a new day.
@@ -724,7 +736,13 @@ describe('verify (pnpm audit:log --verify)', () => {
     expect(
       logged(lines, 'info').filter((line) => line.msg === 'audit file deleted by retention'),
     ).toEqual([expect.objectContaining({ file: planted, reason: 'age' })]);
+    // Named when it appeared, as only something other than this relay makes such a file while it runs.
     expect(logged(lines, 'error')).toEqual([
+      expect.objectContaining({
+        msg: expect.stringMatching(/neither found at its start nor made/) as string,
+        file: planted,
+        bytes: 0,
+      }),
       expect.objectContaining({
         msg: expect.stringMatching(/missing from the start of the log/) as string,
         from: 1,
@@ -764,6 +782,255 @@ function checkpoints(lines: string[]): { seq: number; head: string; first: numbe
       return { seq, head, first };
     });
 }
+
+describe('what retention counts and keeps (ADR 0019)', () => {
+  const CAP = 64 * 1024 * 1024;
+
+  /** A file whose size claims more than it holds, which takes no blocks: whoever holds the disk can make one. */
+  function sparse(path: string, bytes: number, endsLine = false): void {
+    const fd = openSync(path, 'w', 0o600);
+    try {
+      ftruncateSync(fd, endsLine ? bytes - 1 : bytes);
+      if (endsLine) nodeFs.writeSync(fd, Buffer.from('\n'), 0, 1, bytes - 1);
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  /** A disk whose writes to the audit files fail with ENOSPC while full is set, as a volume out of space does. */
+  function noSpaceForLines(): { fs: AuditFs; full: boolean } {
+    const auditFds = new Set<number>();
+    const disk: { fs: AuditFs; full: boolean } = {
+      full: false,
+      fs: {
+        ...nodeFs,
+        openSync: (...args: Parameters<typeof nodeFs.openSync>) => {
+          const fd = nodeFs.openSync(...args);
+          if (/audit-[^/\\]*\.jsonl$/.test(String(args[0]))) auditFds.add(fd);
+          return fd;
+        },
+        closeSync: (fd: number) => {
+          auditFds.delete(fd);
+          nodeFs.closeSync(fd);
+        },
+        writeSync: ((fd: number, ...rest: [NodeJS.ArrayBufferView]) => {
+          if (disk.full && auditFds.has(fd)) {
+            throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+          }
+          return nodeFs.writeSync(fd, ...rest);
+        }) as typeof nodeFs.writeSync,
+      },
+    };
+    return disk;
+  }
+
+  it('leaves a file planted while it runs out of the size total, however large it claims to be, and names it', async () => {
+    const { audit, dir, lines } = open(scratch(), { rotateBytes: 600, maxBytes: CAP });
+    for (let index = 0; index < 10; index += 1) audit.append(call(T0 + index));
+    const made = listAuditFiles(dir).map((file) => file.name);
+    expect(made).toHaveLength(5);
+    // Whoever holds the disk plants a sparse file past the cap, named to sort after every file the log made.
+    const planted = `audit-${utcDay(T0)}-999999999999.jsonl`;
+    sparse(join(dir, planted), CAP + 1);
+    // Each record from here rotates, and each rotation runs retention.
+    for (let index = 10; index < 15; index += 1) audit.append(call(T0 + index));
+    await audit.close();
+    expect(lines.filter((line) => line.includes('deleted by retention'))).toEqual([]);
+    expect(listAuditFiles(dir).map((file) => file.name)).toEqual(
+      expect.arrayContaining([...made, planted]),
+    );
+    // Named once, at the first pass that saw it, though three passes saw it.
+    expect(logged(lines, 'error')).toEqual([
+      expect.objectContaining({
+        msg: expect.stringMatching(/neither found at its start nor made/) as string,
+        file: planted,
+        bytes: CAP + 1,
+      }),
+    ]);
+    expect(checkpoints(lines).map((checkpoint) => checkpoint.first)).toEqual(
+      checkpoints(lines).map(() => 1),
+    );
+    rmSync(join(dir, planted));
+    expect(verifyAuditLines(readAuditLines(dir), checkpoints(lines).at(-1)).problems).toEqual([]);
+  });
+
+  it('deletes for size only files it knows, oldest first, never one planted while it runs', async () => {
+    const { audit, dir, lines } = open(scratch(), { rotateBytes: 600, maxBytes: 1500 });
+    for (let index = 0; index < 4; index += 1) audit.append(call(T0 + index));
+    // A small file named for seq 0, so it sorts before every file the log made.
+    const planted = `audit-${utcDay(T0)}-000000000000.jsonl`;
+    writeFileSync(join(dir, planted), 'x\n', { mode: 0o600 });
+    for (let index = 4; index < 12; index += 1) audit.append(call(T0 + index));
+    await audit.close();
+    const sized = logged(lines, 'info').filter((line) => line.reason === 'size');
+    expect(sized.length).toBeGreaterThan(0);
+    expect(sized.map((line) => line.file)).not.toContain(planted);
+    for (const line of sized) expect(line).toMatchObject({ maxBytes: 1500 });
+    expect(sized.every((line) => Number(line.total) > 1500)).toBe(true);
+    const [first, oldest] = listAuditFiles(dir);
+    expect(first?.name).toBe(planted);
+    // first followed the files the log made as retention deleted them, and the plant was named once.
+    const newest = checkpoints(lines).at(-1);
+    expect(newest?.first).toBe(oldest?.firstSeq);
+    expect(logged(lines, 'error')).toEqual([expect.objectContaining({ file: planted, bytes: 2 })]);
+    rmSync(join(dir, planted));
+    expect(verifyAuditLines(readAuditLines(dir), newest).problems).toEqual([]);
+  });
+
+  it('counts a file it knows at the bytes it wrote there, so one grown in place deletes nothing, and names it', async () => {
+    const { audit, dir, lines } = open(scratch(), { rotateBytes: 600, maxBytes: CAP });
+    for (let index = 0; index < 10; index += 1) audit.append(call(T0 + index));
+    const files = listAuditFiles(dir).map((file) => file.name);
+    expect(files).toHaveLength(5);
+    // The newest file the log closed, grown past the cap in place; what it gained takes no blocks.
+    const grown = files.at(-2) ?? '';
+    const path = join(dir, grown);
+    const wrote = statSync(path).size;
+    truncateSync(path, CAP + 1);
+    for (let index = 10; index < 15; index += 1) audit.append(call(T0 + index));
+    await audit.close();
+    expect(lines.filter((line) => line.includes('deleted by retention'))).toEqual([]);
+    expect(listAuditFiles(dir).map((file) => file.name)).toEqual(expect.arrayContaining(files));
+    expect(logged(lines, 'error')).toEqual([
+      expect.objectContaining({
+        msg: expect.stringMatching(/changed size other than by its own writes/) as string,
+        file: grown,
+        bytes: CAP + 1,
+        knownBytes: wrote,
+      }),
+    ]);
+    expect(checkpoints(lines).map((checkpoint) => checkpoint.first)).toEqual(
+      checkpoints(lines).map(() => 1),
+    );
+    // Cut back to what the log wrote, nothing is missing against the newest checkpoint.
+    truncateSync(path, wrote);
+    expect(verifyAuditLines(readAuditLines(dir), checkpoints(lines).at(-1)).problems).toEqual([]);
+  });
+
+  it('counts only its own bytes in a file it makes under a name something else took first', async () => {
+    const clock = { now: T0 };
+    const { audit, dir, lines } = open(scratch(), { maxBytes: CAP }, clock);
+    for (let index = 0; index < 3; index += 1) audit.append(call(T0 + index));
+    // Whoever holds the disk takes the name the next day's file will have, with a sparse file past the cap.
+    const taken = `audit-${utcDay(T0 + DAY)}-000000000004.jsonl`;
+    sparse(join(dir, taken), CAP + 1, true);
+    clock.now = T0 + DAY;
+    for (let index = 0; index < 3; index += 1) audit.append(call(clock.now + index));
+    // The day after, a rotation runs retention with that file closed.
+    clock.now = T0 + 2 * DAY;
+    audit.append(call(clock.now));
+    await audit.close();
+    expect(lines.filter((line) => line.includes('deleted by retention'))).toEqual([]);
+    expect(checkpoints(lines).map((checkpoint) => checkpoint.first)).toEqual(
+      checkpoints(lines).map(() => 1),
+    );
+    // Named when it appeared, and again once the log wrote there, for the bytes it never wrote.
+    const size = statSync(join(dir, taken)).size;
+    expect(logged(lines, 'error')).toEqual([
+      expect.objectContaining({
+        msg: expect.stringMatching(/neither found at its start nor made/) as string,
+        file: taken,
+        bytes: CAP + 1,
+      }),
+      expect.objectContaining({
+        msg: expect.stringMatching(/changed size other than by its own writes/) as string,
+        file: taken,
+        bytes: size,
+        knownBytes: size - (CAP + 1),
+      }),
+    ]);
+  });
+
+  it('keeps the newest file it found as current until its first line, whatever is planted after it', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    const dir = scratch();
+    const first = open(dir, { rotateBytes: 600 });
+    for (let index = 0; index < 6; index += 1) first.audit.append(call(T0 + index));
+    await first.audit.close();
+    opened.splice(opened.indexOf(first.audit), 1);
+    const newest = listAuditFiles(dir).at(-1)?.name;
+    // A cap of one byte: the start keeps only the file the chain goes on from.
+    open(dir, { rotateBytes: 600, maxBytes: 1 });
+    expect(listAuditFiles(dir).map((file) => file.name)).toEqual([newest]);
+    const planted = `audit-${utcDay(T0)}-999999999999.jsonl`;
+    writeFileSync(join(dir, planted), 'x\n', { mode: 0o600 });
+    vi.advanceTimersByTime(AUDIT_RETENTION_CHECK_MS);
+    expect(listAuditFiles(dir).map((file) => file.name)).toEqual([newest, planted]);
+  });
+
+  it('names a file that held records as missing when it goes, even beside an empty file with its seq planted before the start', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    const start = Date.parse('2026-10-01T12:00:00.000Z');
+    const clock = { now: start };
+    const dir = scratch();
+    const first = open(dir, {}, clock);
+    for (let day = 0; day < 4; day += 1) {
+      clock.now = start + day * DAY;
+      for (let index = 0; index < 3; index += 1) first.audit.append(call(clock.now + index));
+    }
+    await first.audit.close();
+    opened.splice(opened.indexOf(first.audit), 1);
+    const stop = checkpoints(first.lines).at(-1);
+    expect(stop).toMatchObject({ seq: 12, first: 1 });
+    const [oldest] = listAuditFiles(dir);
+    // While no relay runs, an empty file named for seq 1 on the next day, so it sorts after the real one.
+    writeFileSync(join(dir, `audit-${utcDay(start + DAY)}-000000000001.jsonl`), '', {
+      mode: 0o600,
+    });
+    const second = open(dir, {}, clock);
+    // The start's checkpoint repeats the stop's, so nothing at the start shows the plant.
+    expect(checkpoints(second.lines)).toEqual([stop]);
+    // While it runs, the file holding seqs 1 to 3, well inside the retention, is deleted by hand, and the hourly pass looks.
+    rmSync(join(dir, oldest?.name ?? ''));
+    vi.advanceTimersByTime(AUDIT_RETENTION_CHECK_MS);
+    second.audit.append(call(clock.now));
+    await second.audit.close();
+    expect(logged(second.lines, 'error')).toEqual([
+      expect.objectContaining({
+        msg: expect.stringMatching(/missing from the start of the log/) as string,
+        from: 1,
+        to: 3,
+      }),
+    ]);
+    const newest = checkpoints(second.lines).at(-1);
+    expect(newest).toMatchObject({ seq: 13, first: 1 });
+    expect(verifyAuditLines(readAuditLines(dir), newest).problems).toEqual([
+      expect.objectContaining({
+        problem: expect.stringMatching(
+          /the log starts at seq 4, but the checkpoint says it kept every record from seq 1/,
+        ) as string,
+      }),
+    ]);
+  });
+
+  it('lets a file it made go without stopping first there when no line ever landed in it', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    const disk = noSpaceForLines();
+    const clock = { now: T0 };
+    const { audit, dir, lines } = open(scratch(), { fs: disk.fs }, clock);
+    for (let index = 0; index < 3; index += 1) audit.append(call(T0 + index));
+    // The next day's file is made, but its first line finds no space.
+    disk.full = true;
+    clock.now = T0 + DAY;
+    expect(audit.append(call(clock.now))).toBeNull();
+    const [, empty] = listAuditFiles(dir);
+    expect(empty).toMatchObject({ firstSeq: 4, day: utcDay(T0 + DAY) });
+    // A day on, the disk has room, and the gap and the call go to a file of their own with the same first seq.
+    disk.full = false;
+    clock.now = T0 + 2 * DAY;
+    expect(audit.append(call(clock.now))?.seq).toBe(5);
+    rmSync(join(dir, empty?.name ?? ''));
+    vi.advanceTimersByTime(AUDIT_RETENTION_CHECK_MS);
+    // A month on, retention deletes the file that held seqs 1 to 3.
+    clock.now = T0 + 32 * DAY;
+    audit.append(call(clock.now));
+    await audit.close();
+    expect(logged(lines, 'error').filter((line) => /missing/.test(String(line.msg)))).toEqual([]);
+    const newest = checkpoints(lines).at(-1);
+    expect(newest).toMatchObject({ seq: 6, first: 4 });
+    expect(verifyAuditLines(readAuditLines(dir), newest).problems).toEqual([]);
+  });
+});
 
 describe('a gap still owed when the log closes (ADR 0019)', () => {
   interface FailingDisk {

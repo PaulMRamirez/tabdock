@@ -6,7 +6,10 @@
 // calls after hub.shutdown() so the calls it fails are on disk too. A file
 // rotates at AUDIT_ROTATE_MB or at UTC midnight, so each file holds one UTC
 // day and is named for it; files go once their day is past the retention or
-// once all of them pass the size cap, oldest first, never the current one.
+// once the files the log knows pass the size cap, oldest first, never the
+// current one. The cap counts each at the bytes the log knows it by (its size
+// when the start found it, plus what the log wrote since), never at a size
+// read from the directory, which a sparse file can make anything.
 //
 // Each line carries a sequence number and the SHA-256 of the previous line as
 // written (its UTF-8 text without the newline), chained across files and
@@ -17,8 +20,11 @@
 // open or made since, and only to where the next one it knows starts, never
 // to a seq read back from the directory: so a file removed any other way
 // while the log is open, from the start or the middle, is logged as missing
-// and first never passes it for the rest of the run, and a file planted in
-// its place moves nothing. A start takes the files it finds as given: its
+// and first never passes it for the rest of the run. A file planted while it
+// runs, under any name and of any size, and one it knows grown or cut, get an
+// error line naming them at the next retention pass, and move first neither
+// by name nor by size. A start takes the files it finds as given, their sizes
+// included: its
 // checkpoint, written before anything else, repeats the stop's after a clean
 // stop, but a change made while no relay ran that leaves it the same (a file
 // removed from the middle, say) can no longer be told from retention's own
@@ -393,12 +399,10 @@ function codeOf(error: unknown): string {
 
 /** The file the log appends to now. */
 interface CurrentFile {
-  name: string;
+  /** Its entry among the files the log knows, joined to them once the file exists, its size and held kept as lines land. */
+  known: KnownFile;
   day: string;
-  /** The seq its name gives its first line. */
-  firstSeq: number;
   fd: number | null;
-  size: number;
 }
 
 /**
@@ -410,8 +414,24 @@ interface CurrentFile {
 interface KnownFile {
   name: string;
   firstSeq: number;
+  /**
+   * Its bytes as this log knows them: its size when the start found it,
+   * plus every byte this log wrote to it since. Size retention counts this,
+   * never a size read from the directory, which whoever holds the disk can
+   * make anything, sparse files taking no blocks at all.
+   */
+  size: number;
+  /**
+   * Whether it may hold a record: found at open with any bytes in it, or
+   * made here and a whole line landed in it. One gone that held none lost
+   * nothing; this, never the name of the file after it, says so.
+   */
+  held: boolean;
   deleted: boolean;
 }
+
+/** A file in the directory as a retention pass lists it: its name's parts and its size there. */
+type ListedFile = AuditFileInfo & { size: number };
 
 /** What the file missed while writing failed, for the audit_gap record that follows. */
 interface Gap {
@@ -420,12 +440,12 @@ interface Gap {
   lastAt: number;
 }
 
-/** Where a log goes on from: the seq its next line gets, the last line's digest, the seq its oldest file starts at, and the files it found. */
+/** Where a log goes on from: the seq its next line gets, the last line's digest, the seq its oldest file starts at, and the files it found, with their sizes then. */
 interface Recovered {
   nextSeq: number;
   head: string | null;
   first: number;
-  files: AuditFileInfo[];
+  files: ListedFile[];
 }
 
 export class FileAuditLog implements AuditLog {
@@ -458,12 +478,15 @@ export class FileAuditLog implements AuditLog {
   #first: number;
   /**
    * The files this log found at open and made since, oldest first: the only
-   * boundaries first moves along. A file that appears any other way, under
-   * whatever name, is none, so planting one moves nothing.
+   * boundaries first moves along, and the only files size retention counts
+   * or deletes for size. A file that appears any other way, under whatever
+   * name, is none, so planting one moves nothing.
    */
   #known: KnownFile[];
   /** The holes last reported, so each is logged once while it lasts. */
   #missingReported = new Set<string>();
+  /** The files last reported as unknown or changed in size, so each is logged once while it lasts. */
+  #strangeReported = new Set<string>();
   /** Whether #gap came from AUDIT_GAP_NAME, which is cleared once its record is written. */
   #gapOwed = false;
   /** AUDIT_GAP_NAME, open from open to close, so close can write an owed gap over it in place. */
@@ -493,7 +516,13 @@ export class FileAuditLog implements AuditLog {
     this.#nextSeq = recovered.nextSeq;
     this.#head = recovered.head;
     this.#first = recovered.first;
-    this.#known = recovered.files.map(({ name, firstSeq }) => ({ name, firstSeq, deleted: false }));
+    this.#known = recovered.files.map(({ name, firstSeq, size }) => ({
+      name,
+      firstSeq,
+      size,
+      held: size > 0,
+      deleted: false,
+    }));
   }
 
   /**
@@ -741,7 +770,9 @@ export class FileAuditLog implements AuditLog {
       const fd = current.fd ?? this.#openCurrent(current);
       const buffer = Buffer.from(`${text}\n`, 'utf8');
       const written = this.#fs.writeSync(fd, buffer);
-      current.size += written;
+      current.known.size += written;
+      // A whole line, its newline perhaps still owed, is a record in this file.
+      if (written >= buffer.length - 1) current.known.held = true;
       if (written === buffer.length - 1) {
         // Every byte but the newline landed, as a disk that fills at the last
         // byte leaves it: the line is whole, so it is this record, and only
@@ -749,7 +780,7 @@ export class FileAuditLog implements AuditLog {
         // seq and a prev that skips it.
         landed = true;
         const closed = this.#fs.writeSync(fd, Buffer.from('\n'));
-        current.size += closed;
+        current.known.size += closed;
         if (closed !== 1) throw Object.assign(new Error('short write'), { code: 'ESHORT' });
       } else if (written !== buffer.length) {
         // Part of the line landed; the next open sees the torn end and closes it.
@@ -860,12 +891,21 @@ export class FileAuditLog implements AuditLog {
     const current = this.#current;
     const rotating = current !== null;
     if (current !== null) {
-      const full = current.size > 0 && current.size + bytes > this.#rotateBytes;
+      const { size } = current.known;
+      const full = size > 0 && size + bytes > this.#rotateBytes;
       if (current.day === day && !full) return current;
       this.#rotate();
     }
     const name = `audit-${day}-${String(this.#nextSeq).padStart(12, '0')}.jsonl`;
-    const next: CurrentFile = { name, day, firstSeq: this.#nextSeq, fd: null, size: 0 };
+    // One already known under this name, as an empty file a start found, goes on from what the log knows of it.
+    const known = this.#known.find((file) => file.name === name && !file.deleted) ?? {
+      name,
+      firstSeq: this.#nextSeq,
+      size: 0,
+      held: false,
+      deleted: false,
+    };
+    const next: CurrentFile = { known, day, fd: null };
     this.#current = next;
     // After each rotation, with the new file already current, so it is never a candidate.
     if (rotating) this.#retain();
@@ -883,7 +923,7 @@ export class FileAuditLog implements AuditLog {
    * a torn last line first, since a failed or short write may have left one.
    */
   #openCurrent(current: CurrentFile): number {
-    const path = join(this.#dir, current.name);
+    const path = join(this.#dir, current.known.name);
     const fd = this.#fs.openSync(
       path,
       nodeFs.constants.O_WRONLY | nodeFs.constants.O_APPEND | nodeFs.constants.O_CREAT | noFollow(),
@@ -891,15 +931,16 @@ export class FileAuditLog implements AuditLog {
     );
     // Known from the moment it exists, never before: a retention pass that
     // ran before it was made would otherwise count it as removed.
-    this.#know(current);
+    this.#know(current.known);
     try {
       this.#fs.fchmodSync(fd, FILE_MODE);
+      // The size on disk decides only whether a torn line needs closing. The
+      // log counts its own bytes: a file put under this name by something
+      // else counts for nothing, and retention names it once its size and
+      // the log's differ.
       const size = this.#fs.fstatSync(fd).size;
       if (size > 0 && lastByte(this.#fs, path, size) !== NEWLINE) {
-        this.#fs.writeSync(fd, Buffer.from('\n'));
-        current.size = size + 1;
-      } else {
-        current.size = size;
+        current.known.size += this.#fs.writeSync(fd, Buffer.from('\n'));
       }
     } catch (error) {
       this.#fs.closeSync(fd);
@@ -954,11 +995,15 @@ export class FileAuditLog implements AuditLog {
    * checkpoint follows at once. Only this log's own deletions of files it
    * knows move first (see #moveFirst), so a file removed any other way is
    * logged as a hole that every checkpoint from then on shows to --verify
-   * (ADR 0019).
+   * (ADR 0019). The cap counts the files this log knows at the bytes it
+   * knows them by, and only those go for it: a size read from the directory
+   * is whatever whoever holds the disk made it, and a sparse file claims any
+   * size while it takes no blocks, so trusting one would let a planted or
+   * grown file make retention delete the start of the log as if by right.
    */
   #retain(): void {
     if (this.#lockLost) return;
-    let files: (AuditFileInfo & { size: number })[];
+    let files: ListedFile[];
     try {
       files = listAuditFiles(this.#dir, this.#fs).map((file) => ({
         ...file,
@@ -970,18 +1015,32 @@ export class FileAuditLog implements AuditLog {
       });
       return;
     }
-    // Before the first line of a start no file is open, and the newest, which
-    // the chain was just read from, counts as current.
-    const current = this.#current?.name ?? files.at(-1)?.name;
+    // By name; a file its retention deleted whose name is back is no longer the one it knew.
+    const known = new Map(
+      this.#known.filter((file) => !file.deleted).map((file) => [file.name, file]),
+    );
+    const listed = new Set(files.map((file) => file.name));
+    // Before the first line of a start no file is open, and the newest it
+    // found, which the chain was just read from, counts as current.
+    const current =
+      this.#current?.known.name ??
+      this.#known.findLast((file) => !file.deleted && listed.has(file.name))?.name;
+    this.#reportStrange(files, known);
     const cutoff = this.#now() - this.#retentionMs;
-    let total = files.reduce((sum, file) => sum + file.size, 0);
+    let total = files.reduce((sum, file) => sum + (known.get(file.name)?.size ?? 0), 0);
     const deleted = new Set<string>();
-    const remove = (file: AuditFileInfo & { size: number }, reason: 'age' | 'size'): void => {
+    const remove = (file: ListedFile, reason: 'age' | 'size'): void => {
       try {
         this.#fs.unlinkSync(join(this.#dir, file.name));
-        total -= file.size;
         deleted.add(file.name);
-        this.#log.info('audit file deleted by retention', { file: file.name, reason });
+        // A deletion for size names the count that drove it, so a jump in first can be weighed against the files' real sizes.
+        this.#log.info(
+          'audit file deleted by retention',
+          reason === 'size'
+            ? { file: file.name, reason, total, maxBytes: this.#maxBytes }
+            : { file: file.name, reason },
+        );
+        total -= known.get(file.name)?.size ?? 0;
       } catch (error) {
         this.#log.warn('audit retention could not delete a file', {
           file: file.name,
@@ -989,16 +1048,18 @@ export class FileAuditLog implements AuditLog {
         });
       }
     };
-    const kept: (AuditFileInfo & { size: number })[] = [];
+    const kept: ListedFile[] = [];
     for (const file of files) {
-      // A file holds one UTC day, so it goes once that whole day is past the retention.
+      // A file holds one UTC day, so it goes once that whole day is past the
+      // retention, known or not: the age is the name's, and a file the log
+      // does not know moves nothing when it goes.
       const dayEnds = Date.parse(`${file.day}T00:00:00.000Z`) + DAY_MS;
       if (file.name !== current && dayEnds <= cutoff) remove(file, 'age');
       else kept.push(file);
     }
     for (const file of kept) {
       if (total <= this.#maxBytes) break;
-      if (file.name !== current) remove(file, 'size');
+      if (file.name !== current && known.has(file.name)) remove(file, 'size');
     }
     this.#moveFirst(
       new Set(files.filter((file) => !deleted.has(file.name)).map((file) => file.name)),
@@ -1007,10 +1068,41 @@ export class FileAuditLog implements AuditLog {
     if (deleted.size > 0) this.#checkpoint();
   }
 
+  /**
+   * Logs, once while it lasts, each audit file whose size this log cannot
+   * vouch for: one it neither found at its start nor made, which only
+   * something else can have put there while it runs, and one it knows whose
+   * size on disk is no longer the size it found or the bytes it wrote. Size
+   * retention counts neither at its size on disk, and deletes no file it
+   * does not know for size.
+   */
+  #reportStrange(files: readonly ListedFile[], known: ReadonlyMap<string, KnownFile>): void {
+    const strange = new Set<string>();
+    for (const file of files) {
+      const entry = known.get(file.name);
+      if (entry === undefined) {
+        strange.add(`unknown ${file.name}`);
+        if (this.#strangeReported.has(`unknown ${file.name}`)) continue;
+        this.#log.error(
+          'an audit file appeared that this relay neither found at its start nor made, so something else put it there: it is no part of the log, size retention neither counts it nor deletes it, and it moves first neither by its name nor when age retention deletes it (ADR 0019)',
+          { file: file.name, bytes: file.size },
+        );
+      } else if (entry.size !== file.size) {
+        strange.add(`size ${file.name}`);
+        if (this.#strangeReported.has(`size ${file.name}`)) continue;
+        this.#log.error(
+          'an audit file this relay knows changed size other than by its own writes, so something else grew or cut it: size retention counts it at the bytes this relay found at its start or wrote, and --verify reports any line cut or changed (ADR 0019)',
+          { file: file.name, bytes: file.size, knownBytes: entry.size },
+        );
+      }
+    }
+    this.#strangeReported = strange;
+  }
+
   /** Adds a file this log made to the ones it knows, once. */
-  #know(file: CurrentFile): void {
-    if (this.#known.some((known) => known.name === file.name)) return;
-    this.#known.push({ name: file.name, firstSeq: file.firstSeq, deleted: false });
+  #know(file: KnownFile): void {
+    if (this.#known.includes(file)) return;
+    this.#known.push(file);
     // Stable, so a file made after one found with the same seq stays after it.
     this.#known.sort((a, b) => a.firstSeq - b.firstSeq);
   }
@@ -1021,19 +1113,22 @@ export class FileAuditLog implements AuditLog {
    * oldest file it knows, first is where the next one it knows starts. A
    * file it knows that is gone from the directory, and that its retention
    * did not delete, was removed some other way: the seqs from its start to
-   * the next file it knows are logged as missing, and first never passes
-   * them for the rest of the run, so once it reaches them every checkpoint
-   * names the hole and --verify against it fails. A file this log does not
-   * know, planted under whatever name, moves first neither by its name nor
-   * when retention deletes it.
+   * the next file it knows that starts later are logged as missing, and
+   * first never passes them for the rest of the run, so once it reaches
+   * them every checkpoint names the hole and --verify against it fails. A
+   * file this log does not know, planted under whatever name, moves first
+   * neither by its name nor when retention deletes it.
    */
   #moveFirst(onDisk: ReadonlySet<string>, deleted: ReadonlySet<string>): void {
     for (const file of this.#known) if (deleted.has(file.name)) file.deleted = true;
     const gone = (file: KnownFile): boolean => !file.deleted && !onDisk.has(file.name);
-    // A file gone whose successor starts at its own seq held no record, so it
-    // lost nothing; kept, it would stop first there for the rest of the run.
+    // A file gone that the log knows held no record (empty when its start
+    // found it, or made here with no line landing in it) lost nothing; kept,
+    // it would stop first there for the rest of the run. Never decided by the
+    // file after it, which may be an empty one planted with the same seq, and
+    // never the current file, which a line may yet land in.
     this.#known = this.#known.filter(
-      (file, index, all) => !gone(file) || all[index + 1]?.firstSeq !== file.firstSeq,
+      (file) => !gone(file) || file.held || file === this.#current?.known,
     );
     let moved = false;
     while (this.#known[0]?.deleted === true) {
@@ -1045,13 +1140,17 @@ export class FileAuditLog implements AuditLog {
     const holes = new Set<string>();
     let hole: { from: number; atStart: boolean } | null = null;
     // null after the last: a run of files gone at the end held up to the last line written.
-    for (const [index, file] of [...this.#known, null].entries()) {
+    for (const file of [...this.#known, null]) {
       if (file !== null && gone(file)) {
-        hole ??= { from: file.firstSeq, atStart: index === 0 };
+        // At the start when no file it knows starts before it.
+        hole ??= { from: file.firstSeq, atStart: this.#known[0]?.firstSeq === file.firstSeq };
         continue;
       }
-      if (hole === null) continue;
-      // What a run of files gone held: up to the next file known, deleted by retention or not.
+      // A file that starts where the hole does holds none of the seqs after
+      // it: the file gone held them, as an empty one planted beside it would
+      // otherwise hide.
+      if (hole === null || (file !== null && file.firstSeq <= hole.from)) continue;
+      // What a run of files gone held: up to the next file known that starts later, deleted by retention or not.
       const to = (file?.firstSeq ?? this.#nextSeq) - 1;
       if (to >= hole.from) this.#reportMissing(hole.from, to, hole.atStart, holes);
       hole = null;
@@ -1728,8 +1827,9 @@ function prepareDir(dir: string, fs: AuditFs): void {
  * newline here so the next record starts a line of its own; older files are
  * read only when the newest holds no record at all. first is where the
  * oldest file says it starts, and the files listed are the ones the log
- * knows at open, taken as given: whoever held the disk while no relay ran
- * may have changed them, and docs/deploy.md says what then shows it.
+ * knows at open, with their sizes then, taken as given: whoever held the
+ * disk while no relay ran may have changed them, and docs/deploy.md says
+ * what then shows it.
  */
 function recover(dir: string, fs: AuditFs, log: Logger): Recovered {
   let files: AuditFileInfo[];
@@ -1760,16 +1860,34 @@ function recover(dir: string, fs: AuditFs, log: Logger): Recovered {
       if (text === '') continue;
       const record = readLine(file.name, at + 1, text).record;
       if (record !== null) {
+        const found = sizesNow(dir, fs, files);
         return {
           nextSeq: record.seq + 1,
           head: lineHash(text),
-          first: files[0]?.firstSeq ?? 1,
-          files,
+          first: found[0]?.firstSeq ?? 1,
+          files: found,
         };
       }
     }
   }
-  return { nextSeq: 1, head: null, first: 1, files };
+  return { nextSeq: 1, head: null, first: 1, files: sizesNow(dir, fs, files) };
+}
+
+/**
+ * The files a start found, with their sizes after any torn line was closed:
+ * the bytes size retention counts each of them by for the rest of the run.
+ * A file gone since the listing is left out, as if never found.
+ */
+function sizesNow(dir: string, fs: AuditFs, files: readonly AuditFileInfo[]): ListedFile[] {
+  return files.flatMap((file) => {
+    const path = join(dir, file.name);
+    try {
+      return [{ ...file, size: fs.statSync(path).size }];
+    } catch (error) {
+      if (codeOf(error) === 'ENOENT') return [];
+      throw new AuditDirError(`cannot read the audit file ${path} (${codeOf(error)})`);
+    }
+  });
 }
 
 function closeTornLine(path: string, fs: AuditFs): void {
