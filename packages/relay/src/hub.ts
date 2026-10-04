@@ -3154,6 +3154,10 @@ export class PageHub {
     marks: CallMarks | null = null,
   ): Promise<CallOutcome> {
     const started = Date.now();
+    // The duration comes from a clock that only runs forward: a wall clock
+    // stepped back during the call would give a negative one, which the
+    // record's schema refuses, and the call would lose its line (S7).
+    const startedMono = performance.now();
     let auditOutcome: AuditOutcome = 'relay_error';
     const trace: CallTrace = { reached: false };
     try {
@@ -3177,7 +3181,7 @@ export class PageHub {
         client: caller.client,
         tool: auditToolName(tool),
         outcome: auditOutcome,
-        durationMs: Date.now() - started,
+        durationMs: Math.round(performance.now() - startedMono),
       };
       // A call that reached its page is always written in full; one refused
       // before it went out, or failed by the relay before it could, only

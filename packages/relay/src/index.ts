@@ -34,9 +34,12 @@ export {
 } from './audit-budget.ts';
 export {
   AUDIT_CHECKPOINT_MS,
+  AUDIT_GAP_NAME,
   AUDIT_LOCK_NAME,
+  AUDIT_LOCK_STALE_MS,
   AUDIT_RETENTION_CHECK_MS,
   AUDIT_SYNC_MS,
+  type AuditCheckpoint,
   AuditDirError,
   type AuditFileInfo,
   type AuditFs,
