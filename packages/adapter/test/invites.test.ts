@@ -1,9 +1,11 @@
 // The adapter's M4 interfaces (ADR 0017) before workstream B builds on them:
-// stored grants as { role, inviteId?, endsAt? } with the bare role an older
-// adapter stored still read; an attach request's account and invite, never
-// its presented secret; the invites frame, which nothing acts on yet; and
-// dock.invite(), which checks its options and the page's policy and then, with
-// no relay offering invites, answers unavailable.
+// stored grants as { role, inviteId?, endsAt?, inviteRole? } with the bare
+// role an older adapter stored still read; an attach request's account and
+// invite, never its presented secret; the invites frame, which nothing acts on
+// yet; the live list and Cancel, empty and refusing until a relay offers
+// invites; Revoke's closeInvite option; and dock.invite(), which checks its
+// options and the page's policy and then, with no relay offering invites,
+// answers unavailable.
 
 import { describe, expect, it } from 'vitest';
 import { INVITE_LIFETIMES, type InviteOptions } from '../src/core.ts';
@@ -51,9 +53,14 @@ describe('stored grants from M4 (ADRs 0011 and 0017)', () => {
     });
   });
 
-  it("keeps an invite-made grant's invite and end across a reload and a role change", async () => {
+  it("keeps an invite-made grant's invite, end and cap across a reload and a role change", async () => {
     const storage = new MapStorage();
-    const invited = { role: 'observer', inviteId: 'inv_1', endsAt: 86_400_000 };
+    const invited = {
+      role: 'observer',
+      inviteId: 'inv_1',
+      endsAt: 86_400_000,
+      inviteRole: 'observer',
+    };
     storage.setItem(GRANTS_KEY, JSON.stringify({ pageId: 'page-1', grants: { bob: invited } }));
     const h = setup({ storage });
     const socket = await link(h, { resumed: true, roster: [attachment('bob', 'observer')] }, {});
@@ -66,7 +73,14 @@ describe('stored grants from M4 (ADRs 0011 and 0017)', () => {
   });
 
   it('reads a malformed grant of either shape as no grants at all', async () => {
-    for (const bad of [{ role: 'driver', extra: 1 }, { role: 'admin' }, { inviteId: 'inv_1' }]) {
+    for (const bad of [
+      { role: 'driver', extra: 1 },
+      { role: 'admin' },
+      { inviteId: 'inv_1' },
+      // An invite-made grant without its cap, or above it, is no grant (ADR 0017).
+      { role: 'observer', inviteId: 'inv_1', endsAt: 1 },
+      { role: 'driver', inviteId: 'inv_1', endsAt: 1, inviteRole: 'observer' },
+    ]) {
       const storage = new MapStorage();
       storage.setItem(
         GRANTS_KEY,
@@ -132,8 +146,32 @@ describe('an invites frame', () => {
     });
     await flush();
     expect(h.dock.state).toBe(before);
-    expect(h.dock.state.link).toBe('linked');
+    expect(h.dock.state).toMatchObject({ link: 'linked', invites: [], invitesOffered: null });
     expect(socket.closedWith).toBeNull();
+  });
+});
+
+describe('the live list, Cancel and Revoke from M4 (ADR 0017)', () => {
+  it('start empty, with no invites offered until a relay with invites on says so', async () => {
+    const h = setup();
+    expect(h.dock.state).toMatchObject({ invites: [], invitesOffered: null });
+    await link(h);
+    expect(h.dock.state).toMatchObject({ invites: [], invitesOffered: null });
+  });
+
+  it('cancel nothing the page does not list, and send nothing', async () => {
+    const h = setup({ core: { policy: { invites: 'all' } } });
+    const socket = await link(h);
+    expect(h.dock.cancelInvite('inv_1')).toBe(false);
+    expect(socket.framesOf('invite_cancel')).toEqual([]);
+  });
+
+  it('revoke as before with closeInvite, which has no link to close before invites exist', async () => {
+    const h = setup();
+    const socket = await link(h, { roster: [attachment('bob', 'driver')] }, {});
+    expect(h.dock.revoke('bob', { closeInvite: true })).toBe(true);
+    expect(socket.framesOf('revoke')).toEqual([{ t: 'revoke', userId: 'bob' }]);
+    expect(socket.framesOf('invite_cancel')).toEqual([]);
   });
 });
 

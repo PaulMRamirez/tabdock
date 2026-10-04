@@ -196,6 +196,8 @@ describe('origin policy (S1, S2)', () => {
     expect(limits).toEqual({
       sessionsPerUser: 20,
       sessions: 1000,
+      inviteeSessions: 50,
+      sessionsPerInvitee: 2,
       usersPerPage: 10,
       queueDepth: 32,
       pageSocketsPerAddress: 20,
@@ -314,6 +316,8 @@ describe('loadConfigFromEnv', () => {
     expect(config.limits).toEqual({
       sessionsPerUser: 5,
       sessions: 50,
+      inviteeSessions: 50,
+      sessionsPerInvitee: 2,
       usersPerPage: 4,
       queueDepth: 8,
       pageSocketsPerAddress: 3,
@@ -471,6 +475,9 @@ describe('dev-token auth', () => {
         reason: 'no valid dev token',
         body: 'Unauthorized',
         headers: { 'WWW-Authenticate': 'Bearer realm="tabdock"' },
+        // Nothing to say about an account or a client before a token matches (ADR 0020).
+        accountKind: null,
+        oauthClientId: null,
       });
     }
   });

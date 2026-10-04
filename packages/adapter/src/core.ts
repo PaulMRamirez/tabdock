@@ -214,6 +214,46 @@ export interface InviteOptions {
  */
 export type InviteRefusal = InviteRefusalReason | 'invalid' | 'link_down' | 'unavailable';
 
+/**
+ * One live invite this page minted, as the widget's list shows it (ADR
+ * 0017): the relay's listing of an invite this page's own record holds.
+ * expiresAt is the operator's choice on this page's clock, as the relay echoes
+ * it back; null is "while the page is open", which still ends 24 hours after
+ * minting.
+ */
+export interface InviteView {
+  readonly inviteId: string;
+  /** observer for Can watch, driver for Can control. */
+  readonly role: Role;
+  /** Written on this page: shown as its own words (S10). */
+  readonly label: string;
+  readonly uses: number;
+  readonly usesLeft: number;
+  readonly expiresAt: number | null;
+  /** The member the relay named as sponsor at minting; fixed, since /i shows the name. */
+  readonly sponsor: User;
+  /** A redemption waits on the operator; a control invite allows one at a time. */
+  readonly pending: boolean;
+  /** Refusals and timeouts so far; three burn a control invite. */
+  readonly refusals: number;
+}
+
+/** What a relay that offers invites said in its last invites frame. */
+export interface InvitesOffered {
+  /** `<public URL>/i`, where links start; null when this relay mints none, having no public URL. */
+  readonly linkBase: string | null;
+}
+
+/** Options for Revoke (ADR 0017). */
+export interface RevokeOptions {
+  /**
+   * For someone an invite let in, also close that invite's link
+   * (invite_cancel), so nobody else joins by it. The widget checks it by
+   * default for a multi-use invite; revoke('*') closes every link anyway.
+   */
+  readonly closeInvite?: boolean;
+}
+
 /** The link shows here once, and is never stored: only its secret's hash is. */
 export type InviteResult =
   | {
@@ -289,6 +329,17 @@ export interface DockState {
   readonly paused: boolean;
   /** The last ACTIVITY_LIMIT calls, newest first. */
   readonly activity: readonly ActivityEntry[];
+  /**
+   * This page's live invites, oldest first (ADR 0017): empty until a relay
+   * offers invites, and holding only those this page's own record knows.
+   */
+  readonly invites: readonly InviteView[];
+  /**
+   * null until an invites frame arrives, which only a relay with invites on
+   * sends, right after each welcome (ADR 0017's notes); a relay with them off
+   * never sends one, so the widget then offers no Invite form at all.
+   */
+  readonly invitesOffered: InvitesOffered | null;
 }
 
 /** The only control handle. Each method returns false when there was nothing to act on. */
@@ -306,8 +357,18 @@ export interface Dock {
    * choice and the relay's roster either way.
    */
   setRole(userId: string, role: Role): boolean;
-  /** Ends one user's attachment, or everyone's with '*' (S8). */
-  revoke(userId: string): boolean;
+  /**
+   * Ends one user's attachment, or everyone's with '*' (S8), which also
+   * cancels every live invite. Revoking someone an invite let in bars them
+   * from it; options.closeInvite also closes its link (ADR 0017).
+   */
+  revoke(userId: string, options?: RevokeOptions): boolean;
+  /**
+   * Closes one live invite's link (invite_cancel); the attachments it already
+   * made stay until revoked (ADR 0017's notes). False when this page holds no
+   * such invite.
+   */
+  cancelInvite(inviteId: string): boolean;
   /**
    * Mints an invite on this page as far as policy.invites allows (ADR 0017):
    * a 128-bit secret whose hash alone goes to the relay and into this page's
@@ -711,6 +772,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     error: null,
     paused: readPaused(),
     activity: [],
+    invites: [],
+    invitesOffered: null,
   });
   const listeners = new Set<(state: DockState) => void>();
 
@@ -1973,6 +2036,16 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     return refuse('unavailable');
   }
 
+  /**
+   * Closes the link of an invite this page lists. Workstream B also drops it
+   * from the page's own record (ADR 0017); until a relay offers invites the
+   * page lists none, so this finds nothing.
+   */
+  function cancelInvite(inviteId: string): boolean {
+    if (closed || !state.invites.some((view) => view.inviteId === inviteId)) return false;
+    return isLinked() && send({ t: 'invite_cancel', inviteId });
+  }
+
   /** Calls already in the page's hands finish; every other call, now or later, is answered page_busy. */
   function pause(paused: boolean): void {
     writePaused(paused);
@@ -2055,7 +2128,10 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     confirm: (callId: string, allow: boolean) => confirmCall(callId, (allow as unknown) === true),
     rotatePairing: () => isLinked() && send({ t: 'rotate_pairing' }),
     setRole: (userId: string, role: Role) => setRole(userId, role),
+    // Workstream B honours RevokeOptions.closeInvite (ADR 0017); until a
+    // relay offers invites no grant names one, so there is no link to close.
     revoke: (userId: string) => revoke(userId),
+    cancelInvite: (inviteId: string) => cancelInvite(inviteId),
     invite: (options: InviteOptions) => invite(options),
     // Only false resumes: resuming lets calls run again, so a script's 'false' or 0 keeps the pause.
     pause: (paused: boolean) => {

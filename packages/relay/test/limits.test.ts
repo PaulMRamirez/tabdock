@@ -87,6 +87,9 @@ describe('ADR 0009 defaults', () => {
     expect(DEFAULT_LIMITS).toEqual({
       sessionsPerUser: 20,
       sessions: 1000,
+      // ADR 0016: the invitee tier's own small pool, one session until an invitee holds a page.
+      inviteeSessions: 50,
+      sessionsPerInvitee: 2,
       usersPerPage: 10,
       queueDepth: 32,
       pageSocketsPerAddress: 20,

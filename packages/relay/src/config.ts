@@ -144,6 +144,17 @@ export interface RelayLimits {
   sessionsPerUser: number;
   /** 2025-era MCP sessions the relay holds in total. */
   sessions: number;
+  /**
+   * Of those, the sessions all invitees may hold together: their own small
+   * pool, whose idlest session goes first when the relay is full (ADR 0016,
+   * workstream A).
+   */
+  inviteeSessions: number;
+  /**
+   * Sessions one invitee may hold once it holds an attachment; until then it
+   * may hold one (ADR 0016, workstream A).
+   */
+  sessionsPerInvitee: number;
   /** Distinct users attached to one page. */
   usersPerPage: number;
   /** Mutating calls waiting behind the running one on one page. */
@@ -339,6 +350,8 @@ export const DEFAULT_RATE_LIMITS: RelayRateLimits = {
 export const DEFAULT_LIMITS: RelayLimits = {
   sessionsPerUser: 20,
   sessions: 1000,
+  inviteeSessions: 50,
+  sessionsPerInvitee: 2,
   usersPerPage: 10,
   queueDepth: 32,
   pageSocketsPerAddress: 20,
@@ -932,6 +945,7 @@ function authFromEnv(
   env: NodeJS.ProcessEnv,
   envName: RelayEnv,
   host: string | undefined,
+  invites: boolean,
   system: Partial<LocalTokenSystem>,
 ): EnvAuth {
   const publicText = env.TABDOCK_PUBLIC_URL?.trim() ?? '';
@@ -979,7 +993,17 @@ function authFromEnv(
     );
   }
   const tokens = env.TABDOCK_DEV_TOKENS?.trim() ?? '';
-  if (tokens !== '') return { auth: createDevTokenAuth(parseDevTokens(tokens)) };
+  if (tokens !== '') {
+    const users = parseDevTokens(tokens);
+    // An invitee entry means nothing while the relay admits no invitees (ADR 0017).
+    const invitee = users.findIndex((user) => user.kind === 'invitee');
+    if (invitee !== -1 && !invites) {
+      throw new Error(
+        `TABDOCK_DEV_TOKENS entry ${String(invitee + 1)} names an invitee (a g_ user id), and there are none unless TABDOCK_INVITES is on (ADR 0017)`,
+      );
+    }
+    return { auth: createDevTokenAuth(users) };
+  }
   if (envName === 'production') {
     throw new Error(
       'production needs auth settings, such as TABDOCK_PUBLIC_URL with TABDOCK_OAUTH_ISSUER and TABDOCK_OAUTH_USERS; it never falls back to local mode, which serves only this machine (ADR 0022)',
@@ -1146,7 +1170,13 @@ export function loadConfigFromEnv(
   refuseSettingsOutOfMode(env, relayEnv, invites);
 
   // Last, so a mistake in any other setting is reported before local mode draws a token.
-  const { auth, publicUrl, pairClient, localMode } = authFromEnv(env, relayEnv, host, system);
+  const { auth, publicUrl, pairClient, localMode } = authFromEnv(
+    env,
+    relayEnv,
+    host,
+    invites,
+    system,
+  );
   // Local mode keeps its audit files beside its owner token unless told otherwise (ADR 0019).
   const auditDir =
     auditDirText !== ''

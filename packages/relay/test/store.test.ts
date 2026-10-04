@@ -1,10 +1,14 @@
 import { AuditEventSchema } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
 import {
+  type AuditLog,
   callRecords,
+  createLogger,
   createMemoryStore,
   type InviteRecord,
+  MemoryAuditLog,
   type PageRecord,
+  recordAudit,
   type SingleUseTicketRecord,
 } from '../src/index.ts';
 
@@ -75,6 +79,9 @@ describe('the in-memory store', () => {
       clients: [],
       inviteId: null,
       endsAt: null,
+      inviteRole: null,
+      sponsorId: null,
+      emailHash: null,
     };
     attachments.put({ ...base, pageId: 'pg_A', userId: 'alice' });
     attachments.put({ ...base, pageId: 'pg_A', userId: 'bob' });
@@ -138,6 +145,53 @@ describe('the in-memory store', () => {
     expect(audit.records()).toEqual([call, detach]);
     expect(callRecords(audit.records())).toEqual([call]);
     for (const event of audit.records()) expect(AuditEventSchema.parse(event)).toEqual(event);
+  });
+
+  it("writes each audit record's stderr copy through recordAudit, less the email (ADR 0019)", () => {
+    const lines: string[] = [];
+    const log = createLogger({ sink: (line) => lines.push(line) });
+    const { audit } = createMemoryStore();
+    const attach = {
+      v: 1,
+      type: 'attach',
+      at: 1,
+      pageId: 'pg_A',
+      origin: 'https://app.example',
+      userId: `g_${'0'.repeat(32)}`,
+      kind: 'invitee',
+      role: 'observer',
+      via: 'invite',
+      clientId: null,
+      inviteId: 'inv_1',
+      email: 'guest@example.com',
+    } as const;
+    recordAudit(audit, log, attach);
+    expect(audit.records()).toEqual([attach]);
+    expect(lines).toHaveLength(1);
+    const copy = (index: number): { msg: string; audit: Record<string, unknown> } =>
+      JSON.parse(lines[index] ?? '{}') as { msg: string; audit: Record<string, unknown> };
+    expect(copy(0).msg).toBe('attach');
+    // The copy is the record less the email, which never reaches stderr (ADR 0020).
+    expect(copy(0).audit).toEqual({ ...attach, email: '[redacted]' });
+    expect(lines[0]).not.toContain('guest@example.com');
+    // A log that wrote a file line hands back what it added, and the copy carries it.
+    const ring = new MemoryAuditLog(2);
+    const filed: AuditLog = {
+      append: (event) => {
+        ring.append(event);
+        return { seq: 7, prev: 'f'.repeat(64) };
+      },
+      records: () => ring.records(),
+    };
+    recordAudit(filed, log, attach);
+    expect(copy(1).audit).toEqual({
+      ...attach,
+      email: '[redacted]',
+      seq: 7,
+      prev: 'f'.repeat(64),
+    });
+    // The memory ring writes no file line, so it adds nothing.
+    expect(ring.append(attach)).toBeNull();
   });
 
   it('keeps invites by page and id, finds them by digest, and forgets a digest it replaced', () => {

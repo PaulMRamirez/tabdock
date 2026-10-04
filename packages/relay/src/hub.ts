@@ -59,14 +59,15 @@ import {
   SINGLE_USE_SECRET_PATTERN,
 } from './secrets.ts';
 import type { CallMarks, SpikeHooks } from './spike.ts';
-import type {
-  AttachmentRecord,
-  AttachRequestRecord,
-  AuditOutcome,
-  PageRecord,
-  PageState,
-  RelayStore,
-  SingleUseTicketRecord,
+import {
+  type AttachmentRecord,
+  type AttachRequestRecord,
+  type AuditOutcome,
+  type PageRecord,
+  type PageState,
+  recordAudit,
+  type RelayStore,
+  type SingleUseTicketRecord,
 } from './store.ts';
 
 type FrameOf<T extends PageFrame['t']> = Extract<PageFrame, { t: T }>;
@@ -89,7 +90,19 @@ export interface HubError {
 }
 
 export type PairOutcome =
-  { kind: 'attached'; pageId: string; origin: string; role: Role; existing: boolean } | HubError;
+  | {
+      kind: 'attached';
+      pageId: string;
+      origin: string;
+      role: Role;
+      existing: boolean;
+      /**
+       * For an attachment an invite made, the sponsor's display name, so
+       * pair_page can say "shared by <sponsor>" as /i does (ADR 0016).
+       */
+      sponsor?: string;
+    }
+  | HubError;
 
 /** What /pair shows for a live QR nonce before anyone claims it; looking uses nothing up. */
 export interface PairPreview {
@@ -131,7 +144,12 @@ export interface InvitePreview {
  * The hub's invite surface (ADRs 0016 and 0017), which workstream A builds
  * on the page hub; /i, pair_page and the invitee session pool call it. The
  * page side arrives as invite_create and invite_cancel frames, which the hub
- * ignores until then, since no relay without invites ever offers them.
+ * ignores until then, since no relay without invites ever offers them. The
+ * rules A builds to are in ADR 0017's notes: every redemption reaches the
+ * page as an attach_request via invite with the presented secret, autoApprove
+ * or not; a relay with invites off sends no invites frame, and one with them
+ * on sends one after every welcome and answers every invite_create with one;
+ * and a revoke of one user never cancels an invite.
  */
 export interface InviteHub {
   /**
@@ -147,6 +165,13 @@ export interface InviteHub {
   /** Whether the user holds any attachment, which decides an invitee's session pool and audit budget. */
   holds(userId: string): boolean;
 }
+
+/** What #grant takes from an attach request, or from a caller let in without one. */
+type GrantRequest = Pick<
+  AttachRequestRecord,
+  'pageId' | 'userId' | 'displayName' | 'account' | 'oauthClientId' | 'client'
+> &
+  Partial<Pick<AttachRequestRecord, 'joined'>>;
 
 /** A page title longer than this is cut before /pair shows it (S10). */
 export const MAX_PAIR_TITLE_CHARS = 120;
@@ -841,9 +866,9 @@ export class PageHub {
 
   /**
    * A page minting or cancelling an invite. Workstream A answers these
-   * (ADR 0017); until then the relay mints none and sends no invites frame,
-   * which is what tells an adapter it may mint, so a page that sends one
-   * anyway is ignored as before, its secret's hash unlogged.
+   * (ADR 0017); until then the relay mints none and sends no invites frame
+   * (ADR 0017's notes: a relay with invites off sends none at all), so a page
+   * that sends one anyway is ignored as before, its secret's hash unlogged.
    */
   #inviteFrame(pageId: string, frame: FrameOf<'invite_create' | 'invite_cancel'>): void {
     this.#log.warn('ignored an invite frame: this relay mints no invites', {
@@ -1367,11 +1392,7 @@ export class PageHub {
     });
   }
 
-  #grant(
-    request: Pick<AttachRequestRecord, 'pageId' | 'userId' | 'displayName' | 'account' | 'client'> &
-      Partial<Pick<AttachRequestRecord, 'joined'>>,
-    wanted: Role,
-  ): AttachmentRecord {
+  #grant(request: GrantRequest, wanted: Role): AttachmentRecord {
     const existing = this.#store.attachments.get(request.pageId, request.userId);
     if (existing) return existing;
     const now = Date.now();
@@ -1388,9 +1409,14 @@ export class PageHub {
       lastUsedAt: null,
       expiresAt: now + this.#config.timings.attachmentIdleMs,
       clients: clients.slice(0, MAX_ROSTER_CLIENTS),
-      // Invite-made attachments, with their own end, come with workstream A (ADR 0017).
+      // Invite-made attachments, with their end, cap, sponsor and email
+      // digest, and the attach record naming request.oauthClientId, come with
+      // workstream A (ADRs 0017 and 0019).
       inviteId: null,
       endsAt: null,
+      inviteRole: null,
+      sponsorId: null,
+      emailHash: null,
     };
     this.#store.attachments.put(attachment);
     this.#armExpiry(attachment);
@@ -1587,6 +1613,15 @@ export class PageHub {
   }
 
   // MCP side
+
+  /**
+   * Whether the user holds an attachment to any page (InviteHub.holds). An
+   * invitee's session pool and audit budget turn on it (ADRs 0016 and 0019),
+   * and relay.ts hands it to the MCP sessions for that.
+   */
+  holds(userId: string): boolean {
+    return this.#store.attachments.listForUser(userId).length > 0;
+  }
 
   listPages(userId: string): PageListing[] {
     const listings: PageListing[] = [];
@@ -1805,11 +1840,12 @@ export class PageHub {
       };
     }
 
-    const request = {
+    const request: GrantRequest = {
       pageId: page.pageId,
       userId: caller.userId,
       displayName: caller.displayName,
       account: caller.account,
+      oauthClientId: caller.oauthClientId,
       client: caller.client,
     };
 
@@ -2003,13 +2039,13 @@ export class PageHub {
   }
 
   /**
-   * Every audit record goes through here: into the audit log and, as its
-   * off-host copy, to the log, whose redaction drops an invitee's email
-   * (ADR 0019). Arguments are never part of a record (S7).
+   * Every audit record the hub writes goes through here: into the audit log
+   * and, as its off-host copy with whatever the file line added, to the log,
+   * whose redaction drops an invitee's email (recordAudit, ADR 0019).
+   * Arguments are never part of a record (S7).
    */
   #audit(event: AuditEvent): void {
-    this.#store.audit.append(event);
-    this.#log.info(event.type, { audit: event });
+    recordAudit(this.#store.audit, this.#log, event);
   }
 
   /**

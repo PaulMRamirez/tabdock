@@ -5,17 +5,30 @@ export {
   type AuthPlugin,
   type AuthRefusal,
   type AuthRoute,
+  type AuthStartContext,
   type AuthUser,
   type BrowserSignIn,
   createDevTokenAuth,
   type DevTokenOptions,
   type DevTokenUser,
+  foldName,
+  inviteeUser,
+  isInviteePrefixed,
   MEMBER_ACCOUNT,
   MIN_DEV_TOKEN_LENGTH,
+  notAllowedRefusal,
   parseDevTokens,
   type UserAccount,
 } from './auth.ts';
-export { clientAddress, UNKNOWN_ADDRESS } from './client-address.ts';
+export { type AuthRefusalLog, createAuthRefusalLog } from './auth-log.ts';
+export {
+  type ClientAddress,
+  type ClientAddresses,
+  type ClientAddressProblem,
+  createClientAddresses,
+  loggedAddress,
+  UNKNOWN_ADDRESS,
+} from './client-address.ts';
 export {
   AUDIT_MAX_MB,
   AUDIT_RETENTION_DAYS,
@@ -94,6 +107,8 @@ export {
 } from './oauth.ts';
 export { LOGIN_COOKIE, PAIR_ROUTES, SESSION_COOKIE } from './pair.ts';
 export { createRelay, type Relay } from './relay.ts';
+export { type InviteeSessionOptions } from './sessions.ts';
+export { createSignInGate, type SignInGate, type SignInPass } from './sign-in-gate.ts';
 export {
   attachSpikeConsole,
   type MarkerChange,
@@ -109,6 +124,7 @@ export {
   type AttachmentStore,
   type AttachRequestRecord,
   type AttachRequestStore,
+  type AuditLineMeta,
   type AuditLog,
   type AuditOutcome,
   callRecords,
@@ -118,6 +134,7 @@ export {
   MemoryAuditLog,
   MemoryInviteStore,
   type PageRecord,
+  recordAudit,
   type PageState,
   type PageStore,
   type PairingTicketRecord,

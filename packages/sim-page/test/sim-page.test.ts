@@ -259,6 +259,9 @@ describe.each(RUNTIME_PROFILES)('the sim page as %s', (profile) => {
 describe('startSimPage', () => {
   it("passes the operator's Invite form to the current page's handle (ADR 0017)", async () => {
     const { sim } = await linked({ policy: { invites: 'all' } });
+    // Nothing to cancel before invites exist; Revoke takes closeInvite all the same.
+    expect(sim.cancelInvite('inv_1')).toBe(false);
+    expect(sim.state).toMatchObject({ invites: [], invitesOffered: null });
     // No relay offers invites before workstream A, so the answer is unavailable, after the checks.
     expect(await sim.invite({ label: 'Friends', role: 'observer', uses: 3 })).toEqual({
       ok: false,

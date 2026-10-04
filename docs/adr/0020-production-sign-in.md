@@ -27,3 +27,7 @@ The owner chose a WorkOS production environment (D4 in `docs/notes/m4/m4-decisio
 ## Consequences
 
 No new dependency. Members re-enter their user ids once and re-add the connector once. Tokens remain plain bearer tokens (Claude documents no sender-constrained tokens), so the lifetime cap is the main limit on a stolen one, and until the client list is set a third-party client can phish a member's consent, which the threat model records. Whether WorkOS production accepts Claude Code's `localhost` loopback redirect, when its rule names only `http://127.0.0.1`, is checked on the owner's first run; hosted Claude does not depend on it.
+
+## Notes from the interface review (4 October 2026)
+
+The plugin says who someone is and the relay decides whether they may in, so `TABDOCK_INVITES` has one home. The `oauth` plugin maps every valid token to a member or an invitee through `BrowserSignIn.userOf`, and relay.ts answers an invitee with M3's 403 unless it admits invitees, which it will only with `config.invites` on; until workstream A's invitee tier exists it admits none, whatever the setting. Every `AuthRefusal` carries `accountKind` and `oauthClientId`, null when the plugin knows neither, and one module owned by A, `auth-log.ts`, writes the refusal line: A adds those two fields to it and collapses repeated 401s by the client address's limit key. `AuthPlugin.start` receives `{ log }` for the first-sighting and metadata re-read lines, and `stop()` ends what `start` set going; the relay calls it once on close and on every failed start, its own included.

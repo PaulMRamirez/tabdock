@@ -77,6 +77,12 @@ export const MAX_LIVE_INVITES_PER_PAGE = 10;
  * long after redemption an invite-made attachment ends at the latest.
  */
 export const MAX_INVITE_LIFETIME_MS = 24 * 60 * 60_000;
+/**
+ * The least time an invite_create's expiresAt must still have on the relay's
+ * clock, or the relay refuses it as expired: the page set it on its own
+ * clock, which may run behind (ADR 0017's notes).
+ */
+export const MIN_INVITE_REMAINING_MS = 60_000;
 /** The widget's lifetimes besides "while the page is open": 15 minutes, or an hour by default. */
 export const SHORT_INVITE_LIFETIME_MS = 15 * 60_000;
 export const DEFAULT_INVITE_LIFETIME_MS = 60 * 60_000;

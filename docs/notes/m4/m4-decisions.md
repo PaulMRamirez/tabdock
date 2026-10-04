@@ -214,6 +214,8 @@ A4.2 needs a page that runs the adapter, is served from an origin on the product
 
 ## 3. M4 plan outline
 
+Superseded where it assigns work: `docs/plans/M4.md` (Workstreams) gives `/i`, `pair.ts` and the sign-in flow to workstream A, the client address and the sign-in gate to C, and `apps/demo` and `packages/sim-page` to B.
+
 **Order of work.**
 
 1. **Owner step:** you answer D1 to D6 and accept ADRs 0017 to 0021. I write `docs/plans/M4.md` and the verified rows in section 4, and add backlog rows for Node 24, D3 (B) if not taken, and the deny list of revoked sessions.

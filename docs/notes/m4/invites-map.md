@@ -107,6 +107,8 @@ Section 2, section 5's Invite row and trust rule, S4, S11, S14 and section 8's w
 
 ## 10. Workstreams
 
+Superseded: `docs/plans/M4.md` (Workstreams) assigns the work, giving `/i` to workstream A.
+
 First, by the lead: the schemas above, `AuthOutcome` and `Account`, store interfaces, hub signatures (`createInvite`, `cancelInvite`, `previewInvite(secret)`, `claimInvite(caller, secret): ClaimOutcome`), Dock API (`invite()`, `state.invites`), ADR 0017, SPEC edits. Then in parallel: **A relay** (store, lifecycle, invitee tier, sessions, `pair_page`, limits, tests); **B adapter and widget** (record, honour path, form, list, badges, QR, Playwright); **C `/i` and end to end** (routes, page, return target, email, phone-sized redemption, `demo:m4`), needing only A's signatures.
 
 ## External checks today

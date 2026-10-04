@@ -74,7 +74,11 @@ const COUNT = z.number().int().nonnegative();
 /** Refusals by outcome; an outcome with none is left out. */
 const OutcomeCountsSchema = z.partialRecord(AuditOutcomeSchema, z.number().int().positive());
 
-/** The outcomes a pairing or redemption can be refused with. */
+/**
+ * The outcomes a pairing or redemption can be refused with. An invite on
+ * pair_page that is malformed, minted for several uses or unknown is refused
+ * alike as pairing_expired (ADR 0017's notes), so no answer says a secret is live.
+ */
 export const AttachRefusalSchema = z.enum([
   'denied_by_operator',
   'timeout',
@@ -167,6 +171,33 @@ function attachRefusedRule(record: { pageId: string | null; origin: string | nul
   return (record.pageId === null) === (record.origin === null);
 }
 const PAGE_RULE = { message: 'a known page has its origin, and only a known page' };
+
+/**
+ * The fixed tools whose requests past ADR 0018's per-user request budget get
+ * a request_refused record. call_page_tool past it keeps its call record and
+ * pair_page its attach_refused record (outcome rate_limited), so every call
+ * attempt stays a call line (S7) and every pairing an attach_refused line.
+ */
+export const RequestRefusedToolSchema = z.enum(['list_pages', 'list_page_tools', 'detach_page']);
+
+/**
+ * A request ADR 0018's per-user budget refused before its tool ran, within
+ * ADR 0019's refusal budget like any refusal that reached no page. pageId is
+ * the client's own text, as in a call record, and null exactly for list_pages,
+ * which names no page.
+ */
+const RequestRefusedShape = shape('request_refused', {
+  userId: IdSchema,
+  kind: UserKindSchema,
+  client: ClientInfoSchema.nullable(),
+  tool: RequestRefusedToolSchema,
+  pageId: z.union([IdSchema, InvalidTextSchema]).nullable(),
+  outcome: z.literal('rate_limited'),
+});
+function requestRefusedRule(record: { tool: string; pageId: string | null }): boolean {
+  return (record.tool === 'list_pages') === (record.pageId === null);
+}
+const REQUEST_RULE = { message: 'every tool but list_pages names its page, and list_pages none' };
 
 /** The operator changed someone's role. */
 const RoleShape = shape('role', {
@@ -287,6 +318,7 @@ export const AuditEventSchema = z.discriminatedUnion('type', [
   z.strictObject(RelayStopShape),
   z.strictObject(AuditGapShape).refine(auditGapRule, GAP_RULE),
   z.strictObject(RefusedSummaryShape),
+  z.strictObject(RequestRefusedShape).refine(requestRefusedRule, REQUEST_RULE),
 ]);
 export type AuditEvent = z.infer<typeof AuditEventSchema>;
 export type AuditEventType = AuditEvent['type'];
@@ -310,10 +342,11 @@ export const AuditLineSchema = z.discriminatedUnion('type', [
   z.strictObject({ ...RelayStopShape, ...LINE }),
   z.strictObject({ ...AuditGapShape, ...LINE }).refine(auditGapRule, GAP_RULE),
   z.strictObject({ ...RefusedSummaryShape, ...LINE }),
+  z.strictObject({ ...RequestRefusedShape, ...LINE }).refine(requestRefusedRule, REQUEST_RULE),
 ]);
 export type AuditLine = z.infer<typeof AuditLineSchema>;
 
-/** Every record type, in ADR 0019's order, for readers that filter by type. */
+/** Every record type, in ADR 0019's order and then request_refused from its notes, for readers that filter by type. */
 export const AUDIT_EVENT_TYPES = [
   'call',
   'attach',
@@ -330,4 +363,5 @@ export const AUDIT_EVENT_TYPES = [
   'relay_stop',
   'audit_gap',
   'refused_summary',
+  'request_refused',
 ] as const satisfies readonly AuditEventType[];

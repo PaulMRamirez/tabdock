@@ -19,15 +19,32 @@ import {
 
 /**
  * The operator's grant to one user (ADR 0017): the role, and for an attachment
- * an invite made, that invite and the moment it ends. An adapter before M4
- * stored the bare role, which still reads, as a grant with neither.
+ * an invite made, that invite, the moment it ends and the invite's own role,
+ * the cap no role switch may pass. The cap stays here because the invite's
+ * record does not: a control invite is spent on approval and a watch invite
+ * may be cancelled or run out while its guests stay, yet the operator may
+ * still promote a control guest who joined as observer, and never a watch
+ * guest. The three come together or not at all, and the role never passes
+ * the cap. An adapter before M4 stored the bare role, which still reads, as
+ * a grant with none of them.
  */
 export const StoredGrantSchema = z.union([
-  z.strictObject({
-    role: RoleSchema,
-    inviteId: IdSchema.optional(),
-    endsAt: EpochMsSchema.optional(),
-  }),
+  z
+    .strictObject({
+      role: RoleSchema,
+      inviteId: IdSchema.optional(),
+      endsAt: EpochMsSchema.optional(),
+      inviteRole: RoleSchema.optional(),
+    })
+    .refine(
+      (grant) =>
+        (grant.inviteId === undefined) === (grant.endsAt === undefined) &&
+        (grant.inviteId === undefined) === (grant.inviteRole === undefined),
+      { message: 'an invite-made grant names its invite, its end and its cap, and no other does' },
+    )
+    .refine((grant) => grant.inviteRole !== 'observer' || grant.role === 'observer', {
+      message: "a grant never passes its invite's role",
+    }),
   RoleSchema.transform((role) => ({ role })),
 ]);
 export type StoredGrant = z.infer<typeof StoredGrantSchema>;

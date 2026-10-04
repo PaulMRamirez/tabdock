@@ -15,6 +15,7 @@ import {
   type InviteOptions,
   type InviteResult,
   type Logger,
+  type RevokeOptions,
   type SocketFactory,
   type StorageLike,
   type Timers,
@@ -105,8 +106,13 @@ export interface SimPage {
   readonly activity: readonly ActivityEntry[];
   /** The operator's role switch on the current page (Dock.setRole). */
   setRole(userId: string, role: Role): boolean;
-  /** The operator's Revoke, or Revoke all with '*' (Dock.revoke). */
-  revoke(userId: string): boolean;
+  /**
+   * The operator's Revoke, or Revoke all with '*' (Dock.revoke); for someone an
+   * invite let in, closeInvite also closes its link (ADR 0017).
+   */
+  revoke(userId: string, options?: RevokeOptions): boolean;
+  /** The Cancel beside one live invite in the widget's list (Dock.cancelInvite, ADR 0017). */
+  cancelInvite(inviteId: string): boolean;
   /**
    * The operator's Invite form on the current page (Dock.invite, ADR 0017):
    * resolves with the link once, or the reason there is none.
@@ -279,8 +285,11 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
     setRole(userId, role) {
       return current.core.dock.setRole(userId, role);
     },
-    revoke(userId) {
-      return current.core.dock.revoke(userId);
+    revoke(userId, revokeOptions) {
+      return current.core.dock.revoke(userId, revokeOptions);
+    },
+    cancelInvite(inviteId) {
+      return current.core.dock.cancelInvite(inviteId);
     },
     invite(inviteOptions) {
       return current.core.dock.invite(inviteOptions);

@@ -27,3 +27,9 @@ SPEC section 4 asks M4 to persist the audit log and S7 asks that every call be a
 ## Consequences
 
 S7 narrows in three ways, which the owner accepted explicitly on 3 October: past its budget a refused call keeps its user and outcome but loses tool and client; a stranger outside the 20 busiest keeps only its outcome; and during an `audit_gap` records survive only in the platform's logs (7 days on Fly). In exchange no stranger can flush the log, while members and the people the operator let in stay attributed and revocable. Every deploy costs the operator a re-pair and kills live invite links. The audit directory is the only state a hosted relay keeps on disk; on the reference deployment it is a Fly volume, $0.15 a month and snapshotted daily.
+
+## Notes from the interface review (4 October 2026)
+
+A sixteenth record type, `request_refused`, records a request ADR 0018's per-user budget refused for `list_pages`, `list_page_tools` or `detach_page`: `userId`, `kind`, `client`, the tool, the page as the client sent it (null for `list_pages`) and the outcome `rate_limited`, within the refusal budget like any refusal that reached no page. A `call_page_tool` past the budget stays a `call` record and a `pair_page` an `attach_refused` one, so every call attempt is a `call` line.
+
+`AuditLog.append` returns what the file line added, `{ seq, prev }`, or null when no file took the record (the memory ring, or a disk that failed). `recordAudit(audit, log, event)` in `store.ts` appends and writes the stderr copy with those fields, so the copy is the file line less the email whatever log is in use, a test's own included. The hub's records, `relay_start` and `relay_stop` go through it; `FileAuditLog` writes to stderr only the records it makes itself, `audit_gap` and the checkpoints.

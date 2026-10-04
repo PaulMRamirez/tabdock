@@ -18,14 +18,16 @@ import {
   type AuditLog,
   AuthOutcomeSchema,
   callRecords,
-  clientAddress,
+  createClientAddresses,
   createDevTokenAuth,
+  createLogger,
   createMemoryStore,
   createOAuthAuth,
   createRelay,
   DEFAULT_TRUSTED_PROXY_CIDR,
   type EnvConfig,
   loadConfigFromEnv,
+  loggedAddress,
   MemoryAuditLog,
   parseOAuthClientIds,
   parseProxyRange,
@@ -411,7 +413,7 @@ describe('the auth outcome (ADRs 0017 and 0020)', () => {
       resource: PUBLIC_MCP_URL,
       users: [{ sub: 'sub-alice', userId: 'alice', displayName: 'Alice' }],
     });
-    await auth.start?.();
+    await auth.start?.({ log: createLogger({ sink: () => undefined }) });
     const asked = async (claims: Record<string, unknown>): Promise<unknown> => {
       const token = await (provider as TestProvider).token({
         sub: 'sub-alice',
@@ -434,15 +436,41 @@ describe('the auth outcome (ADRs 0017 and 0020)', () => {
   });
 });
 
-describe('clientAddress (ADR 0018)', () => {
-  it("is the socket's peer until hosted mode names the client", () => {
-    const from = (remoteAddress: string | undefined): IncomingMessage =>
-      ({
-        socket: { remoteAddress },
-        headers: { 'fly-client-ip': '203.0.113.7' },
-      }) as unknown as IncomingMessage;
-    expect(clientAddress(from('127.0.0.2'))).toBe('127.0.0.2');
-    expect(clientAddress(from(undefined))).toBe('unknown');
+describe('the client address (ADR 0018)', () => {
+  const from = (remoteAddress: string | undefined): IncomingMessage =>
+    ({
+      socket: { remoteAddress },
+      headers: { 'fly-client-ip': '203.0.113.7' },
+    }) as unknown as IncomingMessage;
+
+  it("is the socket's peer, as address and limit key, until hosted mode names the client", () => {
+    const lines: string[] = [];
+    const log = createLogger({ sink: (line) => lines.push(line) });
+    const addresses = createClientAddresses(resolveEnv(DEV), log);
+    expect(addresses.of(from('127.0.0.2'))).toEqual({
+      ok: true,
+      address: '127.0.0.2',
+      key: '127.0.0.2',
+    });
+    expect(addresses.of(from(undefined))).toEqual({ ok: true, address: 'unknown', key: 'unknown' });
+    expect(lines).toEqual([]);
+  });
+
+  it('says once, in hosted mode, that every client still counts by its proxy until the header is read', () => {
+    const lines: string[] = [];
+    const log = createLogger({ sink: (line) => lines.push(line) });
+    const addresses = createClientAddresses(resolveEnv(HOSTED), log);
+    expect(addresses.of(from('10.0.0.5'))).toMatchObject({ ok: true, key: '10.0.0.5' });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('hosted mode counts every client by its proxy address');
+    expect(lines.join('\n')).not.toContain('203.0.113.7');
+  });
+
+  it('names a header that named no client by its problem, never by what it held', () => {
+    expect(loggedAddress({ ok: true, address: '192.0.2.1', key: '192.0.2.1' })).toBe('192.0.2.1');
+    expect(loggedAddress({ ok: false, problem: 'repeated' })).toBe(
+      '(repeated client address header)',
+    );
   });
 });
 
@@ -524,7 +552,7 @@ describe('the call record as an AuditEvent (ADR 0019)', () => {
     const audit: AuditLog = {
       append: (event) => {
         order.push(event.type);
-        ring.append(event);
+        return ring.append(event);
       },
       records: () => ring.records(),
       close: vi.fn(() => {
@@ -548,7 +576,11 @@ describe('the call record as an AuditEvent (ADR 0019)', () => {
     await page.next('invoke');
     await relay.close();
     await running.catch(() => undefined);
-    expect(order).toEqual(['call', 'close']);
+    // Only what this test is about: the log closes last, after the last call it
+    // recorded. Other records (attach, relay_start, relay_stop) may come and go.
+    expect(order.at(-1)).toBe('close');
+    expect(order.lastIndexOf('call')).toBeGreaterThanOrEqual(0);
+    expect(order.lastIndexOf('call')).toBeLessThan(order.indexOf('close'));
     expect(callRecords(ring.records()).map((record) => record.outcome)).toEqual(['page_asleep']);
 
     const closeFailing = vi.fn(() => Promise.resolve());

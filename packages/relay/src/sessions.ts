@@ -18,6 +18,25 @@ import {
 } from '@modelcontextprotocol/server';
 import type { Logger } from './log.ts';
 
+/**
+ * The invitee tier's sessions (ADRs 0016 and 0017): an invitee may hold one
+ * session until it holds an attachment and perInvitee after, all invitees
+ * together hold at most pool of them, and when the relay is full an invitee's
+ * session goes before anyone else is refused. relay.ts passes these now;
+ * workstream A makes McpSessions enforce them, and until then an invitee's
+ * sessions count as a member's, which the relay never admits yet anyway.
+ */
+export interface InviteeSessionOptions {
+  /** Sessions all invitees may hold together (RelayLimits.inviteeSessions). */
+  pool: number;
+  /** Sessions one invitee holding an attachment may hold (RelayLimits.sessionsPerInvitee). */
+  perInvitee: number;
+  /** Whether a user id is an invitee's, which ADR 0017 makes a matter of its shape. */
+  isInvitee: (userId: string) => boolean;
+  /** Whether the user holds an attachment to any page (PageHub.holds). */
+  holds: (userId: string) => boolean;
+}
+
 export interface SessionOptions {
   /** Builds the McpServer for a new session, for the user who opens it. */
   createServer: (authInfo: AuthInfo, request: Request) => McpServer;
@@ -27,6 +46,8 @@ export interface SessionOptions {
   perUser: number;
   /** Sessions in total; past this, initialize gets 503. */
   total: number;
+  /** The invitee tier; without it, every user's sessions count alike. */
+  invitees?: InviteeSessionOptions | undefined;
   /** A session with no response open for this long is closed. */
   idleMs: number;
   /** Keep-alive comment interval on the session's event streams. */

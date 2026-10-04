@@ -120,6 +120,17 @@ const SAMPLES: Record<AuditEvent['type'], AuditEvent> = {
       others: { accounts: 3, counts: { not_attached: 9 } },
     },
   },
+  request_refused: {
+    v: 1,
+    type: 'request_refused',
+    at: 16,
+    userId: GUEST,
+    kind: 'invitee',
+    client: { name: 'claude-ai', version: '1.0' },
+    tool: 'list_page_tools',
+    pageId: 'pg_0123456789',
+    outcome: 'rate_limited',
+  },
 };
 
 /** What ADR 0019 keeps out of every record, by the names a careless call site might use. */
@@ -141,10 +152,10 @@ const FORBIDDEN = {
 };
 
 describe('the audit record types', () => {
-  it('are the fifteen ADR 0019 lists, at version 1', () => {
+  it('are the fifteen ADR 0019 lists and request_refused from its notes, at version 1', () => {
     expect(AUDIT_VERSION).toBe(1);
     expect([...AUDIT_EVENT_TYPES].sort()).toEqual(Object.keys(SAMPLES).sort());
-    expect(AUDIT_EVENT_TYPES).toHaveLength(15);
+    expect(AUDIT_EVENT_TYPES).toHaveLength(16);
   });
 
   it.each(AUDIT_EVENT_TYPES)('%s round-trips as an event and as a line', (type) => {
@@ -231,6 +242,26 @@ describe('other record rules', () => {
     expect(AuditEventSchema.safeParse({ ...refused, ...PAGE }).success).toBe(true);
     expect(AuditEventSchema.safeParse({ ...refused, pageId: PAGE.pageId }).success).toBe(false);
     expect(AuditEventSchema.safeParse({ ...refused, outcome: 'ok' }).success).toBe(false);
+  });
+
+  it('refuse a request past the budget for the three tools with no record of their own', () => {
+    const refused = SAMPLES.request_refused;
+    const listPages = { ...refused, tool: 'list_pages', pageId: null };
+    expect(AuditEventSchema.safeParse(listPages).success).toBe(true);
+    const invalid = { ...refused, tool: 'detach_page', pageId: auditPageId('not a page id') };
+    expect(AuditEventSchema.safeParse(invalid).success).toBe(true);
+    for (const bad of [
+      // A call past the budget is a call record, and a pairing an attach_refused one.
+      { ...refused, tool: 'call_page_tool' },
+      { ...refused, tool: 'pair_page' },
+      { ...listPages, pageId: 'pg_0123456789' },
+      { ...refused, pageId: null },
+      { ...refused, pageId: 'not a page id' },
+      { ...refused, outcome: 'not_attached' },
+      { ...refused, kind: 'guest' },
+    ]) {
+      expect(AuditEventSchema.safeParse(bad).success, JSON.stringify(bad)).toBe(false);
+    }
   });
 
   it('keep a gap in order', () => {

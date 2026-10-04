@@ -29,6 +29,7 @@ import {
   MAX_INVITE_USES,
   MAX_LIVE_INVITES_PER_PAGE,
   MEMBER_RESERVED_SEATS,
+  MIN_INVITE_REMAINING_MS,
   PairPageInputSchema,
   parsePageFrame,
   parseRelayFrame,
@@ -113,6 +114,7 @@ describe('the numbers ADRs 0016, 0017 and 0019 fix', () => {
     expect(SHORT_INVITE_LIFETIME_MS).toBe(15 * 60 * 1000);
     expect(DEFAULT_INVITE_LIFETIME_MS).toBe(60 * 60 * 1000);
     expect(INVITE_BURN_REFUSALS).toBe(3);
+    expect(MIN_INVITE_REMAINING_MS).toBe(60 * 1000);
     expect(MEMBER_RESERVED_SEATS).toBe(2);
     expect(MAX_INVITE_INPUT_CHARS).toBe(300);
     expect(MAX_CODE_INPUT_CHARS).toBe(64);
@@ -178,7 +180,14 @@ describe('invites', () => {
       refused: { inviteId: 'inv_2', reason: 'no_public_url' },
     };
     expect(parseRelayFrame(JSON.stringify(refused))).toEqual({ kind: 'ok', frame: refused });
-    for (const reason of ['no_sponsor', 'policy', 'limit', 'duplicate', 'no_public_url']) {
+    for (const reason of [
+      'no_sponsor',
+      'policy',
+      'limit',
+      'duplicate',
+      'no_public_url',
+      'expired',
+    ]) {
       expect(relay({ ...refused, refused: { inviteId: 'inv_2', reason } })).toBe('ok');
     }
   });
@@ -239,6 +248,14 @@ describe('attach_request from M4', () => {
     ['a secret that is no secret', { invite: { inviteId: 'inv_1', secret: 'short', label: 'x' } }],
     ['an invite with no label', { invite: { inviteId: 'inv_1', secret: SECRET, label: '' } }],
     ['a via that is not one', { via: 'link' }],
+    [
+      "a member with an invitee's id",
+      { account: { kind: 'member', verified: true }, via: 'code', invite: undefined },
+    ],
+    [
+      "an invitee without an invitee's id",
+      { user: { userId: 'g_guest', displayName: 'guest@example.com' } },
+    ],
   ])('refuses %s', (_name, change) => {
     expect(relay({ ...request, ...change })).toBe('invalid');
   });
@@ -276,6 +293,37 @@ describe('roster entries from M4', () => {
     ['endsAt', { endsAt: undefined }],
   ])('require %s', (_name, change) => {
     expect(relay({ t: 'roster', attachments: [{ ...rosterEntry, ...change }] })).toBe('invalid');
+  });
+
+  // ADR 0017: the kind follows from the id, so the page can tell a caller's kind
+  // from its id alone; and only an invite-made attachment has an end.
+  it.each([
+    ["a member with an invitee's id", { kind: 'member' }],
+    ["an invitee without an invitee's id", { userId: 'bob' }],
+    ['an invite without an end', { endsAt: null }],
+    ['an end without an invite', { inviteId: null }],
+  ])('refuse %s', (_name, change) => {
+    const roster = { t: 'roster', attachments: [{ ...rosterEntry, ...change }] };
+    expect(relay(roster)).toBe('invalid');
+    const welcome = {
+      t: 'welcome',
+      pageId: 'pg_1',
+      resumeToken: 'rt_1',
+      resumed: false,
+      pairing: { code: 'ABCDE-12345', expiresAt: 1 },
+      roster: [{ ...rosterEntry, ...change }],
+      limits: {
+        maxFrameBytes: 1,
+        maxResultChars: 1,
+        maxDescriptionChars: 1,
+        pingIntervalMs: 1,
+        idleTimeoutMs: 1,
+        resumeWindowMs: 1,
+        attachRequestTtlMs: 1,
+      },
+    };
+    expect(relay(welcome)).toBe('invalid');
+    expect(relay({ ...welcome, roster: [rosterEntry] })).toBe('ok');
   });
 });
 
@@ -371,16 +419,36 @@ describe("pair_page's input from M4", () => {
 });
 
 describe("the adapter's stored records (ADRs 0011 and 0017)", () => {
-  it('read a grant as { role, inviteId?, endsAt? }, and an older bare role as a grant with neither', () => {
+  it('read a grant as { role, inviteId?, endsAt?, inviteRole? }, and an older bare role as a grant with none', () => {
     expect(StoredGrantSchema.parse('driver')).toEqual({ role: 'driver' });
     expect(StoredGrantSchema.parse({ role: 'observer' })).toEqual({ role: 'observer' });
-    const invited = { role: 'observer', inviteId: 'inv_1', endsAt: 86_400_000 };
+    const invited = {
+      role: 'observer',
+      inviteId: 'inv_1',
+      endsAt: 86_400_000,
+      inviteRole: 'observer',
+    };
     expect(StoredGrantSchema.parse(invited)).toEqual(invited);
+    // A control guest who joined as observer while the driver seats were full keeps
+    // the cap that lets the operator promote them later (ADR 0017).
+    const control = { ...invited, inviteRole: 'driver' };
+    expect(StoredGrantSchema.parse(control)).toEqual(control);
+    expect(StoredGrantSchema.parse({ ...control, role: 'driver' })).toEqual({
+      ...control,
+      role: 'driver',
+    });
     for (const bad of [
       'admin',
       { role: 'admin' },
       { role: 'driver', extra: 1 },
       { inviteId: 'x' },
+      // A watch guest is never a driver, whatever the stored role says.
+      { ...invited, role: 'driver' },
+      // An invite, its end and its cap come together or not at all.
+      { role: 'observer', inviteId: 'inv_1', endsAt: 86_400_000 },
+      { role: 'observer', inviteRole: 'observer' },
+      { role: 'observer', endsAt: 86_400_000, inviteRole: 'driver' },
+      { ...invited, inviteRole: 'admin' },
     ]) {
       expect(StoredGrantSchema.safeParse(bad).success, JSON.stringify(bad)).toBe(false);
     }

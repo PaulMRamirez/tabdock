@@ -25,3 +25,11 @@ From M4 the relay can run on a host rather than behind a tunnel. The owner chose
 ## Consequences
 
 S12's wording changes, and the owner accepts that knowingly with this record: a plaintext listener faces the platform's proxy, never the internet directly, and the threat model puts that proxy, like the tunnel before it, inside the relay's trust boundary. Pages on any machine can attach through the public URL, bounded by the origin list and the caps; 20 addresses can still hold every page slot, which costs availability, not memory. With a hostname of one's own, a later host move changes only DNS. Every deploy is a restart (ADR 0019). Whether an address header can be trusted is a property of the platform, so SPEC states it as a host requirement and the deploy guide shows how each documented host meets it.
+
+## Notes from the interface review (4 October 2026)
+
+`client-address.ts` exports `createClientAddresses(config, log)`, built once per relay, whose `of(request)` gives `{ ok: true, address, key }`, the address for log lines and the key that limits count by (an IPv4 address, or an IPv6 /56), or `{ ok: false, problem }` with `missing`, `repeated` or `malformed`. relay.ts answers 400 itself on `/page` and on the `/pair` routes, and `/i`'s once they exist, when `ok` is false, and never on `/mcp`, which only names the address in its refusal line. Until workstream C reads the header, every mode counts by the TCP peer, and a hosted relay says so once at start.
+
+A request in hosted mode whose TCP peer lies outside `TABDOCK_TRUSTED_PROXY_CIDR` counts as that peer: its header is ignored, so nothing it sends is believed, and the peer is logged. A range set too narrow then degrades to limits shared behind the proxy, with a log line naming the proxy's address, rather than refusing every page and sign-in; a client that reaches the port directly, which a qualifying host never allows, is counted as itself.
+
+The sign-in budget lives in `sign-in-gate.ts`, which C owns: `pair.ts` asks it once per code exchange with the address key relay.ts hands to `PairFlow.handle`, and it holds today's relay-wide 60 a minute and 8 in flight, to which C adds the per-address share, checked first. `/i` signs in through `/pair/login` and `/pair/callback`, so the one gate covers both routes.

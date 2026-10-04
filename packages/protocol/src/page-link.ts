@@ -147,13 +147,18 @@ export const InviteSecretHashSchema = z.string().regex(/^[0-9a-f]{64}$/);
 /** The operator's label for an invite: page-written text, capped and shown as written (S10). */
 export const InviteLabelSchema = z.string().min(1).max(MAX_INVITE_LABEL_CHARS);
 
-/** Why the relay refused to mint an invite. */
+/**
+ * Why the relay refused to mint an invite. expired: its expiresAt was less
+ * than MIN_INVITE_REMAINING_MS away on the relay's own clock, which says the
+ * page's clock runs behind (ADR 0017's notes).
+ */
 export const InviteRefusalReasonSchema = z.enum([
   'no_sponsor',
   'policy',
   'limit',
   'duplicate',
   'no_public_url',
+  'expired',
 ]);
 export type InviteRefusalReason = z.infer<typeof InviteRefusalReasonSchema>;
 
@@ -235,6 +240,18 @@ export const CallerSchema = UserSchema.extend({
 });
 export type Caller = z.infer<typeof CallerSchema>;
 
+/**
+ * ADR 0017: an account is an invitee exactly when its id is an invitee's, so
+ * the page can tell a caller's kind from its id alone (Caller carries none)
+ * and a frame that says otherwise is malformed.
+ */
+export function kindMatchesId(kind: UserKind, userId: string): boolean {
+  return (kind === 'invitee') === InviteeIdSchema.safeParse(userId).success;
+}
+const KIND_MATCHES_ID = {
+  message: "an invitee's id is g_ and its account key, and only an invitee's is",
+};
+
 export const AttachmentViewSchema = UserSchema.extend({
   kind: UserKindSchema,
   role: RoleSchema,
@@ -247,7 +264,11 @@ export const AttachmentViewSchema = UserSchema.extend({
   inviteId: IdSchema.nullable(),
   /** When an invite-made attachment ends whatever its use, at most 24 hours after redemption; null otherwise. */
   endsAt: EpochMsSchema.nullable(),
-});
+})
+  .refine((view) => kindMatchesId(view.kind, view.userId), KIND_MATCHES_ID)
+  .refine((view) => (view.inviteId === null) === (view.endsAt === null), {
+    message: 'an invite-made attachment has its end, and no other has one',
+  });
 export type AttachmentView = z.infer<typeof AttachmentViewSchema>;
 
 export const PairingSchema = z.object({
@@ -397,7 +418,8 @@ export const AttachRequestFrameSchema = z
   })
   .refine((frame) => (frame.via === 'invite') === (frame.invite !== undefined), {
     message: 'an invite request carries its invite, and no other request does',
-  });
+  })
+  .refine((frame) => kindMatchesId(frame.account.kind, frame.user.userId), KIND_MATCHES_ID);
 
 export const RosterFrameSchema = z.object({
   t: z.literal('roster'),

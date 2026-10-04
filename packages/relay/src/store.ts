@@ -16,6 +16,7 @@ import type {
   UserKind,
 } from '@tabdock/protocol';
 import type { UserAccount } from './auth.ts';
+import type { Logger } from './log.ts';
 
 export type { AuditOutcome } from '@tabdock/protocol';
 
@@ -62,6 +63,22 @@ export interface AttachmentRecord {
   inviteId: string | null;
   /** An invite-made attachment's hard end, at most 24 hours after redemption; null otherwise. */
   endsAt: number | null;
+  // An invite-made attachment outlives its invite's record, which goes once
+  // the invite is used up, cancelled or expired, so it keeps what its rules
+  // need (ADR 0017): the cap set_role cannot pass, the sponsor whose loss ends
+  // it, and what a revoke bars from the invite. All three are null for an
+  // attachment no invite made.
+  /** The invite's role, the most set_role may grant: a watch guest is never a driver. */
+  inviteRole: Role | null;
+  /** The member who sponsored the invite; when their attachment ends, so does this one. */
+  sponsorId: string | null;
+  /**
+   * SHA-256 of an invitee's verified email, hex, which a revoke bars from the
+   * invite beside the user id; null for a member, an unverified account, or
+   * an attachment no invite made. displayName is no stand-in: it may be cut
+   * or replaced by the short id.
+   */
+  emailHash: string | null;
 }
 
 export interface PairingTicketRecord {
@@ -100,6 +117,12 @@ export interface AttachRequestRecord {
   via: AttachVia;
   /** The invite being redeemed, exactly when via is invite; never its secret. */
   inviteId: string | null;
+  /**
+   * The access token's client_id (RFC 9068) of the request that raised this
+   * one, for the attach record an approval writes (ADR 0019); null for a dev
+   * token or a browser sign-in, which carry none.
+   */
+  oauthClientId: string | null;
   client: ClientInfo | null;
   /**
    * The same user's other clients whose pair_page joined this request, oldest
@@ -125,9 +148,17 @@ export interface InviteRecord {
   uses: number;
   usesLeft: number;
   createdAt: number;
-  /** As the page asked; null was "while the page is open". */
+  /**
+   * As the page asked, on the page's own clock; null was "while the page is
+   * open". The invites frame lists this, so the page sees its own terms back.
+   */
   requestedExpiresAt: number | null;
-  /** When it stops working: the page's own expiry, never past createdAt plus MAX_INVITE_LIFETIME_MS. */
+  /**
+   * When it stops working, on the relay's clock: the page's expiry, never
+   * past createdAt plus MAX_INVITE_LIFETIME_MS. An invite_create whose
+   * expiresAt is less than MIN_INVITE_REMAINING_MS past the relay's now is
+   * refused as expired rather than kept (ADR 0017's notes).
+   */
   expiresAt: number;
   /** SHA-256 of the secret, hex, as invite_create carried it; unique across the relay. */
   secretHash: string;
@@ -203,15 +234,26 @@ export interface InviteStore {
   deleteForPage(pageId: string): InviteRecord[];
 }
 
+/** What the persistent log adds to a record it wrote: its place in the log and the previous line's digest. */
+export interface AuditLineMeta {
+  seq: number;
+  /** SHA-256 of the previous line as written, hex; null only on the first line a log ever holds. */
+  prev: string | null;
+}
+
 /**
  * The audit log (S7, ADR 0019). append takes one record, stays synchronous
  * and never throws, so no call waits on a disk or fails for one. The memory
  * ring keeps the newest records; FileAuditLog (workstream C) also writes them
  * to disk, where only it adds the sequence number and chain link, and needs
  * close() after hub.shutdown(), whose failed calls it must still record.
+ * Callers append through recordAudit, which writes the stderr copy, so any
+ * AuditLog, a test's own included, keeps that off-host copy; a log writes to
+ * stderr itself only the records it makes on its own (audit_gap, checkpoints).
  */
 export interface AuditLog {
-  append(event: AuditEvent): void;
+  /** What the file line added, or null when no file took the record: the memory ring, or a disk that failed. */
+  append(event: AuditEvent): AuditLineMeta | null;
   /** The newest records, oldest first, as copies. */
   records(): AuditEvent[];
   close?(): Promise<void>;
@@ -227,6 +269,18 @@ export interface RelayStore {
   /** Live invites (ADR 0017). */
   invites: InviteStore;
   audit: AuditLog;
+}
+
+/**
+ * Appends a record and writes its stderr copy through the logger, whose
+ * redaction drops an invitee's email (ADR 0020), so the copy is the file's
+ * line less that: the same seq and prev when a file took it, the bare record
+ * when none did. The hub's records and relay.ts's (relay_start, relay_stop)
+ * all go through here.
+ */
+export function recordAudit(audit: AuditLog, log: Logger, event: AuditEvent): void {
+  const line = audit.append(event);
+  log.info(event.type, { audit: line === null ? event : { ...event, ...line } });
 }
 
 /** The call records among some audit records, for callers that look only at calls. */
@@ -477,11 +531,13 @@ export class MemoryAuditLog implements AuditLog {
     this.#capacity = capacity;
   }
 
-  append(event: AuditEvent): void {
+  append(event: AuditEvent): null {
     this.#ring.push(structuredClone(event));
     if (this.#ring.length > this.#capacity) {
       this.#ring.splice(0, this.#ring.length - this.#capacity);
     }
+    // No file line, so nothing to add to the stderr copy.
+    return null;
   }
 
   records(): AuditEvent[] {
