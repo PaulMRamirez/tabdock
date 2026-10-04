@@ -27,7 +27,8 @@
 // gets 403 everywhere but /healthz. Requests are logged by route, never by raw
 // path or query, so no secret a URL carries reaches a log, and a line a
 // signed-in client can cause at will on /mcp is written once per kind a window,
-// the rest counted (repeated-lines.ts, A4.3). The client address
+// the rest counted (repeated-lines.ts, A4.3), as is each /page upgrade refused,
+// within its address's budget (hub.ts). The client address
 // that /page and /pair count by, and that /mcp's refusal line names, comes
 // from one place (client-address.ts), which answers 400 on a route that counts
 // by address when a host edge names no client (ADR 0018). With an audit
@@ -478,6 +479,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     maxRequestBodySize: MAX_MCP_BODY_BYTES,
     log,
     lines: mcpLines,
+    windowMs: config.rateLimits.windowMs,
   });
   const listens = new ListenStreams({
     perUser: config.limits.sessionsPerUser,
@@ -579,6 +581,9 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     noServer: true,
     maxPayload: MAX_FRAME_BYTES,
     perMessageDeflate: false,
+    // The hub answers WebSocket pings itself, within what it holds for a page
+    // that is not reading; ws would queue a pong for every one (ADR 0024).
+    autoPong: false,
     handleProtocols: (protocols) => (protocols.has(SUBPROTOCOL) ? SUBPROTOCOL : false),
   });
 
@@ -740,14 +745,20 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     }
     // What the per-address page limits count by (S9): in hosted mode the client the edge names (ADR 0018).
     const client = addresses.of(request);
+    // Each refusal's line is written within its address's budget (ADR 0023's notes).
+    const lineKey = client.ok ? client.key : `(${client.problem})`;
     if (malformedHost(request)) {
-      log.info('page socket refused: malformed Host', { address: loggedAddress(client) });
+      hub.connectionLine(lineKey, 'info', 'page socket refused: malformed Host', {
+        address: loggedAddress(client),
+      });
       refuseUpgrade(socket, 400, 'Bad request');
       return;
     }
     // /page counts by address, so a client the edge did not name is a malformed request.
     if (!client.ok) {
-      log.info('page socket refused: no client address', { problem: client.problem });
+      hub.connectionLine(lineKey, 'info', 'page socket refused: no client address', {
+        problem: client.problem,
+      });
       refuseUpgrade(socket, 400, 'Bad request');
       return;
     }
@@ -758,7 +769,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       // which names the public host; the edge's own forwarding headers are
       // expected, and the client address above came from its one trusted header.
       if (!forPublicHost(request, config)) {
-        log.info('page socket refused: not the public host', { address });
+        hub.connectionLine(key, 'info', 'page socket refused: not the public host', { address });
         refuseUpgrade(socket, 403, 'Pages attach through the public URL only');
         return;
       }
@@ -767,12 +778,14 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       // address says nothing; the Host and proxy headers do. Without a host
       // edge pages attach only from this machine, and a relay without a public
       // URL never takes a proxied page (ADR 0022).
-      log.info('page socket refused: not made on this machine', { address });
+      hub.connectionLine(key, 'info', 'page socket refused: not made on this machine', {
+        address,
+      });
       refuseUpgrade(socket, 403, 'Pages attach only from the relay machine itself');
       return;
     }
     if (!offeredProtocols(request.headers['sec-websocket-protocol']).includes(SUBPROTOCOL)) {
-      log.info('page socket refused: subprotocol missing', { address });
+      hub.connectionLine(key, 'info', 'page socket refused: subprotocol missing', { address });
       refuseUpgrade(socket, 400, `The ${SUBPROTOCOL} subprotocol is required`);
       return;
     }
@@ -781,13 +794,13 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     let origin: string;
     if (header === undefined) {
       if (!config.allowMissingOrigin) {
-        log.info('page socket refused: no Origin header', { address });
+        hub.connectionLine(key, 'info', 'page socket refused: no Origin header', { address });
         refuseUpgrade(socket, 403, 'An Origin header is required');
         return;
       }
       origin = NO_ORIGIN;
     } else if (!config.isOriginAllowed(header)) {
-      log.info('page socket refused: origin not allowed', {
+      hub.connectionLine(key, 'info', 'page socket refused: origin not allowed', {
         address,
         origin: header.slice(0, 200),
       });

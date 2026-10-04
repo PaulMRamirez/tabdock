@@ -14,7 +14,9 @@
 // reached a page passes the refusal budget first (audit-budget.ts). A page
 // frame that changes nothing writes its lines only within a budget per socket
 // and per address, past which they are counted, and never closes the page
-// (ADR 0023).
+// (ADR 0023); the lines each page connection writes have a budget per address
+// too. What the hub sends a page that has stopped reading is held only up to
+// a bound, past which the socket is closed (ADR 0024).
 
 import {
   type AttachmentView,
@@ -404,6 +406,11 @@ interface Conn {
   toolsFrames: number[];
   /** When this socket's recent frames that changed nothing arrived, for ignoredFramesPerSocket. */
   ignoredFrames: number[];
+  /**
+   * Frames sent while the socket's queue was not empty, since it last was:
+   * an upper bound on the frames the page has left unread (#queueFor).
+   */
+  unread: number;
 }
 
 /**
@@ -518,6 +525,19 @@ const CLOSE_TRY_AGAIN_LATER = 1013;
 /** A newer socket resumed this page's session. */
 export const CLOSE_RESUMED_ELSEWHERE = CLOSE_REPLACED;
 const CLOSE_GRACE_MS = 2000;
+/**
+ * What the relay keeps queued for one page that has not read it: the bytes
+ * on its socket past what the kernel took, and the frames sent meanwhile
+ * (ADR 0024). A page that reads empties that queue as fast as the relay
+ * fills it, and one large frame always fits. /page takes no credential, and
+ * the relay answers pings, revokes, invite frames and rotate_pairing with
+ * frames of its own, so a socket that stopped reading while it sent them
+ * held every answer in memory: 80 to 140 MiB of heap for a million pings.
+ * Each small frame queued costs a few hundred bytes beside its own, so the
+ * frames are counted as well as the bytes.
+ */
+export const MAX_UNREAD_BYTES = 2 * MAX_FRAME_BYTES;
+export const MAX_UNREAD_FRAMES = 256;
 const MAX_ROSTER_CLIENTS = 20;
 /**
  * Each call moves its attachment's expiresAt, but the roster carrying it is
@@ -956,6 +976,12 @@ export class PageHub {
    * reconnects, then held back and counted (#ignored, ADR 0023).
    */
   readonly #ignoredLines: RepeatedLines;
+  /**
+   * Lines each page connection writes, per remote address: written in full
+   * up to connectionLinesPerAddress a window, then counted by message into
+   * one line for the address (#connectionLine, ADR 0023's notes).
+   */
+  readonly #connectionLines: RepeatedLines;
   /** The hub's own lines, which a frame's handler can hold until it is known whether it changed anything. */
   readonly #frameLog: FrameLog;
   /**
@@ -1000,6 +1026,7 @@ export class PageHub {
       toolsFramesPerAddress,
       toolsFramesWindowMs,
       ignoredFramesPerAddress,
+      connectionLinesPerAddress,
       redemptionsPerInvite,
       auditRefusalsPerUser,
       auditRefusalsForStrangers,
@@ -1017,6 +1044,18 @@ export class PageHub {
           ...(address === null ? { addresses: 'more than tracked' } : { address }),
           repeated: held.repeated,
           frames: held.reasons,
+        });
+      },
+    });
+    this.#connectionLines = new RepeatedLines({
+      linesPerKey: connectionLinesPerAddress,
+      windowMs,
+      maxKeys: MAX_ADDRESSES_HOLDING_LINES,
+      summary: (address, held) => {
+        log.warn('page connection lines went unlogged', {
+          ...(address === null ? { addresses: 'more than tracked' } : { address }),
+          repeated: held.repeated,
+          lines: held.reasons,
         });
       },
     });
@@ -1056,17 +1095,39 @@ export class PageHub {
   admitSocket(address: string): SocketRefusal | null {
     const { pageSocketsPerAddress, pageSessions } = this.#config.limits;
     if ((this.#socketsByAddress.get(address) ?? 0) >= pageSocketsPerAddress) {
-      this.#log.warn('page socket refused: too many from one address', { address });
+      this.connectionLine(address, 'warn', 'page socket refused: too many from one address', {
+        address,
+      });
       return { status: 429, message: 'Too many page sockets from this address' };
     }
     // Ending asleep pages frees no sockets, so open ones alone are refused outright.
     if (this.#conns.size >= pageSessions) {
-      this.#log.warn('page socket refused: the relay holds the most page sockets allowed', {
+      this.connectionLine(
         address,
-      });
+        'warn',
+        'page socket refused: the relay holds the most page sockets allowed',
+        { address },
+      );
       return { status: 503, message: 'The relay holds as many pages as it can; try again later' };
     }
     return null;
+  }
+
+  /**
+   * A line one page connection writes, from an upgrade relay.ts refuses to
+   * the page it made going: within connectionLinesPerAddress a window for
+   * its remote address, and past that counted, by message, into one line
+   * for the address when the window ends (ADR 0023's notes). /page needs no
+   * credential and each connection writes a few such lines, so without this
+   * a script wrote them as fast as it could connect, to the stderr copy that
+   * carries the audit checkpoints (ADR 0019). The address is the key the
+   * per-address limits count by; a request whose client the edge did not
+   * name is keyed by what was wrong. Never held with a frame's own lines.
+   */
+  connectionLine(address: string, level: LogLevel, message: string, fields: LogFields): void {
+    if (this.#connectionLines.take(address, message, undefined)) {
+      this.#frameLog.kept[level](message, fields);
+    }
   }
 
   /**
@@ -1083,25 +1144,36 @@ export class PageHub {
     if ((own?.pages.size ?? 0) >= pageSessionsPerAddress) {
       const oldest = firstOf(own?.asleep);
       if (oldest === undefined) {
-        this.#log.warn('page session refused: too many from one address', { address });
+        this.connectionLine(address, 'warn', 'page session refused: too many from one address', {
+          address,
+        });
         return 'too many pages from this address; try again later';
       }
-      this.#log.info("ended this address's page asleep longest to make room for its new one", {
-        pageId: oldest,
-      });
+      this.connectionLine(
+        address,
+        'info',
+        "ended this address's page asleep longest to make room for its new one",
+        { pageId: oldest },
+      );
       this.#gone(oldest);
     }
     if (this.#pageAddress.size >= pageSessions) {
       const oldest = firstOf(own?.asleep) ?? firstOf(this.#asleep);
       if (oldest === undefined) {
-        this.#log.warn('page session refused: the relay holds the most page sessions allowed', {
+        this.connectionLine(
           address,
-        });
+          'warn',
+          'page session refused: the relay holds the most page sessions allowed',
+          { address },
+        );
         return 'the relay holds as many pages as it can; try again later';
       }
-      this.#log.info('ended the page asleep longest to make room for a new one', {
-        pageId: oldest,
-      });
+      this.connectionLine(
+        address,
+        'info',
+        'ended the page asleep longest to make room for a new one',
+        { pageId: oldest },
+      );
       this.#gone(oldest);
     }
     return null;
@@ -1125,22 +1197,32 @@ export class PageHub {
       inflight: new Map(),
       toolsFrames: [],
       ignoredFrames: [],
+      unread: 0,
     };
     this.#conns.add(conn);
     this.#socketsByAddress.set(address, (this.#socketsByAddress.get(address) ?? 0) + 1);
     conn.helloTimer = setTimeout(() => {
-      this.#log.info('closing page socket: no hello in time', { origin, address });
+      this.connectionLine(address, 'info', 'closing page socket: no hello in time', {
+        origin,
+        address,
+      });
       this.#closeSocket(conn, CLOSE_POLICY, 'hello timeout');
     }, this.#config.timings.helloTimeoutMs);
     conn.helloTimer.unref();
     ws.on('message', (data, isBinary) => {
       this.#onMessage(conn, data, isBinary);
     });
+    // The WebSocket ping control frame, which relay.ts stops ws answering on its
+    // own: its pong is queued like any frame the relay sends, within the same bound.
+    ws.on('ping', (data) => {
+      if (conn.closing || ws.readyState !== ws.OPEN) return;
+      if (this.#queueFor(conn, data.length)) ws.pong(data);
+    });
     ws.on('close', (code) => {
       this.#onClose(conn, code);
     });
     ws.on('error', (error) => {
-      this.#log.warn('page socket error', { pageId: conn.pageId, error });
+      this.connectionLine(address, 'warn', 'page socket error', { pageId: conn.pageId, error });
     });
   }
 
@@ -1148,7 +1230,9 @@ export class PageHub {
     if (conn.closing) return;
     conn.idleTimer?.refresh();
     if (isBinary) {
-      this.#log.warn('closing page socket: binary frame', { pageId: conn.pageId });
+      this.connectionLine(conn.address, 'warn', 'closing page socket: binary frame', {
+        pageId: conn.pageId,
+      });
       this.#closeSocket(conn, CLOSE_POLICY, 'binary frames are not accepted');
       return;
     }
@@ -1158,9 +1242,12 @@ export class PageHub {
       const { pageId } = conn;
       // The first frame must be hello, whatever comes instead (ADR 0023).
       if (pageId === null) {
-        this.#log.warn('closing page socket: first frame was not hello', {
-          frameType: parsed.type,
-        });
+        this.connectionLine(
+          conn.address,
+          'warn',
+          'closing page socket: first frame was not hello',
+          { frameType: parsed.type },
+        );
         this.#closeSocket(conn, CLOSE_POLICY, 'first frame must be hello');
         return;
       }
@@ -1172,7 +1259,7 @@ export class PageHub {
       return;
     }
     if (parsed.kind === 'invalid') {
-      this.#log.warn('closing page socket: malformed frame', {
+      this.connectionLine(conn.address, 'warn', 'closing page socket: malformed frame', {
         pageId: conn.pageId,
         reason: parsed.reason,
       });
@@ -1185,14 +1272,19 @@ export class PageHub {
       if (frame.t === 'hello') {
         this.#hello(conn, frame);
       } else {
-        this.#log.warn('closing page socket: first frame was not hello', { frameType: frame.t });
+        this.connectionLine(
+          conn.address,
+          'warn',
+          'closing page socket: first frame was not hello',
+          { frameType: frame.t },
+        );
         this.#closeSocket(conn, CLOSE_POLICY, 'first frame must be hello');
       }
       return;
     }
     switch (frame.t) {
       case 'hello':
-        this.#log.warn('closing page socket: second hello', { pageId });
+        this.connectionLine(conn.address, 'warn', 'closing page socket: second hello', { pageId });
         this.#closeSocket(conn, CLOSE_POLICY, 'hello sent twice');
         return;
       case 'tools':
@@ -1586,7 +1678,7 @@ export class PageHub {
         // The token stays a secret even when it is refused; only the reason is
         // logged. A refused token's session is left as it was, still resumable
         // by its own page.
-        this.#log.warn('resume refused; starting a new page session', {
+        this.connectionLine(conn.address, 'warn', 'resume refused; starting a new page session', {
           origin: conn.origin,
           reason: refused,
         });
@@ -1678,7 +1770,11 @@ export class PageHub {
     this.#sendInvites(page.pageId);
     this.#rosterSentAt.set(page.pageId, now);
     this.#startHeartbeat(conn);
-    this.#log.info('page connected', { pageId: page.pageId, origin: page.origin, resumed });
+    this.connectionLine(conn.address, 'info', 'page connected', {
+      pageId: page.pageId,
+      origin: page.origin,
+      resumed,
+    });
   }
 
   #limits(): Limits {
@@ -1701,7 +1797,9 @@ export class PageHub {
     }, pingIntervalMs);
     conn.pingTimer.unref();
     conn.idleTimer = setTimeout(() => {
-      this.#log.info('closing silent page socket', { pageId: conn.pageId });
+      this.connectionLine(conn.address, 'info', 'closing silent page socket', {
+        pageId: conn.pageId,
+      });
       this.#closeSocket(conn, CLOSE_GOING_AWAY, 'idle timeout');
     }, idleTimeoutMs);
     conn.idleTimer.unref();
@@ -1721,15 +1819,19 @@ export class PageHub {
     const { toolsFramesPerSocket, toolsFramesWindowMs } = this.#config.rateLimits;
     conn.toolsFrames = conn.toolsFrames.filter((at) => at > now - toolsFramesWindowMs);
     if (conn.toolsFrames.length >= toolsFramesPerSocket) {
-      this.#log.warn('closing page socket: too many tools frames', { pageId: conn.pageId });
+      this.connectionLine(conn.address, 'warn', 'closing page socket: too many tools frames', {
+        pageId: conn.pageId,
+      });
       this.#closeSocket(conn, CLOSE_POLICY, 'too many tools frames');
       return false;
     }
     if (!this.#toolsFrameLimiter.allows(conn.address, now)) {
-      this.#log.warn('closing page socket: too many tools frames from its address', {
-        pageId: conn.pageId,
-        address: conn.address,
-      });
+      this.connectionLine(
+        conn.address,
+        'warn',
+        'closing page socket: too many tools frames from its address',
+        { pageId: conn.pageId, address: conn.address },
+      );
       this.#closeSocket(conn, CLOSE_POLICY, 'too many tools frames from this address');
       return false;
     }
@@ -1872,10 +1974,12 @@ export class PageHub {
     // dropped with it.
     const held = this.#toolBytes.get(pageId) ?? 0;
     if (this.#toolBytesHeld - held + charge > this.#config.limits.toolBytes) {
-      this.#log.warn('closing page socket: its tools would pass what all pages may hold', {
-        pageId,
-        address: conn.address,
-      });
+      this.connectionLine(
+        conn.address,
+        'warn',
+        'closing page socket: its tools would pass what all pages may hold',
+        { pageId, address: conn.address },
+      );
       this.#closeSocket(conn, CLOSE_POLICY, 'tools would pass the relay tool list budget');
       return;
     }
@@ -1935,15 +2039,15 @@ export class PageHub {
     this.#failPageCalls(pageId, conn, outcome);
     this.#live.delete(pageId);
     if (this.#closed) return;
-    this.#sleep(pageId);
+    this.#sleep(pageId, conn.address);
     // A deliberate detach will not come back, so skip the resume window.
     if (detached) {
-      this.#log.info('page detached', { pageId });
+      this.connectionLine(conn.address, 'info', 'page detached', { pageId });
       this.#gone(pageId);
     }
   }
 
-  #sleep(pageId: string): void {
+  #sleep(pageId: string, address: string): void {
     const page = this.#store.pages.get(pageId);
     if (!page) return;
     page.state = 'asleep';
@@ -1964,7 +2068,7 @@ export class PageHub {
     this.#setTimer(this.#lifecycleTimers, pageId, this.#config.timings.resumeWindowMs, () => {
       this.#gone(pageId);
     });
-    this.#log.info('page asleep', { pageId });
+    this.connectionLine(address, 'info', 'page asleep', { pageId });
   }
 
   #dropRequests(pageId: string): void {
@@ -2025,7 +2129,11 @@ export class PageHub {
       this.#clearTimer(this.#lifecycleTimers, oldest);
       this.#forget(oldest);
     }
-    this.#log.info('page gone', { pageId, attachmentsDeleted: attachments.length });
+    // Its creator's address, whichever socket it last had: the one that made the session.
+    this.connectionLine(creator ?? '(no address)', 'info', 'page gone', {
+      pageId,
+      attachmentsDeleted: attachments.length,
+    });
   }
 
   /** A gone page is dropped for good; its former users hear not_attached from then on. */
@@ -4146,7 +4254,38 @@ export class PageHub {
 
   #send(conn: Conn, frame: RelayFrame): void {
     if (conn.ws.readyState !== conn.ws.OPEN) return;
-    conn.ws.send(encodeFrame(frame));
+    const text = encodeFrame(frame);
+    if (this.#queueFor(conn, Buffer.byteLength(text, 'utf8'))) conn.ws.send(text);
+  }
+
+  /**
+   * Whether a frame of this many bytes may be queued for the page (ADR 0024).
+   * The socket's queue (bufferedAmount) holds only what the kernel has not
+   * taken yet, so it stays empty while the page reads; frames sent while it
+   * is not are counted until it empties again. Past MAX_UNREAD_FRAMES of
+   * them, or MAX_UNREAD_BYTES queued, the page is not reading what it asks
+   * for, and its socket is closed with 1008 and cut off after
+   * CLOSE_GRACE_MS, which frees what it held; the page sleeps and may
+   * resume like after any close.
+   */
+  #queueFor(conn: Conn, bytes: number): boolean {
+    const queued = conn.ws.bufferedAmount;
+    if (queued === 0) {
+      conn.unread = 0;
+      return true;
+    }
+    if (conn.unread < MAX_UNREAD_FRAMES && queued + bytes <= MAX_UNREAD_BYTES) {
+      conn.unread += 1;
+      return true;
+    }
+    this.connectionLine(conn.address, 'warn', 'closing page socket: the page is not reading', {
+      pageId: conn.pageId,
+      address: conn.address,
+      queuedBytes: queued,
+      queuedFrames: conn.unread,
+    });
+    this.#closeSocket(conn, CLOSE_POLICY, 'page is not reading');
+    return false;
   }
 
   #closeSocket(conn: Conn, code: number, reason: string, graceMs = CLOSE_GRACE_MS): void {
@@ -4237,5 +4376,7 @@ export class PageHub {
     }
     this.#liveCodes.clear();
     await Promise.all([...closing, checkerClosed]);
+    // Once every socket has closed, so the lines their closes counted go out too.
+    this.#connectionLines.flush();
   }
 }
