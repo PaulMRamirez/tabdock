@@ -505,9 +505,10 @@ export type ParsedFrame<F> =
  * JSON.parse as it was when this module loaded, which in the adapter's
  * bundle is before attach(): a page script that replaced JSON.parse later
  * would otherwise be handed every relay frame's text, a redemption's invite
- * secret with it. The schema check that follows still runs on the page's
- * built-ins (zod's regex checks call RegExp.prototype), so this narrows what
- * a later script can read rather than closing it (docs/threat-model.md, B5).
+ * secret with it. The checks that follow still run on the page's built-ins
+ * (Array.isArray is handed the parsed frame, here and in zod, and zod's
+ * regex checks call RegExp.prototype), so this narrows what a later script
+ * can read or change rather than closing it (docs/threat-model.md, B5).
  */
 const parseJson = JSON.parse;
 
@@ -550,6 +551,20 @@ export function parseRelayFrame(text: string): ParsedFrame<RelayFrame> {
   return parseWith(RelayFrameSchema, RELAY_FRAME_TYPES, text);
 }
 
+/**
+ * JSON.stringify as it was when this module loaded, for the same reason as
+ * parseJson: a page script that replaced JSON.stringify after attach() would
+ * otherwise be handed every frame the page sends, and could hand back other
+ * text, so that the operator's Deny left the page as Allow. It still looks up
+ * toJSON on every object in the frame, so a toJSON that such a script puts on
+ * Object.prototype is still called and can still read and rewrite each frame
+ * as it goes out. The adapter's schema check, which runs before this, hands
+ * each frame to page built-ins (Array.isArray among them) that such a script
+ * can patch to the same end; this narrows the routes rather than closing
+ * them (docs/threat-model.md, B5).
+ */
+const stringifyJson = JSON.stringify;
+
 export function encodeFrame(frame: PageFrameInput | RelayFrame): string {
-  return JSON.stringify(frame);
+  return stringifyJson(frame);
 }

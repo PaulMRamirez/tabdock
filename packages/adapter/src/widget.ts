@@ -16,20 +16,31 @@
 // nodes goes through functions dom.ts took at mount (qr.ts's too), so
 // patching a DOM prototype afterwards hands a script none of those nodes, and
 // so not the shadow root getRootNode() on one would give: the A4.3 review
-// found getBoundingClientRect doing that every second. WebCrypto, TextEncoder,
-// Uint8Array, the page link's socket and JSON.parse are taken likewise
-// (core.ts, index.ts, the protocol's parser), and so is the clipboard's
-// writeText (here). That narrows the routes; it is no boundary. The widget's
-// own bookkeeping (the Maps, Sets and arrays that hold its nodes) and the text
-// it shows still pass through the page's JavaScript built-ins, so a later
-// script that patches one of those, or a string method the QR encoder calls,
-// can still reach the nodes, rewrite the panel, or read what it shows, an
-// invite link included. Nor does any of it stop a later script misleading the
-// operator without touching the widget at all: its own element drawn over the
-// panel can label Allow as Deny, and the operator's real click, trusted and
-// on a box that held still, then allows. The trusted-page rule (SPEC.md
-// section 2) covers all of this, since such a script can run the page's
-// tools itself; docs/threat-model.md (B5) records it.
+// found getBoundingClientRect doing that every second. The hold-still wait
+// (ARM_DELAY_MS) runs on the window's timers and reads boxes through
+// DOMRect's getters, both taken at mount too (here and in dom.ts), so
+// patching those afterwards arms no box early and keeps no moved box armed.
+// WebCrypto, TextEncoder, Uint8Array, the page link's socket, JSON.parse and
+// JSON.stringify are taken likewise (core.ts, index.ts, the protocol's
+// page-link.ts), and so is the clipboard's writeText (here). That narrows the
+// routes; it is no boundary. The routes known to stay open follow, and they
+// may not be all. The widget's own bookkeeping (the Maps, Sets and arrays
+// that hold its nodes and boxes) and the text it shows still pass through
+// the page's JavaScript built-ins, so a later script that patches one of
+// those, or a string method the QR encoder calls, can still reach the nodes,
+// rewrite the panel, read what it shows (an invite link included), or arm a
+// box the moment it appears. The tab's visibility is read from the page's
+// document, so such a script can also keep the tab coming back into view
+// from restarting the wait. The operator's answer leaves in a frame that
+// still passes through the page's built-ins on its way out (the schema
+// check's, and any toJSON the script defines; see index.ts), so a real click
+// on Deny can leave the page as Allow. Nor does any of it stop a later script
+// misleading the operator without touching the widget at all: its own
+// element drawn over the panel can label Allow as Deny, and the operator's
+// real click, trusted and on a box that held still, then allows. The
+// trusted-page rule (SPEC.md section 2) covers all of this, since such a
+// script can run the page's tools itself; docs/threat-model.md (B5) records
+// it.
 // Buttons carry stable data-action attributes for browser tests.
 
 import {
@@ -57,8 +68,9 @@ import type {
   PendingConfirm,
   PendingRequest,
 } from './core.ts';
-import { type Dom, takeDom } from './dom.ts';
+import { type BoxRect, takeDom } from './dom.ts';
 import { createQrView, inviteQrUrl, QR_SIDE_PX } from './qr.ts';
+import { apply, taken } from './taken.ts';
 
 /** A valid custom element name needs no registration to host a shadow root, so nothing is defined globally. */
 const HOST_TAG = 'tabdock-dock';
@@ -206,13 +218,6 @@ li { padding: 2px 0; }
 }
 `;
 
-interface BoxRect {
-  readonly top: number;
-  readonly left: number;
-  readonly width: number;
-  readonly height: number;
-}
-
 /** A box whose buttons take a click only once it has held still; see ARM_DELAY_MS. */
 interface ArmedBox {
   readonly element: HTMLElement;
@@ -221,7 +226,7 @@ interface ArmedBox {
   /** Where the box was when it appeared or last moved; null until first measured. */
   rect: BoxRect | null;
   armed: boolean;
-  timer: ReturnType<typeof setTimeout> | undefined;
+  timer: number | undefined;
 }
 
 interface PromptView extends ArmedBox {
@@ -268,11 +273,6 @@ interface InviteRowView {
   readonly title: HTMLElement;
   readonly detail: HTMLElement;
   view: InviteView;
-}
-
-function measure(dom: Dom, box: HTMLElement): BoxRect {
-  const { top, left, width, height } = dom.rect(box);
-  return { top, left, width, height };
 }
 
 function sameRect(a: BoxRect | null, b: BoxRect): boolean {
@@ -401,10 +401,44 @@ function clipboardWriter(doc: Document): ((text: string) => Promise<void>) | nul
     : null;
 }
 
+/** The window's timers as the widget mounted; see takeTimers. */
+interface WidgetTimers {
+  after(run: () => void, ms: number): number;
+  cancel(id: number | undefined): void;
+  every(run: () => void, ms: number): number;
+  stop(id: number): void;
+}
+
+/**
+ * The window's timers, taken when the widget mounts and called through the
+ * Reflect.apply taken.ts took. The hold-still wait (ARM_DELAY_MS) runs on
+ * them, so a page script that ran after attach() and swapped setTimeout for
+ * one that fires at once, or clearTimeout for one that cancels nothing, would
+ * otherwise arm a box before it had held still.
+ */
+function takeTimers(doc: Document): WidgetTimers {
+  const scope: object = doc.defaultView ?? globalThis;
+  const setTimer = taken(scope, 'setTimeout', 'value');
+  const clearTimer = taken(scope, 'clearTimeout', 'value');
+  const setRepeat = taken(scope, 'setInterval', 'value');
+  const clearRepeat = taken(scope, 'clearInterval', 'value');
+  return Object.freeze({
+    after: (run: () => void, ms: number) => apply(setTimer, scope, [run, ms]) as number,
+    cancel: (id: number | undefined) => {
+      apply(clearTimer, scope, [id]);
+    },
+    every: (run: () => void, ms: number) => apply(setRepeat, scope, [run, ms]) as number,
+    stop: (id: number) => {
+      apply(clearRepeat, scope, [id]);
+    },
+  });
+}
+
 /** Mounts the widget for one Dock and returns a function that removes it. */
 export function mountWidget(dock: Dock, doc: Document = document): () => void {
   // Before anything else, and inside attach(): every DOM call on the widget's nodes from here goes through it.
   const dom = takeDom(doc);
+  const timers = takeTimers(doc);
   const host = doc.createElement(HOST_TAG);
   const root = host.attachShadow({ mode: 'closed' });
   const writeClipboard = clipboardWriter(doc);
@@ -456,12 +490,12 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
 
   /** Records where the box is now and disarms it until it has stayed there for ARM_DELAY_MS. */
   function restartArming(box: ArmedBox): void {
-    clearTimeout(box.timer);
-    box.rect = measure(dom, box.element);
+    timers.cancel(box.timer);
+    box.rect = dom.rect(box.element);
     setArmed(box, false);
-    box.timer = setTimeout(() => {
+    box.timer = timers.after(() => {
       // A move nobody noticed in between starts the wait again.
-      if (sameRect(box.rect, measure(dom, box.element))) setArmed(box, true);
+      if (sameRect(box.rect, dom.rect(box.element))) setArmed(box, true);
       else restartArming(box);
     }, ARM_DELAY_MS);
   }
@@ -469,7 +503,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   /** Restarts the wait of every box that is new or no longer where it was. */
   function checkMoves(): void {
     for (const box of boxes) {
-      if (!sameRect(box.rect, measure(dom, box.element))) restartArming(box);
+      if (!sameRect(box.rect, dom.rect(box.element))) restartArming(box);
     }
   }
 
@@ -478,7 +512,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   }
 
   function dropBox(box: ArmedBox): void {
-    clearTimeout(box.timer);
+    timers.cancel(box.timer);
     dom.remove(box.element);
     boxes.delete(box);
   }
@@ -496,7 +530,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       action,
       () => {
         // Checked again here, as a shift may land between the last check and the click.
-        if (!box.armed || !sameRect(box.rect, measure(dom, box.element))) {
+        if (!box.armed || !sameRect(box.rect, dom.rect(box.element))) {
           restartArming(box);
           return;
         }
@@ -1413,7 +1447,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
 
   let mounted = true;
   const unsubscribe = dock.on('state', render);
-  const interval = setInterval(tick, 1000);
+  const interval = timers.every(tick, 1000);
   doc.addEventListener('visibilitychange', onVisibility);
   win?.addEventListener('focus', rearmAll);
 
@@ -1421,10 +1455,10 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     if (!mounted) return;
     mounted = false;
     unsubscribe();
-    clearInterval(interval);
+    timers.stop(interval);
     doc.removeEventListener('visibilitychange', onVisibility);
     win?.removeEventListener('focus', rearmAll);
-    for (const box of boxes) clearTimeout(box.timer);
+    for (const box of boxes) timers.cancel(box.timer);
     hideLink();
     dom.remove(host);
   }

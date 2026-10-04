@@ -709,10 +709,6 @@ const encoder = new TextEncoder();
 const encodeUtf8 = encoder.encode.bind(encoder);
 const ByteArray = Uint8Array;
 
-function byteLength(text: string): number {
-  return encodeUtf8(text).length;
-}
-
 /**
  * The 64 digits as an array, indexed directly: a string's charAt, or any
  * other method on String.prototype, is the page's, and a script that patched
@@ -738,6 +734,15 @@ const typedArrayLength = (() => {
   if (getter === undefined) throw new TypeError('no typed array length getter');
   return (bytes: Uint8Array): number => apply(getter, bytes, []) as number;
 })();
+
+/**
+ * Through the taken length getter too: every frame the page sends is counted
+ * here first, so a length getter a later script put on Uint8Array.prototype
+ * would otherwise be handed each one's bytes.
+ */
+function byteLength(text: string): number {
+  return typedArrayLength(encodeUtf8(text));
+}
 
 /** Unpadded base64url, as the relay's Buffer.toString('base64url') writes it: 16 bytes make 22 characters. */
 export function base64url(bytes: Uint8Array): string {

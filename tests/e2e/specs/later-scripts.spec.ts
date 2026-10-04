@@ -17,21 +17,28 @@ import {
   demoPageUrl,
   typeInWidget,
   waitForDock,
+  widgetButtonCentre,
+  widgetButtonNow,
   widgetVisible,
 } from '../src/tabdock-harness.ts';
 
-// What a page script that runs after attach() can catch by patching the
-// browser's built-ins (threat model B5, S4, S11 and S14), against a scripted
-// relay. The adapter drives its page link through functions it took by the
-// time attach() returned, so patching WebSocket.prototype, MessageEvent's
-// data getter or JSON.parse afterwards, even before a reconnect makes a new
-// socket, hands such a script no relay frame and so no invite secret
-// (packages/adapter/test/later-scripts.test.ts covers minting). The widget
-// makes its DOM calls the same way, so patching a DOM prototype afterwards
-// hands it none of the widget's nodes, and so never the closed shadow root
-// that getRootNode() on one would return. What stays open (the page's
-// JavaScript built-ins, and covering the widget with a look-alike) is the
-// trusted page's, as docs/threat-model.md says.
+// What a page script that runs after attach() can catch or change by
+// patching the browser's built-ins (threat model B5, S4, S11 and S14),
+// against a scripted relay. The adapter drives its page link through
+// functions it took by the time attach() returned, so patching
+// WebSocket.prototype, MessageEvent's data getter or JSON.parse afterwards,
+// even before a reconnect makes a new socket, hands such a script no relay
+// frame and so no invite secret (packages/adapter/test/later-scripts.test.ts
+// covers minting); patching JSON.stringify or the typed array length getter
+// hands it no frame the page sends, so it cannot turn the operator's Deny
+// into Allow there. The widget makes its DOM calls the same way, so patching
+// a DOM prototype afterwards hands it none of the widget's nodes, and so
+// never the closed shadow root that getRootNode() on one would return; and
+// it times and measures its boxes the same way, so patching setTimeout,
+// clearTimeout or DOMRect's getters afterwards arms no box early and keeps
+// no moved box armed. What stays open (the page's other JavaScript built-ins, any toJSON,
+// and covering the widget with a look-alike) is the trusted page's, as
+// docs/threat-model.md says.
 
 /** Never dialled: routeWebSocket answers in its place. */
 const FAKE_RELAY = 'ws://127.0.0.1:9/page';
@@ -40,6 +47,10 @@ const SECRET = 'LaterScriptProbe_0123x';
 const GUEST = `g_${'1a2b3c4d'.repeat(4)}`;
 const LINK_BASE = 'https://relay.example/i';
 const BOB = { userId: 'bob', displayName: 'Bob' };
+/** The widget's ARM_DELAY_MS. */
+const ARM_DELAY_MS = 500;
+/** How often the widget's tick looks for boxes that moved. */
+const TICK_MS = 1000;
 
 test.use({ viewport: { width: 1280, height: 1200 } });
 
@@ -136,6 +147,40 @@ async function openWithFakeRelay(page: Page): Promise<FakeRelay> {
   };
 }
 
+/**
+ * Stops the page's timers; only runFor moves them on from here. pauseAt takes
+ * a time in the page's future, and the page's clock runs on while this asks
+ * for it, so a loaded machine may need another try.
+ */
+async function pauseClock(page: Page): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    const now = await page.evaluate(() => Date.now());
+    try {
+      await page.clock.pauseAt(now + 250);
+      return;
+    } catch (error) {
+      if (attempt === 5 || !String(error).includes('to the past')) throw error;
+    }
+  }
+}
+
+/** A member's attach request by code, as the relay forwards it. */
+function attachRequest(requestId: string): RelayFrame {
+  return {
+    t: 'attach_request',
+    requestId,
+    user: { userId: 'mallory', displayName: 'Mallory' },
+    account: { kind: 'member', verified: true },
+    via: 'code',
+    client: null,
+    expiresAt: Date.now() + ATTACH_REQUEST_TTL_MS,
+  };
+}
+
+function decisions(relay: FakeRelay) {
+  return relay.frames.filter((frame) => frame.t === 'attach_decision');
+}
+
 declare global {
   interface Window {
     /** Every string the later script's patches were handed, in order. */
@@ -150,8 +195,11 @@ test('a script that patches the socket, MessageEvent and JSON.parse after attach
 }) => {
   const relay = await openWithFakeRelay(page);
 
-  // A script that runs after attach(): it patches everything a page link's
-  // frames could pass through on their way in or out.
+  // A script that runs after attach(): it patches the socket, the events it
+  // fires and JSON.parse, which a relay frame's text passes through on its
+  // way in, and the socket's send, which a page frame's text leaves through.
+  // A later test patches JSON.stringify and the typed array length getter,
+  // which a page frame's text passes through before that.
   await page.evaluate(() => {
     const seen: string[] = [];
     window.__laterSeen = seen;
@@ -447,4 +495,193 @@ test('a script that patches the DOM prototypes after attach() is handed no node 
   expect(control).toEqual(
     expect.arrayContaining(['Element.getBoundingClientRect', 'Node.textContent']),
   );
+});
+
+test("a script that patches JSON.stringify and the typed array length after attach() sees no frame the page sends, and the operator's Deny goes out as Deny", async ({
+  page,
+}) => {
+  const relay = await openWithFakeRelay(page);
+
+  // A script that runs after attach() and wants in: it records each frame the
+  // page sends, through JSON.stringify and through the length getter a
+  // frame's bytes are counted with, and hands back every answer as an Allow
+  // as driver.
+  await page.evaluate(() => {
+    const seen: string[] = [];
+    window.__laterSeen = seen;
+    const isFrame = (text: string): boolean => text.startsWith('{"t":');
+    const stringify = JSON.stringify;
+    const parse = JSON.parse;
+    Reflect.defineProperty(JSON, 'stringify', {
+      configurable: true,
+      writable: true,
+      value: function (...args: unknown[]): unknown {
+        const text: unknown = Reflect.apply(stringify, JSON, args);
+        if (typeof text !== 'string' || !isFrame(text)) return text;
+        seen.push(text);
+        const frame = parse(text) as Record<string, unknown>;
+        return frame.t === 'attach_decision'
+          ? Reflect.apply(stringify, JSON, [{ ...frame, allow: true, role: 'driver' }])
+          : text;
+      },
+    });
+    const typedArrayPrototype = Reflect.getPrototypeOf(Uint8Array.prototype) as object;
+    const lengthGetter: unknown = Reflect.getOwnPropertyDescriptor(
+      typedArrayPrototype,
+      'length',
+    )?.get;
+    if (typeof lengthGetter !== 'function') throw new Error('no typed array length getter');
+    const decoder = new TextDecoder();
+    let busy = false;
+    Reflect.defineProperty(Uint8Array.prototype, 'length', {
+      configurable: true,
+      get(this: Uint8Array): unknown {
+        const length: unknown = Reflect.apply(lengthGetter, this, []);
+        if (!busy) {
+          busy = true;
+          try {
+            const text = decoder.decode(this);
+            if (isFrame(text)) seen.push(text);
+          } catch {
+            // Bytes a decoder refuses, such as a shared buffer's, are no frame.
+          } finally {
+            busy = false;
+          }
+        }
+        return length;
+      },
+    });
+  });
+
+  relay.send(attachRequest('req-1'));
+  // The operator's real click on the real, uncovered Deny.
+  await clickInWidget(page, { action: 'deny', requestId: 'req-1' });
+  await expect
+    .poll(() => decisions(relay))
+    .toEqual([{ t: 'attach_decision', requestId: 'req-1', allow: false }]);
+  expect(await page.evaluate(() => window.__laterSeen ?? [])).toEqual([]);
+});
+
+test('a script that swaps setTimeout after attach() arms no box before it has held still', async ({
+  page,
+}) => {
+  await page.clock.install();
+  const relay = await openWithFakeRelay(page);
+  await pauseClock(page);
+
+  // A script that runs after attach(): any wait as long as the widget's fires at once.
+  await page.evaluate((delay) => {
+    const setTimer: unknown = Reflect.get(window, 'setTimeout');
+    if (typeof setTimer !== 'function') throw new Error('no setTimeout');
+    Reflect.defineProperty(window, 'setTimeout', {
+      configurable: true,
+      writable: true,
+      value: function (...args: unknown[]): unknown {
+        const [run, ms, ...rest] = args;
+        return Reflect.apply(setTimer, window, [run, ms === delay ? 0 : ms, ...rest]);
+      },
+    });
+  }, ARM_DELAY_MS);
+
+  relay.send(attachRequest('req-1'));
+  await waitForDock(page, (state) => state.pendingRequests.length === 1);
+  const target = { action: 'approve-driver', requestId: 'req-1' };
+  await page.clock.runFor(ARM_DELAY_MS - 100);
+  const shown = await widgetButtonNow(page, target);
+  expect(shown?.armed).toBe(false);
+
+  // A click on it before then lands nowhere, and starts the wait again.
+  await page.mouse.click(shown?.x ?? 0, shown?.y ?? 0);
+  await page.clock.runFor(ARM_DELAY_MS - 100);
+  expect((await widgetButtonNow(page, target))?.armed).toBe(false);
+  await page.clock.runFor(100);
+  expect((await widgetButtonNow(page, target))?.armed).toBe(true);
+  expect(decisions(relay)).toEqual([]);
+
+  await page.mouse.click(shown?.x ?? 0, shown?.y ?? 0);
+  await expect
+    .poll(() => decisions(relay))
+    .toEqual([{ t: 'attach_decision', requestId: 'req-1', allow: true, role: 'driver' }]);
+});
+
+test('a script that swaps clearTimeout after attach() arms no box before it has held still since the click that restarted its wait', async ({
+  page,
+}) => {
+  await page.clock.install();
+  const relay = await openWithFakeRelay(page);
+  await pauseClock(page);
+
+  // A script that runs after attach(): clearing a timer cancels nothing, so
+  // the wait a click restarts would still end when the first one was due.
+  await page.evaluate(() => {
+    Reflect.defineProperty(window, 'clearTimeout', {
+      configurable: true,
+      writable: true,
+      value: function (): void {
+        // Cancels nothing.
+      },
+    });
+  });
+
+  relay.send(attachRequest('req-1'));
+  await waitForDock(page, (state) => state.pendingRequests.length === 1);
+  const target = { action: 'approve-driver', requestId: 'req-1' };
+  await page.clock.runFor(ARM_DELAY_MS - 100);
+  const shown = await widgetButtonNow(page, target);
+  expect(shown?.armed).toBe(false);
+
+  // A click on it before then lands nowhere and starts the wait again; the
+  // first wait, had it not been cancelled, would end 100 ms from here.
+  await page.mouse.click(shown?.x ?? 0, shown?.y ?? 0);
+  await page.clock.runFor(150);
+  expect((await widgetButtonNow(page, target))?.armed).toBe(false);
+  await page.clock.runFor(ARM_DELAY_MS - 100 - 150);
+  expect((await widgetButtonNow(page, target))?.armed).toBe(false);
+  expect(decisions(relay)).toEqual([]);
+  await page.clock.runFor(100);
+  expect((await widgetButtonNow(page, target))?.armed).toBe(true);
+  expect(decisions(relay)).toEqual([]);
+
+  await page.mouse.click(shown?.x ?? 0, shown?.y ?? 0);
+  await expect
+    .poll(() => decisions(relay))
+    .toEqual([{ t: 'attach_decision', requestId: 'req-1', allow: true, role: 'driver' }]);
+});
+
+test("a script that patches DOMRect's getters after attach() keeps no box that moved armed", async ({
+  page,
+}) => {
+  await page.clock.install();
+  const relay = await openWithFakeRelay(page);
+  relay.send(attachRequest('req-1'));
+  const target = { action: 'approve-driver', requestId: 'req-1' };
+  const before = await widgetButtonCentre(page, target);
+  await pauseClock(page);
+
+  // A script that runs after attach(): every rectangle answers the same place.
+  await page.evaluate(() => {
+    for (const proto of [DOMRectReadOnly.prototype, DOMRect.prototype]) {
+      for (const key of ['x', 'y', 'top', 'left', 'right', 'bottom', 'width', 'height']) {
+        if (!Reflect.getOwnPropertyDescriptor(proto, key)) continue;
+        Reflect.defineProperty(proto, key, { configurable: true, get: () => 0 });
+      }
+    }
+  });
+  // Long enough for a tick to see the rectangles' new answer, and for a box
+  // that waited again because of it to arm.
+  await page.clock.runFor(TICK_MS + ARM_DELAY_MS);
+
+  // A shorter window moves the bottom-pinned panel up; nothing renders, and no tick runs.
+  await page.setViewportSize({ width: 1280, height: 1000 });
+  const moved = await widgetButtonNow(page, target);
+  expect(moved?.y ?? before.y).toBeLessThan(before.y);
+  await page.mouse.click(moved?.x ?? 0, moved?.y ?? 0);
+  expect((await widgetButtonNow(page, target))?.armed).toBe(false);
+  await page.clock.runFor(ARM_DELAY_MS);
+  expect(decisions(relay)).toEqual([]);
+
+  await page.mouse.click(moved?.x ?? 0, moved?.y ?? 0);
+  await expect
+    .poll(() => decisions(relay))
+    .toEqual([{ t: 'attach_decision', requestId: 'req-1', allow: true, role: 'driver' }]);
 });
