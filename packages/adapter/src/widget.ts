@@ -1,26 +1,35 @@
 // The operator's widget (SPEC.md section 8), kept thin: a badge and a panel in
-// a closed shadow root. Scripts that run after attach(), and other frames,
-// cannot reach into it for the pairing code or an invite link, or reach the
-// buttons inside it. A page script that runs before attach() could (by
-// patching attachShadow, say), which is acceptable because the page itself is
-// trusted (SPEC.md section 1). As defence in depth, buttons ignore events
-// whose isTrusted is false, so a script that does reach one still cannot press
-// Allow. Everything shown comes from the Dock handle, every relay- or
-// page-supplied string goes in through textContent (the pairing URL only as a
-// QR drawing built with DOM calls; see qr.ts), nothing goes through an HTML
-// parser, and nothing lands on window.
+// a closed shadow root, which other frames, and page script going through the
+// DOM's own ways in, cannot open. A page script that runs before attach()
+// could (by patching attachShadow, say), which is acceptable because the page
+// itself is trusted (SPEC.md section 2). Buttons ignore events whose isTrusted
+// is false, so page script cannot press Allow by dispatching a click.
+// Everything shown comes from the Dock handle, every relay- or page-supplied
+// string goes in as text (the pairing URL only as a QR drawing built with DOM
+// calls; see qr.ts), nothing goes through an HTML parser, and nothing lands on
+// window.
 // From M4 the panel also mints invites (ADR 0017): an invite link shows once,
 // as a QR drawing and as text to send, and only until the operator is done
-// with it or the invite ends; the adapter keeps no copy of its secret. Against
-// scripts that run later, the boundary is what the adapter has taken once by
-// the time attach() returns: WebCrypto's two functions, TextEncoder's encode
-// and the Uint8Array constructor (core.ts), the WebSocket constructor
-// (index.ts) and the clipboard's writeText (here), so replacing any of them
-// afterwards neither predicts a secret nor catches one on its way to the
-// relay's hash or the clipboard. The built-ins the panel draws with stay the
-// page's: a later script that patches a DOM text setter, or a string method
-// the QR encoder calls, can still read what the panel shows, as a script that
-// ran first could, and the trusted page answers for both.
+// with it or the invite ends; the adapter keeps no copy of its secret.
+// Against scripts that run after attach(), what holds is what the adapter
+// took by the time attach() returned. Every DOM call the widget makes on its
+// nodes goes through functions dom.ts took at mount (qr.ts's too), so
+// patching a DOM prototype afterwards hands a script none of those nodes, and
+// so not the shadow root getRootNode() on one would give: the A4.3 review
+// found getBoundingClientRect doing that every second. WebCrypto, TextEncoder,
+// Uint8Array, the page link's socket and JSON.parse are taken likewise
+// (core.ts, index.ts, the protocol's parser), and so is the clipboard's
+// writeText (here). That narrows the routes; it is no boundary. The widget's
+// own bookkeeping (the Maps, Sets and arrays that hold its nodes) and the text
+// it shows still pass through the page's JavaScript built-ins, so a later
+// script that patches one of those, or a string method the QR encoder calls,
+// can still reach the nodes, rewrite the panel, or read what it shows, an
+// invite link included. Nor does any of it stop a later script misleading the
+// operator without touching the widget at all: its own element drawn over the
+// panel can label Allow as Deny, and the operator's real click, trusted and
+// on a box that held still, then allows. The trusted-page rule (SPEC.md
+// section 2) covers all of this, since such a script can run the page's
+// tools itself; docs/threat-model.md (B5) records it.
 // Buttons carry stable data-action attributes for browser tests.
 
 import {
@@ -48,6 +57,7 @@ import type {
   PendingConfirm,
   PendingRequest,
 } from './core.ts';
+import { type Dom, takeDom } from './dom.ts';
 import { createQrView, inviteQrUrl, QR_SIDE_PX } from './qr.ts';
 
 /** A valid custom element name needs no registration to host a shadow root, so nothing is defined globally. */
@@ -206,6 +216,8 @@ interface BoxRect {
 /** A box whose buttons take a click only once it has held still; see ARM_DELAY_MS. */
 interface ArmedBox {
   readonly element: HTMLElement;
+  /** Its buttons, kept here rather than looked up in the tree. */
+  readonly buttons: HTMLButtonElement[];
   /** Where the box was when it appeared or last moved; null until first measured. */
   rect: BoxRect | null;
   armed: boolean;
@@ -258,8 +270,8 @@ interface InviteRowView {
   view: InviteView;
 }
 
-function measure(box: HTMLElement): BoxRect {
-  const { top, left, width, height } = box.getBoundingClientRect();
+function measure(dom: Dom, box: HTMLElement): BoxRect {
+  const { top, left, width, height } = dom.rect(box);
   return { top, left, width, height };
 }
 
@@ -271,6 +283,11 @@ function sameRect(a: BoxRect | null, b: BoxRect): boolean {
     a.width === b.width &&
     a.height === b.height
   );
+}
+
+/** Whether two lists hold the same nodes in the same order. */
+function sameNodes(a: readonly Node[], b: readonly Node[]): boolean {
+  return a.length === b.length && a.every((node, i) => node === b[i]);
 }
 
 function secondsLeft(expiresAt: number): number {
@@ -386,6 +403,8 @@ function clipboardWriter(doc: Document): ((text: string) => Promise<void>) | nul
 
 /** Mounts the widget for one Dock and returns a function that removes it. */
 export function mountWidget(dock: Dock, doc: Document = document): () => void {
+  // Before anything else, and inside attach(): every DOM call on the widget's nodes from here goes through it.
+  const dom = takeDom(doc);
   const host = doc.createElement(HOST_TAG);
   const root = host.attachShadow({ mode: 'closed' });
   const writeClipboard = clipboardWriter(doc);
@@ -395,9 +414,9 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     className = '',
     text = '',
   ): HTMLElementTagNameMap[K] {
-    const node = doc.createElement(tag);
-    if (className) node.className = className;
-    if (text) node.textContent = text;
+    const node = dom.create(tag);
+    if (className) dom.attr(node, 'class', className);
+    if (text) dom.setText(node, text);
     return node;
   }
 
@@ -410,9 +429,9 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
 
   function button(label: string, action: string, onClick: () => void, primary = false) {
     const node = element('button', primary ? 'action primary' : 'action', label);
-    node.type = 'button';
-    node.dataset.action = action;
-    node.addEventListener('click', (event) => {
+    dom.attr(node, 'type', 'button');
+    dom.attr(node, 'data-action', action);
+    dom.listen(node, 'click', (event) => {
       // Page script can dispatch a click, but never a trusted one.
       if (!event.isTrusted) return;
       onClick();
@@ -423,26 +442,26 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   /** The "invited" badge; empty, and so not shown, for anyone else. */
   function badge(show: boolean): HTMLElement {
     const node = element('span', 'invited', show ? 'invited' : '');
-    node.dataset.role = 'invited';
+    dom.attr(node, 'data-role', 'invited');
     return node;
   }
 
   function setArmed(box: ArmedBox, value: boolean): void {
     box.armed = value;
-    for (const node of box.element.querySelectorAll('button')) {
-      node.dataset.armed = String(value);
-      node.setAttribute('aria-disabled', String(!value));
+    for (const node of box.buttons) {
+      dom.attr(node, 'data-armed', String(value));
+      dom.attr(node, 'aria-disabled', String(!value));
     }
   }
 
   /** Records where the box is now and disarms it until it has stayed there for ARM_DELAY_MS. */
   function restartArming(box: ArmedBox): void {
     clearTimeout(box.timer);
-    box.rect = measure(box.element);
+    box.rect = measure(dom, box.element);
     setArmed(box, false);
     box.timer = setTimeout(() => {
       // A move nobody noticed in between starts the wait again.
-      if (sameRect(box.rect, measure(box.element))) setArmed(box, true);
+      if (sameRect(box.rect, measure(dom, box.element))) setArmed(box, true);
       else restartArming(box);
     }, ARM_DELAY_MS);
   }
@@ -450,17 +469,17 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   /** Restarts the wait of every box that is new or no longer where it was. */
   function checkMoves(): void {
     for (const box of boxes) {
-      if (!sameRect(box.rect, measure(box.element))) restartArming(box);
+      if (!sameRect(box.rect, measure(dom, box.element))) restartArming(box);
     }
   }
 
   function newBox(element: HTMLElement): ArmedBox {
-    return { element, rect: null, armed: false, timer: undefined };
+    return { element, buttons: [], rect: null, armed: false, timer: undefined };
   }
 
   function dropBox(box: ArmedBox): void {
     clearTimeout(box.timer);
-    box.element.remove();
+    dom.remove(box.element);
     boxes.delete(box);
   }
 
@@ -477,7 +496,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       action,
       () => {
         // Checked again here, as a shift may land between the last check and the click.
-        if (!box.armed || !sameRect(box.rect, measure(box.element))) {
+        if (!box.armed || !sameRect(box.rect, measure(dom, box.element))) {
           restartArming(box);
           return;
         }
@@ -485,8 +504,9 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       },
       primary,
     );
-    node.dataset.armed = String(box.armed);
-    node.setAttribute('aria-disabled', String(!box.armed));
+    dom.attr(node, 'data-armed', String(box.armed));
+    dom.attr(node, 'aria-disabled', String(!box.armed));
+    box.buttons.push(node);
     return node;
   }
 
@@ -497,20 +517,20 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   const style = adoptStyle(root, doc);
 
   const panel = element('section', 'panel');
-  panel.hidden = true;
-  panel.setAttribute('aria-label', 'Tabdock');
+  dom.flag(panel, 'hidden', true);
+  dom.attr(panel, 'aria-label', 'Tabdock');
   const errorLine = element('p', 'error');
   const noticeLine = element('p', 'notice');
   // Who just joined by a Can watch invite, with no prompt to say so (ADR 0016).
   const joins = element('div');
-  joins.dataset.role = 'joins';
-  joins.setAttribute('aria-live', 'polite');
+  dom.attr(joins, 'data-role', 'joins');
+  dom.attr(joins, 'aria-live', 'polite');
   const prompts = element('div');
-  prompts.setAttribute('aria-live', 'polite');
+  dom.attr(prompts, 'aria-live', 'polite');
 
   const pairing = element('div');
   const code = element('div', 'code');
-  code.dataset.role = 'pairing-code';
+  dom.attr(code, 'data-role', 'pairing-code');
   const expiry = element('p', 'muted');
   const rotate = button('New code', 'rotate', () => {
     dock.rotatePairing();
@@ -518,43 +538,43 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   // Shown only when the relay sent a pairing URL the QR module accepts.
   const qr = createQrView(doc);
   const qrBox = element('div', 'qr');
-  qrBox.dataset.role = 'pairing-qr';
-  qrBox.hidden = true;
-  qrBox.append(qr.element);
+  dom.attr(qrBox, 'data-role', 'pairing-qr');
+  dom.flag(qrBox, 'hidden', true);
+  dom.append(qrBox, qr.element);
   const pairText = element('div', 'pair-text');
-  pairText.append(code, expiry, rotate);
+  dom.append(pairText, code, expiry, rotate);
   const pairRow = element('div', 'pair');
-  pairRow.append(qrBox, pairText);
-  pairing.append(element('div', 'label', 'Pairing code'), pairRow);
+  dom.append(pairRow, qrBox, pairText);
+  dom.append(pairing, element('div', 'label', 'Pairing code'), pairRow);
 
   const roster = element('ul');
-  roster.dataset.role = 'roster';
+  dom.attr(roster, 'data-role', 'roster');
   const nobody = element('p', 'muted', 'Nobody yet');
   // Revoking only takes access away, so it is not held back like the boxes.
   const revokeAll = button('Revoke all', 'revoke-all', () => {
     dock.revoke('*');
   });
   const rosterBlock = element('div');
-  rosterBlock.append(element('div', 'label', 'Attached'), roster, nobody, revokeAll);
+  dom.append(rosterBlock, element('div', 'label', 'Attached'), roster, nobody, revokeAll);
 
   // Invites (ADR 0017): the link shown once, the live list, and the form.
   const invitesBlock = element('div');
-  invitesBlock.dataset.role = 'invites';
-  invitesBlock.hidden = true;
+  dom.attr(invitesBlock, 'data-role', 'invites');
+  dom.flag(invitesBlock, 'hidden', true);
 
   const linkBox = element('div', 'prompt');
-  linkBox.dataset.role = 'invite-link';
-  linkBox.hidden = true;
+  dom.attr(linkBox, 'data-role', 'invite-link');
+  dom.flag(linkBox, 'hidden', true);
   const linkHeading = element('p');
   const linkQr = createQrView(doc, {
     accept: inviteQrUrl,
     label: 'Invite QR code: scan it with a phone to join',
   });
   const linkQrBox = element('div', 'qr');
-  linkQrBox.dataset.role = 'invite-qr';
-  linkQrBox.append(linkQr.element);
+  dom.attr(linkQrBox, 'data-role', 'invite-qr');
+  dom.append(linkQrBox, linkQr.element);
   const linkText = element('p', 'link-text');
-  linkText.dataset.role = 'invite-link-text';
+  dom.attr(linkText, 'data-role', 'invite-link-text');
   const copyLink = button('Copy link', 'invite-copy', () => {
     copyShownLink();
   });
@@ -562,37 +582,37 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     hideLink();
   });
   const linkButtons = element('div', 'buttons');
-  linkButtons.append(copyLink, doneLink);
-  linkBox.append(linkHeading, linkQrBox, linkText, linkButtons);
+  dom.append(linkButtons, copyLink, doneLink);
+  dom.append(linkBox, linkHeading, linkQrBox, linkText, linkButtons);
   /** The link on show and its invite, or null; Copy reads it here, never back from the tree. */
   let shownLink: { readonly inviteId: string; readonly link: string } | null = null;
 
   const inviteList = element('ul');
-  inviteList.dataset.role = 'invite-list';
+  dom.attr(inviteList, 'data-role', 'invite-list');
   const noInvites = element('p', 'muted', 'No live invites');
   const inviteError = element('p', 'error');
-  inviteError.dataset.role = 'invite-error';
-  inviteError.hidden = true;
+  dom.attr(inviteError, 'data-role', 'invite-error');
+  dom.flag(inviteError, 'hidden', true);
   const inviteToggle = button('Invite someone', 'invite-open', () => {
-    // hidden can also be 'until-found', which still means closed.
-    setFormOpen(formBox.hidden !== false);
+    // Any hidden attribute, 'until-found' too, means closed.
+    setFormOpen(dom.has(formBox, 'hidden'));
   });
 
   // The form is an armed box: Create grants access, as Allow does.
   const formBox = element('div', 'row');
-  formBox.dataset.role = 'invite-form';
-  formBox.hidden = true;
+  dom.attr(formBox, 'data-role', 'invite-form');
+  dom.flag(formBox, 'hidden', true);
   const formView = newBox(formBox);
   boxes.add(formView);
   const labelField = element('label', 'field', 'Label, shown wherever the invite is');
   const labelInput = element('input');
-  labelInput.type = 'text';
-  labelInput.maxLength = MAX_INVITE_LABEL_CHARS;
-  labelInput.autocomplete = 'off';
-  labelInput.spellcheck = false;
-  labelInput.placeholder = 'Who is it for?';
-  labelInput.dataset.action = 'invite-label';
-  labelField.append(labelInput);
+  dom.attr(labelInput, 'type', 'text');
+  dom.attr(labelInput, 'maxlength', String(MAX_INVITE_LABEL_CHARS));
+  dom.attr(labelInput, 'autocomplete', 'off');
+  dom.attr(labelInput, 'spellcheck', 'false');
+  dom.attr(labelInput, 'placeholder', 'Who is it for?');
+  dom.attr(labelInput, 'data-action', 'invite-label');
+  dom.append(labelField, labelInput);
 
   function choice(
     group: string,
@@ -602,17 +622,17 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   ): { label: HTMLLabelElement; input: HTMLInputElement } {
     const label = element('label');
     const input = element('input');
-    input.type = 'radio';
-    input.name = group;
-    input.value = value;
-    input.dataset.action = action;
-    label.append(input, text);
+    dom.attr(input, 'type', 'radio');
+    dom.attr(input, 'name', group);
+    dom.attr(input, 'value', value);
+    dom.attr(input, 'data-action', action);
+    dom.append(label, input, text);
     return { label, input };
   }
 
   const roleChoices = element('div', 'choices');
-  roleChoices.setAttribute('role', 'radiogroup');
-  roleChoices.setAttribute('aria-label', 'What the invite allows');
+  dom.attr(roleChoices, 'role', 'radiogroup');
+  dom.attr(roleChoices, 'aria-label', 'What the invite allows');
   const watchChoice = choice(
     'invite-role',
     'observer',
@@ -620,31 +640,31 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     'invite-role-observer',
   );
   const controlChoice = choice('invite-role', 'driver', roleText('driver'), 'invite-role-driver');
-  watchChoice.input.checked = true;
-  roleChoices.append(watchChoice.label, controlChoice.label);
+  dom.setChecked(watchChoice.input, true);
+  dom.append(roleChoices, watchChoice.label, controlChoice.label);
 
   const lifetimeChoices = element('div', 'choices');
-  lifetimeChoices.setAttribute('role', 'radiogroup');
-  lifetimeChoices.setAttribute('aria-label', 'How long the link works');
+  dom.attr(lifetimeChoices, 'role', 'radiogroup');
+  dom.attr(lifetimeChoices, 'aria-label', 'How long the link works');
   const lifetimeInputs = LIFETIME_CHOICES.map(([value, text]) => {
     const made = choice('invite-lifetime', value, text, `invite-lifetime-${value}`);
-    made.input.checked = value === '1h';
-    lifetimeChoices.append(made.label);
+    dom.setChecked(made.input, value === '1h');
+    dom.append(lifetimeChoices, made.label);
     return [value, made.input] as const;
   });
 
   const usesField = element('label', 'field', 'Uses');
   const usesInput = element('input');
-  usesInput.type = 'number';
-  usesInput.min = '1';
-  usesInput.max = String(MAX_INVITE_USES);
-  usesInput.step = '1';
-  usesInput.value = '1';
-  usesInput.dataset.action = 'invite-uses';
-  usesField.append(usesInput);
+  dom.attr(usesInput, 'type', 'number');
+  dom.attr(usesInput, 'min', '1');
+  dom.attr(usesInput, 'max', String(MAX_INVITE_USES));
+  dom.attr(usesInput, 'step', '1');
+  dom.setValue(usesInput, '1');
+  dom.attr(usesInput, 'data-action', 'invite-uses');
+  dom.append(usesField, usesInput);
 
   const formReason = element('p', 'muted');
-  formReason.dataset.role = 'invite-reason';
+  dom.attr(formReason, 'data-role', 'invite-reason');
   const createButton = boxButton(
     formView,
     'Create link',
@@ -655,21 +675,22 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     true,
   );
   const formButtons = element('div', 'buttons');
-  formButtons.append(createButton);
-  formBox.append(labelField, roleChoices, lifetimeChoices, usesField, formReason, formButtons);
+  dom.append(formButtons, createButton);
+  dom.append(formBox, labelField, roleChoices, lifetimeChoices, usesField, formReason, formButtons);
 
   for (const input of [watchChoice.input, controlChoice.input]) {
-    input.addEventListener('change', () => {
+    dom.listen(input, 'change', () => {
       // Create now grants something else, so the form waits again.
       restartArming(formView);
       render(dock.state);
     });
   }
-  labelInput.addEventListener('input', () => {
+  dom.listen(labelInput, 'input', () => {
     render(dock.state);
   });
 
-  invitesBlock.append(
+  dom.append(
+    invitesBlock,
     element('div', 'label', 'Invites'),
     linkBox,
     inviteList,
@@ -681,14 +702,14 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
 
   // A fixed height, so new calls never move the boxes around it.
   const activity = element('ol', 'activity');
-  activity.dataset.role = 'activity';
-  activity.setAttribute('aria-label', 'Recent calls, newest first');
+  dom.attr(activity, 'data-role', 'activity');
+  dom.attr(activity, 'aria-label', 'Recent calls, newest first');
   const activityBlock = element('div');
-  activityBlock.append(element('div', 'label', 'Activity'), activity);
+  dom.append(activityBlock, element('div', 'label', 'Activity'), activity);
 
   // Last in the panel, beside the badge, where other changes move it least.
   const pauseBox = element('div', 'pause');
-  pauseBox.dataset.role = 'pause-box';
+  dom.attr(pauseBox, 'data-role', 'pause-box');
   const pauseView: PauseView = {
     ...newBox(pauseBox),
     text: element('span'),
@@ -699,10 +720,11 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     // What the button says now: Pause when running, Resume when paused.
     dock.pause(pauseView.paused !== true);
   });
-  pauseBox.append(pauseView.text, pauseView.toggle);
+  dom.append(pauseBox, pauseView.text, pauseView.toggle);
   boxes.add(pauseView);
 
-  panel.append(
+  dom.append(
+    panel,
     errorLine,
     noticeLine,
     joins,
@@ -717,25 +739,25 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   const dot = element('span', 'dot');
   const count = element('span', 'count', '0');
   const pausedTag = element('span', 'tag', 'Paused');
-  pausedTag.dataset.role = 'badge-paused';
+  dom.attr(pausedTag, 'data-role', 'badge-paused');
   const badgeButton = button('', 'toggle', () => {
-    // hidden can also be 'until-found', which still means closed.
-    setOpen(panel.hidden !== false);
+    // Any hidden attribute, 'until-found' too, means closed.
+    setOpen(dom.has(panel, 'hidden'));
   });
-  badgeButton.className = 'badge';
-  badgeButton.setAttribute('aria-expanded', 'false');
-  badgeButton.append(dot, element('span', '', 'Tabdock'), count, pausedTag);
+  dom.attr(badgeButton, 'class', 'badge');
+  dom.attr(badgeButton, 'aria-expanded', 'false');
+  dom.append(badgeButton, dot, element('span', '', 'Tabdock'), count, pausedTag);
 
   const wrap = element('div', 'wrap');
-  wrap.append(panel, badgeButton);
+  dom.append(wrap, panel, badgeButton);
   if (style) root.append(style);
   root.append(wrap);
 
   function setOpen(open: boolean): void {
     // Time on screen so far counts for the join notices before the panel changes.
     ageJoinLines();
-    panel.hidden = !open;
-    badgeButton.setAttribute('aria-expanded', String(open));
+    dom.flag(panel, 'hidden', !open);
+    dom.attr(badgeButton, 'aria-expanded', String(open));
     // Opening moves every box from nowhere onto the screen, so each waits from now.
     checkMoves();
     ageJoinLines();
@@ -744,36 +766,39 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
 
   function requestView(request: PendingRequest, state: DockState): PromptView {
     const box = element('div', 'prompt');
-    box.dataset.requestId = request.requestId;
+    dom.attr(box, 'data-request-id', request.requestId);
     const who = personText(request.user, request.account);
     const line = element('p');
     if (request.invite !== null) {
       // The account beside the label the operator gave the invite, which is this page's own text.
-      line.append(`${who} wants to join by your invite "${request.invite.label}"`);
+      dom.append(line, `${who} wants to join by your invite "${request.invite.label}"`);
     } else {
       const via = request.via === 'qr' ? 'QR code' : 'code';
-      line.append(`${who} wants to attach via ${via}`);
+      dom.append(line, `${who} wants to attach via ${via}`);
     }
-    line.append(badge(request.invite !== null || request.account.kind === 'invitee'));
-    box.append(line);
+    dom.append(line, badge(request.invite !== null || request.account.kind === 'invitee'));
+    dom.append(box, line);
     if (!request.account.verified) {
-      box.append(
+      dom.append(
+        box,
         element('p', 'muted', 'Unverified account: the sign-in provider vouches for no email.'),
       );
     }
     const drivers = state.roster.filter((attachment) => attachment.role === 'driver').length;
     if (request.invite !== null && drivers >= state.policy.maxDrivers) {
       // ADR 0017: the relay seats them as observer; Make driver works once a seat is free.
-      box.append(
+      dom.append(
+        box,
         element('p', 'muted', 'The driver seats are full, so they join as observer for now.'),
       );
     }
     if (request.client) {
-      box.append(element('p', 'muted', `Client: ${clientText(request.client)}`));
+      dom.append(box, element('p', 'muted', `Client: ${clientText(request.client)}`));
     }
     const view = newPrompt(box, request.expiresAt);
     const buttons = element('div', 'buttons');
-    buttons.append(
+    dom.append(
+      buttons,
       boxButton(view, 'Allow as driver', 'approve-driver', () => {
         dock.approve(request.requestId, 'driver');
       }),
@@ -790,20 +815,21 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
         true,
       ),
     );
-    box.append(buttons, view.countdown);
+    dom.append(box, buttons, view.countdown);
     return view;
   }
 
   function confirmView(confirm: PendingConfirm): PromptView {
     const box = element('div', 'prompt');
-    box.dataset.callId = confirm.callId;
+    dom.attr(box, 'data-call-id', confirm.callId);
     const line = element('p');
-    line.append(`${personText(confirm.caller)} wants to run ${confirm.tool}`);
-    line.append(badge(shortId(confirm.caller.userId) !== null));
-    box.append(line);
+    dom.append(line, `${personText(confirm.caller)} wants to run ${confirm.tool}`);
+    dom.append(line, badge(shortId(confirm.caller.userId) !== null));
+    dom.append(box, line);
     const view = newPrompt(box, confirm.expiresAt);
     const buttons = element('div', 'buttons');
-    buttons.append(
+    dom.append(
+      buttons,
       boxButton(view, 'Allow', 'confirm-allow', () => {
         dock.confirm(confirm.callId, true);
       }),
@@ -817,7 +843,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
         true,
       ),
     );
-    box.append(buttons, view.countdown);
+    dom.append(box, buttons, view.countdown);
     return view;
   }
 
@@ -846,7 +872,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       const view = build(item);
       views.set(id, view);
       boxes.add(view);
-      prompts.prepend(view.element);
+      dom.prepend(prompts, view.element);
       added = true;
     }
     return added;
@@ -854,13 +880,13 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
 
   function rowView(userId: string): RowView {
     const box = element('li', 'row');
-    box.dataset.userId = userId;
+    dom.attr(box, 'data-user-id', userId);
     const closeLink = element('label', 'check');
     const closeInput = element('input');
-    closeInput.type = 'checkbox';
-    closeInput.dataset.action = 'close-link';
-    closeLink.append(closeInput, 'and close this link');
-    closeLink.hidden = true;
+    dom.attr(closeInput, 'type', 'checkbox');
+    dom.attr(closeInput, 'data-action', 'close-link');
+    dom.append(closeLink, closeInput, 'and close this link');
+    dom.flag(closeLink, 'hidden', true);
     const view: RowView = {
       ...newBox(box),
       name: element('span'),
@@ -879,24 +905,25 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       dock.setRole(userId, view.role === 'driver' ? 'observer' : 'driver');
     });
     const buttons = element('div', 'buttons');
-    buttons.append(
+    dom.append(
+      buttons,
       view.roleSwitch,
       boxButton(view, 'Revoke', 'revoke', () => {
         // The box's own choice when it shows, which starts checked; the
         // adapter's default otherwise, which closes a multi-use link (ADR 0016).
-        if (view.closeLink.hidden) dock.revoke(userId);
-        else dock.revoke(userId, { closeInvite: view.closeInput.checked });
+        if (dom.has(view.closeLink, 'hidden')) dock.revoke(userId);
+        else dock.revoke(userId, { closeInvite: dom.checked(view.closeInput) });
       }),
       view.closeLink,
     );
     const who = element('p', 'who');
-    who.append(view.name, view.badge);
-    box.append(who, view.clients, view.expiry, buttons);
+    dom.append(who, view.name, view.badge);
+    dom.append(box, who, view.clients, view.expiry, buttons);
     return view;
   }
 
   function setText(node: HTMLElement, text: string): void {
-    if (node.textContent !== text) node.textContent = text;
+    if (dom.text(node) !== text) dom.setText(node, text);
   }
 
   /**
@@ -932,16 +959,20 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const isNew = view.key === '';
     view.key = key;
     view.role = role;
-    view.roleSwitch.hidden = role === null || capped;
+    dom.flag(view.roleSwitch, 'hidden', role === null || capped);
     const promote = role !== 'driver';
-    view.roleSwitch.textContent = promote ? 'Make driver' : 'Make observer';
-    view.roleSwitch.dataset.action = promote ? 'make-driver' : 'make-observer';
+    dom.setText(view.roleSwitch, promote ? 'Make driver' : 'Make observer');
+    dom.attr(view.roleSwitch, 'data-action', promote ? 'make-driver' : 'make-observer');
     // "and close this link" starts checked whenever it appears.
-    if (closable && view.closeLink.hidden) view.closeInput.checked = true;
-    view.closeLink.hidden = !closable;
+    if (closable && dom.has(view.closeLink, 'hidden')) dom.setChecked(view.closeInput, true);
+    dom.flag(view.closeLink, 'hidden', !closable);
     // The role switch may now do the opposite of what the operator was reaching for, or be gone.
     if (!isNew) restartArming(view);
   }
+
+  /** The rows in the roster list and the rows in the invite list, in order, as last put there. */
+  let rosterShown: readonly HTMLElement[] = [];
+  let inviteListShown: readonly HTMLElement[] = [];
 
   /** Rows are kept by user id and only reordered when the relay's order changes, like prompts. */
   function syncRows(state: DockState): void {
@@ -964,16 +995,16 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       const invite = attachment.inviteId === null ? undefined : invites.get(attachment.inviteId);
       updateRow(view, attachment, access.get(attachment.userId), invite);
       // Role changes need the relay; revoking works offline and is sent on resume.
-      view.roleSwitch.disabled = state.link !== 'linked';
+      dom.flag(view.roleSwitch, 'disabled', state.link !== 'linked');
       return view.element;
     });
-    const current = [...roster.children];
-    if (current.length !== ordered.length || current.some((node, i) => node !== ordered[i])) {
-      roster.replaceChildren(...ordered);
+    if (!sameNodes(rosterShown, ordered)) {
+      dom.replaceChildren(roster, ordered);
+      rosterShown = ordered;
     }
-    nobody.hidden = state.roster.length > 0;
+    dom.flag(nobody, 'hidden', state.roster.length > 0);
     // Revoke all also closes every live invite, so it stays while any is live.
-    revokeAll.hidden = state.roster.length === 0 && state.invites.length === 0;
+    dom.flag(revokeAll, 'hidden', state.roster.length === 0 && state.invites.length === 0);
   }
 
   /** The seq of the newest join already dealt with; null before the first render. */
@@ -1017,8 +1048,8 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
         `${personText(join.user, join.account)} joined by your invite "${join.label}" as ${role.role}`,
       );
       // Not data-user-id, which names roster rows.
-      line.dataset.joined = join.user.userId;
-      joins.prepend(line);
+      dom.attr(line, 'data-joined', join.user.userId);
+      dom.prepend(joins, line);
       joinLines.push({ element: line, shownMs: 0, since: null, seen: false });
       added = true;
     }
@@ -1033,7 +1064,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
    */
   function ageJoinLines(): void {
     const now = Date.now();
-    const onScreen = !panel.hidden && doc.visibilityState === 'visible';
+    const onScreen = !dom.has(panel, 'hidden') && doc.visibilityState === 'visible';
     for (let i = joinLines.length - 1; i >= 0; i -= 1) {
       const line = joinLines[i];
       if (!line) continue;
@@ -1045,7 +1076,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       line.seen = true;
       line.since ??= now;
       if (line.shownMs + now - line.since >= JOIN_NOTICE_MS) {
-        line.element.remove();
+        dom.remove(line.element);
         joinLines.splice(i, 1);
       }
     }
@@ -1054,22 +1085,24 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   /** The badge asks for attention while a prompt waits or a join notice has not been seen. */
   function updateAttention(): void {
     const waiting = requestViews.size + confirmViews.size > 0;
-    badgeButton.classList.toggle('attention', waiting || joinLines.some((line) => !line.seen));
+    const attention = waiting || joinLines.some((line) => !line.seen);
+    dom.attr(badgeButton, 'class', attention ? 'badge attention' : 'badge');
   }
 
   function inviteRow(view: InviteView): InviteRowView {
     const box = element('li', 'row');
-    box.dataset.inviteId = view.inviteId;
+    dom.attr(box, 'data-invite-id', view.inviteId);
     const title = element('p', 'who');
     const detail = element('p', 'muted');
     const buttons = element('div', 'buttons');
     // Cancelling only takes access away, so it is not held back like the boxes.
-    buttons.append(
+    dom.append(
+      buttons,
       button('Cancel', 'cancel-invite', () => {
         dock.cancelInvite(view.inviteId);
       }),
     );
-    box.append(title, detail, buttons);
+    dom.append(box, title, detail, buttons);
     return { element: box, title, detail, view };
   }
 
@@ -1077,7 +1110,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const live = new Set(state.invites.map((view) => view.inviteId));
     for (const [inviteId, row] of inviteRows) {
       if (!live.has(inviteId)) {
-        row.element.remove();
+        dom.remove(row.element);
         inviteRows.delete(inviteId);
       }
     }
@@ -1093,12 +1126,12 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       setText(row.detail, inviteDetail(view));
       return row.element;
     });
-    const current = [...inviteList.children];
-    if (current.length !== ordered.length || current.some((node, i) => node !== ordered[i])) {
-      inviteList.replaceChildren(...ordered);
+    if (!sameNodes(inviteListShown, ordered)) {
+      dom.replaceChildren(inviteList, ordered);
+      inviteListShown = ordered;
     }
     // Between links the page lists nothing, which says nothing about what is live.
-    noInvites.hidden = state.invites.length > 0 || state.link !== 'linked';
+    dom.flag(noInvites, 'hidden', state.invites.length > 0 || state.link !== 'linked');
     // A link whose invite the relay no longer lists (used up, cancelled, expired) is dead: it goes.
     if (shownLink !== null && state.invitesOffered !== null && !live.has(shownLink.inviteId)) {
       hideLink();
@@ -1119,16 +1152,18 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   let creating = false;
 
   function chosenRole(state: DockState): Role {
-    return state.policy.invites === 'all' && controlChoice.input.checked ? 'driver' : 'observer';
+    return state.policy.invites === 'all' && dom.checked(controlChoice.input)
+      ? 'driver'
+      : 'observer';
   }
 
   function chosenLifetime(): InviteLifetime {
-    for (const [value, input] of lifetimeInputs) if (input.checked) return value;
+    for (const [value, input] of lifetimeInputs) if (dom.checked(input)) return value;
     return '1h';
   }
 
   function chosenUses(): number | null {
-    const uses = Number(usesInput.value);
+    const uses = Number(dom.value(usesInput));
     return Number.isInteger(uses) && uses >= 1 && uses <= MAX_INVITE_USES ? uses : null;
   }
 
@@ -1144,31 +1179,36 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const offered =
       state.policy.invites !== 'off' &&
       (state.invitesOffered !== null || (everOffered && state.link !== 'linked'));
-    invitesBlock.hidden = !offered;
+    dom.flag(invitesBlock, 'hidden', !offered);
     // Can control only where the page opted into it (ADR 0016).
-    controlChoice.label.hidden = state.policy.invites !== 'all';
-    if (controlChoice.label.hidden && controlChoice.input.checked) watchChoice.input.checked = true;
+    const watchOnly = state.policy.invites !== 'all';
+    dom.flag(controlChoice.label, 'hidden', watchOnly);
+    if (watchOnly && dom.checked(controlChoice.input)) dom.setChecked(watchChoice.input, true);
     // A Can control invite always has exactly one use.
-    usesField.hidden = chosenRole(state) === 'driver';
+    dom.flag(usesField, 'hidden', chosenRole(state) === 'driver');
     const blocker = inviteBlocker(state);
     const reason = creating ? 'Asking the relay for the link' : blocker;
     setText(formReason, reason ?? '');
-    formReason.hidden = reason === null;
-    createButton.disabled = creating || blocker !== null || labelInput.value.trim() === '';
-    const open = !formBox.hidden;
-    inviteToggle.textContent = open ? 'Close the form' : 'Invite someone';
-    inviteToggle.dataset.action = open ? 'invite-close' : 'invite-open';
+    dom.flag(formReason, 'hidden', reason === null);
+    dom.flag(
+      createButton,
+      'disabled',
+      creating || blocker !== null || dom.value(labelInput).trim() === '',
+    );
+    const open = !dom.has(formBox, 'hidden');
+    dom.setText(inviteToggle, open ? 'Close the form' : 'Invite someone');
+    dom.attr(inviteToggle, 'data-action', open ? 'invite-close' : 'invite-open');
   }
 
   function setFormOpen(open: boolean): void {
-    formBox.hidden = !open;
-    if (open) inviteError.hidden = true;
+    dom.flag(formBox, 'hidden', !open);
+    if (open) dom.flag(inviteError, 'hidden', true);
     render(dock.state);
   }
 
   async function createInvite(): Promise<void> {
     const state = dock.state;
-    const label = labelInput.value.trim();
+    const label = dom.value(labelInput).trim();
     const role = chosenRole(state);
     const uses = role === 'driver' ? 1 : chosenUses();
     if (label === '' || uses === null) {
@@ -1176,15 +1216,15 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       return;
     }
     creating = true;
-    inviteError.hidden = true;
+    dom.flag(inviteError, 'hidden', true);
     render(state);
     const result = await dock.invite({ label, role, lifetime: chosenLifetime(), uses });
     creating = false;
     if (!mounted) return;
     if (result.ok) {
-      labelInput.value = '';
-      usesInput.value = '1';
-      formBox.hidden = true;
+      dom.setValue(labelInput, '');
+      dom.setValue(usesInput, '1');
+      dom.flag(formBox, 'hidden', true);
       showLink(result.inviteId, result.link, label);
     } else {
       showInviteError(REFUSAL_TEXT[result.reason]);
@@ -1193,33 +1233,36 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   }
 
   function showInviteError(text: string): void {
-    inviteError.textContent = text;
-    inviteError.hidden = false;
+    dom.setText(inviteError, text);
+    dom.flag(inviteError, 'hidden', false);
   }
 
   /** The link, once: as a QR drawing and as text to send, until Done or until its invite ends. */
   function showLink(inviteId: string, link: string, label: string): void {
     shownLink = { inviteId, link };
-    linkHeading.textContent = `Send this link to ${label}. It shows only now, and anyone who holds it can join as the invite says.`;
-    linkText.textContent = link;
-    linkQrBox.hidden = !linkQr.show(link);
-    copyLink.textContent = 'Copy link';
-    linkBox.hidden = false;
+    dom.setText(
+      linkHeading,
+      `Send this link to ${label}. It shows only now, and anyone who holds it can join as the invite says.`,
+    );
+    dom.setText(linkText, link);
+    dom.flag(linkQrBox, 'hidden', !linkQr.show(link));
+    dom.setText(copyLink, 'Copy link');
+    dom.flag(linkBox, 'hidden', false);
     setOpen(true);
   }
 
   function hideLink(): void {
     shownLink = null;
     // Nothing of the link stays in the tree.
-    linkText.textContent = '';
-    linkHeading.textContent = '';
+    dom.setText(linkText, '');
+    dom.setText(linkHeading, '');
     linkQr.show(undefined);
-    linkBox.hidden = true;
+    dom.flag(linkBox, 'hidden', true);
   }
 
   function copyShownLink(): void {
     const fallback = (): void => {
-      copyLink.textContent = 'Select the link to copy it';
+      dom.setText(copyLink, 'Select the link to copy it');
     };
     if (shownLink === null || writeClipboard === null) {
       fallback();
@@ -1227,37 +1270,38 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     }
     // Only through the writeText taken at mount; see clipboardWriter.
     writeClipboard(shownLink.link).then(() => {
-      copyLink.textContent = 'Copied';
+      dom.setText(copyLink, 'Copied');
     }, fallback);
   }
 
   function updatePause(paused: boolean): void {
-    pausedTag.hidden = !paused;
-    badgeButton.dataset.paused = String(paused);
+    dom.flag(pausedTag, 'hidden', !paused);
+    dom.attr(badgeButton, 'data-paused', String(paused));
     if (pauseView.paused === paused) return;
     const isNew = pauseView.paused === null;
     pauseView.paused = paused;
-    pauseBox.classList.toggle('paused', paused);
-    pauseView.text.textContent = paused
-      ? 'Paused: every call is refused'
-      : 'Calls run as they come';
-    pauseView.toggle.textContent = paused ? 'Resume' : 'Pause';
-    pauseView.toggle.dataset.action = paused ? 'resume' : 'pause';
+    dom.attr(pauseBox, 'class', paused ? 'pause paused' : 'pause');
+    dom.setText(
+      pauseView.text,
+      paused ? 'Paused: every call is refused' : 'Calls run as they come',
+    );
+    dom.setText(pauseView.toggle, paused ? 'Resume' : 'Pause');
+    dom.attr(pauseView.toggle, 'data-action', paused ? 'resume' : 'pause');
     // Resume grants access again, so a switch that just flipped waits like a new box.
     if (!isNew) restartArming(pauseView);
   }
 
   function entryLine(entry: ActivityEntry): HTMLElement {
     const line = element('li');
-    line.dataset.activityId = entry.callId;
-    line.dataset.outcome = entry.outcome;
+    dom.attr(line, 'data-activity-id', entry.callId);
+    dom.attr(line, 'data-outcome', entry.outcome);
     const via = entry.client ? ` via ${clientText(entry.client)}` : '';
     const took = entry.durationMs === null ? '' : ` in ${entry.durationMs} ms`;
     // A write answered early still holds the page while its handler runs on.
     const lingering = entry.handlerRunning ? ', but its handler is still running' : '';
-    line.append(`${timeText(entry.time)} ${personText(entry.user)}`);
-    if (shortId(entry.user.userId) !== null) line.append(badge(true));
-    line.append(`${via}: ${entry.tool}, ${entry.outcome}${took}${lingering}`);
+    dom.append(line, `${timeText(entry.time)} ${personText(entry.user)}`);
+    if (shortId(entry.user.userId) !== null) dom.append(line, badge(true));
+    dom.append(line, `${via}: ${entry.tool}, ${entry.outcome}${took}${lingering}`);
     return line;
   }
 
@@ -1266,8 +1310,8 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   function renderActivity(entries: readonly ActivityEntry[]): void {
     if (entries === shownActivity) return;
     shownActivity = entries;
-    activity.replaceChildren(...entries.map(entryLine));
-    if (entries.length === 0) activity.append(element('li', 'muted', 'No calls yet'));
+    dom.replaceChildren(activity, entries.map(entryLine));
+    if (entries.length === 0) dom.append(activity, element('li', 'muted', 'No calls yet'));
   }
 
   /** Whether the panel has opened by itself to show the code since anyone was last attached; see render. */
@@ -1275,17 +1319,19 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
 
   function tick(): void {
     for (const view of [...requestViews.values(), ...confirmViews.values()]) {
-      view.countdown.textContent = `Denied automatically in ${secondsLeft(view.expiresAt)} s`;
+      dom.setText(view.countdown, `Denied automatically in ${secondsLeft(view.expiresAt)} s`);
     }
-    for (const view of rowViews.values()) view.expiry.textContent = expiryText(view.expiresAt);
+    for (const view of rowViews.values()) dom.setText(view.expiry, expiryText(view.expiresAt));
     for (const row of inviteRows.values()) setText(row.detail, inviteDetail(row.view));
     ageJoinLines();
     updateAttention();
     const current = dock.state.pairing;
     if (current) {
       const left = secondsLeft(current.expiresAt);
-      expiry.textContent =
-        left > 0 ? `Expires in ${clockText(left)}` : 'Expired, waiting for a new code';
+      dom.setText(
+        expiry,
+        left > 0 ? `Expires in ${clockText(left)}` : 'Expired, waiting for a new code',
+      );
     }
     // Catches shifts no state change caused, such as a resized window or a scrolled panel.
     checkMoves();
@@ -1296,19 +1342,23 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       unmount();
       return;
     }
-    dot.className = `dot ${state.link}`;
-    badgeButton.title = `Tabdock: ${LINK_LABELS[state.link]}${state.paused ? ', paused' : ''}`;
-    count.textContent = String(state.roster.length);
-    errorLine.textContent = state.error ?? '';
-    errorLine.hidden = state.error === null;
-    noticeLine.textContent = state.notice ?? '';
-    noticeLine.hidden = state.notice === null;
+    dom.attr(dot, 'class', `dot ${state.link}`);
+    dom.attr(
+      badgeButton,
+      'title',
+      `Tabdock: ${LINK_LABELS[state.link]}${state.paused ? ', paused' : ''}`,
+    );
+    dom.setText(count, String(state.roster.length));
+    dom.setText(errorLine, state.error ?? '');
+    dom.flag(errorLine, 'hidden', state.error === null);
+    dom.setText(noticeLine, state.notice ?? '');
+    dom.flag(noticeLine, 'hidden', state.notice === null);
 
-    pairing.hidden = state.pairing === null;
-    code.textContent = state.pairing?.code ?? '';
+    dom.flag(pairing, 'hidden', state.pairing === null);
+    dom.setText(code, state.pairing?.code ?? '');
     // A new pairing carries a new URL, so it redraws; one without a URL clears the code.
-    qrBox.hidden = !qr.show(state.pairing?.url);
-    rotate.disabled = state.link !== 'linked';
+    dom.flag(qrBox, 'hidden', !qr.show(state.pairing?.url));
+    dom.flag(rotate, 'disabled', state.link !== 'linked');
 
     syncInvites(state);
     syncRows(state);
@@ -1376,12 +1426,13 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     win?.removeEventListener('focus', rearmAll);
     for (const box of boxes) clearTimeout(box.timer);
     hideLink();
-    host.remove();
+    dom.remove(host);
   }
 
   const place = (): void => {
     // body is typed as always present, but a document can lack one.
-    if (mounted) ((doc.body as HTMLElement | null) ?? doc.documentElement).append(host);
+    const body = doc.body as HTMLElement | null;
+    if (mounted) dom.append(body ?? doc.documentElement, host);
   };
   if (doc.readyState === 'loading') doc.addEventListener('DOMContentLoaded', place, { once: true });
   else place();

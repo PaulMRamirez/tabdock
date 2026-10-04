@@ -58,6 +58,7 @@ import {
   truncate,
   type User,
 } from '@tabdock/protocol';
+import { apply } from './taken.ts';
 import {
   isConsequential,
   isReadOnly,
@@ -199,7 +200,8 @@ export interface CoreOptions {
    * crypto unless set. Without a usable one (a page outside a secure context)
    * the page mints nothing and honours no invite. Its two functions are
    * taken once, when the core is created, so a script that replaces them
-   * later can neither predict a secret nor see one hashed.
+   * later can neither predict a secret nor see one hashed through them;
+   * docs/threat-model.md (B5) says what such a script can still read.
    */
   crypto?: CryptoLike | undefined;
 }
@@ -691,7 +693,17 @@ const defaultTimers: Timers = {
  * Taken when this module loads, which is before attach(): a script that runs
  * later and replaces TextEncoder's encode or the Uint8Array constructor
  * would otherwise be handed an invite secret's text or bytes as the core
- * draws and hashes it. WebCrypto's functions are taken in usableCrypto.
+ * draws and hashes it. WebCrypto's functions are taken in usableCrypto, and
+ * the base64url digits and the typed array length below.
+ * Each of these closes one route that handed a later script every secret
+ * with no other effort; together they keep no secret from it. A secret still
+ * passes through the page's own built-ins here (the Map that holds a mint
+ * until the relay lists it, the Promise that resolves with the link) and, in
+ * the protocol package, through the RegExp checks of its zod schemas, on its
+ * way into a link and out of each redemption frame. So a script that runs
+ * after attach() can still read an invite's secret as it is minted and as
+ * each redemption arrives, a multi-use link's included, for as long as the
+ * link works. The trusted-page rule covers it (docs/threat-model.md, B5).
  */
 const encoder = new TextEncoder();
 const encodeUtf8 = encoder.encode.bind(encoder);
@@ -701,17 +713,42 @@ function byteLength(text: string): number {
   return encodeUtf8(text).length;
 }
 
-const BASE64URL_DIGITS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+/**
+ * The 64 digits as an array, indexed directly: a string's charAt, or any
+ * other method on String.prototype, is the page's, and a script that patched
+ * it after attach() would be handed each new secret one digit at a time.
+ * Frozen so nothing can change a digit either.
+ */
+const BASE64URL_DIGITS: readonly string[] = Object.freeze(
+  Array.from('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'),
+);
+
+/**
+ * Taken when this module loads, like the digits: the length getter every
+ * typed array inherits, called through the Reflect.apply taken.ts took. A
+ * later script could otherwise put a length getter of its own on
+ * Uint8Array.prototype, or replace Reflect.apply, and be handed a new
+ * secret's 16 bytes.
+ */
+const typedArrayLength = (() => {
+  const getter = Reflect.getOwnPropertyDescriptor(
+    Reflect.getPrototypeOf(Uint8Array.prototype) as object,
+    'length',
+  )?.get;
+  if (getter === undefined) throw new TypeError('no typed array length getter');
+  return (bytes: Uint8Array): number => apply(getter, bytes, []) as number;
+})();
 
 /** Unpadded base64url, as the relay's Buffer.toString('base64url') writes it: 16 bytes make 22 characters. */
 export function base64url(bytes: Uint8Array): string {
   let text = '';
-  for (let i = 0; i < bytes.length; i += 3) {
-    const rest = bytes.length - i;
+  const length = typedArrayLength(bytes);
+  for (let i = 0; i < length; i += 3) {
+    const rest = length - i;
     const n = ((bytes[i] ?? 0) << 16) | ((bytes[i + 1] ?? 0) << 8) | (bytes[i + 2] ?? 0);
-    text += BASE64URL_DIGITS.charAt((n >> 18) & 63) + BASE64URL_DIGITS.charAt((n >> 12) & 63);
-    if (rest > 1) text += BASE64URL_DIGITS.charAt((n >> 6) & 63);
-    if (rest > 2) text += BASE64URL_DIGITS.charAt(n & 63);
+    text += `${BASE64URL_DIGITS[(n >> 18) & 63] ?? ''}${BASE64URL_DIGITS[(n >> 12) & 63] ?? ''}`;
+    if (rest > 1) text += BASE64URL_DIGITS[(n >> 6) & 63] ?? '';
+    if (rest > 2) text += BASE64URL_DIGITS[n & 63] ?? '';
   }
   return text;
 }

@@ -10,7 +10,7 @@
 // for nothing, and a change they cannot read fails rather than slips through:
 // the image installs filtered production dependencies from the lockfile; every
 // image is built, scanned with fail-build and smoke-tested read-only with no
-// capabilities, and main's is pushed with provenance and an SBOM and attested,
+// capabilities (and on a writable root, for what the relay's user owns), and main's is pushed with provenance and an SBOM and attested,
 // by steps no condition can switch off; and a deploy verifies first, stages
 // settings through a pipe, checks the live relay and publishes the demo.
 
@@ -209,6 +209,29 @@ describe('the image (Dockerfile, .dockerignore)', () => {
     expect(dockerfile).toContain('--frozen-lockfile');
   });
 
+  it('creates /app in the runtime stage by a root-owned COPY, before any WORKDIR names it', () => {
+    // BuildKit makes a missing WORKDIR as the stage's user, which the
+    // distroless :nonroot base sets to 65532, and a COPY onto an existing
+    // directory never changes that directory's own owner: a WORKDIR first
+    // would leave /app the relay's, so it could swap its own code tree on a
+    // writable root such as Fly's.
+    const runtime = hashCode(dockerfile)
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line !== '');
+    const stage = runtime.slice(
+      runtime.findIndex((line) => line.startsWith('FROM gcr.io/distroless/')),
+    );
+    const copy = stage.indexOf('COPY --from=build --chown=0:0 /app /app');
+    expect(copy, 'the runtime stage copies /app as root').toBeGreaterThan(0);
+    // Nothing between FROM and that COPY: no WORKDIR, RUN or USER that could make /app first.
+    expect(stage.slice(1, copy)).toEqual([]);
+    expect(stage.slice(copy + 1)).toContain('WORKDIR /app');
+    for (const line of stage.filter((entry) => entry.startsWith('COPY '))) {
+      expect(line).toMatch(/^COPY --from=build --chown=0:0 /);
+    }
+  });
+
   it('lets only the relay, protocol and lockfile into the build context', () => {
     const lines = read('.dockerignore')
       .split('\n')
@@ -362,6 +385,25 @@ describe('the image and the workflows, as they run (comments left out)', () => {
     expect(smoke).toMatch(/const STOP_WITHIN_MS = 5000;/);
     expect(smoke).toMatch(/check\(\s*challenge\.status === 401,/);
     expect(smoke).toMatch(/'--verify',/);
+  });
+
+  it('checks the image on a writable root, as Fly runs it: the relay user owns nothing under /app and cannot write there', () => {
+    const smoke = scriptCode(read('scripts/smoke-image.ts'));
+    // The one run of the ownership probe, as the image's own user and without --read-only.
+    const probeRuns = [...smoke.matchAll(/docker\(\[([^\]]*?)'-e',\s*APP_PROBE,?\s*\]\)/g)];
+    expect(probeRuns).toHaveLength(1);
+    const probeRun = probeRuns[0]?.[1] ?? '';
+    expect(probeRun).not.toContain("'--read-only'");
+    expect(probeRun).not.toContain("'--user'");
+    expect(probeRun).toMatch(/'--entrypoint',\s*'\/nodejs\/bin\/node',\s*image,\s*$/);
+    // The probe walks /app itself and everything under it without following links, and tries two writes.
+    const probe = /const APP_PROBE = `([\s\S]*?)`;/.exec(smoke)?.[1] ?? '';
+    expect(probe).toContain("walk('/app')");
+    expect(probe).toContain('lstatSync');
+    expect(probe).toMatch(/writeFileSync\('\/app\//);
+    expect(probe).toMatch(/writeFileSync\('\/app\/packages\/relay\/src\//);
+    expect(smoke).toMatch(/check\(\s*app\.uid === 65532 && app\.owned\.length === 0,/);
+    expect(smoke).toMatch(/check\(\s*app\.writes\.every\(\(code\) => code === 'EACCES'\),/);
   });
 
   it('deploys only after its checks, then checks the live relay and publishes the demo, none of it switchable', () => {
