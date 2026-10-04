@@ -83,7 +83,7 @@ Roles: an observer may call only tools whose `readOnlyHint` is true. A driver ma
 
 ## 6. Page link protocol (adapter to relay)
 
-Transport: WebSocket at `/page`, subprotocol `tabdock.v1`, JSON text frames shaped `{ "t": "<type>", ... }`. Both sides validate every frame with zod. Unknown types are ignored and logged. Frames are capped at 1 MB. Tool results over 120,000 characters are truncated with a visible marker.
+Transport: WebSocket at `/page`, subprotocol `tabdock.v1`, JSON text frames shaped `{ "t": "<type>", ... }`. Both sides validate every frame with zod. The first frame must be `hello`; any other closes the socket with 1008. After it, unknown types are ignored and logged: the lines of frames that change nothing, unknown types among them, are written up to a budget per socket and per address and past it counted in one line per address each minute, and such frames never close a socket (ADR 0023). Frames are capped at 1 MB. Tool results over 120,000 characters are truncated with a visible marker.
 
 | Direction | Type | Payload | Meaning |
 | --- | --- | --- | --- |
@@ -106,7 +106,7 @@ Transport: WebSocket at `/page`, subprotocol `tabdock.v1`, JSON text frames shap
 
 When the socket drops, the page becomes `asleep` and its attachments survive for a 10 minute resume window. After that the page is `gone` and its attachments are deleted.
 
-Close codes (ADR 0007): only a deliberate detach ends a session at once. A page that calls `dock.close()` closes with 4000, becomes `gone` without the resume window, and its in-flight calls fail with `page_gone`, except calls still waiting on an operator prompt, which the page denies first. Every other close leaves the page asleep, including 4002 (the page heard nothing from the relay and is reconnecting) and 4008 (the page's stand-in for 1008, which page code cannot send). The relay closes a superseded socket with 4001, which the page must not reconnect from, and uses 1001, 1008 and 1009 for idle or shutdown, malformed frames (and a page or address over its `tools`-frame budget) and oversized frames, and 1013 when there is no room for a new page session (ADR 0012).
+Close codes (ADR 0007): only a deliberate detach ends a session at once. A page that calls `dock.close()` closes with 4000, becomes `gone` without the resume window, and its in-flight calls fail with `page_gone`, except calls still waiting on an operator prompt, which the page denies first. Every other close leaves the page asleep, including 4002 (the page heard nothing from the relay and is reconnecting) and 4008 (the page's stand-in for 1008, which page code cannot send). The relay closes a superseded socket with 4001, which the page must not reconnect from, and uses 1001, 1008 and 1009 for idle or shutdown, malformed frames (a first frame that is not `hello` among them, ADR 0023, and a page or address over its `tools`-frame budget) and oversized frames, and 1013 when there is no room for a new page session (ADR 0012).
 
 ## 7. MCP surface (relay to clients)
 

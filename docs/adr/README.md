@@ -26,4 +26,4 @@ Short records of decisions that change or refine `SPEC.md`, or that a future con
 | [0020](0020-production-sign-in.md)               | Production sign-in                                            | Accepted |
 | [0021](0021-refresh-spec-m4.md)                  | Refresh SPEC sections 3, 10, 11 and 12 for M4                 | Accepted |
 | [0022](0022-local-mode-by-default.md)            | Local mode by default                                         | Accepted |
-| [0023](0023-page-frames-that-change-nothing.md)  | Page frames that change nothing                               | Proposed |
+| [0023](0023-page-frames-that-change-nothing.md)  | Page frames that change nothing                               | Accepted |

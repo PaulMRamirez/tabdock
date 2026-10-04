@@ -1,6 +1,6 @@
 # 0023: Page frames that change nothing
 
-Status: Proposed, 4 October 2026, from the second A4.3 pass. Would change SPEC section 6; until the owner accepts it the spec text stands, and the code differs from it in the two ways the Decision names.
+Status: Accepted, 4 October 2026, from the second A4.3 pass, under the owner's standing instruction to take the recommended option. Changes SPEC section 6.
 
 ## Context
 
@@ -18,7 +18,7 @@ The second pass found three things wrong with closing. The shipped adapter sends
 
 **Forward compatibility.** A newer adapter's frame type is ignored and logged within the budget and never disconnects the page. A page frame type whose effect matters ships with a relay that knows it.
 
-**SPEC wording on acceptance.** Section 6's first paragraph would read: "Transport: WebSocket at `/page`, subprotocol `tabdock.v1`, JSON text frames shaped `{ "t": "<type>", ... }`. Both sides validate every frame with zod. The first frame must be `hello`; any other closes the socket with 1008. After it, unknown types are ignored and logged: the lines of frames that change nothing, unknown types among them, are written up to a budget per socket and per address and past it counted in one line per address each minute, and such frames never close a socket (ADR 0023). Frames are capped at 1 MB. Tool results over 120,000 characters are truncated with a visible marker." The close-code paragraph keeps its 1008 for malformed frames, which now names a first frame that is not `hello`.
+**SPEC wording.** Section 6's first paragraph reads: "Transport: WebSocket at `/page`, subprotocol `tabdock.v1`, JSON text frames shaped `{ "t": "<type>", ... }`. Both sides validate every frame with zod. The first frame must be `hello`; any other closes the socket with 1008. After it, unknown types are ignored and logged: the lines of frames that change nothing, unknown types among them, are written up to a budget per socket and per address and past it counted in one line per address each minute, and such frames never close a socket (ADR 0023). Frames are capped at 1 MB. Tool results over 120,000 characters are truncated with a visible marker." The close-code paragraph keeps its 1008 for malformed frames, which now names a first frame that is not `hello`.
 
 ## Consequences
 
