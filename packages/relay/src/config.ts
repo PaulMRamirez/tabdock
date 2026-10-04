@@ -1,6 +1,7 @@
 // Relay options, their defaults, and the checks that refuse an unsafe setup
-// before anything listens: loopback only until TLS arrives in M4 (S12), and an
-// explicit origin allowlist in production (S2). Public URL mode (ADR 0014) puts
+// before anything listens: loopback only, unless hosted mode puts the relay
+// behind a host edge that terminates TLS (S12, ADR 0018), and an explicit
+// origin allowlist in production (S2). Public URL mode (ADR 0014) puts
 // an https address in front of the loopback relay through a tunnel: it brings
 // production rules, only OAuth sign-in for that address, and the QR sign-in at
 // /pair, which needs a client of its own at the provider. The section 9 limits
@@ -13,7 +14,8 @@
 // where it means something: invites (ADR 0017), hosted mode's client address
 // header and proxy ranges with its limits (ADR 0018), the audit log's
 // directory and bounds (ADR 0019), and the OAuth token age cap and client
-// list (ADR 0020). Workstreams A and C put them to work.
+// list (ADR 0020). Hosted mode alone may bind 0.0.0.0, which a platform's
+// proxy and health checks need; every other mode keeps M3's loopback rule.
 
 import { BlockList, isIP, isIPv6 } from 'node:net';
 import { dirname, isAbsolute, join } from 'node:path';
@@ -125,7 +127,7 @@ export interface RelayRateLimits {
   /**
    * Sign-ins one client address may start at /pair and /i per window in
    * hosted mode, under the relay-wide pairSignIns; sized for carrier NAT
-   * (ADR 0018, workstream C).
+   * (ADR 0018, sign-in-gate.ts).
    */
   signInsPerAddress: number;
   /**
@@ -178,12 +180,12 @@ export interface RelayLimits {
   pairSessions: number;
   /** Code exchanges /pair/callback may have waiting on the provider at once, for the whole relay. */
   pairSignInsInFlight: number;
-  /** The same for one client address in hosted mode, across /pair and /i (ADR 0018, workstream C). */
+  /** The same for one client address in hosted mode, across /pair and /i (ADR 0018, sign-in-gate.ts). */
   signInsInFlightPerAddress: number;
   /**
    * Bytes all pages' tool lists and prepared schemas may hold together; a
    * tools frame that would pass it is refused with 1008 and counted against
-   * its address (S9, ADR 0018, workstream C). At least one whole frame.
+   * its address (S9, ADR 0018, hub.ts). At least one whole frame.
    */
   toolBytes: number;
 }
@@ -217,8 +219,9 @@ export interface PairClientOptions {
 export interface RelayOptions {
   auth: AuthPlugin;
   /**
-   * Default 127.0.0.1. Anything but loopback is refused until M4 brings TLS,
-   * and a name must resolve to loopback addresses alone (relay.ts).
+   * Default 127.0.0.1. Anything but loopback is refused, except 0.0.0.0 in
+   * hosted mode (ADR 0018), and a name must resolve to loopback addresses
+   * alone (relay.ts).
    */
   host?: string | undefined;
   /** Default 0, a free port; the CLI uses 8787. */
@@ -253,7 +256,11 @@ export interface RelayOptions {
   /** Receives every log line; stderr when absent. */
   logSink?: LogSink | undefined;
   logLevel?: LogLevel | undefined;
-  /** Storage; in memory when absent. M4 swaps in a persistent audit log here. */
+  /**
+   * Storage; in memory when absent, with the persistent audit log when an
+   * audit directory is set (ADR 0019). Refused beside an audit directory: a
+   * store of one's own brings its own audit log.
+   */
   store?: RelayStore | undefined;
   /**
    * The M3 spike's measurements (ADR 0014, A3.3), off by default and refused
@@ -274,7 +281,7 @@ export interface RelayOptions {
   /**
    * Hosted mode (ADR 0018): the one header a host edge in front of the relay
    * sets to the client's address, replacing any value a client sent. Only in
-   * production with a public URL. Workstream C reads it.
+   * production with a public URL; client-address.ts reads it.
    */
   clientAddressHeader?: string | undefined;
   /**
@@ -293,6 +300,12 @@ export interface RelayOptions {
 }
 
 export const DEFAULT_HOST = '127.0.0.1';
+/**
+ * The one address besides loopback the relay binds, and only in hosted mode
+ * (S12, ADR 0018). Never ::, which on some platforms also listens on a
+ * private network every machine of the account shares.
+ */
+export const HOSTED_WILDCARD_HOST = '0.0.0.0';
 export const DEFAULT_CLI_PORT = 8787;
 export const HELLO_TIMEOUT_MS = 10_000;
 export const CALL_DEADLINE_GRACE_MS = 2000;
@@ -398,6 +411,7 @@ export interface ResolvedConfig {
   host: string;
   port: number;
   env: RelayEnv;
+  /** Whether host names loopback; false only for hosted mode's 0.0.0.0. */
   loopback: boolean;
   /**
    * The public origin in public URL mode, else null. Also the base of the
@@ -596,11 +610,6 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
       );
     }
   }
-  if (!isLoopbackHost(host)) {
-    throw new Error(
-      `refusing to bind ${host}: the relay listens only on loopback (127.0.0.1, ::1 or localhost) until TLS arrives in M4 (SPEC S12)`,
-    );
-  }
   const port = options.port ?? 0;
   if (!Number.isInteger(port) || port < 0 || port > 65_535) {
     throw new Error('port must be an integer from 0 to 65535');
@@ -702,6 +711,16 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
   const trustedProxies = hosted
     ? parseProxyRanges(options.trustedProxyCidr ?? DEFAULT_TRUSTED_PROXY_CIDR)
     : [];
+  // S12: a plaintext listener off loopback is safe only behind an edge that
+  // terminates TLS and names the client, so hosted mode alone may bind the
+  // IPv4 wildcard, and nothing may bind any other address (ADR 0018).
+  if (!isLoopbackHost(host) && !(hosted && host === HOSTED_WILDCARD_HOST)) {
+    throw new Error(
+      hosted
+        ? `refusing to bind ${host}: hosted mode binds loopback or ${HOSTED_WILDCARD_HOST} (TABDOCK_HOST), never another address; :: would also listen on a platform's private network (SPEC S12, ADR 0018)`
+        : `refusing to bind ${host}: the relay listens only on loopback (127.0.0.1, ::1 or localhost) unless it runs in hosted mode, production behind a host edge that terminates TLS and names the client in TABDOCK_CLIENT_ADDRESS_HEADER (SPEC S12, ADR 0018)`,
+    );
+  }
 
   // Every timing ends up in a setTimeout, so it must fit one.
   const timings = positiveIntegers(DEFAULT_TIMINGS, options.timings, MAX_TIMER_MS);
@@ -740,7 +759,7 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     host,
     port,
     env,
-    loopback: true,
+    loopback: isLoopbackHost(host),
     publicUrl,
     publicMcpUrl,
     allowedHosts:

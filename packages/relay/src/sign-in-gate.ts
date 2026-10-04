@@ -5,9 +5,12 @@
 // pairSignIns a window and pairSignInsInFlight at once, and past either the
 // sign-in fails without the provider hearing of it. /i signs in through
 // /pair/login and /pair/callback too, so this one gate covers both routes.
-// Workstream C adds ADR 0018's per-address share here, checked first in hosted
-// mode (signInsPerAddress a window, signInsInFlightPerAddress at once), so
-// one address cannot spend the relay-wide budget; pair.ts asks only enter().
+// In hosted mode, where the edge names each client, one address also gets
+// only its share, signInsPerAddress a window and signInsInFlightPerAddress at
+// once, checked first, so a single address cannot spend the relay-wide budget
+// and keep QR sign-in failing for everyone (ADR 0018). Outside hosted mode
+// every client behind a tunnel arrives from one loopback address, so a share
+// would only be the whole budget again, and none is kept.
 
 import type { ResolvedConfig } from './config.ts';
 import type { Logger } from './log.ts';
@@ -22,7 +25,7 @@ export interface SignInGate {
   /**
    * Admits one code exchange for a client address (its limit key, from
    * client-address.ts) now, or refuses it with null after logging why. A
-   * refusal costs nothing; an admission counts against the window at once.
+   * refusal costs nothing; an admission counts against the windows at once.
    */
   enter(address: string, now: number): SignInPass | null;
 }
@@ -31,13 +34,36 @@ export interface SignInGate {
 const RELAY = 'relay';
 
 export function createSignInGate(config: ResolvedConfig, log: Logger): SignInGate {
-  const { windowMs, pairSignIns } = config.rateLimits;
+  const { windowMs, pairSignIns, signInsPerAddress } = config.rateLimits;
+  const { pairSignInsInFlight, signInsInFlightPerAddress } = config.limits;
   const window = new SlidingWindowLimiter(pairSignIns, windowMs);
+  // Keyed by addresses the edge named: not a set the relay chooses, but the
+  // limiter's own key bound caps its memory, and the relay-wide window above
+  // still holds whatever an early turn of it forgets.
+  const perAddress = config.hosted ? new SlidingWindowLimiter(signInsPerAddress, windowMs) : null;
   /** Code exchanges waiting on the provider now. */
   let inFlight = 0;
+  /** The same per address in hosted mode; an entry goes when its count does, so at most pairSignInsInFlight live. */
+  const inFlightByAddress = new Map<string, number>();
   return {
-    enter(_address, now) {
-      if (inFlight >= config.limits.pairSignInsInFlight) {
+    enter(address, now) {
+      if (perAddress !== null) {
+        // Logged with the address: an operator sees who is spending the budget, and it is no secret.
+        if ((inFlightByAddress.get(address) ?? 0) >= signInsInFlightPerAddress) {
+          log.warn(
+            'pair sign-in refused: too many sign-ins from one address waiting on the provider',
+            { address },
+          );
+          return null;
+        }
+        if (!perAddress.allows(address, now)) {
+          log.warn('pair sign-in refused: too many sign-ins from one address in this window', {
+            address,
+          });
+          return null;
+        }
+      }
+      if (inFlight >= pairSignInsInFlight) {
         log.warn('pair sign-in refused: too many sign-ins waiting on the provider');
         return null;
       }
@@ -46,7 +72,11 @@ export function createSignInGate(config: ResolvedConfig, log: Logger): SignInGat
         return null;
       }
       window.record(RELAY, now);
+      perAddress?.record(address, now);
       inFlight += 1;
+      if (perAddress !== null) {
+        inFlightByAddress.set(address, (inFlightByAddress.get(address) ?? 0) + 1);
+      }
       let left = false;
       return {
         leave() {
@@ -54,6 +84,10 @@ export function createSignInGate(config: ResolvedConfig, log: Logger): SignInGat
           if (left) return;
           left = true;
           inFlight -= 1;
+          if (perAddress === null) return;
+          const held = (inFlightByAddress.get(address) ?? 1) - 1;
+          if (held > 0) inFlightByAddress.set(address, held);
+          else inFlightByAddress.delete(address);
         },
       };
     },

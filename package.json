@@ -12,6 +12,7 @@
   "scripts": {
     "build": "pnpm -r --if-present build",
     "relay": "node packages/relay/src/main.ts",
+    "audit:log": "node packages/relay/src/audit-cli.ts",
     "dev": "node scripts/dev.ts",
     "dev:public": "node scripts/dev.ts --public",
     "dev:demo": "pnpm --filter @tabdock/demo dev",

@@ -22,11 +22,33 @@ export {
 } from './auth.ts';
 export { type AuthRefusalLog, createAuthRefusalLog } from './auth-log.ts';
 export {
+  AUDIT_CHECKPOINT_MS,
+  AUDIT_RETENTION_CHECK_MS,
+  AUDIT_SYNC_MS,
+  AuditDirError,
+  type AuditFileInfo,
+  type AuditFs,
+  FileAuditLog,
+  type FileAuditLogOptions,
+  lineHash,
+  listAuditFiles,
+  readAuditLines,
+  type ReadLine,
+  readLine,
+  utcDay,
+  type VerifyProblem,
+  type VerifyReport,
+  verifyAuditLines,
+} from './audit-file.ts';
+export {
   type ClientAddress,
   type ClientAddresses,
   type ClientAddressProblem,
   createClientAddresses,
+  IPV6_KEY_PREFIX,
+  limitKeyOf,
   loggedAddress,
+  normalizeAddress,
   UNKNOWN_ADDRESS,
 } from './client-address.ts';
 export {
@@ -41,6 +63,7 @@ export {
   DEFAULT_TRUSTED_PROXY_CIDR,
   type EnvConfig,
   HOSTED_LIMITS,
+  HOSTED_WILDCARD_HOST,
   loadConfigFromEnv,
   LOCAL_AUDIT_DIR,
   type LocalModeInfo,

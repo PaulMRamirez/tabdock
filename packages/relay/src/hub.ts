@@ -634,6 +634,13 @@ export class PageHub {
    * checks prepared from the page's own schemas (ADR 0008).
    */
   readonly #listed = new Map<string, Map<string, ListedTool>>();
+  /**
+   * What each page's listed tools are charged against limits.toolBytes: the
+   * size of the tools frame that listed them, which bounds both the copies
+   * the relay keeps and the schemas it prepares from them (S9, ADR 0018).
+   */
+  readonly #toolBytes = new Map<string, number>();
+  #toolBytesHeld = 0;
   /** The only place CfWorker runs: a worker thread with a time budget per check (ADR 0010). */
   readonly #checker: ArgumentChecker;
   /** When each page last got a roster, for EXPIRY_ROSTER_REFRESH_MS. */
@@ -802,7 +809,8 @@ export class PageHub {
       this.#closeSocket(conn, CLOSE_POLICY, 'binary frames are not accepted');
       return;
     }
-    const parsed = parsePageFrame(rawToText(data));
+    const text = rawToText(data);
+    const parsed = parsePageFrame(text);
     if (parsed.kind === 'unknown') {
       this.#log.warn('ignored a frame of unknown type', {
         pageId: conn.pageId,
@@ -835,7 +843,8 @@ export class PageHub {
         this.#closeSocket(conn, CLOSE_POLICY, 'hello sent twice');
         return;
       case 'tools':
-        if (this.#toolsFrameAllowed(conn)) this.#tools(pageId, frame);
+        if (this.#toolsFrameAllowed(conn))
+          this.#tools(conn, pageId, frame, Buffer.byteLength(text));
         return;
       case 'attach_decision':
         this.#decision(pageId, frame);
@@ -921,7 +930,7 @@ export class PageHub {
       // tell list_pages callers the page is ready while calls still wait.
       page.tools = [];
       page.toolsPending = true;
-      this.#listed.delete(page.pageId);
+      this.#dropListed(page.pageId);
       page.title = frame.title;
       page.url = frame.url;
       page.adapterVersion = frame.adapterVersion;
@@ -1040,9 +1049,23 @@ export class PageHub {
     return true;
   }
 
-  #tools(pageId: string, frame: FrameOf<'tools'>): void {
+  #tools(conn: Conn, pageId: string, frame: FrameOf<'tools'>, bytes: number): void {
     const page = this.#store.pages.get(pageId);
     if (!page) return;
+    // One relay-wide budget for what every page's tools hold, so a few pages at
+    // the frame cap cannot fill the heap (S9, ADR 0018). The page's own last
+    // list is replaced, so only the difference counts; the frame already went
+    // against its address's tools-frame budget, and the close leaves the page
+    // asleep like any other policy close.
+    const held = this.#toolBytes.get(pageId) ?? 0;
+    if (this.#toolBytesHeld - held + bytes > this.#config.limits.toolBytes) {
+      this.#log.warn('closing page socket: its tools would pass what all pages may hold', {
+        pageId,
+        address: conn.address,
+      });
+      this.#closeSocket(conn, CLOSE_POLICY, 'tools would pass the relay tool list budget');
+      return;
+    }
     // WebMCP itself refuses duplicate names, so a duplicate is a page bug: keep the first.
     const seen = new Set<string>();
     const tools: PageTool[] = [];
@@ -1134,7 +1157,16 @@ export class PageHub {
     page.toolsPending = false;
     this.#store.pages.put(page);
     this.#listed.set(pageId, listed);
+    this.#toolBytesHeld += bytes - held;
+    this.#toolBytes.set(pageId, bytes);
     this.#log.debug('page tools updated', { pageId, toolCount: tools.length });
+  }
+
+  /** Forgets a page's listed tools and what they were charged against limits.toolBytes. */
+  #dropListed(pageId: string): void {
+    this.#listed.delete(pageId);
+    this.#toolBytesHeld -= this.#toolBytes.get(pageId) ?? 0;
+    this.#toolBytes.delete(pageId);
   }
 
   #onClose(conn: Conn, code: number): void {
@@ -1173,7 +1205,7 @@ export class PageHub {
     // again after the welcome on resume, so they are not held (up to a 1 MB frame
     // of them) for the whole resume window.
     page.tools = [];
-    this.#listed.delete(pageId);
+    this.#dropListed(pageId);
     this.#store.pages.put(page);
     this.#asleep.add(pageId);
     const creator = this.#pageAddress.get(pageId);
@@ -1218,7 +1250,7 @@ export class PageHub {
     page.adapterVersion = '';
     page.policy = { ...page.policy, consequentialTools: [] };
     this.#store.pages.put(page);
-    this.#listed.delete(pageId);
+    this.#dropListed(pageId);
     this.#rosterSentAt.delete(pageId);
     this.#callRosterAt.delete(pageId);
     this.#asleep.delete(pageId);

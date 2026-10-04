@@ -441,6 +441,7 @@ describe('the client address (ADR 0018)', () => {
     ({
       socket: { remoteAddress },
       headers: { 'fly-client-ip': '203.0.113.7' },
+      rawHeaders: ['Fly-Client-IP', '203.0.113.7'],
     }) as unknown as IncomingMessage;
 
   it("is the socket's peer, as address and limit key, until hosted mode names the client", () => {
@@ -456,13 +457,21 @@ describe('the client address (ADR 0018)', () => {
     expect(lines).toEqual([]);
   });
 
-  it('says once, in hosted mode, that every client still counts by its proxy until the header is read', () => {
+  // Workstream C read the header (ADR 0018), so hosted mode now counts the
+  // client the edge names; test/hosted.test.ts covers the rest of the rule.
+  it("names, in hosted mode, the client in the edge's header and logs the proxy once", () => {
     const lines: string[] = [];
     const log = createLogger({ sink: (line) => lines.push(line) });
     const addresses = createClientAddresses(resolveEnv(HOSTED), log);
-    expect(addresses.of(from('10.0.0.5'))).toMatchObject({ ok: true, key: '10.0.0.5' });
+    expect(addresses.of(from('10.0.0.5'))).toEqual({
+      ok: true,
+      address: '203.0.113.7',
+      key: '203.0.113.7',
+    });
+    expect(addresses.of(from('10.0.0.6'))).toMatchObject({ ok: true, key: '203.0.113.7' });
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain('hosted mode counts every client by its proxy address');
+    expect(lines[0]).toContain('its proxy connects from this address');
+    expect(lines[0]).toContain('10.0.0.5');
     expect(lines.join('\n')).not.toContain('203.0.113.7');
   });
 

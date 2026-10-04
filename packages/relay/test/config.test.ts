@@ -37,10 +37,11 @@ function requestWith(authorization?: string): IncomingMessage {
 }
 
 describe('host binding (S12)', () => {
+  // Outside hosted mode (ADR 0018), which test/hosted.test.ts covers.
   it.each(['0.0.0.0', '::', '192.168.1.20', '10.0.0.1', '127.0.0.2', 'relay.example', ''])(
-    'refuses %j and says TLS arrives in M4',
+    'refuses %j and names hosted mode as the only way off loopback',
     (host) => {
-      expect(() => resolveConfig({ auth, host })).toThrow(/loopback.*TLS arrives in M4/);
+      expect(() => resolveConfig({ auth, host })).toThrow(/only on loopback.*unless.*hosted mode/);
     },
   );
 
@@ -91,7 +92,9 @@ describe('Host headers (RFC 9110)', () => {
   });
 
   it('refuses before listening, and defaults to 127.0.0.1 on a free port', async () => {
-    await expect(createRelay({ auth, host: '0.0.0.0', logSink: quiet })).rejects.toThrow(/M4/);
+    await expect(createRelay({ auth, host: '0.0.0.0', logSink: quiet })).rejects.toThrow(
+      /hosted mode/,
+    );
     const relay = await createRelay({ auth, logSink: quiet });
     try {
       expect(relay.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
@@ -392,7 +395,7 @@ describe('loadConfigFromEnv', () => {
     const options = loadConfigFromEnv({ TABDOCK_DEV_TOKENS: tokens, TABDOCK_ENV: 'production' });
     await expect(createRelay({ ...options, logSink: quiet })).rejects.toThrow(/allowedOrigins/);
     const open = loadConfigFromEnv({ TABDOCK_DEV_TOKENS: tokens, TABDOCK_HOST: '0.0.0.0' });
-    await expect(createRelay({ ...open, logSink: quiet })).rejects.toThrow(/M4/);
+    await expect(createRelay({ ...open, logSink: quiet })).rejects.toThrow(/hosted mode/);
   });
 });
 

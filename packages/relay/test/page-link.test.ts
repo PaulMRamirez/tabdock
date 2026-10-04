@@ -1,4 +1,7 @@
+import { mkdtempSync, rmSync } from 'node:fs';
 import { request } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   ATTACH_REQUEST_TTL_MS,
   IDLE_TIMEOUT_MS,
@@ -109,12 +112,21 @@ describe('who may open /page (S1, S2)', () => {
   });
 
   it('serves production with an explicit list and still refuses missing origins', async () => {
-    const { relay } = await relayWith({
-      env: 'production',
-      allowedOrigins: ['https://app.example'],
-    });
-    expect(await refusal(relay.pageUrl, { origin: null })).toBe(403);
-    expect(await refusal(relay.pageUrl, { origin: 'https://app.example' })).toBe(101);
+    // Production keeps its audit log on disk (ADR 0019), so it gets a directory of its own.
+    const scratch = mkdtempSync(join(tmpdir(), 'tabdock-page-link-'));
+    try {
+      const { relay } = await relayWith({
+        env: 'production',
+        allowedOrigins: ['https://app.example'],
+        audit: { dir: join(scratch, 'audit') },
+      });
+      expect(await refusal(relay.pageUrl, { origin: null })).toBe(403);
+      expect(await refusal(relay.pageUrl, { origin: 'https://app.example' })).toBe(101);
+      await current?.close();
+      current = undefined;
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
   });
 });
 
