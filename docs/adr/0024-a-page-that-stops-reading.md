@@ -1,6 +1,6 @@
 # 0024: A page that stops reading
 
-Status: Proposed, 4 October 2026, from the final A4.3 pass. Would change SPEC section 6's close codes and S9's list of limits; until the owner accepts it the spec text stands, and the code differs from it in the one way the Decision names: the relay closes with 1008 a page that leaves too much of what it sends unread.
+Status: Accepted, 4 October 2026, from the final A4.3 pass, under the owner's standing instruction to take the recommended option. Changes SPEC section 6's close codes and S9's list of limits.
 
 ## Context
 
@@ -12,7 +12,7 @@ Status: Proposed, 4 October 2026, from the final A4.3 pass. Would change SPEC se
 
 **WebSocket pings.** The relay's `WebSocketServer` runs with `autoPong: false`, and the hub answers each ping control frame itself, once, within the same bound.
 
-**SPEC wording.** Section 6's close-code paragraph would read "... and uses 1001, 1008 and 1009 for idle or shutdown, malformed frames (a first frame that is not `hello` among them, ADR 0023, and a page or address over its `tools`-frame budget), a page that leaves more of what the relay sends unread than the relay holds for it (ADR 0024) and oversized frames, and 1013 when there is no room for a new page session (ADR 0012)." S9's list would gain "what the relay holds unread for one page" after "the memory page tool lists may hold".
+**SPEC wording.** Section 6's close-code paragraph reads "... and uses 1001, 1008 and 1009 for idle or shutdown, malformed frames (a first frame that is not `hello` among them, ADR 0023, and a page or address over its `tools`-frame budget), a page that leaves more of what the relay sends unread than the relay holds for it (ADR 0024) and oversized frames, and 1013 when there is no room for a new page session (ADR 0012)." S9's list gains "what the relay holds unread for one page" after "the memory page tool lists may hold".
 
 ## Consequences
 
