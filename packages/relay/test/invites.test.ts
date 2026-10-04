@@ -1351,7 +1351,12 @@ describe('S7: what invites leave in the audit log (ADR 0019)', () => {
 
 describe('S7: a page cannot flush the audit log with operator frames (ADR 0019)', () => {
   it('bounds the promotions and mints a page makes, while what takes access away always goes through', async () => {
-    const relay = await setup();
+    // Past the grants most of this flood changes nothing, which a budget of
+    // its own would close the socket for (the next test); lifted here, so the
+    // grants are seen alone.
+    const relay = await setup({
+      rateLimits: { ignoredFramesPerSocket: 10_000, ignoredFramesPerAddress: 10_000 },
+    });
     // Free driver seats, so every promotion would change a role and write a record.
     const page = await relay.page({ policy: { invites: 'all', maxDrivers: 3 } });
     await attachMember(await relay.claude('sub-alice'), page, 'observer');
@@ -1396,6 +1401,37 @@ describe('S7: a page cannot flush the audit log with operator frames (ADR 0019)'
     expect((await latest(page, 'roster')).attachments).toEqual([]);
     // The flood itself left one warning, not a line per frame.
     expect(relay.lines.filter((line) => line.includes('the page made too many'))).toHaveLength(1);
+  });
+
+  it('closes the socket of a page that keeps sending promotions and mints past its grants (A4.3)', async () => {
+    const relay = await setup();
+    const page = await relay.page({ policy: { invites: 'all', maxDrivers: 3 } });
+    await attachMember(await relay.claude('sub-alice'), page, 'observer');
+    for (let i = 0; i < 200; i += 1) {
+      page.send({ t: 'set_role', userId: 'alice', role: i % 2 === 0 ? 'driver' : 'observer' });
+      page.send({
+        t: 'invite_create',
+        inviteId: `inv_flood_${String(i)}`,
+        role: 'observer',
+        label: 'Flood',
+        uses: 1,
+        expiresAt: null,
+        secretHash: newSecret().hash,
+      });
+      page.send({ t: 'invite_cancel', inviteId: `inv_flood_${String(i)}` });
+    }
+    expect(await page.closed).toEqual({ code: 1008, reason: 'too many ignored frames' });
+    // Each refused mint writes a line, so only the budget's worth were written.
+    const refusedLines = relay.lines.filter((line) => line.includes('"msg":"invite refused"'));
+    expect(refusedLines.length).toBeGreaterThan(0);
+    expect(refusedLines.length).toBeLessThanOrEqual(DEFAULT_RATE_LIMITS.ignoredFramesPerSocket + 1);
+    // A policy close is no detach: the page sleeps, and Alice stays attached for its return.
+    const back = await relay.page({
+      policy: { invites: 'all', maxDrivers: 3 },
+      resumeToken: page.welcome?.resumeToken ?? '',
+    });
+    expect(back.welcome?.resumed).toBe(true);
+    expect(back.welcome?.roster).toMatchObject([{ userId: 'alice' }]);
   });
 });
 

@@ -133,6 +133,9 @@ describe('M4 defaults (ADRs 0017, 0018 and 0019)', () => {
     // ADR 0019: refusal lines a minute per member or holder, and for all strangers together.
     expect(DEFAULT_RATE_LIMITS.auditRefusalsPerUser).toBe(10);
     expect(DEFAULT_RATE_LIMITS.auditRefusalsForStrangers).toBe(30);
+    // A4.3: page frames that change nothing, a minute per socket and per address.
+    expect(DEFAULT_RATE_LIMITS.ignoredFramesPerSocket).toBe(20);
+    expect(DEFAULT_RATE_LIMITS.ignoredFramesPerAddress).toBe(60);
     // ADR 0018: hosted mode's page limits for a 512 MB host.
     expect(HOSTED_LIMITS).toEqual({
       pageSessions: 100,
@@ -583,6 +586,119 @@ describe('tools frames per address (S9)', () => {
       code: 1008,
       reason: 'too many tools frames from this address',
     });
+  });
+});
+
+// A4.3: /page takes no credential, and each frame the relay ignores or
+// refuses used to write a line, so one socket could write about a line per
+// 16-byte frame to stderr, the copy ADR 0019 keeps checkpoints and gap-time
+// records in.
+describe('frames that change nothing, per socket and per address (S9)', () => {
+  /** The socket's close, or null if it is still open after a short wait. */
+  async function closedSoon(opened: TestPage): Promise<{ code: number; reason: string } | null> {
+    return Promise.race([opened.closed, delay(2000).then(() => null)]);
+  }
+
+  it('closes a socket past its budget, so a flood of them writes a bounded number of lines', async () => {
+    const { lines } = await setup({ logLevel: 'info' });
+    const opened = await page();
+    const before = lines.length;
+    for (let i = 0; i < 2000; i += 1) opened.sendRaw('{"t":"zz"}');
+    expect(await closedSoon(opened)).toEqual({ code: 1008, reason: 'too many ignored frames' });
+    // The budget's 20, the frame that passed it, and the line naming the close.
+    expect(lines.length - before).toBeLessThanOrEqual(22);
+    expect(lines.some((line) => line.includes('too many frames that changed nothing'))).toBe(true);
+  });
+
+  it('counts frames sent before hello too', async () => {
+    const { relay, lines } = await setup({ logLevel: 'info' });
+    const raw = new TestPage(await openSocket(relay.pageUrl));
+    pages.push(raw);
+    for (let i = 0; i < 2000; i += 1) raw.sendRaw('{"t":"zz"}');
+    expect(await closedSoon(raw)).toEqual({ code: 1008, reason: 'too many ignored frames' });
+    expect(lines.filter((line) => line.includes('ignored a frame of unknown type'))).toHaveLength(
+      21,
+    );
+  });
+
+  it('counts every kind of frame that changes nothing, and none that changes something', async () => {
+    await setup({ rateLimits: { ignoredFramesPerSocket: 6 } });
+    const opened = await page();
+    await pairAndApprove(await client(), opened, 'driver');
+    // Frames that act, and pings, cost nothing.
+    for (let i = 0; i < 30; i += 1) opened.send({ t: 'ping' });
+    opened.send({ t: 'rotate_pairing' });
+    opened.send({ t: 'set_role', userId: 'alice', role: 'observer' });
+    opened.send({ t: 'set_role', userId: 'alice', role: 'driver' });
+    // Six that change nothing: the budget, spent.
+    opened.sendRaw('{"t":"zz"}');
+    opened.send({ t: 'attach_decision', requestId: 'rq_NOPE000000', allow: true });
+    opened.send({ t: 'set_role', userId: 'nobody', role: 'driver' });
+    opened.send({ t: 'set_role', userId: 'alice', role: 'driver' });
+    opened.send({ t: 'revoke', userId: 'nobody' });
+    // This relay mints no invites.
+    opened.send({ t: 'invite_cancel', inviteId: 'inv_NOPE000000' });
+    await opened.sync();
+    expect(opened.ws.readyState).toBe(opened.ws.OPEN);
+    opened.send({
+      t: 'invite_create',
+      inviteId: 'inv_NOPE000001',
+      role: 'observer',
+      label: 'Friends',
+      uses: 1,
+      expiresAt: null,
+      secretHash: 'a'.repeat(64),
+    });
+    expect(await closedSoon(opened)).toEqual({ code: 1008, reason: 'too many ignored frames' });
+  });
+
+  it('counts an invite frame refused or naming no invite on a relay with invites on', async () => {
+    await setup({ invites: true, rateLimits: { ignoredFramesPerSocket: 2 } });
+    const opened = await page();
+    // Refused: without a public URL no invite can be minted.
+    opened.send({
+      t: 'invite_create',
+      inviteId: 'inv_NOPE000001',
+      role: 'observer',
+      label: 'Friends',
+      uses: 1,
+      expiresAt: null,
+      secretHash: 'a'.repeat(64),
+    });
+    opened.send({ t: 'invite_cancel', inviteId: 'inv_NOPE000002' });
+    await opened.sync();
+    expect(opened.ws.readyState).toBe(opened.ws.OPEN);
+    opened.send({ t: 'invite_cancel', inviteId: 'inv_NOPE000003' });
+    expect(await closedSoon(opened)).toEqual({ code: 1008, reason: 'too many ignored frames' });
+  });
+
+  it('shares one budget across every socket from an address and across reconnects', async () => {
+    const { relay } = await setup({
+      rateLimits: { ignoredFramesPerSocket: 10, ignoredFramesPerAddress: 4 },
+    });
+    const first = await page();
+    const second = await page();
+    const elsewhere = await page({ localAddress: OTHER_ADDRESS });
+    for (const opened of [first, second, first, second]) opened.sendRaw('{"t":"zz"}');
+    await first.sync();
+    await second.sync();
+    expect(first.ws.readyState).toBe(first.ws.OPEN);
+    expect(second.ws.readyState).toBe(second.ws.OPEN);
+    first.sendRaw('{"t":"zz"}');
+    const fromAddress = { code: 1008, reason: 'too many ignored frames from this address' };
+    expect(await closedSoon(first)).toEqual(fromAddress);
+    // Another address keeps a budget of its own.
+    for (let i = 0; i < 4; i += 1) elsewhere.sendRaw('{"t":"zz"}');
+    await elsewhere.sync();
+    expect(elsewhere.ws.readyState).toBe(elsewhere.ws.OPEN);
+    // A page that reconnects from the address does not start over.
+    const back = await connectPage(relay.pageUrl, {
+      resumeToken: first.welcome?.resumeToken ?? '',
+    });
+    pages.push(back);
+    expect(back.welcome?.resumed).toBe(true);
+    back.sendRaw('{"t":"zz"}');
+    expect(await closedSoon(back)).toEqual(fromAddress);
   });
 });
 

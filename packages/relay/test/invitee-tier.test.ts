@@ -21,7 +21,14 @@ import {
   type RelayStore,
 } from '../src/index.ts';
 import { connectPage, type TestPage, TOOLS } from './helpers/page-client.ts';
-import { openSession, openStream, type OpenStream, rawCall } from './helpers/raw-mcp.ts';
+import {
+  initializeBody,
+  openSession,
+  openStream,
+  type OpenStream,
+  rawCall,
+  rawPost,
+} from './helpers/raw-mcp.ts';
 import {
   ALICE,
   BOB,
@@ -235,6 +242,74 @@ describe("the invitee tier's sessions (ADR 0016)", () => {
       ),
     );
     expect(left.filter((status) => status === 200)).toHaveLength(1);
+  });
+
+  // A4.3: a 2025-era session whose listening GET stream stays open is never
+  // idle, so strangers holding such streams used to fill the pool and keep
+  // out the guests the operator let in, who share it.
+  it('lets in a guest when busy strangers fill the pool, closing the session of the stranger idle longest', async () => {
+    const store = createMemoryStore();
+    const { relay } = await setup({
+      store,
+      limits: { inviteeSessions: 3 },
+      timings: { sseKeepAliveMs: 50 },
+    });
+    const strangers = [G1, G2, G3];
+    const ids: string[] = [];
+    const held: OpenStream[] = [];
+    for (const stranger of strangers) {
+      const id = await openSession(relay, stranger);
+      const stream = await openStream(relay, stranger, id);
+      streams.push(stream);
+      held.push(stream);
+      ids.push(id);
+    }
+    heldBy(store, G4, 'pg_HELD000000');
+    const guestSession = await openSession(relay, G4);
+    expect((await rawCall(relay, G4, guestSession, 'list_pages')).status).toBe(200);
+    // G1's session was the one active longest ago: closed, its stream ended.
+    await held[0]?.ended;
+    expect((await rawCall(relay, G1, ids[0] ?? '', 'list_pages')).status).toBe(404);
+    expect((await rawCall(relay, G2, ids[1] ?? '', 'list_pages')).status).toBe(200);
+    expect((await rawCall(relay, G3, ids[2] ?? '', 'list_pages')).status).toBe(200);
+
+    // A stranger pushes out neither a guest nor a stranger's busy session.
+    const refused = await rawPost(relay, G5, initializeBody());
+    expect(refused.status).toBe(503);
+    await refused.body?.cancel();
+    expect((await rawCall(relay, G4, guestSession, 'list_pages')).status).toBe(200);
+    // Members are not in the pool at all.
+    await openSession(relay, ALICE);
+  });
+
+  it('never closes a guest session for a stranger when the relay is full, and a guest takes a stranger place', async () => {
+    const store = createMemoryStore();
+    const { relay } = await setup({
+      store,
+      limits: { sessions: 3 },
+      timings: { sseKeepAliveMs: 50 },
+    });
+    heldBy(store, G4, 'pg_HELD000000');
+    // The guest's session is the one active longest ago, and busy.
+    const guestSession = await openSession(relay, G4);
+    streams.push(await openStream(relay, G4, guestSession));
+    const strangerSession = await openSession(relay, G1);
+    streams.push(await openStream(relay, G1, strangerSession));
+    const aliceSession = await openSession(relay, ALICE);
+
+    const refused = await rawPost(relay, G2, initializeBody());
+    expect(refused.status).toBe(503);
+    await refused.body?.cancel();
+    expect((await rawCall(relay, G4, guestSession, 'list_pages')).status).toBe(200);
+    expect((await rawCall(relay, G1, strangerSession, 'list_pages')).status).toBe(200);
+
+    // A second guest takes the stranger's place, busy or not, and never the first guest's.
+    heldBy(store, G5, 'pg_HELD000000');
+    const second = await openSession(relay, G5);
+    expect((await rawCall(relay, G5, second, 'list_pages')).status).toBe(200);
+    expect((await rawCall(relay, G1, strangerSession, 'list_pages')).status).toBe(404);
+    expect((await rawCall(relay, G4, guestSession, 'list_pages')).status).toBe(200);
+    expect((await rawCall(relay, ALICE, aliceSession, 'list_pages')).status).toBe(200);
   });
 });
 

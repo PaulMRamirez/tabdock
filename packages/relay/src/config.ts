@@ -115,9 +115,26 @@ export interface RelayRateLimits {
   /** Short, so a burst is caught at once while a page that changes its tools now and then never is. */
   toolsFramesWindowMs: number;
   /**
+   * Frames one page socket may send per windowMs that the relay ignores or
+   * refuses, changing nothing: a frame of unknown type, before hello too; a
+   * decision for no request of the page; a set_role for no one attached, or
+   * that leaves the role as it was; a revoke that ends nothing; an invite
+   * frame on a relay with invites off, an invite_create refused, and an
+   * invite_cancel naming no live invite. Each may write a log line, and
+   * /page needs no credential, so past this the socket is closed with 1008
+   * (S9, A4.3). A page asks for these only in a race or on a misclick.
+   */
+  ignoredFramesPerSocket: number;
+  /**
+   * The same for all page sockets from one remote address, counted across
+   * reconnects, so neither more sockets nor new ones start the count over;
+   * past it the socket that sent the frame is closed with 1008.
+   */
+  ignoredFramesPerAddress: number;
+  /**
    * Requests one member may make to /mcp per window, every tool counted,
    * checked right after sign-in and before the access check, so refusals
-   * count too (ADR 0018).
+   * count too (ADR 0018), and every 2026-07-28 subscriptions/listen (A4.3).
    */
   requestsPerUser: number;
   /** The same for an invitee, smaller since anyone can become one (ADR 0018). */
@@ -140,20 +157,30 @@ export interface RelayRateLimits {
   auditRefusalsForStrangers: number;
 }
 
-/** Capacities (S9, ADR 0009). Past one, the relay refuses rather than grows. */
+/**
+ * Capacities (S9, ADR 0009). Past one, the relay refuses rather than grows.
+ * The four session numbers also bound the 2026-07-28 leg's subscriptions/listen
+ * streams, counted apart from sessions (listen-streams.ts, A4.3).
+ */
 export interface RelayLimits {
-  /** 2025-era MCP sessions one user may hold; a new one evicts their least recently used idle one. */
+  /**
+   * 2025-era MCP sessions one user may hold; a new one evicts their least
+   * recently used idle one. Also listen streams, a new one ending their oldest.
+   */
   sessionsPerUser: number;
-  /** 2025-era MCP sessions the relay holds in total. */
+  /** 2025-era MCP sessions the relay holds in total, and listen streams in total. */
   sessions: number;
   /**
    * Of those, the sessions all invitees may hold together: their own small
-   * pool, whose idlest session goes first when the relay is full (ADR 0016).
+   * pool, evicted first when the relay is full (ADR 0016). A session gives way
+   * only to someone ranked above its holder (a stranger's to a guest, a
+   * guest's to a member) unless it is idle and the newcomer's rank is its
+   * holder's own (sessions.ts, A4.3). Listen streams the same, never idle.
    */
   inviteeSessions: number;
   /**
    * Sessions one invitee may hold once it holds an attachment; until then it
-   * may hold one (ADR 0016).
+   * may hold one (ADR 0016). Listen streams the same.
    */
   sessionsPerInvitee: number;
   /** Distinct users attached to one page. */
@@ -353,6 +380,8 @@ export const DEFAULT_RATE_LIMITS: RelayRateLimits = {
   toolsFramesPerSocket: 10,
   toolsFramesPerAddress: 30,
   toolsFramesWindowMs: 10_000,
+  ignoredFramesPerSocket: 20,
+  ignoredFramesPerAddress: 60,
   requestsPerUser: 240,
   requestsPerInvitee: 60,
   redemptionsPerInvite: 30,

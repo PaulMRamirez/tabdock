@@ -24,7 +24,9 @@ import type { Logger } from './log.ts';
  * together hold at most pool of them, and when the relay is full an invitee's
  * session goes before anyone else is refused. With invites on, anyone who
  * signs up at the provider is an invitee, so these keep strangers from
- * filling the relay's sessions or pushing out the owner's people.
+ * filling the relay's sessions or pushing out the owner's people. Who gives
+ * way to whom follows rankOf: a stranger (an invitee holding no attachment)
+ * below a guest (one holding an attachment) below a member.
  */
 export interface InviteeSessionOptions {
   /** Sessions all invitees may hold together (RelayLimits.inviteeSessions). */
@@ -35,6 +37,26 @@ export interface InviteeSessionOptions {
   isInvitee: (userId: string) => boolean;
   /** Whether the user holds an attachment to any page (PageHub.holds). */
   holds: (userId: string) => boolean;
+}
+
+/**
+ * Where an account stands when room runs short. A stranger, an invitee
+ * holding no attachment, is anyone who signed up at the provider; a guest is
+ * an invitee the operator let in, through an invite; a member is on the
+ * allowlist. A stream or session gives way only to someone ranked above its
+ * holder, so strangers, however many accounts they open, never push out a
+ * guest or a member (A4.3). Without the tier everyone ranks as a member.
+ */
+export const STRANGER = 0;
+export const GUEST = 1;
+export const MEMBER = 2;
+export type TierRank = typeof STRANGER | typeof GUEST | typeof MEMBER;
+/** Lowest first, the order in which holders give way. */
+export const RANKS: readonly TierRank[] = [STRANGER, GUEST, MEMBER];
+
+export function rankOf(userId: string, invitees: InviteeSessionOptions | undefined): TierRank {
+  if (invitees?.isInvitee(userId) !== true) return MEMBER;
+  return invitees.holds(userId) ? GUEST : STRANGER;
 }
 
 export interface SessionOptions {
@@ -85,6 +107,27 @@ function sessionNotFound(): Response {
  * the Node response closes early).
  */
 export function trackBody(response: Response, signal: AbortSignal, done: () => void): Response {
+  return closableBody(response, signal, done).response;
+}
+
+/** A tracked response, and a way for the relay itself to end it. */
+export interface ClosableBody {
+  response: Response;
+  /**
+   * Ends the body from the relay's side: `done` runs at once, the stream
+   * underneath is cancelled, which makes the SDK tear down whatever it served
+   * on it (a listen subscription with its keep-alive timer, say), and the
+   * client then sees the body end.
+   */
+  close: () => void;
+}
+
+/** trackBody, plus close() (ClosableBody). */
+export function closableBody(
+  response: Response,
+  signal: AbortSignal,
+  done: () => void,
+): ClosableBody {
   let finished = false;
   const finish = (): void => {
     if (finished) return;
@@ -95,7 +138,7 @@ export function trackBody(response: Response, signal: AbortSignal, done: () => v
   const body = response.body;
   if (body === null) {
     finish();
-    return response;
+    return { response, close: finish };
   }
   if (signal.aborted) finish();
   else signal.addEventListener('abort', finish, { once: true });
@@ -120,11 +163,20 @@ export function trackBody(response: Response, signal: AbortSignal, done: () => v
       await reader.cancel(reason);
     },
   });
-  return new Response(tracked, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-  });
+  return {
+    response: new Response(tracked, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    }),
+    close: () => {
+      finish();
+      // A read waiting in pull() then ends as done, which closes the body the client reads.
+      reader.cancel().catch(() => {
+        // Already cancelled or errored: nothing is left to end.
+      });
+    },
+  };
 }
 
 export class McpSessions {
@@ -245,11 +297,33 @@ export class McpSessions {
     return pick.sort((a, b) => a.lastActive - b.lastActive)[0];
   }
 
+  /**
+   * The session to close so a newcomer of this rank fits, or undefined when
+   * none may go: first one held by someone ranked below the newcomer, the
+   * lowest ranked first, idle before busy, since a session whose listening
+   * stream stays open is never idle and would otherwise hold its place for
+   * good; failing that, an idle one held by someone of the newcomer's own
+   * rank. Least recently active first each time. So a busy session gives way
+   * only to someone ranked above its holder, and a guest's never to a
+   * stranger (A4.3).
+   */
+  #giveWay(sessions: Session[], rank: TierRank): Session | undefined {
+    const { invitees } = this.#options;
+    const ofRank = (wanted: TierRank): Session[] =>
+      sessions.filter((session) => rankOf(session.userId, invitees) === wanted);
+    for (const lower of RANKS.filter((each) => each < rank)) {
+      const evicted = this.#idlest(ofRank(lower), false);
+      if (evicted !== undefined) return evicted;
+    }
+    return this.#idlest(ofRank(rank), true);
+  }
+
   /** null when there is room for one more session of this user, else the refusal. */
   #makeRoom(userId: string): Response | null {
     const { total, log, invitees } = this.#options;
+    const rank = rankOf(userId, invitees);
     // The tier's rules when this user is an invitee, else null.
-    const tier = invitees?.isInvitee(userId) === true ? invitees : null;
+    const tier = rank === MEMBER ? null : (invitees ?? null);
     // An invitee holds one session until it holds an attachment (ADR 0016).
     const perUser =
       tier === null
@@ -270,22 +344,24 @@ export class McpSessions {
       void this.#close(idle, 'evicted for a newer session of the same user');
     }
     const open = (): Session[] => [...this.#sessions.values()].filter((session) => !session.closed);
-    // Invitees share a small pool of their own, its idlest session making room first.
+    // Invitees share a small pool of their own: a stranger's session makes
+    // room for a guest, busy or not, and otherwise only an idle one goes.
     if (tier !== null) {
       const pool = open().filter((session) => this.#isInvitee(session));
       if (pool.length >= tier.pool) {
-        const idle = this.#idlest(pool, true);
-        if (!idle) {
+        const evicted = this.#giveWay(pool, rank);
+        if (!evicted) {
           log.warn('MCP session refused: invitees hold the most sessions allowed', { userId });
           return jsonRpcError(503, -32000, 'Too many open sessions on this relay; try again later');
         }
-        void this.#close(idle, 'evicted for a newer invitee session');
+        void this.#close(evicted, 'evicted for a newer invitee session');
       }
     }
     if (this.#sessions.size >= total) {
-      // When the relay is full an invitee's session goes before anyone is refused (ADR 0016).
-      const strangers = open().filter((session) => this.#isInvitee(session));
-      const evicted = invitees === undefined ? undefined : this.#idlest(strangers, false);
+      // When the relay is full an invitee's session goes before anyone is
+      // refused (ADR 0016), so long as its holder ranks below the newcomer.
+      const tiered = open().filter((session) => this.#isInvitee(session));
+      const evicted = this.#giveWay(tiered, rank);
       if (evicted === undefined) {
         log.warn('MCP session refused: the relay holds the most sessions allowed', { userId });
         return jsonRpcError(503, -32000, 'Too many open sessions on this relay; try again later');

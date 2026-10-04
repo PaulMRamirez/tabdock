@@ -398,6 +398,8 @@ interface Conn {
   inflight: Map<string, PendingCall>;
   /** When this socket's recent tools frames arrived, for toolsFramesPerSocket. */
   toolsFrames: number[];
+  /** When this socket's recent frames that changed nothing arrived, for ignoredFramesPerSocket. */
+  ignoredFrames: number[];
 }
 
 const CLOSE_POLICY = 1008;
@@ -839,6 +841,8 @@ export class PageHub {
   readonly #callLimiter: SlidingWindowLimiter;
   /** Tools frames per remote address, shared by its sockets and kept across reconnects. */
   readonly #toolsFrameLimiter: SlidingWindowLimiter;
+  /** Frames that changed nothing per remote address, shared and kept the same way (#ignored). */
+  readonly #ignoredFrameLimiter: SlidingWindowLimiter;
   /**
    * Redemptions of one invite, whoever makes them (ADR 0017), keyed by page
    * and invite id, so only live invites, which a page holds ten of at most,
@@ -874,6 +878,7 @@ export class PageHub {
       windowMs,
       toolsFramesPerAddress,
       toolsFramesWindowMs,
+      ignoredFramesPerAddress,
       redemptionsPerInvite,
       auditRefusalsPerUser,
       auditRefusalsForStrangers,
@@ -882,6 +887,7 @@ export class PageHub {
     this.#pageLimiter = new SlidingWindowLimiter(pairAttemptsPerPage, windowMs);
     this.#callLimiter = new SlidingWindowLimiter(callsPerUserPerPage, windowMs);
     this.#toolsFrameLimiter = new SlidingWindowLimiter(toolsFramesPerAddress, toolsFramesWindowMs);
+    this.#ignoredFrameLimiter = new SlidingWindowLimiter(ignoredFramesPerAddress, windowMs);
     this.#inviteLimiter = new SlidingWindowLimiter(redemptionsPerInvite, windowMs);
     this.#grantLimiter = new SlidingWindowLimiter(OPERATOR_GRANTS_PER_PAGE, windowMs);
     this.#grantWarnings = new SlidingWindowLimiter(1, windowMs);
@@ -986,6 +992,7 @@ export class PageHub {
       idleTimer: null,
       inflight: new Map(),
       toolsFrames: [],
+      ignoredFrames: [],
     };
     this.#conns.add(conn);
     this.#socketsByAddress.set(address, (this.#socketsByAddress.get(address) ?? 0) + 1);
@@ -1020,6 +1027,7 @@ export class PageHub {
         pageId: conn.pageId,
         frameType: parsed.type,
       });
+      this.#ignored(conn);
       return;
     }
     if (parsed.kind === 'invalid') {
@@ -1049,21 +1057,22 @@ export class PageHub {
       case 'tools':
         if (this.#toolsFrameAllowed(conn)) this.#tools(conn, pageId, frame);
         return;
+      // Each of these says whether it changed anything; one that did not counts (#ignored).
       case 'attach_decision':
-        this.#decision(pageId, frame);
+        if (!this.#decision(pageId, frame)) this.#ignored(conn);
         return;
       case 'set_role':
-        this.#setRole(pageId, frame);
+        if (!this.#setRole(pageId, frame)) this.#ignored(conn);
         return;
       case 'revoke':
-        this.#revoke(pageId, frame);
+        if (!this.#revoke(pageId, frame)) this.#ignored(conn);
         return;
       case 'rotate_pairing':
         this.#rotateTicket(pageId, 'asked by page');
         return;
       case 'invite_create':
       case 'invite_cancel':
-        this.#inviteFrame(pageId, frame);
+        if (!this.#inviteFrame(pageId, frame)) this.#ignored(conn);
         return;
       case 'result':
         this.#result(conn, pageId, frame);
@@ -1080,17 +1089,19 @@ export class PageHub {
    * A page minting or cancelling an invite (ADR 0017). A relay with invites
    * off mints none and sends no invites frame at all (ADR 0017's notes), so a
    * page that sends one anyway is ignored, its secret's hash unlogged.
+   * Answers whether it minted or closed an invite.
    */
-  #inviteFrame(pageId: string, frame: FrameOf<'invite_create' | 'invite_cancel'>): void {
+  #inviteFrame(pageId: string, frame: FrameOf<'invite_create' | 'invite_cancel'>): boolean {
     if (!this.#config.invites) {
       this.#log.warn('ignored an invite frame: this relay mints no invites', {
         pageId,
         frameType: frame.t,
       });
-      return;
+      return false;
     }
-    if (frame.t === 'invite_create') this.#inviteCreate(pageId, frame);
-    else this.#inviteCancel(pageId, frame);
+    return frame.t === 'invite_create'
+      ? this.#inviteCreate(pageId, frame)
+      : this.#inviteCancel(pageId, frame);
   }
 
   // Invites (ADRs 0016 and 0017)
@@ -1163,10 +1174,11 @@ export class PageHub {
    * frame either way, so the adapter's invite() always settles. The relay
    * judges expiresAt on its own clock: one under MIN_INVITE_REMAINING_MS away
    * says the page's clock runs behind, and none lasts past 24 hours.
+   * Answers whether it minted one.
    */
-  #inviteCreate(pageId: string, frame: FrameOf<'invite_create'>): void {
+  #inviteCreate(pageId: string, frame: FrameOf<'invite_create'>): boolean {
     const page = this.#store.pages.get(pageId);
-    if (!page) return;
+    if (!page) return false;
     const now = Date.now();
     const refuse = (reason: InviteRefusalReason): void => {
       this.#log.info('invite refused', { pageId, inviteId: frame.inviteId, reason });
@@ -1178,27 +1190,27 @@ export class PageHub {
       this.#store.invites.findBySecretHash(frame.secretHash) !== undefined
     ) {
       refuse('duplicate');
-      return;
+      return false;
     }
     if (
       page.policy.invites === 'off' ||
       (frame.role === 'driver' && page.policy.invites !== 'all')
     ) {
       refuse('policy');
-      return;
+      return false;
     }
     if (this.#linkBase() === null) {
       refuse('no_public_url');
-      return;
+      return false;
     }
     const sponsor = this.#sponsorOf(pageId);
     if (sponsor === null) {
       refuse('no_sponsor');
-      return;
+      return false;
     }
     if (frame.expiresAt !== null && frame.expiresAt - now < MIN_INVITE_REMAINING_MS) {
       refuse('expired');
-      return;
+      return false;
     }
     // Past the page's grants, a mint is refused as one past the live limit is,
     // so the adapter's invite() still settles and the page sees why.
@@ -1207,7 +1219,7 @@ export class PageHub {
       !this.#grantAllowed(pageId, now)
     ) {
       refuse('limit');
-      return;
+      return false;
     }
     const longest = now + MAX_INVITE_LIFETIME_MS;
     const invite: InviteRecord = {
@@ -1248,6 +1260,7 @@ export class PageHub {
       uses: invite.uses,
     });
     this.#sendInvites(pageId);
+    return true;
   }
 
   /**
@@ -1270,11 +1283,15 @@ export class PageHub {
     return false;
   }
 
-  /** Closes one invite's link; the attachments it already made stay (ADR 0017's notes). */
-  #inviteCancel(pageId: string, frame: FrameOf<'invite_cancel'>): void {
+  /**
+   * Closes one invite's link; the attachments it already made stay (ADR
+   * 0017's notes). Answers whether a live invite was named.
+   */
+  #inviteCancel(pageId: string, frame: FrameOf<'invite_cancel'>): boolean {
     const invite = this.#store.invites.get(pageId, frame.inviteId);
     if (invite) this.#closeInvite(invite, 'cancelled', false);
     this.#sendInvites(pageId);
+    return invite !== undefined;
   }
 
   #armInviteExpiry(invite: InviteRecord): void {
@@ -1578,6 +1595,41 @@ export class PageHub {
     this.#toolsFrameLimiter.record(conn.address, now);
     conn.toolsFrames.push(now);
     return true;
+  }
+
+  /**
+   * Counts a frame the relay ignored or refused, which changed nothing and
+   * may have written a log line (ignoredFramesPerSocket lists them). /page
+   * needs no credential, so without a budget one socket could write a line
+   * to stderr for every 16-byte frame, the copy that keeps the audit
+   * checkpoints and, while the audit disk fails, the records themselves (ADR
+   * 0019). Each socket has a budget, and each remote address one across its
+   * sockets and reconnects; past either the socket is closed as a policy
+   * breach, so it writes at most its budget, the frame that passed it and
+   * one more line. A page that sleeps this way resumes like any other.
+   */
+  #ignored(conn: Conn): void {
+    if (conn.closing) return;
+    const now = Date.now();
+    const { ignoredFramesPerSocket, windowMs } = this.#config.rateLimits;
+    conn.ignoredFrames = conn.ignoredFrames.filter((at) => at > now - windowMs);
+    if (conn.ignoredFrames.length >= ignoredFramesPerSocket) {
+      this.#log.warn('closing page socket: too many frames that changed nothing', {
+        pageId: conn.pageId,
+      });
+      this.#closeSocket(conn, CLOSE_POLICY, 'too many ignored frames');
+      return;
+    }
+    if (!this.#ignoredFrameLimiter.allows(conn.address, now)) {
+      this.#log.warn('closing page socket: too many frames that changed nothing from its address', {
+        pageId: conn.pageId,
+        address: conn.address,
+      });
+      this.#closeSocket(conn, CLOSE_POLICY, 'too many ignored frames from this address');
+      return;
+    }
+    this.#ignoredFrameLimiter.record(conn.address, now);
+    conn.ignoredFrames.push(now);
   }
 
   #tools(conn: Conn, pageId: string, frame: FrameOf<'tools'>): void {
@@ -1943,12 +1995,13 @@ export class PageHub {
     );
   }
 
-  #decision(pageId: string, frame: FrameOf<'attach_decision'>): void {
+  /** The page's answer to an attach request; false when it named none of the page's. */
+  #decision(pageId: string, frame: FrameOf<'attach_decision'>): boolean {
     const request = this.#store.requests.get(frame.requestId);
     // A page may only answer its own requests; anything else is stale or forged.
     if (request?.pageId !== pageId) {
       this.#log.warn('ignored a decision for an unknown attach request', { pageId });
-      return;
+      return false;
     }
     if (!frame.allow) {
       this.#log.info('attach request denied', { pageId, userId: request.userId });
@@ -1960,12 +2013,12 @@ export class PageHub {
       });
       // A control invite's prompt refused counts toward burning it.
       if (request.inviteId !== null) this.#inviteRefused(pageId, request.inviteId);
-      return;
+      return true;
     }
     const page = this.#store.pages.get(pageId);
     if (request.inviteId !== null) {
       this.#approveRedemption(request, frame.role ?? 'observer');
-      return;
+      return true;
     }
     if (!this.#store.attachments.get(pageId, request.userId) && this.#pageFull(pageId)) {
       this.#log.info('approval refused: the page filled up while the operator decided', {
@@ -1974,7 +2027,7 @@ export class PageHub {
       });
       this.#spike?.pairingDecided(pageId, request.userId, false);
       this.#endRequest(request.requestId, this.#pageFullError('filled up meanwhile and has'));
-      return;
+      return true;
     }
     const attachment = this.#grant(request, frame.role ?? 'observer');
     this.#spike?.pairingDecided(pageId, request.userId, true);
@@ -1985,6 +2038,7 @@ export class PageHub {
       role: attachment.role,
       existing: false,
     });
+    return true;
   }
 
   /**
@@ -2156,11 +2210,12 @@ export class PageHub {
     return 'driver';
   }
 
-  #setRole(pageId: string, frame: FrameOf<'set_role'>): void {
+  /** The operator's role change; false when nobody's role changed. */
+  #setRole(pageId: string, frame: FrameOf<'set_role'>): boolean {
     const attachment = this.#store.attachments.get(pageId, frame.userId);
     if (!attachment) {
       this.#log.warn('ignored set_role for a user who is not attached', { pageId });
-      return;
+      return false;
     }
     // ADR 0017: an invite-made attachment never passes its invite's role,
     // whatever the page asks: a watch guest stays an observer.
@@ -2179,7 +2234,8 @@ export class PageHub {
       capped === 'driver' && attachment.role !== 'driver' && !this.#grantAllowed(pageId, Date.now())
         ? attachment.role
         : capped;
-    if (role !== attachment.role) {
+    const changed = role !== attachment.role;
+    if (changed) {
       const previous = attachment.role;
       attachment.role = role;
       this.#store.attachments.put(attachment);
@@ -2197,6 +2253,7 @@ export class PageHub {
     }
     // Sent even when nothing changed, so the page shows a capped grant as it really is.
     this.#sendRoster(pageId);
+    return changed;
   }
 
   /**
@@ -2205,9 +2262,10 @@ export class PageHub {
    * whose redemption was waiting, is barred from that invite for its life,
    * by account and verified email, so no redemption brings them back; the
    * invite itself stays unless the page cancels it. Revoke all also closes
-   * every live invite (ADR 0017).
+   * every live invite (ADR 0017). Answers whether it ended anything: an
+   * attachment, a waiting request or an invite.
    */
-  #revoke(pageId: string, frame: FrameOf<'revoke'>): void {
+  #revoke(pageId: string, frame: FrameOf<'revoke'>): boolean {
     const everyone = frame.userId === '*';
     const now = Date.now();
     const targets = everyone
@@ -2240,8 +2298,10 @@ export class PageHub {
         everyone,
       });
     }
+    let ended = targets.length;
     for (const request of this.#store.requests.listForPage(pageId)) {
       if (everyone || users.has(request.userId)) {
+        ended += 1;
         const invite =
           request.inviteId === null ? undefined : this.#store.invites.get(pageId, request.inviteId);
         if (invite !== undefined && !everyone) {
@@ -2258,6 +2318,7 @@ export class PageHub {
     }
     if (everyone) {
       for (const invite of this.#store.invites.listForPage(pageId)) {
+        ended += 1;
         this.#closeInvite(invite, 'revoked', false);
       }
     }
@@ -2265,6 +2326,7 @@ export class PageHub {
     this.#loseSponsors(pageId, targets);
     this.#sendRoster(pageId);
     if (everyone || barred) this.#sendInvites(pageId);
+    return ended > 0;
   }
 
   /**

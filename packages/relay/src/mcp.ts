@@ -7,7 +7,8 @@
 // request budget (ADR 0018), before any access check and before its own
 // arguments are checked, so refusals and malformed calls count too: a member
 // has more than an invitee, and past it the answer is rate_limited with a
-// record within the refusal budget. Nothing here counts by address,
+// record within the refusal budget. The same budget counts each
+// subscriptions/listen a 2026-07-28 client sends (listen-streams.ts). Nothing here counts by address,
 // since all of hosted Claude arrives from one range (ADR 0016). An invitee
 // (ADR 0017) gets the same five tools on the pages it holds and pairs only
 // by invite. With the M3 spike flag on (spike.ts, ADR 0014) a marker tool may
@@ -38,6 +39,7 @@ import {
   PairPageInputSchema,
   truncate,
   untrustedHeader,
+  type UserKind,
   UserKindSchema,
 } from '@tabdock/protocol';
 import { z } from 'zod';
@@ -299,17 +301,44 @@ export function userIdOf(authInfo: AuthInfo | undefined): string | null {
   return extra.success ? extra.data.userId : null;
 }
 
+/**
+ * ADR 0018's per-user request budget. One per relay, shared by every server
+ * the factory builds and by the listen streams (listen-streams.ts), so a
+ * client cannot reset it by opening a new session, request or stream.
+ */
+export interface RequestBudget {
+  /** Counts one request for the user, or answers false, counting nothing, once it is past the budget. */
+  spend(userId: string, kind: UserKind): boolean;
+  /** What a request past the budget is told, naming this kind of account's budget. */
+  refusal(kind: UserKind): string;
+}
+
+export function createRequestBudget(config: ResolvedConfig): RequestBudget {
+  const { windowMs, requestsPerUser, requestsPerInvitee } = config.rateLimits;
+  const memberRequests = new SlidingWindowLimiter(requestsPerUser, windowMs);
+  const inviteeRequests = new SlidingWindowLimiter(requestsPerInvitee, windowMs);
+  return {
+    spend(userId, kind) {
+      const limiter = kind === 'invitee' ? inviteeRequests : memberRequests;
+      const now = Date.now();
+      if (!limiter.allows(userId, now)) return false;
+      limiter.record(userId, now);
+      return true;
+    },
+    refusal(kind) {
+      const limit = kind === 'invitee' ? requestsPerInvitee : requestsPerUser;
+      return `more than ${String(limit)} requests to this relay in ${formatDuration(windowMs)}; wait and try again`;
+    },
+  };
+}
+
 export function createMcpFactory(
   hub: PageHub,
   config: ResolvedConfig,
   spike: Spike | null = null,
+  budget: RequestBudget = createRequestBudget(config),
 ): (ctx: McpRequestContext) => McpServer {
   const waitSeconds = Math.round(config.timings.pairWaitMs / 1000);
-  // One budget per relay, shared by every server this factory builds, so a
-  // client cannot reset it by opening a new session or sending a new request.
-  const { windowMs, requestsPerUser, requestsPerInvitee } = config.rateLimits;
-  const memberRequests = new SlidingWindowLimiter(requestsPerUser, windowMs);
-  const inviteeRequests = new SlidingWindowLimiter(requestsPerInvitee, windowMs);
   /**
    * ADR 0018: counts one request against its caller's budget, before the
    * access check and before its arguments are checked, so a refused or
@@ -317,19 +346,9 @@ export function createMcpFactory(
    * rate_limited and recorded within the refusal budget.
    */
   const overBudget = (who: CallerIdentity, refusal: BudgetRefusal): CallToolResult | null => {
-    const invitee = who.account.kind === 'invitee';
-    const limiter = invitee ? inviteeRequests : memberRequests;
-    const now = Date.now();
-    if (limiter.allows(who.userId, now)) {
-      limiter.record(who.userId, now);
-      return null;
-    }
+    if (budget.spend(who.userId, who.account.kind)) return null;
     hub.refusedByBudget(who, refusal);
-    const limit = invitee ? requestsPerInvitee : requestsPerUser;
-    return errorResult(
-      'rate_limited',
-      `more than ${String(limit)} requests to this relay in ${formatDuration(windowMs)}; wait and try again`,
-    );
+    return errorResult('rate_limited', budget.refusal(who.account.kind));
   };
   return ({ authInfo, era }) => {
     const owner = identityFrom(authInfo).userId;

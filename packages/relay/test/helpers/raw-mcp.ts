@@ -119,6 +119,73 @@ export interface OpenStream {
   close(): void;
 }
 
+export interface OpenListen extends OpenStream {
+  /** Whether the relay answered with an event stream, the listen's only success. */
+  streaming: boolean;
+  /** The body of an answer that was not a stream, such as a refusal; '' for a stream. */
+  text: string;
+}
+
+let nextListen = 0;
+
+/**
+ * A 2026-07-28 subscriptions/listen, as the SDK client sends it, held open
+ * until close(); an answer that is not a stream is read whole into `text`.
+ */
+export async function openListen(relay: Relay, user: DevTokenUser): Promise<OpenListen> {
+  nextListen += 1;
+  const abort = new AbortController();
+  const response = await fetch(relay.mcpUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${user.token}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+      'Mcp-Method': 'subscriptions/listen',
+      'Mcp-Protocol-Version': '2026-07-28',
+    },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: `listen:${String(nextListen)}`,
+      method: 'subscriptions/listen',
+      params: {
+        _meta: {
+          'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+          'io.modelcontextprotocol/clientInfo': { name: 'raw-listen', version: '1.0.0' },
+          'io.modelcontextprotocol/clientCapabilities': {},
+        },
+        notifications: { toolsListChanged: true },
+      },
+    }),
+    signal: abort.signal,
+  });
+  const streaming = (response.headers.get('content-type') ?? '').startsWith('text/event-stream');
+  if (!streaming) {
+    const text = await response.text();
+    return { status: response.status, streaming, text, ended: Promise.resolve(), close: () => {} };
+  }
+  const reader = response.body?.getReader();
+  const ended = (async () => {
+    if (!reader) return;
+    try {
+      while (!(await reader.read()).done) {
+        // The acknowledgement and keep-alive comments only.
+      }
+    } catch {
+      // Ended by close().
+    }
+  })();
+  return {
+    status: response.status,
+    streaming,
+    text: '',
+    ended,
+    close: () => {
+      abort.abort();
+    },
+  };
+}
+
 /** The listening GET stream a 2025-era client keeps open on its session. */
 export async function openStream(
   relay: Relay,

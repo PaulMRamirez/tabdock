@@ -9,10 +9,11 @@
 // only as written, never as the URL parser would rewrite it. /mcp has two legs
 // behind those checks, composed as the SDK documents (ADR 0009): 2025-era
 // traffic goes to the sessionful leg in sessions.ts, everything else to a
-// strict 2026-07-28 handler. In public URL mode (ADR 0014) the public host
-// passes the Host check for /mcp and the QR flow at /pair (pair.ts) is served
-// behind the same check, while /page still takes only requests made on this
-// machine. Without a public URL, in local mode (ADR 0022) and with dev tokens
+// strict 2026-07-28 handler, whose subscriptions/listen streams pass the
+// relay's own bounds first (listen-streams.ts). In public URL mode (ADR 0014)
+// the public host passes the Host check for /mcp and the QR flow at /pair
+// (pair.ts) is served behind the same check, while /page still takes only
+// requests made on this machine. Without a public URL, in local mode (ADR 0022) and with dev tokens
 // alike, /mcp and /page take only requests made on this machine, so a tunnel
 // pointed at a loopback relay, even one that rewrites Host, cannot expose it.
 // Those checks trust a Host header any program can write, so they hold only
@@ -46,6 +47,7 @@ import {
   createMcpHandler,
   isLegacyRequest,
   type McpHandlerRequestOptions,
+  readRequestBody,
 } from '@modelcontextprotocol/server';
 import {
   AUDIT_VERSION,
@@ -77,10 +79,18 @@ import {
   resolveConfig,
 } from './config.ts';
 import { PageHub } from './hub.ts';
+import { ListenStreams } from './listen-streams.ts';
 import { createLogger, type Logger } from './log.ts';
-import { type AuthExtra, createMcpFactory, RELAY_VERSION, userIdOf } from './mcp.ts';
+import {
+  type AuthExtra,
+  AuthExtraSchema,
+  createMcpFactory,
+  createRequestBudget,
+  RELAY_VERSION,
+  userIdOf,
+} from './mcp.ts';
 import { createPairFlow, PAIR_ROUTES, type PairFlow } from './pair.ts';
-import { McpSessions } from './sessions.ts';
+import { type InviteeSessionOptions, McpSessions } from './sessions.ts';
 import { createSignInGate } from './sign-in-gate.ts';
 import { Spike, type SpikeControl } from './spike.ts';
 import { type AuditLog, callRecords, createMemoryStore, recordAudit } from './store.ts';
@@ -162,6 +172,29 @@ function errorClass(error: unknown): string {
  * most MAX_FRAME_BYTES, so a call cannot usefully carry more than about that.
  */
 const MAX_MCP_BODY_BYTES = 2 * MAX_FRAME_BYTES;
+
+/**
+ * A 2026-07-28 request that opens a subscriptions/listen stream: its parsed
+ * body, handed on to the SDK so it routes the very value read here, and its
+ * JSON-RPC id. null for anything else, including a body too large or not
+ * JSON, which the SDK answers itself.
+ */
+async function listenRequest(
+  request: Request,
+): Promise<{ message: Record<string, unknown>; id: unknown } | null> {
+  if (request.method !== 'POST') return null;
+  const body = await readRequestBody(request.clone(), MAX_MCP_BODY_BYTES);
+  if (body.tooLarge) return null;
+  let message: unknown;
+  try {
+    message = JSON.parse(body.text);
+  } catch {
+    return null;
+  }
+  if (typeof message !== 'object' || message === null || Array.isArray(message)) return null;
+  const fields = message as Record<string, unknown>;
+  return fields.method === 'subscriptions/listen' ? { message: fields, id: fields.id } : null;
+}
 
 /** Paths the relay answers whatever its mode; any other is logged as OTHER_ROUTE. */
 const FIXED_ROUTES: readonly string[] = ['/healthz', '/mcp', '/page', ...PAIR_ROUTES];
@@ -339,11 +372,16 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     }
   }
 
-  const factory = createMcpFactory(hub, config, spike);
+  // One request budget for the five tools and the listen streams alike (ADR 0018).
+  const budget = createRequestBudget(config);
+  const factory = createMcpFactory(hub, config, spike, budget);
   const mcp = createMcpHandler(factory, {
     legacy: 'reject',
     maxRequestBodySize: MAX_MCP_BODY_BYTES,
     keepAliveMs: config.timings.sseKeepAliveMs,
+    // The relay's own total for listen streams (listen-streams.ts), which
+    // refuses first; the SDK's 1024 would otherwise cap a larger setting.
+    maxSubscriptions: config.limits.sessions,
     onerror: (error) => {
       log.warn('mcp handler error', { error });
     },
@@ -351,29 +389,53 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   spike?.setModernNotifier(() => {
     mcp.notify.toolsChanged();
   });
+  // The invitee tier (ADRs 0016 and 0017), for 2025-era sessions and listen streams alike.
+  const invitees: InviteeSessionOptions = {
+    pool: config.limits.inviteeSessions,
+    perInvitee: config.limits.sessionsPerInvitee,
+    isInvitee: (userId) => InviteeIdSchema.safeParse(userId).success,
+    holds: (userId) => hub.holds(userId),
+  };
   const sessions = new McpSessions({
     createServer: (authInfo, request) => factory({ era: 'legacy', authInfo, requestInfo: request }),
     ownerOf: userIdOf,
     perUser: config.limits.sessionsPerUser,
     total: config.limits.sessions,
-    invitees: {
-      pool: config.limits.inviteeSessions,
-      perInvitee: config.limits.sessionsPerInvitee,
-      isInvitee: (userId) => InviteeIdSchema.safeParse(userId).success,
-      holds: (userId) => hub.holds(userId),
-    },
+    invitees,
     idleMs: config.timings.sessionIdleMs,
     keepAliveMs: config.timings.sseKeepAliveMs,
     maxRequestBodySize: MAX_MCP_BODY_BYTES,
     log,
   });
+  const listens = new ListenStreams({
+    perUser: config.limits.sessionsPerUser,
+    total: config.limits.sessions,
+    invitees,
+    budget,
+    windowMs: config.rateLimits.windowMs,
+    log,
+  });
+  /** The 2026-07-28 leg, with every listen stream through the relay's bounds first (A4.3). */
+  const modern = async (
+    request: Request,
+    options?: McpHandlerRequestOptions,
+  ): Promise<Response> => {
+    const listen = await listenRequest(request);
+    const extra = AuthExtraSchema.safeParse(options?.authInfo?.extra);
+    // Without an authenticated user the SDK's factory refuses the request anyway.
+    if (listen === null || !extra.success) return mcp.fetch(request, options);
+    const caller = { userId: extra.data.userId, kind: extra.data.kind };
+    return listens.open(caller, listen.id, request.signal, () =>
+      mcp.fetch(request, { ...options, parsedBody: listen.message }),
+    );
+  };
   const legs = {
     fetch: async (request: Request, options?: McpHandlerRequestOptions): Promise<Response> => {
       const legacy = await isLegacyRequest(request, undefined, {
         maxRequestBodySize: MAX_MCP_BODY_BYTES,
       });
       const forward = (forwarded: Request): Promise<Response> =>
-        legacy ? sessions.handle(forwarded, options?.authInfo) : mcp.fetch(forwarded, options);
+        legacy ? sessions.handle(forwarded, options?.authInfo) : modern(forwarded, options);
       const userId = userIdOf(options?.authInfo);
       return spike && userId !== null
         ? spike.observe(request, { userId, legacy }, forward)
