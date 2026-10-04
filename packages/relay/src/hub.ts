@@ -412,6 +412,16 @@ const MAX_ROSTER_CLIENTS = 20;
  * keep the operator's roster rows moving under their pointer.
  */
 export const EXPIRY_ROSTER_REFRESH_MS = 60_000;
+/**
+ * Promotions and minted invites one page may make together per rate-limit
+ * window. Each writes audit records the operator caused, which ADR 0019
+ * writes in full, and a page session needs no credential, so a page with
+ * one member attached could otherwise toggle a role or mint and cancel
+ * invites fast enough to rotate every other record out of the log. Ten a
+ * minute is more than a person clicking needs; what takes access away
+ * (a demotion, a revoke, a cancel) is never counted or refused.
+ */
+export const OPERATOR_GRANTS_PER_PAGE = 10;
 
 /**
  * Page error codes become SPEC section 7 codes. tool_error is not here: it
@@ -734,6 +744,10 @@ export class PageHub {
   readonly #inviteLimiter: SlidingWindowLimiter;
   /** One per live invite, keyed by inviteKey: fires at the invite's expiresAt. */
   readonly #inviteTimers = new Map<string, NodeJS.Timeout>();
+  /** Promotions and mints per page (OPERATOR_GRANTS_PER_PAGE), kept across its reconnects. */
+  readonly #grantLimiter: SlidingWindowLimiter;
+  /** One warning per page and window once its grants run out, so a flood writes no line per frame. */
+  readonly #grantWarnings: SlidingWindowLimiter;
   /** Refusals that reached no page pass this before the audit log (ADR 0019). */
   readonly #budget: AuditRefusalBudget;
   /** The M3 spike's pairing milestones (spike.ts), when TABDOCK_SPIKE is on. */
@@ -766,6 +780,8 @@ export class PageHub {
     this.#callLimiter = new SlidingWindowLimiter(callsPerUserPerPage, windowMs);
     this.#toolsFrameLimiter = new SlidingWindowLimiter(toolsFramesPerAddress, toolsFramesWindowMs);
     this.#inviteLimiter = new SlidingWindowLimiter(redemptionsPerInvite, windowMs);
+    this.#grantLimiter = new SlidingWindowLimiter(OPERATOR_GRANTS_PER_PAGE, windowMs);
+    this.#grantWarnings = new SlidingWindowLimiter(1, windowMs);
     this.#checker = new ArgumentChecker({ budgetMs: config.timings.argumentCheckMs, log });
     this.#budget = new AuditRefusalBudget({
       perUser: auditRefusalsPerUser,
@@ -1075,7 +1091,12 @@ export class PageHub {
       refuse('expired');
       return;
     }
-    if (this.#store.invites.listForPage(pageId).length >= MAX_LIVE_INVITES_PER_PAGE) {
+    // Past the page's grants, a mint is refused as one past the live limit is,
+    // so the adapter's invite() still settles and the page sees why.
+    if (
+      this.#store.invites.listForPage(pageId).length >= MAX_LIVE_INVITES_PER_PAGE ||
+      !this.#grantAllowed(pageId, now)
+    ) {
       refuse('limit');
       return;
     }
@@ -1118,6 +1139,26 @@ export class PageHub {
       uses: invite.uses,
     });
     this.#sendInvites(pageId);
+  }
+
+  /**
+   * Counts one promotion or mint against the page's OPERATOR_GRANTS_PER_PAGE,
+   * or says it is past them. Keyed by page id, which only pairing gives an
+   * attachment, so a page that starts a new session to reset it needs its
+   * members to pair again, which their own limits bound.
+   */
+  #grantAllowed(pageId: string, now: number): boolean {
+    if (this.#grantLimiter.allows(pageId, now)) {
+      this.#grantLimiter.record(pageId, now);
+      return true;
+    }
+    if (this.#grantWarnings.allows(pageId, now)) {
+      this.#grantWarnings.record(pageId, now);
+      this.#log.warn('promotion or invite refused: the page made too many this window', {
+        pageId,
+      });
+    }
+    return false;
   }
 
   /** Closes one invite's link; the attachments it already made stay (ADR 0017's notes). */
@@ -1931,7 +1972,13 @@ export class PageHub {
         userId: frame.userId,
       });
     }
-    const role = this.#cappedRole(pageId, frame.userId, wanted);
+    const capped = this.#cappedRole(pageId, frame.userId, wanted);
+    // A promotion gives access, so it counts against the page's grants; a
+    // demotion only takes access away and never waits on them.
+    const role =
+      capped === 'driver' && attachment.role !== 'driver' && !this.#grantAllowed(pageId, Date.now())
+        ? attachment.role
+        : capped;
     if (role !== attachment.role) {
       const previous = attachment.role;
       attachment.role = role;
@@ -2423,7 +2470,8 @@ export class PageHub {
     const now = Date.now();
     const limited = this.#pairingLimited(caller, 'qr', now);
     if (limited) return limited;
-    // /pair/claim refuses an invitee before it reads the nonce; this holds even so.
+    // After the attempt is counted and before the nonce is looked at, so an
+    // invitee's claim at /pair/claim neither spends nor rotates it (ADR 0017).
     const required = this.#inviteRequired(caller, 'qr');
     if (required) return required;
     const ticket = this.#pairTicket(nonce, now, true);
@@ -2991,6 +3039,27 @@ export class PageHub {
       else this.#budget.refused(record);
       this.#spike?.callFinished(pageId, caller.userId, auditOutcome);
     }
+  }
+
+  /**
+   * A call_page_tool whose own arguments do not fit its schema, a page id
+   * of 101 characters say, is a call refused before any page saw it, so it
+   * keeps its call line within the refusal budget like any other (S7, ADR
+   * 0019). The page and tool are the client's text, stored only when valid.
+   */
+  refusedMalformedCall(caller: CallerIdentity, page: string, pageTool: string): void {
+    this.#budget.refused({
+      v: AUDIT_VERSION,
+      type: 'call',
+      at: Date.now(),
+      pageId: auditPageId(page),
+      origin: this.#store.pages.get(page)?.origin ?? null,
+      userId: caller.userId,
+      client: caller.client,
+      tool: auditToolName(pageTool),
+      outcome: 'invalid_arguments',
+      durationMs: 0,
+    });
   }
 
   /**

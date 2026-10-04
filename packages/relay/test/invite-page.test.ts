@@ -149,6 +149,9 @@ describe('the preview at /i', () => {
     const limited = await phone.post('/i/preview', { secret });
     expect(limited).toMatchObject({ status: 429, data: { error: 'rate_limited' } });
     expect(limited.headers.get('retry-after')).toBe('60');
+    // Per invite: one link looked at to its limit leaves every other link's preview alone.
+    const other = await mintOk(page, { uses: 2 });
+    expect((await phone.post('/i/preview', { secret: other.secret })).status).toBe(200);
   });
 });
 

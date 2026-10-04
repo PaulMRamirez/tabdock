@@ -20,6 +20,7 @@ import {
   EMAIL_VERIFIED_CLAIM,
   JWKS_CACHE_MAX_AGE_MS,
   JWKS_COOLDOWN_MS,
+  MAX_TRACKED_REFUSALS,
   type OAuthAuthOptions,
   type Relay,
   SEEN_SESSIONS,
@@ -293,9 +294,54 @@ describe("a token session's first sighting (ADR 0020)", () => {
     }
   });
 
-  it('remembers at most the newest sessions it saw', () => {
-    expect(SEEN_SESSIONS).toBe(1000);
+  it('logs a token without a sid once per client_id, however many jti it brings', async () => {
+    await start();
+    for (let i = 0; i < 3; i += 1) {
+      expect((await discover(await token({ client_id: 'client_01ABC' }))).status).toBe(200);
+    }
+    expect((await discover(await token({ client_id: 'client_02DEF' }))).status).toBe(200);
+    const seen = events().filter((entry) =>
+      String(entry.msg).startsWith('oauth token shape, first sighting'),
+    );
+    expect(seen.map((entry) => [entry.clientId, entry.sessionId])).toEqual([
+      ['client_01ABC', 'missing'],
+      ['client_02DEF', 'missing'],
+    ]);
   });
+
+  it(`remembers the newest ${String(SEEN_SESSIONS)} sessions it saw, so an older one logs again`, async () => {
+    expect(SEEN_SESSIONS).toBe(1000);
+    const logged: string[] = [];
+    const auth = createOAuthAuth({
+      issuer: provider.issuer,
+      resource: PUBLIC_MCP_URL,
+      users: USERS,
+    });
+    await auth.start?.({ log: createLogger({ sink: (line) => logged.push(line) }) });
+    try {
+      const sightings = () =>
+        logged.filter((line) => line.includes('oauth token shape, first sighting')).length;
+      const seeSession = async (sid: string) => {
+        const bearer = await provider.token({ sub: 'sub-alice', aud: PUBLIC_MCP_URL, sid });
+        const outcome = await auth.authenticate({
+          headers: { authorization: `Bearer ${bearer}` },
+        } as unknown as IncomingMessage);
+        expect(outcome.kind).toBe('user');
+      };
+      await seeSession('session_first');
+      await seeSession('session_first');
+      expect(sightings()).toBe(1);
+      for (let i = 0; i < SEEN_SESSIONS; i += 1) await seeSession(`session_${String(i)}`);
+      expect(sightings()).toBe(1 + SEEN_SESSIONS);
+      // The newest are still remembered; the first fell out and logs its shape again.
+      await seeSession(`session_${String(SEEN_SESSIONS - 1)}`);
+      expect(sightings()).toBe(1 + SEEN_SESSIONS);
+      await seeSession('session_first');
+      expect(sightings()).toBe(2 + SEEN_SESSIONS);
+    } finally {
+      auth.stop?.();
+    }
+  }, 30_000);
 
   it('names a missing claim as missing, so the first production run shows the template is off', async () => {
     await start();
@@ -403,6 +449,29 @@ describe('the refusal line (ADR 0020)', () => {
     // A new minute writes the first line again.
     log.refused(refusal(401, 'Token has expired'), peer('192.0.2.1'));
     expect(parsed().at(-1)).toMatchObject({ msg: 'mcp request refused: not authenticated' });
+    log.close();
+  });
+
+  it(`tracks at most ${String(MAX_TRACKED_REFUSALS)} addresses a minute, and counts the rest together`, () => {
+    const logged: Record<string, unknown>[] = [];
+    const log = createAuthRefusalLog(
+      createLogger({ sink: (line) => logged.push(JSON.parse(line) as Record<string, unknown>) }),
+    );
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-04T00:00:10Z'));
+    const extra = 5;
+    for (let i = 0; i < MAX_TRACKED_REFUSALS + extra; i += 1) {
+      log.refused(
+        refusal(401, 'Token has expired'),
+        peer(`192.0.${String(i >> 8)}.${String(i & 255)}`),
+      );
+    }
+    const named = (msg: string) => logged.filter((entry) => entry.msg === msg);
+    expect(named('mcp request refused: not authenticated')).toHaveLength(MAX_TRACKED_REFUSALS);
+    vi.advanceTimersByTime(60_000);
+    expect(
+      named('mcp request refused: not authenticated, from more addresses than tracked'),
+    ).toEqual([expect.objectContaining({ repeated: extra })]);
     log.close();
   });
 

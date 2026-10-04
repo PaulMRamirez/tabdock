@@ -178,6 +178,20 @@ describe('the /mcp endpoint', () => {
       );
     }
     expect(tools.find((tool) => tool.name === 'list_pages')?.annotations?.readOnlyHint).toBe(true);
+    // The handlers check arguments themselves, after the request budget, yet
+    // clients are still shown each schema in full.
+    expect(tools.find((tool) => tool.name === 'call_page_tool')?.inputSchema).toMatchObject({
+      type: 'object',
+      properties: {
+        page: { type: 'string', minLength: 1, maxLength: 100 },
+        tool: { type: 'string', minLength: 1, maxLength: 200 },
+        arguments: { type: 'object', default: {} },
+      },
+      required: ['page', 'tool'],
+    });
+    expect(tools.find((tool) => tool.name === 'pair_page')?.inputSchema).toMatchObject({
+      properties: { code: { maxLength: 64 }, invite: { maxLength: 300 } },
+    });
   });
 
   it('asks Claude Code to keep a full-size result inline for both tools that return page content', async () => {

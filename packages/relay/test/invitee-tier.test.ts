@@ -9,7 +9,7 @@
 
 import type { Client } from '@modelcontextprotocol/client';
 import { AuditEventSchema } from '@tabdock/protocol';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   type AttachmentRecord,
   AuditRefusalBudget,
@@ -17,6 +17,7 @@ import {
   createDevTokenAuth,
   createMemoryStore,
   type DevTokenUser,
+  MAX_STRANGERS_COUNTED,
   type RelayStore,
 } from '../src/index.ts';
 import { connectPage, type TestPage, TOOLS } from './helpers/page-client.ts';
@@ -288,6 +289,59 @@ describe('the request budget (S9, ADR 0018)', () => {
       expect.objectContaining({ type: 'attach_refused', via: 'code', outcome: 'rate_limited' }),
     );
   });
+
+  it('counts a call whose arguments fail the tool schema, which the SDK would otherwise answer for free', async () => {
+    const { relay } = await setup({ rateLimits: { requestsPerUser: 3, requestsPerInvitee: 2 } });
+    const g1 = await client(G1);
+    // Each fails the schema clients are shown, and is still answered as a tool error.
+    expect((await callTool(g1, 'list_page_tools', { page: 'p'.repeat(101) })).text).toMatch(
+      /^invalid_arguments: /,
+    );
+    expect((await callTool(g1, 'pair_page', { code: 'C'.repeat(65) })).text).toMatch(
+      /^invalid_arguments: /,
+    );
+    // Both counted, so the budget of 2 is spent.
+    expect((await callTool(g1, 'list_pages')).text).toMatch(/^rate_limited: /);
+    // Past it, a call with bad arguments is refused like any other, with its own record.
+    expect((await callTool(g1, 'call_page_tool', { page: 7, tool: 'x' })).text).toMatch(
+      /^rate_limited: /,
+    );
+    expect((await callTool(g1, 'pair_page', { invite: 'i'.repeat(301) })).text).toMatch(
+      /^rate_limited: /,
+    );
+    const alice = await client(ALICE);
+    for (let i = 0; i < 2; i += 1) {
+      expect((await callTool(alice, 'detach_page', { page: '' })).text).toMatch(
+        /^invalid_arguments: /,
+      );
+    }
+    // A malformed call is still a call refused before any page, with a line of its own (S7).
+    const long = { page: 'p'.repeat(101), tool: 'get_view' };
+    expect((await callTool(alice, 'call_page_tool', long)).text).toMatch(/^invalid_arguments: /);
+    expect((await callTool(alice, 'list_pages')).text).toMatch(/^rate_limited: /);
+    const recordsOf = (user: DevTokenUser) =>
+      relay.audit.events().filter((event) => 'userId' in event && event.userId === user.userId);
+    for (const event of relay.audit.events()) expect(AuditEventSchema.parse(event)).toEqual(event);
+    expect(recordsOf(G1)).toEqual([
+      expect.objectContaining({ type: 'request_refused', tool: 'list_pages' }),
+      expect.objectContaining({
+        type: 'call',
+        pageId: '(invalid, 0 chars)',
+        tool: 'x',
+        outcome: 'rate_limited',
+      }),
+      expect.objectContaining({ type: 'attach_refused', via: 'invite', outcome: 'rate_limited' }),
+    ]);
+    expect(recordsOf(ALICE)).toEqual([
+      expect.objectContaining({
+        type: 'call',
+        pageId: '(invalid, 101 chars)',
+        tool: 'get_view',
+        outcome: 'invalid_arguments',
+      }),
+      expect.objectContaining({ type: 'request_refused', tool: 'list_pages' }),
+    ]);
+  });
 });
 
 describe('the refusal budget in front of the audit log (S7, ADR 0019)', () => {
@@ -348,6 +402,26 @@ describe('the refusal budget in front of the audit log (S7, ADR 0019)', () => {
     expect(events.filter((event) => event.type === 'refused_summary')).toHaveLength(2);
   });
 
+  it('writes its summaries every window while the relay runs, not only as it closes', async () => {
+    const { relay } = await setup({ rateLimits: { windowMs: 400, auditRefusalsPerUser: 1 } });
+    const alice = await client(ALICE);
+    for (let i = 0; i < 5; i += 1) {
+      await callTool(alice, 'call_page_tool', { page: 'pg_NOPE000000', tool: 'get_view' });
+    }
+    // No close() here: a relay that runs for days, or dies, must still have counted them.
+    await vi.waitFor(
+      () => {
+        const summaries = relay.audit
+          .events()
+          .flatMap((event) => (event.type === 'refused_summary' ? [event.scope] : []));
+        expect(summaries).toContainEqual(
+          expect.objectContaining({ kind: 'user', userId: ALICE.userId }),
+        );
+      },
+      { timeout: 3000 },
+    );
+  });
+
   it('always writes a call that reached its page in full', async () => {
     const { relay } = await setup();
     const opened = await page();
@@ -395,5 +469,42 @@ describe('the refusal budget in front of the audit log (S7, ADR 0019)', () => {
     expect(summary.scope.busiest[0]?.userId).toBe(guest(25).userId);
     // Guest 1 wrote its one line; guests 2 to 5, the quietest, are counted together.
     expect(summary.scope.others).toEqual({ accounts: 4, counts: { rate_limited: 2 + 3 + 4 + 5 } });
+  });
+
+  it(`holds at most ${String(MAX_STRANGERS_COUNTED)} strangers by name a window, counting the rest as they come`, () => {
+    const written: unknown[] = [];
+    const budget = new AuditRefusalBudget({
+      perUser: 1,
+      strangers: 1,
+      windowMs: 60_000,
+      holds: () => false,
+      write: (event) => written.push(event),
+    });
+    const refuse = (n: number) => {
+      budget.refused({
+        v: 1,
+        type: 'request_refused',
+        at: 0,
+        userId: guest(n).userId,
+        kind: 'invitee',
+        client: null,
+        tool: 'list_pages',
+        pageId: null,
+        outcome: 'rate_limited',
+      });
+    };
+    // The first writes its line; the next fill the pool exactly.
+    for (let n = 1; n <= MAX_STRANGERS_COUNTED + 1; n += 1) refuse(n);
+    // Past the pool, each refusal counts as an account of its own, so one stranger twice is two.
+    refuse(MAX_STRANGERS_COUNTED + 2);
+    refuse(MAX_STRANGERS_COUNTED + 2);
+    budget.close();
+    expect(written).toHaveLength(2);
+    const summary = written.at(-1) as {
+      scope: { busiest: { userId: string }[]; others: { accounts: number; counts: object } };
+    };
+    expect(summary.scope.busiest).toHaveLength(20);
+    const past = MAX_STRANGERS_COUNTED - 20 + 2;
+    expect(summary.scope.others).toEqual({ accounts: past, counts: { rate_limited: past } });
   });
 });

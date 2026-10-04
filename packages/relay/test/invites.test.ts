@@ -14,6 +14,7 @@ import {
   MIN_INVITE_REMAINING_MS,
 } from '@tabdock/protocol';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { OPERATOR_GRANTS_PER_PAGE } from '../src/hub.ts';
 import { emailBarDigest } from '../src/index.ts';
 import {
   attachMember,
@@ -26,6 +27,7 @@ import {
   mintOk,
   newSecret,
   redeem,
+  settledAtI,
   signedInAtI,
   startInviteRelay,
 } from './helpers/invites.ts';
@@ -237,6 +239,31 @@ describe('S14: at most 10 live per page, each for at most 24 hours and 20 uses',
   });
 });
 
+describe('S14: an invite closes at its expiry', () => {
+  it('leaves the list, frees its live slot and is recorded as expired', async () => {
+    const { relay, page } = await sharedPage();
+    for (let i = 1; i < MAX_LIVE_INVITES_PER_PAGE; i += 1) await mintOk(page);
+    // The relay's own timer, faked from the mint on, so the test need not wait a minute.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const short = await mintOk(page, { expiresAt: Date.now() + MIN_INVITE_REMAINING_MS + 1000 });
+    expect((await mint(page)).answer.refused?.reason).toBe('limit');
+    vi.advanceTimersByTime(MIN_INVITE_REMAINING_MS + 2000);
+    const listed = (await latest(page, 'invites')).invites.map((invite) => invite.inviteId);
+    expect(listed).toHaveLength(MAX_LIVE_INVITES_PER_PAGE - 1);
+    expect(listed).not.toContain(short.inviteId);
+    expect(relay.store.invites.get(page.pageId, short.inviteId)).toBeUndefined();
+    expect(relay.relay.audit.events()).toContainEqual(
+      expect.objectContaining({
+        type: 'invite_closed',
+        inviteId: short.inviteId,
+        reason: 'expired',
+      }),
+    );
+    // Its slot is free again, a minute after the mints that filled it.
+    await mintOk(page);
+  });
+});
+
 describe('S14: watch invites approve observers in advance', () => {
   it('reach the page as a request via invite with the presented secret, even under autoApprove', async () => {
     const relay = await setup();
@@ -288,15 +315,24 @@ describe('S14: watch invites approve observers in advance', () => {
   });
 
   it('grant no more than the invite role: a watch guest is never promoted', async () => {
-    const { relay, page } = await sharedPage();
+    const relay = await setup();
+    // Driver seats to spare, so only the invite's role can hold the guest back.
+    const page = await relay.page({ policy: { invites: 'all', maxDrivers: 3 } });
+    await attachMember(await relay.claude('sub-alice'), page);
     const { link } = await mintOk(page);
     const guest = await relay.claude(GUEST, GUEST_EMAIL);
-    const { request } = await redeem(guest, page, link);
+    const { request } = await redeem(guest, page, link, { allow: true, role: 'driver' });
+    const roleOf = async (userId: string) =>
+      (await latest(page, 'roster')).attachments.find((entry) => entry.userId === userId)?.role;
+    expect(await roleOf(request.user.userId)).toBe('observer');
     page.send({ t: 'set_role', userId: request.user.userId, role: 'driver' });
-    const roster = await latest(page, 'roster');
-    expect(roster.attachments.find((entry) => entry.userId === request.user.userId)?.role).toBe(
-      'observer',
-    );
+    expect(await roleOf(request.user.userId)).toBe('observer');
+    // A member let in by a watch invite is held to it too, while seats are free.
+    const bobLink = await mintOk(page);
+    const bob = await relay.claude('sub-bob');
+    await redeem(bob, page, bobLink.link, { allow: true, role: 'driver' });
+    page.send({ t: 'set_role', userId: 'bob', role: 'driver' });
+    expect(await roleOf('bob')).toBe('observer');
     // The relay refuses its writes (S5), whatever the page might do.
     const write = { page: page.pageId, tool: 'add_item', arguments: { label: 'x' } };
     expect((await call(guest, 'call_page_tool', write)).text).toMatch(/^role_denied: /);
@@ -524,6 +560,25 @@ describe('S14: revoking an invitee bars that account and its verified email from
     });
   });
 
+  it('refuses on approval a redemption that was waiting when its verified email was barred', async () => {
+    const { relay, page } = await sharedPage();
+    const { secret } = await mintOk(page, { uses: 5 });
+    const first = await signedInAtI(relay, GUEST, GUEST_EMAIL);
+    const { request } = await joinAtI(first, page, secret);
+    // The same address under a new subject, its redemption waiting on the operator.
+    const again = await signedInAtI(relay, 'sub-guest-again', 'Guest@Example.COM');
+    const claimed = await again.post('/i/claim', { secret });
+    expect(claimed.status).toBe(200);
+    const waiting = await page.next('attach_request');
+    page.send({ t: 'revoke', userId: request.user.userId });
+    page.send({ t: 'attach_decision', requestId: waiting.requestId, allow: true });
+    expect(await settledAtI(again, String(claimed.data.claim))).toEqual({ status: 'expired' });
+    expect(relay.store.attachments.get(page.pageId, waiting.user.userId)).toBeUndefined();
+    expect((await latest(page, 'roster')).attachments.map((entry) => entry.userId)).toEqual([
+      'alice',
+    ]);
+  });
+
   it('bars someone whose redemption was still waiting', async () => {
     const { relay, page } = await sharedPage();
     const { link, inviteId } = await mintOk(page);
@@ -570,6 +625,8 @@ describe("S14: when a sponsor's attachment ends, so do its invites and the attac
         clearInterval(keepAlive);
       }
       expect((await call(guest, 'list_pages')).structured).toEqual({ pages: [] });
+      // The page hears its invites closed, as on every change (ADR 0017).
+      expect((await latest(page, 'invites')).invites).toEqual([]);
       const late = await signedInAtI(relay, 'sub-late', 'late@example.com');
       expect((await late.post('/i/claim', { secret: first.secret })).status).toBe(404);
       // Bob's own attachment stays: only what Alice's invites made ended with her.
@@ -759,6 +816,39 @@ describe("S14: pair_page and /pair/claim answer an invitee's pairing code with i
     await page.sync();
     expect(page.all('pairing')).toHaveLength(pairings);
     expect(page.all('attach_request')).toHaveLength(1);
+    // Counted and recorded as pair_page's would be (ADR 0019), with no page named.
+    const refusals = () =>
+      relay.relay.audit
+        .events()
+        .flatMap((event) =>
+          event.type === 'attach_refused' && event.kind === 'invitee' ? [event] : [],
+        );
+    expect(refusals()).toEqual([
+      expect.objectContaining({ via: 'qr', outcome: 'invite_required', pageId: null }),
+    ]);
+    // The per-user pairing limit (10 a minute) counts these too.
+    for (let i = 2; i <= 10; i += 1) {
+      expect((await phone.claim(page.nonce)).data.error).toBe('invite_required');
+    }
+    expect(await phone.claim(page.nonce)).toMatchObject({
+      status: 429,
+      data: { error: 'rate_limited' },
+    });
+    await page.sync();
+    expect(page.all('pairing')).toHaveLength(pairings);
+    // Ten lines for a stranger, then its refusals go into the window's summary.
+    expect(refusals()).toHaveLength(10);
+    await relay.close();
+    const guestId = refusals()[0]?.userId;
+    expect(relay.relay.audit.events()).toContainEqual(
+      expect.objectContaining({
+        type: 'refused_summary',
+        scope: expect.objectContaining({
+          kind: 'relay',
+          busiest: [{ userId: guestId, counts: { rate_limited: 1 } }],
+        }) as unknown,
+      }),
+    );
   });
 
   it('on pair_page, before the code is matched, so it is neither spent nor rotated', async () => {
@@ -810,6 +900,56 @@ describe('S7: what invites leave in the audit log (ADR 0019)', () => {
       expect(all).not.toContain(kept);
     }
     expect(all).toContain('"msg":"invite_redeemed"');
+  });
+});
+
+describe('S7: a page cannot flush the audit log with operator frames (ADR 0019)', () => {
+  it('bounds the promotions and mints a page makes, while what takes access away always goes through', async () => {
+    const relay = await setup();
+    // Free driver seats, so every promotion would change a role and write a record.
+    const page = await relay.page({ policy: { invites: 'all', maxDrivers: 3 } });
+    await attachMember(await relay.claude('sub-alice'), page, 'observer');
+    for (let i = 0; i < 200; i += 1) {
+      page.send({ t: 'set_role', userId: 'alice', role: i % 2 === 0 ? 'driver' : 'observer' });
+      page.send({
+        t: 'invite_create',
+        inviteId: `inv_flood_${String(i)}`,
+        role: 'observer',
+        label: 'Flood',
+        uses: 1,
+        expiresAt: null,
+        secretHash: newSecret().hash,
+      });
+      page.send({ t: 'invite_cancel', inviteId: `inv_flood_${String(i)}` });
+    }
+    await page.sync();
+    const events = relay.relay.audit.events();
+    const count = (type: string, extra: (event: (typeof events)[number]) => boolean = () => true) =>
+      events.filter((event) => event.type === type && extra(event)).length;
+    const promotions = count('role', (event) => 'role' in event && event.role === 'driver');
+    const minted = count('invite_minted');
+    // Promotions and mints share the page's budget; demotions and cancels follow what they
+    // undo, the demotion after the last promotion included, though it came past the budget.
+    expect(promotions + minted).toBe(OPERATOR_GRANTS_PER_PAGE);
+    expect(count('role')).toBe(2 * promotions);
+    expect(count('invite_closed')).toBe(minted);
+    // Past it, a mint is refused like one past the live limit, so invite() still settles.
+    const answers = page.all('invites').filter((frame) => frame.refused !== undefined);
+    expect(answers.at(-1)?.refused).toEqual({ inviteId: 'inv_flood_199', reason: 'limit' });
+    // A promotion past it is refused, and the roster shows the role unchanged.
+    page.send({ t: 'set_role', userId: 'alice', role: 'driver' });
+    expect((await latest(page, 'roster')).attachments[0]?.role).toBe('observer');
+    // The budget is a window's: the next one promotes again.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + 61_000);
+    page.send({ t: 'set_role', userId: 'alice', role: 'driver' });
+    expect((await latest(page, 'roster')).attachments[0]?.role).toBe('driver');
+    vi.useRealTimers();
+    // Revoke is never refused (S8).
+    page.send({ t: 'revoke', userId: 'alice' });
+    expect((await latest(page, 'roster')).attachments).toEqual([]);
+    // The flood itself left one warning, not a line per frame.
+    expect(relay.lines.filter((line) => line.includes('the page made too many'))).toHaveLength(1);
   });
 });
 

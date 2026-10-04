@@ -763,21 +763,11 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
       refuse(response, 401, 'sign_in_required', 'sign in to join a page');
       return;
     }
-    // Before the nonce is even read, so someone who may not pair cannot use one up.
-    if (session.user.account.kind !== 'member') {
-      if (config.invites) {
-        // ADR 0016: a code seen on a shared screen summons no prompt from a stranger.
-        log.info('pair claim refused: an invitee offered a pairing code');
-        refuse(
-          response,
-          403,
-          'invite_required',
-          "this account joins pages only by invite; ask the page's operator for an invite link",
-        );
-      } else {
-        log.info('pair claim refused: the account is not a member');
-        refuse(response, 403, 'not_allowed', 'this account is not allowed on this relay');
-      }
+    // With invites off this relay admits no one but members (ADR 0013), so
+    // anyone else is turned away before the nonce is even read.
+    if (session.user.account.kind !== 'member' && !config.invites) {
+      log.info('pair claim refused: the account is not a member');
+      refuse(response, 403, 'not_allowed', 'this account is not allowed on this relay');
       return;
     }
     const body = NonceBodySchema.safeParse(await readJson(request, response));
@@ -793,6 +783,11 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
       return;
     }
     const { user } = session;
+    // An invitee's claim goes to the hub as well, which counts it against the
+    // user's pairing limit and records its refusal as pair_page's would, then
+    // answers invite_required before the nonce is looked at, so the nonce is
+    // neither spent nor rotated and a code seen on a shared screen summons no
+    // prompt from a stranger (ADRs 0016 and 0019).
     const outcome = hub.claimPairNonce(callerOf(user), body.data.nonce);
     if (outcome.kind === 'error') {
       refuse(response, claimRefusalStatus(outcome.code), outcome.code, outcome.message);

@@ -636,7 +636,9 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
    * ADR 0020: the first time a token session shows up, its shape, so the
    * owner's first production run settles what the provider really issues: the
    * lifetime, the client and the JSON types of the two email claims. Never
-   * a claim's value, the sid or the subject.
+   * a claim's value, the sid or the subject. A token without a sid counts as
+   * its client_id's session, never its jti's, since every token brings a new
+   * jti and a line per token would grow with the traffic.
    */
   const firstSighting = (payload: JWTPayload, lifetimeSeconds: number): void => {
     const clientId = OAuthClientIdSchema.safeParse(payload.client_id);
