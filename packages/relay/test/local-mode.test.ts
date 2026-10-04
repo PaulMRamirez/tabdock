@@ -247,6 +247,18 @@ describe('a plugin marked loopbackOnly, whatever its name', () => {
 const dns = createRequire(import.meta.url)('node:dns') as typeof Dns;
 
 /**
+ * Takes out the stub resolveLocalhostTo installed, while one is in. A test
+ * that times out is abandoned, not stopped, so its own `finally` may come
+ * only after the next test has started; this hook puts the real resolver
+ * back before that test can see the stub.
+ */
+let removeStub: (() => void) | null = null;
+
+afterEach(() => {
+  removeStub?.();
+});
+
+/**
  * Makes every resolver in this process answer `localhost` with `addresses`,
  * as a hosts file that maps it elsewhere would (the review's probe bound one
  * over /etc/hosts in a private mount namespace), until the returned function
@@ -255,6 +267,8 @@ const dns = createRequire(import.meta.url)('node:dns') as typeof Dns;
  * stray lookup shows.
  */
 function resolveLocalhostTo(addresses: string[]): () => void {
+  // One stub at a time, so what is saved below is always the real resolver.
+  removeStub?.();
   const answerFor = (hostname: string): Dns.LookupAddress[] | Error => {
     if (isIP(hostname) !== 0) return [{ address: hostname, family: isIP(hostname) }];
     if (hostname !== 'localhost' || addresses.length === 0) {
@@ -286,11 +300,16 @@ function resolveLocalhostTo(addresses: string[]): () => void {
     return Promise.resolve(wantsAll(options) ? answer : answer[0]);
   }) as unknown as typeof dns.promises.lookup;
   syncBuiltinESMExports();
-  return () => {
+  const restore = (): void => {
+    // A late restore from an abandoned test must not pull a later test's stub.
+    if (removeStub !== restore) return;
+    removeStub = null;
     dns.lookup = lookup;
     dns.promises.lookup = promised;
     syncBuiltinESMExports();
   };
+  removeStub = restore;
+  return restore;
 }
 
 /** A port nothing listens on, found by listening on it once. */
@@ -333,7 +352,11 @@ describe('the address the relay listens on (S12, ADR 0022)', () => {
     );
   }
 
-  it('is checked, not the name: localhost resolving off loopback is refused before anything listens', async () => {
+  // Four rounds, each drawing a token file and starting two relays: about 1.4 s
+  // alone, but past vitest's default 5 s on a loaded machine, hence its own timeout.
+  it('is checked, not the name: localhost resolving off loopback is refused before anything listens', async ({
+    signal,
+  }) => {
     for (const addresses of [['0.0.0.0'], ['192.0.2.2'], ['127.0.0.1', '0.0.0.0'], ['::']]) {
       const label = addresses.join();
       const port = await vacantPort();
@@ -343,6 +366,9 @@ describe('the address the relay listens on (S12, ADR 0022)', () => {
         TABDOCK_PORT: String(port),
       });
       expect(local.auth.loopbackOnly).toBe(true);
+      // Once vitest has given up on this test, stop before stubbing the resolver
+      // under whichever test runs next.
+      if (signal.aborted) return;
       const restore = resolveLocalhostTo(addresses);
       let refused: string;
       let refusedWithDevTokens: string;
@@ -364,7 +390,7 @@ describe('the address the relay listens on (S12, ADR 0022)', () => {
       }
       expect(await accepts(port), label).toBe(false);
     }
-  });
+  }, 30_000);
 
   it('localhost that resolves to loopback still serves, on the very address it resolved to', async () => {
     const restore = resolveLocalhostTo(['127.0.0.1']);

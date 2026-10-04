@@ -15,7 +15,7 @@ import {
 } from '@tabdock/protocol';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { OPERATOR_GRANTS_PER_PAGE } from '../src/hub.ts';
-import { emailBarDigest } from '../src/index.ts';
+import { DEFAULT_RATE_LIMITS, emailBarDigest } from '../src/index.ts';
 import {
   attachMember,
   call,
@@ -53,6 +53,11 @@ async function setup(options: Parameters<typeof startInviteRelay>[0] = {}): Prom
 
 const GUEST = 'sub-guest';
 const GUEST_EMAIL = 'guest@example.com';
+/**
+ * The window a page's promotions and mints count in (OPERATOR_GRANTS_PER_PAGE);
+ * a mint past them is refused as `limit`, as one past the live limit is.
+ */
+const GRANT_WINDOW_MS = DEFAULT_RATE_LIMITS.windowMs;
 
 /** A relay, a page that allows control invites, and Alice attached as its driver. */
 async function sharedPage(options: Parameters<typeof startInviteRelay>[0] = {}) {
@@ -162,7 +167,17 @@ describe('S14: at most 10 live per page, each for at most 24 hours and 20 uses',
     for (let i = 0; i < MAX_LIVE_INVITES_PER_PAGE; i += 1) {
       ids.push((await mintOk(page, { uses: 20 })).inviteId);
     }
+    // Ten mints also spend the page's grants for this window, and a mint past
+    // those is refused with the same reason, so the clock moves past the window
+    // first: what refuses the eleventh is then the live limit alone.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + GRANT_WINDOW_MS + 1000);
     expect((await mint(page)).answer.refused?.reason).toBe('limit');
+    // A slot freed takes the next mint, and the one after is refused again.
+    page.send({ t: 'invite_cancel', inviteId: ids.pop() ?? '' });
+    await mintOk(page);
+    expect((await mint(page)).answer.refused?.reason).toBe('limit');
+    expect((await latest(page, 'invites')).invites).toHaveLength(MAX_LIVE_INVITES_PER_PAGE);
     expect((await mint(page, { inviteId: ids[0] ?? '' })).answer.refused?.reason).toBe('duplicate');
 
     const other = await relay.page({ policy: { invites: 'all' } });
@@ -246,8 +261,12 @@ describe('S14: an invite closes at its expiry', () => {
     // The relay's own timer, faked from the mint on, so the test need not wait a minute.
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     const short = await mintOk(page, { expiresAt: Date.now() + MIN_INVITE_REMAINING_MS + 1000 });
+    // Past the window the ten mints' grants count in, and short of the short
+    // invite's end, so the live limit alone refuses.
+    expect(GRANT_WINDOW_MS + 500).toBeLessThan(MIN_INVITE_REMAINING_MS + 1000);
+    vi.advanceTimersByTime(GRANT_WINDOW_MS + 500);
     expect((await mint(page)).answer.refused?.reason).toBe('limit');
-    vi.advanceTimersByTime(MIN_INVITE_REMAINING_MS + 2000);
+    vi.advanceTimersByTime(MIN_INVITE_REMAINING_MS + 2000 - (GRANT_WINDOW_MS + 500));
     const listed = (await latest(page, 'invites')).invites.map((invite) => invite.inviteId);
     expect(listed).toHaveLength(MAX_LIVE_INVITES_PER_PAGE - 1);
     expect(listed).not.toContain(short.inviteId);
@@ -259,8 +278,10 @@ describe('S14: an invite closes at its expiry', () => {
         reason: 'expired',
       }),
     );
-    // Its slot is free again, a minute after the mints that filled it.
+    // Its slot is free again, and only the one: the next mint, a single grant
+    // into this window, meets the live limit.
     await mintOk(page);
+    expect((await mint(page)).answer.refused?.reason).toBe('limit');
   });
 });
 
@@ -640,6 +661,50 @@ describe("S14: when a sponsor's attachment ends, so do its invites and the attac
       expect(events).toContainEqual(
         expect.objectContaining({ type: 'expire', reason: 'sponsor_gone' }),
       );
+    },
+    15_000,
+  );
+
+  it.each(['pair_page', '/i'] as const)(
+    'and stay ended when the sponsor redeems one through %s after their own end, before its timer fires',
+    async (route) => {
+      // An idle end the test never waits for, with only Date stepped past it: the
+      // gap between an attachment's expiresAt and the timer that ends it, which a
+      // busy event loop widens. The redemption is what notices the end, and closes
+      // the invite under the very redemption that presented it.
+      const idleMs = 30 * 60_000;
+      const { relay, page } = await sharedPage({ timings: { attachmentIdleMs: idleMs } });
+      const minted = await mintOk(page, { uses: route === 'pair_page' ? 1 : 3 });
+      await page.sync();
+      const asked = page.all('attach_request').length;
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(Date.now() + idleMs + 60_000);
+      if (route === 'pair_page') {
+        const alice = await relay.claude('sub-alice');
+        expect((await call(alice, 'pair_page', { invite: minted.link })).text).toBe(
+          'pairing_expired: this invite is invalid, used up or expired',
+        );
+      } else {
+        const alice = await signedInAtI(relay, 'sub-alice', null);
+        expect((await alice.post('/i/claim', { secret: minted.secret })).status).toBe(404);
+        // Nor does a stranger get in by its other uses.
+        const guest = await signedInAtI(relay, GUEST, GUEST_EMAIL);
+        expect((await guest.post('/i/claim', { secret: minted.secret })).status).toBe(404);
+      }
+      // The page never hears a redemption of an invite that closed, and the
+      // invite does not come back: not in the store, the list or the audit log.
+      await page.sync();
+      expect(page.all('attach_request')).toHaveLength(asked);
+      expect(relay.store.invites.get(page.pageId, minted.inviteId)).toBeUndefined();
+      expect((await latest(page, 'invites')).invites).toEqual([]);
+      expect(relay.store.attachments.listForPage(page.pageId)).toEqual([]);
+      const events = relay.relay.audit.events();
+      expect(
+        events.filter(
+          (event) => event.type === 'invite_closed' && event.inviteId === minted.inviteId,
+        ),
+      ).toEqual([expect.objectContaining({ reason: 'sponsor_gone' })]);
+      expect(events.filter((event) => event.type === 'invite_redeemed')).toEqual([]);
     },
     15_000,
   );
