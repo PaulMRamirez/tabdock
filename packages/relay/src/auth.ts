@@ -194,6 +194,11 @@ export interface ProviderEndpoints {
   jwks_uri: string;
   response_types_supported: string[];
   token_endpoint_auth_methods_supported?: string[] | undefined;
+  /**
+   * Where /pair and /i ask for the email when the ID token carries none
+   * (ADR 0020); absent when the provider lists none, or none over https.
+   */
+  userinfo_endpoint?: string | undefined;
 }
 
 /**
