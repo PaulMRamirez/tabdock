@@ -106,7 +106,7 @@ The zone ends up with `A` and `AAAA` records for `relay`, the `_acme-challenge.r
 
 Every setting that names your domain, accounts or credentials is a secret of the GitHub `production` environment, and nowhere else you maintain. Not in the repository, which is public. Not as an environment variable, which GitHub prints unmasked in logs. Not as a repository secret, which any workflow could read without your approval. GitHub redacts secrets printed to logs, though not reliably once a value is transformed, so the workflows never print them. Redaction also cuts the other way: GitHub hides every occurrence of a secret's value in a job's log, with no minimum length, so a setting that names nothing of yours stays out of the secrets (a secret of `1` would turn every `1` in the deploy log, digests and Machine IDs included, into `***`).
 
-After your approval, the deploy workflow (workstream C) copies the relay's settings into Fly's secret store, which encrypts them, never logs them, and hands them to the Machine as environment variables at boot. flyctl can stage them from standard input with `fly secrets import --stage`, so no value appears on a command line, and the deploy that follows applies them. Fly's store keeps its own copy: deleting a secret at GitHub leaves it at Fly until the workflow or `fly secrets unset` (C) removes it. `FLY_API_TOKEN` and `FLY_APP` stay on the runner and never reach the relay.
+After your approval, the deploy workflow (`.github/workflows/deploy.yml`) copies the relay's settings into Fly's secret store, which encrypts them, never logs them, and hands them to the Machine as environment variables at boot. flyctl can stage them from standard input with `fly secrets import --stage`, so no value appears on a command line, and the deploy that follows applies them. Fly's store keeps its own copy: deleting a secret at GitHub leaves it at Fly until the workflow or `fly secrets unset` (C) removes it. `FLY_API_TOKEN` and `FLY_APP` stay on the runner and never reach the relay.
 
 A changed setting takes effect only with a deploy, and every deploy restarts the relay: pages reconnect as new sessions, everyone pairs again and live invite links die, while Claude stays signed in (ADR 0019). Batch changes where you can.
 
@@ -128,7 +128,7 @@ A changed setting takes effect only with a deploy, and every deploy restarts the
 
 ### Settings in the repository
 
-Settings that are the same for anyone deploying this way and name nothing of yours live in `deploy/fly/fly.toml` (ADR 0018), where each change is a pull request you review: `TABDOCK_ENV=production`, `TABDOCK_HOST=0.0.0.0`, the port, `TABDOCK_AUDIT_DIR` on the volume's mount, and the three below. Workstream C writes the file; these are the values it will hold. See the `fly.toml` section below.
+Settings that are the same for anyone deploying this way and name nothing of yours live in `deploy/fly/fly.toml` (ADR 0018), where each change is a pull request you review: `TABDOCK_ENV=production`, `TABDOCK_HOST=0.0.0.0`, the port, `TABDOCK_AUDIT_DIR` on the volume's mount, and the three below. See the `fly.toml` section below.
 
 **`TABDOCK_INVITES`**, set to `1` to turn invites on (ADRs 0016 and 0017): a signed-in account off the allowlist becomes an invitee instead of getting 403, and members can mint watch invites in the widget, and control invites only on pages that allow them (`policy.invites: 'all'`; the default is `watch`). Delete the line in a pull request and deploy to turn invites off again.
 
@@ -146,32 +146,91 @@ Settings that are the same for anyone deploying this way and name nothing of you
 
 ## The image
 
-_Placeholder, filled by workstream C with the code:_ the Dockerfile at the root, its build and runtime bases pinned by digest, what CI builds, scans, smoke-tests and attests, and how to check an image with `gh attestation verify`.
+The `Dockerfile` at the root names no host, provider or domain; every setting is an environment variable. It builds on `node:22-bookworm-slim` and runs on `gcr.io/distroless/nodejs22-debian13:nonroot`, both pinned by digest (looked up on 4 October 2026). The build stage runs `pnpm install --prod --frozen-lockfile --filter '@tabdock/relay...'` from the lockfile and copies only the relay's and protocol's sources; `.dockerignore` lets nothing else into the build context, so a local `.env`, owner token or audit file can never reach a layer. The relay has no build step, since Node 22 strips TypeScript types itself. The runtime image has no shell or package manager, holds about 58 MB, runs as uid 65532 and owns none of its files, so the root file system can be read-only and only the audit directory needs to be writable. Its command is exec form, `node --max-old-space-size=192 packages/relay/src/main.ts`, so `SIGTERM` reaches the relay, which closes in well under a second; the heap cap holds the default `TABDOCK_MAX_TOOL_BYTES` (64 MiB of what tool lists hold, an upper bound on their heap rather than their size on the wire) with room to spare, which a test checks by filling every hosted page slot under that flag (ADR 0018). There is no `HEALTHCHECK`: the host's own check calls `/healthz`.
+
+CI proves the rest (`.github/workflows/image.yml`). On every pull request and push to `main` it builds the image, scans it with Grype through `anchore/scan-action` (failing on a high or critical finding that has a fix), and runs `scripts/smoke-image.ts`, which starts the image the way a host would: read-only, with every capability dropped and `no-new-privileges`, in hosted mode against a stand-in identity provider, with a volume that starts owned by root and is handed to uid 65532 by the same one-off `chown` the fallback below uses. The image must answer `/healthz` with 200 for any `Host`, answer `/mcp` with 401 naming its `resource_metadata` for the public host and 403 for any other, serve metadata naming the connector URL and the issuer, exit 0 within 5 s of `SIGTERM`, log no client secret, and leave an audit log whose `relay_start` and `relay_stop` pass `--verify`. Only a push to `main` then publishes it as `ghcr.io/<user>/tabdock`, tagged `sha-<commit>` and `main`, with an SPDX SBOM and full provenance in the registry, and attests its build provenance with `actions/attest`, so GitHub signs which workflow, commit and ref built which digest. The run's summary names the digest to deploy.
+
+To check an image yourself (C), with the GitHub CLI:
+
+```
+gh attestation verify oci://ghcr.io/<user>/tabdock@sha256:<digest> --repo <user>/tabdock --signer-workflow <user>/tabdock/.github/workflows/image.yml --source-ref refs/heads/main
+```
+
+To build and smoke-test one on a computer with Docker (C): `docker build -t tabdock-relay .`, then `pnpm install` and `node scripts/smoke-image.ts tabdock-relay`. Behind a proxy that intercepts TLS, as in a Claude Code cloud session, the build stage also needs that proxy's certificate authority, which CI does not.
+
+Dependabot proposes new base digests and action SHAs as pull requests. Four pins sit where it cannot see them and move by hand with the Dockerfile's build base: the BuildKit image and its SBOM scanner in `image.yml`, flyctl's version in `deploy.yml` and `volume-owner.yml`, and the helper image in `volume-owner.yml`, which is the build base itself. Node 22 reaches end of life on 30 April 2027; before then `.nvmrc`, CI and both bases move to Node 24 together (`nodejs24-debian13` at runtime).
 
 ## The workflows
 
-_Placeholder, filled by workstream C:_ the CI image job and the dispatch-only deploy workflow (its inputs, the `production` environment, how it stages the secrets above and deploys one image digest), and the Pages workflow for the demo.
+Every action in every workflow is pinned by its full commit SHA, with its version in a comment, each looked up on 4 October 2026; a check in `pnpm test` (`tests/e2e/test/deploy-files.test.ts`) fails CI if one is not, if a workflow but `ci.yml` grants any permission by default, or if a `${{ }}` expression is spliced into a shell script, where an input could become a command. Values reach scripts through `env:` instead.
+
+**`ci.yml`**, unchanged in shape: lint, typecheck, tests, the browser tests and the demos on every pull request and push to `main`. The test run includes the checks on `fly.toml`, the Dockerfile and these workflows.
+
+**`image.yml`**, described under The image. Its check job reads the repository and nothing else; only its publish job, which runs for a push to `main` alone, may write packages and attestations.
+
+**`deploy.yml`**, dispatched by hand on `main` with one input, the image digest. Its first job, with no environment and no secrets, checks the digest against `^sha256:[0-9a-f]{64}$` (through an environment variable, never spliced into the script) and runs `gh attestation verify` with `--signer-workflow` pointing at `image.yml` and `--source-ref refs/heads/main`, so only an image this repository's main branch built can go further. The deploy job then waits for your approval in the `production` environment; only after it can it read a secret. It checks that each secret it needs exists and holds no line break, stages the relay's six settings as Fly secrets by piping `NAME=VALUE` lines into `fly secrets import --stage` (no value ever on a command line), runs `fly deploy --image ghcr.io/<user>/tabdock@<digest> --config deploy/fly/fly.toml --ha=false --strategy rolling` with flyctl 0.4.111 pinned, and checks the live relay: `/healthz` answers 200, `/mcp` answers 401 naming the metadata URL, and the metadata names the connector URL and the issuer. Last, its Pages job builds `apps/demo` with the demo's own static build and publishes it to GitHub Pages, in the `github-pages` environment that Pages creates. Deploys share one concurrency group, so two never overlap and none is cancelled half way.
+
+To dispatch from a phone, open the repository in a browser, then Actions, Deploy, Run workflow, keep the branch `main`, paste the digest from the Image run's summary and Run workflow; then approve the waiting deployment, in the browser or the GitHub app, under Review deployments.
+
+**`volume-owner.yml`**, the one-off fallback below, dispatched on `main`, typed confirmation and all, and approved like a deploy.
+
+**`.github/dependabot.yml`** proposes action and base image updates weekly. Nothing merges on its own.
 
 ## `deploy/fly/fly.toml`
 
-_Placeholder, filled by workstream C:_ each section of the file, the `[http_service]` handler that rewrites `Fly-Client-IP` and the CI check that keeps it, the `tabdock_audit` mount, `auto_stop_machines = "off"`, the deploy strategy that stops the old Machine before starting the new, and the fixed settings.
+The file holds only what is the same for anyone deploying this way, so each change is a pull request you review; it names no app (the workflow passes `FLY_APP`), domain or secret. Section by section:
+
+- `primary_region = "iad"`, beside the 1 GB volume made there; `kill_signal = "SIGTERM"` and `kill_timeout = 5`, comfortably more than the second the relay needs to close.
+- `[deploy] strategy = "rolling"`: with one Machine and a volume, Fly stops the old Machine before starting the new, which is the one-instance rule; it refuses `bluegreen` and `canary` with a volume anyway.
+- `[env]`: `TABDOCK_ENV=production`, `TABDOCK_HOST=0.0.0.0` (hosted mode alone may bind it, S12), `TABDOCK_PORT=8787`, `TABDOCK_AUDIT_DIR=/data/audit` on the volume, `TABDOCK_INVITES=1`, and `TABDOCK_CLIENT_ADDRESS_HEADER=fly-client-ip`. `TABDOCK_TRUSTED_PROXY_CIDR` waits for the first deploy.
+- `[http_service]` on internal port 8787, with `force_https`, `auto_stop_machines = "off"` (the relay keeps its state in memory and must never be stopped for idling), `auto_start_machines = true` (a Machine stopped by a host restart starts on the next request) and one health check, `GET /healthz` every 30 s. Its ports carry Fly's HTTP handler, and that handler is what overwrites `Fly-Client-IP` with the address Fly's proxy saw; a `[[services]]` section that passed raw TCP instead would leave the header to the client.
+- `[mounts]`: the volume `tabdock_audit` at `/data`. A different name would make `fly deploy` create a fresh volume and leave the audit history behind.
+- `[[vm]]`: `shared-cpu-1x` with 512 MB.
+
+The same test that guards the workflows fails CI if `[http_service]` goes or a `[[services]]` section appears, if the header is anything but `fly-client-ip`, if the mount is not `tabdock_audit` holding the audit directory, if `auto_stop_machines` is not `off`, if the strategy is not `rolling` or `immediate`, or if the file gains an app name or any secret setting.
 
 ## First deploy
 
-_Placeholder, filled by workstream C after the merge:_ dispatching and approving the first deploy, the checks that follow (`/healthz`, the 401 challenge naming the metadata URL, the metadata naming the issuer), narrowing `TABDOCK_TRUSTED_PROXY_CIDR`, and adding the connector.
+After the M4 merge, in this order.
+
+1. The Image workflow runs on `main` and publishes the first image. Open the package from the repository's page, then Package settings, and change its visibility to Public once, since Fly pulls it anonymously and the attestation check reads it.
+2. Copy the digest from that run's summary and dispatch Deploy with it (see The workflows). The verify job must pass before anything asks for your approval; approve the deploy job only for a run on `main` that you started.
+3. The deploy job stages the secrets, deploys and checks the live relay. If it fails because the relay cannot write `/data/audit`, `fly logs` shows `cannot create the audit directory /data/audit (TABDOCK_AUDIT_DIR, EACCES)`: run the Volume ownership fallback, then dispatch Deploy again with the same digest.
+4. Check it yourself from anywhere: `https://relay.<domain>/healthz` answers `ok`; a POST to `https://relay.<domain>/mcp` without a token answers 401 with a `WWW-Authenticate` header naming `resource_metadata="https://relay.<domain>/.well-known/oauth-protected-resource/mcp"`; and that document names `https://relay.<domain>/mcp` as its `resource` and your issuer among its `authorization_servers`. `https://<app>.fly.dev/mcp` answers 403.
+5. Narrow the proxy range. In the app's Monitoring page (or (C) `fly logs --app <app>`), find `first request through the host edge: its proxy connects from this address` and the address it names. Open a pull request that sets `TABDOCK_TRUSTED_PROXY_CIDR` in `fly.toml` to the range holding it (for an address in `172.16.0.0/12`, the `/16` around it), merge it, and deploy again. Afterwards, a line saying `request from a peer outside TABDOCK_TRUSTED_PROXY_CIDR` means Fly's proxy also uses addresses outside the range; widen it the same way. Until then every client counts as itself or as the proxy, never as an address it claims.
+6. Add the connector `https://relay.<domain>/mcp` on claude.ai and continue with `docs/checklists/M4.md`.
 
 ## Rollback
 
-_Placeholder, filled by workstream C:_ redeploying the previous digest (never `latest`), what a rollback costs (a restart, so everyone pairs again), and undoing WorkOS changes by hand.
+Dispatch Deploy with the digest that ran before, from an earlier Image run's summary or the package's versions page, where each image carries its `sha-<commit>` tag; never `main` and never `latest`, which name whatever was built last. A rollback is a deploy, so it is a restart: pages reconnect as new sessions, everyone pairs again and live invite links die, while Claude stays signed in. Deploy reads `deploy/fly/fly.toml` and the workflows from `main` as they are when you dispatch, not from the image's commit, so if the change to undo is in those files, revert its pull request first and deploy after. Secrets are staged from GitHub on every deploy: to undo a changed setting, put the old value back in the `production` environment first. WorkOS changes (redirect URIs, resource indicators, the template, Dynamic Client Registration) are undone by hand in its dashboard.
 
 ## Key rotation runbook
 
-_Placeholder, filled by workstream C:_ what happens when WorkOS rotates its signing keys (up to about 330 s of 401s, ADR 0020), and the order for rotating every secret above at once after a suspected leak.
+**WorkOS rotates its signing keys.** Nothing to do. The relay caches the key set for 10 minutes and, after a token names a key it does not hold, fetches again no sooner than 30 s later, while WorkOS serves the key set with a 5-minute cache, so for up to about 330 s after a rotation some tokens get 401, and Claude refreshes them and tries again (ADR 0020). If 401s go on for longer, the provider has likely moved its key URL: the relay re-reads the metadata hourly but refuses a changed issuer or key URL and keeps what it checked at start, and says so in its log. A deploy picks the new metadata up.
+
+**After a suspected leak, rotate everything, in this order.** First the Fly deploy token, since it can deploy code that reads every secret: revoke it on the app's Tokens page, create a new one and replace `FLY_API_TOKEN`. Then the `/pair` client secret: create a new one on the WorkOS application, delete the old one at once (QR sign-in fails until the deploy) and replace `TABDOCK_PAIR_CLIENT_SECRET`. Then dispatch Deploy with the current digest, which stages every secret again and restarts the relay, ending every page session, attachment and invite. Members' access tokens are the provider's and live until their `exp`, at most 2 hours by the relay's cap: for an account you suspect, remove its entry from `TABDOCK_OAUTH_USERS` in the same deploy and revoke its sessions at WorkOS. Last, check the audit log against the newest checkpoint the platform's logs hold (Reading the audit log). `FLY_APP`, `TABDOCK_PUBLIC_URL`, `TABDOCK_OAUTH_ISSUER` and `TABDOCK_ALLOWED_ORIGINS` are no credentials and stay.
 
 ## Volume ownership fallback
 
-_Placeholder, filled by workstream C:_ the image runs as uid 65532 and production refuses to start if it cannot write the audit directory; if the first deploy shows Fly did not hand the volume to that user, the one-time `chown` that fixes it.
+The image runs as uid 65532, and production refuses to start when it cannot create and write its audit directory (ADR 0019), naming the directory and pointing here. Fly documents no way to set who owns a new volume. If the first deploy shows the volume belongs to root, dispatch the Volume owner workflow on `main`, type `chown` as asked, and approve it. It destroys the relay's Machine, which is failing to start anyway and holds the volume, since a volume attaches to one Machine at a time; runs a throwaway Machine from the Dockerfile's own pinned build base that runs `chown 65532:65532 /data` on the volume and is removed when it exits; and waits until it is gone. Then dispatch Deploy again with the same digest, and Fly creates the relay's Machine on the same volume. It is needed once: the volume keeps its owner. The image side of this is what CI's smoke test runs on every build; the Fly side is checked on the first deploy.
+
+From a computer (C), the same by hand: `fly machine list --app <app>` and `fly machine destroy <id> --app <app> --force` for the relay's Machine, then `fly machine run node:22-bookworm-slim@sha256:<the Dockerfile's build digest> chown 65532:65532 /data --app <app> --region iad --volume <volume id>:/data --restart no --rm`, then a deploy.
 
 ## Reading the audit log
 
-_Placeholder, filled by workstream C:_ `pnpm audit:log` and its filters, `--verify` for the hash chain, running it inside the Machine with `fly ssh console -C` or on files copied out with `fly ssh sftp get`, and what the platform's 7-day logs hold beside it.
+`pnpm audit:log` (pnpm's own `audit` command shadows the shorter name) reads the audit directory, `TABDOCK_AUDIT_DIR` or local mode's `audit/` beside its owner token unless `--dir` names another, and prints each record on one line, oldest first: its sequence number, its time, its type and its fields. `--user`, `--page`, `--type` (`call`, `attach`, `revoke` and the rest, comma-separated), `--outcome`, `--since` and `--until` (ISO 8601, or a span such as `24h` or `7d`) narrow it, and `--json` prints the records as JSON Lines instead. It checks every line against the protocol's schema, names a line that is no record instead of printing it, and writes every control or bidirectional character a client put into a name as a `\u` escape, so nothing in the log can rewrite your terminal.
+
+`--verify` checks the chain: each record's sequence number follows the last, and each `prev` is the SHA-256 of the line before, across files and restarts, from the oldest file retention kept. It names a line a crash or a failed write tore, which the relay closed at its next start and chained past, and fails, exit code 1, on an edited, removed or foreign line. An edit to the last lines leaves no later line to show it, so the relay writes a checkpoint to its log every 15 minutes, at each rotation and at stop (`audit checkpoint` with `seq` and `head`); give the newest one the platform's logs still hold as `--checkpoint <seq>:<head>` and the line with that sequence number must match it. The chain is evidence, not prevention: whoever holds the disk can rewrite everything after that checkpoint, never before it unseen.
+
+One relay writes one audit directory. From start to stop it holds `audit.lock` there, naming its process, and a second relay pointed at the same directory (`pnpm relay` while `pnpm dev` runs, say) refuses to start before it reads or writes a line, naming the lock, since two writers would give the chain two heads and `--verify` would report a log nobody touched as broken. A lock left by a relay that crashed, or by an earlier run of a restarted container, is replaced at the next start with a warning; delete it by hand only when the refusal names a process that is no relay. Reading the log takes no lock.
+
+On the reference deployment the files live on the volume, and the image has node but no shell or pnpm, so the reader runs as node directly (C):
+
+```
+fly ssh console --app <app> -C "/nodejs/bin/node /app/packages/relay/src/audit-cli.ts --dir /data/audit --since 24h"
+fly ssh console --app <app> -C "/nodejs/bin/node /app/packages/relay/src/audit-cli.ts --dir /data/audit --verify"
+```
+
+or copies a file out and reads it locally: `fly ssh sftp get /data/audit/<file> --app <app>` into an empty directory, then `pnpm audit:log --dir <that directory> --verify`. Whether `fly ssh console -C` can run a command in an image with no shell is confirmed on the first deploy (the checklist asks); `sftp` needs none.
+
+Beside the files, Fly keeps 7 days of the relay's stderr: a copy of every record without the invitee's email, which the logger drops, plus the checkpoints and the `audit_gap` records that count what a failing disk missed. Its log search finds a record by type or user from a phone; the files remain the record of truth, with 30 days or 64 MiB of history.

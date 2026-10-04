@@ -1,9 +1,9 @@
 // Relay state behind small interfaces (SPEC section 4). Everything but the
-// audit log lives in memory, and a restart ends it all (ADR 0019); M4 adds a
-// persistent audit log (FileAuditLog, workstream C) behind the same AuditLog,
-// and invites (workstream A) behind InviteStore. Interfaces are synchronous on
-// purpose: a persistent audit log can write behind, and the hub never has to
-// reason about interleaved awaits while it changes attachments.
+// audit log lives in memory, and a restart ends it all (ADR 0019); the
+// persistent audit log (FileAuditLog, audit-file.ts) sits behind the same
+// AuditLog, and invites (workstream A) behind InviteStore. Interfaces are
+// synchronous on purpose: a persistent audit log can write behind, and the hub
+// never has to reason about interleaved awaits while it changes attachments.
 
 import type {
   AttachVia,
@@ -244,7 +244,7 @@ export interface AuditLineMeta {
 /**
  * The audit log (S7, ADR 0019). append takes one record, stays synchronous
  * and never throws, so no call waits on a disk or fails for one. The memory
- * ring keeps the newest records; FileAuditLog (workstream C) also writes them
+ * ring keeps the newest records; FileAuditLog (audit-file.ts) also writes them
  * to disk, where only it adds the sequence number and chain link, and needs
  * close() after hub.shutdown(), whose failed calls it must still record.
  * Callers append through recordAudit, which writes the stderr copy, so any
@@ -545,7 +545,13 @@ export class MemoryAuditLog implements AuditLog {
   }
 }
 
-export function createMemoryStore(options: { auditCapacity?: number } = {}): RelayStore {
+/**
+ * Everything in memory, the audit log included unless one is given: the
+ * relay passes its FileAuditLog here when it has a directory (ADR 0019).
+ */
+export function createMemoryStore(
+  options: { auditCapacity?: number; audit?: AuditLog } = {},
+): RelayStore {
   return {
     pages: new MemoryPageStore(),
     attachments: new MemoryAttachmentStore(),
@@ -553,6 +559,6 @@ export function createMemoryStore(options: { auditCapacity?: number } = {}): Rel
     singleUse: new MemorySingleUseTicketStore(),
     requests: new MemoryAttachRequestStore(),
     invites: new MemoryInviteStore(),
-    audit: new MemoryAuditLog(options.auditCapacity),
+    audit: options.audit ?? new MemoryAuditLog(options.auditCapacity),
   };
 }

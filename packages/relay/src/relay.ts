@@ -17,14 +17,24 @@
 // pointed at a loopback relay, even one that rewrites Host, cannot expose it.
 // Those checks trust a Host header any program can write, so they hold only
 // while the relay listens on loopback: it resolves its host name itself and
-// listens on the address only when that is loopback (S12). Requests are
-// logged by route, never by raw path or query, so no secret a URL carries
-// reaches a log. The client address that /page and /pair count by, and that
-// /mcp's refusal line names, comes from one place (client-address.ts), which
-// answers 400 on a route that counts by address when a host edge names no
-// client (ADR 0018). The plugin says who someone is and the relay decides
-// whether an invitee may in (ADR 0020). The M3 spike's measurements (spike.ts)
-// hook in here when TABDOCK_SPIKE is on; nothing over HTTP controls them.
+// listens on the address only when that is loopback (S12). Hosted mode (ADR
+// 0018) is the one exception: in production behind a host edge that
+// terminates TLS and names the client in one configured header, the relay may
+// bind 0.0.0.0, /page takes upgrades for the public host alone (the edge's
+// forwarding headers are expected there), and the Host allowlist still guards
+// /mcp, /pair and the plugin's routes, so the platform's own name for the app
+// gets 403 everywhere but /healthz. Requests are logged by route, never by raw
+// path or query, so no secret a URL carries reaches a log. The client address
+// that /page and /pair count by, and that /mcp's refusal line names, comes
+// from one place (client-address.ts), which answers 400 on a route that counts
+// by address when a host edge names no client (ADR 0018). With an audit
+// directory (production, local mode, or TABDOCK_AUDIT_DIR) the audit log is a
+// FileAuditLog there, bracketed by relay_start and relay_stop records so a
+// restart shows as a gap (ADR 0019); production refuses to start without one,
+// or if relay_start does not reach the disk. The plugin says who someone is
+// and the relay decides whether an invitee may in (ADR 0020). The M3 spike's
+// measurements (spike.ts) hook in here when TABDOCK_SPIKE is on; nothing over
+// HTTP controls them.
 
 import { lookup } from 'node:dns/promises';
 import { createServer, type IncomingMessage, type ServerResponse, STATUS_CODES } from 'node:http';
@@ -38,6 +48,7 @@ import {
   type McpHandlerRequestOptions,
 } from '@modelcontextprotocol/server';
 import {
+  AUDIT_VERSION,
   type AuditCallEvent,
   type AuditEvent,
   InviteeIdSchema,
@@ -45,6 +56,7 @@ import {
   SUBPROTOCOL,
 } from '@tabdock/protocol';
 import { WebSocketServer } from 'ws';
+import { FileAuditLog } from './audit-file.ts';
 import { createAuthRefusalLog } from './auth-log.ts';
 import {
   type AuthOutcome,
@@ -55,6 +67,7 @@ import {
 } from './auth.ts';
 import { createClientAddresses, loggedAddress } from './client-address.ts';
 import {
+  HOSTED_WILDCARD_HOST,
   isLoopbackAddress,
   LOOPBACK_HOSTNAMES,
   NO_ORIGIN,
@@ -64,13 +77,13 @@ import {
   resolveConfig,
 } from './config.ts';
 import { PageHub } from './hub.ts';
-import { createLogger } from './log.ts';
-import { type AuthExtra, createMcpFactory, userIdOf } from './mcp.ts';
+import { createLogger, type Logger } from './log.ts';
+import { type AuthExtra, createMcpFactory, RELAY_VERSION, userIdOf } from './mcp.ts';
 import { createPairFlow, PAIR_ROUTES, type PairFlow } from './pair.ts';
 import { McpSessions } from './sessions.ts';
 import { createSignInGate } from './sign-in-gate.ts';
 import { Spike, type SpikeControl } from './spike.ts';
-import { callRecords, createMemoryStore } from './store.ts';
+import { type AuditLog, callRecords, createMemoryStore, recordAudit } from './store.ts';
 
 export interface Relay {
   /** http://127.0.0.1:<port> */
@@ -108,6 +121,16 @@ function malformedHost(request: IncomingMessage): boolean {
   if (lines > 1) return true;
   const host = request.headers.host;
   return host !== undefined && parseHostHeader(host) === null;
+}
+
+/**
+ * Whether an upgrade names the public host, exactly as written but for case
+ * and port: in hosted mode the only Host a page reaches the relay by through
+ * the edge (ADR 0018).
+ */
+function forPublicHost(request: IncomingMessage, config: ResolvedConfig): boolean {
+  if (config.publicUrl === null || request.headers.host === undefined) return false;
+  return parseHostHeader(request.headers.host) === new URL(config.publicUrl).hostname;
 }
 
 /**
@@ -213,6 +236,33 @@ async function listenAddress(config: ResolvedConfig): Promise<string> {
   return first;
 }
 
+/**
+ * The persistent audit log the configuration asks for, or null for the memory
+ * ring. Production must keep one (S7, ADR 0019): a relay that cannot write
+ * its audit directory refuses to start rather than serve unrecorded.
+ */
+function openAudit(
+  config: ResolvedConfig,
+  options: RelayOptions,
+  log: Logger,
+): FileAuditLog | null {
+  const { dir, retentionDays, maxBytes } = config.audit;
+  if (dir !== null && options.store !== undefined) {
+    throw new Error(
+      'give the relay an audit directory (TABDOCK_AUDIT_DIR) or a store of its own, not both',
+    );
+  }
+  if (dir === null) {
+    if (config.env === 'production' && options.store === undefined) {
+      throw new Error(
+        'production keeps a persistent audit log: set TABDOCK_AUDIT_DIR to an absolute directory, on a host its persistent volume (SPEC S7, ADR 0019)',
+      );
+    }
+    return null;
+  }
+  return FileAuditLog.open({ dir, retentionDays, maxBytes, log });
+}
+
 export async function createRelay(options: RelayOptions): Promise<Relay> {
   const config = resolveConfig(options);
   const log = createLogger({
@@ -220,16 +270,47 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     ...(options.logLevel ? { level: options.logLevel } : {}),
   });
   const auth = options.auth;
-  // First, before anything else exists: a plugin that cannot work (an identity
+  // Before the plugin starts, so a directory the relay cannot use sets nothing going.
+  const fileAudit = openAudit(config, options, log);
+  // Then, before anything else exists: a plugin that cannot work (an identity
   // provider Claude could not sign in with, say) stops the relay from starting.
   try {
     await auth.start?.({ log });
   } catch (error) {
     // Anything it set going before it threw, such as a timer, stops with it.
     auth.stop?.();
+    await fileAudit?.close();
     throw error;
   }
-  const store = options.store ?? createMemoryStore();
+  const store = options.store ?? createMemoryStore(fileAudit ? { audit: fileAudit } : {});
+  // Only a log that outlives the process marks its starts and stops; a memory
+  // ring forgets everything at a restart anyway.
+  if (fileAudit !== null) {
+    recordAudit(fileAudit, log, {
+      v: AUDIT_VERSION,
+      type: 'relay_start',
+      at: Date.now(),
+      version: RELAY_VERSION,
+      env: config.env,
+      mode: config.mode,
+      invites: config.invites,
+    });
+    // Production serves no one until its first record is on disk (ADR 0019).
+    if (!fileAudit.sync() && config.env === 'production') {
+      await fileAudit.close();
+      auth.stop?.();
+      throw new Error(
+        `production could not write and sync its relay_start record in the audit directory ${fileAudit.dir} (TABDOCK_AUDIT_DIR); refusing to start unrecorded (ADR 0019)`,
+      );
+    }
+  }
+  /** relay_stop, then the log closes: after the hub, whose shutdown audits the calls it fails. */
+  const closeAudit = async (audit: AuditLog): Promise<void> => {
+    if (fileAudit !== null) {
+      recordAudit(audit, log, { v: AUDIT_VERSION, type: 'relay_stop', at: Date.now() });
+    }
+    await audit.close?.();
+  };
   const spike = config.spike ? new Spike(log, MAX_MCP_BODY_BYTES) : null;
   const hub = new PageHub(config, store, log, spike);
   const addresses = createClientAddresses(config, log);
@@ -252,7 +333,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       });
     } catch (error) {
       await hub.shutdown();
-      await store.audit.close?.();
+      await closeAudit(store.audit);
       auth.stop?.();
       throw error;
     }
@@ -380,7 +461,8 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   async function handleMcp(request: IncomingMessage, response: ServerResponse): Promise<void> {
     // Where the spike's call timestamps start: before the Host check, sign-in and the SDK.
     const receivedAt = performance.now();
-    if (config.loopback && !validateHost(request, response)) return;
+    // In every mode, hosted included (ADR 0018): the edge passes on the Host a client sent.
+    if (!validateHost(request, response)) return;
     // Named in refusal lines only: /mcp never counts by address (ADR 0016),
     // so a header that names no client is no reason to refuse it.
     const client = addresses.of(request);
@@ -436,7 +518,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
-    if (config.loopback && !validateHost(request, response)) return;
+    if (!validateHost(request, response)) return;
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       send(response, 405, 'Method not allowed', { Allow: 'GET, HEAD' });
       return;
@@ -494,12 +576,12 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   server.maxHeadersCount = 0;
 
   server.on('upgrade', (request: IncomingMessage, socket: Duplex, head: Buffer) => {
-    // What the per-address page limits count by (S9); the socket's peer until hosted mode (ADR 0018).
-    const client = addresses.of(request);
     if (pathOf(request.url) !== '/page') {
       refuseUpgrade(socket, 404, 'Not found');
       return;
     }
+    // What the per-address page limits count by (S9): in hosted mode the client the edge names (ADR 0018).
+    const client = addresses.of(request);
     if (malformedHost(request)) {
       log.info('page socket refused: malformed Host', { address: loggedAddress(client) });
       refuseUpgrade(socket, 400, 'Bad request');
@@ -513,11 +595,20 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     }
     // Logged as the address, counted by its limit key, which in hosted mode groups an IPv6 /56.
     const { address, key } = client;
-    // ADR 0014: every request through the tunnel arrives from loopback, so the
-    // address says nothing; the Host and proxy headers do. Pages attach only
-    // from this machine until M4 brings a host and a trusted client address,
-    // and a relay without a public URL never takes a proxied page (ADR 0022).
-    if (!madeLocally(request)) {
+    if (config.hosted) {
+      // ADR 0018: behind a host edge pages attach through the public URL,
+      // which names the public host; the edge's own forwarding headers are
+      // expected, and the client address above came from its one trusted header.
+      if (!forPublicHost(request, config)) {
+        log.info('page socket refused: not the public host', { address });
+        refuseUpgrade(socket, 403, 'Pages attach through the public URL only');
+        return;
+      }
+    } else if (!madeLocally(request)) {
+      // ADR 0014: every request through a tunnel arrives from loopback, so the
+      // address says nothing; the Host and proxy headers do. Without a host
+      // edge pages attach only from this machine, and a relay without a public
+      // URL never takes a proxied page (ADR 0022).
       log.info('page socket refused: not made on this machine', { address });
       refuseUpgrade(socket, 403, 'Pages attach only from the relay machine itself');
       return;
@@ -577,17 +668,21 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     pair?.close();
     wss.close();
     await hub.shutdown();
-    await store.audit.close?.();
+    await closeAudit(store.audit);
     await mcp.close();
     await sessions.closeAll();
     auth.stop?.();
     throw error;
   }
   const bound = server.address() as AddressInfo;
-  const hostPort = `${formatHost(bound.address)}:${String(bound.port)}`;
+  // Bound to the wildcard in hosted mode, the relay is still reached on this machine through loopback.
+  const reachable = bound.address === HOSTED_WILDCARD_HOST ? '127.0.0.1' : bound.address;
+  const hostPort = `${formatHost(reachable)}:${String(bound.port)}`;
   const url = `http://${hostPort}`;
   log.info('relay listening', {
     url,
+    bound: `${formatHost(bound.address)}:${String(bound.port)}`,
+    mode: config.mode,
     publicUrl: config.publicUrl,
     env: config.env,
     auth: auth.name,
@@ -618,7 +713,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         pair?.close();
         await hub.shutdown();
         // After the hub, whose shutdown audits the calls it fails (ADR 0019).
-        await store.audit.close?.();
+        await closeAudit(store.audit);
         for (const ws of wss.clients) ws.terminate();
         await new Promise<void>((resolveClose) => {
           wss.close(() => {

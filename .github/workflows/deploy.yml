@@ -1,0 +1,181 @@
+# Deploys one image digest to the reference deployment on Fly.io, then
+# publishes the demo page to GitHub Pages (docs/deploy.md, "The workflows").
+# It runs only when dispatched on main, and its deploy job names the
+# production environment, so it waits for the owner's approval before it can
+# read a single secret. It deploys only a digest that the Image workflow on
+# main attested, and stages the relay's settings as Fly secrets from standard
+# input, never a command line. Every action is pinned by its full commit SHA,
+# its version in the comment, looked up on 4 October 2026.
+
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      digest:
+        description: The image digest to deploy, sha256 and 64 hex characters, from the Image workflow's summary on main
+        required: true
+        type: string
+
+# Nothing by default; each job asks for what it needs.
+permissions: {}
+
+# One deploy at a time, and never one cancelled half way.
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Check the digest and its attestation
+    # GitHub dispatches a workflow only from a branch that holds it; the environment also admits only main.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # No environment and no secrets: this runs before anyone is asked to approve.
+    permissions:
+      contents: read
+      attestations: read
+    env:
+      # Through the environment, never spliced into a script.
+      DIGEST: ${{ inputs.digest }}
+    steps:
+      - name: Check the digest
+        run: |
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::the digest must be sha256: followed by 64 lower-case hex characters"
+            exit 1
+          fi
+      - name: Verify the image was built and attested by the Image workflow on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "oci://ghcr.io/${GITHUB_REPOSITORY,,}@${DIGEST}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/image.yml" \
+            --source-ref refs/heads/main \
+            --deny-self-hosted-runners
+
+  deploy:
+    name: Deploy the relay
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Waits here for the owner's approval; only then can the job read a secret.
+    environment: production
+    permissions:
+      contents: read
+    env:
+      DIGEST: ${{ inputs.digest }}
+    steps:
+      - name: Check the digest again and name the image
+        run: |
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::the digest must be sha256: followed by 64 lower-case hex characters"
+            exit 1
+          fi
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}@${DIGEST}" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # v1.6
+        with:
+          version: 0.4.111
+      - name: Stage the relay's settings as Fly secrets
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP: ${{ secrets.FLY_APP }}
+          TABDOCK_PUBLIC_URL: ${{ secrets.TABDOCK_PUBLIC_URL }}
+          TABDOCK_ALLOWED_ORIGINS: ${{ secrets.TABDOCK_ALLOWED_ORIGINS }}
+          TABDOCK_OAUTH_ISSUER: ${{ secrets.TABDOCK_OAUTH_ISSUER }}
+          TABDOCK_OAUTH_USERS: ${{ secrets.TABDOCK_OAUTH_USERS }}
+          TABDOCK_PAIR_CLIENT_ID: ${{ secrets.TABDOCK_PAIR_CLIENT_ID }}
+          TABDOCK_PAIR_CLIENT_SECRET: ${{ secrets.TABDOCK_PAIR_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          names=(TABDOCK_PUBLIC_URL TABDOCK_ALLOWED_ORIGINS TABDOCK_OAUTH_ISSUER TABDOCK_OAUTH_USERS TABDOCK_PAIR_CLIENT_ID TABDOCK_PAIR_CLIENT_SECRET)
+          # Checked before anything is staged, so a missing secret stages nothing.
+          for name in FLY_API_TOKEN FLY_APP "${names[@]}"; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::the production environment has no secret named $name"
+              exit 1
+            fi
+            if [[ "${!name}" == *$'\n'* ]]; then
+              echo "::error::the secret $name holds a line break"
+              exit 1
+            fi
+          done
+          # printf is a shell builtin: no value reaches a process's arguments.
+          for name in "${names[@]}"; do printf '%s=%s\n' "$name" "${!name}"; done |
+            flyctl secrets import --stage --app "$FLY_APP"
+      - name: Deploy the image
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP: ${{ secrets.FLY_APP }}
+        run: |
+          flyctl deploy \
+            --config deploy/fly/fly.toml \
+            --app "$FLY_APP" \
+            --image "$IMAGE" \
+            --ha=false \
+            --strategy rolling \
+            --wait-timeout 5m
+      - name: Check the live relay
+        env:
+          TABDOCK_PUBLIC_URL: ${{ secrets.TABDOCK_PUBLIC_URL }}
+          TABDOCK_OAUTH_ISSUER: ${{ secrets.TABDOCK_OAUTH_ISSUER }}
+        run: |
+          set -euo pipefail
+          status=000
+          for _ in $(seq 1 30); do
+            status=$(curl -sS -o /dev/null -w '%{http_code}' "$TABDOCK_PUBLIC_URL/healthz" || true)
+            if [[ "$status" == 200 ]]; then break; fi
+            sleep 5
+          done
+          if [[ "$status" != 200 ]]; then
+            echo "::error::/healthz answered $status"
+            exit 1
+          fi
+          headers=$(curl -sS -o /dev/null -D - -X POST -H 'Content-Type: application/json' --data '{}' "$TABDOCK_PUBLIC_URL/mcp")
+          if ! grep -Eq '^HTTP/[0-9.]+ 401' <<<"$headers" || ! grep -Fqi "resource_metadata=\"$TABDOCK_PUBLIC_URL/.well-known/oauth-protected-resource/mcp\"" <<<"$headers"; then
+            echo "::error::/mcp did not answer 401 naming the resource metadata"
+            exit 1
+          fi
+          if ! curl -sS "$TABDOCK_PUBLIC_URL/.well-known/oauth-protected-resource/mcp" |
+            jq -e --arg resource "$TABDOCK_PUBLIC_URL/mcp" --arg issuer "$TABDOCK_OAUTH_ISSUER" \
+              '.resource == $resource and ((.authorization_servers // []) | map(rtrimstr("/")) | index($issuer | rtrimstr("/")) != null)' >/dev/null; then
+            echo "::error::the protected resource metadata does not name the connector URL and the issuer"
+            exit 1
+          fi
+          echo "The relay answers: /healthz 200, /mcp 401 with its metadata, the metadata naming the connector URL and the issuer."
+
+  pages:
+    name: Publish the demo page
+    needs: deploy
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.publish.outputs.page_url }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+      - run: corepack enable pnpm
+      - run: pnpm install --frozen-lockfile --filter '@tabdock/demo...'
+      # The demo's own static build, unchanged: it leaves out what a static host cannot frame-protect.
+      - run: pnpm --filter @tabdock/demo build
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: apps/demo/dist
+      - id: publish
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

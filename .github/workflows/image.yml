@@ -1,0 +1,123 @@
+# The relay's container image (docs/deploy.md, "The image"). Every pull request
+# and push to main builds it, scans it and runs it the way a host would; only a
+# push to main publishes it to GHCR with an SBOM and provenance and attests it,
+# and the deploy workflow deploys nothing that attestation does not cover.
+# Every action is pinned by its full commit SHA, its version in the comment,
+# looked up on 4 October 2026; Dependabot proposes updates.
+
+name: Image
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Nothing by default; each job asks for what it needs.
+permissions: {}
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Build, scan and smoke-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          # BuildKit v0.33.1, pinned rather than the moving buildx-stable-1 tag.
+          driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+      - name: Build the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          push: false
+          # Attestations need a registry; the publish job adds them to what it pushes.
+          provenance: false
+          sbom: false
+          tags: tabdock-relay:check
+          cache-to: type=gha,mode=max,scope=relay-image
+          cache-from: type=gha,scope=relay-image
+      - name: Scan the image
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: tabdock-relay:check
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: true
+          output-format: table
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+      - run: corepack enable pnpm
+      # The smoke test's stand-in identity provider is a dev dependency of the relay.
+      - run: pnpm install --frozen-lockfile --filter '@tabdock/relay...'
+      - name: Smoke-test the image, read-only, against a stand-in provider
+        run: node scripts/smoke-image.ts tabdock-relay:check
+
+  publish:
+    name: Publish and attest
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Name the image
+        id: name
+        # GHCR wants lower case; the repository's owner may have capitals.
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - name: Build and push, with an SBOM and provenance
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          # The Git context of this very commit, so nothing on the runner reaches the image.
+          push: true
+          provenance: mode=max
+          # BuildKit's SBOM generator, pinned: Syft scanner 1.12.0.
+          attests: type=sbom,generator=docker/buildkit-syft-scanner:1.12.0@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9
+          tags: |
+            ${{ steps.name.outputs.image }}:sha-${{ github.sha }}
+            ${{ steps.name.outputs.image }}:main
+          # The layers the check job built, scanned and ran.
+          cache-from: type=gha,scope=relay-image
+      - name: Attest the build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.name.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          # Storage records exist only for organisation-owned repositories.
+          create-storage-record: false
+      - name: Say which digest to deploy
+        env:
+          IMAGE: ${{ steps.name.outputs.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          {
+            echo "### Image published"
+            echo
+            echo "\`${IMAGE}@${DIGEST}\`"
+            echo
+            echo "Deploy it with the Deploy workflow, digest \`${DIGEST}\` (docs/deploy.md, First deploy)."
+          } >> "$GITHUB_STEP_SUMMARY"

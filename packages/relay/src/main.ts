@@ -17,6 +17,16 @@ if (existsSync(envFile)) process.loadEnvFile(envFile);
 try {
   const options = loadConfigFromEnv(process.env);
   const relay = await createRelay(options);
+  // Before the banner, so whoever reads it (a test, a supervisor) knows a
+  // SIGTERM from then on closes the relay and its audit log cleanly.
+  const stop = (): void => {
+    relay.close().then(
+      () => process.exit(0),
+      () => process.exit(1),
+    );
+  };
+  process.once('SIGINT', stop);
+  process.once('SIGTERM', stop);
   const local = options.localMode;
   const lines =
     relay.publicMcpUrl !== null
@@ -24,7 +34,10 @@ try {
           `Tabdock relay on ${relay.url}, public URL ${relay.publicUrl ?? ''}`,
           `  Connector URL (OAuth sign-in through TABDOCK_OAUTH_ISSUER): ${relay.publicMcpUrl}`,
           `  QR pairing page, signing phones in with TABDOCK_PAIR_CLIENT_ID: ${relay.publicUrl ?? ''}/pair`,
-          `  Page socket for the adapter, on this machine only: ${relay.pageUrl}`,
+          // Hosted mode takes pages through the edge (ADR 0018); a tunnelled relay only from this machine.
+          options.clientAddressHeader === undefined
+            ? `  Page socket for the adapter, on this machine only: ${relay.pageUrl}`
+            : `  Page socket for the adapter, through the host edge: ${(relay.publicUrl ?? '').replace(/^https:/, 'wss:')}/page`,
           ...((process.env.TABDOCK_DEV_TOKENS?.trim() ?? '') === ''
             ? []
             : [
@@ -55,14 +68,6 @@ try {
       process.stdout.write(`${line}\n`);
     });
   }
-  const stop = (): void => {
-    relay.close().then(
-      () => process.exit(0),
-      () => process.exit(1),
-    );
-  };
-  process.once('SIGINT', stop);
-  process.once('SIGTERM', stop);
 } catch (error) {
   // Config and owner token errors name variables and paths, never their secrets, so this is safe to print.
   process.stderr.write(
