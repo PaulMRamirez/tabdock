@@ -494,9 +494,13 @@ describe('pnpm audit:log', () => {
       expect.stringMatching(
         /line 4: audit_gap: the file missed 4 records from 2026-10-04T12:00:00\.003Z to 2026-10-04T12:00:00\.004Z/,
       ),
+      // A gap just before a start is no clean stop: more may have gone after it than it counts.
+      expect.stringMatching(
+        /line 5: relay_start follows an audit_gap, not a relay_stop: .*any lost after it are counted only in the platform's logs/,
+      ),
       expect.stringMatching(/line 6: relay_start follows no relay_stop/),
       expect.stringMatching(
-        /^verify: chain intact; 6 records in 1 files, .*, 1 audit_gap records counting 4 missed records, 1 starts after no relay_stop$/,
+        /^verify: chain intact; 6 records in 1 files, .*, 1 audit_gap records counting 4 missed records, 2 starts after no relay_stop$/,
       ),
     ]);
   });

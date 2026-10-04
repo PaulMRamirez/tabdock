@@ -274,7 +274,9 @@ export function runAuditCli(
   for (const stop of report.uncleanStops) {
     io.err(
       escapeForTerminal(
-        `${stop.file} line ${String(stop.lineNumber)}: relay_start follows no relay_stop: the relay before stopped without one (a crash, a kill or a failing disk), so its last records may be missing here, uncounted; the platform's logs keep their copies`,
+        stop.afterGap
+          ? `${stop.file} line ${String(stop.lineNumber)}: relay_start follows an audit_gap, not a relay_stop: the run before lost records to a failing disk, perhaps its relay_stop among them; the audit_gap counts those lost before it was written, and any lost after it are counted only in the platform's logs, which keep their copies and the count a stopping relay logs as an error`
+          : `${stop.file} line ${String(stop.lineNumber)}: relay_start follows no relay_stop: the relay before stopped without one (a crash, a kill or a failing disk), so its last records may be missing here, uncounted; the platform's logs keep their copies`,
       ),
     );
   }

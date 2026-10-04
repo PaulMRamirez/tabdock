@@ -2,19 +2,19 @@
 // image job runs the image itself, read-only, through scripts/smoke-image.ts):
 // main.ts in hosted mode from the environment alone, as on a host, serves
 // /healthz and the 401 challenge naming its metadata, writes its audit files
-// and nothing else in its directory, and exits 0 within 5 s of SIGTERM. Node's
-// permission model cannot stand in for a read-only file system here: it
-// disables fdatasync and fchmod outright, and production will not start
-// without syncing relay_start, so the read-only proof stays with Docker. The
-// relay picks its own port and the test reads it from its listening line, so
-// no other test's relay can answer in its place; every expectation shows the
-// child's output when it fails.
+// and audit.gap and nothing else in its directory, and exits 0 within 5 s of
+// SIGTERM. Node's permission model cannot stand in for a read-only file
+// system here: it disables fdatasync and fchmod outright, and production will
+// not start without syncing relay_start, so the read-only proof stays with
+// Docker. The relay picks its own port and the test reads it from its
+// listening line, so no other test's relay can answer in its place; every
+// expectation shows the child's output when it fails.
 
-import { mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { readAuditLines, verifyAuditLines } from '../src/index.ts';
+import { AUDIT_GAP_NAME, readAuditLines, verifyAuditLines } from '../src/index.ts';
 import { type MainProcess, startMain } from './helpers/main-process.ts';
 import { PAIR_CLIENT, startProvider, type TestProvider } from './helpers/provider.ts';
 import { rawRequest } from './helpers/tunnel.ts';
@@ -34,7 +34,7 @@ afterEach(async () => {
 });
 
 describe('main.ts in hosted mode, as the image runs it', () => {
-  it('serves in hosted mode, writes only audit files, and stops within 5 s of SIGTERM', async () => {
+  it('serves in hosted mode, writes only its audit files, and stops within 5 s of SIGTERM', async () => {
     provider = await startProvider();
     const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'tabdock-hosted-main-')));
     scratches.push(scratch);
@@ -76,9 +76,12 @@ describe('main.ts in hosted mode, as the image runs it', () => {
     expect(await running.exited, running.output()).toEqual({ code: 0, signal: null });
     expect(Date.now() - stopping, running.output()).toBeLessThan(5000);
     main = undefined;
-    // Nothing but the audit directory was written, and nothing but audit files stay in it.
+    // Nothing but the audit directory was written, and nothing but audit files stay in it,
+    // with audit.gap, which owes no gap, ready for a stop on a full disk.
     expect(readdirSync(scratch)).toEqual(['audit']);
-    expect(readdirSync(auditDir).every((name) => /^audit-.*\.jsonl$/.test(name))).toBe(true);
+    const kept = readdirSync(auditDir);
+    expect(kept.filter((name) => !/^audit-.*\.jsonl$/.test(name))).toEqual([AUDIT_GAP_NAME]);
+    expect(readFileSync(join(auditDir, AUDIT_GAP_NAME), 'utf8').trim()).toBe('');
     const report = verifyAuditLines(readAuditLines(auditDir));
     expect(report, running.output()).toMatchObject({ records: 2, problems: [] });
     expect(running.output()).not.toContain(PAIR_CLIENT.clientSecret);
