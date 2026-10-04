@@ -247,6 +247,11 @@ describe('the audit files (ADR 0019)', () => {
     );
     expect(listAuditFiles(dir).map((file) => file.day)).toEqual(['2026-09-04', '2026-09-05']);
     expect(retained.lines.filter((line) => line.includes('deleted by retention'))).toHaveLength(3);
+    // first moved along the files the start found, to the oldest it kept, with nothing missing.
+    const kept = checkpoints(retained.lines).at(-1);
+    expect(kept).toMatchObject({ first: listAuditFiles(dir)[0]?.firstSeq });
+    expect(verifyAuditLines(readAuditLines(dir), kept).problems).toEqual([]);
+    expect(logged(retained.lines, 'error')).toEqual([]);
     await retained.audit.close();
 
     // A cap of one byte deletes everything it may, which is never the file in use:
@@ -575,6 +580,11 @@ describe('verify (pnpm audit:log --verify)', () => {
     opened.splice(opened.indexOf(first.audit), 1);
     const stop = checkpoints(first.lines).at(-1);
     expect(stop).toMatchObject({ seq: 9, first: 1 });
+    // Untouched while it was stopped, a start repeats the stop's checkpoint exactly, as deploy.md tells the operator.
+    const untouched = open(dir, { rotateBytes: 600 });
+    await untouched.audit.close();
+    opened.splice(opened.indexOf(untouched.audit), 1);
+    expect(checkpoints(untouched.lines)).toEqual([stop, stop]);
     const files = listAuditFiles(dir);
     rmSync(join(dir, files[0]?.name ?? ''));
     const second = open(dir, { rotateBytes: 600 });
@@ -591,7 +601,159 @@ describe('verify (pnpm audit:log --verify)', () => {
       }),
     ]);
   });
+
+  it('moves first past a file retention deletes only to where the next file it knew starts, so a file removed from the middle stops first there', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    const start = Date.parse('2026-10-01T12:00:00.000Z');
+    const clock = { now: start };
+    const { audit, dir, lines } = open(scratch(), { retentionDays: 5 }, clock);
+    // One file a day for six days, three records in each.
+    for (let day = 0; day < 6; day += 1) {
+      clock.now = start + day * DAY;
+      for (let index = 0; index < 3; index += 1) audit.append(call(clock.now + index));
+    }
+    const files = listAuditFiles(dir);
+    expect(files.map((file) => file.firstSeq)).toEqual([1, 4, 7, 10, 13, 16]);
+    // Whoever holds the disk deletes the second to the fourth, all well inside the retention.
+    for (const file of files.slice(1, 4)) rmSync(join(dir, file.name));
+    // The hourly pass names the hole while the first file still stands before it.
+    vi.advanceTimersByTime(AUDIT_RETENTION_CHECK_MS);
+    expect(logged(lines, 'error')).toEqual([
+      expect.objectContaining({
+        msg: expect.stringMatching(/missing from the middle of the log/) as string,
+        from: 4,
+        to: 12,
+      }),
+    ]);
+    // A day on, the first file is past the retention, and the next record's rotation deletes it.
+    clock.now = start + 6 * DAY;
+    const before = lines.length;
+    audit.append(call(clock.now));
+    const added = lines.slice(before);
+    const deletion = added.findIndex((line) => line.includes('deleted by retention'));
+    expect(JSON.parse(added[deletion] ?? '{}')).toMatchObject({
+      file: files[0]?.name,
+      reason: 'age',
+    });
+    expect(added.filter((line) => line.includes('deleted by retention'))).toHaveLength(1);
+    // first goes to where the deleted file ended, the start of the hole, never to where the next file on disk starts.
+    expect(checkpoints(added.slice(deletion))[0]).toMatchObject({ seq: 18, first: 4 });
+    expect(logged(lines, 'error').at(-1)).toMatchObject({
+      msg: expect.stringMatching(/missing from the start of the log/) as string,
+      from: 4,
+      to: 12,
+    });
+    await audit.close();
+    const newest = checkpoints(lines).at(-1);
+    expect(newest).toMatchObject({ seq: 19, first: 4 });
+    expect(verifyAuditLines(readAuditLines(dir), newest).problems).toEqual([
+      expect.objectContaining({
+        problem: expect.stringMatching(
+          /the log starts at seq 13, but the checkpoint says it kept every record from seq 4/,
+        ) as string,
+      }),
+    ]);
+  });
+
+  it('names a hole only up to a file its retention deleted, even one it deleted out of order after the clock stepped back', () => {
+    const clock = { now: T0 };
+    const { audit, dir, lines } = open(scratch(), {}, clock);
+    for (let index = 0; index < 3; index += 1) audit.append(call(clock.now + index));
+    // The clock steps back a month, so the next file is named for a day past the retention.
+    clock.now = T0 - 33 * DAY;
+    for (let index = 0; index < 3; index += 1) audit.append(call(clock.now + index));
+    const [oldest, stepped] = listAuditFiles(dir);
+    expect([oldest?.firstSeq, stepped?.firstSeq]).toEqual([1, 4]);
+    // Whoever holds the disk deletes the oldest file; the clock comes back, and the rotation's retention deletes the second by its day.
+    rmSync(join(dir, oldest?.name ?? ''));
+    clock.now = T0 + DAY;
+    audit.append(call(clock.now));
+    expect(
+      logged(lines, 'info').filter((line) => line.msg === 'audit file deleted by retention'),
+    ).toEqual([expect.objectContaining({ file: stepped?.name, reason: 'age' })]);
+    // Seqs 4 to 6 went by retention, so the hole is 1 to 3 alone, and first stays at its start.
+    expect(logged(lines, 'error')).toEqual([
+      expect.objectContaining({
+        msg: expect.stringMatching(/missing from the start of the log/) as string,
+        from: 1,
+        to: 3,
+      }),
+    ]);
+    expect(checkpoints(lines).at(-1)).toMatchObject({ seq: 6, first: 1 });
+  });
+
+  it('lets a file that held no record go without stopping first there, since it lost nothing', async () => {
+    const dir = scratch();
+    const first = open(dir);
+    for (let index = 0; index < 3; index += 1) first.audit.append(call(T0 + index));
+    await first.audit.close();
+    opened.splice(opened.indexOf(first.audit), 1);
+    // An empty file named for the same seq, as a first write that failed for space leaves when the day turns.
+    const empty = `audit-${utcDay(T0 - DAY)}-000000000001.jsonl`;
+    writeFileSync(join(dir, empty), '', { mode: 0o600 });
+    const clock = { now: T0 };
+    const second = open(dir, {}, clock);
+    expect(checkpoints(second.lines)[0]).toMatchObject({ seq: 3, first: 1 });
+    clock.now = T0 + DAY;
+    second.audit.append(call(clock.now));
+    rmSync(join(dir, empty));
+    // A month on, retention deletes the file that held seqs 1 to 3, and keeps the next day's.
+    clock.now = T0 + 31 * DAY;
+    second.audit.append(call(clock.now));
+    await second.audit.close();
+    expect(logged(second.lines, 'error')).toEqual([]);
+    const newest = checkpoints(second.lines).at(-1);
+    expect(newest).toMatchObject({ seq: 5, first: 4 });
+    expect(verifyAuditLines(readAuditLines(dir), newest).problems).toEqual([]);
+  });
+
+  it('never moves first for a file it neither found nor made, so one planted where files were removed hides nothing when retention deletes it', async () => {
+    const { audit, dir, lines } = open(scratch(), { rotateBytes: 600 });
+    for (let index = 0; index < 9; index += 1) audit.append(call(T0 + index));
+    const files = listAuditFiles(dir);
+    const current = files.at(-1)?.firstSeq ?? 0;
+    expect(files.length).toBeGreaterThan(2);
+    // Whoever holds the disk deletes every file but the current one, and plants an
+    // empty one named for seq 1 on a day long past the retention.
+    for (const file of files.slice(0, -1)) rmSync(join(dir, file.name));
+    const planted = 'audit-2000-01-01-000000000001.jsonl';
+    writeFileSync(join(dir, planted), '', { mode: 0o600 });
+    for (let index = 9; index < 15; index += 1) audit.append(call(T0 + index));
+    await audit.close();
+    // Retention deleted the planted file by its age, as it should; that moved nothing.
+    expect(
+      logged(lines, 'info').filter((line) => line.msg === 'audit file deleted by retention'),
+    ).toEqual([expect.objectContaining({ file: planted, reason: 'age' })]);
+    expect(logged(lines, 'error')).toEqual([
+      expect.objectContaining({
+        msg: expect.stringMatching(/missing from the start of the log/) as string,
+        from: 1,
+        to: current - 1,
+      }),
+    ]);
+    expect(checkpoints(lines).map((checkpoint) => checkpoint.first)).toEqual(
+      checkpoints(lines).map(() => 1),
+    );
+    const newest = checkpoints(lines).at(-1);
+    expect(newest).toMatchObject({ seq: 15, first: 1 });
+    expect(verifyAuditLines(readAuditLines(dir), newest).problems).toEqual([
+      expect.objectContaining({
+        problem: expect.stringMatching(
+          new RegExp(
+            `the log starts at seq ${String(current)}, but the checkpoint says it kept every record from seq 1`,
+          ),
+        ) as string,
+      }),
+    ]);
+  });
 });
+
+/** The lines a log wrote at one level, parsed. */
+function logged(lines: string[], level: 'info' | 'warn' | 'error'): Record<string, unknown>[] {
+  return lines
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .filter((line) => line.level === level);
+}
 
 /** The checkpoints a log wrote to stderr, oldest first, as --checkpoint takes them. */
 function checkpoints(lines: string[]): { seq: number; head: string; first: number }[] {

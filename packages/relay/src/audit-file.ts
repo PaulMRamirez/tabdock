@@ -13,15 +13,22 @@
 // restarts, and a checkpoint line goes to stderr at open, every 15 minutes,
 // at rotation, after retention deletes a file and at stop: the last seq, its
 // line's digest (head) and the seq the log starts at (first). first moves
-// only when retention deletes the oldest file, so a file removed from the
-// start any other way while the log is open stays missing in every later
-// checkpoint, and the open's checkpoint shows one removed while it was
-// closed against the stop's before it. That is tamper evidence, not
-// prevention: whoever holds the disk can rewrite everything after the newest
-// checkpoint the platform's logs still keep, but cannot edit or drop a line
-// from its first to its seq unseen. A file whose first record is not the one
-// its name gives shows lines cut from its start even without a checkpoint. It
-// uses node:crypto's SHA-256 and no key.
+// only when retention deletes the oldest file the log knows, one it found at
+// open or made since, and only to where the next one it knows starts, never
+// to a seq read back from the directory: so a file removed any other way
+// while the log is open, from the start or the middle, is logged as missing
+// and first never passes it for the rest of the run, and a file planted in
+// its place moves nothing. A start takes the files it finds as given: its
+// checkpoint, written before anything else, repeats the stop's after a clean
+// stop, but a change made while no relay ran that leaves it the same (a file
+// removed from the middle, say) can no longer be told from retention's own
+// work once retention deletes the files before it (docs/deploy.md says what
+// shows until then). That is tamper evidence, not prevention: whoever holds
+// the disk can rewrite everything after the newest checkpoint the platform's
+// logs still keep, but cannot edit or drop a line from its first to its seq
+// unseen. A file whose first record is not the one its name gives shows
+// lines cut from its start even without a checkpoint. It uses node:crypto's
+// SHA-256 and no key.
 //
 // append never throws and never waits, so no call fails for a disk: a write
 // that fails leaves the record on stderr only (recordAudit writes that copy),
@@ -257,8 +264,8 @@ export interface AuditCheckpoint {
  * checkpoint from the platform's logs, when given, must match the line of its
  * seq, which also shows an edit to the last lines that no later line could
  * reveal; and the log must still start at or before its first, since a
- * relay moves first only when its retention deletes the oldest file, and
- * checkpoints at once when it does.
+ * relay moves first only when its retention deletes the oldest file it
+ * knows, and checkpoints at once when it does.
  */
 export function verifyAuditLines(
   lines: Iterable<ReadLine>,
@@ -388,8 +395,22 @@ function codeOf(error: unknown): string {
 interface CurrentFile {
   name: string;
   day: string;
+  /** The seq its name gives its first line. */
+  firstSeq: number;
   fd: number | null;
   size: number;
+}
+
+/**
+ * A file the log knows: one it found at open or made, by name and the seq
+ * its name gives its first line. deleted marks one its own retention
+ * deleted, kept until first passes it so a file gone before it is never
+ * counted as reaching past it.
+ */
+interface KnownFile {
+  name: string;
+  firstSeq: number;
+  deleted: boolean;
 }
 
 /** What the file missed while writing failed, for the audit_gap record that follows. */
@@ -399,11 +420,12 @@ interface Gap {
   lastAt: number;
 }
 
-/** Where a log goes on from: the seq its next line gets, the last line's digest, and the seq its oldest file starts at. */
+/** Where a log goes on from: the seq its next line gets, the last line's digest, the seq its oldest file starts at, and the files it found. */
 interface Recovered {
   nextSeq: number;
   head: string | null;
   first: number;
+  files: AuditFileInfo[];
 }
 
 export class FileAuditLog implements AuditLog {
@@ -430,11 +452,18 @@ export class FileAuditLog implements AuditLog {
   #closed = false;
   /**
    * The seq the log starts at, which each checkpoint names: where the oldest
-   * file started at open, moved on only by this log's own retention.
+   * file started at open, moved on only when this log's own retention
+   * deletes the oldest file it knows, to where the next one it knows starts.
    */
   #first: number;
-  /** The range of seqs last reported missing from the log's start, so a hole is logged once. */
-  #missingReported: string | null = null;
+  /**
+   * The files this log found at open and made since, oldest first: the only
+   * boundaries first moves along. A file that appears any other way, under
+   * whatever name, is none, so planting one moves nothing.
+   */
+  #known: KnownFile[];
+  /** The holes last reported, so each is logged once while it lasts. */
+  #missingReported = new Set<string>();
   /** Whether #gap came from AUDIT_GAP_NAME, which is cleared once its record is written. */
   #gapOwed = false;
   /** AUDIT_GAP_NAME, open from open to close, so close can write an owed gap over it in place. */
@@ -464,6 +493,7 @@ export class FileAuditLog implements AuditLog {
     this.#nextSeq = recovered.nextSeq;
     this.#head = recovered.head;
     this.#first = recovered.first;
+    this.#known = recovered.files.map(({ name, firstSeq }) => ({ name, firstSeq, deleted: false }));
   }
 
   /**
@@ -835,7 +865,7 @@ export class FileAuditLog implements AuditLog {
       this.#rotate();
     }
     const name = `audit-${day}-${String(this.#nextSeq).padStart(12, '0')}.jsonl`;
-    const next: CurrentFile = { name, day, fd: null, size: 0 };
+    const next: CurrentFile = { name, day, firstSeq: this.#nextSeq, fd: null, size: 0 };
     this.#current = next;
     // After each rotation, with the new file already current, so it is never a candidate.
     if (rotating) this.#retain();
@@ -859,6 +889,9 @@ export class FileAuditLog implements AuditLog {
       nodeFs.constants.O_WRONLY | nodeFs.constants.O_APPEND | nodeFs.constants.O_CREAT | noFollow(),
       FILE_MODE,
     );
+    // Known from the moment it exists, never before: a retention pass that
+    // ran before it was made would otherwise count it as removed.
+    this.#know(current);
     try {
       this.#fs.fchmodSync(fd, FILE_MODE);
       const size = this.#fs.fstatSync(fd).size;
@@ -918,10 +951,10 @@ export class FileAuditLog implements AuditLog {
   /**
    * Deletes files past the retention, then the oldest past the size cap;
    * never the current file. A deletion moves where the log starts, so a
-   * checkpoint follows at once. Only this log's own deletions move first: a
-   * log whose oldest file starts after first lost the files between some
-   * other way, so first stays and the hole is logged, and every checkpoint
-   * from then on still shows it to --verify (ADR 0019).
+   * checkpoint follows at once. Only this log's own deletions of files it
+   * knows move first (see #moveFirst), so a file removed any other way is
+   * logged as a hole that every checkpoint from then on shows to --verify
+   * (ADR 0019).
    */
   #retain(): void {
     if (this.#lockLost) return;
@@ -967,26 +1000,75 @@ export class FileAuditLog implements AuditLog {
       if (total <= this.#maxBytes) break;
       if (file.name !== current) remove(file, 'size');
     }
-    // Where the files started before this pass, which only a hole puts past first.
-    const start = files[0]?.firstSeq;
-    if (this.#head !== null && (start === undefined || start > this.#first)) {
-      this.#reportMissing(start ?? this.#nextSeq);
-    } else {
-      // With no file left on disk, the next line starts the log.
-      const oldest = files.find((file) => !deleted.has(file.name))?.firstSeq ?? this.#nextSeq;
-      this.#first = Math.max(this.#first, oldest);
-    }
+    this.#moveFirst(
+      new Set(files.filter((file) => !deleted.has(file.name)).map((file) => file.name)),
+      deleted,
+    );
     if (deleted.size > 0) this.#checkpoint();
   }
 
-  /** Logs, once for each hole, seqs gone from the log's start that retention did not delete. */
-  #reportMissing(start: number): void {
-    const range = `${String(this.#first)}-${String(start - 1)}`;
-    if (this.#missingReported === range) return;
-    this.#missingReported = range;
+  /** Adds a file this log made to the ones it knows, once. */
+  #know(file: CurrentFile): void {
+    if (this.#known.some((known) => known.name === file.name)) return;
+    this.#known.push({ name: file.name, firstSeq: file.firstSeq, deleted: false });
+    // Stable, so a file made after one found with the same seq stays after it.
+    this.#known.sort((a, b) => a.firstSeq - b.firstSeq);
+  }
+
+  /**
+   * Moves first after a retention pass, along the files this log knows and
+   * never to a seq read from the directory: once retention has deleted the
+   * oldest file it knows, first is where the next one it knows starts. A
+   * file it knows that is gone from the directory, and that its retention
+   * did not delete, was removed some other way: the seqs from its start to
+   * the next file it knows are logged as missing, and first never passes
+   * them for the rest of the run, so once it reaches them every checkpoint
+   * names the hole and --verify against it fails. A file this log does not
+   * know, planted under whatever name, moves first neither by its name nor
+   * when retention deletes it.
+   */
+  #moveFirst(onDisk: ReadonlySet<string>, deleted: ReadonlySet<string>): void {
+    for (const file of this.#known) if (deleted.has(file.name)) file.deleted = true;
+    const gone = (file: KnownFile): boolean => !file.deleted && !onDisk.has(file.name);
+    // A file gone whose successor starts at its own seq held no record, so it
+    // lost nothing; kept, it would stop first there for the rest of the run.
+    this.#known = this.#known.filter(
+      (file, index, all) => !gone(file) || all[index + 1]?.firstSeq !== file.firstSeq,
+    );
+    let moved = false;
+    while (this.#known[0]?.deleted === true) {
+      this.#known.shift();
+      moved = true;
+    }
+    // With no file left that it knows, the next line starts the log.
+    if (moved) this.#first = this.#known[0]?.firstSeq ?? this.#nextSeq;
+    const holes = new Set<string>();
+    let hole: { from: number; atStart: boolean } | null = null;
+    // null after the last: a run of files gone at the end held up to the last line written.
+    for (const [index, file] of [...this.#known, null].entries()) {
+      if (file !== null && gone(file)) {
+        hole ??= { from: file.firstSeq, atStart: index === 0 };
+        continue;
+      }
+      if (hole === null) continue;
+      // What a run of files gone held: up to the next file known, deleted by retention or not.
+      const to = (file?.firstSeq ?? this.#nextSeq) - 1;
+      if (to >= hole.from) this.#reportMissing(hole.from, to, hole.atStart, holes);
+      hole = null;
+    }
+    this.#missingReported = holes;
+  }
+
+  /** Logs seqs gone from the log that retention did not delete, once for each hole while it lasts. */
+  #reportMissing(from: number, to: number, atStart: boolean, holes: Set<string>): void {
+    const hole = `${atStart ? 'start' : 'middle'} ${String(from)}-${String(to)}`;
+    holes.add(hole);
+    if (this.#missingReported.has(hole)) return;
     this.#log.error(
-      'audit records are missing from the start of the log, removed by something other than its retention; each checkpoint this relay writes goes on naming the seq the log started at, so --verify against it reports the hole (ADR 0019)',
-      { from: this.#first, to: start - 1 },
+      atStart
+        ? 'audit records are missing from the start of the log, removed by something other than its retention; each checkpoint this relay writes goes on naming the seq the log started at, so --verify against it reports the hole (ADR 0019)'
+        : 'audit records are missing from the middle of the log, removed by something other than its retention; --verify reports the break in the chain, and once retention deletes the files before it, each checkpoint this relay writes names the seq the hole starts at, so --verify against it still reports the hole (ADR 0019)',
+      { from, to },
     );
   }
 }
@@ -1645,7 +1727,9 @@ function prepareDir(dir: string, fs: AuditFs): void {
  * record's line. A torn last line, which a crash leaves, is closed with a
  * newline here so the next record starts a line of its own; older files are
  * read only when the newest holds no record at all. first is where the
- * oldest file says it starts, until retention looks again.
+ * oldest file says it starts, and the files listed are the ones the log
+ * knows at open, taken as given: whoever held the disk while no relay ran
+ * may have changed them, and docs/deploy.md says what then shows it.
  */
 function recover(dir: string, fs: AuditFs, log: Logger): Recovered {
   let files: AuditFileInfo[];
@@ -1676,11 +1760,16 @@ function recover(dir: string, fs: AuditFs, log: Logger): Recovered {
       if (text === '') continue;
       const record = readLine(file.name, at + 1, text).record;
       if (record !== null) {
-        return { nextSeq: record.seq + 1, head: lineHash(text), first: files[0]?.firstSeq ?? 1 };
+        return {
+          nextSeq: record.seq + 1,
+          head: lineHash(text),
+          first: files[0]?.firstSeq ?? 1,
+          files,
+        };
       }
     }
   }
-  return { nextSeq: 1, head: null, first: 1 };
+  return { nextSeq: 1, head: null, first: 1, files };
 }
 
 function closeTornLine(path: string, fs: AuditFs): void {
