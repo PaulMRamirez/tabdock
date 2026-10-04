@@ -35,37 +35,50 @@ import {
   eventually,
   pairAndApprove,
   startRelay,
+  TestFence,
   type TestRelay,
 } from './helpers/relay.ts';
 
 let current: TestRelay | undefined;
 const pages: TestPage[] = [];
 const clients: Client[] = [];
+const fence = new TestFence();
 
 async function setup(options: Parameters<typeof startRelay>[0] = {}): Promise<TestRelay> {
-  current = await startRelay(options);
+  current = await fence.keep(startRelay(options), (late) => late.close());
   return current;
 }
 
 async function page(options: PageOptions = {}): Promise<TestPage> {
   if (!current) throw new Error('no relay');
-  const opened = await connectPage(current.relay.pageUrl, { tools: TOOLS, ...options });
+  const opened = await fence.keep(
+    connectPage(current.relay.pageUrl, { tools: TOOLS, ...options }),
+    (late) => {
+      late.ws.terminate();
+    },
+  );
   pages.push(opened);
   return opened;
 }
 
 async function client(user = ALICE): Promise<Client> {
   if (!current) throw new Error('no relay');
-  const connected = await connectClient(current.relay, user);
+  const connected = await fence.keep(connectClient(current.relay, user), (late) => late.close());
   clients.push(connected);
   return connected;
 }
 
 afterEach(async () => {
-  for (const connected of clients.splice(0)) await connected.close();
-  for (const opened of pages.splice(0)) opened.ws.terminate();
-  await current?.close();
+  fence.end();
+  const ending = current;
   current = undefined;
+  // The relay closes even if a client will not, so none outlives its test.
+  try {
+    for (const connected of clients.splice(0)) await connected.close();
+  } finally {
+    for (const opened of pages.splice(0)) opened.ws.terminate();
+    await ending?.close();
+  }
 });
 
 function echo(frame: InvokeFrame): InvokeReply {
@@ -975,6 +988,10 @@ describe('schema nodes per tools frame and per tool (S9, ADR 0010)', () => {
     expect(await refused(alice, opened.pageId, 'get_view', { unexpected: true })).toBe(false);
   });
 
+  // A timeout of its own: five re-lists of tools of about 4,450 schema nodes
+  // each, and six calls checked against such a schema in the worker, take
+  // about 0.6 s alone and went past vitest's default 5 s with three test runs
+  // sharing four cores.
   it('walks only tools that changed, so one sent again unchanged costs nothing against the cap', async () => {
     const { opened, alice } = await attached();
     const four = (description?: string) =>
@@ -1017,5 +1034,5 @@ describe('schema nodes per tools frame and per tool (S9, ADR 0010)', () => {
       'Again.',
       'Two.',
     ]);
-  });
+  }, 20_000);
 });

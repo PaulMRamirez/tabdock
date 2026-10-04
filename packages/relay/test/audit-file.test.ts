@@ -8,7 +8,7 @@
 // once a second, checkpoints every 15 minutes, and the reader's --verify,
 // which names torn lines and fails on an edited or removed one.
 
-import { spawn } from 'node:child_process';
+import { type ChildProcess, spawn } from 'node:child_process';
 import * as nodeFs from 'node:fs';
 import {
   chmodSync,
@@ -1616,11 +1616,40 @@ describe('what reaches a line (ADR 0019, S11)', () => {
 });
 
 describe('one writer per directory (ADR 0019)', () => {
+  /**
+   * Every process these tests start. A test's own finally stops its process
+   * only once the test goes on, and one that timed out may never, so this
+   * afterEach, which runs before the file's own removes the directories,
+   * ends any still running, and none outlives its test or the run.
+   */
+  const children = new Set<ChildProcess>();
+
+  afterEach(async () => {
+    const left = [...children];
+    children.clear();
+    await Promise.all(
+      left.map(
+        (child) =>
+          new Promise<void>((resolve) => {
+            if (child.exitCode !== null || child.signalCode !== null) {
+              resolve();
+              return;
+            }
+            child.once('exit', () => {
+              resolve();
+            });
+            child.kill('SIGKILL');
+          }),
+      ),
+    );
+  });
+
   /** A process that runs until killed, to hold a pid that is alive and not this one. */
   async function otherProcess(
     args: string[] = ['-e', 'setInterval(() => {}, 1000)'],
   ): Promise<{ pid: number; stop(): Promise<void> }> {
     const child = spawn(process.execPath, args, { stdio: 'ignore' });
+    children.add(child);
     await new Promise<void>((resolve, reject) => {
       child.once('spawn', resolve);
       child.once('error', reject);
@@ -1684,6 +1713,7 @@ describe('one writer per directory (ADR 0019)', () => {
       ],
       { stdio: ['ignore', 'pipe', 'pipe'] },
     );
+    children.add(child);
     let output = '';
     child.stderr.on('data', (chunk: Buffer) => {
       output += chunk.toString();

@@ -73,6 +73,12 @@ async function sharedPage(options: Parameters<typeof startInviteRelay>[0] = {}) 
 const getView = (pageId: string) => ({ page: pageId, tool: 'get_view' });
 
 describe('S14: minted only while an allowlisted sponsor is attached', () => {
+  // This test and the one naming the sponsor have timeouts of their own. The
+  // first starts this file's first relay and provider and the other signs its
+  // first members in, and vitest has been running this file at the very start
+  // of a run, beside the tool heap test, while every worker starts up. About
+  // 0.3 to 0.4 s each alone, they went past vitest's default 5 s with three
+  // test runs sharing four cores.
   it('refuses with nobody attached, and sends the invites right after every welcome', async () => {
     const relay = await setup();
     const page = await relay.page({ policy: { invites: 'all' } });
@@ -80,7 +86,7 @@ describe('S14: minted only while an allowlisted sponsor is attached', () => {
     const refused = await mint(page);
     expect(refused.answer.refused).toEqual({ inviteId: refused.inviteId, reason: 'no_sponsor' });
     expect(refused.answer.invites).toEqual([]);
-  });
+  }, 20_000);
 
   it('refuses while only an invitee is attached: an invitee sponsors nothing', async () => {
     const relay = await setup();
@@ -125,7 +131,7 @@ describe('S14: minted only while an allowlisted sponsor is attached', () => {
         refusals: 0,
       },
     ]);
-  });
+  }, 20_000);
 
   it.each(['Carol is', 'nobody else is'] as const)(
     'passes over a member whose own sponsor is past their end before the timer runs, when %s attached',
