@@ -23,6 +23,7 @@ import {
   joinAtI,
   latest,
   LINK_BASE,
+  MEMBERS,
   mint,
   mintOk,
   newSecret,
@@ -124,6 +125,68 @@ describe('S14: minted only while an allowlisted sponsor is attached', () => {
       },
     ]);
   });
+
+  it.each(['Carol is', 'nobody else is'] as const)(
+    'passes over a member whose own sponsor is past their end before the timer runs, when %s attached',
+    async (others) => {
+      // Bob, let in by Alice's invite, calls halfway through, so his own end
+      // moves on while Alice passes hers with her timer not yet run. He lasts
+      // only while she does (S14), so he sponsors nothing: the mint ends them
+      // both as the timers would, then names Carol, or refuses with nobody left,
+      // rather than list a link that would be refused on arrival.
+      const idleMs = 30 * 60_000;
+      const relay = await setup({
+        users: [...MEMBERS, { sub: 'sub-carol', userId: 'carol', displayName: 'Carol' }],
+        timings: { attachmentIdleMs: idleMs },
+      });
+      const page = await relay.page({ policy: { invites: 'all' } });
+      await attachMember(await relay.claude('sub-alice'), page);
+      vi.useFakeTimers({ toFake: ['Date'] });
+      const start = Date.now();
+      const bob = await relay.claude('sub-bob');
+      expect((await redeem(bob, page, (await mintOk(page)).link)).outcome.isError).toBe(false);
+      expect(relay.store.attachments.get(page.pageId, 'bob')?.sponsorId).toBe('alice');
+      const calling = [bob];
+      if (others === 'Carol is') {
+        vi.setSystemTime(start + 1000);
+        const carol = await relay.claude('sub-carol');
+        await attachMember(carol, page, 'observer');
+        calling.push(carol);
+      }
+      vi.setSystemTime(start + idleMs / 2);
+      for (const who of calling) {
+        expect((await call(who, 'call_page_tool', getView(page.pageId))).isError).toBe(false);
+      }
+      vi.setSystemTime(start + idleMs + 60_000);
+      const minted = await mint(page);
+      const events = relay.relay.audit.events();
+      expect(events).toContainEqual(
+        expect.objectContaining({ type: 'expire', userId: 'alice', reason: 'idle' }),
+      );
+      expect(events).toContainEqual(
+        expect.objectContaining({ type: 'expire', userId: 'bob', reason: 'sponsor_gone' }),
+      );
+      if (others === 'nobody else is') {
+        expect(minted.answer.refused).toEqual({ inviteId: minted.inviteId, reason: 'no_sponsor' });
+        expect(minted.answer.invites).toEqual([]);
+        expect(relay.store.attachments.listForPage(page.pageId)).toEqual([]);
+        return;
+      }
+      expect(minted.answer.refused).toBeUndefined();
+      expect(
+        minted.answer.invites.find((invite) => invite.inviteId === minted.inviteId)?.sponsor,
+      ).toEqual({ userId: 'carol', displayName: 'Carol' });
+      expect(relay.store.attachments.listForPage(page.pageId).map((a) => a.userId)).toEqual([
+        'carol',
+      ]);
+      // The link it lists works: the page hears the redemption and lets the guest in.
+      const guest = await relay.claude(GUEST, GUEST_EMAIL);
+      const { outcome } = await redeem(guest, page, `${LINK_BASE}#${minted.secret}`);
+      expect(outcome.isError, outcome.text).toBe(false);
+      expect(outcome.text).toContain('Shared by Carol.');
+    },
+    15_000,
+  );
 });
 
 describe('S14: as far as policy.invites allows', () => {
@@ -807,12 +870,113 @@ describe("S14: when a sponsor's attachment ends, so do its invites and the attac
     15_000,
   );
 
+  it.each(['call_page_tool', 'list_page_tools', 'list_pages', 'detach_page'] as const)(
+    'and end what their invites made when a guest next uses the page through %s while the sponsor is past their end, before its timer fires',
+    async (tool) => {
+      // The guest calls halfway through, which moves their own end on, while
+      // Alice passes hers with her timer not yet run. An attachment past its
+      // time is over, and so is everything its invites made (S14), so each
+      // way in ends Alice as her timer would, and the guest with her, before
+      // it answers: nothing reaches the page.
+      const idleMs = 30 * 60_000;
+      const { relay, page } = await sharedPage({ timings: { attachmentIdleMs: idleMs } });
+      vi.useFakeTimers({ toFake: ['Date'] });
+      const start = Date.now();
+      const minted = await mintOk(page);
+      const guest = await relay.claude(GUEST, GUEST_EMAIL);
+      const { outcome, request } = await redeem(guest, page, minted.link);
+      expect(outcome.isError, outcome.text).toBe(false);
+      vi.setSystemTime(start + idleMs / 2);
+      expect((await call(guest, 'call_page_tool', getView(page.pageId))).isError).toBe(false);
+      vi.setSystemTime(start + idleMs + 60_000);
+      await page.sync();
+      const invoked = page.all('invoke').length;
+      const args =
+        tool === 'list_pages'
+          ? {}
+          : tool === 'call_page_tool'
+            ? getView(page.pageId)
+            : { page: page.pageId };
+      const answer = await call(guest, tool, args);
+      if (tool === 'list_pages') expect(answer.structured).toEqual({ pages: [] });
+      else expect(answer.text).toMatch(/^not_attached: /);
+      expect((await call(guest, 'call_page_tool', getView(page.pageId))).text).toMatch(
+        /^not_attached: /,
+      );
+      await page.sync();
+      expect(page.all('invoke')).toHaveLength(invoked);
+      expect(relay.store.attachments.listForPage(page.pageId)).toEqual([]);
+      const events = relay.relay.audit.events();
+      expect(events).toContainEqual(
+        expect.objectContaining({ type: 'expire', userId: 'alice', reason: 'idle' }),
+      );
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: 'expire',
+          userId: request.user.userId,
+          reason: 'sponsor_gone',
+        }),
+      );
+      expect(events.find((event) => event.type === 'sponsor_gone')).toMatchObject({
+        sponsor: 'alice',
+        attachments: 1,
+      });
+      expect(events.filter((event) => event.type === 'detach')).toEqual([]);
+    },
+    15_000,
+  );
+
+  it('and ask the page afresh when a member their invite let in pairs by code while the sponsor is past their end', async () => {
+    // Bob's invite-made attachment lasts only while Alice's does, so a code he
+    // pairs with once she is past her end, her timer not yet run, finds him
+    // not attached: the relay ends them both as the timers would, and the
+    // operator decides again, which gives him an attachment of his own.
+    const idleMs = 30 * 60_000;
+    const { relay, page } = await sharedPage({ timings: { attachmentIdleMs: idleMs } });
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const start = Date.now();
+    const bob = await relay.claude('sub-bob');
+    expect((await redeem(bob, page, (await mintOk(page)).link)).outcome.isError).toBe(false);
+    vi.setSystemTime(start + idleMs / 2);
+    expect((await call(bob, 'call_page_tool', getView(page.pageId))).isError).toBe(false);
+    vi.setSystemTime(start + idleMs + 60_000);
+    // A code shown now, since the one on screen expired on the stepped clock.
+    page.send({ t: 'rotate_pairing' });
+    await page.sync();
+    const pending = call(bob, 'pair_page', { code: page.code });
+    const request = await page.next('attach_request');
+    expect(request).toMatchObject({ via: 'code', user: { userId: 'bob' } });
+    page.send({
+      t: 'attach_decision',
+      requestId: request.requestId,
+      allow: true,
+      role: 'observer',
+    });
+    const outcome = await pending;
+    expect(outcome.isError, outcome.text).toBe(false);
+    expect(outcome.text).not.toContain('You were already attached.');
+    expect(relay.store.attachments.listForPage(page.pageId)).toEqual([
+      expect.objectContaining({ userId: 'bob', inviteId: null, sponsorId: null, endsAt: null }),
+    ]);
+    const events = relay.relay.audit.events();
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: 'expire', userId: 'alice', reason: 'idle' }),
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: 'expire', userId: 'bob', reason: 'sponsor_gone' }),
+    );
+  }, 15_000);
+
   it('and refuse a redemption while the member whose invite let the sponsor in is past their end', async () => {
     // A member let in by another member's invite lasts only while that member
-    // does (S14), so the lookup walks up the chain. Bob, let in by Alice's
-    // invite, calls halfway through, which moves his own end on, and so
-    // sponsors once Alice is past hers; a redemption of his invite ends Alice,
-    // Bob with her, and his invite with him.
+    // does (S14), so the lookup walks up the chain. A mint never names such a
+    // member while the one above them is attached, since that one attached
+    // first and a mint ends anyone past their time; so this test moves Alice's
+    // grant after Bob's in the store, a state the relay never makes, to show
+    // that the walk holds on its own. Bob, let in by Alice's invite, sponsors
+    // and calls halfway through, which moves his own end on; a redemption of
+    // his invite once Alice is past her end ends her, Bob with her, and his
+    // invite with him.
     const idleMs = 30 * 60_000;
     const { relay, page } = await sharedPage({ timings: { attachmentIdleMs: idleMs } });
     vi.useFakeTimers({ toFake: ['Date'] });
@@ -821,13 +985,16 @@ describe("S14: when a sponsor's attachment ends, so do its invites and the attac
     const first = await mintOk(page);
     expect((await redeem(bob, page, first.link)).outcome.isError).toBe(false);
     expect(relay.store.attachments.get(page.pageId, 'bob')?.sponsorId).toBe('alice');
-    vi.setSystemTime(start + idleMs / 2);
-    expect((await call(bob, 'call_page_tool', getView(page.pageId))).isError).toBe(false);
-    vi.setSystemTime(start + idleMs + 60_000);
+    const alice = relay.store.attachments.get(page.pageId, 'alice');
+    if (alice === undefined) throw new Error('Alice is not attached');
+    relay.store.attachments.put({ ...alice, grantedAt: start + 1 });
     const second = await mintOk(page);
     expect(
       second.answer.invites.find((invite) => invite.inviteId === second.inviteId)?.sponsor.userId,
     ).toBe('bob');
+    vi.setSystemTime(start + idleMs / 2);
+    expect((await call(bob, 'call_page_tool', getView(page.pageId))).isError).toBe(false);
+    vi.setSystemTime(start + idleMs + 60_000);
     await page.sync();
     const asked = page.all('attach_request').length;
     const guest = await relay.claude(GUEST, GUEST_EMAIL);
