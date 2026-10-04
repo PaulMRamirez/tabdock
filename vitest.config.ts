@@ -6,5 +6,7 @@ export default defineConfig({
   test: {
     include: ['{packages,apps,tests}/*/{src,test}/**/*.test.ts'],
     environment: 'node',
+    // Throwaway homes for every test file, so local mode never touches the real one.
+    setupFiles: ['./vitest.setup.ts'],
   },
 });

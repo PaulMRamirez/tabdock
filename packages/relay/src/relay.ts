@@ -12,12 +12,19 @@
 // strict 2026-07-28 handler. In public URL mode (ADR 0014) the public host
 // passes the Host check for /mcp and the QR flow at /pair (pair.ts) is served
 // behind the same check, while /page still takes only requests made on this
-// machine. Requests are logged by route, never by raw path or query, so no
-// secret a URL carries reaches a log. The M3 spike's measurements (spike.ts)
-// hook in here when TABDOCK_SPIKE is on; nothing over HTTP controls them.
+// machine. Without a public URL, in local mode (ADR 0022) and with dev tokens
+// alike, /mcp and /page take only requests made on this machine, so a tunnel
+// pointed at a loopback relay, even one that rewrites Host, cannot expose it.
+// Those checks trust a Host header any program can write, so they hold only
+// while the relay listens on loopback: it resolves its host name itself and
+// listens on the address only when that is loopback (S12). Requests are
+// logged by route, never by raw path or query, so no secret a URL carries
+// reaches a log. The M3 spike's measurements (spike.ts) hook in here when
+// TABDOCK_SPIKE is on; nothing over HTTP controls them.
 
+import { lookup } from 'node:dns/promises';
 import { createServer, type IncomingMessage, type ServerResponse, STATUS_CODES } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { type AddressInfo, isIP } from 'node:net';
 import type { Duplex } from 'node:stream';
 import { type NodeIncomingMessageLike, toNodeHandler } from '@modelcontextprotocol/node';
 import {
@@ -30,10 +37,12 @@ import { MAX_FRAME_BYTES, SUBPROTOCOL } from '@tabdock/protocol';
 import { WebSocketServer } from 'ws';
 import { type AuthOutcome, AuthOutcomeSchema, type AuthRoute } from './auth.ts';
 import {
+  isLoopbackAddress,
   LOOPBACK_HOSTNAMES,
   NO_ORIGIN,
   parseHostHeader,
   type RelayOptions,
+  type ResolvedConfig,
   resolveConfig,
 } from './config.ts';
 import { PageHub } from './hub.ts';
@@ -82,10 +91,12 @@ function malformedHost(request: IncomingMessage): boolean {
 }
 
 /**
- * Whether a /page upgrade was made on this machine rather than through the
- * tunnel. The Host must be a loopback name exactly as written, and no proxy
+ * Whether a request was made on this machine rather than through a tunnel or
+ * proxy. The Host must be a loopback name exactly as written, and no proxy
  * header may be present: a tunnel told to rewrite Host still adds
- * X-Forwarded-For, while a browser's WebSocket can set neither.
+ * X-Forwarded-For, while a browser's WebSocket can set neither. Every /page
+ * upgrade must pass it (ADR 0014), and so must every /mcp request on a relay
+ * without a public URL (ADR 0022).
  */
 function madeLocally(request: IncomingMessage): boolean {
   const host = request.headers.host === undefined ? null : parseHostHeader(request.headers.host);
@@ -155,6 +166,31 @@ function send(
 
 function formatHost(address: string): string {
   return address.includes(':') ? `[${address}]` : address;
+}
+
+/**
+ * The literal address to listen on. resolveConfig judged only a name, and
+ * localhost means whatever the hosts file or resolver says: one that maps it
+ * elsewhere, or a search domain added to a lookup that found no hosts entry,
+ * would put a loopback relay, local mode's above all, on the network, where
+ * any client can send the Host and headers madeLocally and validateHost look
+ * for. So the name is resolved once here, every address it gives must be
+ * loopback, and the relay listens on that literal, never on the name, which a
+ * second lookup could answer differently (S12, ADR 0022).
+ */
+async function listenAddress(config: ResolvedConfig): Promise<string> {
+  const host = config.host.replace(/^\[(.*)\]$/, '$1');
+  const addresses =
+    isIP(host) === 0 ? (await lookup(host, { all: true })).map((entry) => entry.address) : [host];
+  const offLoopback = addresses.find((address) => !isLoopbackAddress(address));
+  if (config.loopback && offLoopback !== undefined) {
+    throw new Error(
+      `refusing to listen on ${offLoopback}: the host ${config.host} (TABDOCK_HOST) resolves there, and the relay listens only on loopback (SPEC S12, ADR 0022); fix the hosts file or resolver, or set TABDOCK_HOST to 127.0.0.1 or ::1`,
+    );
+  }
+  const [first] = addresses;
+  if (first === undefined) throw new Error(`the host ${config.host} (TABDOCK_HOST) has no address`);
+  return first;
 }
 
 export async function createRelay(options: RelayOptions): Promise<Relay> {
@@ -296,6 +332,14 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     // Where the spike's call timestamps start: before the Host check, sign-in and the SDK.
     const receivedAt = performance.now();
     if (config.loopback && !validateHost(request, response)) return;
+    // Before the plugin, so a proxied request never even gets a challenge.
+    if (config.publicUrl === null && !madeLocally(request)) {
+      log.info('mcp request refused: not made on this machine', {
+        address: request.socket.remoteAddress,
+      });
+      send(response, 403, 'This relay serves only clients on its own machine');
+      return;
+    }
     const outcome = await authenticate(request, response);
     if (outcome === null) return;
     if (outcome.kind === 'refused') {
@@ -397,8 +441,9 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     }
     // ADR 0014: every request through the tunnel arrives from loopback, so the
     // address says nothing; the Host and proxy headers do. Pages attach only
-    // from this machine until M4 brings a host and a trusted client address.
-    if (config.publicUrl !== null && !madeLocally(request)) {
+    // from this machine until M4 brings a host and a trusted client address,
+    // and a relay without a public URL never takes a proxied page (ADR 0022).
+    if (!madeLocally(request)) {
       log.info('page socket refused: not made on this machine', { address });
       refuseUpgrade(socket, 403, 'Pages attach only from the relay machine itself');
       return;
@@ -444,15 +489,17 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     // first would let its first calls through unchecked. If it cannot start,
     // the relay serves anyway and keeps restarting it (ADR 0010).
     await hub.ready();
+    const address = await listenAddress(config);
     await new Promise<void>((resolveListen, rejectListen) => {
       server.once('error', rejectListen);
-      server.listen(config.port, config.host.replace(/^\[(.*)\]$/, '$1'), () => {
+      server.listen(config.port, address, () => {
         server.off('error', rejectListen);
         resolveListen();
       });
     });
   } catch (error) {
-    // A port in use must not leave the MCP handler, the socket server or the check worker behind.
+    // A port in use or a host off loopback must not leave the MCP handler,
+    // the socket server or the check worker behind.
     pair?.close();
     wss.close();
     await hub.shutdown();

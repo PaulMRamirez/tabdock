@@ -5,9 +5,12 @@
 // production rules, only OAuth sign-in for that address, and the QR sign-in at
 // /pair, which needs a client of its own at the provider. The section 9 limits
 // and the session and attachment lifetimes follow ADR 0009. The M3 spike's
-// measurement flag (ADR 0014) is refused in production.
+// measurement flag (ADR 0014) is refused in production. With no auth settings
+// at all the relay runs in local mode (ADR 0022): one user, `you`, holding an
+// owner token drawn into a private per-user file (local-token.ts), behind a
+// plugin marked loopbackOnly, which resolveConfig keeps on this machine.
 
-import { isIPv6 } from 'node:net';
+import { BlockList, isIP, isIPv6 } from 'node:net';
 import {
   ATTACH_REQUEST_TTL_MS,
   DEFAULT_CALL_DEADLINE_MS,
@@ -18,6 +21,7 @@ import {
   RESUME_WINDOW_MS,
 } from '@tabdock/protocol';
 import { type AuthPlugin, createDevTokenAuth, parseDevTokens } from './auth.ts';
+import { LOCAL_USER, type LocalTokenSystem, loadOwnerToken } from './local-token.ts';
 import type { LogLevel, LogSink } from './log.ts';
 import { createOAuthAuth, parseOAuthUsers } from './oauth.ts';
 import type { RelayStore } from './store.ts';
@@ -140,7 +144,10 @@ export interface PairClientOptions {
 
 export interface RelayOptions {
   auth: AuthPlugin;
-  /** Default 127.0.0.1. Anything but loopback is refused until M4 brings TLS. */
+  /**
+   * Default 127.0.0.1. Anything but loopback is refused until M4 brings TLS,
+   * and a name must resolve to loopback addresses alone (relay.ts).
+   */
   host?: string | undefined;
   /** Default 0, a free port; the CLI uses 8787. */
   port?: number | undefined;
@@ -285,6 +292,20 @@ export function isLoopbackHost(host: string): boolean {
   return ['localhost', '127.0.0.1', '::1', '[::1]'].includes(host.toLowerCase());
 }
 
+const LOOPBACK_ADDRESSES = new BlockList();
+LOOPBACK_ADDRESSES.addSubnet('127.0.0.0', 8, 'ipv4');
+LOOPBACK_ADDRESSES.addAddress('::1', 'ipv6');
+
+/**
+ * Whether an IP address is a loopback one: 127.0.0.0/8 or ::1, in any IPv6
+ * spelling, IPv4-mapped included. isLoopbackHost judges a name, which means
+ * whatever the hosts file says; this judges where the relay would listen.
+ */
+export function isLoopbackAddress(address: string): boolean {
+  const family = isIP(address);
+  return family !== 0 && LOOPBACK_ADDRESSES.check(address, family === 6 ? 'ipv6' : 'ipv4');
+}
+
 /** An Origin value must already be in serialised form: scheme, host, optional port, nothing else. */
 export function parseOrigin(value: string): string | null {
   const url = URL.parse(value);
@@ -400,6 +421,28 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     );
   }
   const host = options.host ?? DEFAULT_HOST;
+  // ADR 0022: a plugin marked loopbackOnly, local mode's above all, serves
+  // this machine and nothing else, whatever its name, so a public URL,
+  // production or a wider bind refuses it before any of their own checks.
+  // Anything but absent or false counts, so a stray value from JavaScript
+  // fails closed.
+  const loopbackOnly: unknown = options.auth.loopbackOnly;
+  if (loopbackOnly !== undefined && loopbackOnly !== false) {
+    const name = `the ${options.auth.name} plugin is marked loopbackOnly: it serves this machine only (local mode, ADR 0022)`;
+    if (options.publicUrl !== undefined) {
+      throw new Error(
+        `${name} and refuses a public URL; public URL mode signs people in through TABDOCK_OAUTH_ISSUER and TABDOCK_OAUTH_USERS`,
+      );
+    }
+    if (env === 'production') {
+      throw new Error(
+        `${name} and refuses production, which never falls back to local mode; give production its own auth settings`,
+      );
+    }
+    if (!isLoopbackHost(host)) {
+      throw new Error(`${name} and refuses to bind ${host}; it listens only on loopback`);
+    }
+  }
   if (!isLoopbackHost(host)) {
     throw new Error(
       `refusing to bind ${host}: the relay listens only on loopback (127.0.0.1, ::1 or localhost) until TLS arrives in M4 (SPEC S12)`,
@@ -567,17 +610,53 @@ function parseMinutes(name: string, value: string | undefined): number | undefin
 }
 
 /**
+ * Any of these, set and not blank, takes the relay out of local mode (ADR
+ * 0022): explicit settings always win.
+ */
+export const AUTH_SETTINGS: readonly string[] = [
+  'TABDOCK_DEV_TOKENS',
+  'TABDOCK_PUBLIC_URL',
+  'TABDOCK_OAUTH_ISSUER',
+  'TABDOCK_OAUTH_USERS',
+  'TABDOCK_PAIR_CLIENT_ID',
+  'TABDOCK_PAIR_CLIENT_SECRET',
+];
+
+/** What local mode tells the banner; the token itself never leaves loadConfigFromEnv. */
+export interface LocalModeInfo {
+  /** The owner token's file, which the printed command reads. */
+  tokenPath: string;
+  /** Whether this start drew the token. */
+  created: boolean;
+}
+
+/** The relay's options from the environment, and in local mode what the banner prints. */
+export interface EnvConfig extends RelayOptions {
+  localMode?: LocalModeInfo | undefined;
+}
+
+interface EnvAuth {
+  auth: AuthPlugin;
+  publicUrl?: string;
+  pairClient?: PairClientOptions;
+  localMode?: LocalModeInfo;
+}
+
+/**
  * The auth plugin the environment asks for. TABDOCK_PUBLIC_URL means OAuth
  * through TABDOCK_OAUTH_ISSUER for the people in TABDOCK_OAUTH_USERS, and
  * TABDOCK_DEV_TOKENS is then ignored (ADR 0014); without it, dev tokens as in
  * M1. The OAuth settings alone mean nothing, since tokens are issued for the
- * public URL, so they are refused rather than silently unused.
+ * public URL, so they are refused rather than silently unused. With none of
+ * AUTH_SETTINGS the relay runs in local mode outside production (ADR 0022);
+ * production without them refuses to start.
  */
-function authFromEnv(env: NodeJS.ProcessEnv): {
-  auth: AuthPlugin;
-  publicUrl?: string;
-  pairClient?: PairClientOptions;
-} {
+function authFromEnv(
+  env: NodeJS.ProcessEnv,
+  envName: RelayEnv,
+  host: string | undefined,
+  system: Partial<LocalTokenSystem>,
+): EnvAuth {
   const publicText = env.TABDOCK_PUBLIC_URL?.trim() ?? '';
   const issuer = env.TABDOCK_OAUTH_ISSUER?.trim() ?? '';
   const oauthUsers = env.TABDOCK_OAUTH_USERS?.trim() ?? '';
@@ -617,21 +696,37 @@ function authFromEnv(env: NodeJS.ProcessEnv): {
     );
   }
   const tokens = env.TABDOCK_DEV_TOKENS?.trim() ?? '';
-  if (tokens === '') {
+  if (tokens !== '') return { auth: createDevTokenAuth(parseDevTokens(tokens)) };
+  if (envName === 'production') {
     throw new Error(
-      'TABDOCK_DEV_TOKENS is not set; give it as user=token pairs, for example alice=<24+ random characters>',
+      'production needs auth settings, such as TABDOCK_PUBLIC_URL with TABDOCK_OAUTH_ISSUER and TABDOCK_OAUTH_USERS; it never falls back to local mode, which serves only this machine (ADR 0022)',
     );
   }
-  return { auth: createDevTokenAuth(parseDevTokens(tokens)) };
+  // Refused here as resolveConfig would, but before a token is drawn for a relay that cannot start.
+  if (host !== undefined && !isLoopbackHost(host)) {
+    throw new Error(
+      `local mode listens only on loopback and refuses TABDOCK_HOST ${host}; leave TABDOCK_HOST unset or use 127.0.0.1, ::1 or localhost (ADR 0022)`,
+    );
+  }
+  const owner = loadOwnerToken(env, system);
+  return {
+    auth: createDevTokenAuth([{ ...LOCAL_USER, token: owner.token }], { loopbackOnly: true }),
+    localMode: { tokenPath: owner.path, created: owner.created },
+  };
 }
 
 /**
  * Reads the relay's settings from the environment (normally process.env after
- * the repo-root .env is loaded). Auth comes from TABDOCK_DEV_TOKENS, or from
- * the OAuth settings in public URL mode. Errors name the variable, never its
- * value, since a token may sit in the wrong place.
+ * the repo-root .env is loaded). Auth comes from TABDOCK_DEV_TOKENS, from the
+ * OAuth settings in public URL mode, or, with neither, from local mode's owner
+ * token, which this reads or draws (ADR 0022); `system` stands in for the
+ * platform, account and home directory in tests. Errors name the variable,
+ * never its value, since a token may sit in the wrong place.
  */
-export function loadConfigFromEnv(env: NodeJS.ProcessEnv): RelayOptions {
+export function loadConfigFromEnv(
+  env: NodeJS.ProcessEnv,
+  system: Partial<LocalTokenSystem> = {},
+): EnvConfig {
   const portText = env.TABDOCK_PORT?.trim();
   let port = DEFAULT_CLI_PORT;
   if (portText !== undefined && portText !== '') {
@@ -655,57 +750,66 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv): RelayOptions {
           .map((entry) => entry.trim())
           .filter((entry) => entry.length > 0);
 
-  const { auth, publicUrl, pairClient } = authFromEnv(env);
+  const hostText = env.TABDOCK_HOST?.trim() ?? '';
+  const host = hostText === '' ? undefined : hostText;
+  const relayEnv: RelayEnv = envName === '' ? 'development' : envName;
+  const allowMissingOrigin = parseFlag(
+    'TABDOCK_DEV_ALLOW_NO_ORIGIN',
+    env.TABDOCK_DEV_ALLOW_NO_ORIGIN,
+  );
+  const spike = parseFlag('TABDOCK_SPIKE', env.TABDOCK_SPIKE);
+  const timings = {
+    sessionIdleMs: parseMinutes('TABDOCK_SESSION_IDLE_MINUTES', env.TABDOCK_SESSION_IDLE_MINUTES),
+    attachmentIdleMs: parseMinutes(
+      'TABDOCK_ATTACHMENT_IDLE_MINUTES',
+      env.TABDOCK_ATTACHMENT_IDLE_MINUTES,
+    ),
+  };
+  const rateLimits = {
+    callsPerUserPerPage: parseCount(
+      'TABDOCK_MAX_CALLS_PER_MINUTE',
+      env.TABDOCK_MAX_CALLS_PER_MINUTE,
+    ),
+    pairSignIns: parseCount(
+      'TABDOCK_MAX_PAIR_SIGNINS_PER_MINUTE',
+      env.TABDOCK_MAX_PAIR_SIGNINS_PER_MINUTE,
+    ),
+  };
+  const limits = {
+    sessionsPerUser: parseCount('TABDOCK_MAX_SESSIONS_PER_USER', env.TABDOCK_MAX_SESSIONS_PER_USER),
+    sessions: parseCount('TABDOCK_MAX_SESSIONS', env.TABDOCK_MAX_SESSIONS),
+    usersPerPage: parseCount('TABDOCK_MAX_USERS_PER_PAGE', env.TABDOCK_MAX_USERS_PER_PAGE),
+    queueDepth: parseCount('TABDOCK_MAX_QUEUE_DEPTH', env.TABDOCK_MAX_QUEUE_DEPTH),
+    pageSocketsPerAddress: parseCount(
+      'TABDOCK_MAX_PAGE_SOCKETS_PER_ADDRESS',
+      env.TABDOCK_MAX_PAGE_SOCKETS_PER_ADDRESS,
+    ),
+    pageSessionsPerAddress: parseCount(
+      'TABDOCK_MAX_PAGE_SESSIONS_PER_ADDRESS',
+      env.TABDOCK_MAX_PAGE_SESSIONS_PER_ADDRESS,
+    ),
+    pageSessions: parseCount('TABDOCK_MAX_PAGE_SESSIONS', env.TABDOCK_MAX_PAGE_SESSIONS),
+    pairSignInsInFlight: parseCount(
+      'TABDOCK_MAX_PAIR_SIGNINS_IN_FLIGHT',
+      env.TABDOCK_MAX_PAIR_SIGNINS_IN_FLIGHT,
+    ),
+  };
 
-  const host = env.TABDOCK_HOST?.trim();
+  // Last, so a mistake in any other setting is reported before local mode draws a token.
+  const { auth, publicUrl, pairClient, localMode } = authFromEnv(env, relayEnv, host, system);
   return {
     auth,
     publicUrl,
     pairClient,
-    host: host === undefined || host === '' ? undefined : host,
+    localMode,
+    host,
     port,
-    env: envName === '' ? 'development' : envName,
+    env: relayEnv,
     allowedOrigins,
-    allowMissingOrigin: parseFlag('TABDOCK_DEV_ALLOW_NO_ORIGIN', env.TABDOCK_DEV_ALLOW_NO_ORIGIN),
-    spike: parseFlag('TABDOCK_SPIKE', env.TABDOCK_SPIKE),
-    timings: {
-      sessionIdleMs: parseMinutes('TABDOCK_SESSION_IDLE_MINUTES', env.TABDOCK_SESSION_IDLE_MINUTES),
-      attachmentIdleMs: parseMinutes(
-        'TABDOCK_ATTACHMENT_IDLE_MINUTES',
-        env.TABDOCK_ATTACHMENT_IDLE_MINUTES,
-      ),
-    },
-    rateLimits: {
-      callsPerUserPerPage: parseCount(
-        'TABDOCK_MAX_CALLS_PER_MINUTE',
-        env.TABDOCK_MAX_CALLS_PER_MINUTE,
-      ),
-      pairSignIns: parseCount(
-        'TABDOCK_MAX_PAIR_SIGNINS_PER_MINUTE',
-        env.TABDOCK_MAX_PAIR_SIGNINS_PER_MINUTE,
-      ),
-    },
-    limits: {
-      sessionsPerUser: parseCount(
-        'TABDOCK_MAX_SESSIONS_PER_USER',
-        env.TABDOCK_MAX_SESSIONS_PER_USER,
-      ),
-      sessions: parseCount('TABDOCK_MAX_SESSIONS', env.TABDOCK_MAX_SESSIONS),
-      usersPerPage: parseCount('TABDOCK_MAX_USERS_PER_PAGE', env.TABDOCK_MAX_USERS_PER_PAGE),
-      queueDepth: parseCount('TABDOCK_MAX_QUEUE_DEPTH', env.TABDOCK_MAX_QUEUE_DEPTH),
-      pageSocketsPerAddress: parseCount(
-        'TABDOCK_MAX_PAGE_SOCKETS_PER_ADDRESS',
-        env.TABDOCK_MAX_PAGE_SOCKETS_PER_ADDRESS,
-      ),
-      pageSessionsPerAddress: parseCount(
-        'TABDOCK_MAX_PAGE_SESSIONS_PER_ADDRESS',
-        env.TABDOCK_MAX_PAGE_SESSIONS_PER_ADDRESS,
-      ),
-      pageSessions: parseCount('TABDOCK_MAX_PAGE_SESSIONS', env.TABDOCK_MAX_PAGE_SESSIONS),
-      pairSignInsInFlight: parseCount(
-        'TABDOCK_MAX_PAIR_SIGNINS_IN_FLIGHT',
-        env.TABDOCK_MAX_PAIR_SIGNINS_IN_FLIGHT,
-      ),
-    },
+    allowMissingOrigin,
+    spike,
+    timings,
+    rateLimits,
+    limits,
   };
 }

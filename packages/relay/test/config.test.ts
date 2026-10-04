@@ -346,8 +346,17 @@ describe('loadConfigFromEnv', () => {
     }
   });
 
+  it('runs local mode with no settings at all, where M1 refused (ADR 0022)', () => {
+    // The vitest setup points HOME and the rest at throwaway directories, and
+    // an empty environment names none, so the injected home directory is used.
+    const options = loadConfigFromEnv({});
+    expect(options.auth.name).toBe('dev-token');
+    expect(options.auth.loopbackOnly).toBe(true);
+    expect(options.localMode?.tokenPath.endsWith('owner-token')).toBe(true);
+    expect(options.port).toBe(DEFAULT_CLI_PORT);
+  });
+
   it('names the bad variable and never echoes a token', () => {
-    expect(() => loadConfigFromEnv({})).toThrow(/TABDOCK_DEV_TOKENS/);
     expect(() => loadConfigFromEnv({ TABDOCK_DEV_TOKENS: tokens, TABDOCK_PORT: 'x' })).toThrow(
       /TABDOCK_PORT/,
     );

@@ -14,6 +14,7 @@
     "check:claude-code:m1": "node src/claude-code-check-m1.ts",
     "check:claude-code:m2": "node src/claude-code-check-m2.ts",
     "check:claude-code:m3": "node src/claude-code-check-m3.ts",
+    "check:claude-code:local": "node src/claude-code-check-local.ts",
     "demo:m1": "node src/demo-m1.ts",
     "demo:m2": "node src/demo-m2.ts",
     "demo:m3": "node src/demo-m3.ts"
