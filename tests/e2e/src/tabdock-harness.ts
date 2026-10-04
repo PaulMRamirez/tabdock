@@ -463,3 +463,82 @@ export async function widgetQrDrawing(
     return { viewBox: attribute(svg, 'viewBox') ?? null, d: attribute(path, 'd') ?? null };
   });
 }
+
+/**
+ * The text of one widget box as the operator reads it: the prompt for a
+ * request or call, a roster row, or a live invite's row, read through the
+ * DevTools protocol. null while there is no such box.
+ */
+export async function widgetBoxText(
+  page: Page,
+  target: Omit<WidgetTarget, 'action'>,
+): Promise<string | null> {
+  const [name, value] =
+    target.requestId !== undefined
+      ? ['data-request-id', target.requestId]
+      : target.callId !== undefined
+        ? ['data-call-id', target.callId]
+        : target.userId !== undefined
+          ? ['data-user-id', target.userId]
+          : ['data-invite-id', target.inviteId ?? ''];
+  return withCdp(page, async (cdp) => {
+    const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
+    const node = findNode(root, (n) => attribute(n, name) === value);
+    if (!node) return null;
+    const { object } = await cdp.send('DOM.resolveNode', { backendNodeId: node.backendNodeId });
+    if (object.objectId === undefined) return null;
+    const { result } = await cdp.send('Runtime.callFunctionOn', {
+      objectId: object.objectId,
+      functionDeclaration: 'function () { return this.textContent; }',
+      returnByValue: true,
+    });
+    return typeof result.value === 'string' ? result.value : null;
+  });
+}
+
+/** Types into a widget input as the operator would: a real click to focus it, then keys. */
+export async function typeInWidget(page: Page, action: string, text: string): Promise<void> {
+  await clickInWidget(page, { action });
+  await page.keyboard.press('ControlOrMeta+A');
+  await page.keyboard.type(text);
+}
+
+/**
+ * Mints an invite with the widget's Invite form, every step a real click or
+ * key as the operator makes it (ADR 0016): the label, Can watch or Can
+ * control, the uses for Can watch, then Create. Returns the link the widget
+ * shows once, read from its text before Done clears it, and the invite's id
+ * from the page's own record.
+ */
+export async function mintInWidget(
+  page: Page,
+  options: { label: string; role: Role; uses?: number },
+): Promise<{ inviteId: string; link: string }> {
+  const before = new Set((await dockState(page))?.invites.map((invite) => invite.inviteId) ?? []);
+  await clickInWidget(page, { action: 'invite-open' });
+  await typeInWidget(page, 'invite-label', options.label);
+  if (options.role === 'driver') await clickInWidget(page, { action: 'invite-role-driver' });
+  else if (options.uses !== undefined) {
+    await typeInWidget(page, 'invite-uses', String(options.uses));
+  }
+  await clickInWidget(page, { action: 'invite-create' });
+  const minted = await waitForDock(page, (state) =>
+    state.invites.find(
+      (invite) =>
+        !before.has(invite.inviteId) &&
+        invite.label === options.label &&
+        invite.role === options.role,
+    ),
+  );
+  // The relay lists the invite before the widget draws its link, so wait for the text too.
+  const deadline = Date.now() + 10_000;
+  let link = '';
+  while (link === '') {
+    link = (await widgetText(page, 'invite-link-text')) ?? '';
+    if (link !== '') break;
+    if (Date.now() > deadline) throw new Error('the widget never showed the invite link');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  await clickInWidget(page, { action: 'invite-done' });
+  return { inviteId: minted.inviteId, link };
+}
