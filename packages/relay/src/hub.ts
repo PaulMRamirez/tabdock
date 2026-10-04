@@ -2699,12 +2699,13 @@ export class PageHub {
   /**
    * Everything a redemption must pass before its page hears of it: the
    * user's pairing limit, a live invite (minted for one use, when pair_page
-   * asks), the invite's own limit, its bars, a linked page and the page's
-   * pairing limit; then the caller is already attached, joins the request
-   * they have waiting, is refused while the invite's one prompt or its last
-   * uses are taken or the seats invites may use are full, or raises a new
-   * request. Never autoApprove: the adapter honours an invite only against
-   * its own record and the presented secret (ADR 0017's notes).
+   * asks), the invite's own limit, its bars, a linked page, the page's
+   * pairing limit, and the invite still live once the caller's own lapsed
+   * attachment has ended; then the caller is already attached, joins the
+   * request they have waiting, is refused while the invite's one prompt or
+   * its last uses are taken or the seats invites may use are full, or raises
+   * a new request. Never autoApprove: the adapter honours an invite only
+   * against its own record and the presented secret (ADR 0017's notes).
    */
   #redeem(caller: CallerIdentity, secret: string | null, oneUse: boolean, now: number): Started {
     const limited = this.#pairingLimited(caller, 'invite', now);
@@ -2774,7 +2775,18 @@ export class PageHub {
     }
     this.#pageLimiter.record(page.pageId, now);
 
+    // Ending the caller's own lapsed attachment can close this very invite
+    // (sponsor_gone, ADR 0017), and the put below would then bring it back
+    // with no sponsor and no timer, so a closed one gets the answer every
+    // dead invite gets.
     this.#expireIfDue(page.pageId, caller.userId);
+    if (this.#store.invites.get(invite.pageId, invite.inviteId) === undefined) {
+      this.#log.info('redemption refused: the invite closed as the caller expired', {
+        pageId: page.pageId,
+        userId: caller.userId,
+      });
+      return refuse(hubError('pairing_expired', 'this invite is invalid, used up or expired'));
+    }
     const existing = this.#store.attachments.get(page.pageId, caller.userId);
     if (existing) {
       // Someone already attached keeps what they hold, and the invite its use (ADR 0017).
