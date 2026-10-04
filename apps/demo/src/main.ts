@@ -2,6 +2,7 @@ import { initializeWebMCPPolyfill } from '@mcp-b/webmcp-polyfill';
 import { attach, type Dock } from '@tabdock/adapter';
 import { Board } from './board.ts';
 import { busyFromQuery, startBusy } from './busy.ts';
+import { policyFromQuery } from './policy.ts';
 import { relayFromQuery } from './relay.ts';
 import { type BoardUi, mountBoard } from './render.ts';
 import { createTools } from './tools.ts';
@@ -76,17 +77,26 @@ function loadMcpbRelayEmbed(params: URLSearchParams): void {
 /**
  * `?relay=ws://127.0.0.1:8787/page` links the board to a Tabdock relay. The
  * adapter reads the tools registered above from document.modelContext, so it
- * needs no handle on them. clear_board is listed as consequential because the
- * polyfill drops consequentialHint (ADR 0002), and it must still prompt here.
+ * needs no handle on them. The policy comes from the query too (policy.ts):
+ * clear_board always prompts, and `?invites=all` offers Can control invites.
  */
 function attachToRelay(params: URLSearchParams, ui: BoardUi, registered: string): void {
-  const relay = relayFromQuery(params);
+  const relay = relayFromQuery(params, window.location.protocol);
   if (relay.kind === 'absent') return;
   if (relay.kind === 'invalid') {
     ui.setStatus(`${registered}; not linked: ${relay.message}`);
     return;
   }
-  const dock = attach({ relay: relay.url, policy: { consequentialTools: ['clear_board'] } });
+  // Any site can frame the published copy, as a static host cannot send
+  // frame-ancestors (ADR 0021), and a page framing the board could dress the
+  // widget up to trick its operator into a click. So the board never links
+  // inside a frame, in any build; the dev server also refuses other sites' frames.
+  if (window.top !== window.self) {
+    ui.setStatus(`${registered}; not linked: this board does not link to a relay inside a frame`);
+    document.documentElement.dataset.link = 'refused';
+    return;
+  }
+  const dock = attach({ relay: relay.url, policy: policyFromQuery(params) });
   // The status line names the relay, so the person at the tab can see where it dials.
   const host = new URL(relay.url).host;
   dock.on('state', (state) => {

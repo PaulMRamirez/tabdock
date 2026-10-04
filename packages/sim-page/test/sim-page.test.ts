@@ -3,6 +3,7 @@
 // on every profile, and reload() and close() look to a relay the way a
 // browser's reload and an explicit detach do.
 
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import {
@@ -10,6 +11,7 @@ import {
   CLOSE_DETACH,
   encodeFrame,
   IDLE_TIMEOUT_MS,
+  inviteSecretOf,
   MAX_DESCRIPTION_CHARS,
   MAX_FRAME_BYTES,
   MAX_RESULT_CHARS,
@@ -262,7 +264,7 @@ describe('startSimPage', () => {
     // Nothing to cancel before invites exist; Revoke takes closeInvite all the same.
     expect(sim.cancelInvite('inv_1')).toBe(false);
     expect(sim.state).toMatchObject({ invites: [], invitesOffered: null });
-    // No relay offers invites before workstream A, so the answer is unavailable, after the checks.
+    // A relay that sends no invites frame offers none, so the answer is unavailable, after the checks.
     expect(await sim.invite({ label: 'Friends', role: 'observer', uses: 3 })).toEqual({
       ok: false,
       reason: 'unavailable',
@@ -271,6 +273,71 @@ describe('startSimPage', () => {
       ok: false,
       reason: 'invalid',
     });
+  });
+
+  it("mints with Node's WebCrypto, keeps the record across a reload, and asks the operator about a Can control redemption", async () => {
+    const asked: string[] = [];
+    const { relay, sim, connection } = await linked({
+      policy: { invites: 'all' },
+      operator: {
+        askAttach: (request) => {
+          asked.push(`${request.via} ${request.invite?.label ?? ''}`);
+          return 'driver';
+        },
+      },
+    });
+    const listing = (create: Extract<PageFrame, { t: 'invite_create' }>) => ({
+      inviteId: create.inviteId,
+      role: create.role,
+      label: create.label,
+      uses: create.uses,
+      expiresAt: create.expiresAt,
+      usesLeft: create.uses,
+      sponsor: { userId: 'alice', displayName: 'Alice' },
+      pending: false,
+      refusals: 0,
+    });
+    send(connection, { t: 'invites', linkBase: 'https://relay.example/i', invites: [] });
+    await sim.waitFor((state) => state.invitesOffered !== null);
+    const minting = sim.invite({ label: 'Help', role: 'driver' });
+    const create = await frameOf(connection, 'invite_create');
+    send(connection, {
+      t: 'invites',
+      linkBase: 'https://relay.example/i',
+      invites: [listing(create)],
+    });
+    const minted = await minting;
+    if (!minted.ok) throw new Error(minted.reason);
+    const secret = inviteSecretOf(minted.link) ?? '';
+    expect(create.secretHash).toBe(createHash('sha256').update(secret, 'utf8').digest('hex'));
+
+    // A reload into the same session keeps the record, never the secret.
+    await sim.reload();
+    const next = await relay.connection(1);
+    expect(await frameOf(next, 'hello')).toMatchObject({ resumeToken: 'token-1' });
+    send(next, welcome('token-2', true));
+    send(next, { t: 'invites', linkBase: 'https://relay.example/i', invites: [listing(create)] });
+    await sim.waitFor((state) => state.invites.length === 1);
+    for (const value of [...sim.logs, JSON.stringify(sim.state)]) {
+      expect(value).not.toContain(secret);
+    }
+    send(next, {
+      t: 'attach_request',
+      requestId: 'redeem',
+      user: { userId: `g_${'ab'.repeat(16)}`, displayName: 'guest@example.com' },
+      account: { kind: 'invitee', verified: true },
+      via: 'invite',
+      invite: { inviteId: create.inviteId, secret, label: 'Help' },
+      client: null,
+      expiresAt: Date.now() + 60_000,
+    });
+    expect(await frameOf(next, 'attach_decision')).toEqual({
+      t: 'attach_decision',
+      requestId: 'redeem',
+      allow: true,
+      role: 'driver',
+    });
+    expect(asked).toEqual(['invite Help']);
   });
 
   it('lets a scripted operator answer attach requests', async () => {

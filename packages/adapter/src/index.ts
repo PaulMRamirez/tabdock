@@ -17,6 +17,7 @@ export type {
   ActivityEntry,
   ActivityOutcome,
   AttachAnswer,
+  CryptoLike,
   Dock,
   DockState,
   HintSupport,

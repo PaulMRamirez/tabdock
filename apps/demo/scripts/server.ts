@@ -62,9 +62,11 @@ const buildOptions = {
 } satisfies esbuild.BuildOptions;
 
 /**
- * Static build for hosting elsewhere (GitHub Pages in M5). It leaves out MCP-B's
- * vendored files: a static host cannot send frame-ancestors, and a frameable
- * widget.html is exactly the injection the dev server's headers prevent.
+ * Static build for hosting elsewhere (GitHub Pages from M4, ADR 0021). It
+ * leaves out MCP-B's vendored files: a static host cannot send
+ * frame-ancestors, and a frameable widget.html is exactly the injection the
+ * dev server's headers prevent. For the same reason the board itself refuses
+ * to link to a relay inside a frame (src/main.ts), in this build and every other.
  */
 export async function buildDemo(): Promise<void> {
   await rm(distDir, { recursive: true, force: true });

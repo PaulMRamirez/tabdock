@@ -1,7 +1,9 @@
 // The pairing URL as a QR code beside the typed code (docs/plans/M3.md,
 // Widget QR). The URL carries a single-use nonce in its fragment (S11), so it
 // is never logged and never shown as text: it appears only as this drawing,
-// inside the widget's closed shadow root.
+// inside the widget's closed shadow root. From M4 an invite link is drawn the
+// same way (ADR 0017); its secret also rides in the fragment, and the widget
+// shows it once beside the drawing as text, for sending, and never logs it.
 //
 // Drawn from the library's isDark() matrix with createElementNS and
 // setAttribute alone. The library's own SVG string needs innerHTML and its
@@ -10,14 +12,15 @@
 // pages whose CSP it does not control, and no relay- or page-supplied string
 // ever goes through an HTML parser here.
 
+import { INVITE_PATH } from '@tabdock/protocol';
 import qrcode from 'qrcode-generator';
 
 /** The QR spec's quiet zone: four light modules on every side, which scanners need to find the code. */
 export const QR_QUIET_ZONE = 4;
 
 /**
- * The relay's URL is its public origin, /pair# and a 22-character nonce:
- * about 70 characters, QR version 4 to 6 at level M. 256 leaves room for a
+ * The relay's URL is its public origin, /pair# (or /i# for an invite) and a
+ * 22-character secret: about 70 characters, QR version 4 to 6 at level M. 256 leaves room for a
  * long hostname and still stays at version 12 or below (65 modules), which a
  * phone reads from the widget's square on a laptop screen. Anything longer is
  * not what the relay builds.
@@ -42,10 +45,11 @@ const SVG_NS = 'http://www.w3.org/2000/svg';
 type QrCode = ReturnType<typeof qrcode>;
 
 /**
- * The nonce in the fragment, as the relay draws it (secrets.ts,
- * newSingleUseSecret): 128 bits as 22 base64url characters, no padding.
+ * The secret in the fragment: the pairing nonce as the relay draws it
+ * (secrets.ts, newSingleUseSecret), or an invite secret as the adapter does
+ * (ADR 0017), each 128 bits as 22 base64url characters, no padding.
  */
-const PAIRING_FRAGMENT = /^#[A-Za-z0-9_-]{22}$/;
+const SECRET_FRAGMENT = /^#[A-Za-z0-9_-]{22}$/;
 
 /**
  * The URL the widget may draw, or null. The relay builds it from its public
@@ -62,6 +66,21 @@ const PAIRING_FRAGMENT = /^#[A-Za-z0-9_-]{22}$/;
  * refuses any other path, any query (even an empty one) and any other spelling.
  */
 export function pairingQrUrl(value: string | undefined): string | null {
+  return canonicalUrl(value, '/pair');
+}
+
+/**
+ * An invite link the widget may draw, or null: exactly
+ * `<https origin>/i#<22 base64url characters>` as the parser spells it back,
+ * by the same rule and for the same reasons as pairingQrUrl. The adapter
+ * builds the link from the relay's link base, which the page link already
+ * checks has this shape; this keeps the drawing from ever showing anything else.
+ */
+export function inviteQrUrl(value: string | undefined): string | null {
+  return canonicalUrl(value, INVITE_PATH);
+}
+
+function canonicalUrl(value: string | undefined, path: string): string | null {
   if (value === undefined || value.length > MAX_QR_URL_LENGTH || !PRINTABLE_ASCII.test(value)) {
     return null;
   }
@@ -71,8 +90,8 @@ export function pairingQrUrl(value: string | undefined): string | null {
   } catch {
     return null;
   }
-  if (parsed.protocol !== 'https:' || !PAIRING_FRAGMENT.test(parsed.hash)) return null;
-  return value === `${parsed.origin}/pair${parsed.hash}` ? value : null;
+  if (parsed.protocol !== 'https:' || !SECRET_FRAGMENT.test(parsed.hash)) return null;
+  return value === `${parsed.origin}${path}${parsed.hash}` ? value : null;
 }
 
 /** The library's code for text at error correction level M, or null if it will not encode. */
@@ -94,9 +113,12 @@ export interface QrPath {
   readonly d: string;
 }
 
-/** The SVG path for a pairing URL, or null when the URL is refused (see pairingQrUrl). */
-export function qrPath(url: string | undefined): QrPath | null {
-  const text = pairingQrUrl(url);
+/** Which URLs a drawing accepts: pairingQrUrl or inviteQrUrl. */
+export type QrUrlCheck = (value: string | undefined) => string | null;
+
+/** The SVG path for a URL `accept` passes, a pairing URL unless set; null when it is refused. */
+export function qrPath(url: string | undefined, accept: QrUrlCheck = pairingQrUrl): QrPath | null {
+  const text = accept(url);
   const code = text === null ? null : encodeQr(text);
   if (code === null) return null;
   const count = code.getModuleCount();
@@ -128,12 +150,20 @@ export interface QrView {
   show(url: string | undefined): boolean;
 }
 
-export function createQrView(doc: Document): QrView {
+export interface QrViewOptions {
+  /** Which URLs it draws; pairingQrUrl unless set. */
+  readonly accept?: QrUrlCheck;
+  /** What a screen reader says the drawing is. */
+  readonly label?: string;
+}
+
+export function createQrView(doc: Document, options: QrViewOptions = {}): QrView {
+  const accept = options.accept ?? pairingQrUrl;
   const svg = doc.createElementNS(SVG_NS, 'svg');
   // Whole modules on whole pixels where the scale allows; blurred edges cost scanners.
   svg.setAttribute('shape-rendering', 'crispEdges');
   svg.setAttribute('role', 'img');
-  svg.setAttribute('aria-label', 'Pairing QR code: scan it with a phone to pair');
+  svg.setAttribute('aria-label', options.label ?? 'Pairing QR code: scan it with a phone to pair');
   // The drawing carries its own size and light ground as attributes, which no
   // style-src governs: a page whose CSP refuses the widget's stylesheet must
   // not leave dark modules on its own dark background, stretched across it.
@@ -156,7 +186,7 @@ export function createQrView(doc: Document): QrView {
     show(url) {
       if (url === drawn) return showing;
       drawn = url;
-      const next = qrPath(url);
+      const next = qrPath(url, accept);
       showing = next !== null;
       if (next === null) {
         // Nothing of an old or refused URL stays in the tree.

@@ -623,23 +623,23 @@ describe("the operator's role switch", () => {
       ],
     });
     expect(h.dock.state.pageRoles).toEqual([
-      { userId: 'mallory', role: null, revoked: false },
-      { userId: 'alice', role: 'driver', revoked: false },
-      { userId: 'bob', role: 'observer', revoked: false },
+      { userId: 'mallory', role: null, revoked: false, inviteRole: null },
+      { userId: 'alice', role: 'driver', revoked: false, inviteRole: null },
+      { userId: 'bob', role: 'observer', revoked: false, inviteRole: null },
     ]);
     // A demotion holds on the page before the relay applies it, and a revoke at once.
     expect(h.dock.setRole('alice', 'observer')).toBe(true);
     expect(h.dock.revoke('bob')).toBe(true);
     expect(h.dock.state.pageRoles).toEqual([
-      { userId: 'mallory', role: null, revoked: false },
-      { userId: 'alice', role: 'observer', revoked: false },
-      { userId: 'bob', role: null, revoked: true },
+      { userId: 'mallory', role: null, revoked: false, inviteRole: null },
+      { userId: 'alice', role: 'observer', revoked: false, inviteRole: null },
+      { userId: 'bob', role: null, revoked: true, inviteRole: null },
     ]);
 
     const auto = setup({ core: { policy: { autoApprove: 'observer' } } });
     await link(auto, { roster: [attachment('carol', 'driver')] }, {});
     expect(auto.dock.state.pageRoles).toEqual([
-      { userId: 'carol', role: 'observer', revoked: false },
+      { userId: 'carol', role: 'observer', revoked: false, inviteRole: null },
     ]);
   });
 

@@ -8,19 +8,36 @@
 // from the Dock handle, every relay- or page-supplied string goes in through
 // textContent (the pairing URL only as a QR drawing built with DOM calls; see
 // qr.ts), nothing goes through an HTML parser, and nothing lands on window.
+// From M4 the panel also mints invites (ADR 0017): an invite link shows once,
+// as a QR drawing and as text to send, and only until the operator is done
+// with it or the invite ends; the adapter keeps no copy of its secret.
 // Buttons carry stable data-action attributes for browser tests.
 
-import type { AttachmentView, Role } from '@tabdock/protocol';
+import {
+  type Account,
+  type AttachmentView,
+  INVITE_BURN_REFUSALS,
+  INVITEE_SHORT_ID_CHARS,
+  InviteeIdSchema,
+  MAX_INVITE_LABEL_CHARS,
+  MAX_INVITE_USES,
+  MAX_LIVE_INVITES_PER_PAGE,
+  type Role,
+  UNVERIFIED_ACCOUNT_NAME,
+} from '@tabdock/protocol';
 import type {
   ActivityEntry,
   Dock,
   DockState,
+  InviteLifetime,
+  InviteRefusal,
+  InviteView,
   LinkState,
   PageRole,
   PendingConfirm,
   PendingRequest,
 } from './core.ts';
-import { createQrView, QR_SIDE_PX } from './qr.ts';
+import { createQrView, inviteQrUrl, QR_SIDE_PX } from './qr.ts';
 
 /** A valid custom element name needs no registration to host a shadow root, so nothing is defined globally. */
 const HOST_TAG = 'tabdock-dock';
@@ -29,18 +46,22 @@ const HOST_TAG = 'tabdock-dock';
  * A box's buttons ignore clicks until the box has held still this long since
  * it appeared or last moved, so a click aimed at one button never lands on
  * another that just slid under the pointer. Prompts are boxes, and so are
- * roster rows and the pause control, since Make driver and Resume grant
- * access as surely as Allow does. Each box is measured rather than guessed
- * at: the relay controls text that can shift it (a roster name that wraps, a
- * longer pairing code, an error), and the panel can scroll. Boxes are timed
- * one by one, so prompts arriving on top, which move nothing below them,
- * never keep an older prompt disarmed. A box whose buttons change meaning
- * (a role switch that flips, Pause turning into Resume) waits again too. A
- * tab coming back into view, or its window into focus, restarts every box's
- * wait, since the operator is seeing the boxes afresh. data-armed shows the
- * state, for people and for browser tests.
+ * roster rows, the pause control and the Invite form, since Make driver,
+ * Resume and Create grant access as surely as Allow does. Each box is
+ * measured rather than guessed at: the relay controls text that can shift it
+ * (a roster name that wraps, a longer pairing code, an error), and the panel
+ * can scroll. Boxes are timed one by one, so prompts arriving on top, which
+ * move nothing below them, never keep an older prompt disarmed. A box whose
+ * buttons change meaning (a role switch that flips, Pause turning into
+ * Resume, the Invite form switching between Can watch and Can control) waits
+ * again too. A tab coming back into view, or its window into focus, restarts
+ * every box's wait, since the operator is seeing the boxes afresh.
+ * data-armed shows the state, for people and for browser tests.
  */
 const ARM_DELAY_MS = 500;
+
+/** How long the line saying someone joined by a Can watch invite stays, the notice ADR 0016 asks for. */
+const JOIN_NOTICE_MS = 20_000;
 
 const LINK_LABELS: Record<LinkState, string> = {
   idle: 'Idle',
@@ -48,6 +69,28 @@ const LINK_LABELS: Record<LinkState, string> = {
   linked: 'Linked',
   reconnecting: 'Reconnecting',
   closed: 'Closed',
+};
+
+const LIFETIME_CHOICES: readonly (readonly [InviteLifetime, string])[] = [
+  ['15m', '15 minutes'],
+  ['1h', '1 hour'],
+  ['open', 'While the page is open'],
+];
+
+/** What the operator reads when no link came back, by reason. */
+const REFUSAL_TEXT: Record<InviteRefusal, string> = {
+  no_sponsor: 'The relay found no member attached to sponsor it. Pair one first.',
+  policy: 'This page does not allow that kind of invite.',
+  limit: `This page already has ${MAX_LIVE_INVITES_PER_PAGE} live invites. Cancel one first.`,
+  duplicate: 'The relay already held an invite like it. Try again.',
+  no_public_url: 'This relay has no public URL, so it makes no invite links.',
+  expired:
+    "This computer's clock is behind the relay's, so the invite would have expired. Check the clock.",
+  invalid: `Give it a label of up to ${MAX_INVITE_LABEL_CHARS} characters, and from 1 to ${MAX_INVITE_USES} uses.`,
+  link_down: 'The link to the relay is down. Try again once it is back.',
+  unavailable:
+    'No link came back: the relay did not answer, or this page cannot make one (it needs https).',
+  cancelled: 'The invite was closed before the relay answered.',
 };
 
 const STYLE = `
@@ -67,6 +110,9 @@ const STYLE = `
 .count { min-width: 20px; padding: 0 6px; border-radius: 10px; background: #e5e7eb; text-align: center; }
 .tag { padding: 0 6px; border-radius: 10px; background: #b91c1c; color: #fff; font-size: 11px;
   letter-spacing: 0.04em; text-transform: uppercase; }
+.invited { margin-left: 6px; padding: 0 6px; border-radius: 10px; background: #dbeafe; color: #1e3a8a;
+  font-size: 11px; font-weight: 400; }
+.invited:empty { display: none; }
 /* Only as tall as its content, up to just above the badge: a panel that scrolls moves every box in it. */
 .panel { width: 360px; max-width: calc(100vw - 32px); max-height: calc(100vh - 88px); overflow: auto; padding: 12px;
   border-radius: 12px; border: 1px solid #cbd5e1; background: #fff; box-shadow: 0 6px 24px rgb(0 0 0 / 0.2);
@@ -87,6 +133,7 @@ const STYLE = `
 .muted { margin: 2px 0; color: #6b7280; }
 .error { margin: 0 0 8px; color: #b91c1c; }
 .notice { margin: 0 0 8px; color: #92400e; }
+.join { margin: 0 0 8px; color: #1e3a8a; }
 .prompt { margin: 0 0 8px; padding: 8px; border: 1px solid #d97706; border-radius: 8px; background: #fffbeb; }
 .prompt p { margin: 0 0 4px; }
 .buttons { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 4px; }
@@ -103,6 +150,15 @@ li { padding: 2px 0; }
 /* One line whatever the clients call themselves, so a growing list never moves a row. */
 .clients { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .who { font-weight: 600; }
+.check { display: inline-flex; align-items: center; gap: 4px; }
+.field { display: block; margin: 6px 0 2px; }
+.field input { display: block; width: 100%; margin-top: 2px; padding: 4px 6px; border-radius: 6px;
+  border: 1px solid #9ca3af; background: #fff; color: inherit; font: inherit; }
+.field input[type='number'] { width: 6em; }
+.choices { display: flex; flex-wrap: wrap; gap: 2px 12px; margin: 6px 0 2px; }
+.choices label { display: inline-flex; align-items: center; gap: 4px; }
+.link-text { margin: 4px 0; font: 12px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  user-select: all; }
 .activity { height: 6.5em; overflow-y: auto; padding: 2px 6px; border: 1px solid #e5e7eb; border-radius: 6px;
   font-size: 12px; }
 .activity li { padding: 1px 0; }
@@ -116,9 +172,11 @@ li { padding: 2px 0; }
   .count { background: #374151; }
   .prompt { background: #3b2a06; }
   .row, .activity, .pause { border-color: #374151; }
-  .action { background: #1f2937; border-color: #4b5563; }
+  .action, .field input { background: #1f2937; border-color: #4b5563; }
+  .invited { background: #1e3a8a; color: #dbeafe; }
   .muted, .label { color: #9ca3af; }
   .error { color: #fca5a5; }
+  .join { color: #93c5fd; }
   .notice, .activity [data-outcome='running'] { color: #fcd34d; }
 }
 `;
@@ -145,9 +203,13 @@ interface PromptView extends ArmedBox {
 }
 
 interface RowView extends ArmedBox {
-  readonly who: HTMLElement;
+  readonly name: HTMLElement;
+  readonly badge: HTMLElement;
   readonly clients: HTMLElement;
   readonly expiry: HTMLElement;
+  /** "and close this link", shown for someone a multi-use invite let in. */
+  readonly closeLink: HTMLElement;
+  readonly closeInput: HTMLInputElement;
   roleSwitch: HTMLButtonElement;
   /** Whom the buttons act on and what they do; when it changes, the row waits again. */
   key: string;
@@ -161,6 +223,13 @@ interface PauseView extends ArmedBox {
   toggle: HTMLButtonElement;
   /** null until the first render. */
   paused: boolean | null;
+}
+
+interface InviteRowView {
+  readonly element: HTMLElement;
+  readonly title: HTMLElement;
+  readonly detail: HTMLElement;
+  view: InviteView;
 }
 
 function measure(box: HTMLElement): BoxRect {
@@ -201,6 +270,49 @@ function clientText(client: { name: string; version: string }): string {
 
 function timeText(epochMs: number): string {
   return new Date(epochMs).toLocaleTimeString([], { hour12: false });
+}
+
+/** The first characters of an invitee's account key, which the widget always shows beside their name (ADR 0017). */
+function shortId(userId: string): string | null {
+  return InviteeIdSchema.safeParse(userId).success
+    ? userId.slice(2, 2 + INVITEE_SHORT_ID_CHARS)
+    : null;
+}
+
+/**
+ * How the widget names a person: a member by their name, an invitee by
+ * their verified email, or "unverified account", always with the short id,
+ * since a name alone could copy someone else's (S10).
+ */
+function personText(user: { userId: string; displayName: string }, account?: Account): string {
+  const id = shortId(user.userId);
+  if (id === null) return user.displayName;
+  const name = account?.verified === false ? UNVERIFIED_ACCOUNT_NAME : user.displayName;
+  return `${name} (${id})`;
+}
+
+/** Whether a roster entry came in by invite, or is an invitee: either way it carries the "invited" badge. */
+function invited(attachment: AttachmentView): boolean {
+  return attachment.inviteId !== null || attachment.kind === 'invitee';
+}
+
+function roleText(role: Role): string {
+  return role === 'driver' ? 'Can control' : 'Can watch';
+}
+
+function inviteDetail(view: InviteView): string {
+  const joined =
+    view.uses === 1 ? `${view.joined} joined` : `${view.joined} of ${view.uses} joined`;
+  const ends =
+    view.expiresAt === null
+      ? 'open while this page is, 24 h at most'
+      : expiryText(view.expiresAt).toLowerCase();
+  const parts = [joined, ends, `shared by ${view.sponsor.displayName}`];
+  if (view.pending) parts.push('someone is waiting');
+  if (view.role === 'driver' && view.refusals > 0) {
+    parts.push(`${view.refusals} of ${INVITE_BURN_REFUSALS} refusals`);
+  }
+  return parts.join(', ');
 }
 
 /**
@@ -245,11 +357,12 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     return node;
   }
 
-  /** Every armed box on show: prompts, roster rows and the pause control. */
+  /** Every armed box on show: prompts, roster rows, the pause control and the Invite form. */
   const boxes = new Set<ArmedBox>();
   const requestViews = new Map<string, PromptView>();
   const confirmViews = new Map<string, PromptView>();
   const rowViews = new Map<string, RowView>();
+  const inviteRows = new Map<string, InviteRowView>();
 
   function button(label: string, action: string, onClick: () => void, primary = false) {
     const node = element('button', primary ? 'action primary' : 'action', label);
@@ -260,6 +373,13 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       if (!event.isTrusted) return;
       onClick();
     });
+    return node;
+  }
+
+  /** The "invited" badge; empty, and so not shown, for anyone else. */
+  function badge(show: boolean): HTMLElement {
+    const node = element('span', 'invited', show ? 'invited' : '');
+    node.dataset.role = 'invited';
     return node;
   }
 
@@ -337,6 +457,10 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   panel.setAttribute('aria-label', 'Tabdock');
   const errorLine = element('p', 'error');
   const noticeLine = element('p', 'notice');
+  // Who just joined by a Can watch invite, with no prompt to say so (ADR 0016).
+  const joins = element('div');
+  joins.dataset.role = 'joins';
+  joins.setAttribute('aria-live', 'polite');
   const prompts = element('div');
   prompts.setAttribute('aria-live', 'polite');
 
@@ -369,6 +493,148 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   const rosterBlock = element('div');
   rosterBlock.append(element('div', 'label', 'Attached'), roster, nobody, revokeAll);
 
+  // Invites (ADR 0017): the link shown once, the live list, and the form.
+  const invitesBlock = element('div');
+  invitesBlock.dataset.role = 'invites';
+  invitesBlock.hidden = true;
+
+  const linkBox = element('div', 'prompt');
+  linkBox.dataset.role = 'invite-link';
+  linkBox.hidden = true;
+  const linkHeading = element('p');
+  const linkQr = createQrView(doc, {
+    accept: inviteQrUrl,
+    label: 'Invite QR code: scan it with a phone to join',
+  });
+  const linkQrBox = element('div', 'qr');
+  linkQrBox.dataset.role = 'invite-qr';
+  linkQrBox.append(linkQr.element);
+  const linkText = element('p', 'link-text');
+  linkText.dataset.role = 'invite-link-text';
+  const copyLink = button('Copy link', 'invite-copy', () => {
+    copyShownLink();
+  });
+  const doneLink = button('Done', 'invite-done', () => {
+    hideLink();
+  });
+  const linkButtons = element('div', 'buttons');
+  linkButtons.append(copyLink, doneLink);
+  linkBox.append(linkHeading, linkQrBox, linkText, linkButtons);
+  /** The invite whose link is on show, or null. */
+  let shownLink: string | null = null;
+
+  const inviteList = element('ul');
+  inviteList.dataset.role = 'invite-list';
+  const noInvites = element('p', 'muted', 'No live invites');
+  const inviteError = element('p', 'error');
+  inviteError.dataset.role = 'invite-error';
+  inviteError.hidden = true;
+  const inviteToggle = button('Invite someone', 'invite-open', () => {
+    // hidden can also be 'until-found', which still means closed.
+    setFormOpen(formBox.hidden !== false);
+  });
+
+  // The form is an armed box: Create grants access, as Allow does.
+  const formBox = element('div', 'row');
+  formBox.dataset.role = 'invite-form';
+  formBox.hidden = true;
+  const formView = newBox(formBox);
+  boxes.add(formView);
+  const labelField = element('label', 'field', 'Label, shown wherever the invite is');
+  const labelInput = element('input');
+  labelInput.type = 'text';
+  labelInput.maxLength = MAX_INVITE_LABEL_CHARS;
+  labelInput.autocomplete = 'off';
+  labelInput.spellcheck = false;
+  labelInput.placeholder = 'Who is it for?';
+  labelInput.dataset.action = 'invite-label';
+  labelField.append(labelInput);
+
+  function choice(
+    group: string,
+    value: string,
+    text: string,
+    action: string,
+  ): { label: HTMLLabelElement; input: HTMLInputElement } {
+    const label = element('label');
+    const input = element('input');
+    input.type = 'radio';
+    input.name = group;
+    input.value = value;
+    input.dataset.action = action;
+    label.append(input, text);
+    return { label, input };
+  }
+
+  const roleChoices = element('div', 'choices');
+  roleChoices.setAttribute('role', 'radiogroup');
+  roleChoices.setAttribute('aria-label', 'What the invite allows');
+  const watchChoice = choice(
+    'invite-role',
+    'observer',
+    roleText('observer'),
+    'invite-role-observer',
+  );
+  const controlChoice = choice('invite-role', 'driver', roleText('driver'), 'invite-role-driver');
+  watchChoice.input.checked = true;
+  roleChoices.append(watchChoice.label, controlChoice.label);
+
+  const lifetimeChoices = element('div', 'choices');
+  lifetimeChoices.setAttribute('role', 'radiogroup');
+  lifetimeChoices.setAttribute('aria-label', 'How long the link works');
+  const lifetimeInputs = LIFETIME_CHOICES.map(([value, text]) => {
+    const made = choice('invite-lifetime', value, text, `invite-lifetime-${value}`);
+    made.input.checked = value === '1h';
+    lifetimeChoices.append(made.label);
+    return [value, made.input] as const;
+  });
+
+  const usesField = element('label', 'field', 'Uses');
+  const usesInput = element('input');
+  usesInput.type = 'number';
+  usesInput.min = '1';
+  usesInput.max = String(MAX_INVITE_USES);
+  usesInput.step = '1';
+  usesInput.value = '1';
+  usesInput.dataset.action = 'invite-uses';
+  usesField.append(usesInput);
+
+  const formReason = element('p', 'muted');
+  formReason.dataset.role = 'invite-reason';
+  const createButton = boxButton(
+    formView,
+    'Create link',
+    'invite-create',
+    () => {
+      void createInvite();
+    },
+    true,
+  );
+  const formButtons = element('div', 'buttons');
+  formButtons.append(createButton);
+  formBox.append(labelField, roleChoices, lifetimeChoices, usesField, formReason, formButtons);
+
+  for (const input of [watchChoice.input, controlChoice.input]) {
+    input.addEventListener('change', () => {
+      // Create now grants something else, so the form waits again.
+      restartArming(formView);
+      render(dock.state);
+    });
+  }
+  labelInput.addEventListener('input', () => {
+    render(dock.state);
+  });
+
+  invitesBlock.append(
+    element('div', 'label', 'Invites'),
+    linkBox,
+    inviteList,
+    noInvites,
+    inviteError,
+    formBox,
+    inviteToggle,
+  );
+
   // A fixed height, so new calls never move the boxes around it.
   const activity = element('ol', 'activity');
   activity.dataset.role = 'activity';
@@ -392,37 +658,68 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   pauseBox.append(pauseView.text, pauseView.toggle);
   boxes.add(pauseView);
 
-  panel.append(errorLine, noticeLine, prompts, pairing, rosterBlock, activityBlock, pauseBox);
+  panel.append(
+    errorLine,
+    noticeLine,
+    joins,
+    prompts,
+    pairing,
+    rosterBlock,
+    invitesBlock,
+    activityBlock,
+    pauseBox,
+  );
 
   const dot = element('span', 'dot');
   const count = element('span', 'count', '0');
   const pausedTag = element('span', 'tag', 'Paused');
   pausedTag.dataset.role = 'badge-paused';
-  const badge = button('', 'toggle', () => {
+  const badgeButton = button('', 'toggle', () => {
     // hidden can also be 'until-found', which still means closed.
     setOpen(panel.hidden !== false);
   });
-  badge.className = 'badge';
-  badge.setAttribute('aria-expanded', 'false');
-  badge.append(dot, element('span', '', 'Tabdock'), count, pausedTag);
+  badgeButton.className = 'badge';
+  badgeButton.setAttribute('aria-expanded', 'false');
+  badgeButton.append(dot, element('span', '', 'Tabdock'), count, pausedTag);
 
   const wrap = element('div', 'wrap');
-  wrap.append(panel, badge);
+  wrap.append(panel, badgeButton);
   if (style) root.append(style);
   root.append(wrap);
 
   function setOpen(open: boolean): void {
     panel.hidden = !open;
-    badge.setAttribute('aria-expanded', String(open));
+    badgeButton.setAttribute('aria-expanded', String(open));
     // Opening moves every box from nowhere onto the screen, so each waits from now.
     checkMoves();
   }
 
-  function requestView(request: PendingRequest): PromptView {
+  function requestView(request: PendingRequest, state: DockState): PromptView {
     const box = element('div', 'prompt');
     box.dataset.requestId = request.requestId;
-    const via = request.via === 'qr' ? 'QR code' : request.via === 'invite' ? 'invite' : 'code';
-    box.append(element('p', '', `${request.user.displayName} wants to attach via ${via}`));
+    const who = personText(request.user, request.account);
+    const line = element('p');
+    if (request.invite !== null) {
+      // The account beside the label the operator gave the invite, which is this page's own text.
+      line.append(`${who} wants to join by your invite "${request.invite.label}"`);
+    } else {
+      const via = request.via === 'qr' ? 'QR code' : 'code';
+      line.append(`${who} wants to attach via ${via}`);
+    }
+    line.append(badge(request.invite !== null || request.account.kind === 'invitee'));
+    box.append(line);
+    if (!request.account.verified) {
+      box.append(
+        element('p', 'muted', 'Unverified account: the sign-in provider vouches for no email.'),
+      );
+    }
+    const drivers = state.roster.filter((attachment) => attachment.role === 'driver').length;
+    if (request.invite !== null && drivers >= state.policy.maxDrivers) {
+      // ADR 0017: the relay seats them as observer; Make driver works once a seat is free.
+      box.append(
+        element('p', 'muted', 'The driver seats are full, so they join as observer for now.'),
+      );
+    }
     if (request.client) {
       box.append(element('p', 'muted', `Client: ${clientText(request.client)}`));
     }
@@ -452,7 +749,10 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   function confirmView(confirm: PendingConfirm): PromptView {
     const box = element('div', 'prompt');
     box.dataset.callId = confirm.callId;
-    box.append(element('p', '', `${confirm.caller.displayName} wants to run ${confirm.tool}`));
+    const line = element('p');
+    line.append(`${personText(confirm.caller)} wants to run ${confirm.tool}`);
+    line.append(badge(shortId(confirm.caller.userId) !== null));
+    box.append(line);
     const view = newPrompt(box, confirm.expiresAt);
     const buttons = element('div', 'buttons');
     buttons.append(
@@ -507,11 +807,20 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   function rowView(userId: string): RowView {
     const box = element('li', 'row');
     box.dataset.userId = userId;
+    const closeLink = element('label', 'check');
+    const closeInput = element('input');
+    closeInput.type = 'checkbox';
+    closeInput.dataset.action = 'close-link';
+    closeLink.append(closeInput, 'and close this link');
+    closeLink.hidden = true;
     const view: RowView = {
       ...newBox(box),
-      who: element('p', 'who'),
+      name: element('span'),
+      badge: badge(false),
       clients: element('p', 'muted clients'),
       expiry: element('p', 'muted'),
+      closeLink,
+      closeInput,
       roleSwitch: element('button'),
       key: '',
       role: null,
@@ -525,10 +834,16 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     buttons.append(
       view.roleSwitch,
       boxButton(view, 'Revoke', 'revoke', () => {
-        dock.revoke(userId);
+        // The box's own choice when it shows, which starts checked; the
+        // adapter's default otherwise, which closes a multi-use link (ADR 0016).
+        if (view.closeLink.hidden) dock.revoke(userId);
+        else dock.revoke(userId, { closeInvite: view.closeInput.checked });
       }),
+      view.closeLink,
     );
-    box.append(view.who, view.clients, view.expiry, buttons);
+    const who = element('p', 'who');
+    who.append(view.name, view.badge);
+    box.append(who, view.clients, view.expiry, buttons);
     return view;
   }
 
@@ -539,69 +854,276 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   /**
    * The row shows the role the page enforces, not the relay's claim alone; a
    * user the page runs nothing for gets Revoke only, since even Make
-   * observer would grant them something.
+   * observer would grant them something, and so does a guest a Can watch
+   * invite let in, whom no switch may make a driver (ADR 0017).
    */
-  function updateRow(view: RowView, attachment: AttachmentView, access?: PageRole): void {
-    view.expiresAt = attachment.expiresAt;
+  function updateRow(
+    view: RowView,
+    attachment: AttachmentView,
+    access: PageRole | undefined,
+    invite: InviteView | undefined,
+  ): void {
+    view.expiresAt =
+      attachment.endsAt === null
+        ? attachment.expiresAt
+        : Math.min(attachment.endsAt, attachment.expiresAt ?? attachment.endsAt);
     const role = access?.role ?? null;
     const revoking = access?.revoked === true;
     const status = role ?? (revoking ? 'revoke pending' : 'not approved on this page');
-    setText(view.who, `${attachment.displayName} (${status})`);
+    setText(view.name, `${personText(attachment)} (${status})`);
+    setText(view.badge, invited(attachment) ? 'invited' : '');
     const clients = attachment.clients.map(clientText).join(', ');
     setText(view.clients, clients === '' ? 'No client seen yet' : `Clients: ${clients}`);
+    const capped = access?.inviteRole === 'observer';
+    const closable = invite !== undefined && invite.uses > 1 && invite.usesLeft > 0;
     // Clients name themselves, on every call if they like, so their names
     // never make the row wait again; the line keeps its height, and real
     // movement is checkMoves' job.
-    const key = JSON.stringify([attachment.displayName, role, revoking]);
+    const key = JSON.stringify([attachment.displayName, role, revoking, capped, closable]);
     if (key === view.key) return;
     const isNew = view.key === '';
     view.key = key;
     view.role = role;
-    view.roleSwitch.hidden = role === null;
+    view.roleSwitch.hidden = role === null || capped;
     const promote = role !== 'driver';
     view.roleSwitch.textContent = promote ? 'Make driver' : 'Make observer';
     view.roleSwitch.dataset.action = promote ? 'make-driver' : 'make-observer';
+    // "and close this link" starts checked whenever it appears.
+    if (closable && view.closeLink.hidden) view.closeInput.checked = true;
+    view.closeLink.hidden = !closable;
     // The role switch may now do the opposite of what the operator was reaching for, or be gone.
     if (!isNew) restartArming(view);
   }
 
   /** Rows are kept by user id and only reordered when the relay's order changes, like prompts. */
-  function syncRows(
-    attachments: readonly AttachmentView[],
-    pageRoles: readonly PageRole[],
-    linked: boolean,
-  ): void {
-    const access = new Map(pageRoles.map((entry) => [entry.userId, entry]));
-    const live = new Set(attachments.map((attachment) => attachment.userId));
+  function syncRows(state: DockState): void {
+    const access = new Map(state.pageRoles.map((entry) => [entry.userId, entry]));
+    const invites = new Map(state.invites.map((view) => [view.inviteId, view]));
+    const live = new Set(state.roster.map((attachment) => attachment.userId));
     for (const [userId, view] of rowViews) {
       if (!live.has(userId)) {
         dropBox(view);
         rowViews.delete(userId);
       }
     }
-    const ordered = attachments.map((attachment) => {
+    const ordered = state.roster.map((attachment) => {
       let view = rowViews.get(attachment.userId);
       if (!view) {
         view = rowView(attachment.userId);
         rowViews.set(attachment.userId, view);
         boxes.add(view);
       }
-      updateRow(view, attachment, access.get(attachment.userId));
+      const invite = attachment.inviteId === null ? undefined : invites.get(attachment.inviteId);
+      updateRow(view, attachment, access.get(attachment.userId), invite);
       // Role changes need the relay; revoking works offline and is sent on resume.
-      view.roleSwitch.disabled = !linked;
+      view.roleSwitch.disabled = state.link !== 'linked';
       return view.element;
     });
     const current = [...roster.children];
     if (current.length !== ordered.length || current.some((node, i) => node !== ordered[i])) {
       roster.replaceChildren(...ordered);
     }
-    nobody.hidden = attachments.length > 0;
-    revokeAll.hidden = attachments.length === 0;
+    nobody.hidden = state.roster.length > 0;
+    // Revoke all also closes every live invite, so it stays while any is live.
+    revokeAll.hidden = state.roster.length === 0 && state.invites.length === 0;
+  }
+
+  /** Roster entries seen so far, so someone new by invite gets their notice; null before the first render. */
+  let seenUsers: Set<string> | null = null;
+  const joinLines: { readonly element: HTMLElement; readonly until: number }[] = [];
+
+  /** ADR 0016: a Can watch invite lets its holder in without a prompt, but never unseen. */
+  function noticeJoins(state: DockState): void {
+    const listed = new Set(state.roster.map((attachment) => attachment.userId));
+    if (seenUsers !== null) {
+      for (const attachment of state.roster) {
+        if (seenUsers.has(attachment.userId) || attachment.inviteId === null) continue;
+        const label = state.invites.find((view) => view.inviteId === attachment.inviteId)?.label;
+        const by = label === undefined ? 'by invite' : `by your invite "${label}"`;
+        const line = element(
+          'p',
+          'join',
+          `${personText(attachment)} joined ${by} as ${attachment.role}`,
+        );
+        // Not data-user-id, which names roster rows.
+        line.dataset.joined = attachment.userId;
+        joins.prepend(line);
+        joinLines.push({ element: line, until: Date.now() + JOIN_NOTICE_MS });
+      }
+    }
+    seenUsers = listed;
+  }
+
+  function inviteRow(view: InviteView): InviteRowView {
+    const box = element('li', 'row');
+    box.dataset.inviteId = view.inviteId;
+    const title = element('p', 'who');
+    const detail = element('p', 'muted');
+    const buttons = element('div', 'buttons');
+    // Cancelling only takes access away, so it is not held back like the boxes.
+    buttons.append(
+      button('Cancel', 'cancel-invite', () => {
+        dock.cancelInvite(view.inviteId);
+      }),
+    );
+    box.append(title, detail, buttons);
+    return { element: box, title, detail, view };
+  }
+
+  function syncInvites(state: DockState): void {
+    const live = new Set(state.invites.map((view) => view.inviteId));
+    for (const [inviteId, row] of inviteRows) {
+      if (!live.has(inviteId)) {
+        row.element.remove();
+        inviteRows.delete(inviteId);
+      }
+    }
+    const ordered = state.invites.map((view) => {
+      let row = inviteRows.get(view.inviteId);
+      if (!row) {
+        row = inviteRow(view);
+        inviteRows.set(view.inviteId, row);
+      }
+      row.view = view;
+      // The label is this page's own words; quoted so it reads as a name, never as the widget's text.
+      setText(row.title, `"${view.label}", ${roleText(view.role)}`);
+      setText(row.detail, inviteDetail(view));
+      return row.element;
+    });
+    const current = [...inviteList.children];
+    if (current.length !== ordered.length || current.some((node, i) => node !== ordered[i])) {
+      inviteList.replaceChildren(...ordered);
+    }
+    noInvites.hidden = state.invites.length > 0;
+    // A link whose invite the relay no longer lists (used up, cancelled, expired) is dead: it goes.
+    if (shownLink !== null && state.invitesOffered !== null && !live.has(shownLink)) hideLink();
+  }
+
+  /** Why Create cannot work now, or null. */
+  function inviteBlocker(state: DockState): string | null {
+    if (state.link !== 'linked') return REFUSAL_TEXT.link_down;
+    if (state.invitesOffered?.linkBase === null) return REFUSAL_TEXT.no_public_url;
+    if (!state.roster.some((attachment) => attachment.kind === 'member')) {
+      return 'Invites need a member attached to sponsor them. Pair one first.';
+    }
+    if (state.invites.length >= MAX_LIVE_INVITES_PER_PAGE) return REFUSAL_TEXT.limit;
+    return null;
+  }
+
+  let creating = false;
+
+  function chosenRole(state: DockState): Role {
+    return state.policy.invites === 'all' && controlChoice.input.checked ? 'driver' : 'observer';
+  }
+
+  function chosenLifetime(): InviteLifetime {
+    for (const [value, input] of lifetimeInputs) if (input.checked) return value;
+    return '1h';
+  }
+
+  function chosenUses(): number | null {
+    const uses = Number(usesInput.value);
+    return Number.isInteger(uses) && uses >= 1 && uses <= MAX_INVITE_USES ? uses : null;
+  }
+
+  function updateForm(state: DockState): void {
+    const offered = state.invitesOffered !== null && state.policy.invites !== 'off';
+    invitesBlock.hidden = !offered;
+    // Can control only where the page opted into it (ADR 0016).
+    controlChoice.label.hidden = state.policy.invites !== 'all';
+    if (controlChoice.label.hidden && controlChoice.input.checked) watchChoice.input.checked = true;
+    // A Can control invite always has exactly one use.
+    usesField.hidden = chosenRole(state) === 'driver';
+    const blocker = inviteBlocker(state);
+    const reason = creating ? 'Asking the relay for the link' : blocker;
+    setText(formReason, reason ?? '');
+    formReason.hidden = reason === null;
+    createButton.disabled = creating || blocker !== null || labelInput.value.trim() === '';
+    const open = !formBox.hidden;
+    inviteToggle.textContent = open ? 'Close the form' : 'Invite someone';
+    inviteToggle.dataset.action = open ? 'invite-close' : 'invite-open';
+  }
+
+  function setFormOpen(open: boolean): void {
+    formBox.hidden = !open;
+    if (open) inviteError.hidden = true;
+    render(dock.state);
+  }
+
+  async function createInvite(): Promise<void> {
+    const state = dock.state;
+    const label = labelInput.value.trim();
+    const role = chosenRole(state);
+    const uses = role === 'driver' ? 1 : chosenUses();
+    if (label === '' || uses === null) {
+      showInviteError(REFUSAL_TEXT.invalid);
+      return;
+    }
+    creating = true;
+    inviteError.hidden = true;
+    render(state);
+    const result = await dock.invite({ label, role, lifetime: chosenLifetime(), uses });
+    creating = false;
+    if (!mounted) return;
+    if (result.ok) {
+      labelInput.value = '';
+      usesInput.value = '1';
+      formBox.hidden = true;
+      showLink(result.inviteId, result.link, label);
+    } else {
+      showInviteError(REFUSAL_TEXT[result.reason]);
+    }
+    render(dock.state);
+  }
+
+  function showInviteError(text: string): void {
+    inviteError.textContent = text;
+    inviteError.hidden = false;
+  }
+
+  /** The link, once: as a QR drawing and as text to send, until Done or until its invite ends. */
+  function showLink(inviteId: string, link: string, label: string): void {
+    shownLink = inviteId;
+    linkHeading.textContent = `Send this link to ${label}. It shows only now, and anyone who holds it can join as the invite says.`;
+    linkText.textContent = link;
+    linkQrBox.hidden = !linkQr.show(link);
+    copyLink.textContent = 'Copy link';
+    linkBox.hidden = false;
+    setOpen(true);
+  }
+
+  function hideLink(): void {
+    shownLink = null;
+    // Nothing of the link stays in the tree.
+    linkText.textContent = '';
+    linkHeading.textContent = '';
+    linkQr.show(undefined);
+    linkBox.hidden = true;
+  }
+
+  function copyShownLink(): void {
+    const link = linkText.textContent;
+    const navigator = doc.defaultView?.navigator;
+    const clipboard: unknown = navigator ? Reflect.get(navigator, 'clipboard') : undefined;
+    const write =
+      typeof clipboard === 'object' && clipboard !== null
+        ? (clipboard as { writeText?: unknown }).writeText
+        : undefined;
+    const fallback = (): void => {
+      copyLink.textContent = 'Select the link to copy it';
+    };
+    if (link === '' || typeof write !== 'function') {
+      fallback();
+      return;
+    }
+    (write as (text: string) => Promise<void>).call(clipboard, link).then(() => {
+      copyLink.textContent = 'Copied';
+    }, fallback);
   }
 
   function updatePause(paused: boolean): void {
     pausedTag.hidden = !paused;
-    badge.dataset.paused = String(paused);
+    badgeButton.dataset.paused = String(paused);
     if (pauseView.paused === paused) return;
     const isNew = pauseView.paused === null;
     pauseView.paused = paused;
@@ -623,7 +1145,9 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const took = entry.durationMs === null ? '' : ` in ${entry.durationMs} ms`;
     // A write answered early still holds the page while its handler runs on.
     const lingering = entry.handlerRunning ? ', but its handler is still running' : '';
-    line.textContent = `${timeText(entry.time)} ${entry.user.displayName}${via}: ${entry.tool}, ${entry.outcome}${took}${lingering}`;
+    line.append(`${timeText(entry.time)} ${personText(entry.user)}`);
+    if (shortId(entry.user.userId) !== null) line.append(badge(true));
+    line.append(`${via}: ${entry.tool}, ${entry.outcome}${took}${lingering}`);
     return line;
   }
 
@@ -644,6 +1168,15 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       view.countdown.textContent = `Denied automatically in ${secondsLeft(view.expiresAt)} s`;
     }
     for (const view of rowViews.values()) view.expiry.textContent = expiryText(view.expiresAt);
+    for (const row of inviteRows.values()) setText(row.detail, inviteDetail(row.view));
+    const now = Date.now();
+    for (let i = joinLines.length - 1; i >= 0; i -= 1) {
+      const line = joinLines[i];
+      if (line && line.until <= now) {
+        line.element.remove();
+        joinLines.splice(i, 1);
+      }
+    }
     const current = dock.state.pairing;
     if (current) {
       const left = secondsLeft(current.expiresAt);
@@ -660,7 +1193,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       return;
     }
     dot.className = `dot ${state.link}`;
-    badge.title = `Tabdock: ${LINK_LABELS[state.link]}${state.paused ? ', paused' : ''}`;
+    badgeButton.title = `Tabdock: ${LINK_LABELS[state.link]}${state.paused ? ', paused' : ''}`;
     count.textContent = String(state.roster.length);
     errorLine.textContent = state.error ?? '';
     errorLine.hidden = state.error === null;
@@ -673,7 +1206,10 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     qrBox.hidden = !qr.show(state.pairing?.url);
     rotate.disabled = state.link !== 'linked';
 
-    syncRows(state.roster, state.pageRoles, state.link === 'linked');
+    syncInvites(state);
+    syncRows(state);
+    noticeJoins(state);
+    updateForm(state);
     renderActivity(state.activity);
     updatePause(state.paused);
 
@@ -681,7 +1217,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       requestViews,
       state.pendingRequests,
       (r) => r.requestId,
-      requestView,
+      (r) => requestView(r, state),
     );
     const newConfirm = syncPrompts(
       confirmViews,
@@ -690,7 +1226,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       confirmView,
     );
     const waiting = requestViews.size + confirmViews.size > 0;
-    badge.classList.toggle('attention', waiting);
+    badgeButton.classList.toggle('attention', waiting);
     // A new prompt opens the panel: the operator has a deadline to meet.
     if (newRequest || newConfirm) setOpen(true);
     // The code is how anyone attaches, so show it without a click while nobody has.
@@ -720,11 +1256,11 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   };
   const win = doc.defaultView;
 
+  let mounted = true;
   const unsubscribe = dock.on('state', render);
   const interval = setInterval(tick, 1000);
   doc.addEventListener('visibilitychange', onVisibility);
   win?.addEventListener('focus', rearmAll);
-  let mounted = true;
 
   function unmount(): void {
     if (!mounted) return;
@@ -734,6 +1270,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     doc.removeEventListener('visibilitychange', onVisibility);
     win?.removeEventListener('focus', rearmAll);
     for (const box of boxes) clearTimeout(box.timer);
+    hideLink();
     host.remove();
   }
 

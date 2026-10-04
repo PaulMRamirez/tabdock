@@ -8,9 +8,10 @@ export type ScriptOptions =
 
 /**
  * `data` is a script element's dataset: data-relay, data-auto-approve,
- * data-max-drivers, data-consequential and data-consequential-tools (a comma
- * list). Absent attributes stay absent, so the policy defaults apply and an
- * omitted tool list still means "the page gave none" (ADR 0002).
+ * data-max-drivers, data-consequential, data-consequential-tools (a comma
+ * list) and data-invites (off, watch or all; ADR 0016). Absent attributes
+ * stay absent, so the policy defaults apply and an omitted tool list still
+ * means "the page gave none" (ADR 0002).
  */
 export function readScriptOptions(
   data: Readonly<Record<string, string | undefined>>,
@@ -23,6 +24,7 @@ export function readScriptOptions(
   if (data.autoApprove !== undefined) policy.autoApprove = data.autoApprove.trim();
   if (data.maxDrivers !== undefined) policy.maxDrivers = Number(data.maxDrivers.trim() || NaN);
   if (data.consequential !== undefined) policy.consequential = data.consequential.trim();
+  if (data.invites !== undefined) policy.invites = data.invites.trim();
   if (data.consequentialTools !== undefined) {
     policy.consequentialTools = data.consequentialTools
       .split(',')

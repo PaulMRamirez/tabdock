@@ -10,6 +10,7 @@ import {
   type ActivityEntry,
   createAdapterCore,
   type AdapterCore,
+  type CryptoLike,
   type Dock,
   type DockState,
   type InviteOptions,
@@ -80,6 +81,12 @@ export interface SimPageOptions {
   adapterVersion?: string;
   /** Timers for the adapter core; a test can shorten one, such as the silence watchdog. */
   timers?: Timers;
+  /**
+   * WebCrypto for minting and checking invites (ADR 0017); Node's global
+   * crypto unless set, which mints for real. A test can pass one without
+   * subtle to play a page outside a secure context.
+   */
+  crypto?: CryptoLike;
 }
 
 export interface SimPage {
@@ -115,7 +122,11 @@ export interface SimPage {
   cancelInvite(inviteId: string): boolean;
   /**
    * The operator's Invite form on the current page (Dock.invite, ADR 0017):
-   * resolves with the link once, or the reason there is none.
+   * resolves with the link once, or the reason there is none. The page keeps
+   * the invite's record, never its secret, in storage, so reload() keeps it
+   * while the relay resumes the session; a redemption is then honoured only
+   * against that record, a Can watch one without asking the operator and a
+   * Can control one through operator.askAttach, whose request names the invite.
    */
   invite(options: InviteOptions): Promise<InviteResult>;
   /** The operator's pause switch (Dock.pause); it survives reload(), as the adapter stores it. */
@@ -235,6 +246,7 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
       adapterVersion: options.adapterVersion ?? '0.0.0-sim',
       logger,
       timers: options.timers,
+      crypto: options.crypto,
     });
     core.start();
     return { core, context };

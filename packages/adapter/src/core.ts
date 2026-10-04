@@ -15,14 +15,23 @@ import {
   CLOSE_REPLACED,
   CLOSE_SILENT,
   CONTROL_INVITE_USES,
+  DEFAULT_INVITE_LIFETIME_MS,
   encodeFrame,
   IdSchema,
   IDLE_TIMEOUT_MS,
+  INVITE_BURN_REFUSALS,
+  INVITE_SECRET_BYTES,
+  InviteeIdSchema,
   InviteLabelSchema,
+  inviteLink,
+  type InviteListing,
   type InviteRefusalReason,
+  INVITEE_SHORT_ID_CHARS,
   JsonObjectSchema,
   MAX_FRAME_BYTES,
+  MAX_INVITE_LIFETIME_MS,
   MAX_INVITE_USES,
+  MAX_LIVE_INVITES_PER_PAGE,
   MAX_RESULT_CHARS,
   type PageErrorCode,
   type PageFrameInput,
@@ -30,6 +39,7 @@ import {
   type PageTool,
   type Pairing,
   parseRelayFrame,
+  type Policy,
   type PolicyInput,
   PolicySchema,
   PROTOCOL_VERSION,
@@ -38,8 +48,11 @@ import {
   type RelayFrame,
   type Role,
   RoleSchema,
+  SHORT_INVITE_LIFETIME_MS,
   type StoredGrant,
   StoredGrantSchema,
+  type StoredInvite,
+  StoredInvitesSchema,
   SUBPROTOCOL,
   TOOL_POLL_MS,
   truncate,
@@ -117,6 +130,19 @@ export interface Logger {
   error(message: string): void;
 }
 
+/**
+ * The slice of WebCrypto that invites need (ADR 0017): random bytes for a
+ * secret and an invite id, and SHA-256 for the hash the relay keeps. A
+ * browser's crypto fits, though its subtle exists only in a secure context;
+ * so does Node's global crypto, which the sim page runs on.
+ */
+export interface CryptoLike {
+  getRandomValues<T extends Uint8Array<ArrayBuffer>>(array: T): T;
+  readonly subtle: {
+    digest(algorithm: 'SHA-256', data: Uint8Array<ArrayBuffer>): Promise<ArrayBuffer>;
+  };
+}
+
 /** What hello says about the page that can change while it is open. */
 export interface PageInfo {
   title: string;
@@ -168,6 +194,12 @@ export interface CoreOptions {
   clock?: (() => number) | undefined;
   timers?: Timers | undefined;
   random?: (() => number) | undefined;
+  /**
+   * WebCrypto, for minting invites and checking redemptions; the global
+   * crypto unless set. Without a usable one (a page outside a secure context)
+   * the page mints nothing and honours no invite.
+   */
+  crypto?: CryptoLike | undefined;
 }
 
 // What the page sees.
@@ -210,9 +242,12 @@ export interface InviteOptions {
 /**
  * Why no link came back: the relay's own reasons (ADR 0017), or the
  * adapter's: options it cannot mint (invalid), no link to the relay
- * (link_down), or a relay that offers no invites (unavailable).
+ * (link_down), a relay that offers no invites or never answers, or a page
+ * without WebCrypto (unavailable), or the operator closing the invite, by
+ * Cancel or Revoke all, before the relay answered (cancelled).
  */
-export type InviteRefusal = InviteRefusalReason | 'invalid' | 'link_down' | 'unavailable';
+export type InviteRefusal =
+  InviteRefusalReason | 'invalid' | 'link_down' | 'unavailable' | 'cancelled';
 
 /**
  * One live invite this page minted, as the widget's list shows it (ADR
@@ -228,7 +263,10 @@ export interface InviteView {
   /** Written on this page: shown as its own words (S10). */
   readonly label: string;
   readonly uses: number;
+  /** Uses anyone can still take: the fewer of what the relay and this page's record have left. */
   readonly usesLeft: number;
+  /** How many people this page let in by it: its own count, whatever the relay says. */
+  readonly joined: number;
   readonly expiresAt: number | null;
   /** The member the relay named as sponsor at minting; fixed, since /i shows the name. */
   readonly sponsor: User;
@@ -248,8 +286,10 @@ export interface InvitesOffered {
 export interface RevokeOptions {
   /**
    * For someone an invite let in, also close that invite's link
-   * (invite_cancel), so nobody else joins by it. The widget checks it by
-   * default for a multi-use invite; revoke('*') closes every link anyway.
+   * (invite_cancel), so nobody else joins by it. Left out, it closes a
+   * multi-use invite's link and leaves a single-use one, which their joining
+   * spent (ADR 0016: "and close this link" by default); revoke('*') closes
+   * every link anyway.
    */
   readonly closeInvite?: boolean;
 }
@@ -305,6 +345,11 @@ export interface PageRole {
   readonly role: Role | null;
   /** Revoked here, and the relay has not dropped them yet. */
   readonly revoked: boolean;
+  /**
+   * For someone an invite let in, that invite's role: the most the role
+   * switch may give them (ADR 0017). null for everyone else.
+   */
+  readonly inviteRole: Role | null;
 }
 
 export interface DockState {
@@ -337,9 +382,16 @@ export interface DockState {
   /**
    * null until an invites frame arrives, which only a relay with invites on
    * sends, right after each welcome (ADR 0017's notes); a relay with them off
-   * never sends one, so the widget then offers no Invite form at all.
+   * never sends one, so the widget then offers no Invite form at all. Back to
+   * null whenever the link drops, until the next one.
    */
   readonly invitesOffered: InvitesOffered | null;
+  /**
+   * The page's policy as attach() was given it, defaults filled in: what
+   * policy.invites lets the operator offer, and maxDrivers, for a prompt to
+   * say a guest will join as observer. A copy; changing it changes nothing.
+   */
+  readonly policy: Policy;
 }
 
 /** The only control handle. Each method returns false when there was nothing to act on. */
@@ -360,21 +412,23 @@ export interface Dock {
   /**
    * Ends one user's attachment, or everyone's with '*' (S8), which also
    * cancels every live invite. Revoking someone an invite let in bars them
-   * from it; options.closeInvite also closes its link (ADR 0017).
+   * from it for its life, and no later redemption by them is honoured;
+   * options.closeInvite also closes its link (ADR 0017).
    */
   revoke(userId: string, options?: RevokeOptions): boolean;
   /**
-   * Closes one live invite's link (invite_cancel); the attachments it already
-   * made stay until revoked (ADR 0017's notes). False when this page holds no
-   * such invite.
+   * Closes one invite's link (invite_cancel); the attachments it already
+   * made stay until revoked (ADR 0017's notes). This page forgets its record
+   * at once, so it honours the link no more whatever the relay does, and a
+   * relay that still lists it after a lost link hears the cancel again.
+   * False when this page holds no such invite.
    */
   cancelInvite(inviteId: string): boolean;
   /**
    * Mints an invite on this page as far as policy.invites allows (ADR 0017):
    * a 128-bit secret whose hash alone goes to the relay and into this page's
-   * own record, and a link that resolves here once. Workstream B mints; until
-   * then every relay offers none, so this resolves unavailable once the
-   * options and the page's policy check out.
+   * own record, and a link that resolves here once, when the relay lists the
+   * invite. The secret is kept nowhere after that.
    */
   invite(options: InviteOptions): Promise<InviteResult>;
   /** Pauses or resumes calls on this page. Only false resumes, and the choice survives a reload. */
@@ -433,6 +487,16 @@ const MAX_ERROR_CHARS = 2000;
 const MIN_FRAME_BYTES = 4096;
 
 /**
+ * How long dock.invite() waits for the relay to list or refuse a new
+ * invite. A relay answers every invite_create at once (ADR 0017's notes), so
+ * only one that does not ever gets here; the page then forgets the invite.
+ */
+export const MINT_ANSWER_MS = 10_000;
+
+/** Random bytes in an invite id, which names an invite but opens nothing. */
+const INVITE_ID_BYTES = 9;
+
+/**
  * What the adapter keeps in the tab's storage, each for one relay and one
  * page: from M4 also its invite records (StoredInvites, ADR 0017), beside
  * the grants and dropped with them.
@@ -486,6 +550,7 @@ const CLOSE_INVALID_FRAME = 1008;
 type InvokeFrame = Extract<RelayFrame, { t: 'invoke' }>;
 type WelcomeFrame = Extract<RelayFrame, { t: 'welcome' }>;
 type AttachRequestFrame = Extract<RelayFrame, { t: 'attach_request' }>;
+type InvitesFrame = Extract<RelayFrame, { t: 'invites' }>;
 
 type Outcome = { ok: true; content: string } | { ok: false; code: PageErrorCode; message: string };
 type Refusal = Extract<Outcome, { ok: false }>;
@@ -530,10 +595,43 @@ function refuse(code: PageErrorCode, message: string): Checked {
   return { ok: false, refusal: { ok: false, code, message } };
 }
 
+/**
+ * A grant as the core holds it: StoredGrant read back, the bare role of an
+ * older adapter included, with every field it may have in one shape.
+ */
+interface Grant {
+  readonly role: Role;
+  readonly inviteId?: string | undefined;
+  readonly endsAt?: number | undefined;
+  readonly inviteRole?: Role | undefined;
+}
+
 interface RequestRecord {
   readonly request: PendingRequest;
   readonly timer: unknown;
   readonly port: AbortController;
+  /**
+   * Put before the operator: listed in pendingRequests and asked through
+   * the UI port. A redemption is shown only once its secret checks out, and
+   * only for Can control; a Can watch one is answered without a prompt.
+   */
+  shown: boolean;
+  /** The secret a redemption presented, held only until it is checked. */
+  secret: string | null;
+}
+
+/**
+ * Why a request was answered, which decides whether a control invite counts
+ * a refusal: only the operator's Deny and a prompt left to time out do,
+ * since three of those burn it (ADR 0017).
+ */
+type DecisionCause = 'operator' | 'timeout' | 'rule' | 'invite' | 'revoke' | 'detach';
+
+interface MintInFlight {
+  /** Only until the relay answers; then it goes into the link, and from here nowhere. */
+  readonly secret: string;
+  readonly resolve: (result: InviteResult) => void;
+  readonly timer: unknown;
 }
 
 const consoleLogger: Logger = {
@@ -559,6 +657,84 @@ const encoder = new TextEncoder();
 
 function byteLength(text: string): number {
   return encoder.encode(text).length;
+}
+
+const BASE64URL_DIGITS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+
+/** Unpadded base64url, as the relay's Buffer.toString('base64url') writes it: 16 bytes make 22 characters. */
+export function base64url(bytes: Uint8Array): string {
+  let text = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const rest = bytes.length - i;
+    const n = ((bytes[i] ?? 0) << 16) | ((bytes[i + 1] ?? 0) << 8) | (bytes[i + 2] ?? 0);
+    text += BASE64URL_DIGITS.charAt((n >> 18) & 63) + BASE64URL_DIGITS.charAt((n >> 12) & 63);
+    if (rest > 1) text += BASE64URL_DIGITS.charAt((n >> 6) & 63);
+    if (rest > 2) text += BASE64URL_DIGITS.charAt(n & 63);
+  }
+  return text;
+}
+
+/**
+ * The page's WebCrypto, when it has one it can use: browsers leave subtle
+ * out outside a secure context, where invites then stay off.
+ */
+function usableCrypto(given: CryptoLike | undefined): CryptoLike | null {
+  const candidate: unknown = given ?? Reflect.get(globalThis, 'crypto');
+  if (typeof candidate !== 'object' || candidate === null) return null;
+  const { getRandomValues, subtle } = candidate as { getRandomValues?: unknown; subtle?: unknown };
+  if (typeof getRandomValues !== 'function' || typeof subtle !== 'object' || subtle === null) {
+    return null;
+  }
+  return typeof (subtle as { digest?: unknown }).digest === 'function'
+    ? (candidate as CryptoLike)
+    : null;
+}
+
+/** SHA-256 of the text's UTF-8 bytes as 64 lower-case hex characters, matching the relay's digestHex. */
+async function sha256Hex(crypto: CryptoLike, text: string): Promise<string> {
+  const hash = await crypto.subtle.digest('SHA-256', encoder.encode(text));
+  return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function randomText(crypto: CryptoLike, bytes: number): string {
+  return base64url(crypto.getRandomValues(new Uint8Array(bytes)));
+}
+
+/** An invitee's id is the prefix and its account key; their kind follows from it (ADR 0017's notes). */
+function isInvitee(userId: string): boolean {
+  return InviteeIdSchema.safeParse(userId).success;
+}
+
+/**
+ * How a user appears in the adapter's own log lines. An invitee's display
+ * name is their email, which belongs on the operator's screen and in no log
+ * (ADR 0020), so they appear by the short id the widget also shows.
+ */
+function logName(user: { userId: string; displayName: string }): string {
+  return isInvitee(user.userId)
+    ? `invitee ${user.userId.slice(2, 2 + INVITEE_SHORT_ID_CHARS)}`
+    : user.displayName;
+}
+
+/** When an invite stops working on this page's clock: its expiry, and 24 hours after minting whatever it says. */
+function inviteEnd(invite: StoredInvite): number {
+  const latest = invite.createdAt + MAX_INVITE_LIFETIME_MS;
+  return invite.expiresAt === null ? latest : Math.min(invite.expiresAt, latest);
+}
+
+/** Whether the relay lists an invite with the very terms this page minted it with (ADR 0017's notes). */
+function sameTerms(invite: StoredInvite, listing: InviteListing): boolean {
+  return (
+    invite.role === listing.role &&
+    invite.label === listing.label &&
+    invite.uses === listing.uses &&
+    invite.expiresAt === listing.expiresAt
+  );
+}
+
+function lifetimeMs(lifetime: InviteLifetime): number | null {
+  if (lifetime === 'open') return null;
+  return lifetime === '15m' ? SHORT_INVITE_LIFETIME_MS : DEFAULT_INVITE_LIFETIME_MS;
 }
 
 /** Each UTF-16 code unit becomes at most 3 UTF-8 bytes, so only longer strings need counting. */
@@ -750,7 +926,9 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   const grantsKey = storageKey('grants', options.relayUrl, options.pageUrl);
   const revokedKey = storageKey('revoked', options.relayUrl, options.pageUrl);
   const pausedKey = storageKey('paused', options.relayUrl, options.pageUrl);
+  const invitesKey = storageKey('invites', options.relayUrl, options.pageUrl);
   forgetLegacyRecords(options.storage, options.relayUrl);
+  const webCrypto = usableCrypto(options.crypto);
   const polyfillMarker: unknown = context && Reflect.get(context, POLYFILL_MARKER);
   /**
    * Under ADR 0001 a call that ends early aborts the signal it handed
@@ -774,6 +952,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     activity: [],
     invites: [],
     invitesOffered: null,
+    policy: { ...policy, consequentialTools: [...policy.consequentialTools] },
   });
   const listeners = new Set<(state: DockState) => void>();
 
@@ -801,10 +980,10 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    * The roles the operator granted on this page, by user id: the root of S5's
    * second check. The relay's roster and the role an invoke claims can only
    * lower them, so a relay cannot run a tool for someone nobody approved. An
-   * invite-made grant also names its invite and end, which workstream B
-   * enforces (ADR 0017); no grant has either until it does.
+   * invite-made grant also names its invite, its end and the invite's role,
+   * which caps it (ADR 0017).
    */
-  const grants = new Map<string, StoredGrant>();
+  const grants = new Map<string, Grant>();
   /** The page session the grants belong to; they mean nothing on another. */
   let grantsPage: string | null = null;
   /**
@@ -831,6 +1010,25 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    */
   let writing: CallRecord | null = null;
   let nextSeq = 0;
+  /**
+   * This page's own record of every invite it minted (ADR 0017), by id,
+   * stored beside the grants: the hash of its secret, its terms, the uses
+   * this page has let go, its refusals and the accounts barred from it. A
+   * redemption is honoured only against this, never against what the relay
+   * says, so a relay that never saw a secret cannot invent one that works.
+   */
+  const invites = new Map<string, StoredInvite>();
+  /** What the relay's last invites frame said of each invite the records hold, terms matching. */
+  let listings = new Map<string, InviteListing>();
+  /** Invites sent to the relay that it has neither listed nor refused yet. */
+  const minting = new Map<string, MintInFlight>();
+  /**
+   * Invites closed on this link because this page holds no record of them,
+   * so a relay that keeps listing one hears the cancel once per link.
+   */
+  const cancelSent = new Set<string>();
+  /** Fires when the next invite-made grant ends, so the roles shown change with it. */
+  let grantEndTimer: unknown = null;
 
   function setState(patch: Partial<DockState>): void {
     const next = { ...state, ...patch };
@@ -888,6 +1086,16 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       grantsPage = pending.pageId;
       for (const userId of pending.users) revoked.add(userId);
     }
+    // The invite records too: a strict schema, so a record holding a secret,
+    // or anything else malformed, reads as no records at all.
+    const invitesText = readStored(invitesKey);
+    const records =
+      invitesText === null ? null : StoredInvitesSchema.safeParse(parseJson(invitesText));
+    if (records && !records.success) log.warn('ignored stored invites that did not parse');
+    if (records?.success && (grantsPage === null || grantsPage === records.data.pageId)) {
+      grantsPage = records.data.pageId;
+      for (const invite of records.data.invites) invites.set(invite.inviteId, invite);
+    }
   }
 
   function writeStored(key: string, value: string | null, what: string): void {
@@ -899,7 +1107,10 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     }
   }
 
-  /** Every change to the grants or the pending revokes ends here, so storage and the shown roles always match memory. */
+  /**
+   * Every change to the grants, the pending revokes or the invite records
+   * ends here, so storage and the shown roles and invites always match memory.
+   */
   function saveGrants(): void {
     const page = grantsPage;
     writeStored(
@@ -916,11 +1127,24 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         : JSON.stringify({ pageId: page, users: [...revoked] }),
       "the operator's revokes",
     );
-    if (JSON.stringify(rolesFor(state.roster)) !== JSON.stringify(state.pageRoles)) setState({});
+    writeStored(
+      invitesKey,
+      invites.size === 0 || page === null
+        ? null
+        : JSON.stringify({ pageId: page, invites: [...invites.values()] }),
+      "the page's invite records",
+    );
+    armGrantEnd();
+    const views = inviteViews();
+    if (JSON.stringify(views) !== JSON.stringify(state.invites)) {
+      setState({ invites: views });
+    } else if (JSON.stringify(rolesFor(state.roster)) !== JSON.stringify(state.pageRoles)) {
+      setState({});
+    }
   }
 
   /** The operator's approvals and role changes go through here, so storage always matches memory. */
-  function setGrant(userId: string, grant: StoredGrant): void {
+  function setGrant(userId: string, grant: Grant): void {
     grants.set(userId, grant);
     saveGrants();
   }
@@ -942,11 +1166,35 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     if (changed) saveGrants();
   }
 
+  /** Everything this page approved, revoked or minted for one page session goes together. */
   function clearGrants(): void {
     grants.clear();
     revoked.clear();
+    for (const inviteId of [...invites.keys()]) forgetInvite(inviteId, 'cancelled');
     grantsPage = null;
     saveGrants();
+  }
+
+  /**
+   * Refreshes the shown roles when the next invite-made grant ends: calls
+   * check the end themselves, but the roster in the widget should not wait
+   * for some other change to show it.
+   */
+  function armGrantEnd(): void {
+    timers.clearTimeout(grantEndTimer);
+    grantEndTimer = null;
+    if (closed) return;
+    const now = clock();
+    let next = Infinity;
+    for (const grant of grants.values()) {
+      if (grant.endsAt !== undefined && grant.endsAt > now) next = Math.min(next, grant.endsAt);
+    }
+    if (next === Infinity) return;
+    grantEndTimer = timers.setTimeout(() => {
+      grantEndTimer = null;
+      setState({});
+      armGrantEnd();
+    }, next - now);
   }
 
   loadGrants();
@@ -990,18 +1238,35 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     return caller.role === 'observer' ? 'observer' : role;
   }
 
-  /** callerRole before the invoke's own claim, for a user the roster lists as `listed`. */
+  /**
+   * callerRole before the invoke's own claim, for a user the roster lists as
+   * `listed`. An invite-made grant gives nothing past its end, and never
+   * more than its invite's role (S14). autoApprove lets in members only: an
+   * invitee comes in through an invite this page honoured, or not at all,
+   * whatever the relay says (ADR 0017's notes).
+   */
   function pageRole(userId: string, listed: Role): Role | null {
     if (revoked.has(userId)) return null;
-    const granted =
-      grants.get(userId)?.role ?? (policy.autoApprove === 'observer' ? 'observer' : undefined);
-    if (granted === undefined) return null;
+    const grant = grants.get(userId);
+    let granted: Role;
+    if (grant) {
+      if (grant.endsAt !== undefined && clock() >= grant.endsAt) return null;
+      granted = grant.inviteRole === 'observer' ? 'observer' : grant.role;
+    } else {
+      if (policy.autoApprove !== 'observer' || isInvitee(userId)) return null;
+      granted = 'observer';
+    }
     return granted === 'observer' || listed === 'observer' ? 'observer' : 'driver';
   }
 
   function rolesFor(roster: readonly AttachmentView[]): PageRole[] {
     return roster.map(({ userId, role }) =>
-      Object.freeze({ userId, role: pageRole(userId, role), revoked: revoked.has(userId) }),
+      Object.freeze({
+        userId,
+        role: pageRole(userId, role),
+        revoked: revoked.has(userId),
+        inviteRole: grants.get(userId)?.inviteRole ?? null,
+      }),
     );
   }
 
@@ -1163,8 +1428,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         });
         return;
       case 'invites':
-        // Workstream B shows these and mints against linkBase (ADR 0017). A
-        // relay sends them only once invites are on, which none is yet.
+        onInvites(frame);
         return;
       case 'invoke':
         onInvoke(frame);
@@ -1196,6 +1460,13 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     for (const userId of [...revoked]) {
       if (!samePage || !listed.has(userId)) revoked.delete(userId);
     }
+    // Invites belong to their page session too: a relay that did not resume it
+    // holds none of them (a restart ends every invite, ADR 0019), and the
+    // invites frame that follows a resumed welcome prunes what it ended.
+    if (!samePage) {
+      for (const inviteId of [...invites.keys()]) forgetInvite(inviteId, 'link_down');
+    }
+    cancelSent.clear();
     grantsPage = frame.pageId;
     saveGrants();
     frameLimit = Math.max(MIN_FRAME_BYTES, Math.min(MAX_FRAME_BYTES, frame.limits.maxFrameBytes));
@@ -1293,13 +1564,26 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       record.port.abort();
     }
     requests.clear();
-    setState({ pairing: null, pendingRequests: [], pendingConfirms: [] });
+    // A mint the relay has not answered may or may not have reached it. The
+    // page forgets it, so nothing honours its link, and should a resumed
+    // relay list it, the page closes it as one it holds no record of.
+    for (const inviteId of [...minting.keys()]) forgetInvite(inviteId, 'link_down');
+    listings = new Map();
+    setState({
+      pairing: null,
+      pendingRequests: [],
+      pendingConfirms: [],
+      invites: [],
+      invitesOffered: null,
+    });
   }
 
   function stopForGood(error: string | null): void {
     closed = true;
     timers.clearTimeout(reconnectTimer);
     reconnectTimer = null;
+    timers.clearTimeout(grantEndTimer);
+    grantEndTimer = null;
     context?.removeEventListener('toolchange', onToolChange);
     setState({ link: 'closed', error });
   }
@@ -1493,7 +1777,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   /** S7 attribution; never the arguments, the result or the error text. */
   function logCall(call: CallRecord, outcome: string): void {
     const { caller, tool, callId } = call.frame;
-    log.info(`call ${callId} ${tool} by ${caller.displayName} (${caller.role}): ${outcome}`);
+    log.info(`call ${callId} ${tool} by ${logName(caller)} (${caller.role}): ${outcome}`);
   }
 
   function updateEntry(call: CallRecord, patch: Partial<ActivityEntry>): void {
@@ -1870,32 +2154,60 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       user: frame.user,
       account: frame.account,
       via: frame.via,
-      // Never the secret: workstream B checks it against this page's own record, and no state shows it (ADR 0017).
+      // Never the secret: checkRedemption checks it against this page's own record, and no state shows it (ADR 0017).
       invite:
         frame.invite === undefined
           ? null
-          : { inviteId: frame.invite.inviteId, label: frame.invite.label },
+          : Object.freeze({ inviteId: frame.invite.inviteId, label: frame.invite.label }),
       client: frame.client,
       expiresAt,
     });
     const port = new AbortController();
     const timer = timers.setTimeout(
       () => {
-        decide(frame.requestId, false);
+        decide(frame.requestId, false, undefined, 'timeout');
       },
       Math.max(0, expiresAt - now),
     );
-    requests.set(frame.requestId, { request, timer, port });
+    const record: RequestRecord = {
+      request,
+      timer,
+      port,
+      shown: false,
+      secret: frame.invite?.secret ?? null,
+    };
+    requests.set(frame.requestId, record);
+    log.info(`attach request from ${logName(frame.user)} via ${frame.via}`);
+    if (frame.invite !== undefined) {
+      void checkRedemption(record);
+      return;
+    }
+    // Pairing codes are for members: the relay answers an invitee's with
+    // invite_required (ADR 0017), so one that reaches the page is the relay's
+    // mistake or its lie, and no operator should be asked to judge it.
+    if (isInvitee(frame.user.userId)) {
+      log.warn(
+        `refused a ${frame.via} request from ${logName(frame.user)}: an invitee joins only by invite`,
+      );
+      decide(frame.requestId, false, undefined, 'rule');
+      return;
+    }
+    show(record);
+  }
+
+  /** Puts a request before the operator: in the widget, and through the UI port when there is one. */
+  function show(record: RequestRecord): void {
+    record.shown = true;
+    const { request } = record;
     setState({ pendingRequests: [...state.pendingRequests, request] });
-    log.info(`attach request from ${frame.user.displayName} via ${frame.via}`);
     const ui = options.ui;
     if (!ui?.askAttach) return;
     Promise.resolve()
-      .then(() => ui.askAttach?.(request, port.signal))
+      .then(() => ui.askAttach?.(request, record.port.signal))
       .then(
         (answer) => {
-          if (answer === 'deny') decide(frame.requestId, false);
-          else if (answer !== undefined) decide(frame.requestId, true, answer);
+          if (answer === 'deny') decide(request.requestId, false, undefined, 'operator');
+          else if (answer !== undefined) decide(request.requestId, true, answer, 'operator');
         },
         (error: unknown) => {
           log.warn(`the UI port failed to ask about an attach request: ${describe(error)}`);
@@ -1903,19 +2215,131 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       );
   }
 
-  function decide(requestId: string, allow: boolean, role?: Role): boolean {
+  /**
+   * S14: a redemption is honoured only against this page's own record and
+   * the secret the relay presented, whose hash must be the one this page
+   * kept, so a relay that never saw a link cannot redeem it. Then a Can watch
+   * invite lets its holder in as observer without a prompt, approval given
+   * in advance as autoApprove gives it (ADR 0016), and a Can control one asks
+   * the operator. Anything else is refused without troubling the operator:
+   * only a relay's mistake or lie could have sent it.
+   */
+  async function checkRedemption(record: RequestRecord): Promise<void> {
+    const { request } = record;
+    const secret = record.secret;
+    record.secret = null;
+    const inviteId = request.invite?.inviteId ?? '';
+    const kept = invites.get(inviteId);
+    let matches = false;
+    if (kept && secret !== null && webCrypto) {
+      try {
+        // Both sides are digests of a secret, so how long the comparison takes says nothing about it.
+        matches = (await sha256Hex(webCrypto, secret)) === kept.secretHash;
+      } catch (error) {
+        log.warn(`could not hash a presented invite secret: ${describe(error)}`);
+      }
+    }
+    // Answered meanwhile: expired, revoked, the invite closed, or the link lost.
+    if (requests.get(request.requestId) !== record) return;
+    const problem = !kept
+      ? 'this page holds no record of it'
+      : !webCrypto
+        ? 'this page has no WebCrypto to check its secret'
+        : !matches
+          ? "the secret presented is not the one this page's record was made from"
+          : redemptionProblem(request);
+    if (problem !== null || !kept) {
+      log.warn(
+        `refused a redemption of invite ${inviteId} by ${logName(request.user)}: ${problem ?? 'this page holds no record of it'}`,
+      );
+      decide(request.requestId, false, undefined, 'rule');
+      return;
+    }
+    if (kept.role === 'observer') {
+      decide(request.requestId, true, 'observer', 'invite');
+      return;
+    }
+    show(record);
+  }
+
+  /**
+   * Whatever about an invite's own record stops a redemption now, beyond its
+   * secret, or null. Checked when the secret checks out and again as the
+   * operator approves, since a prompt can outlive the invite's terms.
+   */
+  function redemptionProblem(request: PendingRequest): string | null {
+    const invite = request.invite === null ? undefined : invites.get(request.invite.inviteId);
+    if (!invite || request.invite === null) return 'this page holds no record of it';
+    const { userId } = request.user;
+    if (request.invite.label !== invite.label) return 'the relay named it by a label it never had';
+    // The page's policy as it stands now, which a reload may have narrowed since minting.
+    if (policy.invites === 'off' || (invite.role === 'driver' && policy.invites !== 'all')) {
+      return "the page's policy no longer allows it";
+    }
+    if (clock() >= inviteEnd(invite)) return 'it has expired';
+    if (invite.usesLeft <= 0) return 'it is used up';
+    if (invite.refusals >= INVITE_BURN_REFUSALS) return 'three refusals burnt it';
+    if (invite.barred.includes(userId)) return 'the operator revoked this account from it';
+    // No redemption clears a revoke (ADR 0017), not even one the operator approves.
+    if (revoked.has(userId)) return 'the operator revoked this account';
+    // For someone already attached a redemption changes nothing (ADR 0017).
+    if (state.roster.some((attachment) => attachment.userId === userId)) {
+      return 'the account is already attached';
+    }
+    // A Can control invite allows one prompt at a time (S14).
+    if (invite.role === 'driver') {
+      for (const other of requests.values()) {
+        if (
+          other.shown &&
+          other.request !== request &&
+          other.request.invite?.inviteId === invite.inviteId
+        ) {
+          return 'another redemption of it is waiting for the operator';
+        }
+      }
+    }
+    return null;
+  }
+
+  function isShown(requestId: string): boolean {
+    return requests.get(requestId)?.shown === true;
+  }
+
+  function decide(
+    requestId: string,
+    allow: boolean,
+    role?: Role,
+    cause: DecisionCause = 'operator',
+  ): boolean {
     const record = requests.get(requestId);
     if (!record) return false;
     if (allow && !RoleSchema.safeParse(role).success) {
       log.warn('ignored an approval without a valid role');
       return false;
     }
+    const { request } = record;
+    const inviteId = request.invite?.inviteId;
+    const invite = inviteId === undefined ? undefined : invites.get(inviteId);
+    let granted = role;
+    if (allow && inviteId !== undefined) {
+      const problem = redemptionProblem(request);
+      if (problem !== null || !invite) {
+        log.warn(
+          `refused a redemption of invite ${inviteId} by ${logName(request.user)}: ${problem ?? 'this page holds no record of it'}`,
+        );
+        return decide(requestId, false, undefined, 'rule');
+      }
+      // Never above the invite's role, whatever the operator or a UI port chose (S14).
+      if (invite.role === 'observer') granted = 'observer';
+    }
     requests.delete(requestId);
     timers.clearTimeout(record.timer);
     record.port.abort();
-    setState({
-      pendingRequests: state.pendingRequests.filter((item) => item.requestId !== requestId),
-    });
+    if (record.shown) {
+      setState({
+        pendingRequests: state.pendingRequests.filter((item) => item.requestId !== requestId),
+      });
+    }
     // The first approval wins, as on the relay, which keeps an existing
     // attachment as it is (role changes are set_role's job, from M2). It wins
     // only while the roster lists the user: a grant for a user the relay never
@@ -1925,22 +2349,198 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     // grant alone, since the relay keeps them attached (ADR 0007); withdrawing
     // access is revoke's job. For anyone else it withdraws that ignored grant,
     // so the operator's latest decision stands.
-    const { userId } = record.request.user;
+    const { userId } = request.user;
     const listed = state.roster.some((attachment) => attachment.userId === userId);
-    // An approval after a revoke lets the user back in; the relay applies the two in that order too.
-    if (allow) forgetRevokes([userId]);
-    if (allow && role !== undefined && (!listed || !grants.has(userId))) {
-      setGrant(userId, { role });
+    if (allow && granted !== undefined && invite && inviteId !== undefined) {
+      // An invite-made grant ends 24 hours after redemption and names the
+      // invite's role as its cap (ADR 0017); its use is spent here, on the
+      // page's own count, whatever the relay counts.
+      setGrant(userId, {
+        role: granted,
+        inviteId,
+        endsAt: clock() + MAX_INVITE_LIFETIME_MS,
+        inviteRole: invite.role,
+      });
+      updateInvite({ ...invite, usesLeft: invite.usesLeft - 1 });
+    } else if (allow && granted !== undefined) {
+      // An approval after a revoke lets the user back in; the relay applies
+      // the two in that order too. A redemption never does (redemptionProblem).
+      forgetRevokes([userId]);
+      if (!listed || !grants.has(userId)) setGrant(userId, { role: granted });
     }
     if (!allow && !listed) pruneGrants([userId]);
-    const who = record.request.user.displayName;
-    log.info(allow ? `allowed ${who} as ${String(role)}` : `denied ${who}`);
+    if (!allow && invite && record.shown && (cause === 'operator' || cause === 'timeout')) {
+      updateInvite({ ...invite, refusals: Math.min(INVITE_BURN_REFUSALS, invite.refusals + 1) });
+    }
+    const who = logName(request.user);
+    log.info(allow ? `allowed ${who} as ${String(granted)}` : `denied ${who}`);
     return send({
       t: 'attach_decision',
       requestId,
       allow,
-      ...(allow && role !== undefined ? { role } : {}),
+      ...(allow && granted !== undefined ? { role: granted } : {}),
     });
+  }
+
+  // Invites (ADR 0017)
+
+  function updateInvite(invite: StoredInvite): void {
+    invites.set(invite.inviteId, invite);
+    saveGrants();
+  }
+
+  /** Every invite this page minted that the relay lists on the very terms it was minted with, oldest first. */
+  function inviteViews(): InviteView[] {
+    const views: InviteView[] = [];
+    const oldestFirst = [...invites.values()].sort((a, b) => a.createdAt - b.createdAt);
+    for (const invite of oldestFirst) {
+      const listing = listings.get(invite.inviteId);
+      if (!listing) continue;
+      views.push(
+        Object.freeze({
+          inviteId: invite.inviteId,
+          role: invite.role,
+          label: invite.label,
+          uses: invite.uses,
+          usesLeft: Math.min(listing.usesLeft, invite.usesLeft),
+          joined: invite.uses - invite.usesLeft,
+          expiresAt: invite.expiresAt,
+          sponsor: Object.freeze({ ...listing.sponsor }),
+          pending: listing.pending,
+          refusals: Math.max(listing.refusals, invite.refusals),
+        }),
+      );
+    }
+    return views;
+  }
+
+  /**
+   * The page stops honouring an invite: its record goes, stored copy too, a
+   * redemption of it still being checked or waiting on the operator is
+   * refused, and a mint still waiting on the relay settles with `reason`.
+   */
+  function forgetInvite(inviteId: string, reason: InviteRefusal): void {
+    const had = invites.delete(inviteId);
+    listings.delete(inviteId);
+    const mint = minting.get(inviteId);
+    if (mint) {
+      minting.delete(inviteId);
+      timers.clearTimeout(mint.timer);
+      mint.resolve(Object.freeze({ ok: false, reason }));
+    }
+    for (const record of [...requests.values()]) {
+      if (record.request.invite?.inviteId === inviteId) {
+        decide(record.request.requestId, false, undefined, 'rule');
+      }
+    }
+    if (had) saveGrants();
+  }
+
+  /** Closes an invite the relay lists that this page holds no record of, once per link. */
+  function closeUnknown(inviteId: string): void {
+    if (cancelSent.has(inviteId) || !isLinked()) return;
+    if (send({ t: 'invite_cancel', inviteId })) {
+      cancelSent.add(inviteId);
+      log.warn(`closed invite ${inviteId}, which this page holds no record of`);
+    }
+  }
+
+  /**
+   * The relay's list of this page's live invites (ADR 0017). Only invites
+   * this page's own record holds, on the very terms it minted them with, are
+   * shown; any other is closed, since nothing here would honour it. A record
+   * the relay no longer lists was used up, cancelled or expired and goes,
+   * unless its mint is still waiting for this very answer.
+   */
+  function onInvites(frame: InvitesFrame): void {
+    const refused = frame.refused?.inviteId;
+    const listed = new Map<string, InviteListing>();
+    for (const listing of frame.invites) {
+      const invite = invites.get(listing.inviteId);
+      if (invite && sameTerms(invite, listing) && listing.inviteId !== refused) {
+        listed.set(listing.inviteId, listing);
+        continue;
+      }
+      if (invite) {
+        log.warn(`the relay listed invite ${listing.inviteId} on terms this page never set`);
+        forgetInvite(listing.inviteId, 'unavailable');
+      }
+      closeUnknown(listing.inviteId);
+    }
+    if (frame.refused !== undefined && minting.has(frame.refused.inviteId)) {
+      log.info(`the relay refused invite ${frame.refused.inviteId}: ${frame.refused.reason}`);
+      forgetInvite(frame.refused.inviteId, frame.refused.reason);
+    }
+    for (const inviteId of [...invites.keys()]) {
+      if (!listed.has(inviteId) && !minting.has(inviteId)) forgetInvite(inviteId, 'cancelled');
+    }
+    listings = listed;
+    setState({
+      invitesOffered: Object.freeze({ linkBase: frame.linkBase }),
+      invites: inviteViews(),
+    });
+    for (const inviteId of [...minting.keys()]) {
+      if (listed.has(inviteId)) answerMint(inviteId, frame.linkBase);
+    }
+  }
+
+  /** The relay listed a new invite: dock.invite() resolves with its link, the only place the secret ever goes. */
+  function answerMint(inviteId: string, linkBase: string | null): void {
+    const mint = minting.get(inviteId);
+    if (!mint) return;
+    let link: string | null;
+    try {
+      link = linkBase === null ? null : inviteLink(linkBase, mint.secret);
+    } catch {
+      link = null;
+    }
+    if (link === null) {
+      // A relay with no public URL mints nothing (ADR 0017), so one listing an invite anyway gets it closed.
+      forgetInvite(inviteId, 'no_public_url');
+      closeUnknown(inviteId);
+      return;
+    }
+    minting.delete(inviteId);
+    timers.clearTimeout(mint.timer);
+    log.info(`minted invite ${inviteId}`);
+    mint.resolve(
+      Object.freeze({
+        ok: true,
+        inviteId,
+        link,
+        expiresAt: invites.get(inviteId)?.expiresAt ?? null,
+      }),
+    );
+  }
+
+  /**
+   * The invites this page holds that let a user in: the one their grant
+   * names, and the one the roster names, which can only add to what a revoke
+   * bars and closes.
+   */
+  function invitesOf(userId: string): string[] {
+    const ids = new Set<string>();
+    const own = grants.get(userId)?.inviteId;
+    if (own !== undefined) ids.add(own);
+    const claimed = state.roster.find((attachment) => attachment.userId === userId)?.inviteId;
+    if (claimed !== undefined && claimed !== null) ids.add(claimed);
+    return [...ids].filter((inviteId) => invites.has(inviteId));
+  }
+
+  /** Bars a revoked user from the invites that let them in, for each invite's life (ADR 0017). */
+  function bar(userId: string, inviteIds: readonly string[]): void {
+    for (const inviteId of inviteIds) {
+      const invite = invites.get(inviteId);
+      if (!invite || invite.barred.includes(userId)) continue;
+      if (invite.barred.length >= MAX_INVITE_USES) {
+        // More revokes than the invite has uses: the relay is making up who
+        // it let in. Closing it bars everyone.
+        cancelInvite(inviteId);
+        continue;
+      }
+      invites.set(inviteId, { ...invite, barred: [...invite.barred, userId] });
+    }
+    saveGrants();
   }
 
   // Operator controls
@@ -1958,13 +2558,19 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     }
     const attachment = state.roster.find((entry) => entry.userId === userId);
     if (!attachment || revoked.has(userId) || !isLinked()) return false;
+    const grant = grants.get(userId);
     // Only for someone the operator approved here, or autoApprove let in (S4):
     // otherwise even Make observer would be the approval S4 asks for, made by
-    // a click meant to lower access. Revoke is what such a row needs.
-    if (!grants.has(userId) && policy.autoApprove !== 'observer') return false;
+    // a click meant to lower access. Revoke is what such a row needs. An
+    // invitee only ever comes in through an invite this page honoured.
+    if (!grant && (policy.autoApprove !== 'observer' || isInvitee(userId))) return false;
+    // Never past the invite's role, nor once an invite-made attachment has
+    // ended (S14); the relay refuses both as well.
+    if (grant?.inviteRole === 'observer' && role === 'driver') return false;
+    if (grant?.endsAt !== undefined && clock() >= grant.endsAt) return false;
     // A role change keeps whatever else the grant names, such as the invite that made it.
-    setGrant(userId, { ...grants.get(userId), role });
-    log.info(`set ${attachment.displayName} to ${role}`);
+    setGrant(userId, { ...grant, role });
+    log.info(`set ${logName(attachment)} to ${role}`);
     return send({ t: 'set_role', userId, role });
   }
 
@@ -1973,24 +2579,49 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    * call of theirs runs here again whatever the relay does next. The revoke
    * frame goes first, so the relay answers their calls with not_attached
    * before any result below reaches it; their pending requests and prompts
-   * are denied, and their calls in flight are cancelled.
+   * are denied, and their calls in flight are cancelled. Someone an invite
+   * let in is barred from it first, and its link closed as RevokeOptions
+   * says; revoke('*') forgets every invite (ADR 0017).
    */
-  function revoke(target: string): boolean {
+  function revoke(target: string, revokeOptions?: RevokeOptions): boolean {
     const everyone = target === '*';
     if (closed || (!everyone && !IdSchema.safeParse(target).success)) return false;
+    // A page script can pass anything: only an explicit false keeps a link open.
+    const given: unknown = revokeOptions;
+    const closeInvite: unknown =
+      typeof given === 'object' && given !== null
+        ? (given as { closeInvite?: unknown }).closeInvite
+        : undefined;
     const hits = (userId: string): boolean => everyone || userId === target;
     const listed = state.roster.map((attachment) => attachment.userId).filter(hits);
     const granted = [...grants.keys()].filter(hits);
     const asking = [...requests.values()].filter((record) => hits(record.request.user.userId));
     const running = [...calls.values()].filter((call) => hits(call.frame.caller.userId));
-    if (listed.length + granted.length + asking.length + running.length === 0) return false;
+    const theirs = everyone ? [] : invitesOf(target);
+    const closing = everyone
+      ? [...invites.keys()]
+      : theirs.filter((inviteId) =>
+          closeInvite === undefined
+            ? (invites.get(inviteId)?.uses ?? 0) > 1
+            : closeInvite !== false,
+        );
+    const reach = listed.length + granted.length + asking.length + running.length;
+    if (reach + theirs.length + closing.length === 0) return false;
+    // Barred first, so nothing below can let them back in by it.
+    if (!everyone) bar(target, theirs);
     for (const userId of listed) revoked.add(userId);
     for (const userId of granted) grants.delete(userId);
     saveGrants();
     log.info(everyone ? 'the operator revoked everyone' : `the operator revoked ${target}`);
     // While the link is down, the next welcome sends it for anyone still listed.
     if (isLinked()) send({ t: 'revoke', userId: target });
-    for (const record of asking) decide(record.request.requestId, false);
+    // The relay's revoke '*' cancels every invite itself; the page forgets
+    // them now whatever the relay does, and closes any a resumed relay still lists.
+    for (const inviteId of closing) {
+      if (everyone) forgetInvite(inviteId, 'cancelled');
+      else cancelInvite(inviteId);
+    }
+    for (const record of asking) decide(record.request.requestId, false, undefined, 'revoke');
     for (const call of running) {
       if (call.confirm) {
         finish(call, { ok: false, code: 'denied_by_operator', message: REVOKED_MESSAGE });
@@ -2007,43 +2638,104 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    * role, a known lifetime, and uses only a Can watch invite may have more
    * than one of. Checked at run time, since a page script can pass anything.
    */
-  function validInvite(options: InviteOptions): boolean {
-    const uses: unknown = options.uses;
-    const lifetime: unknown = options.lifetime;
+  function validInvite(request: InviteOptions): boolean {
+    const uses: unknown = request.uses;
+    const lifetime: unknown = request.lifetime;
     return (
-      InviteLabelSchema.safeParse(options.label).success &&
-      RoleSchema.safeParse(options.role).success &&
+      InviteLabelSchema.safeParse(request.label).success &&
+      RoleSchema.safeParse(request.role).success &&
       (lifetime === undefined || INVITE_LIFETIMES.some((known) => known === lifetime)) &&
       (uses === undefined ||
         (typeof uses === 'number' &&
           Number.isInteger(uses) &&
           uses >= 1 &&
-          uses <= (options.role === 'driver' ? CONTROL_INVITE_USES : MAX_INVITE_USES)))
+          uses <= (request.role === 'driver' ? CONTROL_INVITE_USES : MAX_INVITE_USES)))
     );
   }
 
-  function invite(options: InviteOptions): Promise<InviteResult> {
-    const refuse = (reason: InviteRefusal): Promise<InviteResult> =>
-      Promise.resolve(Object.freeze({ ok: false, reason }));
-    if (typeof options !== 'object' || !validInvite(options)) return refuse('invalid');
+  /**
+   * Mints an invite (ADR 0017): a 128-bit secret from getRandomValues, its
+   * SHA-256 kept in this page's own record and sent to the relay, and the
+   * secret itself only in the link dock.invite() resolves with, once the
+   * relay lists the invite. The record is stored before invite_create goes,
+   * so a reload while the relay answers still knows the invite it may hold.
+   */
+  async function invite(request: InviteOptions): Promise<InviteResult> {
+    const refuse = (reason: InviteRefusal): InviteResult => Object.freeze({ ok: false, reason });
+    const given: unknown = request;
+    if (typeof given !== 'object' || given === null || !validInvite(request)) {
+      return refuse('invalid');
+    }
     // ADR 0016: watch by default, so Can control needs a page that opted into 'all'.
-    if (policy.invites === 'off' || (options.role === 'driver' && policy.invites !== 'all')) {
+    if (policy.invites === 'off' || (request.role === 'driver' && policy.invites !== 'all')) {
       return refuse('policy');
     }
     if (!isLinked()) return refuse('link_down');
-    // Workstream B mints from here once a relay offers invites with its
-    // invites frame (ADR 0017); none does before workstream A.
-    return refuse('unavailable');
+    const offered = state.invitesOffered;
+    if (offered === null || !webCrypto) return refuse('unavailable');
+    if (offered.linkBase === null) return refuse('no_public_url');
+    if (invites.size >= MAX_LIVE_INVITES_PER_PAGE) return refuse('limit');
+    const secret = randomText(webCrypto, INVITE_SECRET_BYTES);
+    const inviteId = `inv_${randomText(webCrypto, INVITE_ID_BYTES)}`;
+    let secretHash: string;
+    try {
+      secretHash = await sha256Hex(webCrypto, secret);
+    } catch (error) {
+      log.warn(`could not hash a new invite secret: ${describe(error)}`);
+      return refuse('unavailable');
+    }
+    // The link may have dropped, or the page closed, while the hash was made.
+    if (!isLinked()) return refuse('link_down');
+    if (invites.size >= MAX_LIVE_INVITES_PER_PAGE) return refuse('limit');
+    const now = clock();
+    const lifetime = lifetimeMs(request.lifetime ?? '1h');
+    const uses = request.role === 'driver' ? CONTROL_INVITE_USES : (request.uses ?? 1);
+    const record: StoredInvite = {
+      inviteId,
+      secretHash,
+      role: request.role,
+      label: request.label,
+      uses,
+      usesLeft: uses,
+      createdAt: now,
+      expiresAt: lifetime === null ? null : now + lifetime,
+      refusals: 0,
+      barred: [],
+    };
+    invites.set(inviteId, record);
+    saveGrants();
+    return new Promise<InviteResult>((resolve) => {
+      const timer = timers.setTimeout(() => {
+        if (!minting.has(inviteId)) return;
+        log.warn(`the relay never answered invite ${inviteId}; closing it`);
+        forgetInvite(inviteId, 'unavailable');
+        closeUnknown(inviteId);
+      }, MINT_ANSWER_MS);
+      minting.set(inviteId, { secret, resolve, timer });
+      const sent = send({
+        t: 'invite_create',
+        inviteId,
+        role: record.role,
+        label: record.label,
+        uses: record.uses,
+        expiresAt: record.expiresAt,
+        secretHash,
+      });
+      if (!sent) forgetInvite(inviteId, 'link_down');
+    });
   }
 
   /**
-   * Closes the link of an invite this page lists. Workstream B also drops it
-   * from the page's own record (ADR 0017); until a relay offers invites the
-   * page lists none, so this finds nothing.
+   * Closes the link of an invite this page holds (invite_cancel) and forgets
+   * its record at once. While the link is down nothing goes out; a resumed
+   * relay that still lists it hears the cancel then, from onInvites.
    */
   function cancelInvite(inviteId: string): boolean {
-    if (closed || !state.invites.some((view) => view.inviteId === inviteId)) return false;
-    return isLinked() && send({ t: 'invite_cancel', inviteId });
+    if (closed || !invites.has(inviteId)) return false;
+    forgetInvite(inviteId, 'cancelled');
+    log.info(`closed invite ${inviteId}`);
+    if (isLinked() && send({ t: 'invite_cancel', inviteId })) cancelSent.add(inviteId);
+    return true;
   }
 
   /** Calls already in the page's hands finish; every other call, now or later, is answered page_busy. */
@@ -2078,7 +2770,9 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   function close(mode: CloseMode = 'detach'): void {
     if (closed) return;
     if (mode === 'detach' && isLinked()) {
-      for (const requestId of [...requests.keys()]) decide(requestId, false);
+      for (const requestId of [...requests.keys()]) {
+        decide(requestId, false, undefined, 'detach');
+      }
       for (const call of [...calls.values()]) {
         // S6: a prompt left unanswered is a denial.
         if (call.confirm) {
@@ -2122,15 +2816,17 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         listeners.delete(listener);
       };
     },
-    approve: (requestId: string, role: Role) => decide(requestId, true, role),
-    deny: (requestId: string) => decide(requestId, false),
+    // Only a request the operator was shown: a redemption whose secret is
+    // still being checked, or that is approved without a prompt, is not theirs to answer.
+    approve: (requestId: string, role: Role) =>
+      isShown(requestId) && decide(requestId, true, role, 'operator'),
+    deny: (requestId: string) =>
+      isShown(requestId) && decide(requestId, false, undefined, 'operator'),
     // Strictly true: a script passing the string 'false' must not allow a consequential call.
     confirm: (callId: string, allow: boolean) => confirmCall(callId, (allow as unknown) === true),
     rotatePairing: () => isLinked() && send({ t: 'rotate_pairing' }),
     setRole: (userId: string, role: Role) => setRole(userId, role),
-    // Workstream B honours RevokeOptions.closeInvite (ADR 0017); until a
-    // relay offers invites no grant names one, so there is no link to close.
-    revoke: (userId: string) => revoke(userId),
+    revoke: (userId: string, revokeOptions?: RevokeOptions) => revoke(userId, revokeOptions),
     cancelInvite: (inviteId: string) => cancelInvite(inviteId),
     invite: (options: InviteOptions) => invite(options),
     // Only false resumes: resuming lets calls run again, so a script's 'false' or 0 keeps the pause.

@@ -219,8 +219,11 @@ function findNode(node: DomNode, match: (node: DomNode) => boolean): DomNode | n
 export interface WidgetTarget {
   /**
    * A data-action value: approve-driver, approve-observer, deny, confirm-allow,
-   * confirm-deny, rotate, toggle; make-driver, make-observer and revoke in a
-   * roster row; revoke-all; pause or resume.
+   * confirm-deny, rotate, toggle; make-driver, make-observer, revoke and
+   * close-link in a roster row; revoke-all; pause or resume; from M4
+   * invite-open, invite-close, invite-label, invite-role-observer,
+   * invite-role-driver, invite-lifetime-15m, -1h and -open, invite-uses,
+   * invite-create, invite-copy, invite-done, and cancel-invite in a list row.
    */
   action: string;
   /** Narrows to the prompt box for one attach request. */
@@ -229,6 +232,8 @@ export interface WidgetTarget {
   callId?: string;
   /** Narrows to one user's roster row. */
   userId?: string;
+  /** Narrows to one invite's row in the live list (M4). */
+  inviteId?: string;
 }
 
 async function withCdp<T>(page: Page, run: (cdp: CDPSession) => Promise<T>): Promise<T> {
@@ -249,7 +254,9 @@ async function findButton(cdp: CDPSession, target: WidgetTarget): Promise<DomNod
         ? findNode(root, (n) => attribute(n, 'data-call-id') === target.callId)
         : target.userId !== undefined
           ? findNode(root, (n) => attribute(n, 'data-user-id') === target.userId)
-          : root;
+          : target.inviteId !== undefined
+            ? findNode(root, (n) => attribute(n, 'data-invite-id') === target.inviteId)
+            : root;
   return scope && findNode(scope, (n) => attribute(n, 'data-action') === target.action);
 }
 
@@ -438,15 +445,17 @@ export async function activityStrip(page: Page): Promise<string[]> {
 }
 
 /**
- * The widget's QR drawing as the operator sees it: the svg's viewBox and its
- * one path, read through the DevTools protocol; null while there is none.
+ * A QR drawing in the widget as the operator sees it: the svg's viewBox and
+ * its one path, read through the DevTools protocol; null while there is
+ * none. The pairing QR code unless role names another, such as invite-qr.
  */
 export async function widgetQrDrawing(
   page: Page,
+  role = 'pairing-qr',
 ): Promise<{ viewBox: string | null; d: string | null } | null> {
   return withCdp(page, async (cdp) => {
     const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
-    const box = findNode(root, (n) => attribute(n, 'data-role') === 'pairing-qr');
+    const box = findNode(root, (n) => attribute(n, 'data-role') === role);
     const svg = box?.children?.find((child) => child.localName === 'svg');
     // By name, as the light ground is drawn before it.
     const path = svg?.children?.find((child) => child.localName === 'path');
