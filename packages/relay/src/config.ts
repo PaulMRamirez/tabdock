@@ -183,9 +183,11 @@ export interface RelayLimits {
   /** The same for one client address in hosted mode, across /pair and /i (ADR 0018, sign-in-gate.ts). */
   signInsInFlightPerAddress: number;
   /**
-   * Bytes all pages' tool lists and prepared schemas may hold together; a
-   * tools frame that would pass it is refused with 1008 and counted against
-   * its address (S9, ADR 0018, hub.ts). At least one whole frame.
+   * Heap all pages' tool lists and prepared schemas may hold together, each
+   * page charged an upper bound on what its list holds rather than its
+   * frame's size (heldBytes in hub.ts); a tools frame that would pass it is
+   * refused with 1008 and counted against its address (S9, ADR 0018). At
+   * least MAX_FRAME_BYTES.
    */
   toolBytes: number;
 }
@@ -373,8 +375,10 @@ export const DEFAULT_LIMITS: RelayLimits = {
   pairSessions: 200,
   pairSignInsInFlight: 8,
   signInsInFlightPerAddress: 2,
-  // Provisional: integration sizes it, with Node's heap flag, so the most
-  // pages at the largest tool lists stay under a fixed ceiling (ADR 0018).
+  // Sized with the image's --max-old-space-size=192 (ADR 0018): charged by
+  // heldBytes, which holds above the heap a list really keeps, every hosted
+  // page slot filled up to it leaves the relay well inside that heap
+  // (tool-heap.test.ts).
   toolBytes: 64 * 1024 * 1024,
 };
 
@@ -736,7 +740,7 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
   );
   if (limits.toolBytes < MAX_FRAME_BYTES) {
     throw new Error(
-      `toolBytes (TABDOCK_MAX_TOOL_BYTES) must be at least ${String(MAX_FRAME_BYTES)}, so one page can list a whole frame of tools (ADR 0018)`,
+      `toolBytes (TABDOCK_MAX_TOOL_BYTES) must be at least ${String(MAX_FRAME_BYTES)}, so the budget holds at least one page of ordinary tools (ADR 0018)`,
     );
   }
   // Only true turns invites on, so a stray value from JavaScript leaves them off.

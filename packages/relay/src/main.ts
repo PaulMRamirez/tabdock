@@ -17,6 +17,16 @@ if (existsSync(envFile)) process.loadEnvFile(envFile);
 try {
   const options = loadConfigFromEnv(process.env);
   const relay = await createRelay(options);
+  // Before the banner, so whoever reads it (a test, a supervisor) knows a
+  // SIGTERM from then on closes the relay and its audit log cleanly.
+  const stop = (): void => {
+    relay.close().then(
+      () => process.exit(0),
+      () => process.exit(1),
+    );
+  };
+  process.once('SIGINT', stop);
+  process.once('SIGTERM', stop);
   const local = options.localMode;
   const lines =
     relay.publicMcpUrl !== null
@@ -58,14 +68,6 @@ try {
       process.stdout.write(`${line}\n`);
     });
   }
-  const stop = (): void => {
-    relay.close().then(
-      () => process.exit(0),
-      () => process.exit(1),
-    );
-  };
-  process.once('SIGINT', stop);
-  process.once('SIGTERM', stop);
 } catch (error) {
   // Config and owner token errors name variables and paths, never their secrets, so this is safe to print.
   process.stderr.write(

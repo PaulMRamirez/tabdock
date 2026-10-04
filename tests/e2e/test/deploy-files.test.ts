@@ -6,7 +6,13 @@
 // what the image needs; and every workflow pins every action by commit SHA,
 // asks for no permission by default, and splices no expression into a shell
 // script, where an input could become a command. The checks read the files as
-// text, so a change they cannot read fails rather than slips through.
+// text with their comments left out, so a rule kept only in a comment counts
+// for nothing, and a change they cannot read fails rather than slips through:
+// the image installs filtered production dependencies from the lockfile; every
+// image is built, scanned with fail-build and smoke-tested read-only with no
+// capabilities, and main's is pushed with provenance and an SBOM and attested,
+// by steps no condition can switch off; and a deploy verifies first, stages
+// settings through a pipe, checks the live relay and publishes the demo.
 
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -14,6 +20,62 @@ import { describe, expect, it } from 'vitest';
 
 const ROOT = resolve(import.meta.dirname, '../../..');
 const read = (path: string): string => readFileSync(join(ROOT, path), 'utf8');
+
+/**
+ * A YAML file or Dockerfile as it runs: whole-line comments and comments
+ * after whitespace removed, so a command kept in a comment, or a rule written
+ * only there, counts for nothing.
+ */
+function hashCode(text: string): string {
+  return text
+    .split('\n')
+    .map((line) => (/^\s*#/.test(line) ? '' : line.replace(/\s+#(\s.*)?$/, '')))
+    .join('\n');
+}
+
+/** TypeScript as it runs: block comments and line comments removed. */
+function scriptCode(text: string): string {
+  return text
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .map((line) => line.replace(/(^|\s)\/\/.*$/, ''))
+    .join('\n');
+}
+
+/** The jobs of a workflow by name, each as its own block of (comment-free) text. */
+function jobsOf(text: string): Map<string, string> {
+  const code = hashCode(text);
+  const body = code.slice(code.search(/^jobs:$/m));
+  const jobs = new Map<string, string>();
+  for (const block of body.split(/\n(?= {2}[a-z][\w-]*:\n)/).slice(1)) {
+    const name = /^ {2}([a-z][\w-]*):/.exec(block)?.[1];
+    if (name !== undefined) jobs.set(name, block);
+  }
+  return jobs;
+}
+
+/** A job's steps, each as its own block of text. */
+function stepsOf(job: string): string[] {
+  const steps = job.slice(job.search(/^ {4}steps:$/m));
+  return steps.split(/\n(?= {6}- )/).slice(1);
+}
+
+/** A job's own condition, or null when it runs whenever its needs succeed. */
+function jobIf(job: string): string | null {
+  return /^ {4}if:\s*(.+)$/m.exec(job)?.[1]?.trim() ?? null;
+}
+
+/** Whether a step has a condition of its own, which could switch it off. */
+function stepIf(step: string): boolean {
+  return /^ {6}- if:|^ {8}if:/m.test(step);
+}
+
+/** The one step of a job that holds this text; it must be exactly one. */
+function stepWith(job: string, text: string): string {
+  const found = stepsOf(job).filter((step) => step.includes(text));
+  expect(found, text).toHaveLength(1);
+  return found[0] ?? '';
+}
 
 type TomlValue = string | number | boolean | string[];
 type TomlTable = Record<string, TomlValue>;
@@ -209,7 +271,8 @@ describe('the workflows', () => {
   });
 
   it('deploy only a checked, attested digest, from main, behind the production environment', () => {
-    const deploy = read(`${dir}/deploy.yml`);
+    const raw = read(`${dir}/deploy.yml`);
+    const deploy = hashCode(raw);
     expect(deploy).toMatch(/^on:\n {2}workflow_dispatch:\n/m);
     expect(deploy).not.toMatch(/^ {2}(push|pull_request|schedule|workflow_run):/m);
     expect(deploy).toContain('DIGEST: ${{ inputs.digest }}');
@@ -221,7 +284,7 @@ describe('the workflows', () => {
     expect(deploy).toMatch(/environment: production/);
     expect(deploy).toMatch(/needs: verify/);
     expect(deploy).toMatch(/flyctl secrets import --stage/);
-    expect(deploy).toMatch(
+    expect(raw).toMatch(
       /setup-flyctl@[0-9a-f]{40} # v[\d.]+\n {8}with:\n {10}version: \d+\.\d+\.\d+\n/,
     );
     // Every job that reads a secret first waits for the environment's approval.
@@ -234,7 +297,7 @@ describe('the workflows', () => {
   });
 
   it('publish and attest the image only from a push to main', () => {
-    const image = read(`${dir}/image.yml`);
+    const image = hashCode(read(`${dir}/image.yml`));
     expect(image).toContain("if: github.event_name == 'push' && github.ref == 'refs/heads/main'");
     expect(image).toMatch(/node scripts\/smoke-image\.ts/);
     expect(image).toMatch(/anchore\/scan-action@/);
@@ -245,5 +308,94 @@ describe('the workflows', () => {
     const dependabot = read('.github/dependabot.yml');
     expect(dependabot).toMatch(/package-ecosystem: github-actions/);
     expect(dependabot).toMatch(/package-ecosystem: docker/);
+  });
+});
+
+describe('the image and the workflows, as they run (comments left out)', () => {
+  const dir = '.github/workflows';
+
+  it('builds the image from a filtered, production-only, locked install', () => {
+    const instructions = hashCode(read('Dockerfile'))
+      .split('\n')
+      .map((line) => line.trim());
+    expect(instructions).toContain(
+      "RUN pnpm install --prod --frozen-lockfile --filter '@tabdock/relay...'",
+    );
+    expect(instructions.filter((line) => line.includes('pnpm install'))).toHaveLength(1);
+  });
+
+  it('builds, scans and smoke-tests every image, with no step that can be switched off', () => {
+    const jobs = jobsOf(read(`${dir}/image.yml`));
+    const check = jobs.get('check') ?? '';
+    expect(jobIf(check)).toBeNull();
+    expect(stepsOf(check).filter(stepIf)).toEqual([]);
+    const scan = stepWith(check, 'uses: anchore/scan-action@');
+    expect(scan).toMatch(/^ {10}fail-build: true$/m);
+    expect(scan).toMatch(/^ {10}image: tabdock-relay:check$/m);
+    expect(stepWith(check, 'node scripts/smoke-image.ts')).toMatch(
+      /run: node scripts\/smoke-image\.ts tabdock-relay:check$/m,
+    );
+    expect(stepWith(check, 'uses: docker/build-push-action@')).toMatch(/^ {10}load: true$/m);
+  });
+
+  it('publishes from main only, with provenance, an SBOM and an attestation, none of them switchable', () => {
+    const jobs = jobsOf(read(`${dir}/image.yml`));
+    const publish = jobs.get('publish') ?? '';
+    expect(jobIf(publish)).toBe("github.event_name == 'push' && github.ref == 'refs/heads/main'");
+    expect(publish).toMatch(/^ {4}needs: check$/m);
+    expect(stepsOf(publish).filter(stepIf)).toEqual([]);
+    const push = stepWith(publish, 'uses: docker/build-push-action@');
+    expect(push).toMatch(/^ {10}push: true$/m);
+    expect(push).toMatch(/^ {10}provenance: mode=max$/m);
+    expect(push).toMatch(/^ {10}attests: type=sbom,/m);
+    const attest = stepWith(publish, 'uses: actions/attest@');
+    expect(attest).toMatch(/^ {10}subject-digest: \$\{\{ steps\.push\.outputs\.digest \}\}$/m);
+    expect(attest).toMatch(/^ {10}push-to-registry: true$/m);
+  });
+
+  it('smoke-tests the image read-only, with no capabilities and no new privileges', () => {
+    const smoke = scriptCode(read('scripts/smoke-image.ts'));
+    const relayRun = /docker\(\[\s*'run',\s*'-d',([\s\S]*?)\]\);/.exec(smoke)?.[1] ?? '';
+    expect(relayRun).toContain("'--read-only'");
+    expect(relayRun).toMatch(/'--cap-drop',\s*'ALL'/);
+    expect(relayRun).toMatch(/'--security-opt',\s*'no-new-privileges'/);
+    expect(smoke).toMatch(/const STOP_WITHIN_MS = 5000;/);
+    expect(smoke).toMatch(/check\(\s*challenge\.status === 401,/);
+    expect(smoke).toMatch(/'--verify',/);
+  });
+
+  it('deploys only after its checks, then checks the live relay and publishes the demo, none of it switchable', () => {
+    const jobs = jobsOf(read(`${dir}/deploy.yml`));
+    expect([...jobs.keys()]).toEqual(['verify', 'deploy', 'pages']);
+    for (const [name, job] of jobs) {
+      expect(jobIf(job), name).toBe("github.ref == 'refs/heads/main'");
+      expect(stepsOf(job).filter(stepIf), name).toEqual([]);
+    }
+    const deploy = jobs.get('deploy') ?? '';
+    expect(deploy).toMatch(/^ {4}needs: verify$/m);
+    expect(deploy).toMatch(/^ {4}environment: production$/m);
+    // Settings go to Fly through a pipe from printf, a shell builtin, never on a command line.
+    const stage = stepWith(deploy, 'flyctl secrets import');
+    expect(stage).toMatch(/done \|\n\s+flyctl secrets import --stage --app "\$FLY_APP"$/m);
+    expect(hashCode(read(`${dir}/deploy.yml`))).not.toMatch(/secrets set/);
+    expect(stepWith(deploy, 'flyctl deploy')).toMatch(/--image "\$IMAGE"/);
+    const live = stepWith(deploy, '/healthz');
+    expect(live).toMatch(/^ {6}- name: Check the live relay$/m);
+    expect(live).toContain('resource_metadata=');
+    const pages = jobs.get('pages') ?? '';
+    expect(pages).toMatch(/^ {4}needs: deploy$/m);
+    stepWith(pages, 'uses: actions/upload-pages-artifact@');
+    stepWith(pages, 'uses: actions/deploy-pages@');
+  });
+
+  it('reads workflows the way it means to: a disabled step or job is seen', () => {
+    const disabled = `jobs:\n  a:\n    if: false\n    steps:\n      - name: x\n        if: false\n        run: echo\n`;
+    const job = jobsOf(disabled).get('a') ?? '';
+    expect(jobIf(job)).toBe('false');
+    expect(stepsOf(job).filter(stepIf)).toHaveLength(1);
+    expect(hashCode('run: flyctl secrets import # flyctl secrets set\n')).not.toMatch(
+      /secrets set/,
+    );
+    expect(scriptCode("'--read-only', // '--cap-drop'\n")).not.toContain('--cap-drop');
   });
 });

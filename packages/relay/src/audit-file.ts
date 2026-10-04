@@ -19,11 +19,15 @@
 // append never throws and never waits, so no call fails for a disk: a write
 // that fails leaves the record on stderr only (recordAudit writes that copy),
 // and once a write works again an audit_gap record counts what the file
-// missed. Failing closed would let a full disk stop every page. Every line is
-// checked against AuditLineSchema before it is written, so a field no record
-// type lists, such as a token, cannot reach the file even by a bug.
+// missed. Failing closed would let a full disk stop every page; a write that
+// lands every byte but the newline is a whole record, kept as one. Every line
+// is checked against AuditLineSchema and the checked record is what is
+// written, so a field no record type lists, such as a token, cannot reach the
+// file even by a bug, nested inside another field or not. One log holds its
+// directory's lock (audit.lock) from open to close, so a second relay on the
+// same directory refuses to start rather than fork the chain.
 
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import * as nodeFs from 'node:fs';
 import { join } from 'node:path';
 import {
@@ -45,6 +49,7 @@ export type AuditFs = Pick<
   | 'fchmodSync'
   | 'fdatasyncSync'
   | 'fstatSync'
+  | 'linkSync'
   | 'lstatSync'
   | 'mkdirSync'
   | 'openSync'
@@ -319,11 +324,15 @@ export class FileAuditLog implements AuditLog {
   #syncTimer: NodeJS.Timeout | null = null;
   readonly #intervals: NodeJS.Timeout[] = [];
   #closed = false;
+  /** Held from open to close, so no second relay writes this directory meanwhile. */
+  readonly #lock: AuditLock;
 
   private constructor(
     options: FileAuditLogOptions,
     recovered: { nextSeq: number; head: string | null },
+    lock: AuditLock,
   ) {
+    this.#lock = lock;
     this.#dir = options.dir;
     this.#retentionMs = options.retentionDays * DAY_MS;
     this.#maxBytes = options.maxBytes;
@@ -345,8 +354,16 @@ export class FileAuditLog implements AuditLog {
   static open(options: FileAuditLogOptions): FileAuditLog {
     const fs = options.fs ?? nodeFs;
     prepareDir(options.dir, fs);
-    const recovered = recover(options.dir, fs, options.log);
-    const audit = new FileAuditLog(options, recovered);
+    // Before anything is read or written, so a second relay changes nothing.
+    const lock = takeLock(options.dir, fs, options.log);
+    let recovered: { nextSeq: number; head: string | null };
+    try {
+      recovered = recover(options.dir, fs, options.log);
+    } catch (error) {
+      releaseLock(lock, fs);
+      throw error;
+    }
+    const audit = new FileAuditLog(options, recovered, lock);
     audit.#retain();
     const checkpoints = setInterval(() => {
       audit.#checkpoint();
@@ -415,16 +432,14 @@ export class FileAuditLog implements AuditLog {
     this.sync();
     this.#checkpoint();
     this.#closeCurrent();
+    releaseLock(this.#lock, this.#fs);
     return Promise.resolve();
   }
 
   /** Writes one record's line, rotating first when due; null when the file did not take it. */
   #write(event: AuditEvent): AuditLineMeta | null {
     const meta: AuditLineMeta = { seq: this.#nextSeq, prev: this.#head };
-    // seq right after v, so a person reading the file sees it early; the digest covers the text as written.
-    const { v, ...fields } = event;
-    const line: unknown = { v, seq: meta.seq, ...fields, prev: meta.prev };
-    const checked = AuditLineSchema.safeParse(line);
+    const checked = AuditLineSchema.safeParse({ ...event, seq: meta.seq, prev: meta.prev });
     if (!checked.success) {
       // A bug, never a disk: the record stays in memory and on stderr, and the file stays clean.
       this.#log.error('audit record does not match its schema; it was not written to the file', {
@@ -433,27 +448,47 @@ export class FileAuditLog implements AuditLog {
       });
       return null;
     }
-    const text = JSON.stringify(line);
+    // What the schema let through is written, never the object it was given:
+    // a nested object such as client keeps only the keys its schema lists, so
+    // nothing rides along inside one. seq right after v, so a person reading
+    // the file sees it early, and prev last, where the schema puts it; the
+    // digest covers the text as written.
+    const { v, seq, ...fields } = checked.data;
+    const text = JSON.stringify({ v, seq, ...fields });
     const bytes = Buffer.byteLength(text, 'utf8') + 1;
+    /** Whether the whole line reached the file, its newline perhaps still owed. */
+    let landed = false;
     try {
       const current = this.#fileFor(bytes);
       const fd = current.fd ?? this.#openCurrent(current);
       const buffer = Buffer.from(`${text}\n`, 'utf8');
       const written = this.#fs.writeSync(fd, buffer);
       current.size += written;
-      if (written !== buffer.length) {
+      if (written === buffer.length - 1) {
+        // Every byte but the newline landed, as a disk that fills at the last
+        // byte leaves it: the line is whole, so it is this record, and only
+        // its newline is owed. Counting it lost would give the next line its
+        // seq and a prev that skips it.
+        landed = true;
+        const closed = this.#fs.writeSync(fd, Buffer.from('\n'));
+        current.size += closed;
+        if (closed !== 1) throw Object.assign(new Error('short write'), { code: 'ESHORT' });
+      } else if (written !== buffer.length) {
         // Part of the line landed; the next open sees the torn end and closes it.
         throw Object.assign(new Error('short write'), { code: 'ESHORT' });
       }
     } catch (error) {
       this.#failed(error);
-      return null;
+      // A whole line is in the file even so, and the next open gives it its newline.
+      if (!landed) return null;
     }
     this.#nextSeq += 1;
     this.#head = lineHash(text);
-    this.#failing = false;
-    this.#dirty = true;
-    this.#syncSoon();
+    if ((this.#current?.fd ?? null) !== null) {
+      this.#failing = false;
+      this.#dirty = true;
+      this.#syncSoon();
+    }
     return meta;
   }
 
@@ -627,6 +662,149 @@ export class FileAuditLog implements AuditLog {
       if (total <= this.#maxBytes) break;
       if (file.name !== current) remove(file, 'size');
     }
+  }
+}
+
+/**
+ * The lock file a log holds in its directory from open to close. Two relays
+ * appending to one directory would each go on from the chain's head as they
+ * last saw it, so their lines would share seq numbers and prev digests, and
+ * --verify would report an untouched log as broken; so the second relay
+ * refuses to start before it reads or writes anything, naming the lock.
+ */
+export const AUDIT_LOCK_NAME = 'audit.lock';
+
+/** A lock this process holds: its path, its text, and the directory it is held for. */
+interface AuditLock {
+  path: string;
+  text: string;
+  dir: string;
+}
+
+/**
+ * Directories this process holds the lock of, by real path. The pid in a
+ * lock cannot tell this process's own lock from one an earlier run left with
+ * the same pid (in a container the relay is pid 1 every time), so a second
+ * log in this process is refused here.
+ */
+const heldHere = new Set<string>();
+
+/** This boot of the machine, where Linux names it; a lock from another boot is stale whatever its pid. */
+function bootId(fs: AuditFs): string {
+  try {
+    const id = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+    return /^[0-9a-f-]{1,64}$/.test(id) ? id : '-';
+  } catch {
+    return '-';
+  }
+}
+
+/**
+ * The pid of the relay that wrote a lock, when it may still be running: a pid
+ * on this boot, not this process's own, that the system says exists; else
+ * null. A lock that cannot be read as one was left by no relay, since a lock
+ * is written whole before it takes its name.
+ */
+function lockHolder(text: string, boot: string): number | null {
+  const match = /^(\d{1,10}) ([0-9a-f-]{1,64})\n$/.exec(text);
+  if (match === null) return null;
+  const pid = Number(match[1]);
+  const lockBoot = match[2] ?? '-';
+  if (lockBoot !== '-' && boot !== '-' && lockBoot !== boot) return null;
+  if (pid === process.pid) return null;
+  try {
+    process.kill(pid, 0);
+    return pid;
+  } catch (error) {
+    // EPERM: it runs, as another account.
+    return codeOf(error) === 'EPERM' ? pid : null;
+  }
+}
+
+/**
+ * Takes the directory's lock: the pid and boot go into a file of this
+ * process's own, which is then linked to the lock's name, so the lock appears
+ * whole or not at all and a second relay never reads half of one. A lock left
+ * by a relay that is gone (a crash, a container restarted) is replaced.
+ */
+function takeLock(dir: string, fs: AuditFs, log: Logger): AuditLock {
+  const real = nodeFs.realpathSync(dir);
+  if (heldHere.has(real)) {
+    throw new AuditDirError(
+      `the audit directory ${dir} (TABDOCK_AUDIT_DIR) is already open in this process; one relay writes one audit log (ADR 0019)`,
+    );
+  }
+  const path = join(dir, AUDIT_LOCK_NAME);
+  const text = `${String(process.pid)} ${bootId(fs)}\n`;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const own = join(
+      dir,
+      `${AUDIT_LOCK_NAME}.${String(process.pid)}.${randomBytes(6).toString('hex')}`,
+    );
+    try {
+      const fd = fs.openSync(
+        own,
+        nodeFs.constants.O_WRONLY | nodeFs.constants.O_CREAT | nodeFs.constants.O_EXCL | noFollow(),
+        FILE_MODE,
+      );
+      try {
+        fs.writeSync(fd, Buffer.from(text));
+      } finally {
+        fs.closeSync(fd);
+      }
+      fs.linkSync(own, path);
+      heldHere.add(real);
+      return { path, text, dir: real };
+    } catch (error) {
+      if (codeOf(error) !== 'EEXIST') {
+        throw new AuditDirError(
+          `cannot lock the audit directory ${dir} (TABDOCK_AUDIT_DIR, ${codeOf(error)}); the relay must be able to create ${AUDIT_LOCK_NAME} there`,
+        );
+      }
+    } finally {
+      try {
+        fs.unlinkSync(own);
+      } catch {
+        // Never made, or already gone.
+      }
+    }
+    let held: string;
+    try {
+      held = fs.readFileSync(path, 'utf8');
+    } catch (error) {
+      // Released between the link and the read: try again.
+      if (codeOf(error) === 'ENOENT') continue;
+      throw new AuditDirError(`cannot read the audit lock ${path} (${codeOf(error)})`);
+    }
+    const pid = lockHolder(held, bootId(fs));
+    if (pid !== null) {
+      throw new AuditDirError(
+        `the audit directory ${dir} (TABDOCK_AUDIT_DIR) is in use by another relay, pid ${String(pid)}, which holds ${path}; two relays writing one audit log would break its chain (ADR 0019). Stop that relay first or, if none is running, delete ${path}`,
+      );
+    }
+    log.warn('replaced an audit directory lock left by a relay that is gone', {
+      lock: AUDIT_LOCK_NAME,
+    });
+    try {
+      fs.unlinkSync(path);
+    } catch (error) {
+      if (codeOf(error) !== 'ENOENT') {
+        throw new AuditDirError(`cannot remove the stale audit lock ${path} (${codeOf(error)})`);
+      }
+    }
+  }
+  throw new AuditDirError(
+    `cannot lock the audit directory ${dir} (TABDOCK_AUDIT_DIR): another relay keeps taking ${path}`,
+  );
+}
+
+/** Gives the lock up, leaving alone a lock that is no longer this log's. */
+function releaseLock(lock: AuditLock, fs: AuditFs): void {
+  heldHere.delete(lock.dir);
+  try {
+    if (fs.readFileSync(lock.path, 'utf8') === lock.text) fs.unlinkSync(lock.path);
+  } catch {
+    // Gone already: no lock is all a release must leave.
   }
 }
 

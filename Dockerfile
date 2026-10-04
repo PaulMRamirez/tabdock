@@ -39,7 +39,8 @@ USER 65532:65532
 EXPOSE 8787
 # The base's entrypoint is node itself. Exec form, so SIGTERM and SIGINT reach
 # the relay, which closes within a second (main.ts); no init process is needed,
-# since the relay starts only worker threads. The heap cap is provisional, for
-# a 512 MB host beside the argument worker's own 256 MB cap; integration sizes
-# it with TABDOCK_MAX_TOOL_BYTES (ADR 0018).
+# since the relay starts only worker threads. The heap cap suits a 512 MB host
+# beside the argument worker's own 256 MB cap, and holds TABDOCK_MAX_TOOL_BYTES's
+# default with room to spare: packages/relay/test/tool-heap.test.ts reads this
+# flag and fills every hosted page slot up to that budget under it (ADR 0018).
 CMD ["--max-old-space-size=192", "packages/relay/src/main.ts"]

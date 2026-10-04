@@ -288,6 +288,8 @@ interface ListedTool {
   /** As clients are shown it, cut (S10). */
   tool: PageTool;
   check: ArgCheckEntry;
+  /** What it is charged against limits.toolBytes, kept while it is reused unchanged (heldBytes). */
+  held: number;
 }
 
 /** Logged once per tool and reason; fixed words, never the schema or the arguments. */
@@ -474,21 +476,68 @@ class SchemaTooDeep extends Error {}
 class SchemaKeyTooLong extends Error {}
 
 /**
+ * What a listed tool keeps on the heap, counted as it is cut: the values and
+ * object keys of the copy clients are shown, and the characters of every
+ * string it holds. limits.toolBytes is charged from this (heldBytes), never
+ * from the frame's size on the wire (S9, ADR 0018).
+ */
+interface HeldTally {
+  nodes: number;
+  chars: number;
+}
+
+/**
+ * Counts a string the cut copy keeps. A cut string is a new one that may
+ * still point into the page's original, so both are counted.
+ */
+function holdText(text: string, tally: HeldTally): string {
+  const cut = truncate(text, MAX_DESCRIPTION_CHARS);
+  tally.nodes += 1;
+  tally.chars += cut.truncated ? text.length + cut.text.length : text.length;
+  return cut.text;
+}
+
+/** Counts a small value the relay made itself and keeps as it is, such as a stub schema. */
+function holdValue(value: unknown, tally: HeldTally): void {
+  tally.nodes += 1;
+  if (typeof value === 'string') tally.chars += value.length;
+  else if (Array.isArray(value)) for (const item of value) holdValue(item, tally);
+  else if (typeof value === 'object' && value !== null) {
+    for (const [key, item] of Object.entries(value)) {
+      tally.nodes += 1;
+      tally.chars += key.length;
+      holdValue(item, tally);
+    }
+  }
+}
+
+/**
  * Every string anywhere in a schema is page text: enum values, defaults,
  * examples, patterns and comments reach the model as surely as descriptions do,
  * so all of them are cut to the description cap (S10).
  */
-function cutSchemaText(value: unknown, depth: number, position: SchemaPosition): unknown {
+function cutSchemaText(
+  value: unknown,
+  depth: number,
+  position: SchemaPosition,
+  tally: HeldTally,
+): unknown {
   if (depth > MAX_SCHEMA_DEPTH) throw new SchemaTooDeep();
-  if (typeof value === 'string') return truncate(value, MAX_DESCRIPTION_CHARS).text;
-  if (Array.isArray(value)) return value.map((item) => cutSchemaText(item, depth + 1, position));
+  if (typeof value === 'string') return holdText(value, tally);
+  tally.nodes += 1;
+  if (Array.isArray(value)) {
+    return value.map((item) => cutSchemaText(item, depth + 1, position, tally));
+  }
   if (typeof value !== 'object' || value === null) return value;
   // fromEntries defines own properties, so a "__proto__" key stays a plain key.
   return Object.fromEntries(
     Object.entries(value).map(([key, item]) => {
       // A key cannot be cut without changing what it names, so a long one removes the schema.
       if (key.length > MAX_DESCRIPTION_CHARS) throw new SchemaKeyTooLong();
-      return [key, cutSchemaEntry(key, item, depth + 1, position)];
+      // A key is a slot in its object, and its text when no other object shares it.
+      tally.nodes += 1;
+      tally.chars += key.length;
+      return [key, cutSchemaEntry(key, item, depth + 1, position, tally)];
     }),
   );
 }
@@ -498,18 +547,21 @@ function cutSchemaEntry(
   item: unknown,
   depth: number,
   position: SchemaPosition,
+  tally: HeldTally,
 ): unknown {
-  if (position === 'names') return cutSchemaText(item, depth, 'schema');
-  if (position === 'data') return cutSchemaText(item, depth, 'data');
+  if (position === 'names') return cutSchemaText(item, depth, 'schema', tally);
+  if (position === 'data') return cutSchemaText(item, depth, 'data', tally);
   if (SCHEMA_TEXT_KEYS.has(key) && typeof item !== 'string') {
-    return `[tabdock: non-string ${key} removed]`;
+    const removed = `[tabdock: non-string ${key} removed]`;
+    holdValue(removed, tally);
+    return removed;
   }
   const next = SCHEMA_NAME_MAP_KEYS.has(key)
     ? 'names'
     : SCHEMA_DATA_KEYS.has(key)
       ? 'data'
       : 'schema';
-  return cutSchemaText(item, depth, next);
+  return cutSchemaText(item, depth, next, tally);
 }
 
 function removedSchema(why: string): JsonObject {
@@ -521,31 +573,75 @@ function removedSchema(why: string): JsonObject {
  * big or too deep to pass along, or with a key too long to pass, is replaced by
  * a stub that says so (S9).
  */
-function cutSchema(schema: JsonObject): JsonObject {
+function cutSchema(schema: JsonObject, tally: HeldTally): JsonObject {
+  // Counted apart, since a copy replaced by a stub is not kept.
+  const counted: HeldTally = { nodes: 0, chars: 0 };
+  const stub = (why: string): JsonObject => {
+    const removed = removedSchema(why);
+    holdValue(removed, tally);
+    return removed;
+  };
   let cut: JsonObject;
   try {
-    cut = cutSchemaText(schema, 0, 'schema') as JsonObject;
+    cut = cutSchemaText(schema, 0, 'schema', counted) as JsonObject;
   } catch (error) {
     if (error instanceof SchemaTooDeep) {
-      return removedSchema(`nested more than ${String(MAX_SCHEMA_DEPTH)} levels deep`);
+      return stub(`nested more than ${String(MAX_SCHEMA_DEPTH)} levels deep`);
     }
     if (error instanceof SchemaKeyTooLong) {
-      return removedSchema(`a key longer than ${String(MAX_DESCRIPTION_CHARS)} characters`);
+      return stub(`a key longer than ${String(MAX_DESCRIPTION_CHARS)} characters`);
     }
     throw error;
   }
   const size = JSON.stringify(cut).length;
-  return size > MAX_SCHEMA_CHARS ? removedSchema(`${String(size)} characters`) : cut;
+  if (size > MAX_SCHEMA_CHARS) return stub(`${String(size)} characters`);
+  tally.nodes += counted.nodes;
+  tally.chars += counted.chars;
+  return cut;
 }
 
-/** Every page-written string in a tool is capped once, as it arrives, before any client sees it. */
-function cutTool(tool: PageTool, inputSchema = cutSchema(tool.inputSchema)): PageTool {
-  return {
-    ...tool,
-    description: truncate(tool.description, MAX_DESCRIPTION_CHARS).text,
-    inputSchema,
-  };
+/**
+ * Every page-written string in a tool is capped once, as it arrives, before
+ * any client sees it. What the copy keeps, a stub schema given in place of the
+ * page's included, is added to the tally.
+ */
+function cutTool(tool: PageTool, tally: HeldTally, stubSchema?: JsonObject): PageTool {
+  let inputSchema: JsonObject;
+  if (stubSchema === undefined) {
+    inputSchema = cutSchema(tool.inputSchema, tally);
+  } else {
+    holdValue(stubSchema, tally);
+    inputSchema = stubSchema;
+  }
+  // The spread keeps the parsed tool's name, title and annotations as they are.
+  holdValue(tool.name, tally);
+  if (tool.title !== undefined) holdValue(tool.title, tally);
+  if (tool.annotations !== undefined) holdValue(tool.annotations, tally);
+  return { ...tool, description: holdText(tool.description, tally), inputSchema };
 }
+
+/**
+ * What one listed tool is charged against limits.toolBytes (S9, ADR 0018): an
+ * upper bound on the heap it holds, never its size on the wire. A frame of
+ * small empty objects or arrays holds many times its size in the copies
+ * clients are shown, while long text the relay cuts or replaces holds little
+ * of it. Each value and key of the cut copy costs TOOL_NODE_HEAP_BYTES, which
+ * covers an object, its hidden class when its keys are its own, and its slot
+ * in its parent; each character kept, the prepared schema's included, costs
+ * two bytes, since one character past Latin-1 makes V8 store a whole string at
+ * two bytes each; and TOOL_HEAP_BYTES covers the rest of the tool's record
+ * (its hashes, its check and the maps that hold them). The constants were
+ * measured with a probe of node-dense, string-heavy and two-byte frames under
+ * --expose-gc, and sit above the most any of them held (tool-heap.test.ts).
+ */
+function heldBytes(tally: HeldTally, preparedChars: number): number {
+  return TOOL_HEAP_BYTES + tally.nodes * TOOL_NODE_HEAP_BYTES + 2 * (tally.chars + preparedChars);
+}
+
+/** Heap a listed tool holds besides its nodes and characters; see heldBytes. */
+export const TOOL_HEAP_BYTES = 1024;
+/** Heap one value or key of a tool's cut copy may hold; see heldBytes. */
+export const TOOL_NODE_HEAP_BYTES = 128;
 
 /**
  * Schema nodes (objects, arrays and plain values) the main thread walks for
@@ -635,9 +731,9 @@ export class PageHub {
    */
   readonly #listed = new Map<string, Map<string, ListedTool>>();
   /**
-   * What each page's listed tools are charged against limits.toolBytes: the
-   * size of the tools frame that listed them, which bounds both the copies
-   * the relay keeps and the schemas it prepares from them (S9, ADR 0018).
+   * What each page's listed tools are charged against limits.toolBytes: an
+   * upper bound on the heap their cut copies and prepared schemas hold
+   * (heldBytes), which a frame's size on the wire is not (S9, ADR 0018).
    */
   readonly #toolBytes = new Map<string, number>();
   #toolBytesHeld = 0;
@@ -843,8 +939,7 @@ export class PageHub {
         this.#closeSocket(conn, CLOSE_POLICY, 'hello sent twice');
         return;
       case 'tools':
-        if (this.#toolsFrameAllowed(conn))
-          this.#tools(conn, pageId, frame, Buffer.byteLength(text));
+        if (this.#toolsFrameAllowed(conn)) this.#tools(conn, pageId, frame);
         return;
       case 'attach_decision':
         this.#decision(pageId, frame);
@@ -1049,23 +1144,9 @@ export class PageHub {
     return true;
   }
 
-  #tools(conn: Conn, pageId: string, frame: FrameOf<'tools'>, bytes: number): void {
+  #tools(conn: Conn, pageId: string, frame: FrameOf<'tools'>): void {
     const page = this.#store.pages.get(pageId);
     if (!page) return;
-    // One relay-wide budget for what every page's tools hold, so a few pages at
-    // the frame cap cannot fill the heap (S9, ADR 0018). The page's own last
-    // list is replaced, so only the difference counts; the frame already went
-    // against its address's tools-frame budget, and the close leaves the page
-    // asleep like any other policy close.
-    const held = this.#toolBytes.get(pageId) ?? 0;
-    if (this.#toolBytesHeld - held + bytes > this.#config.limits.toolBytes) {
-      this.#log.warn('closing page socket: its tools would pass what all pages may hold', {
-        pageId,
-        address: conn.address,
-      });
-      this.#closeSocket(conn, CLOSE_POLICY, 'tools would pass the relay tool list budget');
-      return;
-    }
     // WebMCP itself refuses duplicate names, so a duplicate is a page bug: keep the first.
     const seen = new Set<string>();
     const tools: PageTool[] = [];
@@ -1074,6 +1155,9 @@ export class PageHub {
     let nodesLeft = MAX_FRAME_SCHEMA_NODES;
     let overTool = 0;
     let overFrame = 0;
+    const uncheckable: string[] = [];
+    /** What the list as built would hold, in heldBytes's terms. */
+    let charge = 0;
     for (const tool of frame.tools) {
       if (seen.has(tool.name)) continue;
       seen.add(tool.name);
@@ -1083,8 +1167,10 @@ export class PageHub {
       if (before && raw !== null && before.raw === raw) {
         listed.set(tool.name, before);
         tools.push(before.tool);
+        charge += before.held;
         continue;
       }
+      const tally: HeldTally = { nodes: 0, chars: 0 };
       // The count stops one node past the limit, and the frame is charged what
       // was counted, so the walk per frame stays within the frame's cap plus one
       // node per tool however many large tools it lists.
@@ -1099,6 +1185,7 @@ export class PageHub {
         else overFrame += 1;
         const stub = cutTool(
           tool,
+          tally,
           removedSchema(
             own
               ? `more than ${String(MAX_TOOL_SCHEMA_NODES)} schema nodes`
@@ -1106,6 +1193,7 @@ export class PageHub {
           ),
         );
         const check = { schema: null, uncompilable: false, warned: new Set<UncheckedReason>() };
+        const held = heldBytes(tally, 0);
         // Over its own limit it always will be, so it is kept by hash and reused
         // unchanged without another walk, leaving the frame to the tools after it.
         // One stubbed only for the frame's lack of room is walked again next time.
@@ -1114,20 +1202,23 @@ export class PageHub {
           capped: true,
           tool: stub,
           check,
+          held,
         });
         tools.push(stub);
+        charge += held;
         continue;
       }
-      const cut = cutTool(tool);
+      const cut = cutTool(tool, tally);
       // From the page's own schema, not the cut copy, so a long enum value still
       // matches. Prepared here and compiled in the worker, at the tool's first call.
       const schema = prepareForCheck(tool.inputSchema);
       // The same schema again keeps what is known about it, so nothing is logged twice.
       let check = before?.capped === false ? before.check : undefined;
       if (!check || !sameSchema(check.schema, schema)) {
-        if (schema === null) this.#warnUncheckable(pageId, tool.name);
+        if (schema === null) uncheckable.push(tool.name);
         check = { schema, uncompilable: false, warned: new Set() };
       }
+      const held = heldBytes(tally, check.schema?.text.length ?? 0);
       // Hashed for the next frame only when the count covered all of it, so the
       // hash costs no more than the walk did; a schema too deep is walked again.
       listed.set(tool.name, {
@@ -1135,9 +1226,28 @@ export class PageHub {
         capped: false,
         tool: cut,
         check,
+        held,
       });
       tools.push(cut);
+      charge += held;
     }
+    // One relay-wide budget for what every page's tools hold, so pages cannot
+    // fill the heap however they shape their frames (S9, ADR 0018). Charged
+    // what the list as built holds, so it is checked once it is built; the
+    // page's own last list is replaced, so only the difference counts. The
+    // frame already went against its address's tools-frame budget, and the
+    // close leaves the page asleep like any other policy close, its last list
+    // dropped with it.
+    const held = this.#toolBytes.get(pageId) ?? 0;
+    if (this.#toolBytesHeld - held + charge > this.#config.limits.toolBytes) {
+      this.#log.warn('closing page socket: its tools would pass what all pages may hold', {
+        pageId,
+        address: conn.address,
+      });
+      this.#closeSocket(conn, CLOSE_POLICY, 'tools would pass the relay tool list budget');
+      return;
+    }
+    for (const name of uncheckable) this.#warnUncheckable(pageId, name);
     if (tools.length !== frame.tools.length) {
       this.#log.warn('page listed a tool name twice; kept the first', { pageId });
     }
@@ -1157,9 +1267,14 @@ export class PageHub {
     page.toolsPending = false;
     this.#store.pages.put(page);
     this.#listed.set(pageId, listed);
-    this.#toolBytesHeld += bytes - held;
-    this.#toolBytes.set(pageId, bytes);
-    this.#log.debug('page tools updated', { pageId, toolCount: tools.length });
+    this.#toolBytesHeld += charge - held;
+    this.#toolBytes.set(pageId, charge);
+    this.#log.debug('page tools updated', {
+      pageId,
+      toolCount: tools.length,
+      heldBytes: charge,
+      allPagesHeldBytes: this.#toolBytesHeld,
+    });
   }
 
   /** Forgets a page's listed tools and what they were charged against limits.toolBytes. */

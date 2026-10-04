@@ -3,11 +3,23 @@
 // files and restarts, rotation by size and UTC day, retention by age and
 // total size that never deletes the current file, a torn line from a crash
 // closed at the next start, failing open with an audit_gap record once
-// writing works again, a schema check before every line, and the reader's
-// --verify, which names torn lines and fails on an edited or removed one.
+// writing works again, a schema check before every line whose checked form
+// is what is written, a lock that keeps a second writer out, syncs at most
+// once a second, checkpoints every 15 minutes, and the reader's --verify,
+// which names torn lines and fails on an edited or removed one.
 
+import { spawn } from 'node:child_process';
 import * as nodeFs from 'node:fs';
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -16,8 +28,13 @@ import {
   type AuditEventOf,
   AuditLineSchema,
 } from '@tabdock/protocol';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { AUDIT_ROTATE_MB } from '../src/config.ts';
 import {
+  AUDIT_CHECKPOINT_MS,
+  AUDIT_LOCK_NAME,
+  AUDIT_RETENTION_CHECK_MS,
+  AUDIT_SYNC_MS,
   AuditDirError,
   type AuditFs,
   createLogger,
@@ -26,6 +43,7 @@ import {
   lineHash,
   listAuditFiles,
   readAuditLines,
+  utcDay,
   verifyAuditLines,
 } from '../src/index.ts';
 
@@ -33,6 +51,7 @@ const scratches: string[] = [];
 const opened: FileAuditLog[] = [];
 
 afterEach(async () => {
+  vi.useRealTimers();
   for (const audit of opened.splice(0)) await audit.close();
   for (const dir of scratches.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
@@ -424,5 +443,303 @@ describe('verify (pnpm audit:log --verify)', () => {
     expect(missing.map((problem) => problem.problem)).toEqual([
       expect.stringMatching(/no record has the checkpoint/) as string,
     ]);
+  });
+});
+
+/** The record types of the lines in a directory, a line that is no JSON as 'torn'. */
+function typesIn(dir: string): string[] {
+  return fileLines(dir).map((line) => {
+    try {
+      return (JSON.parse(line) as { type: string }).type;
+    } catch {
+      return 'torn';
+    }
+  });
+}
+
+describe('a short write that leaves only the newline out (ADR 0019)', () => {
+  /** An fs whose next armed record write lands every byte but the last, as a disk filling there does. */
+  function shortByOne(newline: 'lands' | 'fails'): { fs: AuditFs; arm(): void } {
+    let armed = false;
+    let owed = false;
+    const fs: AuditFs = {
+      ...nodeFs,
+      writeSync: ((fd: number, buffer: NodeJS.ArrayBufferView) => {
+        const bytes = buffer as Buffer;
+        if (armed && bytes.length > 1) {
+          armed = false;
+          owed = true;
+          return nodeFs.writeSync(fd, bytes, 0, bytes.length - 1);
+        }
+        if (owed && newline === 'fails') {
+          owed = false;
+          throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+        }
+        owed = false;
+        return nodeFs.writeSync(fd, bytes);
+      }) as typeof nodeFs.writeSync,
+    };
+    return {
+      fs,
+      arm: () => {
+        armed = true;
+      },
+    };
+  }
+
+  it('keeps the record, writing the newline after it, so no seq repeats and verify is clean', async () => {
+    const disk = shortByOne('lands');
+    const { audit, dir, lines } = open(scratch(), { fs: disk.fs });
+    audit.append(call(T0));
+    disk.arm();
+    expect(audit.append(call(T0 + 1))).toMatchObject({ seq: 2 });
+    expect(audit.append(call(T0 + 2))).toMatchObject({ seq: 3 });
+    await audit.close();
+    expect(typesIn(dir)).toEqual(['call', 'call', 'call']);
+    expect(lines.join('\n')).not.toContain('audit file write failed');
+    const report = verifyAuditLines(readAuditLines(dir));
+    expect(report).toMatchObject({ records: 3, lastSeq: 3, problems: [], torn: [] });
+  });
+
+  it('keeps the record when its newline fails too, and the next open closes the line', async () => {
+    const disk = shortByOne('fails');
+    const { audit, dir, lines } = open(scratch(), { fs: disk.fs });
+    audit.append(call(T0));
+    disk.arm();
+    // The line is whole in the file, so it is a record: no gap, and its seq is not given again.
+    expect(audit.append(call(T0 + 1))).toMatchObject({ seq: 2 });
+    expect(lines.join('\n')).toContain('audit file write failed');
+    expect(audit.append(call(T0 + 2))).toMatchObject({ seq: 3 });
+    await audit.close();
+    expect(typesIn(dir)).toEqual(['call', 'call', 'call']);
+    const report = verifyAuditLines(readAuditLines(dir));
+    expect(report).toMatchObject({ records: 3, lastSeq: 3, problems: [], torn: [] });
+  });
+});
+
+describe('what reaches a line (ADR 0019, S11)', () => {
+  it('writes the schema-checked record, so a field no schema lists is dropped even inside a nested object', async () => {
+    const { audit, dir } = open(scratch());
+    const secret = 'eyJhbGciOiJSUzI1NiJ9.SECRET-TOKEN';
+    const tainted = call(T0, {
+      client: {
+        name: 'test',
+        version: '1.0.0',
+        accessToken: secret,
+      } as AuditEventOf<'call'>['client'],
+    });
+    expect(audit.append(tainted)).toEqual({ seq: 1, prev: null });
+    await audit.close();
+    const [file] = listAuditFiles(dir);
+    const text = readFileSync(join(dir, file?.name ?? ''), 'utf8');
+    expect(text).not.toContain('SECRET-TOKEN');
+    expect(text).not.toContain('accessToken');
+    const [record] = fileLines(dir).map((line) => AuditLineSchema.parse(JSON.parse(line)));
+    expect(record).toMatchObject({
+      seq: 1,
+      type: 'call',
+      client: { name: 'test', version: '1.0.0' },
+    });
+    // The chain covers the line as written.
+    expect(verifyAuditLines(readAuditLines(dir)).problems).toEqual([]);
+  });
+});
+
+describe('one writer per directory (ADR 0019)', () => {
+  /** A process that runs until killed, to hold a pid that is alive and not this one. */
+  async function otherProcess(): Promise<{ pid: number; stop(): Promise<void> }> {
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      stdio: 'ignore',
+    });
+    await new Promise<void>((resolve, reject) => {
+      child.once('spawn', resolve);
+      child.once('error', reject);
+    });
+    return {
+      pid: child.pid ?? 0,
+      stop: () =>
+        new Promise<void>((resolve) => {
+          child.once('exit', () => {
+            resolve();
+          });
+          child.kill('SIGKILL');
+        }),
+    };
+  }
+
+  it('refuses a second log on a directory this process already writes, before it reads or writes a line', async () => {
+    const dir = scratch();
+    const first = open(dir);
+    first.audit.append(call(T0));
+    expect(existsSync(join(dir, AUDIT_LOCK_NAME))).toBe(true);
+    expect(() => open(dir)).toThrow(AuditDirError);
+    expect(() => open(dir)).toThrow(/already open in this process/);
+    first.audit.append(call(T0 + 1));
+    await first.audit.close();
+    // Released at close; the next log goes on with the chain.
+    expect(existsSync(join(dir, AUDIT_LOCK_NAME))).toBe(false);
+    const second = open(dir);
+    expect(second.audit.append(call(T0 + 2))?.seq).toBe(3);
+    await second.audit.close();
+    expect(verifyAuditLines(readAuditLines(dir))).toMatchObject({ records: 3, problems: [] });
+  });
+
+  it("refuses a directory another live relay's lock holds, naming its pid, and replaces a lock whose relay is gone", async () => {
+    const dir = scratch();
+    open(dir).audit.append(call(T0));
+    for (const audit of opened.splice(0)) await audit.close();
+    const before = readFileSync(join(dir, listAuditFiles(dir)[0]?.name ?? ''), 'utf8');
+    const other = await otherProcess();
+    try {
+      writeFileSync(join(dir, AUDIT_LOCK_NAME), `${String(other.pid)} -\n`);
+      expect(() => open(dir)).toThrow(
+        new RegExp(
+          `in use by another relay, pid ${String(other.pid)}.*delete .*${AUDIT_LOCK_NAME}`,
+        ),
+      );
+      // Nothing was read into a chain or written.
+      expect(readFileSync(join(dir, listAuditFiles(dir)[0]?.name ?? ''), 'utf8')).toBe(before);
+    } finally {
+      await other.stop();
+    }
+    // Its relay is gone now, as after a crash: the lock is replaced, with a warning.
+    const after = open(dir);
+    expect(after.lines.join('\n')).toContain('replaced an audit directory lock');
+    expect(after.audit.append(call(T0 + 1))?.seq).toBe(2);
+    await after.audit.close();
+    // A lock naming this very pid was left by an earlier run, as a container's pid 1 leaves it.
+    writeFileSync(join(dir, AUDIT_LOCK_NAME), `${String(process.pid)} -\n`);
+    const again = open(dir);
+    expect(again.audit.append(call(T0 + 2))?.seq).toBe(3);
+    await again.audit.close();
+    // Nor does a lock from another boot of the machine hold, whatever its pid.
+    const other2 = await otherProcess();
+    try {
+      writeFileSync(
+        join(dir, AUDIT_LOCK_NAME),
+        `${String(other2.pid)} 00000000-0000-0000-0000-000000000000\n`,
+      );
+      if (process.platform === 'linux') {
+        const later = open(dir);
+        expect(later.audit.append(call(T0 + 3))?.seq).toBe(4);
+        await later.audit.close();
+      }
+    } finally {
+      await other2.stop();
+    }
+    expect(verifyAuditLines(readAuditLines(dir)).problems).toEqual([]);
+  });
+});
+
+describe('the timers and defaults ADR 0019 sets', () => {
+  /** An fs that counts fdatasync calls. */
+  function counting(): { fs: AuditFs; readonly syncs: number } {
+    let syncs = 0;
+    return {
+      fs: {
+        ...nodeFs,
+        fdatasyncSync: (fd: number) => {
+          syncs += 1;
+          nodeFs.fdatasyncSync(fd);
+        },
+      },
+      get syncs() {
+        return syncs;
+      },
+    };
+  }
+
+  it('syncs at most once a second, one sync for a burst, and none when nothing is new', () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    const disk = counting();
+    const { audit } = open(scratch(), { fs: disk.fs });
+    audit.append(call(T0));
+    expect(disk.syncs).toBe(0);
+    vi.advanceTimersByTime(AUDIT_SYNC_MS - 1);
+    expect(disk.syncs).toBe(0);
+    vi.advanceTimersByTime(1);
+    expect(disk.syncs).toBe(1);
+    for (let index = 1; index <= 5; index += 1) audit.append(call(T0 + index));
+    expect(disk.syncs).toBe(1);
+    vi.advanceTimersByTime(AUDIT_SYNC_MS);
+    expect(disk.syncs).toBe(2);
+    vi.advanceTimersByTime(10 * AUDIT_SYNC_MS);
+    expect(disk.syncs).toBe(2);
+    expect(AUDIT_SYNC_MS).toBe(1000);
+  });
+
+  it('writes a checkpoint to stderr every 15 minutes, naming the head', () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    const { audit, dir, lines } = open(scratch());
+    audit.append(call(T0));
+    const checkpoints = (): string[] =>
+      lines.filter((line) => line.includes('"msg":"audit checkpoint"'));
+    vi.advanceTimersByTime(AUDIT_CHECKPOINT_MS - 1);
+    expect(checkpoints()).toHaveLength(0);
+    vi.advanceTimersByTime(1);
+    expect(checkpoints()).toHaveLength(1);
+    expect(JSON.parse(checkpoints()[0] ?? '{}')).toMatchObject({
+      seq: 1,
+      head: lineHash(fileLines(dir)[0] ?? ''),
+    });
+    vi.advanceTimersByTime(AUDIT_CHECKPOINT_MS);
+    expect(checkpoints()).toHaveLength(2);
+    expect(AUDIT_CHECKPOINT_MS).toBe(15 * 60_000);
+  });
+
+  it(`rotates at ${String(AUDIT_ROTATE_MB)} MiB when no test says otherwise`, async () => {
+    expect(AUDIT_ROTATE_MB).toBe(8);
+    const limit = AUDIT_ROTATE_MB * 1024 * 1024;
+    const { audit, dir } = open(scratch());
+    // Long origins make long lines, so a few thousand of them fill a file.
+    const origin = `https://${'o'.repeat(2000)}.example`;
+    audit.append(call(T0, { origin }));
+    audit.append(call(T0, { origin }));
+    const line = statSync(join(dir, listAuditFiles(dir)[0]?.name ?? '')).size / 2;
+    // Enough lines to pass the limit by a few, and no more, whatever the limit really is.
+    const enough = Math.ceil((limit / line) * 1.01) + 20;
+    for (let count = 2; count < enough && listAuditFiles(dir).length < 2; count += 1) {
+      expect(audit.append(call(T0, { origin }))).not.toBeNull();
+    }
+    await audit.close();
+    const files = listAuditFiles(dir).map((file) => statSync(join(dir, file.name)).size);
+    expect(files).toHaveLength(2);
+    expect(files[0]).toBeLessThanOrEqual(limit);
+    expect(files[0]).toBeGreaterThan(limit - 2 * (line + 20));
+    expect(verifyAuditLines(readAuditLines(dir)).problems).toEqual([]);
+  });
+
+  it('keeps the file the chain goes on from at a start, however old, until a newer one exists', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    const dir = scratch();
+    const first = open(dir);
+    first.audit.append(call(T0));
+    await first.audit.close();
+    const [only] = listAuditFiles(dir);
+    // 31 days on, with 30 days of retention: the only file is still the current one.
+    const later = { now: T0 + 31 * DAY };
+    const reopened = open(dir, {}, later);
+    expect(listAuditFiles(dir)).toEqual([only]);
+    expect(reopened.lines.join('\n')).not.toContain('deleted by retention');
+    // Once a record goes to today's file, the old one is past the retention and goes at the next pass.
+    expect(reopened.audit.append(call(later.now))?.seq).toBe(2);
+    vi.advanceTimersByTime(AUDIT_RETENTION_CHECK_MS);
+    expect(listAuditFiles(dir).map((file) => file.day)).toEqual([utcDay(later.now)]);
+    await reopened.audit.close();
+  });
+
+  it('narrows a file that already exists to 0600 before writing to it', () => {
+    if (process.platform === 'win32') return;
+    const dir = scratch();
+    mkdirSync(dir, { mode: 0o700 });
+    const path = join(dir, `audit-${utcDay(T0)}-000000000001.jsonl`);
+    writeFileSync(path, '');
+    chmodSync(path, 0o644);
+    const { audit } = open(dir);
+    expect(audit.append(call(T0))?.seq).toBe(1);
+    expect(listAuditFiles(dir).map((file) => file.name)).toEqual([
+      `audit-${utcDay(T0)}-000000000001.jsonl`,
+    ]);
+    expect(statSync(path).mode & 0o777).toBe(0o600);
   });
 });

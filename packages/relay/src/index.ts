@@ -23,6 +23,7 @@ export {
 export { type AuthRefusalLog, createAuthRefusalLog } from './auth-log.ts';
 export {
   AUDIT_CHECKPOINT_MS,
+  AUDIT_LOCK_NAME,
   AUDIT_RETENTION_CHECK_MS,
   AUDIT_SYNC_MS,
   AuditDirError,

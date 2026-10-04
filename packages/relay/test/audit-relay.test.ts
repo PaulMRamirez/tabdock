@@ -2,9 +2,12 @@
 // production refuses to start without its directory or when relay_start does
 // not reach the disk; relay_start and relay_stop bracket every run; a call the
 // shutdown fails is on disk before the log closes; local mode keeps its log in
-// audit/ beside the owner token; and no file line or log line holds a token,
-// a pairing code, a resume token, an argument or a client address. Then the
-// reader, pnpm audit:log, over what the relay wrote.
+// audit/ beside the owner token; a second relay on the same directory, in
+// this process or another, refuses to start before it writes a line, so the
+// chain stays whole; and no file line or log line holds a token, a pairing
+// code, a resume token, an argument or a client address. Then the reader,
+// pnpm audit:log, over what the relay wrote, each filter shown to leave
+// something out.
 
 import {
   mkdirSync,
@@ -32,6 +35,7 @@ import {
   utcDay,
   verifyAuditLines,
 } from '../src/index.ts';
+import { startMain } from './helpers/main-process.ts';
 import { connectPage, PAGE_ORIGIN, type TestPage, TOOLS } from './helpers/page-client.ts';
 import {
   ALICE,
@@ -191,6 +195,43 @@ describe('a relay with an audit directory (ADR 0019)', () => {
     ]);
   });
 
+  it('refuses a second relay on the same audit directory before it writes a line, in this process or another', async () => {
+    const home = join(scratch(), 'tabdock');
+    const dir = join(home, 'audit');
+    const options = loadConfigFromEnv({ TABDOCK_HOME: home, TABDOCK_PORT: '0' });
+    const first = await createRelay({ ...options, logSink: quiet });
+    const port = new URL(first.url).port;
+    // On a port of its own, and on the first relay's, where it could not listen anyway.
+    for (const again of [options, loadConfigFromEnv({ TABDOCK_HOME: home, TABDOCK_PORT: port })]) {
+      await expect(createRelay({ ...again, logSink: quiet })).rejects.toThrow(
+        /audit directory .* is already open in this process/,
+      );
+    }
+    await first.close();
+    expect(records(dir).map((record) => record.type)).toEqual(['relay_start', 'relay_stop']);
+
+    // pnpm relay while pnpm dev already runs: the other process holds the lock.
+    const other = startMain({ TABDOCK_HOME: home });
+    await other.port;
+    await expect(createRelay({ ...options, logSink: quiet })).rejects.toThrow(
+      new RegExp(`in use by another relay, pid ${String(other.child.pid)}`),
+    );
+    other.child.kill('SIGTERM');
+    expect(await other.exited, other.output()).toEqual({ code: 0, signal: null });
+    expect(records(dir).map((record) => record.type)).toEqual([
+      'relay_start',
+      'relay_stop',
+      'relay_start',
+      'relay_stop',
+    ]);
+    const report = verifyAuditLines(readAuditLines(dir));
+    expect(report).toMatchObject({ records: 4, firstSeq: 1, lastSeq: 4, problems: [], torn: [] });
+    // The lock goes with the relay that held it, so the next start finds none.
+    const next = await createRelay({ ...options, logSink: quiet });
+    await next.close();
+    expect(verifyAuditLines(readAuditLines(dir)).problems).toEqual([]);
+  });
+
   it('never writes a token, code, resume token, argument or client address to a file or a log line (S11)', async () => {
     const dir = join(scratch(), 'audit');
     const relay = await startRelay({ audit: { dir } });
@@ -270,13 +311,19 @@ describe('pnpm audit:log', () => {
   function run(
     argv: string[],
     env: NodeJS.ProcessEnv = {},
+    now?: number,
   ): { code: number; out: string[]; err: string[] } {
     const out: string[] = [];
     const err: string[] = [];
-    const code = runAuditCli(argv, env, {
-      out: (line) => out.push(line),
-      err: (line) => err.push(line),
-    });
+    const code = runAuditCli(
+      argv,
+      env,
+      {
+        out: (line) => out.push(line),
+        err: (line) => err.push(line),
+      },
+      now,
+    );
     return { code, out, err };
   }
 
@@ -296,6 +343,20 @@ describe('pnpm audit:log', () => {
     expect(run(['--dir', dir, '--type', 'relay_start,relay_stop']).out).toHaveLength(2);
     expect(run(['--dir', dir, '--outcome', 'not_attached']).out[0]).toContain('userId="bob"');
     expect(run(['--dir', dir, '--since', '1h']).out).toHaveLength(4);
+    // Each filter leaves something out: two hours on, the last hour holds nothing.
+    expect(run(['--dir', dir, '--since', '1h'], {}, Date.now() + 2 * 3_600_000).out).toHaveLength(
+      0,
+    );
+    const at = records(dir).map((record) => record.at);
+    const since = new Date(Math.max(...at)).toISOString();
+    expect(run(['--dir', dir, '--since', since]).out.length).toBeLessThan(4);
+    // The page's calls, and nothing that names no page.
+    const pageId = records(dir).find((record) => record.type === 'call' && 'pageId' in record);
+    const page = pageId !== undefined && 'pageId' in pageId ? pageId.pageId : '';
+    const onPage = run(['--dir', dir, '--page', page]).out;
+    expect(onPage).toHaveLength(2);
+    expect(onPage.every((line) => line.includes(' call ') && line.includes(page))).toBe(true);
+    expect(run(['--dir', dir, '--page', 'pg_another']).out).toHaveLength(0);
     expect(run(['--dir', dir, '--until', '2000-01-01T00:00:00Z']).out).toHaveLength(0);
     const json = run(['--dir', dir, '--json', '--type', 'call']).out;
     expect(json).toHaveLength(2);

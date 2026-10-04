@@ -5,12 +5,15 @@
 // missing, repeated or not an address is a 400 where requests count by
 // address; IPv4-mapped forms count as IPv4 and native IPv6 by its /56; pages
 // attach through the public host, under hosted mode's per-address limits;
-// sign-ins get a per-address share of the relay-wide budget; and the platform's
+// sign-ins through /pair get a per-address share of the relay-wide budget,
+// counted by the client the edge names, while outside hosted mode every
+// tunnelled sign-in shares the relay-wide budget alone; and the platform's
 // own name for the app gets 403 everywhere but /healthz. Outside hosted mode
 // M3's rules stay exactly as they were. Ends with a signed-in client and a page
 // through the stand-in edge, and a scan of the audit files for anything S11
 // keeps out of them.
 
+import { randomBytes } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { connect } from 'node:net';
@@ -22,7 +25,7 @@ import {
   StreamableHTTPClientTransport,
 } from '@modelcontextprotocol/client';
 import { SUBPROTOCOL } from '@tabdock/protocol';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { resolveConfig } from '../src/config.ts';
 import {
   createClientAddresses,
@@ -33,6 +36,7 @@ import {
   createSignInGate,
   limitKeyOf,
   listAuditFiles,
+  LOGIN_COOKIE,
   loadConfigFromEnv,
   normalizeAddress,
   type Relay,
@@ -47,11 +51,12 @@ import {
   UpgradeRefused,
 } from './helpers/page-client.ts';
 import { PAIR_CLIENT, startProvider, type TestProvider } from './helpers/provider.ts';
-import { ALICE } from './helpers/relay.ts';
+import { ALICE, delay, eventually } from './helpers/relay.ts';
 import {
   PUBLIC_MCP_URL,
   PUBLIC_METADATA_URL,
   PUBLIC_ORIGIN,
+  type RawAnswer,
   rawRequest,
   tunnelFetch,
 } from './helpers/tunnel.ts';
@@ -587,6 +592,150 @@ describe('a relay on a host (ADR 0018)', () => {
     const logged = lines.join('\n');
     expect(logged).not.toContain(token);
     expect(logged).not.toContain(code);
+  });
+
+  /**
+   * Counts the relay's requests to the provider's token endpoint, one per code
+   * exchange, each carrying the /pair client's secret; while held, they wait.
+   */
+  function watchTokenEndpoint(): {
+    readonly count: number;
+    hold(): void;
+    release(): void;
+    restore(): void;
+  } {
+    const realFetch = globalThis.fetch;
+    let count = 0;
+    let gate: Promise<void> | null = null;
+    let open = (): void => undefined;
+    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url === `${provider.issuer}/token`) {
+        count += 1;
+        if (gate !== null) await gate;
+      }
+      return realFetch(input, init);
+    });
+    return {
+      get count() {
+        return count;
+      },
+      hold() {
+        gate = new Promise((resolve) => {
+          open = resolve;
+        });
+      },
+      release() {
+        open();
+        gate = null;
+      },
+      restore() {
+        spy.mockRestore();
+      },
+    };
+  }
+
+  /**
+   * A callback through the edge for a sign-in of the caller's own making,
+   * with the login cookie and state anyone can send without a browser, from
+   * the client the edge names (none when address is null).
+   */
+  function forgedCallback(relay: Relay, address: string | null): Promise<RawAnswer> {
+    const part = (): string => randomBytes(32).toString('base64url');
+    const state = part();
+    return rawRequest(relay.url, `/pair/callback?code=made-up-${part()}&state=${state}`, {
+      host: PUBLIC_HOST,
+      headers: {
+        Cookie: `${LOGIN_COOKIE}=${state}.${part()}.${part()}.${String(Date.now() + 600_000)}`,
+        ...(address === null ? {} : { [HEADER]: address }),
+      },
+    });
+  }
+
+  const FAILED = '/pair?signin=failed';
+
+  it('gives each client the edge names its share of sign-ins through /pair: 2 in flight and 10 a minute', async () => {
+    const relay = await hosted();
+    const tokens = watchTokenEndpoint();
+    try {
+      tokens.hold();
+      const waiting = [forgedCallback(relay, '203.0.113.7'), forgedCallback(relay, '203.0.113.7')];
+      await eventually(() => tokens.count === 2, 3000);
+      // A third from the same client is answered at once; the provider never hears of it.
+      const third = await Promise.race([
+        forgedCallback(relay, '203.0.113.7'),
+        delay(2000).then(() => null),
+      ]);
+      expect(third?.headers.get('location'), 'answered without the provider').toBe(FAILED);
+      expect(tokens.count).toBe(2);
+      expect(lines.join('\n')).toContain(
+        'too many sign-ins from one address waiting on the provider',
+      );
+      // Another client behind the same edge still reaches the provider.
+      const other = forgedCallback(relay, '198.51.100.1');
+      await eventually(() => tokens.count === 3, 3000);
+      tokens.release();
+      for (const answer of await Promise.all([...waiting, other])) {
+        expect(answer.headers.get('location')).toBe(FAILED);
+      }
+
+      // Two of the first client's ten a minute are spent; eight more reach the provider.
+      for (let index = 0; index < 8; index += 1) {
+        expect((await forgedCallback(relay, '203.0.113.7')).headers.get('location')).toBe(FAILED);
+      }
+      expect(tokens.count).toBe(11);
+      // The eleventh in the minute does not, while another client's still does.
+      expect((await forgedCallback(relay, '203.0.113.7')).headers.get('location')).toBe(FAILED);
+      expect(tokens.count).toBe(11);
+      expect(lines.join('\n')).toContain('too many sign-ins from one address in this window');
+      expect((await forgedCallback(relay, '198.51.100.2')).headers.get('location')).toBe(FAILED);
+      expect(tokens.count).toBe(12);
+      // An IPv6 client counts by its /56: another address in it shares the spent share.
+      for (let index = 0; index < 10; index += 1) {
+        await forgedCallback(relay, `2001:db8:0:12${String(index % 10)}0::1`);
+      }
+      expect(tokens.count).toBe(22);
+      await forgedCallback(relay, '2001:db8:0:12ff::99');
+      expect(tokens.count).toBe(22);
+      // A callback whose client the edge did not name is malformed: 400, no provider.
+      expect((await forgedCallback(relay, null)).status).toBe(400);
+      expect(tokens.count).toBe(22);
+    } finally {
+      tokens.release();
+      tokens.restore();
+    }
+  });
+
+  it('keeps M3 exactly outside hosted mode: every tunnelled sign-in shares the relay-wide 8 in flight, with no share per address', async () => {
+    const relay = await hosted({
+      env: 'development',
+      host: '127.0.0.1',
+      clientAddressHeader: undefined,
+      trustedProxyCidr: undefined,
+      audit: undefined,
+    });
+    const tokens = watchTokenEndpoint();
+    try {
+      tokens.hold();
+      // Every one arrives from the tunnel's loopback address, whatever header it carries.
+      const waiting = Array.from({ length: 8 }, () => forgedCallback(relay, '203.0.113.7'));
+      await eventually(() => tokens.count === 8, 3000);
+      const ninth = await Promise.race([
+        forgedCallback(relay, '198.51.100.1'),
+        delay(2000).then(() => null),
+      ]);
+      expect(ninth?.headers.get('location'), 'answered without the provider').toBe(FAILED);
+      expect(tokens.count).toBe(8);
+      expect(lines.join('\n')).toContain('too many sign-ins waiting on the provider');
+      expect(lines.join('\n')).not.toContain('from one address');
+      tokens.release();
+      for (const answer of await Promise.all(waiting)) {
+        expect(answer.headers.get('location')).toBe(FAILED);
+      }
+    } finally {
+      tokens.release();
+      tokens.restore();
+    }
   });
 
   it('keeps M3 exactly outside hosted mode: a tunnelled relay takes /page only from this machine', async () => {
