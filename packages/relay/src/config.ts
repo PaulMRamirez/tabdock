@@ -138,6 +138,15 @@ export interface RelayRateLimits {
    */
   ignoredFramesPerAddress: number;
   /**
+   * Lines the page connections from one remote address may write in full
+   * per windowMs: an upgrade refused, a socket closed for its first frame,
+   * its silence or its unread frames, a page connected, asleep or gone, a
+   * sleeper ended to make room. /page needs no credential and each connection
+   * writes a few, so past this they are counted, by message, into one line
+   * per address when the window ends (ADR 0023's notes).
+   */
+  connectionLinesPerAddress: number;
+  /**
    * Requests one member may make to /mcp per window, every tool counted,
    * checked right after sign-in and before the access check, so refusals
    * count too (ADR 0018), and every 2026-07-28 subscriptions/listen and
@@ -389,6 +398,7 @@ export const DEFAULT_RATE_LIMITS: RelayRateLimits = {
   toolsFramesWindowMs: 10_000,
   ignoredFramesPerSocket: 20,
   ignoredFramesPerAddress: 60,
+  connectionLinesPerAddress: 60,
   requestsPerUser: 240,
   requestsPerInvitee: 60,
   redemptionsPerInvite: 30,

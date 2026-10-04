@@ -6,12 +6,16 @@
 // queued for the stream's life beside the parsed one: fifty strangers, the
 // invitee pool, pinned about 300 MiB of RSS on a 512 MB host with bodies
 // padded to the 2 MiB cap. Now a listen's body is read once, and one over a
-// few kB, far past any real listen, is refused before it opens anything.
+// few kB, far past any real listen, is refused before it opens anything. The
+// same read serves every 2026-07-28 request, so a call waiting on a page holds
+// its body once, not twice: with the clone back, ten calls padded toward the
+// cap held about 18 MiB more while they waited, and no test saw it.
 
 import { type ChildProcess, fork } from 'node:child_process';
 import { resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { DEFAULT_LIMITS } from '../src/index.ts';
+import { connectPage, READ_TOOL, type TestPage } from './helpers/page-client.ts';
 
 const RELAY = resolve(import.meta.dirname, 'fixtures/listen-heap-relay.ts');
 const MIB = 1024 * 1024;
@@ -24,21 +28,27 @@ interface Memory {
 
 let child: ChildProcess | undefined;
 const aborts: AbortController[] = [];
+const pages: TestPage[] = [];
 
 afterEach(() => {
   for (const abort of aborts.splice(0)) abort.abort();
+  for (const page of pages.splice(0)) page.ws.terminate();
   child?.kill('SIGKILL');
   child = undefined;
 });
 
-/** The fixture relay, its /mcp URL, and a way to read its memory after collecting garbage. */
-async function startRelay(): Promise<{ url: string; memory: () => Promise<Memory> }> {
+/** The fixture relay, its /mcp and /page URLs, and a way to read its memory after collecting garbage. */
+async function startRelay(): Promise<{
+  url: string;
+  pageUrl: string;
+  memory: () => Promise<Memory>;
+}> {
   const started = fork(RELAY, [], {
     execArgv: ['--expose-gc'],
     stdio: ['ignore', 'pipe', 'inherit', 'ipc'],
   });
   child = started;
-  const url = await new Promise<string>((resolveUrl, reject) => {
+  const urls = await new Promise<string>((resolveUrl, reject) => {
     started.stdout?.once('data', (chunk: Buffer) => {
       resolveUrl(chunk.toString('utf8').trim());
     });
@@ -53,7 +63,8 @@ async function startRelay(): Promise<{ url: string; memory: () => Promise<Memory
       });
       started.send('measure');
     });
-  return { url, memory };
+  const [url = '', pageUrl = ''] = urls.split(' ');
+  return { url, pageUrl, memory };
 }
 
 /** One stranger's listen, its body padded by this many bytes; whether it streams, held open if so. */
@@ -138,4 +149,81 @@ describe('listen streams and the heap (S9, A4.3)', () => {
     expect(held.every((each) => each.streaming)).toBe(true);
     expect(afterHeld.heapUsed + afterHeld.arrayBuffers, JSON.stringify(afterHeld)).toBeLessThan(16);
   }, 120_000);
+
+  it('holds one copy of the body of each call left waiting on a page, never a second', async () => {
+    const relay = await startRelay();
+    // The page never answers, so every call it is sent waits for its deadline.
+    const page = await connectPage(relay.pageUrl, { tools: [READ_TOOL] });
+    pages.push(page);
+    const pairing = memberCall(relay.url, 'pair_page', { code: page.code }, 0);
+    const request = await page.next('attach_request');
+    page.send({ t: 'attach_decision', requestId: request.requestId, allow: true, role: 'driver' });
+    expect(await pairing).toBe(200);
+    const base = await relay.memory();
+    const calls = 10;
+    const pad = 2 * MIB - 4096;
+    for (let n = 0; n < calls; n += 1) {
+      // Ended by the abort at the end of the test.
+      memberCall(
+        relay.url,
+        'call_page_tool',
+        { page: page.pageId, tool: READ_TOOL.name },
+        pad,
+      ).catch(() => undefined);
+    }
+    // Each body was read, and its call is on the page, before this is measured.
+    for (let n = 0; n < calls; n += 1) await page.next('invoke', 30_000);
+    const now = await relay.memory();
+    const held = {
+      heapUsed: Math.round((now.heapUsed - base.heapUsed) / MIB),
+      arrayBuffers: Math.round((now.arrayBuffers - base.arrayBuffers) / MIB),
+    };
+    // About one padded body a call (2 MiB) at most; a second copy would add as much again.
+    expect(held.heapUsed + held.arrayBuffers, JSON.stringify(held)).toBeLessThan(
+      (calls * pad * 1.4) / MIB,
+    );
+  }, 120_000);
 });
+
+/**
+ * A 2026-07-28 tools/call as the fixture's member, its body padded with this
+ * many spaces; its status once answered, which a call the page holds never is.
+ */
+async function memberCall(
+  url: string,
+  name: string,
+  args: Record<string, unknown>,
+  pad: number,
+): Promise<number> {
+  const abort = new AbortController();
+  aborts.push(abort);
+  const body = JSON.stringify({
+    jsonrpc: '2.0',
+    id: `call:${name}`,
+    method: 'tools/call',
+    params: {
+      name,
+      arguments: args,
+      _meta: {
+        'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+        'io.modelcontextprotocol/clientInfo': { name: 'heap', version: '1.0.0' },
+        'io.modelcontextprotocol/clientCapabilities': {},
+      },
+    },
+  });
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: 'Bearer member-heap-dev-token-7c2e9a4b1d6f8035',
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+      'Mcp-Method': 'tools/call',
+      'Mcp-Name': name,
+      'Mcp-Protocol-Version': '2026-07-28',
+    },
+    body: `${body.slice(0, -1)}${' '.repeat(pad)}}`,
+    signal: abort.signal,
+  });
+  await response.text();
+  return response.status;
+}

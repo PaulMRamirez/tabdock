@@ -7,19 +7,37 @@
 // audit checkpoints and, while the audit disk fails, the records themselves
 // (ADR 0019). Now such lines are written once per kind a window, with the
 // rest counted, an error's message is cut short, and a 2026-07-28 request the
-// SDK refuses costs one request of its caller's budget.
+// SDK refuses costs one request of its caller's budget. The final pass found
+// three such kinds no test held (refused listens, proxied requests, the Node
+// adapter's errors), a call its client abandons charged twice by a mutation
+// no test caught, and the S13 line for a stolen session id sharing the
+// per-kind budget, so a decoy could leave a real presenter unnamed.
 
 import type { Client } from '@modelcontextprotocol/client';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createDevTokenAuth, type DevTokenUser } from '../src/index.ts';
+import { connectPage, type TestPage, TOOLS } from './helpers/page-client.ts';
 import {
   initializeBody,
+  openListen,
   openSession,
   openStream,
   type OpenStream,
   rawPost,
 } from './helpers/raw-mcp.ts';
-import { ALICE, callTool, connectClient, startRelay, type TestRelay } from './helpers/relay.ts';
+import {
+  ALICE,
+  BOB,
+  CAROL,
+  callTool,
+  connectClient,
+  delay,
+  eventually,
+  pairAndApprove,
+  startRelay,
+  type TestRelay,
+} from './helpers/relay.ts';
+import { rawRequest } from './helpers/tunnel.ts';
 
 function invitee(n: number): DevTokenUser {
   return {
@@ -41,10 +59,12 @@ const META = {
 let current: TestRelay | undefined;
 const streams: OpenStream[] = [];
 const clients: Client[] = [];
+const pages: TestPage[] = [];
 
 afterEach(async () => {
   for (const stream of streams.splice(0)) stream.close();
   for (const client of clients.splice(0)) await client.close().catch(() => undefined);
+  for (const page of pages.splice(0)) page.ws.terminate();
   await current?.close();
   current = undefined;
 });
@@ -210,5 +230,141 @@ describe('lines a signed-in account can make /mcp write (A4.3)', () => {
     await current?.close();
     // The 39 the loop ended, and the last one at shutdown.
     expect(tally(lines.slice(before), message)).toEqual({ written: 2, repeated: 38 });
+  });
+
+  it('writes listens refused past the request budget once a window, and counts the rest', async () => {
+    const { relay, lines } = await setup({ rateLimits: { requestsPerInvitee: 1 } });
+    const served = await openListen(relay, G1);
+    streams.push(served);
+    expect(served.streaming).toBe(true);
+    const before = lines.length;
+    for (let i = 0; i < 50; i += 1) {
+      const refused = await openListen(relay, G1);
+      streams.push(refused);
+      expect(refused.text).toMatch(/more than 1 requests to this relay/);
+    }
+    const message = 'listen stream refused: past the request budget';
+    expect(tally(lines.slice(before), message).written).toBe(1);
+    await current?.close();
+    expect(tally(lines.slice(before), message)).toEqual({ written: 1, repeated: 49 });
+  });
+
+  it('writes the refusals of requests made through a proxy once a window, and counts the rest', async () => {
+    const { relay, lines } = await setup();
+    const before = lines.length;
+    for (let i = 0; i < 40; i += 1) {
+      const answer = await rawRequest(relay.url, '/mcp', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${ALICE.token}`,
+          'Content-Type': 'application/json',
+          'X-Forwarded-For': `203.0.113.${String(i)}`,
+        },
+        body: JSON.stringify(initializeBody()),
+      });
+      expect(answer.status).toBe(403);
+    }
+    const message = 'mcp request refused: not made on this machine';
+    expect(tally(lines.slice(before), message).written).toBe(1);
+    await current?.close();
+    expect(tally(lines.slice(before), message)).toEqual({ written: 1, repeated: 39 });
+  });
+
+  it("writes the Node adapter's errors once a window, and counts the rest", async () => {
+    const { relay, lines } = await setup();
+    const before = lines.length;
+    // TRACE passes sign-in, and then the SDK's adapter cannot make a web Request of it.
+    for (let i = 0; i < 30; i += 1) {
+      const answer = await rawRequest(relay.url, '/mcp', {
+        method: 'TRACE',
+        headers: { Authorization: `Bearer ${ALICE.token}` },
+      });
+      expect(answer.status).toBe(500);
+    }
+    const message = 'mcp adapter error';
+    expect(tally(lines.slice(before), message).written).toBe(1);
+    await current?.close();
+    expect(tally(lines.slice(before), message)).toEqual({ written: 1, repeated: 29 });
+  });
+
+  it('charges a 2026-07-28 call its client abandons one request, as the tool did, and no more', async () => {
+    const relay = await setup({
+      rateLimits: { requestsPerUser: 4 },
+      timings: { callDeadlineMs: 10_000 },
+    });
+    // The page holds every call, so only the client's leaving ends this one.
+    const page = await connectPage(relay.relay.pageUrl, { tools: TOOLS });
+    pages.push(page);
+    const alice = await connectClient(relay.relay, ALICE, { modern: true });
+    clients.push(alice);
+    // The first request.
+    await pairAndApprove(alice, page);
+    const abort = new AbortController();
+    // The second, which the SDK answers 499 once its client has gone.
+    const abandoned = alice
+      .callTool(
+        { name: 'call_page_tool', arguments: { page: page.pageId, tool: 'get_view' } },
+        { signal: abort.signal },
+      )
+      .then(
+        () => 'answered',
+        () => 'rejected',
+      );
+    await page.next('invoke');
+    abort.abort();
+    expect(await abandoned).toBe('rejected');
+    await page.next('cancel');
+    await eventually(() => relay.relay.audit.records().length === 1);
+    // Room for the 499 to come back through the relay before the next requests.
+    await delay(200);
+    // The third and the fourth: had the 499 cost one more, the fourth would be refused.
+    expect((await callTool(alice, 'list_pages')).isError).toBe(false);
+    const fourth = await callTool(alice, 'list_pages');
+    expect(fourth.text).not.toMatch(/^rate_limited: /);
+    expect(fourth.isError).toBe(false);
+  });
+
+  it("names each user who presents another user's session id, however many others do (S13)", async () => {
+    const { relay, lines } = await setup({
+      auth: createDevTokenAuth([ALICE, BOB, CAROL, G1, G2]),
+    });
+    const decoy = await openSession(relay, G1);
+    const alices = await openSession(relay, ALICE);
+    const before = lines.length;
+    const present = async (user: DevTokenUser, sessionId: string, times: number): Promise<void> => {
+      for (let i = 0; i < times; i += 1) {
+        const response = await rawPost(
+          relay,
+          user,
+          { jsonrpc: '2.0', id: 1, method: 'tools/list' },
+          { sessionId },
+        );
+        await response.text();
+        // The same answer as for an unknown id (S13).
+        expect(response.status).toBe(404);
+      }
+    };
+    // A decoy pair of accounts first, which used to spend the minute's only line.
+    await present(G2, decoy, 5);
+    await present(BOB, alices, 5);
+    await present(CAROL, alices, 3);
+    const message = 'MCP session id presented by another user';
+    const named = (userId: string): number =>
+      entries(lines.slice(before)).filter(
+        (entry) => entry.msg === message && entry.userId === userId,
+      ).length;
+    expect(named(G2.userId)).toBe(3);
+    expect(named(BOB.userId)).toBe(3);
+    expect(named(CAROL.userId)).toBe(3);
+    await current?.close();
+    // The rest are counted by user, so every presenter is named in a line of its own.
+    expect(
+      entries(lines.slice(before))
+        .filter((entry) => entry.msg === `${message}, repeated`)
+        .map(({ userId, repeated }) => ({ userId, repeated })),
+    ).toEqual([
+      { userId: G2.userId, repeated: 2 },
+      { userId: BOB.userId, repeated: 2 },
+    ]);
   });
 });

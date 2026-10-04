@@ -149,6 +149,8 @@ describe('M4 defaults (ADRs 0017, 0018 and 0019)', () => {
     // A4.3: page frames that change nothing, a minute per socket and per address.
     expect(DEFAULT_RATE_LIMITS.ignoredFramesPerSocket).toBe(20);
     expect(DEFAULT_RATE_LIMITS.ignoredFramesPerAddress).toBe(60);
+    // A4.3, final pass: the lines page connections write, a minute per address.
+    expect(DEFAULT_RATE_LIMITS.connectionLinesPerAddress).toBe(60);
     // ADR 0018: hosted mode's page limits for a 512 MB host.
     expect(HOSTED_LIMITS).toEqual({
       pageSessions: 100,
@@ -805,6 +807,68 @@ describe('frames that change nothing, per socket and per address (S9, ADR 0023)'
     expect(await summaries(relay)).toEqual([
       expect.objectContaining({ repeated: 1, frames: { attach_decision: 1 } }),
     ]);
+  });
+});
+
+// A4.3, final pass: frames past their budget wrote nothing, but each page
+// connection still wrote a line or two of its own (an upgrade refused, a
+// first frame that is not hello, page connected, page asleep, a sleeper
+// ended), as fast as a script could connect: about 2,400 a second from one
+// sequential client with no credential. Now each address writes
+// connectionLinesPerAddress of them a window, and the rest are counted.
+describe('lines each page connection writes, per address (S9, ADR 0023)', () => {
+  const HELD = 'page connection lines went unlogged';
+
+  interface Summary {
+    msg: string;
+    address?: string;
+    repeated?: number;
+    lines?: Record<string, number>;
+  }
+
+  function written(lines: readonly string[], message: string): number {
+    return lines.filter((line) => (JSON.parse(line) as Summary).msg === message).length;
+  }
+
+  it('writes an address its budget of connection lines, counts the rest by message into one line, and leaves other addresses theirs', async () => {
+    const relay = await setup({ logLevel: 'info', rateLimits: { connectionLinesPerAddress: 6 } });
+    const before = relay.lines.length;
+    // Each line is written before the page hears its answer, so none is still to come.
+    for (let i = 0; i < 8; i += 1) await page();
+    for (let i = 0; i < 5; i += 1) {
+      await expect(
+        openSocket(relay.relay.pageUrl, { origin: 'https://elsewhere.example' }),
+      ).rejects.toMatchObject({ status: 403 });
+    }
+    for (let i = 0; i < 5; i += 1) {
+      const raw = new TestPage(await openSocket(relay.relay.pageUrl));
+      pages.push(raw);
+      raw.send({ t: 'ping' });
+      expect(await raw.closed).toEqual({ code: 1008, reason: 'first frame must be hello' });
+    }
+    const flood = relay.lines.slice(before);
+    // About one line for each of 18 connections before; the budget now.
+    expect(written(flood, 'page connected')).toBe(6);
+    expect(written(flood, 'page socket refused: origin not allowed')).toBe(0);
+    expect(written(flood, 'closing page socket: first frame was not hello')).toBe(0);
+    // Another address writes its own.
+    await page({ localAddress: OTHER_ADDRESS });
+    expect(written(relay.lines.slice(before), 'page connected')).toBe(7);
+    await relay.close();
+    const held = relay.lines
+      .map((line) => JSON.parse(line) as Summary)
+      .filter((entry) => entry.msg === HELD);
+    expect(held).toEqual([
+      expect.objectContaining({
+        repeated: 12,
+        lines: {
+          'page connected': 2,
+          'page socket refused: origin not allowed': 5,
+          'closing page socket: first frame was not hello': 5,
+        },
+      }),
+    ]);
+    expect(held[0]?.address).not.toBe(OTHER_ADDRESS);
   });
 });
 

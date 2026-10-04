@@ -9,7 +9,10 @@
 // spends a request budget (ADR 0018 counts tool calls, never initialize), so
 // the lines a client can cause at will, refusals and sessions it opens and
 // drops in a loop, go through the relay's budget for repeated lines
-// (repeated-lines.ts): one per kind a window, the rest counted (A4.3).
+// (repeated-lines.ts): one per kind a window, the rest counted (A4.3). A
+// session id presented by someone other than its owner is evidence of a
+// stolen id, not noise, so that line has a budget of its own per presenting
+// user, and each one is named every window however many others present ids.
 
 import { randomUUID } from 'node:crypto';
 import {
@@ -21,7 +24,7 @@ import {
   WebStandardStreamableHTTPServerTransport,
 } from '@modelcontextprotocol/server';
 import type { Logger, LogFields, LogLevel } from './log.ts';
-import type { RepeatedLog } from './repeated-lines.ts';
+import { type RepeatedLog, RepeatedLines } from './repeated-lines.ts';
 
 /**
  * The invitee tier's sessions (ADRs 0016 and 0017): an invitee may hold one
@@ -88,7 +91,24 @@ export interface SessionOptions {
    * goes to log.
    */
   lines?: RepeatedLog | undefined;
+  /** The window PRESENTED_LINES_PER_USER counts over; a minute by default. */
+  windowMs?: number | undefined;
 }
+
+/**
+ * Lines one user presenting other users' session ids writes in full per
+ * window; past it they are counted into one line naming that user. S13
+ * refuses every such request; the line says someone holds an id that is not
+ * theirs. It once shared the per-kind budget for lines anyone can cause, so
+ * a decoy pair of accounts could spend the window's one line and leave a
+ * real presenter only in an unnamed count (A4.3, final pass).
+ */
+export const PRESENTED_LINES_PER_USER = 3;
+/**
+ * Presenting users tracked in one window; past it the rest share one count,
+ * as auth-log.ts does for addresses, since sign-up is open with invites on.
+ */
+export const MAX_PRESENTERS_TRACKED = 10_000;
 
 interface Session {
   id: string;
@@ -194,10 +214,23 @@ export function closableBody(
 export class McpSessions {
   readonly #options: SessionOptions;
   readonly #sessions = new Map<string, Session>();
+  /** Lines for session ids presented by someone other than their owner, per presenting user. */
+  readonly #presented: RepeatedLines;
   #closed = false;
 
   constructor(options: SessionOptions) {
     this.#options = options;
+    this.#presented = new RepeatedLines({
+      linesPerKey: PRESENTED_LINES_PER_USER,
+      windowMs: options.windowMs ?? 60_000,
+      maxKeys: MAX_PRESENTERS_TRACKED,
+      summary: (userId, held) => {
+        options.log.warn('MCP session id presented by another user, repeated', {
+          ...(userId === null ? { users: 'more than tracked' } : { userId }),
+          repeated: held.repeated,
+        });
+      },
+    });
   }
 
   /** Open sessions, including one whose initialize is still being answered. */
@@ -215,7 +248,9 @@ export class McpSessions {
       const session = this.#sessions.get(sessionId);
       if (!session?.ready || session.closed || session.userId !== userId) {
         if (session?.ready && session.userId !== userId) {
-          this.#line('warn', 'MCP session id presented by another user', { userId });
+          if (this.#presented.take(userId, 'presented', undefined)) {
+            this.#options.log.warn('MCP session id presented by another user', { userId });
+          }
         }
         return sessionNotFound();
       }
@@ -454,5 +489,6 @@ export class McpSessions {
     await Promise.all(
       [...this.#sessions.values()].map((session) => this.#close(session, 'shutdown')),
     );
+    this.#presented.flush();
   }
 }
