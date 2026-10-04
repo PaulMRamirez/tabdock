@@ -101,10 +101,14 @@ const CLOSED = 3;
  * after attach() and replaced any of them (the constructor, the onmessage
  * setter, MessageEvent's data getter) would otherwise sit inside the link
  * from then on or from the next reconnect, reading every relay frame (a
- * redemption's invite secret among them), dropping or rewriting the page's
- * answers, and playing relay. This closes those routes only: the frame's text
- * still goes through the protocol's schema check on the page's built-ins
- * (docs/threat-model.md, B5).
+ * redemption's invite secret among them), dropping or rewriting what the
+ * page sends at the socket, and playing relay. This closes the socket's
+ * routes only. Past it, each relay frame is still checked against the
+ * protocol's schemas on the page's built-ins once parsed, and so is each
+ * frame the page sends before it becomes text; the protocol's JSON.stringify
+ * that makes the text is taken, but still calls any toJSON a later script
+ * defines. So such a script can still read and rewrite frames either way
+ * there, an operator's Deny included (docs/threat-model.md, B5).
  */
 function pageSockets(): SocketFactory {
   const Socket = WebSocket;

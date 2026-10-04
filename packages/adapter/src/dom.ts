@@ -9,9 +9,20 @@
 // reflecting property the widget sets (class, hidden, disabled, title, type
 // and data-*) goes through its attribute, so a handful of taken functions
 // cover them all; an input's value and checked state are properties of their
-// own and are taken too. What this leaves open is in widget.ts's header.
+// own and are taken too. So are the getters that read a box's place off the
+// rectangle getBoundingClientRect returns, as the widget's hold-still rule
+// trusts them: a later script that made them answer a fixed place would keep
+// a box that moved armed. What this leaves open is in widget.ts's header.
 
 import { apply, taken } from './taken.ts';
+
+/** Where a box is, copied off its DOMRect into an object of the widget's own. */
+export interface BoxRect {
+  readonly top: number;
+  readonly left: number;
+  readonly width: number;
+  readonly height: number;
+}
 
 export interface Dom {
   create<K extends keyof HTMLElementTagNameMap>(tag: K): HTMLElementTagNameMap[K];
@@ -25,7 +36,7 @@ export interface Dom {
   prepend(parent: Element, child: Node): void;
   replaceChildren(parent: Element, children: readonly Node[]): void;
   remove(node: Element): void;
-  rect(node: Element): DOMRectReadOnly;
+  rect(node: Element): BoxRect;
   listen(target: EventTarget, type: string, listener: (event: Event) => void): void;
   value(input: HTMLInputElement): string;
   setValue(input: HTMLInputElement, value: string): void;
@@ -48,6 +59,13 @@ export function takeDom(doc: Document): Dom {
   const replaceChildren = taken(probe, 'replaceChildren', 'value');
   const remove = taken(probe, 'remove', 'value');
   const getBoundingClientRect = taken(probe, 'getBoundingClientRect', 'value');
+  // From the chain of a rectangle it returns: DOMRect's own width and height,
+  // and DOMRectReadOnly's top and left.
+  const sample = apply(getBoundingClientRect, probe, []) as DOMRectReadOnly;
+  const getTop = taken(sample, 'top', 'get');
+  const getLeft = taken(sample, 'left', 'get');
+  const getWidth = taken(sample, 'width', 'get');
+  const getHeight = taken(sample, 'height', 'get');
   const addEventListener = taken(probe, 'addEventListener', 'value');
   const getValue = taken(probe, 'value', 'get');
   const setValue = taken(probe, 'value', 'set');
@@ -79,7 +97,16 @@ export function takeDom(doc: Document): Dom {
     remove: (node: Element) => {
       apply(remove, node, []);
     },
-    rect: (node: Element) => apply(getBoundingClientRect, node, []) as DOMRectReadOnly,
+    rect: (node: Element) => {
+      const rect = apply(getBoundingClientRect, node, []) as DOMRectReadOnly;
+      // A literal, not Object.freeze: a later script could patch that and be handed the copy to change.
+      return {
+        top: apply(getTop, rect, []) as number,
+        left: apply(getLeft, rect, []) as number,
+        width: apply(getWidth, rect, []) as number,
+        height: apply(getHeight, rect, []) as number,
+      };
+    },
     listen: (target: EventTarget, type: string, listener: (event: Event) => void) => {
       apply(addEventListener, target, [type, listener]);
     },

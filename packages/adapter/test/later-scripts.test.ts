@@ -1,16 +1,28 @@
-// What a page script that runs after attach() can catch of an invite secret
-// by patching a built-in the adapter calls (S11, S14, threat model B5). The
-// adapter takes the built-ins it hands a secret to once, by the time attach()
-// returns, so patching them later catches nothing: here String.prototype and
-// the typed array length getter while a secret is drawn, and JSON.parse while
-// a redemption arrives. Routes it does not close (zod's RegExp checks, Map,
-// Promise, the panel's DOM) are the residual the threat model records; the
-// browser half of this, the socket and MessageEvent, is in
+// What a page script that runs after attach() can catch of an invite secret,
+// or change of what the page sends, by patching a built-in the adapter calls
+// (S4, S11, S14, threat model B5). The adapter takes the built-ins it hands a
+// secret or a frame's text to once, by the time attach() returns, so
+// patching them later catches nothing: here String.prototype and the typed
+// array length getter while a secret is drawn, JSON.parse while a
+// redemption arrives, and JSON.stringify and the typed array length while
+// the operator's Deny goes out. Routes it does not close (zod's checks, any
+// toJSON, Map, Promise, the panel's DOM) are the residual the threat model
+// records; the browser half of this, the socket and MessageEvent, is in
 // tests/e2e/specs/later-scripts.spec.ts.
 
 import { afterEach, describe, expect, it } from 'vitest';
 import { base64url } from '../src/core.ts';
-import { flush, invitesFrame, link, listingOf, mint, redemption, setup, until } from './harness.ts';
+import {
+  attachRequest,
+  flush,
+  invitesFrame,
+  link,
+  listingOf,
+  mint,
+  redemption,
+  setup,
+  until,
+} from './harness.ts';
 
 const restores: (() => void)[] = [];
 
@@ -133,5 +145,56 @@ describe('a page script that runs after attach() and patches built-ins', () => {
     // The redemption arrived and was checked, with the secret it carried.
     await until(() => h.dock.state.pendingRequests.length + h.dock.state.joins.length > 0);
     expect(parsed.filter((text) => text.includes(minted.secret))).toEqual([]);
+  });
+
+  it("sees no frame the page sends through JSON.stringify or the typed array length, and cannot turn the operator's Deny into Allow there", async () => {
+    const h = setup();
+    const socket = await link(h);
+    socket.deliver(attachRequest(h.clock, 'req-x'));
+    await until(() => h.dock.state.pendingRequests.length > 0, 'the prompt');
+
+    const seen: string[] = [];
+    const isFrame = (text: string): boolean => text.startsWith('{"t":');
+    const stringify = JSON.stringify;
+    const parse = JSON.parse;
+    patch(JSON, 'stringify', {
+      writable: true,
+      value: function (...args: unknown[]): unknown {
+        const text: unknown = Reflect.apply(stringify, JSON, args);
+        if (typeof text !== 'string' || !isFrame(text)) return text;
+        seen.push(text);
+        // What a script that wanted in would hand back: every answer an Allow as driver.
+        const frame = parse(text) as Record<string, unknown>;
+        return frame.t === 'attach_decision'
+          ? Reflect.apply(stringify, JSON, [{ ...frame, allow: true, role: 'driver' }])
+          : text;
+      },
+    });
+    const typedArrayPrototype = Reflect.getPrototypeOf(Uint8Array.prototype) as object;
+    const lengthGetter = Reflect.getOwnPropertyDescriptor(typedArrayPrototype, 'length')?.get;
+    if (!lengthGetter) throw new Error('no typed array length getter');
+    const decoder = new TextDecoder();
+    let busy = false;
+    patch(Uint8Array.prototype, 'length', {
+      get(this: Uint8Array): unknown {
+        const length: unknown = Reflect.apply(lengthGetter, this, []);
+        if (!busy) {
+          busy = true;
+          const text = decoder.decode(this);
+          if (isFrame(text)) seen.push(text);
+          busy = false;
+        }
+        return length;
+      },
+    });
+
+    expect(h.dock.deny('req-x')).toBe(true);
+    await flush();
+    restoreAll();
+
+    expect(
+      socket.framesOf('attach_decision').filter((frame) => frame.requestId === 'req-x'),
+    ).toEqual([{ t: 'attach_decision', requestId: 'req-x', allow: false }]);
+    expect(seen).toEqual([]);
   });
 });
