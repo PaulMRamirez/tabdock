@@ -6,11 +6,14 @@
 //    the loopback Host would still be reachable by any web page open in the
 //    owner's browser (a no-cors POST needs no permission), and by the internet
 //    through a tunnel told to rewrite Host, so the only control is one with no
-//    network surface at all. Adding or removing it tells open sessions the
-//    tool list changed: 2025-era sessions through notifications/tools/
-//    list_changed on their listening GET stream (the SDK sends it when a tool
-//    is registered on a connected server), 2026-07-28 clients through the
-//    SDK's subscriptions/listen bus.
+//    network surface at all. Every server the MCP factory builds lists it
+//    beside the five for members while it exists (mcp.ts), and adding or
+//    removing it tells every member's open sessions and listen streams the
+//    tool list changed, through the notifier relay.ts gives it: 2025-era
+//    sessions get notifications/tools/list_changed on their listening GET
+//    stream, 2026-07-28 clients on their subscriptions/listen streams. A
+//    first-class list change reaches only its own user (ADR 0025); the
+//    marker concerns every member, so the spike tells them all itself.
 // 2. A log line for every tools/list request and every stream a client opens
 //    (a 2025 session's GET stream, a 2026 subscriptions/listen), with the
 //    client's name and, for a session, a short label such as s3.
@@ -34,14 +37,12 @@ import {
   type AuthInfo,
   CLIENT_INFO_META_KEY,
   type CallToolResult,
-  type McpServer,
   readRequestBody,
-  type RegisteredTool,
 } from '@modelcontextprotocol/server';
 import type { AttachVia, ClientInfo } from '@tabdock/protocol';
 import { z } from 'zod';
 import type { Logger } from './log.ts';
-import { parseClientInfo } from './mcp.ts';
+import { type ListedTool, listedInputSchema, parseClientInfo } from './mcp.ts';
 import { newId } from './secrets.ts';
 import { trackBody } from './sessions.ts';
 
@@ -125,9 +126,20 @@ interface Marker {
   addedAt: string;
 }
 
-interface LegacyServer {
-  registered: RegisteredTool | null;
+/** The marker as the MCP factory lists and answers it (mcp.ts). */
+export interface MarkerTool {
+  entry: ListedTool;
+  call(): CallToolResult;
 }
+
+/**
+ * Tells every member's open sessions and listen streams that the tool list
+ * changed; answers how many open 2025-era sessions it told.
+ */
+export type MarkerNotifier = () => number;
+
+/** The marker's input schema: no arguments, as McpServer listed it in M3. */
+const MARKER_INPUT = z.object({});
 
 interface SessionLabel {
   label: string;
@@ -225,9 +237,7 @@ export class Spike implements SpikeControl, SpikeHooks {
   readonly #now: () => number;
   #marker: Marker | null = null;
   #generation = 0;
-  /** Every 2025-era session's server, so a change reaches the sessions already open. */
-  readonly #legacy = new Map<McpServer, LegacyServer>();
-  #notifyModern: (() => void) | null = null;
+  #notify: MarkerNotifier | null = null;
   /** Session id to its label; the id itself is never logged. */
   readonly #sessions = new Map<string, SessionLabel>();
   #nextSession = 1;
@@ -247,22 +257,26 @@ export class Spike implements SpikeControl, SpikeHooks {
     return this.#marker?.name ?? null;
   }
 
-  /** Called for every server the MCP factory builds, so each one lists the marker while it exists. */
-  attachServer(server: McpServer, era: 'legacy' | 'modern'): void {
-    const registered = this.#marker ? this.#register(server, this.#marker) : null;
-    // A 2026-07-28 server lives for one request; the next request builds a new one.
-    if (era !== 'legacy') return;
-    this.#legacy.set(server, { registered });
-    const previous = server.server.onclose;
-    server.server.onclose = () => {
-      this.#legacy.delete(server);
-      previous?.();
+  /** The marker while it exists, else null; the MCP factory lists it for members. */
+  markerTool(): MarkerTool | null {
+    const marker = this.#marker;
+    if (marker === null) return null;
+    const added = `marker ${String(marker.generation)}, added at ${marker.addedAt}`;
+    return {
+      entry: {
+        name: marker.name,
+        title: `Tabdock spike marker ${String(marker.generation)}`,
+        description: `A measurement marker from the Tabdock relay (${added}). It exists only to test whether this client notices a tool list that changes during a conversation. Calling it returns when it was added and does nothing else.`,
+        inputSchema: listedInputSchema(MARKER_INPUT),
+        annotations: { readOnlyHint: true, openWorldHint: false },
+      },
+      call: () => ({ content: [{ type: 'text', text: `Tabdock spike ${added}.` }] }),
     };
   }
 
-  /** How 2026-07-28 clients hear of a change: the handler's subscriptions/listen bus. */
-  setModernNotifier(notify: () => void): void {
-    this.#notifyModern = notify;
+  /** How a change reaches every member's clients (relay.ts). */
+  setNotifier(notify: MarkerNotifier): void {
+    this.#notify = notify;
   }
 
   addMarker(): MarkerChange {
@@ -274,11 +288,7 @@ export class Spike implements SpikeControl, SpikeHooks {
       addedAt: new Date().toISOString(),
     };
     this.#marker = marker;
-    // Registering on a connected server makes the SDK send list_changed itself.
-    const sessions = this.#eachLiveSession((entry, server) => {
-      entry.registered = this.#register(server, marker);
-    });
-    this.#notifyModern?.();
+    const sessions = this.#notify?.() ?? 0;
     this.#log.info('spike: marker tool added', { tool: marker.name, sessions });
     return { changed: true, marker: marker.name, sessions };
   }
@@ -287,41 +297,9 @@ export class Spike implements SpikeControl, SpikeHooks {
     const marker = this.#marker;
     if (!marker) return { changed: false, marker: null, sessions: 0 };
     this.#marker = null;
-    // Removing a registered tool sends list_changed the same way.
-    const sessions = this.#eachLiveSession((entry) => {
-      entry.registered?.remove();
-      entry.registered = null;
-    });
-    this.#notifyModern?.();
+    const sessions = this.#notify?.() ?? 0;
     this.#log.info('spike: marker tool removed', { tool: marker.name, sessions });
     return { changed: true, marker: null, sessions };
-  }
-
-  #eachLiveSession(change: (entry: LegacyServer, server: McpServer) => void): number {
-    let count = 0;
-    for (const [server, entry] of this.#legacy) {
-      if (!server.isConnected()) {
-        this.#legacy.delete(server);
-        continue;
-      }
-      change(entry, server);
-      count += 1;
-    }
-    return count;
-  }
-
-  #register(server: McpServer, marker: Marker): RegisteredTool {
-    const added = `marker ${String(marker.generation)}, added at ${marker.addedAt}`;
-    return server.registerTool(
-      marker.name,
-      {
-        title: `Tabdock spike marker ${String(marker.generation)}`,
-        description: `A measurement marker from the Tabdock relay (${added}). It exists only to test whether this client notices a tool list that changes during a conversation. Calling it returns when it was added and does nothing else.`,
-        inputSchema: z.object({}),
-        annotations: { readOnlyHint: true, openWorldHint: false },
-      },
-      () => ({ content: [{ type: 'text', text: `Tabdock spike ${added}.` }] }),
-    );
   }
 
   // 2. What clients fetch and listen on

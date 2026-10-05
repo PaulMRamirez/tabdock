@@ -19,7 +19,10 @@
 // listen, which spends where it lands (ADR 0030); the review of M5 Step 1
 // found a tools/call with an unknown name or a requestState that is not a
 // string still free, and now every tools/call spends as it arrives too, a
-// fixed tool spending nothing more (ADR 0032).
+// fixed tool spending nothing more (ADR 0032). On the 2025-era leg the
+// relay's own dispatcher spends for every tools/call, an unknown name
+// included, and with first-class tools on for every tools/list (ADRs 0025
+// and 0030).
 
 import type { Client } from '@modelcontextprotocol/client';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -47,6 +50,7 @@ import {
   type TestRelay,
 } from './helpers/relay.ts';
 import { rawRequest } from './helpers/tunnel.ts';
+import { legacyExchange } from './helpers/wire.ts';
 
 function invitee(n: number): DevTokenUser {
   return {
@@ -553,5 +557,80 @@ describe('lines a signed-in account can make /mcp write (A4.3)', () => {
       { userId: G2.userId, repeated: 2 },
       { userId: BOB.userId, repeated: 2 },
     ]);
+  });
+});
+
+describe("the 2025-era leg's spending once the dispatcher spends for every call (ADRs 0025 and 0030)", () => {
+  /** One request on a session, answered whole: its JSON-RPC result or error. */
+  async function onSession(
+    sessionId: string,
+    method: string,
+    params: Record<string, unknown> = {},
+  ): Promise<{
+    result?: { content?: { text?: string }[] };
+    error?: { code: number; message: string };
+  }> {
+    if (!current) throw new Error('no relay');
+    const answer = await legacyExchange(current.relay, ALICE, sessionId, method, params);
+    if (answer.message === null) throw new Error(answer.body);
+    return answer.message as {
+      result?: { content?: { text?: string }[] };
+      error?: { code: number; message: string };
+    };
+  }
+
+  const PAST = 'more than 3 requests to this relay in 1 minute; wait and try again';
+
+  it('spends a request on a tools/call naming a tool the relay does not serve, and refuses those past the budget', async () => {
+    const relay = await setup({ rateLimits: { requestsPerUser: 3 } });
+    const sessionId = await openSession(relay.relay, ALICE);
+    const answers = [];
+    for (let index = 0; index < 5; index += 1) {
+      answers.push(await onSession(sessionId, 'tools/call', { name: 'nope', arguments: {} }));
+    }
+    for (const answer of answers.slice(0, 3)) {
+      expect(answer.error).toEqual({ code: -32602, message: 'Tool nope not found' });
+    }
+    for (const answer of answers.slice(3)) {
+      expect(answer.error).toEqual({ code: -32000, message: PAST });
+    }
+    const listed = await onSession(sessionId, 'tools/call', { name: 'list_pages', arguments: {} });
+    expect(listed.result?.content?.[0]?.text).toMatch(/^rate_limited: more than 3 requests/);
+    // The unknown names asked nothing of a page: one line, no record.
+    const refused = relay.lines.filter((line) =>
+      line.includes('"msg":"mcp request refused: past the request budget"'),
+    );
+    expect(refused).toHaveLength(1);
+    expect(relay.relay.audit.events()).toEqual([
+      expect.objectContaining({ type: 'request_refused', tool: 'list_pages' }),
+    ]);
+  });
+
+  it('spends a request on every tools/list while first-class tools are on, and none while they are off', async () => {
+    for (const firstClassTools of [true, false]) {
+      await current?.close();
+      const relay = await setup({ rateLimits: { requestsPerUser: 3 }, firstClassTools });
+      const sessionId = await openSession(relay.relay, ALICE);
+      const lists = [];
+      for (let index = 0; index < 5; index += 1) {
+        lists.push(await onSession(sessionId, 'tools/list'));
+      }
+      const refused = lists.filter((answer) => answer.error !== undefined);
+      const listed = await onSession(sessionId, 'tools/call', {
+        name: 'list_pages',
+        arguments: {},
+      });
+      if (firstClassTools) {
+        expect(refused.map((answer) => answer.error)).toEqual([
+          { code: -32000, message: PAST },
+          { code: -32000, message: PAST },
+        ]);
+        expect(listed.result?.content?.[0]?.text).toMatch(/^rate_limited: /);
+      } else {
+        // As in M4: this leg's housekeeping is unbudgeted while its lists hold only the five.
+        expect(refused).toEqual([]);
+        expect(listed.result?.content?.[0]?.text).not.toMatch(/^rate_limited: /);
+      }
+    }
   });
 });

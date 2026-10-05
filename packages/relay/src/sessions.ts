@@ -6,21 +6,25 @@
 // call on the owner's server. So every session records its owner, and anyone
 // else presenting its id gets the same 404 as an unknown id before the SDK sees
 // the request (S13). Idle expiry and the caps are ours as well. Nothing here
-// spends a request budget (ADR 0018 counts tool calls, never initialize), so
-// the lines a client can cause at will, refusals and sessions it opens and
-// drops in a loop, go through the relay's budget for repeated lines
-// (repeated-lines.ts): one per kind a window, the rest counted (A4.3). A
-// session id presented by someone other than its owner is evidence of a
-// stolen id, not noise, so that line has a budget of its own per presenting
-// user, and each one is named every window however many others present ids.
+// spends a request budget (the session's server spends for each tools/call,
+// and with first-class tools on for each tools/list, ADRs 0018, 0025 and
+// 0030; never for initialize), so the lines a client can cause at will,
+// refusals and sessions it opens and drops in a loop, go through the relay's
+// budget for repeated lines (repeated-lines.ts): one per kind a window, the
+// rest counted (A4.3). A session id presented by someone other than its owner
+// is evidence of a stolen id, not noise, so that line has a budget of its own
+// per presenting user, and each one is named every window however many others
+// present ids. A tool list change reaches only the sessions of the user whose
+// list changed (notifyUser, ADR 0025), or every member's for the spike's
+// marker, which all of them list (notifyAll).
 
 import { randomUUID } from 'node:crypto';
 import {
   type AuthInfo,
   type HandleRequestOptions,
   isInitializeRequest,
-  type McpServer,
   readRequestBody,
+  type Transport,
   WebStandardStreamableHTTPServerTransport,
 } from '@modelcontextprotocol/server';
 import type { Logger, LogFields, LogLevel } from './log.ts';
@@ -67,9 +71,20 @@ export function rankOf(userId: string, invitees: InviteeSessionOptions | undefin
   return invitees.holds(userId) ? GUEST : STRANGER;
 }
 
+/**
+ * What a session needs of its server: the SDK's low-level Server, which the
+ * relay's factory builds (mcp.ts), or an McpServer in a test.
+ */
+export interface SessionServer {
+  connect(transport: Transport): Promise<void>;
+  close(): Promise<void>;
+  /** Sent on the session's GET stream when it has one; dropped otherwise. */
+  sendToolListChanged(): unknown;
+}
+
 export interface SessionOptions {
-  /** Builds the McpServer for a new session, for the user who opens it. */
-  createServer: (authInfo: AuthInfo, request: Request) => McpServer;
+  /** Builds the server for a new session, for the user who opens it. */
+  createServer: (authInfo: AuthInfo, request: Request) => SessionServer;
   /** The authenticated user's id, or null if the request somehow carries none. */
   ownerOf: (authInfo: AuthInfo | undefined) => string | null;
   /** Sessions one user may hold; a new one evicts their least recently used idle one. */
@@ -114,7 +129,7 @@ interface Session {
   id: string;
   userId: string;
   transport: WebStandardStreamableHTTPServerTransport;
-  server: McpServer;
+  server: SessionServer;
   /** False until the SDK accepts the initialize request; no request can name the session before. */
   ready: boolean;
   /** Responses still streaming, a client's listening GET stream included. Idle means none. */
@@ -482,6 +497,31 @@ export class McpSessions {
     const { lines, log } = this.#options;
     if (lines) lines.write(level, message, fields, detail);
     else log[level](message, fields);
+  }
+
+  /**
+   * Tells the user's open sessions that their tool list changed (ADR 0025);
+   * each hears it on its GET stream if it holds one. No other user's session
+   * hears of it (S13).
+   */
+  notifyUser(userId: string): number {
+    return this.#notify((session) => session.userId === userId);
+  }
+
+  /** Tells every open session whose user `whose` names; the spike's marker concerns every member. */
+  notifyAll(whose: (userId: string) => boolean): number {
+    return this.#notify((session) => whose(session.userId));
+  }
+
+  #notify(which: (session: Session) => boolean): number {
+    let told = 0;
+    for (const session of this.#sessions.values()) {
+      if (!session.ready || session.closed || !which(session)) continue;
+      told += 1;
+      // A session whose stream just went may refuse; the client lists again when it reconnects.
+      Promise.resolve(session.server.sendToolListChanged()).catch(() => undefined);
+    }
+    return told;
   }
 
   async closeAll(): Promise<void> {
