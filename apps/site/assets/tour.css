@@ -1,0 +1,131 @@
+/* The tour's one stylesheet. Tour pages allow styles from the site alone
+   (style-src 'self'), so every rule lives here and none in the pages. */
+
+:root {
+  color-scheme: light dark;
+  --text: #212529;
+  --muted: #495057;
+  --ground: #f8f9fa;
+  --panel: #fff;
+  --rule: #dee2e6;
+  --link: #1c5fc9;
+  font-family: system-ui, sans-serif;
+  line-height: 1.55;
+  color: var(--text);
+  background: var(--ground);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --text: #e9ecef;
+    --muted: #adb5bd;
+    --ground: #16191c;
+    --panel: #212529;
+    --rule: #343a40;
+    --link: #74a7f5;
+  }
+}
+
+body {
+  margin: 0;
+  padding: 0 16px;
+}
+
+header,
+main,
+footer {
+  max-width: 44rem;
+  margin: 0 auto;
+}
+
+header nav {
+  display: flex;
+  gap: 16px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--rule);
+  font-size: 0.9rem;
+}
+
+a {
+  color: var(--link);
+}
+
+h1 {
+  font-size: 1.6rem;
+  line-height: 1.25;
+}
+
+h2 {
+  font-size: 1.2rem;
+  margin-top: 2rem;
+}
+
+code,
+pre {
+  font-family: ui-monospace, monospace;
+  font-size: 0.88em;
+}
+
+code {
+  overflow-wrap: anywhere;
+}
+
+pre {
+  overflow-x: auto;
+  padding: 12px;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+}
+
+pre code {
+  overflow-wrap: normal;
+}
+
+img {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Diagrams keep their drawn size and scroll sideways, so a phone can read them;
+   the white ground keeps Mermaid's dark lines legible in a dark theme. */
+figure.diagram {
+  margin: 1.5rem 0;
+  overflow-x: auto;
+  background: #fff;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 8px;
+}
+
+figure.diagram img {
+  max-width: none;
+  display: block;
+}
+
+table {
+  border-collapse: collapse;
+  display: block;
+  overflow-x: auto;
+}
+
+th,
+td {
+  border: 1px solid var(--rule);
+  padding: 4px 8px;
+}
+
+footer {
+  margin-top: 3rem;
+  padding: 12px 0 24px;
+  border-top: 1px solid var(--rule);
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+footer nav.steps {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 12px;
+}

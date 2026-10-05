@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // DOM for the functions page.evaluate runs in the build's Chromium.
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": ["node"]
+  },
+  "include": ["lib/*.ts", "scripts/*.ts"]
+}

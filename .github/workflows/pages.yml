@@ -1,0 +1,66 @@
+# Publishes the GitHub Pages site (ADR 0029): the demo board's static build at
+# / and the docs/tour explainers at /tour/, built whole by `pnpm site:build`,
+# since each deploy replaces the whole site. It runs only when dispatched on
+# main. Its build job reads the repository and nothing else, so mermaid's
+# packages and Playwright's Chromium run with no token that can publish; its
+# deploy job holds the Pages and OIDC permissions, names the github-pages
+# environment, whose deployment branch rule admits only main, and runs no npm
+# package at all. Every action is pinned by its full commit SHA, its version
+# in the comment, looked up on 5 October 2026.
+
+name: Pages
+
+on:
+  workflow_dispatch:
+
+# Nothing by default; each job asks for what it needs.
+permissions: {}
+
+# One publish at a time, and never one cancelled half way.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build the site
+    # GitHub dispatches a workflow only from a branch that holds it; the environment also admits only main.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+      - run: corepack enable pnpm
+      # What the demo's static build needs, then the site's own packages from
+      # its own lockfile, whose playwright-core matches the workspace's Playwright.
+      - run: pnpm install --frozen-lockfile --filter '@tabdock/demo...'
+      - run: pnpm --dir apps/site install --frozen-lockfile --ignore-workspace
+      - name: Install Chromium for Playwright
+        run: pnpm --dir apps/site exec playwright-core install --with-deps chromium
+      - run: pnpm site:build
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: apps/site/dist
+
+  deploy:
+    name: Publish the site
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.publish.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - id: publish
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

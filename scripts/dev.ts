@@ -84,12 +84,15 @@ if (allowedOrigins && !allowedOrigins.includes(demoOrigin)) {
 }
 // Readable rather than percent-encoded; browsers read the parameter the same way.
 const demoLink = `${demo.url}?relay=${relay.pageUrl}`;
+// The board dials only a relay its visitor chose (ADR 0029), so say why it sits idle until then.
+const waitsForClick = `${' '.repeat(34)}(it dials the relay once you click Connect to ${new URL(relay.pageUrl).host} on it)`;
 
 function localModeBanner(live: Relay, local: LocalModeInfo): string[] {
   return [
     'Tabdock dev: relay and demo board',
     '',
     `  Demo board linked to the relay: ${demoLink}`,
+    waitsForClick,
     '',
     ...localModeLines({
       mcpUrl: live.mcpUrl,
@@ -106,6 +109,7 @@ function devTokenLines(live: Relay): string[] {
     'Tabdock dev: relay and demo board',
     '',
     `  Demo board linked to the relay: ${demoLink}`,
+    waitsForClick,
     `  MCP endpoint:                   ${live.mcpUrl}`,
     `  Page socket:                    ${live.pageUrl}`,
     '',
@@ -128,6 +132,7 @@ function publicLines(live: Relay, publicUrl: string): string[] {
     `  Connector URL for Claude:       ${values.connectorUrl}`,
     `  QR pairing page:                ${values.pairPage}`,
     `  Demo board linked to the relay: ${demoLink}`,
+    waitsForClick,
     `  Relay on this machine:          ${live.url}  (point the tunnel's https address here)`,
     '',
     ...providerLines(values, issuer),

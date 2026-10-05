@@ -47,6 +47,38 @@
       li.error {
         color: #c92a2a;
       }
+      .connect {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        background: #fff;
+        border: 1px solid #dee2e6;
+        border-radius: 8px;
+        font-size: 0.9rem;
+      }
+      .connect input {
+        flex: 1 1 16rem;
+        min-width: 0;
+        font: inherit;
+        padding: 4px 8px;
+      }
+      .connect button {
+        font: inherit;
+        padding: 4px 12px;
+      }
+      .connect-error {
+        flex-basis: 100%;
+        margin: 0;
+        color: #c92a2a;
+      }
+      .connect-error:empty {
+        display: none;
+      }
+      nav.meta a {
+        color: inherit;
+      }
     </style>
   </head>
   <body>
@@ -59,7 +91,11 @@
         <h2 class="meta">Recent tool calls</h2>
         <ol data-role="log" aria-live="polite"></ol>
       </section>
+      <nav class="meta">
+        <a href="tour/">The tour: how Tabdock works, milestone by milestone</a>
+      </nav>
     </main>
-    <script type="module" src="/main.js"></script>
+    <!-- Relative, so a copy served under <user>.github.io/<repository>/ finds its script too. -->
+    <script type="module" src="./main.js"></script>
   </body>
 </html>

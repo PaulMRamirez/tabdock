@@ -13,6 +13,10 @@ export default defineConfig(
       '**/playwright-report/**',
       // Agents' temporary worktrees: other checkouts of this repo, possibly mid-edit.
       '.claude/**',
+      // The Pages site keeps its own packages outside the workspace (ADR 0029),
+      // so a clean clone cannot type its imports; `pnpm site:build` typechecks
+      // and tests it with those packages installed.
+      'apps/site/**',
     ],
   },
   js.configs.recommended,
