@@ -30,7 +30,8 @@
 // the rest counted (repeated-lines.ts, A4.3), as is each /page upgrade refused,
 // within its address's budget (hub.ts). Every 2026-07-28 request spends the
 // caller's request budget once, and an /mcp response its client leaves unread
-// is cut off once it stops moving (response-stalls.ts, ADRs 0030 and 0032).
+// is cut off once it stops moving, or once its user has more such responses
+// than they may (response-stalls.ts, ADRs 0030 and 0032).
 // The client address that /page and /pair count by, and that /mcp's refusal
 // line names, comes from one place (client-address.ts), which answers 400 on
 // a route that counts by address when a host edge names no client (ADR 0018).
@@ -590,7 +591,9 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   const clientLines = createClientLines(log);
   // Refused Origins on /mcp, a few named in full each window apart from the lines above (ADR 0027).
   const originRefusals = new OriginRefusals(log, config.rateLimits.windowMs);
-  // Responses a client leaves unread are cut off once they stop moving (ADR 0030).
+  // Responses a client leaves unread are cut off once they stop moving, and a
+  // user's oldest once more of theirs wait than they may, an invitee a
+  // quarter as many as a member (responsesWaitingFor, ADR 0030 and its notes).
   const stalls = new ResponseStalls({ lines: mcpLines });
   // What each /mcp request's body holds on the heap, measured before either
   // leg reads it, so a call or pairing that waits on a page is charged it
@@ -808,9 +811,16 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   };
   // Every answer goes to the adapter in slices, so a client reading a large
   // one shows progress as each slice is written (response-stalls.ts, ADR 0032).
+  // Before it is written its user's oldest responses waiting past their cap
+  // go, so answers that arrive between two checks cannot pile up unread
+  // (ADR 0030's notes).
   const sliced = {
-    fetch: async (request: Request, options?: McpHandlerRequestOptions): Promise<Response> =>
-      inSlices(await legs.fetch(request, options)),
+    fetch: async (request: Request, options?: McpHandlerRequestOptions): Promise<Response> => {
+      const answer = await legs.fetch(request, options);
+      const userId = userIdOf(options?.authInfo);
+      if (userId !== null) stalls.answering(userId);
+      return inSlices(answer);
+    },
   };
   const mcpNode = toNodeHandler(sliced, {
     maxRequestBodySize: MAX_MCP_BODY_BYTES,
@@ -954,8 +964,9 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     // under exactOptionalPropertyTypes (method is string | undefined there).
     const withAuth = request as IncomingMessage & { auth?: AuthInfo };
     withAuth.auth = authInfo;
-    // Until it finishes or closes: one the client leaves unread is cut off (ADR 0030).
-    stalls.track(response, outcome.user.userId);
+    // Until it finishes or closes: one the client leaves unread is cut off
+    // (ADR 0030), and one queued on a connection that closes is ended with it.
+    stalls.track(response, outcome.user.userId, request.socket);
     await mcpNode(withAuth as NodeIncomingMessageLike, response);
   }
 
