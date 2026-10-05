@@ -115,7 +115,11 @@ function pnpmVersions(): Map<string, string> {
   return single;
 }
 
-/** Where a published @tabdock package's tarball lives on the npm registry. */
+/**
+ * Where a published package's tarball lives on the npm registry, scoped or
+ * not: `<name>/-/<name without its scope>-<version>.tgz`. release-check.ts
+ * holds every entry of the relay's shrinkwrap to it.
+ */
 export function registryTarballUrl(name: string, version: string): string {
   return `https://registry.npmjs.org/${name}/-/${name.slice(name.indexOf('/') + 1)}-${version}.tgz`;
 }

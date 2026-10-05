@@ -6,14 +6,18 @@
 // package's allowlist, or one it needs missing; tests, sources, a .env, an
 // owner token or a header helper; a repository URL other than the one
 // trusted publishing compares; LICENSE and NOTICE other than the root's; a
-// dependency left on workspace:, or a sibling not pinned to the shared
-// version; a script npm would run on install; and for the relay, a second bin,
-// a library entry point, or a shrinkwrap that pins anything but registry
-// tarballs with their integrity, that leaves out a package its tree needs, or
-// that pins a sibling other than the very tarball packed beside it; and a
-// README, which npm shows as the package's page, that names an import the
-// packed manifests would refuse with ERR_PACKAGE_PATH_NOT_EXPORTED. CI runs
-// it on every pack (the pack-install job) and publish.yml before staging.
+// dependency left on workspace:, not pinned exactly, or not on the package's
+// allowlist, or a sibling not pinned to the shared version; an optional, peer
+// or bundled dependency; a script npm would run on install; a bin on the
+// protocol or the adapter, or a bin directory anywhere; and for the relay, a
+// second bin, a library entry point, or a shrinkwrap that pins anything but
+// each package's own registry tarball with a whole sha512, that holds a
+// package npm would run a script for on install, that leaves out a package its
+// tree needs, or that pins a sibling other than the very tarball packed beside
+// it; and a README, which npm shows as the package's page, that names an
+// import the packed manifests would refuse with ERR_PACKAGE_PATH_NOT_EXPORTED.
+// CI runs it on every pack (the pack-install job) and publish.yml before
+// staging.
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -76,6 +80,49 @@ const RULES: Record<PackageName, Rules> = {
     ],
   },
 };
+
+/**
+ * Every package each published package may depend on when it runs: names
+ * from CLAUDE.md's list of approved runtime dependencies, the official MCP
+ * SDK's packages, `jose` and `openid-client` (ADR 0013), and the sibling a
+ * package needs. Whatever reaches the relay's tree reaches every `npx` user,
+ * so a name joins this list only with the owner's approval in an ADR, and
+ * release-check.test.ts holds the workspace's package.json files to it as
+ * well, so an addition fails on its pull request rather than on release day.
+ */
+export const RUNTIME_DEPENDENCIES: Record<PackageName, readonly string[]> = {
+  protocol: ['zod'],
+  adapter: ['@tabdock/protocol', 'qrcode-generator', 'zod'],
+  relay: [
+    '@modelcontextprotocol/node',
+    '@modelcontextprotocol/server',
+    '@tabdock/protocol',
+    'jose',
+    'openid-client',
+    'ws',
+    'zod',
+  ],
+};
+
+/**
+ * Manifest fields that pull packages in beside `dependencies`, which the
+ * allowlist and the exact pins would not see: npm installs optional
+ * dependencies when it can and, from npm 7, peer dependencies too, by range;
+ * bundled ones ship inside the tarball unchecked. None of the three needs one.
+ */
+const OTHER_DEPENDENCY_FIELDS = [
+  'optionalDependencies',
+  'peerDependencies',
+  'peerDependenciesMeta',
+  'bundleDependencies',
+  'bundledDependencies',
+] as const;
+
+/** An exact version, never a range, a tag or a URL. */
+const EXACT_VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+
+/** A sha512 integrity as npm writes it: 64 bytes, so 86 base64 characters and its padding. */
+const SHA512_INTEGRITY = /^sha512-[A-Za-z0-9+/]{86}==$/;
 
 /** Never in a tarball whatever the allowlist says; named so a refusal says why. */
 const FORBIDDEN: [RegExp, string][] = [
@@ -171,8 +218,7 @@ export function checkRelease(dir: string, options: CheckOptions = {}): string[] 
     problems.push(`the packages carry different versions: ${shared.join(', ')}`);
   const version = shared[0];
   if (version === undefined) return problems;
-  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version))
-    problems.push(`${version} is not a version`);
+  if (!EXACT_VERSION.test(version)) problems.push(`${version} is not a version`);
   if (options.tag !== undefined && options.tag !== `v${version}`) {
     problems.push(`the tag ${options.tag} is not v${version}, the packages' version`);
   }
@@ -352,16 +398,31 @@ function checkManifest(
     problems.push(`${where}'s package.json still holds a workspace: specifier`);
   }
   for (const [dependency, spec] of Object.entries(object(manifest.dependencies))) {
+    if (!RUNTIME_DEPENDENCIES[name].includes(dependency)) {
+      problems.push(
+        `${where} depends on ${dependency}, which its allowlist of runtime dependencies does not name`,
+      );
+    }
     if (dependency.startsWith('@tabdock/') && spec !== version) {
       problems.push(
         `${where} depends on ${dependency} ${JSON.stringify(spec)}, not exactly ${version}`,
       );
     }
-    if (typeof spec !== 'string' || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(spec)) {
+    if (typeof spec !== 'string' || !EXACT_VERSION.test(spec)) {
       problems.push(
         `${where} depends on ${dependency} ${JSON.stringify(spec)}, not an exact version`,
       );
     }
+  }
+  problems.push(...otherDependencyProblems(where, manifest));
+  // A library's bin lands in its consumer's node_modules/.bin, where a name
+  // such as node or npm would shadow the real one for every script there.
+  if (name !== 'relay' && manifest.bin !== undefined) {
+    problems.push(`${where} has a bin; only @tabdock/relay may, and only tabdock-relay`);
+  }
+  // npm turns every file in directories.bin into a bin when bin is absent.
+  if (object(manifest.directories).bin !== undefined) {
+    problems.push(`${where} names a bin directory, whose every file npm would link as a bin`);
   }
   for (const script of INSTALL_SCRIPTS) {
     if (object(manifest.scripts)[script] !== undefined) {
@@ -390,6 +451,13 @@ function checkManifest(
     }
   }
   return problems;
+}
+
+/** Each field of a manifest, or the shrinkwrap's root, that pulls packages in beside `dependencies`. */
+function otherDependencyProblems(where: string, manifest: Record<string, Json>): string[] {
+  return OTHER_DEPENDENCY_FIELDS.filter((field) => manifest[field] !== undefined).map(
+    (field) => `${where} has ${field}, which none of the three packages may have`,
+  );
 }
 
 /**
@@ -466,12 +534,21 @@ function checkRelay(
   if (sorted(rootEntry.dependencies) !== sorted(manifest.dependencies)) {
     problems.push("npm-shrinkwrap.json's dependencies are not package.json's");
   }
+  problems.push(...otherDependencyProblems("npm-shrinkwrap.json's root", rootEntry));
   // npm installs a shrinkwrapped package's dependencies from the file alone,
   // so whatever the tree needs and the file leaves out is never installed.
   problems.push(...missingFromShrinkwrap(packages));
   for (const [path, value] of Object.entries(packages)) {
-    if (path === '') continue;
     const entry = object(value);
+    // The install-script refusal on the manifests stops at the relay itself;
+    // npm records here which package in its tree would run one, and npx runs
+    // it on every user's machine, though the workspace's pnpm never does.
+    if (entry.hasInstallScript !== undefined && entry.hasInstallScript !== false) {
+      problems.push(
+        `npm-shrinkwrap.json pins ${path === '' ? 'the relay' : path}, which runs a script on install`,
+      );
+    }
+    if (path === '') continue;
     const name = path.slice(path.lastIndexOf('node_modules/') + 'node_modules/'.length);
     if (name.startsWith('@tabdock/')) {
       // A sibling of this release: exactly the tarball beside the relay, at the URL npm will give it.
@@ -495,14 +572,21 @@ function checkRelay(
       }
       continue;
     }
-    const resolved = entry.resolved;
-    if (typeof resolved !== 'string' || !resolved.startsWith('https://registry.npmjs.org/')) {
+    // The URL must be this very package's tarball at this very version: a
+    // registry prefix alone would let an entry named ws fetch any package,
+    // or an alias fetch another under ws's name.
+    const entryVersion = entry.version;
+    if (typeof entryVersion !== 'string' || !EXACT_VERSION.test(entryVersion)) {
       problems.push(
-        `npm-shrinkwrap.json takes ${path} from ${JSON.stringify(resolved)}, not the npm registry`,
+        `npm-shrinkwrap.json pins ${path} at ${JSON.stringify(entryVersion)}, not an exact version`,
+      );
+    } else if (entry.resolved !== registryTarballUrl(name, entryVersion)) {
+      problems.push(
+        `npm-shrinkwrap.json takes ${path} from ${JSON.stringify(entry.resolved)}, not ${registryTarballUrl(name, entryVersion)}`,
       );
     }
-    if (typeof entry.integrity !== 'string' || !entry.integrity.startsWith('sha512-')) {
-      problems.push(`npm-shrinkwrap.json pins ${path} without a sha512 integrity`);
+    if (typeof entry.integrity !== 'string' || !SHA512_INTEGRITY.test(entry.integrity)) {
+      problems.push(`npm-shrinkwrap.json pins ${path} without a whole sha512 integrity`);
     }
   }
   return problems;

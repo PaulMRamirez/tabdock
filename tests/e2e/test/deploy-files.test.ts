@@ -14,11 +14,14 @@
 // by steps no condition can switch off; a deploy verifies first, stages
 // settings through a pipe and checks the live relay; and the Pages site is
 // published by a workflow of its own, from main, by a deploy job that runs
-// nothing but deploy-pages after a build job that can only read (ADR 0029).
+// nothing but deploy-pages after a build job that can only read (ADR 0029);
+// and Dependabot watches the npm trees as well as the action and image pins,
+// ignoring nothing a published package runs on (ADR 0028's A5.6 notes).
 
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { RUNTIME_DEPENDENCIES } from '../../../scripts/release-check.ts';
 
 const ROOT = resolve(import.meta.dirname, '../../..');
 const read = (path: string): string => readFileSync(join(ROOT, path), 'utf8');
@@ -344,10 +347,35 @@ describe('the workflows', () => {
     expect(image).not.toMatch(/trivy/);
   });
 
-  it('keep Dependabot on the action and image pins', () => {
-    const dependabot = read('.github/dependabot.yml');
-    expect(dependabot).toMatch(/package-ecosystem: github-actions/);
-    expect(dependabot).toMatch(/package-ecosystem: docker/);
+  it('keep Dependabot on the action and image pins and on both npm trees', () => {
+    const dependabot = hashCode(read('.github/dependabot.yml'));
+    const entries = dependabot
+      .split(/\n(?= {2}- package-ecosystem: )/)
+      .slice(1)
+      .map((entry) => ({
+        ecosystem: /^ {2}- package-ecosystem: (\S+)$/m.exec(entry)?.[1],
+        directory: /^ {4}directory: (\S+)$/m.exec(entry)?.[1],
+        text: entry,
+      }));
+    expect(
+      entries.map(({ ecosystem, directory }) => `${ecosystem ?? ''} ${directory ?? ''}`),
+    ).toEqual(['github-actions /', 'docker /', 'npm /', 'npm /apps/site']);
+    for (const { ecosystem, directory, text } of entries) {
+      const where = `${ecosystem ?? ''} ${directory ?? ''}`;
+      expect(text, where).toMatch(/^ {6}interval: weekly$/m);
+      // A limit of 0 turns version updates off; a target branch keeps
+      // security updates from reading the entry at all.
+      expect(text, where).not.toMatch(/open-pull-requests-limit:\s*0\b|target-branch:/);
+    }
+    // Ignoring a package the published three run on would hide the very
+    // pull requests that prompt a release of the relay.
+    const runtime = new Set(Object.values(RUNTIME_DEPENDENCIES).flat());
+    for (const match of dependabot.matchAll(/dependency-name: '([^']+)'/g)) {
+      const glob = match[1] ?? '';
+      const escaped = glob.replace(/[.+?^${}()|[\]\\/]/g, '\\$&').replace(/\*/g, '.*');
+      const pattern = new RegExp(`^${escaped}$`);
+      for (const name of runtime) expect(pattern.test(name), `${glob} ignores ${name}`).toBe(false);
+    }
   });
 });
 

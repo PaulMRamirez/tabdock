@@ -180,7 +180,7 @@ To dispatch from a phone, open the repository in a browser, then Actions, Deploy
 
 **`volume-owner.yml`**, the one-off fallback below, dispatched on `main`, typed confirmation and all, and approved like a deploy.
 
-**`.github/dependabot.yml`** proposes action and base image updates weekly. Nothing merges on its own.
+**`.github/dependabot.yml`** proposes action, base image and npm updates weekly, npm for the workspace and for `apps/site`, and security updates as advisories appear once the owner turns them on (`docs/release.md`). Nothing merges on its own.
 
 ## `deploy/fly/fly.toml`
 

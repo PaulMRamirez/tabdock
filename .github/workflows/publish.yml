@@ -7,7 +7,8 @@ name: Publish
 # GitHub environment `npm`. So a release takes two approvals, and a stolen CI
 # credential can at most stage.
 #
-# The pack job builds and checks the tarballs with read-only access; the stage
+# The pack job, with read-only access, first checks that the tag names a
+# commit on main, then builds and checks the tarballs; the stage
 # job, the only one with an OIDC token, receives only those tarballs and runs
 # no repository code; the last job attaches the tarballs, their checksums and
 # the script-tag file's integrity line to the release. Actions are pinned by
@@ -34,6 +35,36 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+          # Every branch and tag, so the next step can read main's history.
+          fetch-depth: 0
+      # A release ships only reviewed code: the tag must name this run's commit
+      # and that commit must be on main. GitHub reads this file from the tagged
+      # commit, so a tag on an unreviewed commit could drop this step; the `v*`
+      # tag ruleset that only the owner may bypass is the gate that holds
+      # (docs/release.md). This step stops a release drafted on the wrong
+      # commit and writes what the run is about to stage into its summary,
+      # beside the approval the stage job waits for. Before any repository
+      # code runs.
+      - name: Check that the tag is on main
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          tagged="$(git rev-parse --verify --quiet "refs/tags/$TAG^{commit}" || echo none)"
+          on_main=no
+          if [ "$tagged" = "$GITHUB_SHA" ] && git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            on_main=yes
+          fi
+          {
+            echo "### Release $TAG"
+            echo
+            echo "- This run's commit: $GITHUB_SHA"
+            echo "- The tag's commit: $tagged"
+            echo "- On main: $on_main"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$on_main" != yes ]; then
+            echo "the tag $TAG is not this run's commit on main; nothing is staged" >&2
+            exit 1
+          fi
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version-file: .nvmrc
