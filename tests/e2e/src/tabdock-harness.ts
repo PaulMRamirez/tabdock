@@ -395,6 +395,33 @@ export async function widgetText(page: Page, role: string): Promise<string | nul
   }
 }
 
+/**
+ * What a function returns, by value, when run in the page with `this` as the
+ * widget node whose data-role is `role`; null while there is no such node.
+ * For a spec that needs the widget as it is laid out on screen, which the
+ * closed shadow root keeps from page script and from Playwright's selectors.
+ */
+export async function widgetEvaluate(
+  page: Page,
+  role: string,
+  functionDeclaration: string,
+): Promise<unknown> {
+  return withCdp(page, async (cdp) => {
+    const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
+    const node = findNode(root, (n) => attribute(n, 'data-role') === role);
+    if (!node) return null;
+    const { object } = await cdp.send('DOM.resolveNode', { backendNodeId: node.backendNodeId });
+    if (object.objectId === undefined) return null;
+    const { result, exceptionDetails } = await cdp.send('Runtime.callFunctionOn', {
+      objectId: object.objectId,
+      functionDeclaration,
+      returnByValue: true,
+    });
+    if (exceptionDetails) throw new Error(`the function threw: ${exceptionDetails.text}`);
+    return result.value as unknown;
+  });
+}
+
 /** One entry of a widget list as the operator sees it: its text, and its data-* attributes for telling entries apart. */
 export interface WidgetItem {
   text: string;

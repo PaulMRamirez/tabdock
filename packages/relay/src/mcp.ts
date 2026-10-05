@@ -59,6 +59,7 @@ import {
   MAX_RESULT_CHARS,
   OAuthClientIdSchema,
   PairPageInputSchema,
+  plainLine,
   truncate,
   untrustedHeader,
   type UserKind,
@@ -198,14 +199,21 @@ export function errorResult(code: ErrorCode, message: string): CallToolResult {
   return { content: [text(formatError(code, message))], isError: true };
 }
 
-/** A client's name and version as it gave them, capped; null when it gave none. */
+/**
+ * A client's name and version as it gave them, capped and then made one plain
+ * line each (plainLine); null when it gave none. The widget shows them beside
+ * the page's own words, where a line break or a bidirectional override could
+ * forge an entry or turn the page's words around, and the audit and the
+ * relay's lines carry them too. Capping first bounds the work, and a name
+ * that spends its characters on nothing keeps nothing.
+ */
 export function parseClientInfo(raw: unknown): ClientInfo | null {
   if (typeof raw !== 'object' || raw === null) return null;
   const { name, version } = raw as Record<string, unknown>;
   if (typeof name !== 'string' || typeof version !== 'string') return null;
   const parsed = ClientInfoSchema.safeParse({
-    name: name.slice(0, 100),
-    version: version.slice(0, 50),
+    name: plainLine(name.slice(0, 100)),
+    version: plainLine(version.slice(0, 50)),
   });
   return parsed.success ? parsed.data : null;
 }

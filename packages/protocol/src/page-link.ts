@@ -253,7 +253,34 @@ export const AttachInviteSchema = z.object({
 export const AttachViaSchema = z.enum(['code', 'qr', 'invite']);
 export type AttachVia = z.infer<typeof AttachViaSchema>;
 
-/** MCP client name and version, for attribution only; null when the client did not say. */
+/**
+ * Characters that show as nothing yet can turn the words after them around
+ * or hide among them: format characters (the bidirectional controls among
+ * them), a half of a surrogate pair that a cap cut, and every other
+ * default-ignorable code point.
+ */
+const UNSEEN = /[\p{Cf}\p{Cs}\p{Default_Ignorable_Code_Point}]/gu;
+/** Controls, and every kind of space, line break and paragraph break. */
+const BREAKS = /[\p{Cc}\s]+/gu;
+
+/**
+ * Self-declared text, such as a client's name, as it may be shown on one
+ * line beside other words: what shows as nothing goes, each run of controls,
+ * spaces or breaks becomes one space, and the ends are trimmed. Such a name
+ * can then neither start a line of its own nor reorder the words around it,
+ * and it is never longer than it was given.
+ */
+export function plainLine(text: string): string {
+  return text.replace(UNSEEN, '').replace(BREAKS, ' ').trim();
+}
+
+/**
+ * MCP client name and version, for attribution only; null when the client
+ * did not say. The relay keeps them as plainLine leaves them, and the widget
+ * shows them so again, since the adapter does not trust the relay. The schema
+ * itself takes any text within its caps, so audit records written before
+ * that still parse.
+ */
 export const ClientInfoSchema = z.object({
   name: z.string().check(z.maxLength(100)),
   version: z.string().check(z.maxLength(50)),

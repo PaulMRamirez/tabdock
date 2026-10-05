@@ -836,7 +836,7 @@ test.describe('M2: many clients, many users', () => {
       const [name, clientName, tool, outcome] = expected[index] ?? [];
       expect(line.text).toMatch(
         new RegExp(
-          `^\\S+ ${String(name)} via ${String(clientName)} 0\\.0\\.0: ${String(tool)}, ${String(outcome)} in \\d+ ms$`,
+          `^\\S+ ${String(name)} via "${String(clientName)} 0\\.0\\.0": ${String(tool)}, ${String(outcome)} in \\d+ ms$`,
         ),
       );
     });
