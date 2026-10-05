@@ -15,7 +15,7 @@ pnpm install
 pnpm dev
 ```
 
-With no `.env`, the relay runs in local mode: loopback only, one user, and an owner token kept in a private file outside the repository. Without a clone, `npx @tabdock/relay` starts the same relay. Paste the command the relay prints into a terminal: on macOS and Linux a `claude mcp add-json` line whose header helper reads the token as Claude Code connects, so the token never enters the command or Claude Code's settings. Then check it with `claude mcp list` (never `claude mcp get`, which prints a stored header). Open the board link it printed, click Connect, ask Claude to pair with the code in the board's widget, and approve the request on the page.
+With no `.env`, the relay runs in local mode: loopback only, one user, and an owner token kept in a private file outside the repository. Without a clone, `npx @tabdock/relay` starts the same relay. Paste the command the relay prints into a terminal: on macOS and Linux a `claude mcp add-json` line whose header helper reads the token as Claude Code connects, so the token never enters the command or Claude Code's settings. Then check it with `claude mcp list` (never `claude mcp get`, which prints a stored header). Open the board link `pnpm dev` printed, click Connect, ask Claude to pair with the code in the board's widget, and approve the request on the page. A relay started with `npx` prints no board link: attach your own page (below), or start it with the published board's origin in `TABDOCK_ALLOWED_ORIGINS` and allow Chrome's local network prompt there.
 
 ## Claude on the web, desktop and phone
 
