@@ -1,0 +1,41 @@
+# Both MCP revisions, verified
+
+Checked on 5 October 2026 against a relay started in local mode (`TABDOCK_HOME` in a temp directory, port 47801), a recording proxy in front of it, the `@modelcontextprotocol/sdk` and `client` tarballs named below, `@modelcontextprotocol/conformance` 0.2.0-alpha.12 run live, the SDK's changelogs on `main`, the 2025-11-25 and 2026-07-28 transport and versioning pages, Claude's connector docs, and Claude Code 2.1.289 (`latest` on npm) driven headless. `packages/relay/test/{sessions,mcp,listen-streams}.test.ts` pass (65 tests).
+
+## What each leg accepts today
+
+The sessionful leg (`sessions.ts`, ADR 0009) answers `initialize` with the version asked for when it is one of `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05` or `2024-10-07`, the SDK's legacy list, and with `2025-11-25` for anything else, `2026-07-28` included, as the 2025 lifecycle requires. On a session it takes any supported `MCP-Protocol-Version`, treats a missing one as allowed (the spec's 2025-03-26 fallback), and answers 400 to an unknown one or to `2026-07-28`. The strict leg answers `server/discover` with `supportedVersions: ["2026-07-28"]` and `tools.listChanged`, refuses any other envelope version with 400 and `-32022`, and a header that disagrees with the envelope with 400 and `-32020`. Real clients through the proxy: SDK 1.10.2 sends 2024-11-05 (over Streamable HTTP; the deprecated HTTP+SSE transport is not served, so 1.9 and older cannot connect), 1.12.3 sends 2025-03-26, 1.13.0 to 1.24.0 send 2025-06-18, 1.24.1 onward and `client` 2.x by default send 2025-11-25, and `client` 2.x in `auto` or pinned mode speaks 2026-07-28 with no session. Every one listed tools and called `list_pages`. The repo's own tests cover only 2025-11-25 and 2026-07-28.
+
+Two deviations. The relay answers a present, foreign `Origin` with 200 on both legs (a valid token is still needed), while both revisions say a server MUST answer 403; the Host check is what stops DNS rebinding today. And `-32022` lists only `2026-07-28`, though the relay also serves 2025 revisions on the same endpoint, where the spec's dual-era example lists both; that comes from the SDK's `legacy: 'reject'` handler, is harmless for any client, and I would leave it.
+
+## The conformance suite
+
+It exists: `@modelcontextprotocol/conformance`, MIT. `latest` is 0.1.16 (30 March 2026) and knows no 2026-07-28; 0.2.0-alpha.12 (1 October) carries frozen requirement sets for `2025-11-25` and `2026-07-28` and runs each at its own wire. Server scenarios are tagged 2025-03-26 (session lifecycle only), 2025-06-18, 2025-11-25 and 2026-07-28; nothing tests 2024-11-05, and no server scenario tests resource-server authorization. Most scenarios call the referee's fixture tools (`test_simple_text` and so on), prompts and resources, so against the relay they fail by design. Server mode has no header option (issue 453 asks for one, open) and the relay never takes a token in a URL (S11), so I ran it through a loopback proxy that adds the bearer and passes foreign `Host` values through untouched.
+
+Results: on 2026-07-28, `server-stateless` passed 24 of 28 checks (the four failures say "not testable" without diagnostic tools), and `tools-list`, `server-sse-multiple-streams`, `dns-rebinding-protection`, `http-header-validation`, `sep-2164-resource-not-found`, the tools part of `caching` and four `input-required` structure scenarios passed. On 2025-11-25, `server-initialize`, `ping`, `tools-list`, `server-sse-multiple-streams`, `dns-rebinding-protection` and `server-session-lifecycle` passed, the last also at 2025-03-26. With relay defaults the 2025 run hit the per-user cap of 20 sessions (the referee leaves streams open) and got 429; with `TABDOCK_MAX_SESSIONS_PER_USER=200` that cleared. With a baseline listing only fixture scenarios and five SHOULD-level warnings by check id, both requirement runs exit 0, in about 1 and 4 seconds. It runs in this sandbox and needs only Node and npm, so it runs in CI.
+
+## The SDK
+
+The relay already pins the latest: `server`, `client` and `core` 2.3.0, `node` 2.1.1 (all 2 October); `sdk` is 1.32.0. `main` has no pending changesets after the 2.3.0 release, and `pnpm audit --prod` finds nothing. 2.3.0 breaks reuse of one server across connections (the relay builds one per request and per session, so it is unaffected), adds `expectedResource`, `maxToolInputElements` (off by default) and wildcard extension origins, and the client now follows only same-origin redirects. 2.1.0 made a modern POST without `MCP-Protocol-Version` a 400. No move is needed before 0.1.0, only a recheck on release day.
+
+## Claude clients
+
+Claude Code 2.1.289 sends `server/discover`, then every request with `MCP-Protocol-Version: 2026-07-28` and the envelope, naming itself `claude-code` and declaring `roots.listChanged` and `elicitation: {form, url}`; it sends no `Origin`. Its changelog makes 2026-07-28 negotiation with HTTP servers the default on every install from 2.1.274, with `MCP_PROTOCOL_NEGOTIATION=legacy` as the opt-out; with it, and when `server/discover` gets a legacy-looking 400, it initializes at 2025-11-25 on a session and never sends DELETE. Headless runs opened neither a listen stream nor a GET stream. Claude's connector docs name only the 2025-03-26, 2025-06-18 and 2025-11-25 authorization specs and say draft capabilities are unsupported; which revision hosted Claude speaks cannot be seen from here.
+
+## What "verified" should mean
+
+Proposed A5.2, "both revisions verified", has four parts. First, a matrix test in CI: SDK 1.10.2, 1.12.3, 1.24.0 and 1.32.0, and `client` 2.3.0 in legacy, `auto` and pinned mode, each pairing with the sim page, listing and calling a page tool and a first-class tool, asserting the revision and leg (session id or none) and the roster's client name, and receiving `list_changed` on its own channel (GET stream or `subscriptions/listen`). Second, raw probes in CI for the version answers above, plus a foreign `Origin` answered 403. Third, the conformance requirement sets for 2025-11-25 and 2026-07-28 in CI, pinned at 0.2.0-alpha.12 with checked-in baselines; a stale entry fails the run, which is the point. Fourth, outside CI because it needs a signed-in CLI and spends model calls, `check:claude-code:m5` drives Claude Code once by default and once with `MCP_PROTOCOL_NEGOTIATION=legacy` through a page tool, run in the sandbox; hosted Claude's revision goes in `docs/checklists/M5.md`, read from a relay log line on the reference deployment.
+
+## Recommendations
+
+Which revisions to claim: (A) only 2025-11-25 and 2026-07-28; (B) 2025-03-26 through 2026-07-28, with 2024-11-05 over Streamable HTTP as best effort; (C) refuse anything before 2025-06-18. I recommend B: the SDK already accepts them, it costs only the matrix rows, and refusing old clients buys no security.
+
+Conformance: (A) skip it; (B) run everything and read the failures by hand; (C) both requirement sets in CI with a baseline. I recommend C, run by a script that starts the relay with a throwaway `TABDOCK_DEV_TOKENS` token, sets `TABDOCK_MAX_SESSIONS_PER_USER=200` for that run alone, and puts a loopback proxy in front that adds the header and logs nothing. The raised cap does not weaken S9: defaults are unchanged and still tested. The suite is a dev tool outside CLAUDE.md's pre-approved list (it brings express and the v1 SDK), so pin it exactly in `tests/e2e` and say so in the PR.
+
+Origin on `/mcp`: (A) keep Host only; (B) refuse a present Origin outside an allowlist with the SDK's `validateOriginHeader`: loopback hostnames in local and dev-token mode, the public hostname in public and hosted mode, plus `TABDOCK_MCP_ALLOWED_ORIGINS`. I recommend B; it only tightens, and no Claude client sends `Origin`.
+
+SDK: stay on the exact pins and recheck at release; floating ranges would let an unreviewed transport change in.
+
+Hosted Claude: log one info line per user, client name and leg, once a window through the existing repeated-lines budget, with no token, so the owner can read the revision off the reference deployment.
+
+These need one ADR: section 3 gains rows for the conformance suite, Claude Code's negotiation and the SDK recheck; section 7 says which revisions the relay serves and that `/mcp` validates `Origin`; section 10's M5 entry gains A5.2.
