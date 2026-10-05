@@ -610,4 +610,50 @@ describe('pnpm audit:log', () => {
       expect(ran.err[1]).toContain('Usage: pnpm audit:log');
     }
   });
+
+  it('never repeats a directory --dir or TABDOCK_AUDIT_DIR gives, which could be a token, and shows the default it derived (ADR 0028)', () => {
+    const token = `tabdock_${'SECRETsecret'.repeat(3)}SECRET1`;
+    const base = scratch();
+    // A file where the directory should be: it exists, and reading it fails.
+    const notADirectory = join(scratch(), token);
+    writeFileSync(notADirectory, '');
+    const cases: [string[], NodeJS.ProcessEnv, string][] = [
+      [['--dir', token], {}, 'no audit directory at the path --dir gives; check it'],
+      [[`--dir=${token}`], {}, 'no audit directory at the path --dir gives; check it'],
+      [['--dir', join(base, token)], {}, 'no audit directory at the path --dir gives; check it'],
+      [
+        [],
+        { TABDOCK_AUDIT_DIR: token },
+        'no audit directory at the path TABDOCK_AUDIT_DIR gives; check it, or give --dir',
+      ],
+      [
+        [],
+        { TABDOCK_AUDIT_DIR: join(base, token) },
+        'no audit directory at the path TABDOCK_AUDIT_DIR gives; check it, or give --dir',
+      ],
+      [
+        ['--dir', notADirectory],
+        {},
+        'cannot read the audit directory at the path --dir gives (ENOTDIR)',
+      ],
+      [
+        [],
+        { TABDOCK_AUDIT_DIR: notADirectory },
+        'cannot read the audit directory at the path TABDOCK_AUDIT_DIR gives (ENOTDIR)',
+      ],
+    ];
+    for (const [argv, env, reason] of cases) {
+      const ran = run(argv, env);
+      expect(ran.code, reason).toBe(2);
+      expect(leakIn([...ran.out, ...ran.err].join('\n'), token), reason).toBeNull();
+      expect(ran.err, reason).toEqual([reason]);
+    }
+    // The default comes from the token directory, never from a value given for the directory.
+    const home = scratch();
+    const derived = run([], { TABDOCK_HOME: home });
+    expect(derived.code).toBe(2);
+    expect(derived.err).toEqual([
+      `no audit directory at ${join(home, 'audit')}; give --dir or TABDOCK_AUDIT_DIR`,
+    ]);
+  });
 });

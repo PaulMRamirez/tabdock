@@ -151,12 +151,36 @@ function list(values: string[] | undefined): string[] {
   );
 }
 
-/** The directory to read: --dir, then TABDOCK_AUDIT_DIR, then local mode's beside its token. */
-function auditDir(given: string | undefined, env: NodeJS.ProcessEnv): string {
-  if (given !== undefined) return resolve(given);
+interface AuditDir {
+  path: string;
+  /** How a message names the directory. */
+  named: string;
+  /** What a message about a missing directory suggests. */
+  hint: string;
+}
+
+/**
+ * The directory to read: --dir, then TABDOCK_AUDIT_DIR, then local mode's
+ * beside its token. A path the person gave is named only by where it came
+ * from, never repeated: the value after --dir or in the variable may be a
+ * token pasted in the wrong place, and stderr may reach a supervisor's or
+ * CI's log (ADR 0028). The default is shown, since the reader derived it
+ * from the token directory, which TABDOCK_HOME may name only absolutely.
+ */
+function auditDir(given: string | undefined, env: NodeJS.ProcessEnv): AuditDir {
+  if (given !== undefined) {
+    return { path: resolve(given), named: 'the path --dir gives', hint: 'check it' };
+  }
   const fromEnv = env.TABDOCK_AUDIT_DIR?.trim() ?? '';
-  if (fromEnv !== '') return fromEnv;
-  return join(ownerTokenDirectory(env), LOCAL_AUDIT_DIR);
+  if (fromEnv !== '') {
+    return {
+      path: fromEnv,
+      named: 'the path TABDOCK_AUDIT_DIR gives',
+      hint: 'check it, or give --dir',
+    };
+  }
+  const path = join(ownerTokenDirectory(env), LOCAL_AUDIT_DIR);
+  return { path, named: path, hint: 'give --dir or TABDOCK_AUDIT_DIR' };
 }
 
 const AUDIT_OPTIONS = {
@@ -258,7 +282,7 @@ export function runAuditCli(
   }
   let filter: AuditFilter;
   let checkpoint: AuditCheckpoint | undefined;
-  let dir: string;
+  let dir: AuditDir;
   try {
     const types = list(values.type);
     const unknown = types.find((type) => !(AUDIT_EVENT_TYPES as readonly string[]).includes(type));
@@ -291,18 +315,18 @@ export function runAuditCli(
     io.err(escapeForTerminal(error instanceof Error ? error.message : String(error)));
     return 2;
   }
-  if (!existsSync(dir)) {
-    io.err(escapeForTerminal(`no audit directory at ${dir}; give --dir or TABDOCK_AUDIT_DIR`));
+  if (!existsSync(dir.path)) {
+    io.err(escapeForTerminal(`no audit directory at ${dir.named}; ${dir.hint}`));
     return 2;
   }
 
   const lines: ReadLine[] = [];
   try {
-    for (const line of readAuditLines(dir)) lines.push(line);
+    for (const line of readAuditLines(dir.path)) lines.push(line);
   } catch (error) {
     const code =
       typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : 'error';
-    io.err(escapeForTerminal(`cannot read the audit directory ${dir} (${code})`));
+    io.err(escapeForTerminal(`cannot read the audit directory at ${dir.named} (${code})`));
     return 2;
   }
 
