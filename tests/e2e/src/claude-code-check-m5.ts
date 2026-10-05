@@ -15,10 +15,15 @@
 // envelope on every request, no session) and open a subscriptions/listen
 // stream; and once with MCP_PROTOCOL_NEGOTIATION=legacy, where it must
 // initialize at 2025-11-25 on a session and open that session's GET stream.
-// Each run calls call_page_tool and a first-class name, and the relay's audit,
-// its `mcp client` line and the page's roster must name claude-code. The token
-// reaches Claude Code only through its environment, which its configuration
-// names, and no line anything printed may hold it.
+// Each run must get the first-class name in a tools/list answer and send a
+// tools/call by that name and one by call_page_tool, each answered with a
+// result, read off the wire: the audit names the page tool whatever the
+// route, so it cannot tell a first-class call from call_page_tool asked for
+// the same tool, and Claude Code falls back to call_page_tool by itself when
+// a first-class name is missing. The relay's audit, its `mcp client` line and
+// the page's roster must also name claude-code. The token reaches Claude Code
+// only through its environment, which its configuration names, and no line
+// anything printed may hold it.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -204,6 +209,10 @@ try {
     const posts = wire.filter((r) => r.method === 'POST');
     const messages = posts.flatMap((r) => r.messages);
     const methods = (r: RecordedRequest): (string | null)[] => r.messages.map((m) => m.method);
+    const shown = (r: RecordedRequest): string =>
+      r.messages
+        .map((m) => (m.tool === null ? String(m.method) : `${String(m.method)}(${m.tool})`))
+        .join('+') || '-';
     let answer = '';
     try {
       answer = (JSON.parse(ran.output) as { result?: string }).result ?? '';
@@ -217,7 +226,7 @@ try {
       `   requests as they arrived: ${wire
         .map(
           (r) =>
-            `${r.method} ${methods(r).join('+') || '-'}${r.session === null ? '' : ` [${r.session}]`} ${String(r.status)}`,
+            `${r.method} ${shown(r)}${r.session === null ? '' : ` [${r.session}]`} ${String(r.status)}`,
         )
         .join(', ')}`,
     );
@@ -288,6 +297,13 @@ try {
         ],
       );
     }
+    // Which route each call took, read off the wire: the audit names the page
+    // tool whatever the route, so only the name a tools/call asked for says
+    // whether Claude Code used the first-class name or call_page_tool.
+    const callsNamed = (name: string): RecordedRequest[] =>
+      posts.filter((r) =>
+        r.messages.some((m) => m.request && m.method === 'tools/call' && m.tool === name),
+      );
     checks.push(
       ['no request refused 429', !wire.some((r) => r.status === 429)],
       ['no request carried an Origin', !wire.some((r) => r.origin)],
@@ -300,12 +316,21 @@ try {
         line?.revision === (legacy ? '2025-11-25' : '2026-07-28') && line.formElicitation === true,
       ],
       [
-        'call_page_tool get_value ran for claude-code',
-        byClaude.some((record) => record.tool === 'get_value'),
+        `a tools/list answer gave Claude Code the first-class ${firstClass}`,
+        wire.some((r) => r.listed.includes(firstClass)),
       ],
       [
-        `the first-class ${firstClass} ran for claude-code`,
-        byClaude.some((record) => record.tool === 'set_value'),
+        'a tools/call named call_page_tool reached the relay and was answered with a result',
+        callsNamed('call_page_tool').some((r) => r.outcomes.includes('result')),
+      ],
+      [
+        `a tools/call named ${firstClass} reached the relay and was answered with a result`,
+        callsNamed(firstClass).some((r) => r.outcomes.includes('result')),
+      ],
+      [
+        'the audit holds get_value and set_value calls for claude-code',
+        byClaude.some((record) => record.tool === 'get_value') &&
+          byClaude.some((record) => record.tool === 'set_value'),
       ],
       ['the page holds the value Claude set', sim.store.value === marker],
     );

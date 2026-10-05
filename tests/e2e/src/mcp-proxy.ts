@@ -10,9 +10,16 @@
 // header lines and all, so a foreign Host or Origin, or two Origin lines,
 // reach the relay exactly as the client wrote them and the suite's rebinding
 // scenario tests the relay itself; only hop-by-hop headers are dropped, and
-// with a bearer configured the client's own Authorization is replaced. It
-// logs nothing, anywhere: what it records stays in memory for the caller,
-// and a record never holds a token, a session id or a tool's arguments.
+// with a bearer configured the client's own Authorization is replaced. The
+// suite's rebinding probe sends a foreign Host and a foreign Origin together,
+// so either of the relay's guards alone would refuse it; `soleGuard` leaves
+// one guard to refuse it alone, by sending the relay's own Host in place of
+// the client's or by dropping every Origin line, so a run through each fails
+// when that guard is lost. It logs nothing, anywhere: what it
+// records stays in memory for the caller, and a record never holds a token,
+// a session id or a tool's arguments. It does hold the name a tools/call
+// asks for and the names a tools/list answer gives, which the relay's own
+// audit records too, so a check can tell which route a client took.
 
 import {
   createServer,
@@ -47,7 +54,12 @@ export interface RecordedMessage {
   version: string | null;
   /** The client's name, from `initialize` or the envelope. */
   client: string | null;
+  /** The tool a tools/call names, and never its arguments; null for any other message. */
+  tool: string | null;
 }
+
+/** What one JSON-RPC response on an answer said: a result, a tool's error result, or an error. */
+export type AnswerOutcome = 'result' | 'tool-error' | 'error';
 
 export interface RecordedRequest {
   /** The order requests arrived in, from 1. */
@@ -70,6 +82,10 @@ export interface RecordedRequest {
   heard: string[];
   /** The protocolVersion an answer's result named: `initialize`'s negotiated revision. */
   negotiated: string | null;
+  /** The tool names a tools/list result on the answer gave, in order. */
+  listed: string[];
+  /** Each JSON-RPC response heard on the answer, in order. */
+  outcomes: AnswerOutcome[];
 }
 
 export interface McpProxy {
@@ -87,6 +103,14 @@ export interface McpProxyOptions {
   bearer?: string;
   /** Record each request as it arrives. */
   record?: boolean;
+  /**
+   * Which of the relay's rebinding guards a request must meet alone: 'origin'
+   * sends every request with the relay's own Host, so only the Origin check
+   * can refuse a foreign Origin; 'host' drops every Origin line, so only the
+   * Host checks (the allowlist and, without a public URL, the rule that a
+   * request was made on this machine) can refuse a foreign Host.
+   */
+  soleGuard?: 'origin' | 'host';
 }
 
 function firstHeader(headers: IncomingHttpHeaders, name: string): string | null {
@@ -128,8 +152,28 @@ function messagesOf(body: string): RecordedMessage[] {
     const client =
       (method === 'initialize' ? stringAt(message, 'params', 'clientInfo', 'name') : null) ??
       stringAt(message, 'params', '_meta', 'io.modelcontextprotocol/clientInfo', 'name');
-    return { method, request, version, client };
+    const tool = method === 'tools/call' ? stringAt(message, 'params', 'name') : null;
+    return { method, request, version, client, tool };
   });
+}
+
+/** The names of a tools/list result's tools, or none for any other message. */
+function listedNames(message: unknown): string[] {
+  const tools = (message as { result?: { tools?: unknown } }).result?.tools;
+  if (!Array.isArray(tools)) return [];
+  return tools.flatMap((tool) => {
+    const name = stringAt(tool, 'name');
+    return name === null ? [] : [name];
+  });
+}
+
+/** What a JSON-RPC response said, or null for a message that is not one. */
+function outcomeOf(message: unknown): AnswerOutcome | null {
+  const fields = message as Record<string, unknown>;
+  if (fields.id === undefined || typeof fields.method === 'string') return null;
+  if (fields.error !== undefined) return 'error';
+  const result = fields.result as { isError?: unknown } | undefined;
+  return result?.isError === true ? 'tool-error' : 'result';
 }
 
 /** The raw header lines of a message, without hop-by-hop ones and those `drop` names. */
@@ -158,7 +202,10 @@ export async function startMcpProxy(options: McpProxyOptions): Promise<McpProxy>
     }
     return known;
   };
-  const replaceAuth = options.bearer === undefined ? new Set<string>() : new Set(['authorization']);
+  const dropped = new Set<string>();
+  if (options.bearer !== undefined) dropped.add('authorization');
+  if (options.soleGuard === 'origin') dropped.add('host');
+  if (options.soleGuard === 'host') dropped.add('origin');
 
   /** Reads an answer's JSON-RPC messages into its record as they pass, an event stream a line at a time. */
   const readAnswer = (answer: IncomingMessage, entry: RecordedRequest): void => {
@@ -174,6 +221,9 @@ export async function startMcpProxy(options: McpProxyOptions): Promise<McpProxy>
           entry.heard.push(method);
         }
         entry.negotiated = stringAt(message, 'result', 'protocolVersion') ?? entry.negotiated;
+        entry.listed.push(...listedNames(message));
+        const outcome = outcomeOf(message);
+        if (outcome !== null) entry.outcomes.push(outcome);
       }
     };
     answer.on('data', (chunk: Buffer) => {
@@ -193,7 +243,8 @@ export async function startMcpProxy(options: McpProxyOptions): Promise<McpProxy>
   };
 
   const handle = (incoming: IncomingMessage, outgoing: ServerResponse): void => {
-    const headers = forwardable(incoming.rawHeaders, replaceAuth);
+    const headers = forwardable(incoming.rawHeaders, dropped);
+    if (options.soleGuard === 'origin') headers.unshift('Host', upstream.host);
     if (options.bearer !== undefined) headers.push('Authorization', `Bearer ${options.bearer}`);
     const entry: RecordedRequest | null =
       options.record === true
@@ -209,6 +260,8 @@ export async function startMcpProxy(options: McpProxyOptions): Promise<McpProxy>
             openedSession: null,
             heard: [],
             negotiated: null,
+            listed: [],
+            outcomes: [],
           }
         : null;
     const up = httpRequest({
@@ -268,7 +321,12 @@ export async function startMcpProxy(options: McpProxyOptions): Promise<McpProxy>
     url: `http://127.0.0.1:${String(port)}/mcp`,
     requests: () =>
       recorded
-        .map((entry) => ({ ...entry, heard: [...entry.heard] }))
+        .map((entry) => ({
+          ...entry,
+          heard: [...entry.heard],
+          listed: [...entry.listed],
+          outcomes: [...entry.outcomes],
+        }))
         .sort((one, other) => one.seq - other.seq),
     close: () =>
       new Promise<void>((resolve) => {

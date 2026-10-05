@@ -1,13 +1,18 @@
 # What the relay fails of the 2025-11-25 requirement set by design, for
-# @modelcontextprotocol/conformance 0.2.0-alpha.12 (ADR 0027). Every entry is
-# a scenario that calls the referee's own fixture tools, prompts, resources or
-# capabilities, named with its reason in reviewed.json beside this file; the
-# relay serves only its own tools. Scenarios that pass have no entry, and the
-# suite fails the run on an entry whose scenario now passes, so this list can
-# never outlive what it excuses. server-initialize, ping, tools-list,
-# server-sse-multiple-streams, server-session-lifecycle and
-# dns-rebinding-protection must pass with no entry; test/conformance-baselines.test.ts
-# holds this file to reviewed.json. One entry per line, `- <scenario>`, nothing else.
+# @modelcontextprotocol/conformance 0.2.0-alpha.12 (ADR 0027 and its Step 3
+# review notes). A bare scenario calls the referee's own fixture tools,
+# prompts, resources or capabilities; a `<scenario>:<check-id>` entry excuses
+# a SHOULD-level warning, that one check alone; each is named with its reason
+# in reviewed.json beside this file. The relay serves only its own tools.
+# Scenarios that pass have no entry. The suite scores the set's scored
+# scenarios and fails the run on an entry whose scenario now passes;
+# src/conformance.ts holds the unscored ones (json-schema-2020-12 and
+# server-sse-polling here) to the same rule, so this list can never outlive
+# what it excuses. server-initialize, ping, tools-list,
+# server-sse-multiple-streams, dns-rebinding-protection and
+# server-session-lifecycle must pass with no entry, the last two every check;
+# test/conformance-baselines.test.ts holds this file to reviewed.json.
+# One entry per line, `- <scenario>` or `- <scenario>:<check-id>`, nothing else.
 server:
   - logging-set-level
   - completion-complete
@@ -34,3 +39,6 @@ server:
   - prompts-get-with-args
   - prompts-get-embedded-resource
   - prompts-get-with-image
+  - json-schema-2020-12
+  - server-sse-polling:server-sse-priming-event
+  - server-sse-polling:server-sse-retry-field

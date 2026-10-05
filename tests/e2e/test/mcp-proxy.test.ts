@@ -4,7 +4,10 @@
 // so the suite's rebinding scenario tests the relay's own checks; replace the
 // client's Authorization with the run's bearer when it has one; record each
 // request as it arrives, before any answer, since the relay holds back a GET
-// stream's head; keep no token, session id or argument in a record; and log
+// stream's head, with the tool a tools/call names, the names a tools/list
+// answer gives and what each answer said, so a check can tell which route a
+// client took; keep no token, session id or argument in a record; leave one
+// rebinding guard alone to refuse a probe when asked (soleGuard); and log
 // nothing at all.
 
 import { createServer, request as httpRequest, type IncomingMessage, type Server } from 'node:http';
@@ -34,12 +37,21 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
+/** Each answer the upstream gives to a POST whose body holds the key, in place of initialize's. */
+const ANSWERS: Record<string, string> = {
+  'tools/list':
+    '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"list_pages","inputSchema":{}},{"name":"pg_1__set_value","inputSchema":{}}]}}',
+  'tool-error': '{"jsonrpc":"2.0","id":1,"result":{"content":[],"isError":true}}',
+  'rpc-error': '{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"nope"}}',
+};
+
 /** An upstream that keeps each request's raw header lines, holds GETs until released, and answers JSON-RPC. */
 async function startUpstream(): Promise<{ origin: string; seen: IncomingMessage['rawHeaders'][] }> {
   const seen: string[][] = [];
   upstream = createServer((request, response) => {
     seen.push([...request.rawHeaders]);
-    request.resume();
+    let body = '';
+    request.on('data', (chunk: Buffer) => (body += chunk.toString('utf8')));
     if (request.method === 'GET') {
       release = () => {
         if (response.headersSent) return;
@@ -56,7 +68,12 @@ async function startUpstream(): Promise<{ origin: string; seen: IncomingMessage[
         'Content-Type': 'application/json',
         'Mcp-Session-Id': 'sess-secret-123',
       });
-      response.end('{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}');
+      const key = Object.keys(ANSWERS).find((one) => body.includes(one));
+      response.end(
+        key === undefined
+          ? '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}'
+          : ANSWERS[key],
+      );
     });
   });
   await new Promise<void>((resolve) => upstream?.listen(0, '127.0.0.1', resolve));
@@ -181,15 +198,84 @@ describe('the loopback proxy', () => {
       expect(proxy?.requests()[1]?.heard).toEqual(['notifications/tools/list_changed']);
     });
     const records = proxy.requests();
+    // The tool a call names is kept, as the relay's own audit keeps it, so a
+    // check can tell which route a client took; its arguments never are.
     expect(records[0]).toMatchObject({
       session: 's1',
       negotiated: '2025-11-25',
-      messages: [{ method: 'tools/call', request: true, version: null, client: null }],
+      messages: [
+        { method: 'tools/call', request: true, version: null, client: null, tool: 'set_value' },
+      ],
+      outcomes: ['result'],
     });
     const text = JSON.stringify(records);
-    for (const secret of ['run-token', 'sess-secret-123', 'argument-secret-456', 'set_value']) {
+    for (const secret of ['run-token', 'sess-secret-123', 'argument-secret-456', '"value"']) {
       expect(text).not.toContain(secret);
     }
+  });
+
+  it('records the names a tools/list answer gives and what each answer said, and no tool name for any other method', async () => {
+    const { origin } = await startUpstream();
+    proxy = await startMcpProxy({ upstream: origin, record: true });
+    const post = (message: Record<string, unknown>): Promise<{ status: number }> =>
+      send(
+        proxy?.url ?? '',
+        'POST',
+        ['Content-Type', 'application/json'],
+        JSON.stringify({ jsonrpc: '2.0', id: 1, ...message }),
+      );
+    await post({ method: 'tools/list', params: {} });
+    await post({ method: 'tools/call', params: { name: 'tool-error', arguments: {} } });
+    await post({ method: 'tools/call', params: { name: 'rpc-error', arguments: {} } });
+    // A name in any other method's params is not a tool's.
+    await post({ method: 'prompts/get', params: { name: 'a-prompt' } });
+    await vi.waitFor(() => {
+      expect(proxy?.requests().map((r) => r.outcomes)).toEqual([
+        ['result'],
+        ['tool-error'],
+        ['error'],
+        ['result'],
+      ]);
+    });
+    const records = proxy.requests();
+    expect(records[0]?.listed).toEqual(['list_pages', 'pg_1__set_value']);
+    expect(records.slice(1).map((r) => r.listed)).toEqual([[], [], []]);
+    expect(records.map((r) => r.messages[0]?.tool)).toEqual([
+      null,
+      'tool-error',
+      'rpc-error',
+      null,
+    ]);
+  });
+
+  it("leaves the Origin check alone to refuse a rebinding probe: the relay's own Host in place of any other", async () => {
+    const { origin, seen } = await startUpstream();
+    proxy = await startMcpProxy({ upstream: origin, bearer: 'run-token', soleGuard: 'origin' });
+    await send(
+      proxy.url,
+      'POST',
+      ['Host', 'evil.example.com', 'Origin', 'http://evil.example.com'],
+      '{}',
+    );
+    const headers = pairs(seen[0] ?? []);
+    expect(headers.filter(([name]) => name === 'host')).toEqual([['host', new URL(origin).host]]);
+    expect(headers.filter(([name]) => name === 'origin')).toEqual([
+      ['origin', 'http://evil.example.com'],
+    ]);
+  });
+
+  it('leaves the Host checks alone to refuse a rebinding probe: every Origin line dropped', async () => {
+    const { origin, seen } = await startUpstream();
+    proxy = await startMcpProxy({ upstream: origin, bearer: 'run-token', soleGuard: 'host' });
+    await send(
+      proxy.url,
+      'POST',
+      ['Host', 'evil.example.com', 'Origin', 'http://evil.example.com', 'Origin', 'http://b.test'],
+      '{}',
+    );
+    const headers = pairs(seen[0] ?? []);
+    expect(headers.filter(([name]) => name === 'host')).toEqual([['host', 'evil.example.com']]);
+    expect(headers.filter(([name]) => name === 'origin')).toEqual([]);
   });
 
   it('logs nothing, on any channel', async () => {

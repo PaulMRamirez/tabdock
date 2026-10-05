@@ -1,13 +1,19 @@
 # What the relay fails of the 2026-07-28 requirement set by design, for
-# @modelcontextprotocol/conformance 0.2.0-alpha.12 (ADR 0027). A bare
-# scenario calls the referee's own fixture tools, prompts or resources; a
+# @modelcontextprotocol/conformance 0.2.0-alpha.12 (ADR 0027 and its Step 3
+# review notes). A bare scenario either calls the referee's own fixture
+# tools, prompts or resources, or belongs to an optional extension the relay
+# does not offer and the set runs unscored (the tasks scenarios); a
 # `<scenario>:<check-id>` entry excuses that one check alone, either one that
-# needs a diagnostic fixture tool the relay does not serve or a SHOULD-level
-# warning, each named with its reason in reviewed.json beside this file. Every
-# other check of server-stateless, caching and the rest must pass, as must
-# dns-rebinding-protection and http-header-validation with no entry; the
-# suite fails the run on an entry that now passes, src/conformance.ts fails it
-# when an excused check fails for any other reason, and
+# cannot reach the relay (the suite reports it "Not testable" for want of a
+# tool the relay does not serve, or it needs a method of a capability the
+# relay never declares) or a SHOULD-level warning; each is named with its
+# reason in reviewed.json beside this file. Every other check of
+# server-stateless, caching, http-custom-header-server-validation and the
+# rest must pass, as must dns-rebinding-protection and http-header-validation,
+# every check and with no entry. The suite scores the set's scored scenarios
+# and fails the run on an entry that now passes; src/conformance.ts holds the
+# unscored ones to the same rule, and fails the run when an excused check
+# fails in other words than reviewed.json gives; and
 # test/conformance-baselines.test.ts holds this file to reviewed.json.
 # One entry per line, `- <scenario>` or `- <scenario>:<check-id>`, nothing else.
 server:
@@ -38,6 +44,16 @@ server:
   - input-required-result-result-type
   - input-required-result-tampered-state
   - input-required-result-capability-check
+  - json-schema-2020-12
+  - tasks-capability-negotiation
+  - tasks-dispatch-and-envelope
+  - tasks-lifecycle
+  - tasks-mrtr-composition
+  - tasks-mrtr-input
+  - tasks-request-headers
+  - tasks-request-state-removal
+  - tasks-required-task-error
+  - tasks-wire-fields
   - server-stateless:sep-2575-server-rejects-undeclared-capability
   - server-stateless:sep-2575-missing-capability-http-400
   - server-stateless:sep-2575-http-server-no-independent-requests-on-stream
@@ -46,6 +62,11 @@ server:
   - caching:sep-2549-prompts-list-caching-hints
   - caching:sep-2549-resources-list-caching-hints
   - caching:sep-2549-resources-templates-list-caching-hints
+  - http-custom-header-server-validation:sep-2243-server-no-xmcp-tool
+  - http-custom-header-server-validation:sep-2243-server-decode-base64
+  - http-custom-header-server-validation:sep-2243-server-validate-param-match
+  - http-custom-header-server-validation:sep-2243-server-reject-invalid-param-chars
+  - http-custom-header-server-validation:sep-2243-server-reject-param-mismatch
   - sep-2164-resource-not-found:sep-2164-error-code
   - sep-2164-resource-not-found:sep-2164-data-uri
   - input-required-result-ignore-extra-params:sep-2322-ignore-unexpected-params

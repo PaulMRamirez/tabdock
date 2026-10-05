@@ -326,6 +326,11 @@ describe('the client matrix (A5.2), with first-class tools on', () => {
       const messages = posts.flatMap((r) => r.messages);
       const named = messages.filter((message) => message.client !== null);
       expect(new Set(named.map((message) => message.client))).toEqual(new Set([row.name]));
+      // Each route as the relay received it, and the first-class name a tools/list answer gave.
+      expect(
+        messages.filter((message) => message.method === 'tools/call').map((m) => m.tool),
+      ).toEqual(['pair_page', 'list_page_tools', `${pageId}__set_value`, 'call_page_tool']);
+      expect(wire.some((r) => r.listed.includes(`${pageId}__set_value`))).toBe(true);
       if (row.leg === 'session') {
         expect(client.sessionId()).toBeDefined();
         const [first] = posts;

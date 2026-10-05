@@ -5,13 +5,17 @@
 // 2026-07-28 and an unknown date included, as the 2025 lifecycle requires; on
 // a session a missing MCP-Protocol-Version passes, as 2025-06-18 allows for a
 // client of an earlier revision, while 2026-07-28 or an unknown one gets 400.
-// The strict leg answers server/discover with 2026-07-28 alone, a header that
-// disagrees with the envelope with -32020, and a revision it does not serve
-// with -32022, whose data.supported the relay rewrites to every revision /mcp
-// serves, newest first, since 2026-07-28 says a server MUST list the versions
-// it supports and the same endpoint serves the 2025 ones on a session; the
-// rewrite changes nothing else, on a listen as on any other request, and
-// every other answer passes untouched.
+// The strict leg answers a header that disagrees with the envelope with
+// -32020, and a revision it does not serve with -32022, whose data.supported
+// the relay rewrites to every revision /mcp serves, newest first, since
+// 2026-07-28 says a server MUST list the versions it supports and the same
+// endpoint serves the 2025 ones on a session; the rewrite changes nothing
+// else, on a listen as on any other request, and every other answer passes
+// untouched. server/discover lists the same revisions, so every one a -32022
+// names is one discover names too (ADR 0027's Step 3 review notes); the
+// golden test holds the rest of discover's answer as M4 sent it. This file,
+// not the conformance suite, guards the -32022 list: the suite only asks
+// that the list name nothing discover does not.
 
 import { afterEach, describe, expect, it } from 'vitest';
 import type { DevTokenUser, Relay } from '../src/index.ts';
@@ -162,14 +166,30 @@ describe('MCP-Protocol-Version on a session', () => {
 });
 
 describe('the strict leg', () => {
-  it('answers server/discover with 2026-07-28 alone and the tools capability', async () => {
+  it('answers server/discover with every revision /mcp serves, the -32022 list, and the tools capability', async () => {
     current = await startRelay();
     const answer = await modernExchange(current.relay, ALICE, 'server/discover');
     expect(answer.status).toBe(200);
     expect(answer.message?.result).toMatchObject({
-      supportedVersions: ['2026-07-28'],
+      supportedVersions: [...SERVED_REVISIONS],
       capabilities: { tools: { listChanged: true } },
     });
+    // A client may read the refusal's list against discover's, as the
+    // conformance suite does: every revision a -32022 names is in discover.
+    const refused = await modernExchange(
+      current.relay,
+      ALICE,
+      'tools/list',
+      {},
+      {
+        version: '2027-01-01',
+      },
+    );
+    const supported = (refused.message?.error as { data?: { supported?: unknown } } | undefined)
+      ?.data?.supported;
+    expect(supported).toEqual(
+      (answer.message?.result as { supportedVersions?: unknown }).supportedVersions,
+    );
   });
 
   it('answers a header that disagrees with the envelope 400 with -32020', async () => {

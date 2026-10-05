@@ -14,17 +14,29 @@
 // header and the relay never takes a token in a URL (S11), so the suite
 // talks to a loopback proxy (mcp-proxy.ts) that adds the bearer header, logs
 // nothing and passes Host and Origin through untouched, so the suite's
-// rebinding scenario tests the relay's own checks.
+// rebinding scenario reaches the relay's own checks. That scenario sends a
+// foreign Host and a foreign Origin in one request, which either guard alone
+// refuses, so it shows only that the relay has not lost both; two more runs
+// of it, through proxies that each leave one guard to refuse it alone
+// (soleGuard: the relay's own Host in place of the foreign one, or no Origin
+// at all), show that neither is lost. Without a public URL, as here, a
+// foreign Host meets both the Host allowlist and the rule that a request was
+// made on this machine, so the Host run fails only when both go;
+// mcp-origin.test.ts and hosted.test.ts in the relay hold each rule alone in
+// `pnpm test`.
 //
 // `@modelcontextprotocol/conformance` 0.2.0-alpha.12, pinned exactly in
 // tests/e2e, runs the 2025-11-25 set and then the 2026-07-28 set, each at its
 // own wire, against tests/e2e/conformance/<revision>.yaml, a baseline that
 // lists only what reviewed.json beside it names (conformance-baselines.ts).
 // The suite fails a run on an unexpected failure and on a stale entry, one
-// that now passes; this script also fails it when an excused check failed for
-// another reason than the one reviewed, or when dns-rebinding-protection or
-// http-header-validation did not pass every check (the suite does not score
-// the second in this alpha), and when anything printed holds the token.
+// that now passes, but only in the set's scored scenarios; this script holds
+// the unscored ones to the same rule, and also fails a run when a scenario
+// of the set did not run, when an excused check failed in other words than
+// the ones reviewed, when dns-rebinding-protection, http-header-validation or
+// server-session-lifecycle did not pass every check (the suite scores none
+// but the first), when a wire-schema-valid check failed anywhere, and when
+// anything printed holds the token.
 
 import { randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -42,6 +54,8 @@ import {
   readRun,
   reviewedProblems,
   runProblems,
+  SOLE_GUARDS,
+  soleGuardProblems,
 } from './conformance-baselines.ts';
 import { freePort } from './harness.ts';
 import { blankEnv, type Run, runPnpm } from './local-harness.ts';
@@ -175,6 +189,37 @@ async function main(kept: string | null): Promise<boolean> {
       outcomes.push([revision, ran.code === 0]);
       after.push(...runProblems(revision, readRun(out), entries.get(revision) ?? [], reviewed));
     }
+    const guarded: string[] = [];
+    for (const revision of REVISIONS) {
+      for (const guard of SOLE_GUARDS) {
+        say(
+          `\n=== ${revision}: dns-rebinding-protection with ${guard === 'origin' ? 'the Origin check' : 'the Host checks'} alone ===`,
+        );
+        const alone = await startMcpProxy({
+          upstream: `http://127.0.0.1:${String(port)}`,
+          bearer: token,
+          soleGuard: guard,
+        });
+        try {
+          const out = join(results, `${revision}-${guard}-alone`);
+          const ran = await runSuite([
+            'server',
+            '--url',
+            alone.url,
+            '--scenario',
+            'dns-rebinding-protection',
+            '--spec-version',
+            revision,
+            '--output-dir',
+            out,
+          ]);
+          clean = show(ran.output.trimEnd()) && clean;
+          guarded.push(...soleGuardProblems(revision, guard, readRun(out)));
+        } finally {
+          await alone.close();
+        }
+      }
+    }
     await relay.stop();
     const relayClean = leakIn(`${relay.stdout()}\n${relay.stderr()}`, token) === null;
     say('');
@@ -184,13 +229,23 @@ async function main(kept: string | null): Promise<boolean> {
       );
     }
     say(
-      `   ${after.length === 0 ? 'ok  ' : 'FAIL'} dns-rebinding-protection and http-header-validation passed every check, and each excused check failed only for its reviewed reason`,
+      `   ${after.length === 0 ? 'ok  ' : 'FAIL'} every scenario ran; dns-rebinding-protection, http-header-validation and server-session-lifecycle passed every check; every unscored scenario met its baseline; each excused check failed only for its reviewed reason; and no wire-schema-valid check failed`,
     );
     for (const problem of after) say(`        ${problem}`);
+    say(
+      `   ${guarded.length === 0 ? 'ok  ' : 'FAIL'} dns-rebinding-protection passed every check with the Origin check alone and with the Host checks alone, on both revisions`,
+    );
+    for (const problem of guarded) say(`        ${problem}`);
     say(`   ${relayClean ? 'ok  ' : 'FAIL'} the relay printed no part of the run token`);
     say(`   ${clean ? 'ok  ' : 'FAIL'} the suite printed no part of the run token`);
     if (kept !== null) say(`\nEach scenario's checks.json is kept under ${kept}.`);
-    return outcomes.every(([, ok]) => ok) && after.length === 0 && relayClean && clean;
+    return (
+      outcomes.every(([, ok]) => ok) &&
+      after.length === 0 &&
+      guarded.length === 0 &&
+      relayClean &&
+      clean
+    );
   } finally {
     await proxy?.close();
     await relay?.stop();

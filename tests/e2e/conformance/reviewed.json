@@ -1,5 +1,5 @@
 {
-  "about": "The reviewed list of ADR 0027: everything a conformance baseline (2025-11-25.yaml, 2026-07-28.yaml beside this file) may excuse, each with why. fixtureScenarios are whole scenarios that call the referee's own fixture tools, prompts, resources or capabilities, which the relay does not serve and should not. fixtureChecks are single checks, in scenarios whose other checks must pass, that need one of the referee's diagnostic fixture tools; a run fails if one of them fails for any reason but a fixture the relay lacks. shouldWarnings are single SHOULD-level checks; a run fails if one of them fails as anything but a warning. Nothing here may name dns-rebinding-protection or http-header-validation, and nothing may excuse a MUST-level check of a scenario that does not depend on the referee's fixtures. test/conformance-baselines.test.ts holds both baselines to this list and this list to those rules; change it only in a reviewed commit.",
+  "about": "The reviewed list of ADR 0027 and its Step 3 review notes: everything a conformance baseline (2025-11-25.yaml, 2026-07-28.yaml beside this file) may excuse, each with why. fixtureScenarios are whole scenarios that call the referee's own fixture tools, prompts, resources or capabilities, which the relay does not serve and should not. untestableChecks are single checks, in scenarios whose other checks must pass, that cannot reach the relay at all: the suite itself reports them \"Not testable\" for want of a tool the relay does not serve (notTestable gives the words after \"Not testable: \"), or they need a method of a capability the relay never declares, which it answers -32601 (unknownMethod); a run fails if one of them fails in any other words. shouldWarnings are single SHOULD-level checks; a run fails if one of them fails as anything but a warning. extensionScenarios are whole scenarios of an optional extension the relay does not offer, allowed only where the set itself runs them unscored as an extension. Nothing here may name dns-rebinding-protection, http-header-validation, server-session-lifecycle or any wire-schema-valid check, and every other MUST-level check must pass. test/conformance-baselines.test.ts holds both baselines to this list and this list to those rules, and src/conformance.ts holds each run to them; change it only in a reviewed commit.",
   "fixtureScenarios": {
     "logging-set-level": "sets the log level of the referee's fixture logging capability; the relay declares no logging capability, so logging/setLevel is an unknown method (-32601)",
     "completion-complete": "completes an argument of the referee's fixture prompt; the relay serves no prompts and declares no completions capability",
@@ -35,22 +35,77 @@
     "input-required-result-non-tool-request": "gets the referee's fixture prompt test_input_required_result_prompt",
     "input-required-result-result-type": "calls the referee's fixture tool test_input_required_result_elicitation",
     "input-required-result-tampered-state": "calls the referee's fixture tool test_input_required_result_tampered_state",
-    "input-required-result-capability-check": "calls the referee's fixture tool test_input_required_result_capabilities"
+    "input-required-result-capability-check": "calls the referee's fixture tool test_input_required_result_capabilities",
+    "json-schema-2020-12": "calls the referee's fixture tool json_schema_2020_12_tool"
   },
-  "fixtureChecks": {
-    "server-stateless:sep-2575-server-rejects-undeclared-capability": "needs the referee's diagnostic fixture tool test_missing_capability",
-    "server-stateless:sep-2575-missing-capability-http-400": "needs the referee's diagnostic fixture tool test_missing_capability",
-    "server-stateless:sep-2575-http-server-no-independent-requests-on-stream": "needs the referee's diagnostic fixture tool test_streaming_elicitation",
-    "server-stateless:sep-2575-server-no-log-without-loglevel": "needs the referee's diagnostic fixture tool test_logging_tool",
-    "caching:sep-2549-prompts-list-caching-hints": "lists the referee's fixture prompts; the relay serves no prompts (-32601)",
-    "caching:sep-2549-resources-list-caching-hints": "lists the referee's fixture resources; the relay serves no resources (-32601)",
-    "caching:sep-2549-resources-templates-list-caching-hints": "lists the referee's fixture resource templates; the relay serves none (-32601)"
+  "untestableChecks": {
+    "server-stateless:sep-2575-server-rejects-undeclared-capability": {
+      "reason": "needs the referee's diagnostic fixture tool test_missing_capability, which the relay does not serve",
+      "notTestable": "server does not list the diagnostic tool 'test_missing_capability'"
+    },
+    "server-stateless:sep-2575-missing-capability-http-400": {
+      "reason": "needs the referee's diagnostic fixture tool test_missing_capability, which the relay does not serve",
+      "notTestable": "server does not list the diagnostic tool 'test_missing_capability'"
+    },
+    "server-stateless:sep-2575-http-server-no-independent-requests-on-stream": {
+      "reason": "needs the referee's diagnostic fixture tool test_streaming_elicitation, which the relay does not serve",
+      "notTestable": "server does not list the diagnostic tool 'test_streaming_elicitation'"
+    },
+    "server-stateless:sep-2575-server-no-log-without-loglevel": {
+      "reason": "needs the referee's diagnostic fixture tool test_logging_tool, which the relay does not serve",
+      "notTestable": "server does not list the diagnostic tool 'test_logging_tool'"
+    },
+    "caching:sep-2549-prompts-list-caching-hints": {
+      "reason": "lists prompts; the relay serves no prompts and declares no prompts capability",
+      "unknownMethod": "prompts/list"
+    },
+    "caching:sep-2549-resources-list-caching-hints": {
+      "reason": "lists resources; the relay serves no resources and declares no resources capability",
+      "unknownMethod": "resources/list"
+    },
+    "caching:sep-2549-resources-templates-list-caching-hints": {
+      "reason": "lists resource templates; the relay serves none and declares no resources capability",
+      "unknownMethod": "resources/templates/list"
+    },
+    "http-custom-header-server-validation:sep-2243-server-no-xmcp-tool": {
+      "reason": "needs a tool whose input schema carries x-mcp-header annotations; the relay serves none, since its fixed tools have none and ADR 0025 removes every x-mcp-header key from first-class schemas",
+      "notTestable": "server exposes no tool with x-mcp-header annotations"
+    },
+    "http-custom-header-server-validation:sep-2243-server-decode-base64": {
+      "reason": "needs a tool whose input schema carries x-mcp-header annotations; the relay serves none, since its fixed tools have none and ADR 0025 removes every x-mcp-header key from first-class schemas",
+      "notTestable": "server exposes no tool with x-mcp-header annotations"
+    },
+    "http-custom-header-server-validation:sep-2243-server-validate-param-match": {
+      "reason": "needs a tool whose input schema carries x-mcp-header annotations; the relay serves none, since its fixed tools have none and ADR 0025 removes every x-mcp-header key from first-class schemas",
+      "notTestable": "server exposes no tool with x-mcp-header annotations"
+    },
+    "http-custom-header-server-validation:sep-2243-server-reject-invalid-param-chars": {
+      "reason": "needs a tool whose input schema carries x-mcp-header annotations; the relay serves none, since its fixed tools have none and ADR 0025 removes every x-mcp-header key from first-class schemas",
+      "notTestable": "server exposes no tool with x-mcp-header annotations"
+    },
+    "http-custom-header-server-validation:sep-2243-server-reject-param-mismatch": {
+      "reason": "needs a tool whose input schema carries x-mcp-header annotations; the relay serves none, since its fixed tools have none and ADR 0025 removes every x-mcp-header key from first-class schemas",
+      "notTestable": "server exposes no tool with x-mcp-header annotations"
+    }
   },
   "shouldWarnings": {
     "server-stateless:sep-2575-server-sends-tools-list-changed-on-subscription": "SHOULD notify a listen stream when the tool list changes; the suite changes the list through the referee's fixture, and the relay's own notifications are tested in packages/relay/test/page-tools-notify.test.ts and tests/e2e/test/revisions.test.ts",
     "sep-2164-resource-not-found:sep-2164-error-code": "SHOULD answer -32602 for a resource that does not exist; the relay serves no resources, so resources/read is an unknown method (-32601)",
     "sep-2164-resource-not-found:sep-2164-data-uri": "SHOULD name the missing resource's URI in the error; the relay serves no resources",
     "input-required-result-ignore-extra-params:sep-2322-ignore-unexpected-params": "SHOULD ignore unrecognized inputResponses keys; the suite sends them to the referee's fixture tool test_input_required_result_elicitation",
-    "input-required-result-missing-input-response:sep-2322-missing-response-rerequests": "SHOULD re-request missing inputResponses; the suite asks it of the referee's fixture tool test_input_required_result_elicitation"
+    "input-required-result-missing-input-response:sep-2322-missing-response-rerequests": "SHOULD re-request missing inputResponses; the suite asks it of the referee's fixture tool test_input_required_result_elicitation",
+    "server-sse-polling:server-sse-priming-event": "SHOULD prime a POST SSE stream with an event of an id and empty data, for a client to resume from (2025-11-25 transports); the relay keeps no event store, so its SDK transport offers no resumption and sends no priming event",
+    "server-sse-polling:server-sse-retry-field": "SHOULD send a retry field before closing a connection whose stream has not ended (2025-11-25 transports); with no event store the relay offers no polling, so its SDK transport sends none"
+  },
+  "extensionScenarios": {
+    "tasks-capability-negotiation": "a scenario of the tasks extension (io.modelcontextprotocol/tasks, SEP-2663), optional and not offered by the relay, which declares no extensions; the 2026-07-28 set runs it unscored as an extension",
+    "tasks-dispatch-and-envelope": "a scenario of the tasks extension (io.modelcontextprotocol/tasks, SEP-2663), optional and not offered by the relay, which declares no extensions; the 2026-07-28 set runs it unscored as an extension",
+    "tasks-lifecycle": "a scenario of the tasks extension (io.modelcontextprotocol/tasks, SEP-2663), optional and not offered by the relay, which declares no extensions; the 2026-07-28 set runs it unscored as an extension",
+    "tasks-mrtr-composition": "a scenario of the tasks extension (io.modelcontextprotocol/tasks, SEP-2663), optional and not offered by the relay, which declares no extensions; the 2026-07-28 set runs it unscored as an extension",
+    "tasks-mrtr-input": "a scenario of the tasks extension (io.modelcontextprotocol/tasks, SEP-2663), optional and not offered by the relay, which declares no extensions; the 2026-07-28 set runs it unscored as an extension",
+    "tasks-request-headers": "a scenario of the tasks extension (io.modelcontextprotocol/tasks, SEP-2663), optional and not offered by the relay, which declares no extensions; the 2026-07-28 set runs it unscored as an extension",
+    "tasks-request-state-removal": "a scenario of the tasks extension (io.modelcontextprotocol/tasks, SEP-2663), optional and not offered by the relay, which declares no extensions; the 2026-07-28 set runs it unscored as an extension",
+    "tasks-required-task-error": "a scenario of the tasks extension (io.modelcontextprotocol/tasks, SEP-2663), optional and not offered by the relay, which declares no extensions; the 2026-07-28 set runs it unscored as an extension",
+    "tasks-wire-fields": "a scenario of the tasks extension (io.modelcontextprotocol/tasks, SEP-2663), optional and not offered by the relay, which declares no extensions; the 2026-07-28 set runs it unscored as an extension"
   }
 }
