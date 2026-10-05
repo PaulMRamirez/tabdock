@@ -3,13 +3,16 @@
 // into <dir> (default dist/packages, which git ignores): the protocol's and
 // the adapter's tsc output with declarations, the adapter's script-tag build,
 // and the relay's bundle with an npm-shrinkwrap.json made for this pack and
-// removed after it. Each package is packed by `pnpm pack`, which applies
-// publishConfig, pins workspace:* to the shared version and adds the root
-// LICENSE; each package keeps its own copy of NOTICE, which pnpm would not
-// add. Beside the tarballs go SHA256SUMS and tabdock-adapter.integrity.txt,
-// the script-tag file's SRI digest and a ready jsDelivr tag, which the release
-// carries. release-check.ts then checks what was packed; nothing here
-// publishes.
+// removed after it. The protocol is packed first, since the relay's
+// shrinkwrap pins it by that tarball's integrity: npm installs a
+// shrinkwrapped package's dependencies from the file alone (ADR 0028's
+// notes), and the stage job publishes these very files. Each package is
+// packed by `pnpm pack`, which applies publishConfig, pins workspace:* to the
+// shared version and adds the root LICENSE; each package keeps its own copy
+// of NOTICE, which pnpm would not add. Beside the tarballs go SHA256SUMS and
+// tabdock-adapter.integrity.txt, the script-tag file's SRI digest and a ready
+// jsDelivr tag, which the release carries. release-check.ts then checks what
+// was packed; nothing here publishes.
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -41,15 +44,21 @@ export function releasePack(out: string): string[] {
   // The adapter's build builds the protocol's first, which its declarations need.
   pnpm(['--filter', '@tabdock/adapter', 'build']);
   pnpm(['--filter', '@tabdock/relay', 'build']);
-  const shrinkwrap = writeShrinkwrap();
   const packed: string[] = [];
+  let shrinkwrap: string | null = null;
   try {
+    // PACKAGES lists the protocol first and the relay last.
     for (const name of PACKAGES) {
+      if (name === 'relay') {
+        shrinkwrap = writeShrinkwrap({
+          '@tabdock/protocol': join(out, tarballName('protocol', versionOf('protocol'))),
+        });
+      }
       pnpm(['pack', '--pack-destination', out], join(ROOT, 'packages', name));
       packed.push(join(out, tarballName(name, versionOf(name))));
     }
   } finally {
-    rmSync(shrinkwrap, { force: true });
+    if (shrinkwrap !== null) rmSync(shrinkwrap, { force: true });
   }
   const sums = packed
     .map(

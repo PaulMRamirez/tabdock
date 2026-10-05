@@ -3,26 +3,29 @@
 //   node packages/relay/scripts/pack-install.ts [<dir of tarballs>]
 //
 // The packaged mark exists only in the bundle, where unit tests on the
-// sources never run, so this installs the three packed tarballs with npm in a
-// scratch directory, as `npx @tabdock/relay` would. npm follows a
-// dependency's npm-shrinkwrap.json only for a package from the registry,
-// whose metadata marks it (`_hasShrinkwrap`, which pacote never sets for a
-// local tarball), so the install pins every package the relay's shrinkwrap
-// names to its version through `overrides`, and checks it got them: the tree
-// this runs on is the tree an install from npm gets. Then it runs the installed
-// `tabdock-relay` the way a person would: from inside a git work tree, with
-// nothing in its environment but PATH, a HOME and a TABDOCK_HOME in a scratch
-// directory. Each .env a relay could find (the work tree's, the install's, and
-// the one a checkout's relative path would name from the bundle) sets dev
-// tokens and a port, so reading any of them would leave local mode or fail.
-// It checks: the token file 0600 outside the work tree; a TABDOCK_HOME inside
-// the work tree refused, nothing made there; no .env read; claude-headers 0700
-// and holding no token; an MCP client connecting with exactly the header the
-// banner's add-json line makes the helper print; the argument worker
-// starting, from the relay and on its own; --new-token; --version, --help,
-// a refused argument and the audit subcommand; and the published types and
-// modules loading in a consumer. Nothing printed may hold a token. It prints
-// what it checked and exits 1 on any failure.
+// sources never run, so this runs the packed relay the way a person would get
+// it: `npx --yes @tabdock/relay@<version>` with a fresh npm cache, through
+// local-registry.ts, which serves the three tarballs as the npm registry will
+// once they are published, `_hasShrinkwrap` and all, and sends every other
+// request to the real registry. npm then installs the relay's dependencies
+// from its npm-shrinkwrap.json alone, as it does for an install from npm, so a
+// package the shrinkwrap leaves out fails here as it would for everyone (ADR
+// 0028's notes); an install from local tarballs never takes that path. It
+// checks npx printed the version and that every package the shrinkwrap pins
+// is installed at its version. Then it runs the installed `tabdock-relay`
+// from inside a git work tree, with nothing in its environment but PATH, a
+// HOME and a TABDOCK_HOME in a scratch directory. Each .env a relay could find
+// (the work tree's, the install's, and the one a checkout's relative path
+// would name from the bundle) sets dev tokens and a port, so reading any of
+// them would leave local mode or fail. It checks: the token file 0600 outside
+// the work tree; a TABDOCK_HOME inside the work tree refused, nothing made
+// there; no .env read; claude-headers 0700 and holding no token; an MCP
+// client connecting with exactly the header the banner's add-json line makes
+// the helper print; the argument worker starting, from the relay and on its
+// own; --new-token; --version, --help, a refused argument and the audit
+// subcommand; and the published types and modules, installed from the same
+// registry, loading in a consumer. Nothing printed may hold a token. It
+// prints what it checked and exits 1 on any failure.
 
 import { type ChildProcess, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -42,12 +45,16 @@ import { join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Worker } from 'node:worker_threads';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import { privateTempRoot } from '../test/helpers/private-tmp.ts';
 import { leakIn } from '../test/helpers/secrecy.ts';
+import { type LocalRegistry, npmEnvFor, runAsync, startLocalRegistry } from './local-registry.ts';
 
 const ROOT = resolve(import.meta.dirname, '../../..');
 const TARBALLS = resolve(process.argv[2] ?? join(ROOT, 'dist', 'packages'));
 const DEPLOY_GUIDE = 'https://github.com/PaulMRamirez/tabdock/blob/main/docs/deploy.md';
 const DEV_TOKENS = 'alice=pack-install-dev-token-0123456789';
+/** Where every package but the three comes from, as for anyone installing them. */
+const UPSTREAM = 'https://registry.npmjs.org';
 
 const failures: string[] = [];
 const tokens: string[] = [];
@@ -196,8 +203,10 @@ async function workerAnswers(file: string): Promise<boolean> {
   }
 }
 
-const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'tabdock-pack-install-')));
+// Not the shared temporary directory, where local mode refuses its token (ADR 0028's notes).
+const scratch = realpathSync(mkdtempSync(join(privateTempRoot(), 'tabdock-pack-install-')));
 const relays: Started[] = [];
+let registry: LocalRegistry | null = null;
 try {
   console.log(`Node ${process.version}; tarballs from ${TARBALLS}`);
   const tarballs = readdirSync(TARBALLS)
@@ -205,76 +214,67 @@ try {
     .map((file) => join(TARBALLS, file));
   check(tarballs.length === 3, 'three tarballs to install');
 
-  // The relay's shrinkwrap, read from its tarball, pins the install.
+  // The relay's shrinkwrap and version, read from its tarball.
   const relayTarball = tarballs.find((file) => file.includes('tabdock-relay-')) ?? '';
-  const shrinkwrapText = spawnSync('tar', ['-xzOf', relayTarball, 'package/npm-shrinkwrap.json'], {
-    encoding: 'utf8',
-  }).stdout;
-  const shrinkwrap = JSON.parse(shrinkwrapText || '{"packages":{}}') as {
+  const fromTarball = (file: string): string =>
+    spawnSync('tar', ['-xzOf', relayTarball, `package/${file}`], { encoding: 'utf8' }).stdout;
+  const shrinkwrap = JSON.parse(fromTarball('npm-shrinkwrap.json') || '{"packages":{}}') as {
     packages: Record<string, { version?: string }>;
   };
-  const pins = Object.fromEntries(
-    Object.entries(shrinkwrap.packages)
-      .filter(([path]) => path !== '')
-      .map(([path, entry]) => [
-        path.slice(path.lastIndexOf('node_modules/') + 'node_modules/'.length),
-        entry.version ?? '',
-      ]),
-  );
-  check(Object.keys(pins).length > 0, 'the relay tarball carries its npm-shrinkwrap.json');
+  const pinned = Object.entries(shrinkwrap.packages).filter(([path]) => path !== '');
+  check(pinned.length > 0, 'the relay tarball carries its npm-shrinkwrap.json');
+  const manifest = JSON.parse(fromTarball('package.json') || '{"version":""}') as {
+    version: string;
+  };
 
-  // The install, as npx would make it.
-  const install = join(scratch, 'install');
-  mkdirSync(install);
-  writeFileSync(
-    join(install, 'package.json'),
-    `${JSON.stringify(
-      {
-        name: 'pack-install',
-        version: '0.0.0',
-        private: true,
-        dependencies: Object.fromEntries(
-          tarballs.map((file) => [
-            `@tabdock/${/tabdock-([a-z]+)-/.exec(file)?.[1] ?? ''}`,
-            pathToFileURL(file).href,
-          ]),
-        ),
-        overrides: pins,
-      },
-      null,
-      2,
-    )}\n`,
+  // The registry the packages will be on once published, and a cache nothing else filled.
+  registry = await startLocalRegistry(tarballs, UPSTREAM);
+  writeFileSync(join(scratch, 'npmrc'), '');
+  const npmEnv = npmEnvFor(registry, {
+    cache: join(scratch, 'npm-cache'),
+    userconfig: join(scratch, 'npmrc'),
+  });
+  const npxCwd = join(scratch, 'npx');
+  mkdirSync(npxCwd);
+  const viaNpx = await runAsync(
+    'npx',
+    ['--yes', `@tabdock/relay@${manifest.version}`, '--version'],
+    {
+      cwd: npxCwd,
+      env: npmEnv,
+    },
   );
-  const installed = run('npm', ['install', '--no-audit', '--no-fund'], { cwd: install });
+  printed.push(viaNpx.stdout, viaNpx.stderr);
   check(
-    installed.status === 0,
-    `npm install of the three tarballs${installed.status === 0 ? '' : `:\n${installed.stderr}`}`,
+    viaNpx.status === 0 && viaNpx.stdout.trim() === manifest.version,
+    `npx @tabdock/relay@${manifest.version} --version, from a registry, prints ${manifest.version}${viaNpx.status === 0 ? '' : `:\n${viaNpx.stderr}`}`,
   );
+  const npxRoot = join(scratch, 'npm-cache', '_npx');
+  const npxInstall = (existsSync(npxRoot) ? readdirSync(npxRoot) : [])
+    .map((hash) => join(npxRoot, hash))
+    .find((dir) => existsSync(join(dir, 'node_modules', '@tabdock', 'relay', 'package.json')));
+  check(npxInstall !== undefined, 'npx installed @tabdock/relay in its cache');
+  const install = npxInstall ?? join(npxRoot, 'missing');
   const relayDir = join(install, 'node_modules', '@tabdock', 'relay');
   const bin = join(install, 'node_modules', '.bin', 'tabdock-relay');
   check(existsSync(bin), 'the install links one bin, tabdock-relay');
-  const manifest = JSON.parse(readFileSync(join(relayDir, 'package.json'), 'utf8')) as {
-    version: string;
-  };
-  const drift = Object.entries(shrinkwrap.packages)
-    .filter(([path]) => path !== '')
+  // npm put each package where the shrinkwrap says, under the relay itself.
+  const drift = pinned
     .filter(([path, entry]) => {
-      const name = path.slice(path.lastIndexOf('node_modules/') + 'node_modules/'.length);
-      const candidates = [
-        join(relayDir, 'node_modules', name),
-        join(install, 'node_modules', name),
-      ];
-      const found = candidates.find((dir) => existsSync(join(dir, 'package.json')));
-      if (found === undefined) return true;
-      const version = (
-        JSON.parse(readFileSync(join(found, 'package.json'), 'utf8')) as { version: string }
-      ).version;
-      return version !== entry.version;
+      const file = join(relayDir, path, 'package.json');
+      if (!existsSync(file)) return true;
+      return (
+        (JSON.parse(readFileSync(file, 'utf8')) as { version: string }).version !== entry.version
+      );
     })
     .map(([path]) => path);
   check(
     drift.length === 0,
     `every package the shrinkwrap pins is installed at its version${drift.length === 0 ? '' : `: ${drift.join(', ')}`}`,
+  );
+  check(
+    registry.requests().includes(`/@tabdock/protocol/-/protocol-${manifest.version}.tgz`),
+    'npm fetched the protocol the shrinkwrap pins, by its registry URL',
   );
 
   // A git work tree to stand in, and a .env wherever a relay could look for one.
@@ -283,8 +283,8 @@ try {
   const initialized = run('git', ['init', '-q'], { cwd: work });
   check(initialized.status === 0 && existsSync(join(work, '.git')), 'a git work tree to run from');
   const poison = `TABDOCK_DEV_TOKENS=${DEV_TOKENS}\nTABDOCK_PORT=1\n`;
-  for (const dir of [work, install, join(install, 'node_modules'), relayDir]) {
-    writeFileSync(join(dir, '.env'), poison);
+  for (const dir of [work, npxCwd, install, join(install, 'node_modules'), relayDir]) {
+    if (existsSync(dir)) writeFileSync(join(dir, '.env'), poison);
   }
   const home = join(scratch, 'home');
   mkdirSync(home);
@@ -428,8 +428,39 @@ try {
       dotfiles.stderr().includes('set TABDOCK_HOME to an absolute path outside every repository'),
     'the default directory under a home that is a work tree is refused, naming TABDOCK_HOME',
   );
+  // A TABDOCK_HOME in the shared temporary directory, which another account
+  // could make again once it is gone, with a header helper of its own in it.
+  const shared = realpathSync(tmpdir());
+  if ((lstatSync(shared).mode & 0o002) !== 0) {
+    const sharedHome = join(shared, `tabdock-pack-install-${String(process.pid)}`, 'tabdock');
+    const sharedRun = startRelay(bin, [], work, { ...env, TABDOCK_HOME: sharedHome });
+    relays.push(sharedRun);
+    check(
+      (await sharedRun.exited) === 1 &&
+        sharedRun.stderr().includes(`${shared} above it can be written by other accounts`) &&
+        !existsSync(join(shared, `tabdock-pack-install-${String(process.pid)}`)),
+      `a TABDOCK_HOME under ${shared} is refused, and nothing is made there`,
+    );
+  }
 
-  // A consumer of the libraries: Node loads the protocol, tsc takes both packages' types.
+  // A consumer of the libraries, installed from the registry: Node loads the
+  // protocol, tsc takes both packages' types.
+  const consumer = join(scratch, 'consumer');
+  mkdirSync(consumer);
+  writeFileSync(
+    join(consumer, 'package.json'),
+    `${JSON.stringify({ name: 'pack-install-consumer', version: '0.0.0', private: true })}\n`,
+  );
+  const libraries = await runAsync(
+    'npm',
+    ['install', `@tabdock/protocol@${manifest.version}`, `@tabdock/adapter@${manifest.version}`],
+    { cwd: consumer, env: npmEnv },
+  );
+  printed.push(libraries.stdout, libraries.stderr);
+  check(
+    libraries.status === 0,
+    `npm install of @tabdock/protocol and @tabdock/adapter from the registry${libraries.status === 0 ? '' : `:\n${libraries.stderr}`}`,
+  );
   const loaded = run(
     process.execPath,
     [
@@ -437,14 +468,14 @@ try {
       '-e',
       "const p = await import('@tabdock/protocol'); if (p.SUBPROTOCOL !== 'tabdock.v1') process.exit(1);",
     ],
-    { cwd: install },
+    { cwd: consumer },
   );
   check(
     loaded.status === 0,
     `Node imports @tabdock/protocol from its dist${loaded.status === 0 ? '' : `:\n${loaded.stderr}`}`,
   );
   writeFileSync(
-    join(install, 'consumer.ts'),
+    join(consumer, 'consumer.ts'),
     [
       "import { attach, type AttachOptions } from '@tabdock/adapter';",
       "import { SUBPROTOCOL, type PolicyInput } from '@tabdock/protocol';",
@@ -456,7 +487,7 @@ try {
     ].join('\n'),
   );
   writeFileSync(
-    join(install, 'tsconfig.json'),
+    join(consumer, 'tsconfig.json'),
     JSON.stringify({
       compilerOptions: {
         target: 'ES2023',
@@ -473,8 +504,8 @@ try {
   );
   const tsc = run(
     process.execPath,
-    [join(ROOT, 'node_modules', 'typescript', 'bin', 'tsc'), '-p', install],
-    { cwd: install },
+    [join(ROOT, 'node_modules', 'typescript', 'bin', 'tsc'), '-p', consumer],
+    { cwd: consumer },
   );
   check(
     tsc.status === 0,
@@ -489,6 +520,7 @@ try {
   console.log(`FAIL ${failures.at(-1) ?? ''}`);
 } finally {
   for (const relay of relays) relay.child.kill('SIGKILL');
+  await registry?.close();
   rmSync(scratch, { recursive: true, force: true });
 }
 

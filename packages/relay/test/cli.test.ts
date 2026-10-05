@@ -4,12 +4,14 @@
 // command it runs under; the version from package.json; the .env rule, which
 // the package never reads; the worker file the bundle names; and
 // `--new-token`, which draws a token without reading the old file, replaces it
-// only once the start holds the audit directory's lock, and is refused by
-// name outside local mode. The bundle itself is checked by the pack-install
+// only once the relay holds the token directory's lock and listens, whatever
+// audit directory or port a relay already running beside it uses, and is
+// refused by name outside local mode. The bundle itself is checked by the pack-install
 // job (packages/relay/scripts/pack-install.ts), since PACKAGED is true only
 // there.
 
 import { mkdtempSync, readFileSync, realpathSync, rmSync, existsSync } from 'node:fs';
+import { type AddressInfo, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
@@ -27,6 +29,7 @@ import {
 } from '../src/cli.ts';
 import { headersHelperPath, OWNER_TOKEN_FILE } from '../src/local-token.ts';
 import { PACKAGED } from '../src/packaged.ts';
+import { TOKEN_LOCK_FILE } from '../src/token-lock.ts';
 import type { Relay } from '../src/relay.ts';
 import { startMain } from './helpers/main-process.ts';
 import { leakIn } from './helpers/secrecy.ts';
@@ -200,6 +203,20 @@ describe('the usage, the version and the audit subcommand', () => {
     expect(await runCommand(['audit', '--nope'], checkout)).toBe(2);
     expect(checkout.errors.join('\n')).toContain('Usage: pnpm audit:log [options]');
   });
+
+  it('never repeats a token pasted after audit, as the rest of the command never does', async () => {
+    const token = `tabdock_${'s3cr3t'.repeat(7)}x`;
+    for (const argv of [
+      ['audit', token],
+      ['audit', `--${token}`],
+      ['audit', '--verify', `--header=Bearer ${token}`],
+    ]) {
+      const ran = context({}, true);
+      expect(await runCommand(argv, ran)).toBe(2);
+      expect(ran.errors[0]).toMatch(/^argument \d is not one this reader takes/);
+      expect(leakIn([...ran.printed, ...ran.errors].join('\n'), token)).toBeNull();
+    }
+  });
 });
 
 describe('what only the package does differently (ADR 0028)', () => {
@@ -281,6 +298,69 @@ describe('--new-token (ADR 0028)', () => {
     } finally {
       running.child.kill('SIGTERM');
       await running.exited;
+    }
+  }, 30_000);
+
+  // The audit lock guards only relays that also share the audit directory, so
+  // the token directory holds a lock of its own (ADR 0028's notes): a relay
+  // left serving the old token after a rotation would keep it valid.
+  for (const [where, port] of [
+    ['on the same port', 'running'],
+    ['on another port', '0'],
+  ] as const) {
+    it(`beside a running relay with its own audit directory ${where}, refuses on the token directory's lock and changes nothing`, async () => {
+      const home = freshHome();
+      const running = startMain({
+        TABDOCK_HOME: home,
+        TABDOCK_AUDIT_DIR: join(home, '..', 'audit elsewhere'),
+      });
+      try {
+        const runningPort = await running.port;
+        const tokenPath = join(home, OWNER_TOKEN_FILE);
+        const before = readFileSync(tokenPath);
+        const old = before.toString('latin1').trim();
+        expect(existsSync(join(home, TOKEN_LOCK_FILE))).toBe(true);
+        for (const argv of [['--new-token'], []]) {
+          const ran = context({
+            TABDOCK_HOME: home,
+            TABDOCK_PORT: port === 'running' ? String(runningPort) : port,
+          });
+          expect(await runCommand(argv, ran)).toBe(1);
+          expect(ran.errors.join('\n')).toMatch(
+            /token directory .* is in use by another relay, pid \d+, which holds .*owner-token\.lock; stop that relay first/,
+          );
+          expect(readFileSync(tokenPath).equals(before)).toBe(true);
+          expect(ran.printed).toEqual([]);
+        }
+        expect(await toolCount(`http://127.0.0.1:${String(runningPort)}/mcp`, old)).toBe(5);
+      } finally {
+        running.child.kill('SIGTERM');
+        await running.exited;
+      }
+      // The lock goes with the relay, and the next start may rotate.
+      expect(existsSync(join(home, TOKEN_LOCK_FILE))).toBe(false);
+      const after = await startRelay(context({ TABDOCK_HOME: home }), { newToken: true });
+      relays.push(after.relay);
+    }, 30_000);
+  }
+
+  it('changes nothing when the start fails before it listens, on a port another program holds', async () => {
+    const home = freshHome();
+    const first = await startRelay(context({ TABDOCK_HOME: home }), { newToken: false });
+    await first.relay.close();
+    const tokenPath = join(home, OWNER_TOKEN_FILE);
+    const before = readFileSync(tokenPath);
+    const holder = createServer();
+    await new Promise<void>((resolveListen) => holder.listen(0, '127.0.0.1', resolveListen));
+    try {
+      const { port } = holder.address() as AddressInfo;
+      const ran = context({ TABDOCK_HOME: home, TABDOCK_PORT: String(port) });
+      expect(await runCommand(['--new-token'], ran)).toBe(1);
+      expect(ran.errors.join('\n')).toMatch(/EADDRINUSE/);
+      expect(readFileSync(tokenPath).equals(before)).toBe(true);
+      expect(existsSync(join(home, TOKEN_LOCK_FILE))).toBe(false);
+    } finally {
+      await new Promise((resolveClose) => holder.close(resolveClose));
     }
   }, 30_000);
 

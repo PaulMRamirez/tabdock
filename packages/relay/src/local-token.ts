@@ -84,9 +84,10 @@ export interface LocalTokenSystem {
   /**
    * Set only for `--new-token` (ADR 0028): loadOwnerToken then never reads the
    * old file but draws a new token, and hands this a function that renames it
-   * over owner-token. The caller runs that function only once its start holds
-   * the audit directory's lock, so a start beside a running relay that shares
-   * the directory refuses before anything changes.
+   * over owner-token. The caller runs that function only once its relay holds
+   * the token directory's lock (token-lock.ts) and listens, so a start beside
+   * a running relay that shares the directory, or one that fails on its way
+   * up, refuses before anything changes.
    */
   replaceToken?: ((commit: () => void) => void) | undefined;
 }
@@ -235,25 +236,109 @@ function isWithin(child: string, parent: string, platform: NodeJS.Platform): boo
 }
 
 /**
- * The work tree of a repository that `real` lies in: the nearest of it and
- * its ancestors, up to the file system's root, that holds a `.git` entry of
- * any kind, a directory or a file (a linked worktree's or a submodule's), or
- * null when none does. A `.git` the relay cannot even look for is refused
- * rather than guessed absent.
+ * What marks the top of a work tree, for each version control tool that could
+ * commit a file left inside one, git first so a colocated Jujutsu repository
+ * is named as git's. Jujutsu needs no `add` at all: it snapshots new files
+ * into the working-copy commit on its own, so `jj git push` sends them on.
  */
-function workTreeAround(real: string, system: LocalTokenSystem): string | null {
+const WORK_TREE_MARKERS: readonly (readonly [entry: string, tool: string])[] = [
+  ['.git', 'git'],
+  ['.jj', 'Jujutsu'],
+  ['.hg', 'Mercurial'],
+  ['.sl', 'Sapling'],
+  ['.svn', 'Subversion'],
+  ['.bzr', 'Bazaar'],
+];
+
+/**
+ * The work tree of a repository that `real` lies in: the nearest of it and
+ * its ancestors, up to the file system's root, that holds one of
+ * WORK_TREE_MARKERS of any kind, a directory or a file (a linked worktree's
+ * or a submodule's `.git`), with the tool it belongs to; or null when none
+ * does. An entry the relay cannot even look for is refused rather than
+ * guessed absent.
+ */
+function workTreeAround(
+  real: string,
+  system: LocalTokenSystem,
+): { path: string; tool: string } | null {
   let current = real;
   for (;;) {
-    const entry = join(current, '.git');
+    for (const [marker, tool] of WORK_TREE_MARKERS) {
+      const entry = join(current, marker);
+      try {
+        system.lstat(entry);
+        return { path: current, tool };
+      } catch (error) {
+        const code = errorCode(error);
+        if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+          throw new OwnerTokenError(
+            `local mode cannot tell whether ${current} is a repository's work tree (${code ?? 'error'} on ${entry}), so it will not keep its owner token below it; set TABDOCK_HOME to an absolute path outside any repository (ADR 0028)`,
+          );
+        }
+      }
+    }
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+/** An ancestor another account could change, and why. */
+export interface SharedAncestor {
+  path: string;
+  why: string;
+  /**
+   * Whether `chmod go-w` on it is the fix: it is this account's, and not a
+   * sticky directory such as /tmp, which is there to be shared.
+   */
+  fixable: boolean;
+}
+
+/**
+ * The nearest of `path` and its ancestors, up to the file system's root, that
+ * an account other than this one or root could change, or null when none
+ * could, as OpenSSH's StrictModes asks of the path to a key: one writable by
+ * its group or by others, sticky or not, or owned by another account, which
+ * may make it writable whenever it likes. A sticky directory such as /tmp
+ * keeps others from removing what is in it, never from making a name again
+ * once it is gone, and Claude Code keeps running the header helper by its
+ * path long after this relay last checked it. Names that do not exist yet
+ * are passed over; the walk judges the nearest that does and every one
+ * above it.
+ */
+export function sharedAncestor(
+  path: string,
+  overrides: Partial<LocalTokenSystem> = {},
+): SharedAncestor | null {
+  const system = systemOf(overrides);
+  let current = realpathNearest(path);
+  for (;;) {
+    let facts: FileFacts | null = null;
     try {
-      system.lstat(entry);
-      return current;
+      facts = system.lstat(current);
     } catch (error) {
       const code = errorCode(error);
       if (code !== 'ENOENT' && code !== 'ENOTDIR') {
-        throw new OwnerTokenError(
-          `local mode cannot tell whether ${current} is a repository's work tree (${code ?? 'error'} on ${entry}), so it will not keep its owner token below it; set TABDOCK_HOME to an absolute path outside any repository (ADR 0028)`,
-        );
+        return { path: current, why: `cannot be examined (${code ?? 'error'})`, fixable: false };
+      }
+    }
+    if (facts !== null) {
+      const ours = system.uid !== undefined && facts.uid === system.uid;
+      if (system.uid !== undefined && facts.uid !== 0 && !ours) {
+        return {
+          path: current,
+          why: `belongs to another account (uid ${String(facts.uid)})`,
+          fixable: false,
+        };
+      }
+      if ((facts.mode & 0o022) !== 0) {
+        const mode = (facts.mode & 0o7777).toString(8).padStart(3, '0');
+        return {
+          path: current,
+          why: `can be written by other accounts (mode ${mode})`,
+          fixable: ours && (facts.mode & 0o1000) === 0,
+        };
       }
     }
     const parent = dirname(current);
@@ -264,8 +349,11 @@ function workTreeAround(real: string, system: LocalTokenSystem): string | null {
 
 /**
  * Where the directory may lie: never inside the checkout or any repository's
- * work tree, where the token could be committed, and on Windows only under
- * the profile, whose default access list admits only the user, SYSTEM and
+ * work tree, where the token could be committed; on POSIX systems never
+ * below a directory another account could change (sharedAncestor), from which
+ * that account could make the directory again once it is gone and have
+ * Claude Code run a header helper of its own; and on Windows only under the
+ * profile, whose default access list admits only the user, SYSTEM and
  * Administrators, since Node reports no owner or mode there to check instead.
  * The checkout comparison still guards a checkout with no `.git`, such as an
  * unpacked source archive; the work tree rule covers every repository the
@@ -288,10 +376,21 @@ function checkPlace(dir: string, env: TokenEnv, system: LocalTokenSystem): void 
         ? 'set TABDOCK_HOME to an absolute path outside every repository'
         : 'set TABDOCK_HOME to an absolute path outside every repository, or unset it';
     throw new OwnerTokenError(
-      `local mode refuses ${dir} for its owner token: it lies inside the git work tree ${tree}, where the token could be committed; ${fix} (ADR 0028)`,
+      `local mode refuses ${dir} for its owner token: it lies inside the ${tree.tool} work tree ${tree.path}, where the token could be committed; ${fix} (ADR 0028)`,
     );
   }
-  if (system.platform !== 'win32') return;
+  if (system.platform !== 'win32') {
+    // The directory itself is checkDirectory's, whose message names its own fix.
+    const shared = sharedAncestor(dirname(real), system);
+    if (shared !== null) {
+      const elsewhere = 'set TABDOCK_HOME to an absolute path under your home directory';
+      const fix = shared.fixable ? `run chmod go-w on it, or ${elsewhere}` : elsewhere;
+      throw new OwnerTokenError(
+        `local mode refuses ${dir} for its owner token: ${shared.path} above it ${shared.why}, so another account could make the directory again once it is gone and have Claude Code run a header helper of its own; ${fix} (ADR 0028)`,
+      );
+    }
+    return;
+  }
   const anchors = [
     absoluteSetting(env, 'LOCALAPPDATA'),
     absoluteSetting(env, 'USERPROFILE') ?? system.homedir,
@@ -300,6 +399,24 @@ function checkPlace(dir: string, env: TokenEnv, system: LocalTokenSystem): void 
     throw new OwnerTokenError(
       `local mode refuses ${dir} for its owner token: on Windows it must lie under %LOCALAPPDATA% or %USERPROFILE%, whose default access list admits only you, SYSTEM and Administrators; set TABDOCK_HOME to a directory there, or unset it (ADR 0022)`,
     );
+  }
+}
+
+/**
+ * Why local mode would refuse a token directory at `dir` for where it lies,
+ * or null when it would not; the directory itself is not examined. For tools
+ * that choose such a directory, as the tests' scratch space does.
+ */
+export function placeRefusal(
+  dir: string,
+  overrides: Partial<LocalTokenSystem> = {},
+): string | null {
+  try {
+    checkPlace(resolve(dir), { TABDOCK_HOME: dir }, systemOf(overrides));
+    return null;
+  } catch (error) {
+    if (error instanceof OwnerTokenError) return error.message;
+    throw error;
   }
 }
 

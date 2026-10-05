@@ -19,9 +19,9 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, stat } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
+import { privateTempRoot } from '@tabdock/relay/test/private-tmp';
 import { leakIn } from '@tabdock/relay/test/secrecy';
 import { freePort } from './harness.ts';
 import { blankEnv, listsConnected, readBanner, type Run, runPnpm } from './local-harness.ts';
@@ -60,7 +60,8 @@ function run(command: string, args: string[], cwd: string, env: NodeJS.ProcessEn
   });
 }
 
-const dir = await mkdtemp(join(tmpdir(), 'tabdock-cc-local-'));
+// Not the shared temporary directory, where local mode refuses its token (ADR 0028's notes).
+const dir = await mkdtemp(join(privateTempRoot(), 'tabdock-cc-local-'));
 const home = join(dir, 'home');
 const work = join(dir, 'work');
 const tabdockHome = join(dir, "owner's tabdock");
