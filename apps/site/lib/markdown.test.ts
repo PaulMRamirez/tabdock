@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { tourPageProblems } from './checks.ts';
 import { LinkError, type LinkContext } from './links.ts';
-import { renderTourPage, slug } from './markdown.ts';
+import { mermaidSources, renderTourPage, slug } from './markdown.ts';
 import { tourPage } from './page.ts';
 
 const COMMIT = '0123456789abcdef0123456789abcdef01234567';
@@ -99,5 +99,15 @@ describe('renderTourPage (ADR 0029)', () => {
     assert.throws(() => render('# T\n\n<javascript:alert(1)>\n'), LinkError);
     assert.throws(() => render('# T\n\n![x](https://example.com/x.png)\n'), LinkError);
     assert.throws(() => render('No title here\n'), /has no # title/);
+  });
+});
+
+describe('mermaidSources', () => {
+  it("finds every Mermaid fence, in order, and nothing else's", () => {
+    assert.deepEqual(
+      mermaidSources(`${SAMPLE}\n\n\`\`\`mermaid\nflowchart TB\n  a --> b\n\`\`\`\n`),
+      ['sequenceDiagram\n  C->>R: tools/call', 'flowchart TB\n  a --> b'],
+    );
+    assert.deepEqual(mermaidSources('# T\n\n```ts\nconst x = 1;\n```\n'), []);
   });
 });

@@ -52,13 +52,15 @@ export interface InviteRelay {
   /**
    * Claude signed in as `sub`, with the namespaced email claims ADR 0020's
    * template adds; `wrap`, if given, wraps the tunnel's fetch, to change what
-   * the client sends.
+   * the client sends; `modern` pins the client to 2026-07-28, where without
+   * it the SDK's default speaks a 2025 revision on a session.
    */
   claude(
     sub: string,
     email?: string | null,
     verified?: boolean,
     wrap?: (base: FetchLike) => FetchLike,
+    modern?: boolean,
   ): Promise<Client>;
   close(): Promise<void>;
 }
@@ -126,8 +128,11 @@ export async function startInviteRelay(options: InviteRelayOptions = {}): Promis
       pages.push(opened);
       return opened;
     },
-    async claude(sub, email = null, verified = true, wrap = (base) => base) {
-      const client = new Client({ name: `claude-${sub}`, version: '1.0.0' });
+    async claude(sub, email = null, verified = true, wrap = (base) => base, modern = false) {
+      const client = new Client(
+        { name: `claude-${sub}`, version: '1.0.0' },
+        modern ? { versionNegotiation: { mode: { pin: '2026-07-28' } } } : {},
+      );
       await client.connect(
         new StreamableHTTPClientTransport(new URL(PUBLIC_MCP_URL), {
           authProvider: {

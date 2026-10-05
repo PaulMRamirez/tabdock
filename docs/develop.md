@@ -14,6 +14,7 @@ pnpm build         # each package's build, where it has one
 pnpm test:e2e      # browser tests (Playwright; fetches Chromium on first run)
 
 pnpm relay         # the relay alone; local mode with no settings, printing the command for Claude Code
+pnpm relay --new-token  # the same, after replacing local mode's owner token in one rename
 pnpm dev           # relay and demo board together, local mode unless .env says otherwise
 pnpm dev:public    # the same in public URL mode, for Claude on a phone through a tunnel
 pnpm dev:demo      # the demo board alone at http://127.0.0.1:5173/
@@ -26,11 +27,15 @@ pnpm demo:m3       # sign-in, pairing by code and by the widget's QR code from a
 pnpm demo:m4       # local mode, then a page shared by watch and control invites, and the audit log
 
 pnpm site:build    # the Pages site into apps/site/dist: the demo at / and docs/tour at /tour/
+
+pnpm release:pack  # build and pack the three npm packages into dist/packages, publishing nothing
+pnpm release:check # check those tarballs file by file (add --tag v0.1.0 to match a tag)
+pnpm pack:install  # install those tarballs in a scratch directory and run tabdock-relay as A5.5 asks
 pnpm spike:latency # the M3 spike's call timings against a running relay
 pnpm spike:soak    # the M3 spike's long run with a busy page
 ```
 
-`pnpm --filter @tabdock/e2e <script>` runs the end-to-end package's own scripts: `baseline` re-measures the M0 baseline, and the `check:claude-code` scripts drive a real Claude Code against a relay in the sandbox. One Playwright spec runs alone with `pnpm --filter @tabdock/e2e exec playwright test specs/<name>.spec.ts`; specs take free ports, so several can run at once.
+The three release commands are what CI's `pack-install` job and `publish.yml` run; `docs/release.md` says how a release is made. `pnpm --filter @tabdock/e2e <script>` runs the end-to-end package's own scripts: `baseline` re-measures the M0 baseline, and the `check:claude-code` scripts drive a real Claude Code against a relay in the sandbox. One Playwright spec runs alone with `pnpm --filter @tabdock/e2e exec playwright test specs/<name>.spec.ts`; specs take free ports, so several can run at once.
 
 ## Settings
 

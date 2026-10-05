@@ -906,10 +906,15 @@ export function createMcpFactory(
       const firstClass = firstClassOn ? parseFirstClassName(name) : null;
       if (firstClass !== null) {
         const { pageId, toolPart } = firstClass;
-        // Recorded under the page tool call_page_tool would name (S7, ADR 0025).
+        // Recorded under the page tool call_page_tool would name, which the
+        // hub reads from the page record, or else the whole first-class name
+        // (S7, ADR 0025).
         if (!within) {
-          const pageTool = hub.firstClassAuditName(pageId, toolPart);
-          return refuse(who, { tool: 'call_page_tool', page: pageId, pageTool });
+          return refuse(who, {
+            tool: 'call_page_tool',
+            page: pageId,
+            pageTool: { firstClass: toolPart },
+          });
         }
         const args: JsonObject = request.params.arguments ?? {};
         return answer(() => callPage(who, pageId, { firstClass: toolPart }, args, toolPart, ctx));

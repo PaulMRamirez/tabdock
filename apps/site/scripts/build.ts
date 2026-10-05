@@ -3,7 +3,9 @@
 // /tour/, then reads back every tour page and diagram it wrote and stops on
 // any that holds a script, an event handler or an outside URL, or lacks the
 // tour policy. Pages publishes one directory per deploy, so the site is
-// always built whole: a tour-only publish would drop the demo.
+// always built whole: a tour-only publish would drop the demo. It also draws
+// the README's diagrams, which it does not publish, and stops on one that
+// will not draw, so A5.5's "the README builds" has a check of its own.
 
 import { copyFile, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { extname, join, resolve } from 'node:path';
@@ -11,7 +13,7 @@ import { buildDemo } from '../../demo/scripts/server.ts';
 import { COPIED_IMAGES, tourDirProblems } from '../lib/checks.ts';
 import { drawDiagrams } from '../lib/diagrams.ts';
 import { TOUR_DIR } from '../lib/links.ts';
-import { type RenderedPage, renderTourPage } from '../lib/markdown.ts';
+import { mermaidSources, type RenderedPage, renderTourPage } from '../lib/markdown.ts';
 import { indexPage, type PageLink, tourPage } from '../lib/page.ts';
 import { resolveRepository } from '../lib/repo.ts';
 
@@ -51,6 +53,16 @@ async function main(): Promise<void> {
         `${TOUR_DIR}/${stem}.md: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+  }
+
+  // The README shows its architecture as Mermaid, which GitHub draws (ADR
+  // 0029); one that will not draw here would show there as an error.
+  const readmeDiagrams = mermaidSources(await readFile(join(repoRoot, 'README.md'), 'utf8'));
+  if (readmeDiagrams.length === 0) throw new Error('README.md: no Mermaid diagram found');
+  try {
+    await drawDiagrams(readmeDiagrams);
+  } catch (error) {
+    throw new Error(`README.md: ${error instanceof Error ? error.message : String(error)}`);
   }
 
   await mkdir(imageOut, { recursive: true });
@@ -93,7 +105,7 @@ async function main(): Promise<void> {
     );
   }
   console.log(
-    `Built the site into ${distDir}: the demo at /, ${String(rendered.length)} tour pages and ${String(diagrams.length)} diagrams at /tour/, from ${repository.commit.slice(0, 7)}.`,
+    `Built the site into ${distDir}: the demo at /, ${String(rendered.length)} tour pages and ${String(diagrams.length)} diagrams at /tour/, from ${repository.commit.slice(0, 7)}, and drew the README's ${String(readmeDiagrams.length)} (not published).`,
   );
 }
 

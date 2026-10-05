@@ -61,7 +61,7 @@ export interface WorldOptions {
   rateLimits?: RelayOptions['rateLimits'];
   /** The M3 spike's measurements (ADR 0014); off unless a test asks. */
   spike?: boolean;
-  /** First-class page tools (ADR 0025); off unless a test asks. */
+  /** First-class page tools (ADR 0025); off unless a test asks, as in every mode. */
   firstClassTools?: boolean;
 }
 
