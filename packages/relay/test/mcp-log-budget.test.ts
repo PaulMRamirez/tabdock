@@ -11,11 +11,17 @@
 // three such kinds no test held (refused listens, proxied requests, the Node
 // adapter's errors), a call its client abandons charged twice by a mutation
 // no test caught, and the S13 line for a stolen session id sharing the
-// per-kind budget, so a decoy could leave a real presenter unnamed.
+// per-kind budget, so a decoy could leave a real presenter unnamed. The last
+// M4 hunt found the 2026-07-28 requests the SDK serves, tools/list and
+// server/discover among them, and a tools/call it answers with an error in a
+// 200, still free: each builds a server of its own, and 50 tools/list passed a
+// budget of 3. Now every 2026-07-28 request spends once, as it arrives, but a
+// listen and a tools/call bound for a tool, which spend where they land (ADR
+// 0030).
 
 import type { Client } from '@modelcontextprotocol/client';
 import { afterEach, describe, expect, it } from 'vitest';
-import { createDevTokenAuth, type DevTokenUser } from '../src/index.ts';
+import { createDevTokenAuth, DEFAULT_RATE_LIMITS, type DevTokenUser } from '../src/index.ts';
 import { connectPage, type TestPage, TOOLS } from './helpers/page-client.ts';
 import {
   initializeBody,
@@ -107,6 +113,33 @@ async function modernPost(
   return response.status;
 }
 
+/**
+ * A well-formed 2026-07-28 request as G1 or another user, its headers as the
+ * SDK client sends them; its status and the body's text.
+ */
+async function modernRequest(
+  user: DevTokenUser,
+  id: number,
+  method: string,
+  params: Record<string, unknown> = {},
+): Promise<{ status: number; text: string }> {
+  if (!current) throw new Error('no relay');
+  const name = typeof params.name === 'string' ? { 'Mcp-Name': params.name } : {};
+  const response = await fetch(current.relay.mcpUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${user.token}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+      'Mcp-Protocol-Version': '2026-07-28',
+      'Mcp-Method': method,
+      ...name,
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id, method, params: { ...params, _meta: META } }),
+  });
+  return { status: response.status, text: await response.text() };
+}
+
 interface Entry {
   msg: string;
   repeated?: number;
@@ -170,7 +203,7 @@ describe('lines a signed-in account can make /mcp write (A4.3)', () => {
     expect(written + repeated).toBe(30);
   }, 30_000);
 
-  it('writes small SDK refusals once a window too, however many come', async () => {
+  it('writes small SDK refusals once a window too, however many come, and those past the budget never reach it', async () => {
     const { lines } = await setup();
     const before = lines.length;
     const body = JSON.stringify({
@@ -182,29 +215,105 @@ describe('lines a signed-in account can make /mcp write (A4.3)', () => {
     const statuses = await Promise.all(
       Array.from({ length: 200 }, () => modernPost(G1, { 'Mcp-Method': 'x' }, body)),
     );
-    expect(new Set(statuses)).toEqual(new Set([400]));
+    // Each spends a request as it arrives (ADR 0030): an invitee's minute
+    // reaches the SDK, which refuses each, and the relay refuses the rest.
+    const { requestsPerInvitee } = DEFAULT_RATE_LIMITS;
+    expect(statuses.filter((status) => status === 400)).toHaveLength(requestsPerInvitee);
+    expect(statuses.filter((status) => status === 429)).toHaveLength(200 - requestsPerInvitee);
     expect(tally(lines.slice(before), 'mcp handler error').written).toBe(1);
     await current?.close();
-    expect(tally(lines.slice(before), 'mcp handler error')).toEqual({ written: 1, repeated: 199 });
+    expect(tally(lines.slice(before), 'mcp handler error')).toEqual({
+      written: 1,
+      repeated: requestsPerInvitee - 1,
+    });
+    expect(tally(lines.slice(before), 'mcp request refused: past the request budget')).toEqual({
+      written: 1,
+      repeated: 200 - requestsPerInvitee - 1,
+    });
   });
 
-  it("counts each 2026-07-28 request the SDK refuses against its caller's request budget", async () => {
+  it("counts each 2026-07-28 request the SDK refuses against its caller's request budget, once", async () => {
     const relay = await setup({ rateLimits: { requestsPerInvitee: 3 } });
-    const body = JSON.stringify({
+    const request = JSON.stringify({
       jsonrpc: '2.0',
       id: 1,
       method: 'tools/list',
       params: { _meta: META },
     });
-    for (let i = 0; i < 3; i += 1)
-      expect(await modernPost(G1, { 'Mcp-Method': 'x' }, body)).toBe(400);
-    const g1 = await connectClient(relay.relay, G1, { modern: true });
-    clients.push(g1);
-    expect((await callTool(g1, 'list_pages')).text).toMatch(/^rate_limited: /);
+    // One request, spent as it arrives, that the SDK then refuses: once, not twice.
+    expect(await modernPost(G1, { 'Mcp-Method': 'x' }, request)).toBe(400);
+    // A batch and a refused Content-Type are no one request: they spend
+    // nothing as they arrive, and one each when the SDK refuses them.
+    expect(await modernPost(G1, {}, `[${request}]`)).toBe(400);
+    expect(await modernPost(G1, { 'Content-Type': 'text/plain' }, request)).toBe(415);
+    const listed = await modernRequest(G1, 2, 'tools/call', { name: 'list_pages', arguments: {} });
+    expect(listed.status).toBe(200);
+    expect(listed.text).toMatch(/rate_limited: more than 3 requests/);
     // Another account's budget is its own.
     const g2 = await connectClient(relay.relay, G2, { modern: true });
     clients.push(g2);
     expect((await callTool(g2, 'list_pages')).isError).toBe(false);
+  });
+
+  it('spends a request of the budget on every 2026-07-28 tools/list and refuses those past it 429 (ADR 0030)', async () => {
+    const relay = await setup({ rateLimits: { requestsPerUser: 3 } });
+    const before = relay.lines.length;
+    const answers = [];
+    for (let id = 1; id <= 50; id += 1) answers.push(await modernRequest(ALICE, id, 'tools/list'));
+    // Three answered with the list, as M4 answered all fifty.
+    for (const answer of answers.slice(0, 3)) {
+      expect(answer.status).toBe(200);
+      expect(answer.text).toContain('"list_pages"');
+    }
+    // The rest refused before the SDK saw them, in the budget's own words, each with its own id.
+    answers.slice(3).forEach((answer, index) => {
+      expect(answer.status).toBe(429);
+      expect(JSON.parse(answer.text)).toEqual({
+        jsonrpc: '2.0',
+        id: index + 4,
+        error: {
+          code: -32000,
+          message: 'more than 3 requests to this relay in 1 minute; wait and try again',
+        },
+      });
+    });
+    // So list_pages, which still answered in M4, is refused too.
+    const listed = await modernRequest(ALICE, 51, 'tools/call', {
+      name: 'list_pages',
+      arguments: {},
+    });
+    expect(listed.text).toMatch(/rate_limited: more than 3 requests/);
+    // They asked nothing of a page, so they leave no audit record, only list_pages its own
+    // refusal; and one line a window.
+    expect(relay.relay.audit.events()).toEqual([
+      expect.objectContaining({ type: 'request_refused', tool: 'list_pages' }),
+    ]);
+    const message = 'mcp request refused: past the request budget';
+    expect(tally(relay.lines.slice(before), message).written).toBe(1);
+    await current?.close();
+    expect(tally(relay.lines.slice(before), message)).toEqual({ written: 1, repeated: 46 });
+  });
+
+  it('spends a request on a 2026-07-28 tools/call the SDK refuses before any tool runs, as on server/discover (ADR 0030)', async () => {
+    const relay = await setup({ rateLimits: { requestsPerUser: 3 } });
+    // server/discover, as a client sends it on connecting, and the SDK serves it.
+    expect((await modernRequest(ALICE, 1, 'server/discover')).status).toBe(200);
+    // A tools/call with no name: the SDK answers it an error in a 200, and in M4 it cost nothing.
+    const nameless = [];
+    for (let id = 2; id <= 6; id += 1) {
+      nameless.push(await modernRequest(ALICE, id, 'tools/call', { arguments: {} }));
+    }
+    expect(nameless.map((answer) => answer.status)).toEqual([200, 200, 429, 429, 429]);
+    expect(nameless[0]?.text).toMatch(/Invalid tools\/call request/);
+    expect(nameless[2]?.text).toMatch(/more than 3 requests to this relay/);
+    const listed = await modernRequest(ALICE, 7, 'tools/call', {
+      name: 'list_pages',
+      arguments: {},
+    });
+    expect(listed.text).toMatch(/rate_limited: more than 3 requests/);
+    expect(relay.relay.audit.events()).toEqual([
+      expect.objectContaining({ type: 'request_refused', tool: 'list_pages' }),
+    ]);
   });
 
   it('writes refused 2025-era initializes once per reason a window, and counts the rest', async () => {
@@ -297,18 +406,19 @@ describe('lines a signed-in account can make /mcp write (A4.3)', () => {
 
   it('charges a 2026-07-28 call its client abandons one request, as the tool did, and no more', async () => {
     const relay = await setup({
-      rateLimits: { requestsPerUser: 4 },
+      rateLimits: { requestsPerUser: 5 },
       timings: { callDeadlineMs: 10_000 },
     });
     // The page holds every call, so only the client's leaving ends this one.
     const page = await connectPage(relay.relay.pageUrl, { tools: TOOLS });
     pages.push(page);
+    // The first request: the client's server/discover as it connects (ADR 0030).
     const alice = await connectClient(relay.relay, ALICE, { modern: true });
     clients.push(alice);
-    // The first request.
+    // The second.
     await pairAndApprove(alice, page);
     const abort = new AbortController();
-    // The second, which the SDK answers 499 once its client has gone.
+    // The third, which the SDK answers 499 once its client has gone.
     const abandoned = alice
       .callTool(
         { name: 'call_page_tool', arguments: { page: page.pageId, tool: 'get_view' } },
@@ -325,7 +435,7 @@ describe('lines a signed-in account can make /mcp write (A4.3)', () => {
     await eventually(() => relay.relay.audit.records().length === 1);
     // Room for the 499 to come back through the relay before the next requests.
     await delay(200);
-    // The third and the fourth: had the 499 cost one more, the fourth would be refused.
+    // The fourth and the fifth: had the 499 cost one more, the fifth would be refused.
     expect((await callTool(alice, 'list_pages')).isError).toBe(false);
     const fourth = await callTool(alice, 'list_pages');
     expect(fourth.text).not.toMatch(/^rate_limited: /);

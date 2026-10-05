@@ -70,7 +70,7 @@ import {
 } from './argument-checker.ts';
 import { AuditRefusalBudget } from './audit-budget.ts';
 import { foldName, type UserAccount } from './auth.ts';
-import type { ResolvedConfig } from './config.ts';
+import { MIN_REQUEST_BYTES, type ResolvedConfig } from './config.ts';
 import type { LogFields, Logger, LogLevel } from './log.ts';
 import { SlidingWindowLimiter } from './rate-limit.ts';
 import { RepeatedLines } from './repeated-lines.ts';
@@ -1008,12 +1008,14 @@ export class PageHub {
   readonly #pageLimiter: SlidingWindowLimiter;
   readonly #callLimiter: SlidingWindowLimiter;
   /**
-   * What the /mcp requests waiting on a page hold on the heap, by user and
-   * in all, each charged its body's upper bound (request-heap.ts) from
-   * when it may start waiting until it is answered (#holdBytes).
+   * What the /mcp requests waiting on a page hold on the heap, by user, in
+   * all, and for invitees together, each charged what request-heap.ts
+   * measures its body to hold, from when it may start waiting until it is
+   * answered (#holdBytes).
    */
   readonly #heldBytes = new Map<string, number>();
   #heldTotal = 0;
+  #heldByInvitees = 0;
   /** Tools frames per remote address, shared by its sockets and kept across reconnects. */
   readonly #toolsFrameLimiter: SlidingWindowLimiter;
   /**
@@ -2387,6 +2389,20 @@ export class PageHub {
       );
       return;
     }
+    // The invite may have reached its end while the operator decided, with
+    // its timer not yet run: its lifetime holds on the relay's own clock at
+    // approval too (S14), so it closes now, which ends this request as its
+    // timer would, and nothing is granted under it.
+    if (invite.expiresAt <= Date.now()) {
+      this.#closeInvite(invite, 'expired');
+      if (this.#store.requests.get(request.requestId) !== undefined) {
+        this.#endRequest(
+          request.requestId,
+          hubError('pairing_expired', 'this invite is no longer live'),
+        );
+      }
+      return;
+    }
     // The sponsor may have passed their end while the operator decided, with
     // the timer not yet run; ending them now closes the invite, which answers
     // this request as any sponsor's end does, so nothing is granted under it.
@@ -2888,17 +2904,24 @@ export class PageHub {
 
   /**
    * Charges a request that may wait on a page (a call, or a pairing waiting
-   * for the operator) its body's upper bound on the heap, `bytes`, until
-   * release. Past what one user's such requests may hold together
-   * (limits.requestBytesPerUser) it is refused rate_limited, and past what
-   * all may hold (limits.requestBytes) `relayFull`: the request budget
-   * alone let one member hold 120 calls of 1 MB arguments, about 2 MB of
-   * heap each, and crash a relay with the image's 192 MiB heap (ADR 0018's
-   * notes). A request charged nothing, as from a caller with no HTTP body,
-   * is always held.
+   * for the operator) what its body is measured to hold on the heap,
+   * `bytes`, until release. Past what one user's such requests may hold
+   * together (limits.requestBytesPerUser) it is refused rate_limited; an
+   * invitee's past what invitees may hold together (#inviteeShare)
+   * `relayFull`; and anyone's past what all may hold (limits.requestBytes)
+   * `relayFull` too: the request budget alone let one member hold 120 calls
+   * of 1 MB arguments, about 2 MB of heap each, and crash a relay with the
+   * image's 192 MiB heap (ADR 0018's notes). A request charged nothing, as
+   * from a caller with no HTTP body, is always held.
    */
-  #holdBytes(userId: string, bytes: number, relayFull: 'page_busy' | 'rate_limited'): HeldBytes {
+  #holdBytes(
+    caller: CallerIdentity,
+    bytes: number,
+    relayFull: 'page_busy' | 'rate_limited',
+  ): HeldBytes {
     if (bytes <= 0) return { kind: 'held', release: () => undefined };
+    const { userId } = caller;
+    const invitee = caller.account.kind === 'invitee';
     const { requestBytes, requestBytesPerUser } = this.#config.limits;
     const own = this.#heldBytes.get(userId) ?? 0;
     if (bytes > requestBytesPerUser) {
@@ -2915,6 +2938,15 @@ export class PageHub {
         `your requests waiting on pages already hold ${mebibytes(own)} of the relay's memory, and one user's may hold ${mebibytes(requestBytesPerUser)}; wait for some to finish`,
       );
     }
+    if (invitee && this.#heldByInvitees + bytes > this.#inviteeShare()) {
+      this.#log.debug('request refused: invitees hold all their requests waiting may', {
+        userId,
+      });
+      return hubError(
+        relayFull,
+        "requests from invited accounts already hold all of the relay's memory they may while they wait; try again shortly",
+      );
+    }
     if (this.#heldTotal + bytes > requestBytes) {
       this.#log.debug('request refused: requests waiting hold all the relay allows', { userId });
       return hubError(
@@ -2924,6 +2956,7 @@ export class PageHub {
     }
     this.#heldBytes.set(userId, own + bytes);
     this.#heldTotal += bytes;
+    if (invitee) this.#heldByInvitees += bytes;
     let held = true;
     return {
       kind: 'held',
@@ -2931,11 +2964,24 @@ export class PageHub {
         if (!held) return;
         held = false;
         this.#heldTotal -= bytes;
+        if (invitee) this.#heldByInvitees -= bytes;
         const left = (this.#heldBytes.get(userId) ?? bytes) - bytes;
         if (left > 0) this.#heldBytes.set(userId, left);
         else this.#heldBytes.delete(userId);
       },
     };
+  }
+
+  /**
+   * What invitees' waiting requests may hold together: a quarter of the
+   * relay's total, or one call of the largest arguments where a quarter is
+   * less, in every mode and with no setting of its own. Guests and strangers
+   * rank below members (ADR 0016's notes), so guests calling a frozen tab can
+   * no longer leave members page_busy everywhere, while members may still
+   * use the whole (S9, ADR 0030).
+   */
+  #inviteeShare(): number {
+    return Math.max(Math.floor(this.#config.limits.requestBytes / 4), MIN_REQUEST_BYTES);
   }
 
   // Calls
@@ -3098,7 +3144,7 @@ export class PageHub {
     // strangers (ADR 0016).
     const required = this.#inviteRequired(caller, 'code');
     if (required) return required;
-    const held = this.#holdBytes(caller.userId, heldBytes, 'rate_limited');
+    const held = this.#holdBytes(caller, heldBytes, 'rate_limited');
     if (held.kind === 'error') return this.#refusedBeforePage(caller, 'code', null, held);
     try {
       return await this.#pairByCode(caller, code, signal, now);
@@ -3204,7 +3250,7 @@ export class PageHub {
     heldBytes = 0,
   ): Promise<PairOutcome> {
     // As for pairPage, before anything is spent: the request may wait for the operator.
-    const held = this.#holdBytes(caller.userId, heldBytes, 'rate_limited');
+    const held = this.#holdBytes(caller, heldBytes, 'rate_limited');
     if (held.kind === 'error') return this.#refusedBeforePage(caller, 'invite', null, held);
     try {
       const secret = inviteSecretOf(invite, this.#linkBase());
@@ -3724,9 +3770,9 @@ export class PageHub {
   }
 
   /**
-   * `heldBytes` is an upper bound on what the call's own request holds on
-   * the heap while it waits (request-heap.ts), which relay.ts measures from
-   * its body; 0 for a caller with none.
+   * `heldBytes` is what the call's own request is measured to hold on the
+   * heap while it waits (request-heap.ts), which relay.ts measures from its
+   * body; 0 for a caller with none.
    */
   async callPageTool(
     caller: CallerIdentity,
@@ -3904,7 +3950,7 @@ export class PageHub {
       );
     }
     this.#callLimiter.record(rateKey, arrivedAt);
-    const held = this.#holdBytes(caller.userId, heldBytes, 'page_busy');
+    const held = this.#holdBytes(caller, heldBytes, 'page_busy');
     if (held.kind === 'error') return held;
     trace.release = held.release;
 
@@ -4263,6 +4309,15 @@ export class PageHub {
 
   /** The invoke itself, once every check has passed and the socket has room. True if it went out. */
   #sendInvoke(call: PendingCall, attachment: AttachmentRecord, conn: Conn): boolean {
+    // #access refuses a socket the relay is closing, but one the page began
+    // to close stays CLOSING until ws reports the close, up to its 30 s
+    // closeTimeout while the peer keeps TCP open, and ws sends nothing on it;
+    // written there, the call would wait out its deadline and be recorded as
+    // having reached the page (S7).
+    if (conn.closing || conn.ws.readyState !== conn.ws.OPEN) {
+      call.settle(hubError('page_asleep', 'the page disconnected before the call reached it'));
+      return false;
+    }
     const { callDeadlineMs } = this.#config.timings;
     const remaining = call.waited ? callDeadlineMs - (Date.now() - call.arrivedAt) : callDeadlineMs;
     if (remaining <= 0) {

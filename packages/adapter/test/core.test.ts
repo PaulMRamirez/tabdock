@@ -5,12 +5,19 @@ import {
   IDLE_TIMEOUT_MS,
   MAX_FRAME_BYTES,
   MAX_RESULT_CHARS,
+  MAX_TIMER_MS,
   RECONNECT_MAX_MS,
   RECONNECT_MIN_MS,
   TOOL_POLL_MS,
 } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
-import { backoffDelay, createAdapterCore, type LocksLike, type RuntimeTool } from '../src/core.ts';
+import {
+  backoffDelay,
+  createAdapterCore,
+  type LocksLike,
+  MAX_DEADLINE_MS,
+  type RuntimeTool,
+} from '../src/core.ts';
 import {
   FRAME_WINDOW,
   GRANTS_KEY,
@@ -443,6 +450,34 @@ describe('cancel and deadline', () => {
     expect(results(socket)[0]?.error?.code).toBe('timeout');
     expect(h.context.runs[0]?.signal.aborted).toBe(true);
   });
+
+  // The schema takes any positive safe integer, so a relay the adapter does
+  // not trust can send a deadline no timer can hold; Chromium ran such a
+  // timer at once, ending the call as it began (ADR 0030).
+  it.each([
+    ['2^31 ms', 2 ** 31],
+    ['Number.MAX_SAFE_INTEGER ms', Number.MAX_SAFE_INTEGER],
+  ])(
+    'caps a deadline of %s under the timer maximum, so the call ends neither at once nor past the cap',
+    async (_, deadlineMs) => {
+      const h = setup({ browserTimers: true });
+      h.context.handlers.set('get_value', () => new Promise<string>(() => undefined));
+      const socket = await link(h);
+      socket.deliver(invoke('get_value', { deadlineMs }));
+      await h.clock.advance(1000);
+      expect(results(socket)).toEqual([]);
+      expect(h.context.runs[0]?.signal.aborted).toBe(false);
+      // On to just short of the cap at once, the relay's ping keeping the link alive meanwhile.
+      h.clock.now += MAX_DEADLINE_MS - 1000 - 1;
+      socket.deliver({ t: 'ping' });
+      await h.clock.advance(0);
+      expect(results(socket)).toEqual([]);
+      await h.clock.advance(1);
+      expect(results(socket)[0]?.error?.code).toBe('timeout');
+      expect(h.context.runs[0]?.signal.aborted).toBe(true);
+      expect(h.delays.filter((ms) => ms > MAX_TIMER_MS)).toEqual([]);
+    },
+  );
 });
 
 describe('roles and consequential tools', () => {

@@ -6,7 +6,11 @@
 // with its own secrets, hashed as the adapter hashes them.
 
 import { createHash, randomBytes } from 'node:crypto';
-import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import {
+  Client,
+  type FetchLike,
+  StreamableHTTPClientTransport,
+} from '@modelcontextprotocol/client';
 import type { RelayFrame, Role } from '@tabdock/protocol';
 import { expect } from 'vitest';
 import {
@@ -45,8 +49,17 @@ export interface InviteRelay {
   /** Every log line, parsed. */
   events(): Record<string, unknown>[];
   page(options?: PageOptions): Promise<TestPage>;
-  /** Claude signed in as `sub`, with the namespaced email claims ADR 0020's template adds. */
-  claude(sub: string, email?: string | null, verified?: boolean): Promise<Client>;
+  /**
+   * Claude signed in as `sub`, with the namespaced email claims ADR 0020's
+   * template adds; `wrap`, if given, wraps the tunnel's fetch, to change what
+   * the client sends.
+   */
+  claude(
+    sub: string,
+    email?: string | null,
+    verified?: boolean,
+    wrap?: (base: FetchLike) => FetchLike,
+  ): Promise<Client>;
   close(): Promise<void>;
 }
 
@@ -113,7 +126,7 @@ export async function startInviteRelay(options: InviteRelayOptions = {}): Promis
       pages.push(opened);
       return opened;
     },
-    async claude(sub, email = null, verified = true) {
+    async claude(sub, email = null, verified = true, wrap = (base) => base) {
       const client = new Client({ name: `claude-${sub}`, version: '1.0.0' });
       await client.connect(
         new StreamableHTTPClientTransport(new URL(PUBLIC_MCP_URL), {
@@ -121,7 +134,7 @@ export async function startInviteRelay(options: InviteRelayOptions = {}): Promis
             token: () =>
               provider.token({ sub, aud: PUBLIC_MCP_URL, ...emailClaims(email, verified) }),
           },
-          fetch: tunnelFetch(relay.url),
+          fetch: wrap(tunnelFetch(relay.url)),
         }),
       );
       clients.push(client);

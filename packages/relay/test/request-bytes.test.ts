@@ -3,8 +3,9 @@
 // its body and what was parsed from it, and the request budget bounded only
 // how many a user sent in a minute: one member held 237 MiB with 120 calls
 // of 1 MB, past the image's 192 MiB heap. Now each such request is charged
-// an upper bound on what its body holds (request-heap.ts) while it waits,
-// within a share per user and a total for the relay, on both MCP legs.
+// what its body is measured to hold (request-heap.ts) while it waits, within
+// a share per user and a total for the relay, on both MCP legs, and
+// invitees' requests together within a quarter of that total (ADR 0030).
 // call-heap.test.ts measures the charge against the heap and runs the
 // image's relay against it.
 
@@ -14,12 +15,21 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { MIN_REQUEST_BYTES } from '../src/config.ts';
 import {
   CONTAINER_HEAP_BYTES,
+  INDEX_KEY_HEAP_BYTES,
   PROPERTY_HEAP_BYTES,
   REQUEST_HEAP_BYTES,
   requestHeapBytes,
   STRING_HEAP_BYTES,
   VALUE_HEAP_BYTES,
 } from '../src/request-heap.ts';
+import {
+  call as inviteCall,
+  attachMember,
+  type InviteRelay,
+  mintOk,
+  redeem,
+  startInviteRelay,
+} from './helpers/invites.ts';
 import { connectPage, type TestPage } from './helpers/page-client.ts';
 import {
   ALICE,
@@ -42,11 +52,14 @@ const MIB = 1024 * 1024;
 const relays: TestRelay[] = [];
 const pages: TestPage[] = [];
 const closers: (() => Promise<unknown>)[] = [];
+let inviteRelay: InviteRelay | undefined;
 
 afterEach(async () => {
   for (const close of closers.splice(0)) await close().catch(() => undefined);
   for (const page of pages.splice(0)) page.ws.terminate();
   for (const relay of relays.splice(0)) await relay.close();
+  await inviteRelay?.close();
+  inviteRelay = undefined;
 });
 
 function utf8(text: string): Uint8Array {
@@ -56,8 +69,8 @@ function utf8(text: string): Uint8Array {
 /**
  * What the charge stands for, counted on the parsed value itself: the root's
  * slot, each object, each array with its first value's slot, each further
- * value's slot in an array, each property, and each string with two bytes a
- * character, a key's included.
+ * value's slot in an array, each property, and more for one whose key is
+ * digits alone, and each string with two bytes a character, a key's included.
  */
 function parsedCharge(value: unknown, root = true): number {
   let charge = root ? VALUE_HEAP_BYTES : 0;
@@ -72,6 +85,7 @@ function parsedCharge(value: unknown, root = true): number {
   charge += CONTAINER_HEAP_BYTES + VALUE_HEAP_BYTES * Math.max(0, entries.length - 1);
   for (const [key, item] of entries) {
     charge += STRING_HEAP_BYTES + 2 * key.length + PROPERTY_HEAP_BYTES + parsedCharge(item, false);
+    if (/^[0-9]+$/.test(key)) charge += INDEX_KEY_HEAP_BYTES;
   }
   return charge;
 }
@@ -83,6 +97,10 @@ describe('requestHeapBytes', () => {
     ['arrays of numbers', '[[0],[0,1],[0,1,2],[]]'],
     ['empty objects', `[${Array(1000).fill('{}').join(',')}]`],
     ['unique keys', `{${Array.from({ length: 500 }, (_, n) => `"k${String(n)}":0`).join(',')}}`],
+    [
+      'keys of digits alone',
+      `{"4294967294":0,${Array.from({ length: 500 }, (_, n) => `"${String(n)}":0`).join(',')}}`,
+    ],
     ['escapes', JSON.stringify({ text: 'a"b\\c\nd\u4e00'.repeat(50) })],
     ['two-byte text', JSON.stringify({ text: '\u4e00'.repeat(1000) })],
     ['nested values', JSON.stringify({ a: [1, 'two', { three: [null, true, 4.5] }], b: {} })],
@@ -112,6 +130,27 @@ describe('requestHeapBytes', () => {
     const wide = requestHeapBytes(utf8('"\u00e9aa"'));
     // Both are one string of six bytes on the wire; the second is held at two bytes a character.
     expect(wide - ascii).toBe(6);
+  });
+
+  it('charges a property more when its key is digits alone, and only then (ADR 0030)', () => {
+    const charge = (text: string): number => requestHeapBytes(utf8(text));
+    expect(charge('{"12":0}') - charge('{"ab":0}')).toBe(INDEX_KEY_HEAP_BYTES);
+    expect(charge('{"12" : 0}') - charge('{"ab" : 0}')).toBe(INDEX_KEY_HEAP_BYTES);
+    // A value of digits, an empty key, and keys with anything else in them are not index keys.
+    expect(charge('{"a":"12"}')).toBe(charge('{"a":"ab"}'));
+    // One byte less on the wire and two less held for the character, no surcharge.
+    expect(charge('{"":0}')).toBe(charge('{"a":0}') - 3);
+    for (const key of ['1a', '-1', '1.5', '1e3']) {
+      expect(charge(`{"${key}":0}`), key).toBe(charge(`{"${'a'.repeat(key.length)}":0}`));
+    }
+    // An escape may stand for a digit ("\\u0031" parses to "1"), so a key of
+    // digits and escapes counts as one, which can only overstate.
+    expect(charge('{"\\u0031":0}') - charge('{"aaaaaa":0}')).toBe(INDEX_KEY_HEAP_BYTES);
+    expect(charge('{"1\\"":0}')).toBe(charge('{"aaa":0}'));
+    // Each such key counts, not only the first.
+    expect(charge('{"1":0,"2":0,"3":0}') - charge('{"a":0,"b":0,"c":0}')).toBe(
+      3 * INDEX_KEY_HEAP_BYTES,
+    );
   });
 
   it('charges whitespace only as the body it is', () => {
@@ -153,11 +192,11 @@ async function holdingPage(relay: TestRelay): Promise<{ page: TestPage; release:
 }
 
 /** A fetch that pads every tools/call body with this many spaces, which the SDK itself never would. */
-function padding(spaces: number): FetchLike {
+function padding(spaces: number, base: FetchLike = fetch): FetchLike {
   return (input, init) => {
     const body = init?.body;
-    if (typeof body !== 'string' || !body.includes('"tools/call"')) return fetch(input, init);
-    return fetch(input, { ...init, body: `${body.slice(0, -1)}${' '.repeat(spaces)}}` });
+    if (typeof body !== 'string' || !body.includes('"tools/call"')) return base(input, init);
+    return base(input, { ...init, body: `${body.slice(0, -1)}${' '.repeat(spaces)}}` });
   };
 }
 
@@ -330,4 +369,83 @@ describe('what requests waiting on a page may hold', () => {
     },
     60_000,
   );
+});
+
+describe('what invitees together may hold while their requests wait (S9, ADR 0030)', () => {
+  it('refuses a guest past a quarter of the total, a call page_busy and a redemption rate_limited, and still holds a member', async () => {
+    // Shares of 8 MiB and a total of 32 MiB, so invitees may hold 8 MiB
+    // together: twice what the least setting allows, so the quarter, not
+    // the floor, is what binds.
+    const relay = await startInviteRelay({
+      limits: { requestBytesPerUser: 2 * MIN_REQUEST_BYTES, requestBytes: 8 * MIN_REQUEST_BYTES },
+      timings: { callDeadlineMs: 20_000 },
+    });
+    inviteRelay = relay;
+    const waiting: (() => void)[] = [];
+    const page = await relay.page({
+      tools: [SEARCH],
+      onInvoke: () =>
+        new Promise((resolve) => {
+          waiting.push(() => {
+            resolve({ ok: true, content: 'found' });
+          });
+        }),
+    });
+    const release = (): void => {
+      for (const answer of waiting.splice(0)) answer();
+    };
+    // Every tools/call body padded to 1.25 MiB, which the relay charges about
+    // 1.5 MiB with its fixed quarter MiB: five fit in 8 MiB and a sixth does not.
+    const padded = (base: FetchLike): FetchLike => padding(1.25 * MIB, base);
+    const alice = await relay.claude('sub-alice', null, true, padded);
+    await attachMember(alice, page);
+    const guests = [];
+    for (const n of [1, 2]) {
+      const guest = await relay.claude(
+        `sub-guest-${String(n)}`,
+        `guest${String(n)}@example.com`,
+        true,
+        padded,
+      );
+      const { link } = await mintOk(page);
+      expect((await redeem(guest, page, link)).outcome.isError).toBe(false);
+      guests.push(guest);
+    }
+    const [first, second] = guests;
+    if (first === undefined || second === undefined) throw new Error('no guests');
+    const search = (client: typeof alice) =>
+      inviteCall(client, 'call_page_tool', {
+        page: page.pageId,
+        tool: SEARCH.name,
+        arguments: { text: 'x' },
+      });
+    // The first guest's five calls hold about 7.5 MiB, more than the least
+    // setting (4 MiB) and within both the guest's share and the quarter.
+    const held = Array.from({ length: 5 }, () => search(first));
+    while (page.all('invoke').length < 5) await page.next('invoke', 10_000);
+    const refused = await search(second);
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toMatch(/^page_busy: requests from invited accounts already hold all/);
+    // A redemption waits for the operator too, so it is held to the same
+    // quarter, before anything of its invite is spent.
+    const third = await relay.claude('sub-guest-3', 'guest3@example.com', true, padded);
+    const { link, inviteId } = await mintOk(page);
+    const redemption = await inviteCall(third, 'pair_page', { invite: link });
+    expect(redemption.text).toMatch(
+      /^rate_limited: requests from invited accounts already hold all/,
+    );
+    expect(relay.store.invites.get(page.pageId, inviteId)?.usesLeft).toBe(1);
+    // A member ranks above them and may still use the rest of the total.
+    const member = search(alice);
+    while (page.all('invoke').length < 6) await page.next('invoke', 10_000);
+    release();
+    for (const outcome of await Promise.all([...held, member])) {
+      expect(outcome.isError, outcome.text).toBe(false);
+    }
+    // What the guests held is back, so the second guest's call now waits on the page.
+    const later = search(second);
+    while (page.all('invoke').length < 7) await page.next('invoke', 10_000);
+    release();
+    expect((await later).isError).toBe(false);
+  }, 60_000);
 });

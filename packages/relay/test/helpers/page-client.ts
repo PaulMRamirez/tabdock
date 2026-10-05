@@ -3,6 +3,7 @@
 // invokes automatically. It is deliberately not the adapter, so relay tests do
 // not depend on adapter behaviour.
 
+import type { Socket } from 'node:net';
 import {
   encodeFrame,
   type PageFrameInput,
@@ -15,6 +16,16 @@ import {
 import WebSocket from 'ws';
 
 export const PAGE_ORIGIN = 'http://localhost:5173';
+
+/** Each page socket's TCP connection, for tests that act below the WebSocket layer. */
+const connections = new WeakMap<WebSocket, Socket>();
+
+/** The TCP connection under a socket openSocket opened, as ws's upgrade event handed it over. */
+export function connectionOf(ws: WebSocket): Socket {
+  const connection = connections.get(ws);
+  if (connection === undefined) throw new Error('not a socket openSocket opened');
+  return connection;
+}
 
 export type RelayFrameOf<T extends RelayFrame['t']> = Extract<RelayFrame, { t: T }>;
 export type InvokeFrame = RelayFrameOf<'invoke'>;
@@ -50,6 +61,9 @@ export function openSocket(url: string, options: SocketOptions = {}): Promise<We
     ...(origin === null ? {} : { origin }),
     ...(options.localAddress === undefined ? {} : { localAddress: options.localAddress }),
     ...(options.headers === undefined ? {} : { headers: options.headers }),
+  });
+  ws.once('upgrade', (response) => {
+    connections.set(ws, response.socket);
   });
   return new Promise((resolve, reject) => {
     ws.once('open', () => {

@@ -215,6 +215,30 @@ describe('M4 settings', () => {
         expect(() => loadConfigFromEnv({ ...DEV, [name]: 'lots' })).toThrow(new RegExp(name));
       }
     });
+
+    it('refuse a per-user share above the total, naming the share, and take the two equal (ADR 0030)', () => {
+      // The total alone lowered under the default 24 MiB share: a body charged
+      // between the two would be parsed, only to be refused page_busy.
+      const refused = thrown(() => resolveEnv({ ...DEV, TABDOCK_MAX_REQUEST_BYTES: '8388608' }));
+      expect(refused).toMatch(
+        /TABDOCK_MAX_REQUEST_BYTES_PER_USER\) must be at most requestBytes \(TABDOCK_MAX_REQUEST_BYTES\)/,
+      );
+      expect(refused).not.toContain('8388608');
+      expect(
+        thrown(() =>
+          resolveConfig({
+            auth: createDevTokenAuth([ALICE]),
+            limits: { requestBytes: 8 * 1024 * 1024, requestBytesPerUser: 8 * 1024 * 1024 + 1 },
+          }),
+        ),
+      ).toMatch(/TABDOCK_MAX_REQUEST_BYTES_PER_USER/);
+      const equal = resolveEnv({
+        ...DEV,
+        TABDOCK_MAX_REQUEST_BYTES: '8388608',
+        TABDOCK_MAX_REQUEST_BYTES_PER_USER: '8388608',
+      }).limits;
+      expect([equal.requestBytes, equal.requestBytesPerUser]).toEqual([8_388_608, 8_388_608]);
+    });
   });
 
   describe('hosted mode (ADR 0018)', () => {
