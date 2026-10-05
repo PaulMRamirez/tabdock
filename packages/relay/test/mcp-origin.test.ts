@@ -21,6 +21,7 @@ import {
   type Relay,
   type RelayOptions,
 } from '../src/index.ts';
+import { MAX_NAMED_REFUSED_ORIGINS } from '../src/origin-refusals.ts';
 import { openSocket, PAGE_ORIGIN, UpgradeRefused } from './helpers/page-client.ts';
 import { PAIR_CLIENT, startProvider, type TestProvider } from './helpers/provider.ts';
 import { openSession } from './helpers/raw-mcp.ts';
@@ -332,6 +333,48 @@ describe('without a public URL (dev tokens and local mode)', () => {
     expect(refused).toHaveLength(1);
     expect(refused[0]).toMatchObject({ origin: long.slice(0, 200), address: '127.0.0.1' });
     expect(lines.join('\n')).not.toContain(long.slice(0, 201));
+  });
+
+  it('names each of the first origins refused in a window, and the most seen of the rest, so a trickle of others cannot hide one', async () => {
+    atWindowStart();
+    const started = await start({ auth: createDevTokenAuth([ALICE]) });
+    const discover = OPENERS[4];
+    if (!discover) throw new Error('no opener');
+    const refuse = async (origin: string): Promise<void> => {
+      expect((await send(started, discover, { origin })).status).toBe(403);
+    };
+    // Others get in first, as a trickle at each window's start would.
+    for (let index = 0; index < MAX_NAMED_REFUSED_ORIGINS; index += 1) {
+      await refuse(`http://first${String(index)}.example`);
+    }
+    await refuse('http://first0.example');
+    // Then the origin the owner is looking for, among many others seen once each.
+    for (let index = 0; index < 120; index += 1) {
+      await refuse(`http://evil${String(index)}.example`);
+      if (index % 15 === 0) await refuse('https://claude.ai');
+    }
+    const named = logged('mcp request refused: origin not allowed');
+    expect(named.map((line) => line.origin)).toEqual(
+      Array.from({ length: MAX_NAMED_REFUSED_ORIGINS }, (_, index) => {
+        return `http://first${String(index)}.example`;
+      }),
+    );
+    // The window's counts go out as it ends, or as the relay closes.
+    await started.close();
+    relay = undefined;
+    expect(logged('mcp request refused: origin not allowed, repeated')).toEqual([
+      expect.objectContaining({ origin: 'http://first0.example', repeated: 1 }),
+    ]);
+    const [rest] = logged('mcp request refused: origin not allowed, more origins than named');
+    expect(rest).toMatchObject({ repeated: 128 });
+    expect((rest?.mostSeen as { origin: string }[])[0]).toEqual({
+      origin: 'https://claude.ai',
+      refusedAtMost: 8,
+    });
+    // The shared /mcp lines' budget has none of them, so they crowd no other kind.
+    expect(lines.filter((line) => line.includes('origin not allowed'))).toHaveLength(
+      MAX_NAMED_REFUSED_ORIGINS + 2,
+    );
   });
 
   it('names its policy in the start line', async () => {

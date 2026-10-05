@@ -76,10 +76,16 @@ import {
 import { AuditRefusalBudget } from './audit-budget.ts';
 import { foldName, type UserAccount } from './auth.ts';
 import { MIN_REQUEST_BYTES, type ResolvedConfig } from './config.ts';
-import { type FirstClassTool, firstClassEntry, firstClassToolPart } from './first-class.ts';
+import {
+  type FirstClassTool,
+  firstClassEntry,
+  firstClassName,
+  firstClassToolPart,
+} from './first-class.ts';
 import type { LogFields, Logger, LogLevel } from './log.ts';
 import { SlidingWindowLimiter } from './rate-limit.ts';
 import { RepeatedLines } from './repeated-lines.ts';
+import { childPosition, SCHEMA_TEXT_KEYS, type SchemaPosition } from './schema-keywords.ts';
 import {
   digest,
   digestHex,
@@ -768,31 +774,6 @@ export const MAX_SCHEMA_CHARS = 8192;
  * a few thousand levels deep would break every listing that serialises it.
  */
 export const MAX_SCHEMA_DEPTH = 64;
-/**
- * Schema keywords that clients show as prose. A string there is cut like any
- * other; anything else is replaced, because an array or object there would put
- * several capped strings into what a client shows as one description (S10).
- */
-const SCHEMA_TEXT_KEYS = new Set(['description', 'title']);
-/**
- * Keywords whose value maps names (property names, definition names, patterns)
- * to schemas: a "title" key in there is a property called title, not prose, and
- * must keep its schema.
- */
-const SCHEMA_NAME_MAP_KEYS = new Set([
-  'properties',
-  'patternProperties',
-  '$defs',
-  'definitions',
-  'dependentSchemas',
-  'dependentRequired',
-  'dependencies',
-]);
-/** Keywords whose value is instance data, where keys mean nothing to JSON Schema. */
-const SCHEMA_DATA_KEYS = new Set(['enum', 'const', 'default', 'examples']);
-
-/** What a value is to JSON Schema, so keyword rules apply only where keys are keywords. */
-type SchemaPosition = 'schema' | 'names' | 'data';
 
 class SchemaTooDeep extends Error {}
 class SchemaKeyTooLong extends Error {}
@@ -871,19 +852,12 @@ function cutSchemaEntry(
   position: SchemaPosition,
   tally: HeldTally,
 ): unknown {
-  if (position === 'names') return cutSchemaText(item, depth, 'schema', tally);
-  if (position === 'data') return cutSchemaText(item, depth, 'data', tally);
-  if (SCHEMA_TEXT_KEYS.has(key) && typeof item !== 'string') {
+  if (position === 'schema' && SCHEMA_TEXT_KEYS.has(key) && typeof item !== 'string') {
     const removed = `[tabdock: non-string ${key} removed]`;
     holdValue(removed, tally);
     return removed;
   }
-  const next = SCHEMA_NAME_MAP_KEYS.has(key)
-    ? 'names'
-    : SCHEMA_DATA_KEYS.has(key)
-      ? 'data'
-      : 'schema';
-  return cutSchemaText(item, depth, next, tally);
+  return cutSchemaText(item, depth, childPosition(key, position), tally);
 }
 
 function removedSchema(why: string): JsonObject {
@@ -4083,7 +4057,7 @@ export class PageHub {
     const trace: CallTrace = {
       reached: false,
       release: null,
-      tool: typeof tool === 'string' ? tool : tool.firstClass,
+      tool: typeof tool === 'string' ? tool : this.firstClassAuditName(pageId, tool.firstClass),
     };
     try {
       const outcome = await this.#call(caller, pageId, tool, args, signal, marks, trace, heldBytes);
@@ -4118,6 +4092,26 @@ export class PageHub {
       else this.#budget.refused(record);
       this.#spike?.callFinished(pageId, caller.userId, auditOutcome);
     }
+  }
+
+  /**
+   * The tool a first-class call is recorded under (S7) until the call
+   * resolves it: the one tool of the page that maps to the name, which is
+   * what call_page_tool records for the same call, refused or not; or, when
+   * the relay holds no such tool (the page is asleep, gone or unknown, or
+   * none or two of its tools map to the name), the whole first-class name.
+   * Never the mapped part alone, which reads as another tool's name: a
+   * refused `<page id>__doc_save` must not be recorded as a call to a
+   * `doc_save` the page may also have when it meant `doc.save`.
+   */
+  firstClassAuditName(pageId: string, toolPart: string): string {
+    let found: string | null = null;
+    for (const tool of this.#store.pages.get(pageId)?.tools ?? []) {
+      if (firstClassToolPart(tool.name) !== toolPart) continue;
+      if (found !== null) return firstClassName(pageId, toolPart);
+      found = tool.name;
+    }
+    return found ?? firstClassName(pageId, toolPart);
   }
 
   /**

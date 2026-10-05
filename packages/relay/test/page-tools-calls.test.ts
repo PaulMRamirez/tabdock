@@ -74,14 +74,17 @@ async function client(user: DevTokenUser = ALICE, modern = false): Promise<Clien
   return connected;
 }
 
+/** A call record without the two fields a second call cannot share. */
+type CallLine = Omit<AuditCallEvent, 'at' | 'durationMs'>;
+
 /** The newest call record, without the two fields a second call cannot share. */
-function lastRecord(): Omit<AuditCallEvent, 'at' | 'durationMs'> {
+function lastRecord(): CallLine {
   const record = current?.relay.audit.records().at(-1);
   if (!record) throw new Error('no call record');
   const rest: Partial<AuditCallEvent> = { ...record };
   delete rest.at;
   delete rest.durationMs;
-  return rest as Omit<AuditCallEvent, 'at' | 'durationMs'>;
+  return rest as CallLine;
 }
 
 /** One call by each route, and the result and call line each left. */
@@ -90,7 +93,12 @@ async function bothRoutes(
   pageId: string,
   tool: string,
   args: Record<string, unknown> = {},
-): Promise<{ fixed: ToolOutcome; named: ToolOutcome; fixedRecord: unknown; namedRecord: unknown }> {
+): Promise<{
+  fixed: ToolOutcome;
+  named: ToolOutcome;
+  fixedRecord: CallLine;
+  namedRecord: CallLine;
+}> {
   const fixed = await callTool(alice, 'call_page_tool', { page: pageId, tool, arguments: args });
   const fixedRecord = lastRecord();
   const named = await callTool(alice, `${pageId}__${tool.replaceAll('.', '_')}`, args);
@@ -136,7 +144,10 @@ describe('a first-class call and call_page_tool', () => {
           );
           expect(fixed.text, tool).toMatch(expected);
           expect(named, tool).toEqual(fixed);
-          expect(namedRecord, tool).toEqual(fixedRecord);
+          // A name no tool of the page maps to is recorded as the client named it.
+          expect(namedRecord, tool).toEqual(
+            tool === 'nope' ? { ...fixedRecord, tool: `${opened.pageId}__nope` } : fixedRecord,
+          );
         }
         // The page saw both routes' calls under the page tool's own name.
         expect(opened.all('invoke').filter((frame) => frame.tool === 'board.add')).toHaveLength(2);
@@ -149,21 +160,29 @@ describe('a first-class call and call_page_tool', () => {
     await setup({ timings: { resumeWindowMs: 1000 } });
     const opened = await page({ onInvoke: () => ({ ok: true, content: 'ok' }) });
     const alice = await client();
-    // A page id nobody holds: not_attached, by the same words either way.
+    // A page id nobody holds: not_attached, by the same words either way. The
+    // relay holds no tool there to name, so the line names what the client did.
     const stranger = await bothRoutes(alice, 'pg_ZZZZZZZZZZ', 'get_view');
     expect(stranger.fixed.text).toMatch(/^not_attached: /);
     expect(stranger.named).toEqual(stranger.fixed);
-    expect(stranger.namedRecord).toEqual(stranger.fixedRecord);
+    expect(stranger.namedRecord).toEqual({
+      ...stranger.fixedRecord,
+      tool: 'pg_ZZZZZZZZZZ__get_view',
+    });
     await pairAndApprove(alice, opened);
     opened.ws.terminate();
     await opened.closed;
     await eventually(async () =>
       (await callTool(alice, 'list_pages')).text.includes('"state":"asleep"'),
     );
+    // An asleep page's tools are not held, so the same holds for it and a gone page.
     const asleep = await bothRoutes(alice, opened.pageId, 'get_view');
     expect(asleep.fixed.text).toMatch(/^page_asleep: /);
     expect(asleep.named).toEqual(asleep.fixed);
-    expect(asleep.namedRecord).toEqual(asleep.fixedRecord);
+    expect(asleep.namedRecord).toEqual({
+      ...asleep.fixedRecord,
+      tool: `${opened.pageId}__get_view`,
+    });
     // The resume window ends and the page is gone.
     await eventually(
       async () => (await callTool(alice, 'list_pages')).text.includes('"state":"gone"'),
@@ -172,7 +191,53 @@ describe('a first-class call and call_page_tool', () => {
     const gone = await bothRoutes(alice, opened.pageId, 'get_view');
     expect(gone.fixed.text).toMatch(/^page_gone: /);
     expect(gone.named).toEqual(gone.fixed);
-    expect(gone.namedRecord).toEqual(gone.fixedRecord);
+    expect(gone.namedRecord).toEqual({ ...gone.fixedRecord, tool: `${opened.pageId}__get_view` });
+  });
+
+  it('record a dotted tool under its own name by either route, refused before the call resolves it too (S7)', async () => {
+    await setup({ rateLimits: { requestsPerUser: 6 } });
+    const opened = await page({
+      tools: [...TOOLS, { ...DOTTED, name: 'doc.save' }],
+      onInvoke: () => ({ ok: true, content: 'ok' }),
+    });
+    // Alice holds the page; Bob does not, and spends his own budget.
+    await pairAndApprove(await client(), opened);
+    const bob = await client(BOB);
+    const records: CallLine[] = [];
+    for (let index = 0; index < 4; index += 1) {
+      const route = await bothRoutes(bob, opened.pageId, 'doc.save', { label: 'x' });
+      expect(route.named).toEqual(route.fixed);
+      expect(route.namedRecord).toEqual(route.fixedRecord);
+      records.push(route.namedRecord);
+    }
+    // not_attached at first, then past Bob's budget of 6: every line names doc.save.
+    expect(records.map((record) => record.outcome)).toEqual([
+      'not_attached',
+      'not_attached',
+      'not_attached',
+      'rate_limited',
+    ]);
+    for (const record of records) {
+      expect(record).toMatchObject({ userId: 'bob', tool: 'doc.save' });
+    }
+  });
+
+  it('record a name two tools map to as the client named it, never as one of the two', async () => {
+    await setup();
+    const opened = await page({
+      tools: [...TOOLS, { ...DOTTED, name: 'doc.save' }, { ...DOTTED, name: 'doc_save' }],
+    });
+    const bob = await client(BOB);
+    const fixed = await callTool(bob, 'call_page_tool', { page: opened.pageId, tool: 'doc_save' });
+    expect(fixed.text).toMatch(/^not_attached: /);
+    expect(lastRecord()).toMatchObject({ userId: 'bob', tool: 'doc_save' });
+    const named = await callTool(bob, `${opened.pageId}__doc_save`, { label: 'x' });
+    expect(named).toEqual(fixed);
+    expect(lastRecord()).toMatchObject({
+      userId: 'bob',
+      tool: `${opened.pageId}__doc_save`,
+      outcome: 'not_attached',
+    });
   });
 
   it('share one write queue, in arrival order across both routes (A2.3)', async () => {

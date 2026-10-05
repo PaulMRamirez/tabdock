@@ -104,6 +104,7 @@ import {
   RELAY_VERSION,
   userIdOf,
 } from './mcp.ts';
+import { OriginRefusals } from './origin-refusals.ts';
 import { PageToolNotifier } from './page-tool-notifier.ts';
 import { createPairFlow, PAIR_ROUTES, type PairFlow } from './pair.ts';
 import { createRepeatedLog, errorKind } from './repeated-lines.ts';
@@ -554,6 +555,8 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   const mcpLines = createRepeatedLog(log, config.rateLimits.windowMs);
   // Which revision each client speaks, one line per user, client and leg an hour (ADR 0027).
   const clientLines = createClientLines(log);
+  // Refused Origins on /mcp, a few named in full each window apart from the lines above (ADR 0027).
+  const originRefusals = new OriginRefusals(log, config.rateLimits.windowMs);
   // Responses a client leaves unread are cut off once they stop moving (ADR 0030).
   const stalls = new ResponseStalls({ lines: mcpLines });
   // What each /mcp request's body holds on the heap, measured before either
@@ -665,9 +668,10 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
    * tool will answer goes on, so that tool refuses it with its record (S7).
    * A body that is not one request and that the SDK refuses reached no tool
    * either, so it spends one then: refusals cost like calls, and a flood of
-   * them runs dry. Each request counts once. Each request also names its
-   * client for the hour's `mcp client` line, and an answer to a revision the
-   * leg does not serve lists every revision /mcp serves (ADR 0027).
+   * them runs dry. Each request counts once. Each request that paid also
+   * names its client for the hour's `mcp client` line, and an answer to a
+   * revision the leg does not serve lists every revision /mcp serves (ADR
+   * 0027).
    */
   const strictLeg = async (
     request: Request,
@@ -685,10 +689,6 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     } else if (body.kind === 'answered') {
       response = body.response;
     } else {
-      const envelope = isJSONRPCRequest(body.message) ? envelopeOf(body.message) : null;
-      if (envelope !== null) {
-        clientLines.write({ userId: caller.userId, leg: 'strict', ...envelope });
-      }
       const listen = listenOf(body.message);
       const parsed = { ...options, parsedBody: body.message };
       const arrival = listen === null ? arrivalOf(body.message, config.firstClassTools) : null;
@@ -699,6 +699,14 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         if (!paid && !arrival.toolAnswers) {
           refusedLine(caller.userId);
           return jsonRpcError(429, BUDGET_CODE, budget.refusal(caller.kind), arrival.id);
+        }
+        // Only a request that paid names its client, so requests refused
+        // past the budget, which cost their sender nothing more, write no
+        // line; a listen spends in its own gate and its client's other
+        // requests name it.
+        const envelope = paid && isJSONRPCRequest(body.message) ? envelopeOf(body.message) : null;
+        if (envelope !== null) {
+          clientLines.write({ userId: caller.userId, leg: 'strict', ...envelope });
         }
       }
       if (listen === null) {
@@ -857,10 +865,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     // with none passes: the header is a browser's, and Claude Code sends none.
     const origin = request.headers.origin;
     if (origin !== undefined && !config.isMcpOriginAllowed(origin)) {
-      mcpLines.write('info', 'mcp request refused: origin not allowed', {
-        origin: origin.slice(0, 200),
-        address: loggedAddress(client),
-      });
+      originRefusals.refused(origin, loggedAddress(client));
       send(response, 403, ORIGIN_REFUSAL, { 'Content-Type': 'application/json' });
       return;
     }
@@ -1083,6 +1088,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     notifier?.close();
     stalls.close();
     mcpLines.close();
+    originRefusals.close();
     clientLines.close();
     auth.stop?.();
     throw error;
@@ -1145,6 +1151,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         // The counts of repeated refusals still held go out before the last line.
         refusals.close();
         mcpLines.close();
+        originRefusals.close();
         server.closeAllConnections();
         await new Promise<void>((resolveClose) => {
           server.close(() => {

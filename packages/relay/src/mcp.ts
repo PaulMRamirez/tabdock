@@ -85,7 +85,6 @@ import {
 } from './hub.ts';
 import type { Logger } from './log.ts';
 import { SlidingWindowLimiter } from './rate-limit.ts';
-import { RepeatedLines } from './repeated-lines.ts';
 import type { Spike } from './spike.ts';
 
 export const RELAY_NAME = 'tabdock-relay';
@@ -479,6 +478,12 @@ function fixedEntries(config: ResolvedConfig): ListedTool[] {
 export const CLIENT_LINE_WINDOW_MS = 60 * 60_000;
 /** Keys the `mcp client` lines track in one hour; past it, a new key writes nothing. */
 export const MAX_CLIENT_LINE_KEYS = 256;
+/**
+ * Keys one user may fill in an hour, four client names on both legs, so
+ * one account that renames its client on every request cannot spend the
+ * relay's MAX_CLIENT_LINE_KEYS and hide every other user's line.
+ */
+export const MAX_CLIENT_LINE_KEYS_PER_USER = 8;
 /** The most of a client's claimed revision the line keeps; a real one is ten characters. */
 const MAX_REVISION_CHARS = 32;
 
@@ -500,11 +505,12 @@ export interface ClientLineFields {
  * whether it declared form elicitation, which is how the owner reads hosted
  * Claude's off the reference deployment. One line per user, client name and
  * leg an hour, through a budget of its own with no summary line, so a client
- * that renames itself on every request fills only this budget, at most
- * MAX_CLIENT_LINE_KEYS lines an hour, and never hides a refusal line. A
- * line names the user id, the client's name and version as parseClientInfo
- * caps them, the leg and the revision; never a token, a session id or an
- * argument.
+ * that renames itself on every request fills only this budget and never
+ * hides a refusal line: at most MAX_CLIENT_LINE_KEYS lines an hour, and at
+ * most MAX_CLIENT_LINE_KEYS_PER_USER of them for one user, so it takes many
+ * accounts, not one, to hide another user's line. A line names the user id,
+ * the client's name and version as parseClientInfo caps them, the leg and
+ * the revision; never a token, a session id or an argument.
  */
 export interface ClientLines {
   write(fields: ClientLineFields, now?: number): void;
@@ -522,17 +528,28 @@ export function declaresFormElicitation(capabilities: unknown): boolean {
 }
 
 export function createClientLines(log: Logger): ClientLines {
-  const keys = new RepeatedLines({
-    linesPerKey: 1,
-    windowMs: CLIENT_LINE_WINDOW_MS,
-    maxKeys: MAX_CLIENT_LINE_KEYS,
-    // No summary: the hour's one line per key is the record.
-    summary: () => undefined,
-  });
+  let hour = Number.NEGATIVE_INFINITY;
+  // No summary: the hour's one line per key is the record, so what is held
+  // is the keys written this hour and how many of them each user filled.
+  let written = new Set<string>();
+  let perUser = new Map<string, number>();
+  const forget = (): void => {
+    written = new Set();
+    perUser = new Map();
+  };
   return {
     write({ userId, client, leg, revision, capabilities }, now = Date.now()) {
+      const current = Math.floor(now / CLIENT_LINE_WINDOW_MS);
+      if (current !== hour) {
+        hour = current;
+        forget();
+      }
       const key = JSON.stringify([userId, client?.name ?? null, leg]);
-      if (!keys.take(key, 'mcp client', undefined, now)) return;
+      if (written.has(key) || written.size >= MAX_CLIENT_LINE_KEYS) return;
+      const filled = perUser.get(userId) ?? 0;
+      if (filled >= MAX_CLIENT_LINE_KEYS_PER_USER) return;
+      written.add(key);
+      perUser.set(userId, filled + 1);
       log.info('mcp client', {
         userId,
         client: client?.name ?? null,
@@ -543,7 +560,7 @@ export function createClientLines(log: Logger): ClientLines {
       });
     },
     close() {
-      keys.flush();
+      forget();
     },
   };
 }
@@ -881,8 +898,11 @@ export function createMcpFactory(
       const firstClass = firstClassOn ? parseFirstClassName(name) : null;
       if (firstClass !== null) {
         const { pageId, toolPart } = firstClass;
-        if (!within)
-          return refuse(who, { tool: 'call_page_tool', page: pageId, pageTool: toolPart });
+        // Recorded under the page tool call_page_tool would name (S7, ADR 0025).
+        if (!within) {
+          const pageTool = hub.firstClassAuditName(pageId, toolPart);
+          return refuse(who, { tool: 'call_page_tool', page: pageId, pageTool });
+        }
         const args: JsonObject = request.params.arguments ?? {};
         return answer(() => callPage(who, pageId, { firstClass: toolPart }, args, toolPart, ctx));
       }
