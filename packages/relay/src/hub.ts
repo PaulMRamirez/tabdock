@@ -360,10 +360,11 @@ export interface ConfirmLeg {
    */
   mode: 'retry' | 'elicit';
   /**
-   * A request that carried a requestState: what the verify hook found for
-   * it (the record, taken out already, or a refusal) and the client's
-   * answer as the SDK handed it over. null on a first round. A 2025-era
-   * session never asks this way, so there it is always a refusal.
+   * A request that carried a requestState: what the dispatcher took for it
+   * before any other check (the record, out of the store already, or a
+   * refusal) and the client's answer as the SDK handed it over. null on a
+   * first round. A 2025-era session never asks this way, so there it is
+   * always a refusal.
    */
   retry: { state: RetryState; answer: unknown } | null;
   /** elicit mode: puts the question to the client, resolving with its answer as given. */
@@ -4245,9 +4246,10 @@ export class PageHub {
   }
 
   /**
-   * The verify hook's step (mcp.ts): the record a retry's state names,
-   * taken out before any other check, so a retry refused for any reason has
-   * spent it (ADR 0026); null when the relay holds none.
+   * The dispatcher's first step for a page call that carries a state
+   * (mcp.ts): the record the state names, taken out before any other check,
+   * so a retry refused for any reason has spent it (ADR 0026); null when
+   * the relay holds none.
    */
   takeConfirmation(id: string): ConfirmationRecord | null {
     return this.#confirmations.take(id);
@@ -4394,7 +4396,7 @@ export class PageHub {
     // A confirmation already given, by a retry that checked out or by an
     // answer inside a 2025-era request; null until then (ADR 0026).
     let confirmation: ClientConfirmation | null = null;
-    // The page tool a retry's record was asked about, which the name must still reach.
+    // The page tool a retry's record or a 2025-era answer was about, which the name must still reach.
     let confirmedTool: string | null = null;
     if (confirm?.retry) {
       const retried = this.#retried(caller, pageId, toolRef, args, confirm);
@@ -4494,6 +4496,10 @@ export class PageHub {
         const asked = await this.#ask(caller, page, tool.name, toolRef, args, signal, confirm);
         if (asked.kind !== 'confirmed') return asked;
         confirmation = { confirmationId: newId('cf'), at: asked.at };
+        // The answer was about this page tool; a first-class name that now
+        // reaches another one, after the page re-listed, is not_confirmed,
+        // as a 2026-07-28 retry is.
+        confirmedTool = tool.name;
         continue;
       }
 

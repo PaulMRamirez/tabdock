@@ -97,6 +97,7 @@ import {
   type AuthExtra,
   AuthExtraSchema,
   BUDGET_CODE,
+  callsPageTool,
   createClientLines,
   createMcpFactory,
   createRequestBudget,
@@ -573,8 +574,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     mcpLines.write('warn', 'mcp request refused: past the request budget', { userId });
   };
   /** A tools/call name the dispatcher sends to a page tool, the calls a confirmation can be for (ADR 0026). */
-  const isPageCall = (name: string): boolean =>
-    name === 'call_page_tool' || (config.firstClassTools && parseFirstClassName(name) !== null);
+  const isPageCall = (name: string): boolean => callsPageTool(name, config.firstClassTools);
   const factory = createMcpFactory(hub, config, {
     spike,
     budget,

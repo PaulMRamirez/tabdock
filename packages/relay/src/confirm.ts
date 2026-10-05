@@ -447,13 +447,24 @@ export class PendingConfirmations {
 
 // The request state
 
-/** What the verify hook leaves for the dispatcher: the record a retry named, or a refusal. */
+/**
+ * What the verify hook leaves for the dispatcher: the record id a state
+ * opened to, or a refusal. The hook takes no record: only a call to a page
+ * tool can be a confirmation's retry, and the hook runs before the name is
+ * known, so the dispatcher takes it for such a call alone (ADR 0026).
+ */
+export type OpenedState =
+  | { kind: 'opened'; id: string }
+  /** A bad MAC, expiry, another binding, or no state the codec made. */
+  | { kind: 'refused' };
+
+/** What a retry found: the record its state named, taken out of the store, or a refusal. */
 export type RetryState =
   | { kind: 'record'; record: ConfirmationRecord }
   /** Forged, expired, reused, dropped, bound to someone else, or no state the codec made. */
   | { kind: 'refused' };
 
-export const REFUSED_RETRY: RetryState = Object.freeze({ kind: 'refused' });
+export const REFUSED_RETRY: { readonly kind: 'refused' } = Object.freeze({ kind: 'refused' });
 
 const StatePayloadSchema = z.object({ id: z.string().min(1).max(64) });
 

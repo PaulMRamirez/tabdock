@@ -624,6 +624,30 @@ describe.each(ERAS)('confirmation in the client (%s)', (_label, modern) => {
     ]);
   });
 
+  it('binds a confirmation to the page tool it named: a first-class name that reaches another tool once answered answers not_confirmed', async () => {
+    await relay();
+    // `pay.small` is listed as `<page id>__pay_small`, the name a page tool `pay_small` maps to as well.
+    const dotted: PageTool = { ...WIPE, name: 'pay.small' };
+    const { page, invokes } = await board({ tools: [READ_TOOL, dotted] });
+    const alice = await asking(ALICE, modern, async () => {
+      // While the question waits, the page re-lists, and the same name now reaches another tool.
+      page.send({ t: 'tools', tools: [READ_TOOL, { ...WIPE, name: 'pay_small' }] });
+      await page.sync();
+      return ACCEPT;
+    });
+    await pairAndApprove(alice.client, page, 'driver');
+    const before = callRecords().length;
+    const outcome = await callTool(alice.client, `${page.pageId}__pay_small`, { why: 'swap' });
+    expect(codeOf(outcome), outcome.text).toBe('not_confirmed');
+    expect(alice.asked).toHaveLength(1);
+    expect(alice.asked[0]?.message).toContain('Tool: "pay.small" (a name the page chose)');
+    await page.sync();
+    expect(invokes).toEqual([]);
+    const records = callRecords().slice(before);
+    expect(records).toEqual([expect.objectContaining({ outcome: 'not_confirmed' })]);
+    expect(records[0]).not.toHaveProperty('confirmedBy');
+  });
+
   it('sends a confirmed call whose arguments leave room for exactly its confirmation', async () => {
     await relay();
     const { page, invokes } = await board();
@@ -666,6 +690,76 @@ async function sessionCall(user: DevTokenUser, params: Record<string, unknown>):
     { sessionId },
   );
   return response.text();
+}
+
+interface StreamedCall {
+  /** Each elicitation/create the call's own stream carried, in order. */
+  questions: { message: string }[];
+  result?: RawAnswer['result'];
+  error?: RawAnswer['error'];
+}
+
+/**
+ * A raw tools/call on a 2025-era session, read from its own SSE stream as it
+ * arrives: each elicitation/create there is answered `answer`, POSTed back on
+ * the session as a client does, until the call's own answer comes.
+ */
+async function sessionCallAnswering(
+  user: DevTokenUser,
+  sessionId: string,
+  params: Record<string, unknown>,
+  answer: ElicitResult,
+): Promise<StreamedCall> {
+  if (!current) throw new Error('no relay');
+  const { relay: on } = current;
+  nextId += 1;
+  const id = nextId;
+  const response = await rawPost(
+    on,
+    user,
+    { jsonrpc: '2.0', id, method: 'tools/call', params },
+    { sessionId },
+  );
+  const reader: ReadableStreamDefaultReader<Uint8Array> | undefined = response.body?.getReader();
+  if (!reader) throw new Error(`no stream: ${String(response.status)}`);
+  const decoder = new TextDecoder();
+  const questions: StreamedCall['questions'] = [];
+  let buffered = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return { questions };
+    buffered += decoder.decode(value, { stream: true }).replaceAll('\r\n', '\n');
+    let end = buffered.indexOf('\n\n');
+    while (end !== -1) {
+      const data = buffered
+        .slice(0, end)
+        .split('\n')
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice('data:'.length).trimStart())
+        .join('\n');
+      buffered = buffered.slice(end + 2);
+      end = buffered.indexOf('\n\n');
+      if (data === '') continue;
+      const message = JSON.parse(data) as {
+        id?: number | string;
+        method?: string;
+        params?: { message: string };
+      } & Omit<RawAnswer, 'status'>;
+      if (message.method === 'elicitation/create' && message.params !== undefined) {
+        questions.push(message.params);
+        const reply = await rawPost(
+          on,
+          user,
+          { jsonrpc: '2.0', id: message.id, result: answer },
+          { sessionId },
+        );
+        await reply.text();
+      } else if (message.id === id) {
+        await reader.cancel();
+        return { questions, result: message.result, error: message.error };
+      }
+    }
+  }
 }
 
 describe('a 2026-07-28 retry', () => {
@@ -762,6 +856,47 @@ describe('a 2026-07-28 retry', () => {
     );
     expect(lines.filter((line) => line.durationMs >= 1000)).toHaveLength(2);
     expect(lines.at(-1)?.durationMs).toBeLessThan(1000);
+  });
+
+  it("leaves a question's record to its own retry, or to the sweep and its line, when its state rides on a call to no page tool", async () => {
+    await relay({ timings: { confirmationTtlMs: 1500 } });
+    const { page, invokes, target } = await attachedDriver();
+    /** The state on a fixed tool that runs no page tool and on a name the relay does not serve, on both legs. */
+    const elsewhere = async (state: string): Promise<void> => {
+      const listed = await rawCall(target, {
+        name: 'list_pages',
+        arguments: {},
+        requestState: state,
+      });
+      expect(listed.result?.isError, JSON.stringify(listed)).toBeUndefined();
+      const unknown = await rawCall(target, {
+        name: 'no_such_tool',
+        arguments: {},
+        requestState: state,
+      });
+      expect(unknown.error?.code, JSON.stringify(unknown)).toBe(-32602);
+      const onSession = await sessionCall(ALICE, {
+        name: 'list_pages',
+        arguments: {},
+        requestState: state,
+      });
+      expect(onSession).not.toMatch(/"isError":true/);
+    };
+
+    const { state } = await firstRound(target, wipeParams(page.pageId, { n: 1 }));
+    await elsewhere(state);
+    expect(rawCode(await retry(target, wipeParams(page.pageId, { n: 1 }), state))).toBeNull();
+    expect(invokes).toHaveLength(1);
+
+    const second = await firstRound(target, wipeParams(page.pageId, { n: 2 }));
+    await elsewhere(second.state);
+    const before = callRecords().length;
+    await delay(1800);
+    // A question nobody retried leaves its line while the relay runs (S7).
+    expect(callRecords().slice(before)).toEqual([
+      expect.objectContaining({ tool: 'wipe', outcome: 'not_confirmed' }),
+    ]);
+    expect(invokes).toHaveLength(1);
   });
 
   it('spends its record when the request budget refuses it', async () => {
@@ -881,6 +1016,33 @@ describe('a 2025-era question', () => {
     expect(callRecords().at(-1)).toMatchObject({ tool: 'wipe', outcome: 'not_confirmed' });
     held.resolve(ACCEPT);
     expect(invokes).toEqual([]);
+  });
+
+  it("asks on the call's own stream, so a client that holds no GET stream still hears the question", async () => {
+    // Short, so a question sent anywhere but the call's stream fails fast.
+    await relay({ timings: { confirmationTtlMs: 3000 } });
+    const { page, invokes } = await attachedDriver();
+    if (!current) throw new Error('no relay');
+    // Raw, since the SDK client opens a GET stream right after initialize.
+    const sessionId = await openSession(current.relay, ALICE, 'no-get-stream', {
+      elicitation: { form: {} },
+    });
+    const before = callRecords().length;
+    const answered = await sessionCallAnswering(
+      ALICE,
+      sessionId,
+      wipeParams(page.pageId, { why: 'own stream' }),
+      ACCEPT,
+    );
+    expect(answered.questions, JSON.stringify(answered)).toHaveLength(1);
+    expect(answered.questions[0]?.message).toContain('Tool: "wipe" (a name the page chose)');
+    expect(answered.result?.isError, JSON.stringify(answered)).toBeUndefined();
+    expect(answered.result?.content?.[0]?.text).toContain('{"ran":"wipe"}');
+    expect(invokes).toHaveLength(1);
+    expect(invokes[0]?.confirmation?.by).toBe('client');
+    expect(callRecords().slice(before)).toEqual([
+      expect.objectContaining({ tool: 'wipe', outcome: 'ok', confirmedBy: 'client' }),
+    ]);
   });
 
   it('never takes a requestState, which a session is never asked for', async () => {

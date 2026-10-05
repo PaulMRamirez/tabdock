@@ -72,8 +72,8 @@ import type { ResolvedConfig } from './config.ts';
 import {
   CONFIRM_FIELD,
   createConfirmationCodec,
+  type OpenedState,
   REFUSED_RETRY,
-  type RetryState,
 } from './confirm.ts';
 import {
   CALL_PAGE_TOOL_ANNOTATIONS,
@@ -407,6 +407,16 @@ export const FIXED_TOOL_NAMES: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Whether a tools/call by this name runs a page tool: call_page_tool, or,
+ * while first-class tools are on, a first-class name (ADR 0025). Only such a
+ * call can be a confirmation's retry, so only it takes a record, and only its
+ * requestState, when not a string, is answered not_confirmed (ADR 0026).
+ */
+export function callsPageTool(name: string, firstClassTools: boolean): boolean {
+  return name === 'call_page_tool' || (firstClassTools && parseFirstClassName(name) !== null);
+}
+
+/**
  * A first-class entry as tools/list carries it. Its schema is page JSON the
  * relay cut and checked to have a `type: "object"` root (first-class.ts),
  * which is all the SDK's type adds beyond a JSON object.
@@ -650,10 +660,12 @@ function confirmationBinding(ctx: ServerContext): string {
 }
 
 /** What the verify hook resolved for a request's state, read back; anything else is a refusal. */
-function retryStateOf(value: unknown): RetryState {
+function openedStateOf(value: unknown): OpenedState {
   if (typeof value !== 'object' || value === null) return REFUSED_RETRY;
-  const state = value as Partial<RetryState>;
-  return state.kind === 'record' && 'record' in state ? (state as RetryState) : REFUSED_RETRY;
+  const state = value as { kind?: unknown; id?: unknown };
+  return state.kind === 'opened' && typeof state.id === 'string'
+    ? { kind: 'opened', id: state.id }
+    : REFUSED_RETRY;
 }
 
 /** A dispatcher's answer: a tool's result, or a 2026-07-28 question for the client (ADR 0026). */
@@ -681,14 +693,30 @@ export function createMcpFactory(
    * The SDK's requestState.verify hook, run before any handler on every
    * request whose requestState is a string. It never throws: a throw would
    * become the SDK's frozen -32602 with no call line (S7), answered unlike a
-   * reused state. A state that opens gives up its record here, before any
-   * other check, the budget included, so a retry refused for any reason has
-   * spent it; the dispatcher reads what is left (ADR 0026).
+   * reused state. It only opens the state: the hook runs whatever the call
+   * names, and a record taken for a call that runs no page tool would go
+   * with no call line, and with no sweep line either, so the dispatcher
+   * takes it for a page call alone (takeRetry, ADR 0026).
    */
-  const verifyRetry = async (state: string, ctx: ServerContext): Promise<RetryState> => {
+  const verifyRetry = async (state: string, ctx: ServerContext): Promise<OpenedState> => {
     const id = await codec.open(state, ctx);
-    const record = id === null ? null : hub.takeConfirmation(id);
-    return record === null ? REFUSED_RETRY : { kind: 'record', record };
+    return id === null ? REFUSED_RETRY : { kind: 'opened', id };
+  };
+
+  /**
+   * A page call's retry, its record taken out of the store before any other
+   * check, the budget included, so a retry refused for any reason has spent
+   * it; null for a call that carries no requestState (ADR 0026).
+   */
+  const takeRetry = (ctx: ServerContext): ConfirmLeg['retry'] => {
+    const state: unknown = ctx.mcpReq.requestState();
+    if (state === undefined) return null;
+    const opened = openedStateOf(state);
+    const record = opened.kind === 'opened' ? hub.takeConfirmation(opened.id) : null;
+    return {
+      state: record === null ? REFUSED_RETRY : { kind: 'record', record },
+      answer: ctx.mcpReq.inputResponses?.[CONFIRM_FIELD],
+    };
   };
 
   return ({ authInfo, era }) => {
@@ -837,17 +865,12 @@ export function createMcpFactory(
     /**
      * How this request can confirm a call in its client (ADR 0026). On
      * 2026-07-28 the question goes out as input_required and its answer
-     * comes back on a retry, which carries the state the verify hook has
-     * already read; a 2025-era session puts it inside the request, and never
+     * comes back on a retry, whose record the dispatcher has already taken
+     * (`retry`); a 2025-era session puts it inside the request, and never
      * takes a retry, since it never asks for one. The capability is the
      * request's own on 2026-07-28 and initialize's on a session.
      */
-    const confirmLeg = (ctx: ServerContext): ConfirmLeg => {
-      const state: unknown = ctx.mcpReq.requestState();
-      const retry =
-        state === undefined
-          ? null
-          : { state: retryStateOf(state), answer: ctx.mcpReq.inputResponses?.[CONFIRM_FIELD] };
+    const confirmLeg = (ctx: ServerContext, retry: ConfirmLeg['retry']): ConfirmLeg => {
       if (era === 'modern') {
         const envelope = ctx.mcpReq.envelope as Record<string, unknown> | undefined;
         return {
@@ -867,7 +890,15 @@ export function createMcpFactory(
           // eslint-disable-next-line @typescript-eslint/no-deprecated
           ctx.mcpReq.elicitInput(
             { mode: 'form', message: question.message, requestedSchema: question.requestedSchema },
-            { signal, timeout: config.timings.confirmationTtlMs + ELICIT_SLACK_MS },
+            {
+              signal,
+              timeout: config.timings.confirmationTtlMs + ELICIT_SLACK_MS,
+              // The question, its cancellation and its answer belong on the
+              // call's own stream: without this the SDK sends them on the
+              // session's GET stream, which a client need not hold, and
+              // drops them when there is none.
+              relatedRequestId: ctx.mcpReq.id,
+            },
           ),
       };
     };
@@ -912,6 +943,7 @@ export function createMcpFactory(
       args: JsonObject,
       label: string,
       ctx: ServerContext,
+      retry: ConfirmLeg['retry'],
     ): Promise<ToolAnswer> => {
       const timer = spike?.startCall(authOf(ctx));
       const outcome = await hub.callPageTool(
@@ -922,7 +954,7 @@ export function createMcpFactory(
         ctx.mcpReq.signal,
         timer?.marks ?? null,
         heldBytes(ctx),
-        confirmLeg(ctx),
+        confirmLeg(ctx, retry),
       );
       if (outcome.kind === 'ask') return askInClient(outcome, ctx);
       const result = callResult(label, outcome);
@@ -936,6 +968,7 @@ export function createMcpFactory(
       raw: unknown,
       within: boolean,
       ctx: ServerContext,
+      retry: ConfirmLeg['retry'],
     ): Promise<ToolAnswer> => {
       const input = checked(CALL_PAGE_TOOL_INPUT, raw);
       const page = fieldOf(input, 'page');
@@ -946,7 +979,7 @@ export function createMcpFactory(
         hub.refusedMalformedCall(who, page, tool);
         return invalidArguments(input);
       }
-      return callPage(who, page, tool, input.args.arguments, tool, ctx);
+      return callPage(who, page, tool, input.args.arguments, tool, ctx, retry);
     };
 
     const detachPage = (who: CallerIdentity, raw: unknown, within: boolean): CallToolResult => {
@@ -968,6 +1001,7 @@ export function createMcpFactory(
       raw: unknown,
       within: boolean,
       ctx: ServerContext,
+      retry: ConfirmLeg['retry'],
     ): ToolAnswer | Promise<ToolAnswer> => {
       switch (name) {
         case 'list_pages':
@@ -977,7 +1011,7 @@ export function createMcpFactory(
         case 'list_page_tools':
           return listPageTools(who, raw, within);
         case 'call_page_tool':
-          return callPageTool(who, raw, within, ctx);
+          return callPageTool(who, raw, within, ctx, retry);
         default:
           return detachPage(who, raw, within);
       }
@@ -1019,6 +1053,10 @@ export function createMcpFactory(
     server.setRequestHandler('tools/call', async (request, ctx) => {
       const { name } = request.params;
       const raw: unknown = request.params.arguments ?? {};
+      // ADR 0026: a page call's retry gives up its record before anything
+      // else. Any other call leaves it to its own retry or to the sweep,
+      // whose line it then still writes (S7).
+      const retry = callsPageTool(name, firstClassOn) ? takeRetry(ctx) : null;
       let who: CallerIdentity;
       try {
         who = caller(ctx);
@@ -1028,7 +1066,9 @@ export function createMcpFactory(
       // ADR 0025: one request for every call, before the name is resolved,
       // so an unknown name is not free (ADR 0030).
       const within = spent(who, ctx);
-      if (FIXED_TOOL_NAMES.has(name)) return answer(() => runFixed(name, who, raw, within, ctx));
+      if (FIXED_TOOL_NAMES.has(name)) {
+        return answer(() => runFixed(name, who, raw, within, ctx, retry));
+      }
       // An invitee's too: the hub answers it tool_not_found with its call
       // line, as ADR 0016 keeps invitees on the fixed tools.
       const firstClass = firstClassOn ? parseFirstClassName(name) : null;
@@ -1043,7 +1083,7 @@ export function createMcpFactory(
           return refuse(who, { tool: 'call_page_tool', page: pageId, pageTool: ref });
         }
         const args: JsonObject = request.params.arguments ?? {};
-        return answer(() => callPage(who, pageId, ref, args, toolPart, ctx));
+        return answer(() => callPage(who, pageId, ref, args, toolPart, ctx, retry));
       }
       const marker = member ? (spike?.markerTool() ?? null) : null;
       if (marker?.entry.name === name) {
