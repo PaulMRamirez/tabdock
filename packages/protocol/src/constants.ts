@@ -109,6 +109,30 @@ export const MAX_EMAIL_CHARS = 320;
 /** A user's display name on the wire; an invitee's email is cut to 97 characters and '...' to fit. */
 export const MAX_DISPLAY_NAME_CHARS = 100;
 
+// First-class page tools (ADR 0025): SPEC section 7's and S9's numbers. Only
+// the relay uses them, and they live here beside the rest so a number changes
+// here or nowhere.
+
+/**
+ * The longest first-class name, `<page id>__<tool>`, the relay lists: connector
+ * review's cap, which leaves 49 characters for the tool's own name.
+ */
+export const MAX_FIRST_CLASS_NAME_CHARS = 64;
+/** Page tools in one user's first-class list (S9). */
+export const MAX_FIRST_CLASS_TOOLS_PER_USER = 64;
+/** Characters of one user's first-class entries, counted as JSON text (S9). */
+export const MAX_FIRST_CLASS_CHARS_PER_USER = 100_000;
+/** A first-class entry's whole description, the relay's prefix included (S10). */
+export const MAX_FIRST_CLASS_DESCRIPTION_CHARS = 500;
+/** A first-class entry's title, the origin's host included; the page's part is what is cut. */
+export const MAX_FIRST_CLASS_TITLE_CHARS = 120;
+/** Characters of the page's origin that the description's prefix names. */
+export const MAX_FIRST_CLASS_ORIGIN_CHARS = 100;
+/** ttlMs on a 2026-07-28 tools/list while first-class tools are on, always with cacheScope private. */
+export const FIRST_CLASS_LIST_TTL_MS = 10_000;
+/** The least time between two tool list change notifications to one user. */
+export const FIRST_CLASS_NOTIFY_INTERVAL_MS = 1000;
+
 // The audit log (ADR 0019).
 
 /** The version every audit record carries. */

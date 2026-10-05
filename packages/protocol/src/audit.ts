@@ -11,7 +11,7 @@
 
 // First, before zod builds anything: no eval probe on Trusted Types pages.
 import './zod-config.ts';
-import { z } from 'zod';
+import * as z from 'zod/mini';
 import { AUDIT_VERSION, REFUSED_SUMMARY_BUSIEST } from './constants.ts';
 import { ERROR_CODES } from './errors.ts';
 import {
@@ -40,7 +40,7 @@ export const AuditOutcomeSchema = z.enum([
 export type AuditOutcome = z.infer<typeof AuditOutcomeSchema>;
 
 /** What client text that is no valid id or tool name is stored as: its length, never its content. */
-const InvalidTextSchema = z.string().regex(/^\(invalid, \d{1,7} chars\)$/);
+const InvalidTextSchema = z.string().check(z.regex(/^\(invalid, \d{1,7} chars\)$/));
 
 function invalidText(text: string): string {
   return `(invalid, ${String(Math.min(text.length, 9_999_999))} chars)`;
@@ -61,18 +61,21 @@ export function auditToolName(text: string): string {
  * printable ASCII, an opaque id from dynamic registration or the URL of a
  * client ID metadata document.
  */
-export const OAuthClientIdSchema = z.string().regex(/^[\x21-\x7e]{1,512}$/);
+export const OAuthClientIdSchema = z.string().check(z.regex(/^[\x21-\x7e]{1,512}$/));
 
 /** A page's origin from its socket's Origin header, or the dev flag's stand-in. */
-const OriginSchema = z.string().min(1).max(2048);
+const OriginSchema = z.string().check(z.minLength(1), z.maxLength(2048));
 
 /** An invitee's verified email, or this when the provider vouched for none. */
 export const UNVERIFIED_EMAIL = 'unverified';
 
-const COUNT = z.number().int().nonnegative();
+const COUNT = z.number().check(z.int(), z.nonnegative());
 
 /** Refusals by outcome; an outcome with none is left out. */
-const OutcomeCountsSchema = z.partialRecord(AuditOutcomeSchema, z.number().int().positive());
+const OutcomeCountsSchema = z.partialRecord(
+  AuditOutcomeSchema,
+  z.number().check(z.int(), z.positive()),
+);
 
 /**
  * The outcomes a pairing or redemption can be refused with. An invite on
@@ -108,7 +111,7 @@ export const InviteCloseReasonSchema = z.enum([
 export const RelayModeSchema = z.enum(['local', 'dev_tokens', 'public', 'hosted']);
 export type RelayMode = z.infer<typeof RelayModeSchema>;
 
-function shape<const T extends string, S extends z.ZodRawShape>(type: T, fields: S) {
+function shape<const T extends string, S extends z.core.$ZodLooseShape>(type: T, fields: S) {
   return { v: z.literal(AUDIT_VERSION), type: z.literal(type), at: EpochMsSchema, ...fields };
 }
 
@@ -118,12 +121,18 @@ const PAGE = { pageId: IdSchema, origin: OriginSchema };
 const CallShape = shape('call', {
   pageId: z.union([IdSchema, InvalidTextSchema]),
   /** null when no page by that id was known. */
-  origin: OriginSchema.nullable(),
+  origin: z.nullable(OriginSchema),
   userId: IdSchema,
-  client: ClientInfoSchema.nullable(),
+  client: z.nullable(ClientInfoSchema),
   tool: z.union([ToolNameSchema, InvalidTextSchema]),
   outcome: AuditOutcomeSchema,
   durationMs: COUNT,
+  /**
+   * Present exactly when the call went out confirmed in its caller's client
+   * (ADR 0026), so the log never credits a client with a call the operator
+   * decided. Additive within AUDIT_VERSION 1: lines without it read as before.
+   */
+  confirmedBy: z.optional(z.literal('client')),
 });
 
 /** An attachment made, by an approval, autoApprove or an invite. */
@@ -134,10 +143,10 @@ const AttachShape = shape('attach', {
   role: RoleSchema,
   via: AttachViaSchema,
   /** The access token's client_id; null for a dev token, which has none. */
-  clientId: OAuthClientIdSchema.nullable(),
-  inviteId: IdSchema.nullable(),
+  clientId: z.nullable(OAuthClientIdSchema),
+  inviteId: z.nullable(IdSchema),
   /** An invitee's verified email, or UNVERIFIED_EMAIL; present exactly for an invitee. */
-  email: z.union([EmailSchema, z.literal(UNVERIFIED_EMAIL)]).optional(),
+  email: z.optional(z.union([EmailSchema, z.literal(UNVERIFIED_EMAIL)])),
 });
 function attachRule(record: {
   kind: string;
@@ -159,12 +168,12 @@ const ATTACH_RULE = {
  * or before any page was reached (a wrong code, a limit), when pageId is null.
  */
 const AttachRefusedShape = shape('attach_refused', {
-  pageId: IdSchema.nullable(),
-  origin: OriginSchema.nullable(),
+  pageId: z.nullable(IdSchema),
+  origin: z.nullable(OriginSchema),
   userId: IdSchema,
   kind: UserKindSchema,
   via: AttachViaSchema,
-  inviteId: IdSchema.nullable(),
+  inviteId: z.nullable(IdSchema),
   outcome: AttachRefusalSchema,
 });
 function attachRefusedRule(record: { pageId: string | null; origin: string | null }): boolean {
@@ -189,9 +198,9 @@ export const RequestRefusedToolSchema = z.enum(['list_pages', 'list_page_tools',
 const RequestRefusedShape = shape('request_refused', {
   userId: IdSchema,
   kind: UserKindSchema,
-  client: ClientInfoSchema.nullable(),
+  client: z.nullable(ClientInfoSchema),
   tool: RequestRefusedToolSchema,
-  pageId: z.union([IdSchema, InvalidTextSchema]).nullable(),
+  pageId: z.nullable(z.union([IdSchema, InvalidTextSchema])),
   outcome: z.literal('rate_limited'),
 });
 function requestRefusedRule(record: { tool: string; pageId: string | null }): boolean {
@@ -221,9 +230,9 @@ const InviteMintedShape = shape('invite_minted', {
   ...PAGE,
   inviteId: IdSchema,
   role: RoleSchema,
-  uses: z.number().int().positive(),
+  uses: z.number().check(z.int(), z.positive()),
   /** As the page asked; null was "while the page is open". */
-  expiresAt: EpochMsSchema.nullable(),
+  expiresAt: z.nullable(EpochMsSchema),
   sponsor: IdSchema,
 });
 
@@ -253,7 +262,7 @@ const SponsorGoneShape = shape('sponsor_gone', {
 
 /** The relay started; with relay_stop it marks the gap a restart leaves (ADR 0019). */
 const RelayStartShape = shape('relay_start', {
-  version: z.string().min(1).max(50),
+  version: z.string().check(z.minLength(1), z.maxLength(50)),
   env: z.enum(['development', 'production']),
   mode: RelayModeSchema,
   invites: z.boolean(),
@@ -263,7 +272,7 @@ const RelayStopShape = shape('relay_stop', {});
 
 /** Records that reached only stderr while the audit disk failed, counted once writing works again. */
 const AuditGapShape = shape('audit_gap', {
-  lost: z.number().int().positive(),
+  lost: z.number().check(z.int(), z.positive()),
   firstAt: EpochMsSchema,
   lastAt: EpochMsSchema,
 });
@@ -285,7 +294,7 @@ const RefusedSummaryShape = shape('refused_summary', {
       kind: z.literal('relay'),
       busiest: z
         .array(z.strictObject({ userId: IdSchema, counts: OutcomeCountsSchema }))
-        .max(REFUSED_SUMMARY_BUSIEST),
+        .check(z.maxLength(REFUSED_SUMMARY_BUSIEST)),
       others: z.strictObject({ accounts: COUNT, counts: OutcomeCountsSchema }),
     }),
   ]),
@@ -295,17 +304,14 @@ const RefusedSummaryShape = shape('refused_summary', {
 const LINE = {
   seq: COUNT,
   /** SHA-256 of the previous line as written, hex; null only on the first line a log ever holds. */
-  prev: z
-    .string()
-    .regex(/^[0-9a-f]{64}$/)
-    .nullable(),
+  prev: z.nullable(z.string().check(z.regex(/^[0-9a-f]{64}$/))),
 };
 
 /** What the hub appends (AuditLog.append). */
 export const AuditEventSchema = z.discriminatedUnion('type', [
   z.strictObject(CallShape),
-  z.strictObject(AttachShape).refine(attachRule, ATTACH_RULE),
-  z.strictObject(AttachRefusedShape).refine(attachRefusedRule, PAGE_RULE),
+  z.strictObject(AttachShape).check(z.refine(attachRule, ATTACH_RULE)),
+  z.strictObject(AttachRefusedShape).check(z.refine(attachRefusedRule, PAGE_RULE)),
   z.strictObject(RoleShape),
   z.strictObject(RevokeShape),
   z.strictObject(DetachShape),
@@ -316,9 +322,9 @@ export const AuditEventSchema = z.discriminatedUnion('type', [
   z.strictObject(SponsorGoneShape),
   z.strictObject(RelayStartShape),
   z.strictObject(RelayStopShape),
-  z.strictObject(AuditGapShape).refine(auditGapRule, GAP_RULE),
+  z.strictObject(AuditGapShape).check(z.refine(auditGapRule, GAP_RULE)),
   z.strictObject(RefusedSummaryShape),
-  z.strictObject(RequestRefusedShape).refine(requestRefusedRule, REQUEST_RULE),
+  z.strictObject(RequestRefusedShape).check(z.refine(requestRefusedRule, REQUEST_RULE)),
 ]);
 export type AuditEvent = z.infer<typeof AuditEventSchema>;
 export type AuditEventType = AuditEvent['type'];
@@ -328,8 +334,8 @@ export type AuditCallEvent = AuditEventOf<'call'>;
 /** One line of the persistent log: an event with its sequence number and chain link. */
 export const AuditLineSchema = z.discriminatedUnion('type', [
   z.strictObject({ ...CallShape, ...LINE }),
-  z.strictObject({ ...AttachShape, ...LINE }).refine(attachRule, ATTACH_RULE),
-  z.strictObject({ ...AttachRefusedShape, ...LINE }).refine(attachRefusedRule, PAGE_RULE),
+  z.strictObject({ ...AttachShape, ...LINE }).check(z.refine(attachRule, ATTACH_RULE)),
+  z.strictObject({ ...AttachRefusedShape, ...LINE }).check(z.refine(attachRefusedRule, PAGE_RULE)),
   z.strictObject({ ...RoleShape, ...LINE }),
   z.strictObject({ ...RevokeShape, ...LINE }),
   z.strictObject({ ...DetachShape, ...LINE }),
@@ -340,9 +346,11 @@ export const AuditLineSchema = z.discriminatedUnion('type', [
   z.strictObject({ ...SponsorGoneShape, ...LINE }),
   z.strictObject({ ...RelayStartShape, ...LINE }),
   z.strictObject({ ...RelayStopShape, ...LINE }),
-  z.strictObject({ ...AuditGapShape, ...LINE }).refine(auditGapRule, GAP_RULE),
+  z.strictObject({ ...AuditGapShape, ...LINE }).check(z.refine(auditGapRule, GAP_RULE)),
   z.strictObject({ ...RefusedSummaryShape, ...LINE }),
-  z.strictObject({ ...RequestRefusedShape, ...LINE }).refine(requestRefusedRule, REQUEST_RULE),
+  z
+    .strictObject({ ...RequestRefusedShape, ...LINE })
+    .check(z.refine(requestRefusedRule, REQUEST_RULE)),
 ]);
 export type AuditLine = z.infer<typeof AuditLineSchema>;
 

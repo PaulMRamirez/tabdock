@@ -58,6 +58,7 @@ import {
   truncate,
   type User,
 } from '@tabdock/protocol';
+import * as z from 'zod/mini';
 import { apply } from './taken.ts';
 import {
   isConsequential,
@@ -866,7 +867,7 @@ function parseRevoked(text: string): { pageId: string; users: string[] } | null 
   const record = JsonObjectSchema.safeParse(parseJson(text));
   if (!record.success) return null;
   const pageId = IdSchema.safeParse(record.data.pageId);
-  const users = IdSchema.array().safeParse(record.data.users);
+  const users = z.array(IdSchema).safeParse(record.data.users);
   if (!pageId.success || !users.success) return null;
   return { pageId: pageId.data, users: users.data };
 }

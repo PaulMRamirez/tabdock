@@ -73,8 +73,8 @@ export const AuthExtraSchema = z.object({
   userId: IdSchema,
   displayName: z.string().min(1).max(MAX_DISPLAY_NAME_CHARS),
   kind: UserKindSchema,
-  email: EmailSchema.nullable(),
-  oauthClientId: OAuthClientIdSchema.nullable(),
+  email: z.nullable(EmailSchema),
+  oauthClientId: z.nullable(OAuthClientIdSchema),
 });
 export type AuthExtra = z.infer<typeof AuthExtraSchema>;
 

@@ -16,6 +16,9 @@
 // directory and bounds (ADR 0019), and the OAuth token age cap and client
 // list (ADR 0020). Hosted mode alone may bind 0.0.0.0, which a platform's
 // proxy and health checks need; every other mode keeps M3's loopback rule.
+// M5 adds two settings that every mode allows: first-class page tools (ADR
+// 0025), off by default, and the origins /mcp accepts beside its mode's own
+// (ADR 0027).
 
 import { BlockList, isIP, isIPv6 } from 'node:net';
 import { dirname, isAbsolute, join } from 'node:path';
@@ -296,6 +299,15 @@ export interface RelayOptions {
   /** Development only: accept page sockets with no Origin header (the Node sim page). */
   allowMissingOrigin?: boolean | undefined;
   /**
+   * Origins /mcp accepts in an Origin header besides its mode's own
+   * (TABDOCK_MCP_ALLOWED_ORIGINS, ADR 0027): loopback http and https without
+   * a public URL, the public origin with one. Each must be a serialised http
+   * or https origin, compared exactly as written; any other entry stops the
+   * relay at start. Allowed in every mode, and empty adds nothing. These admit
+   * nothing to /page, and allowedOrigins admits nothing to /mcp.
+   */
+  mcpAllowedOrigins?: readonly string[] | undefined;
+  /**
    * The https origin a tunnel serves the relay at, such as
    * https://relay.example. Setting it switches on public URL mode (ADR 0014):
    * its host passes the Host check, `<publicUrl>/mcp` is the resource OAuth
@@ -337,6 +349,13 @@ export interface RelayOptions {
    * pages no invites frame and answers every invitee with M3's 403.
    */
   invites?: boolean | undefined;
+  /**
+   * First-class page tools (TABDOCK_FIRST_CLASS_TOOLS, ADR 0025), off unless
+   * exactly true, in every mode, local mode included, and allowed in
+   * production: members' clients list each attached page's tools as
+   * `<page id>__<tool>` beside the five fixed tools. Off, the tool surface is M4's.
+   */
+  firstClassTools?: boolean | undefined;
   /**
    * Hosted mode (ADR 0018): the one header a host edge in front of the relay
    * sets to the client's address, replacing any value a client sent. Only in
@@ -503,6 +522,14 @@ export interface ResolvedConfig {
   isOriginAllowed: (origin: string) => boolean;
   /** For the startup log line: the list, or a note that the dev default applies. */
   originPolicy: string;
+  /**
+   * Whether an Origin header value, exactly as received, may reach /mcp (ADR
+   * 0027). A request with no Origin header never asks: the header is a
+   * browser's, and Claude Code sends none.
+   */
+  isMcpOriginAllowed: (origin: string) => boolean;
+  /** The /mcp origin policy, as the startup log line names it beside the page one. */
+  mcpOriginPolicy: string;
   timings: RelayTimings;
   rateLimits: RelayRateLimits;
   limits: RelayLimits;
@@ -512,6 +539,8 @@ export interface ResolvedConfig {
   mode: RelayMode;
   /** Invites are on (ADR 0017): the invitee tier, /i, and minting in the widget. */
   invites: boolean;
+  /** First-class page tools are on (ADR 0025). */
+  firstClassTools: boolean;
   /** Production with a public URL behind an edge that names the client in clientAddressHeader (ADR 0018). */
   hosted: boolean;
   /** The edge's client address header, lower-cased; null outside hosted mode. */
@@ -550,6 +579,25 @@ export function parseOrigin(value: string): string | null {
   const url = URL.parse(value);
   if (!url || (url.protocol !== 'http:' && url.protocol !== 'https:')) return null;
   return url.origin === value ? url.origin : null;
+}
+
+/**
+ * TABDOCK_MCP_ALLOWED_ORIGINS's entries as origins (ADR 0027), each held to
+ * parseOrigin's exact form, as page origins are, so an entry with a path, a
+ * trailing slash or upper case never matches what a browser sends. A bad
+ * entry is named by its place, never echoed, since a token may sit in the
+ * wrong variable.
+ */
+export function parseMcpAllowedOrigins(entries: readonly string[]): string[] {
+  return entries.map((entry, index) => {
+    const parsed = parseOrigin(entry.trim());
+    if (parsed === null) {
+      throw new Error(
+        `TABDOCK_MCP_ALLOWED_ORIGINS entry ${String(index + 1)} is not an http or https origin written as a browser sends one, such as https://app.example or http://localhost:6274: lower case, no path and no trailing slash (ADR 0027)`,
+      );
+    }
+    return parsed;
+  });
 }
 
 /** The Host names the SDK's localhost guard accepts, as its own helper lists them. */
@@ -659,6 +707,10 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
       'spike (TABDOCK_SPIKE) is the M3 spike measurement flag; production refuses to start with it (ADR 0014)',
     );
   }
+  // First-class page tools change what members' clients list (ADR 0025), and
+  // nothing about who may reach what, so every mode allows them, production
+  // included; only true turns them on, so a stray value leaves them off.
+  const firstClassTools = options.firstClassTools === true;
   const host = options.host ?? DEFAULT_HOST;
   // ADR 0022: a plugin marked loopbackOnly, local mode's above all, serves
   // this machine and nothing else, whatever its name, so a public URL,
@@ -748,6 +800,22 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     isOriginAllowed = (origin) => allowed.has(origin);
     originPolicy = [...allowed].join(', ');
   }
+
+  // ADR 0027: /mcp takes loopback origins without a public URL and the public
+  // origin with one, compared as written like page origins rather than by
+  // hostname as the SDK's guard would, so the public host on another port or
+  // over http never passes; and in every mode the listed ones.
+  const mcpListed = new Set(parseMcpAllowedOrigins(options.mcpAllowedOrigins ?? []));
+  const isMcpOriginAllowed = (origin: string): boolean => {
+    if (mcpListed.has(origin)) return true;
+    if (publicUrl !== null) return origin === publicUrl;
+    const parsed = parseOrigin(origin);
+    return parsed !== null && DEV_ORIGIN_HOSTS.has(new URL(parsed).hostname);
+  };
+  const mcpOriginPolicy = [
+    publicUrl ?? 'loopback: http and https on localhost, 127.0.0.1 and [::1]',
+    ...mcpListed,
+  ].join(', ');
 
   // The QR page signs phones in at the same provider as the plugin, with a
   // client of the relay's own, so both are needed in public URL mode and the
@@ -856,12 +924,15 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     allowMissingOrigin,
     isOriginAllowed,
     originPolicy,
+    isMcpOriginAllowed,
+    mcpOriginPolicy,
     timings,
     rateLimits: positiveIntegers(DEFAULT_RATE_LIMITS, options.rateLimits),
     limits,
     spike,
     mode,
     invites,
+    firstClassTools,
     hosted,
     clientAddressHeader,
     trustedProxies,
@@ -1214,6 +1285,19 @@ export function loadConfigFromEnv(
           .map((entry) => entry.trim())
           .filter((entry) => entry.length > 0);
 
+  // Parsed like TABDOCK_ALLOWED_ORIGINS, and checked here as well, so a bad
+  // entry stops the relay before local mode draws a token.
+  const mcpOriginsText = env.TABDOCK_MCP_ALLOWED_ORIGINS?.trim() ?? '';
+  const mcpAllowedOrigins =
+    mcpOriginsText === ''
+      ? undefined
+      : parseMcpAllowedOrigins(
+          mcpOriginsText
+            .split(',')
+            .map((entry) => entry.trim())
+            .filter((entry) => entry.length > 0),
+        );
+
   const hostText = env.TABDOCK_HOST?.trim() ?? '';
   const host = hostText === '' ? undefined : hostText;
   const relayEnv: RelayEnv = envName === '' ? 'development' : envName;
@@ -1270,6 +1354,7 @@ export function loadConfigFromEnv(
     ),
   };
   const invites = parseFlag('TABDOCK_INVITES', env.TABDOCK_INVITES);
+  const firstClassTools = parseFlag('TABDOCK_FIRST_CLASS_TOOLS', env.TABDOCK_FIRST_CLASS_TOOLS);
   const headerText = env.TABDOCK_CLIENT_ADDRESS_HEADER?.trim() ?? '';
   const cidrText = env.TABDOCK_TRUSTED_PROXY_CIDR?.trim() ?? '';
   const auditDirText = env.TABDOCK_AUDIT_DIR?.trim() ?? '';
@@ -1305,11 +1390,13 @@ export function loadConfigFromEnv(
     env: relayEnv,
     allowedOrigins,
     allowMissingOrigin,
+    mcpAllowedOrigins,
     spike,
     timings,
     rateLimits,
     limits,
     invites,
+    firstClassTools,
     clientAddressHeader: headerText === '' ? undefined : headerText,
     trustedProxyCidr:
       cidrText === ''

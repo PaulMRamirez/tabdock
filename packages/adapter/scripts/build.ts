@@ -9,9 +9,11 @@ import * as esbuild from 'esbuild';
 const packageDir = resolve(import.meta.dirname, '..');
 
 /**
- * zod's namespace export pulls in every message locale, more than half the
- * bundle. The adapter only shows English (zod registers it as the default on
- * its own), so the locale index is replaced by one that exports `en` alone.
+ * zod's namespace export names every message locale. On `zod/mini` (ADR 0028)
+ * esbuild already drops the locales nobody reads, but keeps the index that
+ * names them, about 170 bytes; under classic zod it kept them all, more than
+ * half the bundle. The adapter only shows English (zod-config.ts sets it
+ * where no locale is set), so the index is replaced by one exporting `en` alone.
  */
 const englishOnlyZod: esbuild.Plugin = {
   name: 'zod-english-only',

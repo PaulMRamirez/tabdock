@@ -469,7 +469,7 @@ export function parseOAuthUsers(envValue: string): OAuthUser[] {
 /** What a checked token says, kept in AuthInfo.extra between the verifier and authenticate(). */
 const VerifiedExtraSchema = z.object({
   sub: SubSchema,
-  email: EmailSchema.nullable(),
+  email: z.nullable(EmailSchema),
 });
 
 /**

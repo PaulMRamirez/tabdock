@@ -54,6 +54,8 @@ describe('linking', () => {
           consequential: 'confirm',
           consequentialTools: [],
           invites: 'watch',
+          // M5's default (ADR 0026): the operator confirms on the page.
+          confirmVia: 'page',
         },
       },
     ]);

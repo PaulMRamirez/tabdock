@@ -898,6 +898,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     origins: config.originPolicy,
     allowMissingOrigin: config.allowMissingOrigin,
     spike: config.spike,
+    firstClassTools: config.firstClassTools,
   });
   if (spike) {
     log.warn(

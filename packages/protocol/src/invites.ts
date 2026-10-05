@@ -5,7 +5,7 @@
 
 // First, before zod builds anything: no eval probe on Trusted Types pages.
 import './zod-config.ts';
-import { z } from 'zod';
+import * as z from 'zod/mini';
 import { MAX_CODE_INPUT_CHARS, MAX_INVITE_INPUT_CHARS } from './constants.ts';
 import { InviteSecretSchema, isInviteLinkBase } from './page-link.ts';
 
@@ -43,10 +43,12 @@ export function inviteSecretOf(input: string, linkBase?: string | null): string 
  */
 export const PairPageInputSchema = z
   .object({
-    code: z.string().min(1).max(MAX_CODE_INPUT_CHARS).optional(),
-    invite: z.string().min(1).max(MAX_INVITE_INPUT_CHARS).optional(),
+    code: z.optional(z.string().check(z.minLength(1), z.maxLength(MAX_CODE_INPUT_CHARS))),
+    invite: z.optional(z.string().check(z.minLength(1), z.maxLength(MAX_INVITE_INPUT_CHARS))),
   })
-  .refine((input) => (input.code === undefined) !== (input.invite === undefined), {
-    message: 'give exactly one of code and invite',
-  });
+  .check(
+    z.refine((input) => (input.code === undefined) !== (input.invite === undefined), {
+      message: 'give exactly one of code and invite',
+    }),
+  );
 export type PairPageInput = z.infer<typeof PairPageInputSchema>;
