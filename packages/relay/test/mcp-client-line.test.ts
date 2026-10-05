@@ -16,6 +16,7 @@ import {
   createClientLines,
   declaresFormElicitation,
   MAX_CLIENT_LINE_KEYS,
+  MAX_CLIENT_LINE_KEYS_PER_USER,
 } from '../src/mcp.ts';
 import { ALICE, BOB, startRelay, type TestRelay } from './helpers/relay.ts';
 import { legacyExchange, legacyInitialize, modernExchange } from './helpers/wire.ts';
@@ -107,6 +108,55 @@ describe('the mcp client line', () => {
     expect(clientLines(current.lines).map((line) => line.leg)).toEqual(['strict', 'session']);
   });
 
+  it('is written only for a request that paid, and one account renaming its client cannot hide another user', async () => {
+    current = await startRelay({ logLevel: 'info', rateLimits: { requestsPerUser: 3 } });
+    const statuses: number[] = [];
+    for (let index = 0; index < 40; index += 1) {
+      const answer = await modernExchange(
+        current.relay,
+        ALICE,
+        'tools/list',
+        {},
+        { client: `renamed-${String(index)}` },
+      );
+      statuses.push(answer.status);
+    }
+    expect(statuses.filter((status) => status === 200)).toHaveLength(3);
+    expect(statuses.filter((status) => status === 429)).toHaveLength(37);
+    // The three that paid named their clients; the 37 refused past the budget wrote nothing.
+    expect(clientLines(current.lines).map((line) => line.client)).toEqual([
+      'renamed-0',
+      'renamed-1',
+      'renamed-2',
+    ]);
+    const bob = await modernExchange(current.relay, BOB, 'tools/list', {}, { client: 'claude-ai' });
+    expect(bob.status).toBe(200);
+    expect(clientLines(current.lines).at(-1)).toMatchObject({ userId: 'bob', client: 'claude-ai' });
+  });
+
+  it(`writes at most ${String(MAX_CLIENT_LINE_KEYS_PER_USER)} lines an hour for one account, on both legs together`, async () => {
+    current = await startRelay({ logLevel: 'info' });
+    for (let index = 0; index < 12; index += 1) {
+      const answer = await modernExchange(
+        current.relay,
+        ALICE,
+        'tools/list',
+        {},
+        { client: `renamed-${String(index)}` },
+      );
+      expect(answer.status).toBe(200);
+    }
+    // A 2025-era session's initialize is not budgeted, so only the share bounds it.
+    for (let index = 0; index < 4; index += 1) {
+      await legacyInitialize(current.relay, ALICE, {}, `session-${String(index)}`);
+    }
+    expect(clientLines(current.lines).filter((line) => line.userId === 'alice')).toHaveLength(
+      MAX_CLIENT_LINE_KEYS_PER_USER,
+    );
+    await legacyInitialize(current.relay, BOB, {}, 'claude-ai');
+    expect(clientLines(current.lines).at(-1)).toMatchObject({ userId: 'bob', leg: 'session' });
+  });
+
   it('carries no token, session id or argument', async () => {
     current = await startRelay({ logLevel: 'info' });
     const opened = await legacyInitialize(current.relay, ALICE, {}, 'claude-code');
@@ -172,10 +222,11 @@ describe('the client line budget', () => {
   it(`writes at most ${String(MAX_CLIENT_LINE_KEYS)} lines an hour, and no summary of the rest`, () => {
     const { lines, write } = written();
     const hour = Math.floor(Date.now() / CLIENT_LINE_WINDOW_MS) * CLIENT_LINE_WINDOW_MS;
+    // Many accounts, each within its own share, renaming their clients.
     for (let index = 0; index < MAX_CLIENT_LINE_KEYS + 100; index += 1) {
       write(
         {
-          userId: 'alice',
+          userId: `user-${String(Math.floor(index / 2))}`,
           client: { name: `renamed-${String(index)}`, version: '1' },
           leg: 'strict',
           revision: '2026-07-28',
@@ -192,6 +243,36 @@ describe('the client line budget', () => {
     );
     expect(lines).toHaveLength(MAX_CLIENT_LINE_KEYS + 1);
     expect(lines.every((line) => line.includes('"msg":"mcp client"'))).toBe(true);
+  });
+
+  it(`gives one user at most ${String(MAX_CLIENT_LINE_KEYS_PER_USER)} of them an hour, so one account cannot hide another's line`, () => {
+    const { lines, write } = written();
+    const hour = Math.floor(Date.now() / CLIENT_LINE_WINDOW_MS) * CLIENT_LINE_WINDOW_MS;
+    const line = (userId: string, name: string, at: number): void => {
+      write(
+        {
+          userId,
+          client: { name, version: '1' },
+          leg: 'strict',
+          revision: '2026-07-28',
+          capabilities: {},
+        },
+        hour + at,
+      );
+    };
+    for (let index = 0; index < MAX_CLIENT_LINE_KEYS + 100; index += 1) {
+      line('alice', `renamed-${String(index)}`, index);
+    }
+    expect(lines).toHaveLength(MAX_CLIENT_LINE_KEYS_PER_USER);
+    line('bob', 'claude-ai', 1000);
+    expect(lines).toHaveLength(MAX_CLIENT_LINE_KEYS_PER_USER + 1);
+    expect(lines.at(-1)).toContain('"userId":"bob"');
+    // A name already written is no new key, and spends nothing of the share.
+    line('bob', 'claude-ai', 1001);
+    expect(lines).toHaveLength(MAX_CLIENT_LINE_KEYS_PER_USER + 1);
+    // The next hour each user has a share again.
+    line('alice', 'claude-code', CLIENT_LINE_WINDOW_MS);
+    expect(lines).toHaveLength(MAX_CLIENT_LINE_KEYS_PER_USER + 2);
   });
 
   it('reads form elicitation as a capability that is empty or names form', () => {

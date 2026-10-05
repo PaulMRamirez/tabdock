@@ -8,16 +8,20 @@
 // reused, so a cached name can only reach the page it named, and no fixed or
 // spike name holds `__`. Every word a client shows from an entry is either
 // the relay's own or page text behind a prefix that calls it untrusted: the
-// description quotes the page's text, one line, NFKC-normalised and with any
-// `[tabdock` defused, so the page can neither close the quote nor forge a
-// relay prefix; the title, normalised and defused alike, names the origin's
-// host. Annotations are call_page_tool's whatever the page says, so page
-// text never decides whether a client asks before a call (the page's own
-// readOnlyHint decides only what an observer is shown, S5). The schema is
-// the cut copy without any `x-mcp-header` key, so no client copies page
-// arguments into headers an edge may log (S7); a typeless root gets
-// `type: "object"` and any other root keeps the tool off the list, since
-// clients of both eras reject a whole list over one such root.
+// description quotes the page's text, one line, NFKC-normalised, with
+// nothing a client draws as nothing and any `[tabdock` defused, so the page
+// can neither close the quote nor forge a relay prefix; the title,
+// normalised and defused alike, names the origin's host. Annotations are
+// call_page_tool's whatever the page says, so page text never decides
+// whether a client asks before a call (the page's own readOnlyHint decides
+// only what an observer is shown, S5). The schema is the cut copy without
+// any `x-mcp-header` key, so no client copies page arguments into headers an
+// edge may log (S7), with its descriptions and titles defused like the
+// entry's own; a typeless root gets `type: "object"`, and a root of another
+// type, a root some client era rejects, or other page text in the schema
+// that does not read as written keeps the tool off the list, since clients
+// reject a whole list over one bad root and that text cannot be rewritten
+// without changing what the schema means.
 
 import {
   type JsonObject,
@@ -27,6 +31,7 @@ import {
   MAX_RESULT_CHARS,
   type PageTool,
 } from '@tabdock/protocol';
+import { childPosition, SCHEMA_TEXT_KEYS, type SchemaPosition } from './schema-keywords.ts';
 
 /**
  * call_page_tool's annotations, which every first-class entry carries too:
@@ -80,22 +85,59 @@ export function parseFirstClassName(name: string): { pageId: string; toolPart: s
  * controls, line and paragraph separators, and the bidirectional controls.
  */
 const NOT_ONE_LINE = /[\p{Cc}\p{Zl}\p{Zp}\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
-/** A bracket that, with what follows, would read as the relay's own prefix. */
-const PREFIX_BRACKET = /\[(?=tabdock)/gi;
+/**
+ * Characters a client draws as nothing, which NFKC keeps: format characters
+ * (zero-width space and joiners, the soft hyphen, the byte order mark and
+ * the tag block) and every other default-ignorable code point. Between a
+ * bracket and the word one would forge a relay prefix that reads as plain
+ * `[tabdock`, and tag characters carry text a person reviewing a tool never
+ * sees but a model reads.
+ */
+const UNSEEN = /[\p{Cf}\p{Default_Ignorable_Code_Point}]/gu;
+/**
+ * A run of brackets, spaces (the braille blank, drawn as one, among them)
+ * and combining marks: what may stand between a bracket and the word so
+ * that the two still read as the relay's prefix. The class matches each run
+ * whole, from its first character, so the search is one pass over the
+ * text, however many brackets it holds.
+ */
+const RUN_BEFORE_WORD = /[[\s\p{M}⠀]+/gu;
+/** The word, matched only where the run before it ends. */
+const WORD_AT = /tabdock/iuy;
+const BRACKET_OR_MARK = /[[\p{M}]/gu;
 
 /**
  * Page text made safe to show after a relay prefix: NFKC first, so a
- * fullwidth bracket or letter reads as its plain form, then one line, then
- * every `[tabdock` in any letter case loses its bracket, again until none is
- * left, since removing one bracket can join another to the word.
+ * fullwidth bracket or letter reads as its plain form; then one line, and
+ * nothing a client draws as nothing; then each run of brackets, spaces and
+ * marks just before `tabdock`, in any letter case, loses its brackets and
+ * marks from its first bracket on. A run is defused whole, so removing one
+ * bracket can never join another to the word, and the work is linear in
+ * the text (S9).
  */
 export function defusedLine(text: string): string {
-  let out = text.normalize('NFKC').replace(NOT_ONE_LINE, ' ');
-  for (;;) {
-    const next = out.replace(PREFIX_BRACKET, '');
-    if (next === out) return out;
-    out = next;
-  }
+  const line = text.normalize('NFKC').replace(NOT_ONE_LINE, ' ').replace(UNSEEN, '');
+  return line.replace(RUN_BEFORE_WORD, (run: string, at: number) => {
+    const first = run.indexOf('[');
+    if (first < 0) return run;
+    WORD_AT.lastIndex = at + run.length;
+    if (!WORD_AT.test(line)) return run;
+    return run.slice(0, first) + run.slice(first).replace(BRACKET_OR_MARK, '');
+  });
+}
+
+/** Printable ASCII but `[`: text that reads as written, the common case, told apart without normalising. */
+const PLAIN_ASCII = /^[\x20-\x5a\x5c-\x7e]*$/;
+
+/**
+ * Whether page text reads as written: one line, nothing drawn as nothing,
+ * and no `[tabdock` once NFKC-normalised, which is when defusing it would
+ * change nothing but its normal form.
+ */
+export function readsAsWritten(text: string): boolean {
+  if (PLAIN_ASCII.test(text)) return true;
+  const normal = text.normalize('NFKC');
+  return defusedLine(normal) === normal;
 }
 
 /** The longest start of `text`, whole code points, whose JSON-quoted form fits `room` characters. */
@@ -148,17 +190,38 @@ export function firstClassTitle(origin: string, tool: PageTool): string {
 
 const HEADER_KEY = 'x-mcp-header';
 
+/** What entryCopy answers for page text that keeps the tool off every list. */
+const OFF: unique symbol = Symbol('off the list');
+
+/** Prose defused, or the very string when defusing changes nothing, so the schema is shared. */
+function sameOrDefused(text: string): string {
+  if (PLAIN_ASCII.test(text)) return text;
+  const defused = defusedLine(text);
+  return defused === text ? text : defused;
+}
+
 /**
- * The value without any `x-mcp-header` key at any depth, sharing every part
- * that held none, so a schema without one is returned as it is. The cut
- * copy is at most MAX_SCHEMA_DEPTH deep, so the recursion is bounded.
+ * The entry's copy of a value of the cut schema at this position, sharing
+ * every part it leaves as it is, so a schema with nothing to change is
+ * returned as it is: no `x-mcp-header` key at any depth; each description
+ * and title in schema position made one line and defused, as the entry's
+ * own are (S10); and OFF when any other page text in it, a key, a name or
+ * a value, does not read as written. That text cannot be rewritten without
+ * changing what the schema means (an `enum` value rewritten would fail the
+ * page's own argument check), and in a first-class entry it is part of the
+ * tool's own definition, where the model reads it and some clients show
+ * it, rather than inside a result the relay labels untrusted. The cut copy
+ * is at most MAX_SCHEMA_DEPTH deep and MAX_SCHEMA_CHARS long, so the walk
+ * is bounded and linear in it.
  */
-function withoutHeaderKeys(value: unknown): unknown {
+function entryCopy(value: unknown, position: SchemaPosition): unknown {
+  if (typeof value === 'string') return readsAsWritten(value) ? value : OFF;
   if (Array.isArray(value)) {
     const items: unknown[] = [];
     let changed = false;
     for (const item of value as unknown[]) {
-      const next = withoutHeaderKeys(item);
+      const next = entryCopy(item, position);
+      if (next === OFF) return OFF;
       if (next !== item) changed = true;
       items.push(next);
     }
@@ -172,7 +235,12 @@ function withoutHeaderKeys(value: unknown): unknown {
       changed = true;
       continue;
     }
-    const next = withoutHeaderKeys(item);
+    if (!readsAsWritten(key)) return OFF;
+    const next =
+      position === 'schema' && SCHEMA_TEXT_KEYS.has(key) && typeof item === 'string'
+        ? sameOrDefused(item)
+        : entryCopy(item, childPosition(key, position));
+    if (next === OFF) return OFF;
     if (next !== item) changed = true;
     entries.push([key, next]);
   }
@@ -180,16 +248,50 @@ function withoutHeaderKeys(value: unknown): unknown {
   return changed ? Object.fromEntries(entries) : value;
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 /**
- * The entry's input schema from the cut copy: null for a root of a type
- * other than object; `copied` names what the entry holds beyond the cut
- * copy, which hub.ts charges against the tool budget.
+ * Whether every client era the relay serves takes this root, since each
+ * rejects a whole tools/list, the fixed tools included, over one entry it
+ * does not: the SDK's 2025-era clients (2.3.0 in legacy mode, and v1) want
+ * `properties` an object, each property's schema an object (v1 from 1.24),
+ * and `required` an array of strings; its 2026-07-28 client wants
+ * `$schema` a string. Checked by hand at the root alone, where those rules
+ * apply, rather than by parsing the entry with the SDK's own schema, which
+ * would walk every node of every tool on each tools frame (S9); the tests
+ * run the SDK's clients of both eras against the same shapes, so a rule a
+ * later client adds is caught on upgrade.
+ */
+function clientsTake(root: JsonObject): boolean {
+  const { properties, required, $schema } = root;
+  if ($schema !== undefined && typeof $schema !== 'string') return false;
+  if (
+    required !== undefined &&
+    !(Array.isArray(required) && required.every((name) => typeof name === 'string'))
+  ) {
+    return false;
+  }
+  if (properties === undefined) return true;
+  return isPlainObject(properties) && Object.values(properties).every(isPlainObject);
+}
+
+/**
+ * The entry's input schema from the cut copy, or null when it keeps the
+ * tool off every list: a root of a type other than object, a root some
+ * client era would reject the whole list over, or page text in the schema
+ * that does not read as written (entryCopy). `copied` names what the entry
+ * holds beyond the cut copy, which hub.ts charges against the tool budget.
  */
 export function firstClassSchema(cut: JsonObject): { schema: JsonObject; copied: boolean } | null {
   if (cut.type !== undefined && cut.type !== 'object') return null;
-  const stripped = withoutHeaderKeys(cut) as JsonObject;
-  if (cut.type === undefined) return { schema: { type: 'object', ...stripped }, copied: true };
-  return { schema: stripped, copied: stripped !== cut };
+  if (!clientsTake(cut)) return null;
+  const copy = entryCopy(cut, 'schema');
+  if (copy === OFF) return null;
+  const schema = copy as JsonObject;
+  if (cut.type === undefined) return { schema: { type: 'object', ...schema }, copied: true };
+  return { schema, copied: schema !== cut };
 }
 
 /** A tool's entry, or null when its schema's root keeps it off every list. */
