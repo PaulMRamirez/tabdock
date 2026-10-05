@@ -1,38 +1,58 @@
-// The five fixed MCP tools (SPEC section 7). The factory builds one McpServer
-// per 2026-07-28 request, and one per 2025-era session (sessions.ts). Every
-// handler reads who is calling from the request itself, not from the factory,
-// and refuses a request from anyone but the user the server was built for.
-// Tool descriptions are fixed relay text: no page-supplied string is ever
-// merged into them (S10). Every tool first counts against its caller's
-// request budget (ADR 0018), before any access check and before its own
-// arguments are checked, so refusals and malformed calls count too: a member
-// has more than an invitee, and past it the answer is rate_limited with a
-// record within the refusal budget. The same budget counts each
-// subscriptions/listen a 2026-07-28 client sends (listen-streams.ts), and
-// each 2026-07-28 request the SDK refuses before any tool runs (relay.ts).
-// Nothing here counts by address, since all of hosted Claude arrives from
-// one range (ADR 0016). An invitee
-// (ADR 0017) gets the same five tools on the pages it holds and pairs only
-// by invite. With the M3 spike flag on (spike.ts, ADR 0014) a marker tool may
-// sit beside the five for members, and call_page_tool results carry
-// timestamps.
+// The relay's whole MCP tool surface (SPEC section 7, ADR 0025): the five
+// fixed tools, the M3 spike's marker while it exists (spike.ts, ADR 0014)
+// and, with TABDOCK_FIRST_CLASS_TOOLS on, each member's first-class page
+// tools. The factory builds one server per 2026-07-28 request and one per
+// 2025-era session (sessions.ts), each for one user. It is the SDK's
+// low-level Server, which answers tools/list and tools/call in the relay's
+// own code: the list is computed per user, and a call is dispatched by name,
+// so no page-chosen name is ever registered with the SDK, and a stale
+// first-class name still reaches the hub and answers as call_page_tool would.
+// The fixed tools' wire entries are what McpServer.registerTool sent in M4,
+// which a golden test holds on both eras (fixed-tools-golden.test.ts).
+//
+// Every handler reads who is calling from the request itself, not from the
+// factory, and refuses a request from anyone but the user the server was
+// built for. Tool descriptions are fixed relay text: no page-supplied string
+// is ever merged into them (S10); a first-class entry quotes page text only
+// behind a relay prefix that calls it untrusted (first-class.ts). The
+// dispatcher spends one request of its caller's budget (ADR 0018) for every
+// tools/call, before it resolves the name, so refusals, malformed calls and
+// names the relay does not serve count too; a 2026-07-28 request already
+// spent as it arrived (relay.ts, ADR 0032), so it spends nothing more here,
+// and one that arrived past the budget is refused. Past the budget a fixed
+// tool or a first-class call answers rate_limited with a record within the
+// refusal budget, and any other name a JSON-RPC error and one line a window.
+// With first-class tools on, a 2025-era tools/list spends one request too
+// (ADR 0030), since a member's list may then hold 100,000 characters of page
+// tools. Nothing here counts by address, since all of hosted Claude arrives
+// from one range (ADR 0016). An invitee (ADR 0017) gets the five fixed tools
+// on the pages it holds, pairs only by invite, and never a first-class name.
+// One `mcp client` line per user, client and leg an hour says which revision
+// each client speaks (ADR 0027).
 
 import {
   type AuthInfo,
+  CLIENT_CAPABILITIES_META_KEY,
   CLIENT_INFO_META_KEY,
   type CallToolResult,
-  McpServer,
+  isInputRequiredResult,
+  type ListToolsResult,
   type McpRequestContext,
+  PROTOCOL_VERSION_META_KEY,
+  ProtocolError,
+  ProtocolErrorCode,
+  Server,
   type ServerContext,
-  type StandardSchemaWithJSON,
 } from '@modelcontextprotocol/server';
 import {
   type ClientInfo,
   ClientInfoSchema,
   EmailSchema,
   type ErrorCode,
+  FIRST_CLASS_LIST_TTL_MS,
   formatError,
   IdSchema,
+  type JsonObject,
   MAX_CODE_INPUT_CHARS,
   MAX_DISPLAY_NAME_CHARS,
   MAX_INVITE_INPUT_CHARS,
@@ -47,16 +67,25 @@ import {
 import { z } from 'zod';
 import type { ResolvedConfig } from './config.ts';
 import {
+  CALL_PAGE_TOOL_ANNOTATIONS,
+  type FirstClassTool,
+  MAX_RESULT_SIZE_META,
+  parseFirstClassName,
+} from './first-class.ts';
+import {
   type BudgetRefusal,
   type CallerIdentity,
   type CallOutcome,
   formatDuration,
   type PageHub,
+  type PageToolRef,
   type PairOutcome,
   type ToolListing,
   type ToolsOutcome,
 } from './hub.ts';
+import type { Logger } from './log.ts';
 import { SlidingWindowLimiter } from './rate-limit.ts';
+import { RepeatedLines } from './repeated-lines.ts';
 import type { Spike } from './spike.ts';
 
 export const RELAY_NAME = 'tabdock-relay';
@@ -93,17 +122,26 @@ const PageArg = z
   .describe('A page id from list_pages, like pg_0123456789');
 
 /**
- * Claude Code moves results over its own text threshold into a file; the cap
- * plus the header line must stay inline (docs/notes/verified.md). Both tools
- * that return page content up to MAX_RESULT_CHARS carry it.
- */
-const MAX_RESULT_SIZE_META = { 'anthropic/maxResultSizeChars': MAX_RESULT_CHARS + 1000 };
-
-/**
  * A fixed tool's arguments as its handler receives them: what the tool's
  * own schema made of them, or the arguments as sent and what was wrong.
  */
 type Checked<T> = { ok: true; args: T } | { ok: false; raw: unknown; problem: string };
+
+/** One entry of tools/list as the relay builds it. */
+export type ListedTool = ListToolsResult['tools'][number];
+
+/**
+ * The SDK's low-level server, which the relay builds for every request and
+ * session. Its 2.3.0 typings mark it deprecated for ordinary use; the relay's
+ * tool set, computed per user from the hub, is the advanced case the SDK's
+ * docs name it for (ADR 0025), and the golden test catches a change on
+ * upgrade.
+ */
+// eslint-disable-next-line @typescript-eslint/no-deprecated
+export type RelayServer = Server;
+
+/** The SDK's code for a URL elicitation a handler requires; McpServer let it through as a JSON-RPC error. */
+const URL_ELICITATION_REQUIRED: number = ProtocolErrorCode.UrlElicitationRequired;
 
 /**
  * The first few issues, by path, so a client can see what to fix. For these
@@ -118,31 +156,27 @@ function problemOf(error: z.ZodError): string {
 
 /**
  * ADR 0018 counts a request against its caller's budget before anything
- * else, but the SDK checks a tool's arguments against its schema before the
- * handler runs and answers a mismatch itself, so a call with bad arguments
- * would cost nothing. Each fixed tool is registered with this instead: it
- * shows clients exactly the JSON Schema `schema` shows, and hands every call
- * to the handler with `schema`'s verdict, which the handler reads only after
- * counting the request.
+ * else, so a fixed tool's arguments are checked only once the dispatcher has
+ * counted the request: a call with bad arguments costs as much as any.
  */
-function checkedInHandler<S extends z.ZodType>(
-  schema: S,
-): StandardSchemaWithJSON<unknown, Checked<z.output<S>>> {
-  return {
-    '~standard': {
-      version: 1,
-      vendor: 'tabdock',
-      jsonSchema: schema['~standard'].jsonSchema,
-      validate: (raw) => {
-        const parsed = schema.safeParse(raw);
-        return {
-          value: parsed.success
-            ? { ok: true, args: parsed.data }
-            : { ok: false, raw, problem: problemOf(parsed.error) },
-        };
-      },
-    },
-  };
+function checked<S extends z.ZodType>(schema: S, raw: unknown): Checked<z.output<S>> {
+  const parsed = schema.safeParse(raw);
+  return parsed.success
+    ? { ok: true, args: parsed.data }
+    : { ok: false, raw, problem: problemOf(parsed.error) };
+}
+
+/**
+ * A fixed tool's input schema as clients are shown it: what McpServer sent
+ * in M4 for the same zod schema, its JSON Schema for draft 2020-12 under a
+ * root `type: "object"`, so the golden test finds every byte where it was.
+ */
+export function listedInputSchema(schema: z.ZodType): ListedTool['inputSchema'] {
+  // `type` first, as McpServer put it, then the converted schema's own keys.
+  const listed: ListedTool['inputSchema'] = { type: 'object' };
+  Object.assign(listed, schema['~standard'].jsonSchema.input({ target: 'draft-2020-12' }));
+  listed.type = 'object';
+  return listed;
 }
 
 /** A text field of the arguments, checked or as sent, for a refusal's record; '' when there is none. */
@@ -184,10 +218,10 @@ export function parseClientInfo(raw: unknown): ClientInfo | null {
  * Either way the client says it about itself, so it is capped and attribution
  * only.
  */
-export function clientFrom(server: McpServer, ctx: ServerContext): ClientInfo | null {
+export function clientFrom(server: RelayServer, ctx: ServerContext): ClientInfo | null {
   // Deprecated for 2026-07-28 code, and still the documented way to read what a 2025 session's client said in initialize.
   // eslint-disable-next-line @typescript-eslint/no-deprecated
-  const declared = parseClientInfo(server.server.getClientVersion());
+  const declared = parseClientInfo(server.getClientVersion());
   if (declared) return declared;
   const envelope = ctx.mcpReq.envelope as Record<string, unknown> | undefined;
   return parseClientInfo(envelope?.[CLIENT_INFO_META_KEY]);
@@ -255,7 +289,10 @@ function toolListResult(outcome: Extract<ToolsOutcome, { kind: 'tools' }>): Call
   };
 }
 
-export function callResult(tool: string, outcome: CallOutcome): CallToolResult {
+/** `tool` names the page tool in the result's header, unless the hub named the one the call reached. */
+export function callResult(asked: string, outcome: CallOutcome): CallToolResult {
+  const tool =
+    outcome.kind === 'ok' || outcome.kind === 'tool_error' ? (outcome.tool ?? asked) : asked;
   switch (outcome.kind) {
     case 'ok': {
       const cut = truncate(outcome.content, MAX_RESULT_CHARS);
@@ -306,8 +343,8 @@ export function userIdOf(authInfo: AuthInfo | undefined): string | null {
 /**
  * ADR 0018's per-user request budget. One per relay, shared by every server
  * the factory builds, by the listen streams (listen-streams.ts) and by the
- * 2026-07-28 leg for the requests the SDK refuses (relay.ts), so a client
- * cannot reset it by opening a new session, request or stream.
+ * 2026-07-28 leg as each request arrives (relay.ts), so a client cannot
+ * reset it by opening a new session, request or stream.
  */
 export interface RequestBudget {
   /** Counts one request for the user, or answers false, counting nothing, once it is past the budget. */
@@ -335,11 +372,14 @@ export function createRequestBudget(config: ResolvedConfig): RequestBudget {
   };
 }
 
+/** The SDK's server-error code, for a request the relay will not serve now. */
+export const BUDGET_CODE = -32000;
+
 /**
- * The five fixed tools (SPEC section 7), each spending the request budget in
- * its own handler. relay.ts lets a 2026-07-28 tools/call naming one of them
- * past the budget on to that tool, so it is refused in the tool's words and
- * with its record (ADR 0032); a test holds this set to what the server lists.
+ * The five fixed tools (SPEC section 7). relay.ts lets a 2026-07-28
+ * tools/call naming one of them past the budget on to the dispatcher, so
+ * that tool refuses it in its own words and with its record (ADR 0032); a
+ * test holds this set to what the server lists.
  */
 export const FIXED_TOOL_NAMES: ReadonlySet<string> = new Set([
   'list_pages',
@@ -350,46 +390,262 @@ export const FIXED_TOOL_NAMES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * `heldBytesOf` gives what a request holds on the heap (request-heap.ts),
- * from the auth object relay.ts made for it; a call or pairing that waits
- * on a page is charged that much (ADR 0018's notes). 0 where nothing
- * measured it. `paidOnArrival` says, from the same object, whether relay.ts
- * spent the request's budget as it arrived (true), found it past the budget
- * (false), or spent nothing (undefined), as on the 2025-era leg.
+ * A first-class entry as tools/list carries it. Its schema is page JSON the
+ * relay cut and checked to have a `type: "object"` root (first-class.ts),
+ * which is all the SDK's type adds beyond a JSON object.
  */
+function listed(entry: FirstClassTool): ListedTool {
+  return entry as unknown as ListedTool;
+}
+
+const LIST_PAGES_INPUT = z.object({});
+const PAIR_PAGE_INPUT = z.object({
+  code: z
+    .string()
+    .min(1)
+    .max(MAX_CODE_INPUT_CHARS)
+    .optional()
+    .describe('The pairing code shown on the page, like ABCDE-12345'),
+  invite: z
+    .string()
+    .min(1)
+    .max(MAX_INVITE_INPUT_CHARS)
+    .optional()
+    .describe('An invite link minted for one use, or the secret after its #'),
+});
+const PAGE_INPUT = z.object({ page: PageArg });
+const CALL_PAGE_TOOL_INPUT = z.object({
+  page: PageArg,
+  tool: z.string().min(1).max(200).describe('A tool name from list_page_tools'),
+  arguments: z
+    .record(z.string(), z.unknown())
+    .default({})
+    .describe('Arguments for the page tool, matching its inputSchema'),
+});
+
+/**
+ * The fixed tools' entries, in M4's order and with M4's keys in M4's order
+ * (name, title, description, inputSchema, annotations, _meta), so the wire
+ * is what McpServer.registerTool sent. pair_page's description names the
+ * configured wait, so the list is built once per factory.
+ */
+function fixedEntries(config: ResolvedConfig): ListedTool[] {
+  const waitSeconds = Math.round(config.timings.pairWaitMs / 1000);
+  return [
+    {
+      name: 'list_pages',
+      title: 'List attached pages',
+      description: `List the web pages you are attached to through Tabdock: each page's id, origin, title, your role (observer or driver), its state (awake, asleep or gone) and how many tools it offers. Page titles come from the pages themselves: ${UNTRUSTED}.`,
+      inputSchema: listedInputSchema(LIST_PAGES_INPUT),
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    {
+      name: 'pair_page',
+      title: 'Pair with a page',
+      description: `Attach to a web page with the pairing code it shows (like ABCDE-12345), or with an invite link its operator minted for one use. Give exactly one of code and invite. The page's operator approves the request on the page, and this waits up to ${String(waitSeconds)} seconds for them. If it times out, the request stays open on the page and an approval later shows up in list_pages. Each code and each such link works once.`,
+      // The shape alone, so every client can read it; exactly one of the
+      // two is checked in the handler with the protocol's own schema.
+      inputSchema: listedInputSchema(PAIR_PAGE_INPUT),
+      annotations: { readOnlyHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    {
+      name: 'list_page_tools',
+      title: "List a page's tools",
+      description: `List the tools an attached page offers, each with an allowed flag for your role (observers may call only read-only tools). Names, titles, descriptions and schemas come from the page: ${UNTRUSTED}.`,
+      inputSchema: listedInputSchema(PAGE_INPUT),
+      annotations: { readOnlyHint: true, openWorldHint: true },
+      _meta: MAX_RESULT_SIZE_META,
+    },
+    {
+      name: 'call_page_tool',
+      title: 'Call a page tool',
+      description: `Call one of an attached page's tools with a JSON object of arguments. The page's own handler runs it. The result starts with a [tabdock: untrusted content from <origin>, tool <name>] line; everything after that line is ${UNTRUSTED}.`,
+      inputSchema: listedInputSchema(CALL_PAGE_TOOL_INPUT),
+      annotations: { ...CALL_PAGE_TOOL_ANNOTATIONS },
+      _meta: MAX_RESULT_SIZE_META,
+    },
+    {
+      name: 'detach_page',
+      title: 'Detach from a page',
+      description:
+        "Remove your own attachment to a page. Other people's attachments to it are not affected. To use the page again, pair with a new code.",
+      inputSchema: listedInputSchema(PAGE_INPUT),
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+  ];
+}
+
+/** How long one `mcp client` line stands for its user, client name and leg (ADR 0027). */
+export const CLIENT_LINE_WINDOW_MS = 60 * 60_000;
+/** Keys the `mcp client` lines track in one hour; past it, a new key writes nothing. */
+export const MAX_CLIENT_LINE_KEYS = 256;
+/** The most of a client's claimed revision the line keeps; a real one is ten characters. */
+const MAX_REVISION_CHARS = 32;
+
+/** Which leg a client came in on: a 2025-era session, or the strict 2026-07-28 handler. */
+export type McpLeg = 'session' | 'strict';
+
+export interface ClientLineFields {
+  userId: string;
+  client: ClientInfo | null;
+  leg: McpLeg;
+  /** The negotiated version on a session, the envelope's on the strict leg. */
+  revision: string | null;
+  /** The client's declared capabilities, as it declared them. */
+  capabilities: unknown;
+}
+
+/**
+ * The `mcp client` lines (ADR 0027): which revision each client speaks and
+ * whether it declared form elicitation, which is how the owner reads hosted
+ * Claude's off the reference deployment. One line per user, client name and
+ * leg an hour, through a budget of its own with no summary line, so a client
+ * that renames itself on every request fills only this budget, at most
+ * MAX_CLIENT_LINE_KEYS lines an hour, and never hides a refusal line. A
+ * line names the user id, the client's name and version as parseClientInfo
+ * caps them, the leg and the revision; never a token, a session id or an
+ * argument.
+ */
+export interface ClientLines {
+  write(fields: ClientLineFields, now?: number): void;
+  close(): void;
+}
+
+/** An elicitation capability that is empty or names form (ADR 0026). */
+export function declaresFormElicitation(capabilities: unknown): boolean {
+  if (typeof capabilities !== 'object' || capabilities === null) return false;
+  const elicitation: unknown = (capabilities as Record<string, unknown>).elicitation;
+  if (typeof elicitation !== 'object' || elicitation === null || Array.isArray(elicitation)) {
+    return false;
+  }
+  return Object.keys(elicitation).length === 0 || 'form' in elicitation;
+}
+
+export function createClientLines(log: Logger): ClientLines {
+  const keys = new RepeatedLines({
+    linesPerKey: 1,
+    windowMs: CLIENT_LINE_WINDOW_MS,
+    maxKeys: MAX_CLIENT_LINE_KEYS,
+    // No summary: the hour's one line per key is the record.
+    summary: () => undefined,
+  });
+  return {
+    write({ userId, client, leg, revision, capabilities }, now = Date.now()) {
+      const key = JSON.stringify([userId, client?.name ?? null, leg]);
+      if (!keys.take(key, 'mcp client', undefined, now)) return;
+      log.info('mcp client', {
+        userId,
+        client: client?.name ?? null,
+        clientVersion: client?.version ?? null,
+        leg,
+        revision: revision === null ? null : revision.slice(0, MAX_REVISION_CHARS),
+        formElicitation: declaresFormElicitation(capabilities),
+      });
+    },
+    close() {
+      keys.flush();
+    },
+  };
+}
+
+/**
+ * A 2026-07-28 request's envelope, as the strict leg reads it for the
+ * client line: the client's own name, version, revision and capabilities.
+ */
+export function envelopeOf(message: unknown): Omit<ClientLineFields, 'userId' | 'leg'> | null {
+  if (typeof message !== 'object' || message === null) return null;
+  const params: unknown = (message as Record<string, unknown>).params;
+  if (typeof params !== 'object' || params === null) return null;
+  const meta: unknown = (params as Record<string, unknown>)._meta;
+  if (typeof meta !== 'object' || meta === null) return null;
+  const fields = meta as Record<string, unknown>;
+  const revision = fields[PROTOCOL_VERSION_META_KEY];
+  return {
+    client: parseClientInfo(fields[CLIENT_INFO_META_KEY]),
+    revision: typeof revision === 'string' ? revision : null,
+    capabilities: fields[CLIENT_CAPABILITIES_META_KEY],
+  };
+}
+
+export interface McpFactoryOptions {
+  /** The M3 spike while TABDOCK_SPIKE is on. */
+  spike?: Spike | null;
+  budget?: RequestBudget;
+  /**
+   * What a request holds on the heap (request-heap.ts), from the auth object
+   * relay.ts made for it; a call or pairing that waits on a page is charged
+   * that much (ADR 0018's notes). 0 where nothing measured it.
+   */
+  heldBytesOf?: (authInfo: AuthInfo | undefined) => number;
+  /**
+   * From the same object, whether relay.ts spent the request's budget as it
+   * arrived (true), found it past the budget (false), or spent nothing
+   * (undefined), as on the 2025-era leg.
+   */
+  paidOnArrival?: (authInfo: AuthInfo | undefined) => boolean | undefined;
+  /** One line a window for a request refused past the budget with no record (relay.ts's /mcp lines). */
+  refusedLine?: (userId: string) => void;
+  /** The `mcp client` lines; a 2025-era session's is written when its initialize completes. */
+  clientLines?: ClientLines | null;
+}
+
+/** The answer McpServer gave a throw in a tool handler: an isError result in the thrown words. */
+function thrownResult(error: unknown): CallToolResult {
+  return { content: [text(error instanceof Error ? error.message : String(error))], isError: true };
+}
+
 export function createMcpFactory(
   hub: PageHub,
   config: ResolvedConfig,
-  spike: Spike | null = null,
-  budget: RequestBudget = createRequestBudget(config),
-  heldBytesOf: (authInfo: AuthInfo | undefined) => number = () => 0,
-  paidOnArrival: (authInfo: AuthInfo | undefined) => boolean | undefined = () => undefined,
-): (ctx: McpRequestContext) => McpServer {
-  const waitSeconds = Math.round(config.timings.pairWaitMs / 1000);
-  /**
-   * ADR 0018: counts one request against its caller's budget, before the
-   * access check and before its arguments are checked, so a refused or
-   * malformed request costs as much as any. Past it the request is answered
-   * rate_limited and recorded within the refusal budget. A 2026-07-28
-   * request already counted as it arrived (`paid`, ADRs 0030 and 0032), so it
-   * counts nothing more here, and one that arrived past the budget is refused.
-   */
-  const overBudget = (
-    who: CallerIdentity,
-    refusal: BudgetRefusal,
-    paid: boolean | undefined,
-  ): CallToolResult | null => {
-    if (paid === true) return null;
-    if (paid === undefined && budget.spend(who.userId, who.account.kind)) return null;
-    hub.refusedByBudget(who, refusal);
-    return errorResult('rate_limited', budget.refusal(who.account.kind));
-  };
+  options: McpFactoryOptions = {},
+): (ctx: McpRequestContext) => RelayServer {
+  const spike = options.spike ?? null;
+  const budget = options.budget ?? createRequestBudget(config);
+  const heldBytesOf = options.heldBytesOf ?? (() => 0);
+  const paidOnArrival = options.paidOnArrival ?? (() => undefined);
+  const refusedLine = options.refusedLine ?? (() => undefined);
+  const clientLines = options.clientLines ?? null;
+  const fixed = fixedEntries(config);
+  const firstClassOn = config.firstClassTools;
+
   return ({ authInfo, era }) => {
-    const owner = identityFrom(authInfo).userId;
-    const server = new McpServer(
+    const owner = identityFrom(authInfo);
+    const member = owner.account.kind === 'member';
+    // The advanced case the SDK's docs name Server for: a tool set computed
+    // per request, here per user and from the hub (ADR 0025). McpServer
+    // registers each tool by name, which page-chosen names cannot be.
+    // eslint-disable-next-line @typescript-eslint/no-deprecated
+    const server = new Server(
       { name: RELAY_NAME, version: RELAY_VERSION },
-      { instructions: INSTRUCTIONS },
+      {
+        instructions: INSTRUCTIONS,
+        capabilities: { tools: { listChanged: true } },
+        // ADR 0025: a list a user's clients may keep for 10 s, never in a shared cache.
+        ...(firstClassOn
+          ? {
+              cacheHints: {
+                'tools/list': { ttlMs: FIRST_CLASS_LIST_TTL_MS, cacheScope: 'private' },
+              },
+            }
+          : {}),
+      },
     );
+    if (era === 'legacy' && clientLines !== null) {
+      server.oninitialized = () => {
+        clientLines.write({
+          userId: owner.userId,
+          // eslint-disable-next-line @typescript-eslint/no-deprecated
+          client: parseClientInfo(server.getClientVersion()),
+          leg: 'session',
+          // The documented way to read what a 2025 session negotiated in initialize.
+          // eslint-disable-next-line @typescript-eslint/no-deprecated
+          revision: server.getNegotiatedProtocolVersion() ?? null,
+          // eslint-disable-next-line @typescript-eslint/no-deprecated
+          capabilities: server.getClientCapabilities(),
+        });
+      };
+    }
+
     /**
      * From this request's own auth, with the per-request address. sessions.ts
      * already answers 404 to anyone but a session's owner; this refuses again,
@@ -397,7 +653,7 @@ export function createMcpFactory(
      */
     const identityOf = (ctx: ServerContext): Omit<CallerIdentity, 'client'> => {
       const identity = identityFrom(ctx.http?.authInfo ?? authInfo);
-      if (identity.userId !== owner) {
+      if (identity.userId !== owner.userId) {
         throw new Error('MCP request from a user other than the one this server serves');
       }
       return identity;
@@ -406,202 +662,240 @@ export function createMcpFactory(
       ...identityOf(ctx),
       client: clientFrom(server, ctx),
     });
+    const authOf = (ctx: ServerContext): AuthInfo | undefined => ctx.http?.authInfo ?? authInfo;
     /** What this request's body holds while it waits, measured by relay.ts. */
-    const heldBytes = (ctx: ServerContext): number => heldBytesOf(ctx.http?.authInfo ?? authInfo);
-    /** Whether relay.ts spent this request's budget as it arrived. */
-    const paid = (ctx: ServerContext): boolean | undefined =>
-      paidOnArrival(ctx.http?.authInfo ?? authInfo);
+    const heldBytes = (ctx: ServerContext): number => heldBytesOf(authOf(ctx));
+    /**
+     * ADR 0018, in the dispatcher: one request of the caller's budget for
+     * this request, whatever it names, unless relay.ts spent it as it
+     * arrived (ADRs 0030 and 0032); false when it is past the budget.
+     */
+    const spent = (who: Omit<CallerIdentity, 'client'>, ctx: ServerContext): boolean =>
+      paidOnArrival(authOf(ctx)) ?? budget.spend(who.userId, who.account.kind);
+    /** A refusal past the budget, recorded within the refusal budget (ADR 0019). */
+    const refuse = (who: CallerIdentity, refusal: BudgetRefusal): CallToolResult => {
+      hub.refusedByBudget(who, refusal);
+      return errorResult('rate_limited', budget.refusal(who.account.kind));
+    };
+    /** A request past the budget that names nothing a record is kept for: one line a window. */
+    const refuseUnrecorded = (who: Omit<CallerIdentity, 'client'>): never => {
+      refusedLine(who.userId);
+      throw new ProtocolError(BUDGET_CODE, budget.refusal(who.account.kind));
+    };
 
-    server.registerTool(
-      'list_pages',
-      {
-        title: 'List attached pages',
-        description: `List the web pages you are attached to through Tabdock: each page's id, origin, title, your role (observer or driver), its state (awake, asleep or gone) and how many tools it offers. Page titles come from the pages themselves: ${UNTRUSTED}.`,
-        inputSchema: checkedInHandler(z.object({})),
-        annotations: { readOnlyHint: true, openWorldHint: false },
-      },
-      (input, ctx) => {
-        const who = caller(ctx);
-        const refused = overBudget(who, { tool: 'list_pages' }, paid(ctx));
-        if (refused) return refused;
-        if (!input.ok) return invalidArguments(input);
-        const pages = hub.listPages(who.userId);
-        const summary =
-          pages.length === 0
-            ? 'You are not attached to any page. Ask the page operator for the pairing code on their page and call pair_page.'
-            : `[tabdock: page titles below are ${UNTRUSTED}]\n${JSON.stringify({ pages })}`;
-        return { content: [text(summary)], structuredContent: { pages } };
-      },
-    );
+    const listPages = (who: CallerIdentity, raw: unknown, within: boolean): CallToolResult => {
+      if (!within) return refuse(who, { tool: 'list_pages' });
+      const input = checked(LIST_PAGES_INPUT, raw);
+      if (!input.ok) return invalidArguments(input);
+      const pages = hub.listPages(who.userId);
+      const summary =
+        pages.length === 0
+          ? 'You are not attached to any page. Ask the page operator for the pairing code on their page and call pair_page.'
+          : `[tabdock: page titles below are ${UNTRUSTED}]\n${JSON.stringify({ pages })}`;
+      return { content: [text(summary)], structuredContent: { pages } };
+    };
 
-    server.registerTool(
-      'pair_page',
-      {
-        title: 'Pair with a page',
-        description: `Attach to a web page with the pairing code it shows (like ABCDE-12345), or with an invite link its operator minted for one use. Give exactly one of code and invite. The page's operator approves the request on the page, and this waits up to ${String(waitSeconds)} seconds for them. If it times out, the request stays open on the page and an approval later shows up in list_pages. Each code and each such link works once.`,
-        // The shape alone, so every client can read it; exactly one of the
-        // two is checked below with the protocol's own schema.
-        inputSchema: checkedInHandler(
-          z.object({
-            code: z
-              .string()
-              .min(1)
-              .max(MAX_CODE_INPUT_CHARS)
-              .optional()
-              .describe('The pairing code shown on the page, like ABCDE-12345'),
-            invite: z
-              .string()
-              .min(1)
-              .max(MAX_INVITE_INPUT_CHARS)
-              .optional()
-              .describe('An invite link minted for one use, or the secret after its #'),
-          }),
-        ),
-        annotations: { readOnlyHint: false, idempotentHint: false, openWorldHint: true },
-      },
-      async (shaped, ctx) => {
-        const who = caller(ctx);
-        const refused = overBudget(
-          who,
-          { tool: 'pair_page', via: fieldOf(shaped, 'code') === '' ? 'invite' : 'code' },
-          paid(ctx),
-        );
-        if (refused) return refused;
-        if (!shaped.ok) return invalidArguments(shaped);
-        const input = PairPageInputSchema.safeParse(shaped.args);
-        if (!input.success) {
-          return errorResult('invalid_arguments', 'give exactly one of code and invite');
+    const pairPage = async (
+      who: CallerIdentity,
+      raw: unknown,
+      within: boolean,
+      ctx: ServerContext,
+    ): Promise<CallToolResult> => {
+      const shaped = checked(PAIR_PAGE_INPUT, raw);
+      if (!within) {
+        return refuse(who, {
+          tool: 'pair_page',
+          via: fieldOf(shaped, 'code') === '' ? 'invite' : 'code',
+        });
+      }
+      if (!shaped.ok) return invalidArguments(shaped);
+      const input = PairPageInputSchema.safeParse(shaped.args);
+      if (!input.success) {
+        return errorResult('invalid_arguments', 'give exactly one of code and invite');
+      }
+      const { code, invite } = input.data;
+      const outcome: PairOutcome =
+        code !== undefined
+          ? await hub.pairPage(who, code, ctx.mcpReq.signal, heldBytes(ctx))
+          : await hub.redeemInvite(who, invite ?? '', ctx.mcpReq.signal, heldBytes(ctx));
+      if (outcome.kind === 'error') return errorResult(outcome.code, outcome.message);
+      const already = outcome.existing ? ' You were already attached.' : '';
+      // A member's name from the owner's settings, never page text, as /i shows it (ADR 0016).
+      const shared = outcome.sponsor === undefined ? '' : ` Shared by ${outcome.sponsor}.`;
+      return {
+        content: [
+          text(
+            `Attached to page ${outcome.pageId} (${outcome.origin}) as ${outcome.role}.${already}${shared}`,
+          ),
+        ],
+        structuredContent: {
+          page: outcome.pageId,
+          origin: outcome.origin,
+          role: outcome.role,
+          ...(outcome.sponsor === undefined ? {} : { sponsor: outcome.sponsor }),
+        },
+      };
+    };
+
+    const listPageTools = (who: CallerIdentity, raw: unknown, within: boolean): CallToolResult => {
+      const input = checked(PAGE_INPUT, raw);
+      if (!within) return refuse(who, { tool: 'list_page_tools', page: fieldOf(input, 'page') });
+      if (!input.ok) return invalidArguments(input);
+      const outcome = hub.listPageTools(who.userId, input.args.page);
+      if (outcome.kind === 'error') return errorResult(outcome.code, outcome.message);
+      return toolListResult(outcome);
+    };
+
+    /**
+     * Both routes to a page tool end here: call_page_tool, and a first-class
+     * name (ADR 0025), whose reference the hub resolves where it looks the
+     * tool up. One function, so both get the same checks, prompts, queue,
+     * audit records, cancellation and errors.
+     */
+    const callPage = async (
+      who: CallerIdentity,
+      page: string,
+      tool: PageToolRef,
+      args: JsonObject,
+      label: string,
+      ctx: ServerContext,
+    ): Promise<CallToolResult> => {
+      const timer = spike?.startCall(authOf(ctx));
+      const outcome = await hub.callPageTool(
+        who,
+        page,
+        tool,
+        args,
+        ctx.mcpReq.signal,
+        timer?.marks ?? null,
+        heldBytes(ctx),
+      );
+      const result = callResult(label, outcome);
+      return spike && timer
+        ? spike.finishCall(timer, result, { userId: who.userId, pageId: page, tool: label })
+        : result;
+    };
+
+    const callPageTool = async (
+      who: CallerIdentity,
+      raw: unknown,
+      within: boolean,
+      ctx: ServerContext,
+    ): Promise<CallToolResult> => {
+      const input = checked(CALL_PAGE_TOOL_INPUT, raw);
+      const page = fieldOf(input, 'page');
+      const tool = fieldOf(input, 'tool');
+      if (!within) return refuse(who, { tool: 'call_page_tool', page, pageTool: tool });
+      if (!input.ok) {
+        // Every call attempt keeps a call line (S7), a malformed one too.
+        hub.refusedMalformedCall(who, page, tool);
+        return invalidArguments(input);
+      }
+      return callPage(who, page, tool, input.args.arguments, tool, ctx);
+    };
+
+    const detachPage = (who: CallerIdentity, raw: unknown, within: boolean): CallToolResult => {
+      const input = checked(PAGE_INPUT, raw);
+      if (!within) return refuse(who, { tool: 'detach_page', page: fieldOf(input, 'page') });
+      if (!input.ok) return invalidArguments(input);
+      const outcome = hub.detachPage(who.userId, input.args.page);
+      if (outcome.kind === 'error') return errorResult(outcome.code, outcome.message);
+      return {
+        content: [text(`Detached from page ${outcome.pageId}.`)],
+        structuredContent: { page: outcome.pageId, detached: true },
+      };
+    };
+
+    /** A fixed tool's call; past the budget it is refused in the tool's own words. */
+    const runFixed = (
+      name: string,
+      who: CallerIdentity,
+      raw: unknown,
+      within: boolean,
+      ctx: ServerContext,
+    ): CallToolResult | Promise<CallToolResult> => {
+      switch (name) {
+        case 'list_pages':
+          return listPages(who, raw, within);
+        case 'pair_page':
+          return pairPage(who, raw, within, ctx);
+        case 'list_page_tools':
+          return listPageTools(who, raw, within);
+        case 'call_page_tool':
+          return callPageTool(who, raw, within, ctx);
+        default:
+          return detachPage(who, raw, within);
+      }
+    };
+
+    /**
+     * A handler's answer as McpServer gave it: a result through the
+     * negotiated codec, and a throw as an isError result in its words.
+     */
+    const answer = async (
+      run: () => CallToolResult | Promise<CallToolResult>,
+    ): Promise<CallToolResult> => {
+      try {
+        const result = await run();
+        if (isInputRequiredResult(result)) return result;
+        return server.projectCallToolResult(result, undefined);
+      } catch (error) {
+        if (error instanceof ProtocolError && error.code === URL_ELICITATION_REQUIRED) {
+          throw error;
         }
-        const { code, invite } = input.data;
-        const outcome: PairOutcome =
-          code !== undefined
-            ? await hub.pairPage(who, code, ctx.mcpReq.signal, heldBytes(ctx))
-            : await hub.redeemInvite(who, invite ?? '', ctx.mcpReq.signal, heldBytes(ctx));
-        if (outcome.kind === 'error') return errorResult(outcome.code, outcome.message);
-        const already = outcome.existing ? ' You were already attached.' : '';
-        // A member's name from the owner's settings, never page text, as /i shows it (ADR 0016).
-        const shared = outcome.sponsor === undefined ? '' : ` Shared by ${outcome.sponsor}.`;
-        return {
-          content: [
-            text(
-              `Attached to page ${outcome.pageId} (${outcome.origin}) as ${outcome.role}.${already}${shared}`,
-            ),
-          ],
-          structuredContent: {
-            page: outcome.pageId,
-            origin: outcome.origin,
-            role: outcome.role,
-            ...(outcome.sponsor === undefined ? {} : { sponsor: outcome.sponsor }),
-          },
-        };
-      },
-    );
+        return thrownResult(error);
+      }
+    };
 
-    server.registerTool(
-      'list_page_tools',
-      {
-        title: "List a page's tools",
-        description: `List the tools an attached page offers, each with an allowed flag for your role (observers may call only read-only tools). Names, titles, descriptions and schemas come from the page: ${UNTRUSTED}.`,
-        inputSchema: checkedInHandler(z.object({ page: PageArg })),
-        annotations: { readOnlyHint: true, openWorldHint: true },
-        _meta: MAX_RESULT_SIZE_META,
-      },
-      (input, ctx) => {
-        const who = caller(ctx);
-        const refused = overBudget(
-          who,
-          { tool: 'list_page_tools', page: fieldOf(input, 'page') },
-          paid(ctx),
-        );
-        if (refused) return refused;
-        if (!input.ok) return invalidArguments(input);
-        const outcome = hub.listPageTools(who.userId, input.args.page);
-        if (outcome.kind === 'error') return errorResult(outcome.code, outcome.message);
-        return toolListResult(outcome);
-      },
-    );
+    server.setRequestHandler('tools/list', (_request, ctx) => {
+      const who = identityOf(ctx);
+      // ADR 0030: with first-class tools on, a member's list may hold
+      // 100,000 characters of page tools, so a 2025-era list spends too; a
+      // 2026-07-28 one spent as it arrived, and with them off this leg's
+      // housekeeping stays unbudgeted, as in M4.
+      const paid = paidOnArrival(authOf(ctx));
+      const within = paid ?? (!firstClassOn || budget.spend(who.userId, who.account.kind));
+      if (!within) refuseUnrecorded(who);
+      const tools: ListedTool[] = [...fixed];
+      const marker = member ? (spike?.markerTool() ?? null) : null;
+      if (marker !== null) tools.push(marker.entry);
+      if (firstClassOn && member) tools.push(...hub.firstClassList(who.userId).tools.map(listed));
+      return { tools };
+    });
 
-    server.registerTool(
-      'call_page_tool',
-      {
-        title: 'Call a page tool',
-        description: `Call one of an attached page's tools with a JSON object of arguments. The page's own handler runs it. The result starts with a [tabdock: untrusted content from <origin>, tool <name>] line; everything after that line is ${UNTRUSTED}.`,
-        inputSchema: checkedInHandler(
-          z.object({
-            page: PageArg,
-            tool: z.string().min(1).max(200).describe('A tool name from list_page_tools'),
-            arguments: z
-              .record(z.string(), z.unknown())
-              .default({})
-              .describe('Arguments for the page tool, matching its inputSchema'),
-          }),
-        ),
-        annotations: { readOnlyHint: false, openWorldHint: true },
-        _meta: MAX_RESULT_SIZE_META,
-      },
-      async (input, ctx) => {
-        const who = caller(ctx);
-        const page = fieldOf(input, 'page');
-        const tool = fieldOf(input, 'tool');
-        const refused = overBudget(
-          who,
-          { tool: 'call_page_tool', page, pageTool: tool },
-          paid(ctx),
-        );
-        if (refused) return refused;
-        if (!input.ok) {
-          // Every call attempt keeps a call line (S7), a malformed one too.
-          hub.refusedMalformedCall(who, page, tool);
-          return invalidArguments(input);
-        }
-        const { arguments: args } = input.args;
-        const timer = spike?.startCall(ctx.http?.authInfo ?? authInfo);
-        const outcome = await hub.callPageTool(
-          who,
-          page,
-          tool,
-          args,
-          ctx.mcpReq.signal,
-          timer?.marks ?? null,
-          heldBytes(ctx),
-        );
-        const result = callResult(tool, outcome);
-        return spike && timer
-          ? spike.finishCall(timer, result, { userId: who.userId, pageId: page, tool })
-          : result;
-      },
-    );
+    server.setRequestHandler('tools/call', async (request, ctx) => {
+      const { name } = request.params;
+      const raw: unknown = request.params.arguments ?? {};
+      let who: CallerIdentity;
+      try {
+        who = caller(ctx);
+      } catch (error) {
+        return thrownResult(error);
+      }
+      // ADR 0025: one request for every call, before the name is resolved,
+      // so an unknown name is not free (ADR 0030).
+      const within = spent(who, ctx);
+      if (FIXED_TOOL_NAMES.has(name)) return answer(() => runFixed(name, who, raw, within, ctx));
+      // An invitee's too: the hub answers it tool_not_found with its call
+      // line, as ADR 0016 keeps invitees on the fixed tools.
+      const firstClass = firstClassOn ? parseFirstClassName(name) : null;
+      if (firstClass !== null) {
+        const { pageId, toolPart } = firstClass;
+        if (!within)
+          return refuse(who, { tool: 'call_page_tool', page: pageId, pageTool: toolPart });
+        const args: JsonObject = request.params.arguments ?? {};
+        return answer(() => callPage(who, pageId, { firstClass: toolPart }, args, toolPart, ctx));
+      }
+      const marker = member ? (spike?.markerTool() ?? null) : null;
+      if (marker?.entry.name === name) {
+        if (!within) refuseUnrecorded(who);
+        return answer(() => marker.call());
+      }
+      if (!within) refuseUnrecorded(who);
+      // M4's answer to a name it does not serve, word for word.
+      throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Tool ${name} not found`);
+    });
 
-    server.registerTool(
-      'detach_page',
-      {
-        title: 'Detach from a page',
-        description:
-          "Remove your own attachment to a page. Other people's attachments to it are not affected. To use the page again, pair with a new code.",
-        inputSchema: checkedInHandler(z.object({ page: PageArg })),
-        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-      },
-      (input, ctx) => {
-        const who = caller(ctx);
-        const refused = overBudget(
-          who,
-          { tool: 'detach_page', page: fieldOf(input, 'page') },
-          paid(ctx),
-        );
-        if (refused) return refused;
-        if (!input.ok) return invalidArguments(input);
-        const outcome = hub.detachPage(who.userId, input.args.page);
-        if (outcome.kind === 'error') return errorResult(outcome.code, outcome.message);
-        return {
-          content: [text(`Detached from page ${outcome.pageId}.`)],
-          structuredContent: { page: outcome.pageId, detached: true },
-        };
-      },
-    );
-
-    // The spike's marker tool, while it exists, sits beside the five (ADR
-    // 0014), for members only: an invitee stays on the five fixed tools (ADR 0016).
-    if (identityFrom(authInfo).account.kind === 'member') spike?.attachServer(server, era);
     return server;
   };
 }

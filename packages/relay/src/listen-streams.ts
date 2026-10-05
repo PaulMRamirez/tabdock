@@ -24,7 +24,16 @@
 // again, and the listen being answered counts in its place, so listens that
 // overlap still never overshoot a cap. The SDK's own cap therefore needs
 // room for those marked streams beside the total (relay.ts).
+//
+// From M5 each user's streams are served by an SDK handler of that user's
+// own (ADR 0025), made with their first stream and closed with their last,
+// so a change to one user's tool list signals only that user's streams
+// (notifyUser) and never another's (S13); the spike's marker, which every
+// member lists, signals them all (notifyAll). This gate still decides who
+// may hold a stream; each handler's own cap sits above anything the gate
+// lets one user hold, so the SDK's cap never binds first.
 
+import type { McpHttpHandler } from '@modelcontextprotocol/server';
 import type { UserKind } from '@tabdock/protocol';
 import type { Logger } from './log.ts';
 import type { RequestBudget } from './mcp.ts';
@@ -49,6 +58,17 @@ export interface ListenStreamOptions {
   log: Logger;
   /** Where refusals go, one line per reason a window and the rest counted (repeated-lines.ts). */
   lines: RepeatedLog;
+  /**
+   * Makes the SDK handler that serves one user's streams; relay.ts gives it
+   * the relay's factory and a cap above anything the gate allows one user.
+   */
+  createHandler: () => McpHttpHandler;
+}
+
+/** One user's handler, and how many of their streams it holds or is answering. */
+interface UserHandler {
+  handler: McpHttpHandler;
+  streams: number;
 }
 
 /** Who opens a stream, as the HTTP layer established it. */
@@ -100,6 +120,8 @@ export class ListenStreams {
   readonly #options: ListenStreamOptions;
   /** Every stream held or being answered, oldest first. */
   readonly #held = new Set<Held>();
+  /** Each user's own handler while they hold or are opening a stream. */
+  readonly #handlers = new Map<string, UserHandler>();
 
   constructor(options: ListenStreamOptions) {
     this.#options = options;
@@ -110,17 +132,39 @@ export class ListenStreams {
     return this.#held.size;
   }
 
+  /** Users with a handler of their own, which is every user holding or opening a stream. */
+  get handlers(): number {
+    return this.#handlers.size;
+  }
+
+  /** Tells the user's own streams that their tool list changed; no other user's hear it. */
+  notifyUser(userId: string): void {
+    this.#handlers.get(userId)?.handler.notify.toolsChanged();
+  }
+
+  /** Tells every stream; the spike's marker concerns every member. */
+  notifyAll(): void {
+    for (const { handler } of this.#handlers.values()) handler.notify.toolsChanged();
+  }
+
+  /** Closes every user's handler, ending their streams, as the relay closes. */
+  async closeAll(): Promise<void> {
+    const closing = [...this.#handlers.values()].map(({ handler }) => handler.close());
+    this.#handlers.clear();
+    await Promise.all(closing);
+  }
+
   /**
-   * Serves one subscriptions/listen through `serve` (the SDK) if the caller
-   * has budget and there is room, ending whichever stream gives way once the
-   * SDK has answered with a stream; `id` is the request's JSON-RPC id, echoed
-   * in a refusal.
+   * Serves one subscriptions/listen through `serve` (the SDK) on the
+   * caller's own handler if the caller has budget and there is room, ending
+   * whichever stream gives way once the SDK has answered with a stream; `id`
+   * is the request's JSON-RPC id, echoed in a refusal.
    */
   async open(
     caller: ListenCaller,
     id: unknown,
     signal: AbortSignal,
-    serve: () => Promise<Response>,
+    serve: (handler: McpHttpHandler) => Promise<Response>,
   ): Promise<Response> {
     const { budget } = this.#options;
     if (!budget.spend(caller.userId, caller.kind)) {
@@ -131,10 +175,10 @@ export class ListenStreams {
     const givingWay = this.#makeRoom(held);
     if (givingWay === null) return listenError(id, FULL_CODE, FULL_MESSAGE);
     // Counted from now, so listens that overlap cannot overshoot a cap together.
-    this.#held.add(held);
+    this.#hold(held);
     let response: Response;
     try {
-      response = await serve();
+      response = await serve(this.#handlerOf(caller.userId));
     } catch (error) {
       this.#release(held, givingWay);
       throw error;
@@ -150,7 +194,7 @@ export class ListenStreams {
       this.#options.log.debug(why, { userId: caller.userId });
     }
     const body = closableBody(response, signal, () => {
-      this.#held.delete(held);
+      this.#forget(held);
     });
     // Unless the client already left, in which case it is gone from the set.
     if (this.#held.has(held)) held.close = body.close;
@@ -162,7 +206,39 @@ export class ListenStreams {
     for (const { held: marked } of givingWay) {
       if (marked.givingWayTo === held) marked.givingWayTo = null;
     }
-    this.#held.delete(held);
+    this.#forget(held);
+  }
+
+  /** Counts a stream in, making its user's handler with their first. */
+  #hold(held: Held): void {
+    this.#held.add(held);
+    let own = this.#handlers.get(held.userId);
+    if (own === undefined) {
+      own = { handler: this.#options.createHandler(), streams: 0 };
+      this.#handlers.set(held.userId, own);
+    }
+    own.streams += 1;
+  }
+
+  /** The handler #hold made for this user; there is one while any of their streams is held. */
+  #handlerOf(userId: string): McpHttpHandler {
+    const own = this.#handlers.get(userId);
+    if (own === undefined)
+      throw new Error('a listen stream is being served with no handler for its user');
+    return own.handler;
+  }
+
+  /** Counts a stream out, once; the user's handler closes with their last. */
+  #forget(held: Held): void {
+    if (!this.#held.delete(held)) return;
+    const own = this.#handlers.get(held.userId);
+    if (own === undefined) return;
+    own.streams -= 1;
+    if (own.streams > 0) return;
+    this.#handlers.delete(held.userId);
+    own.handler.close().catch((error: unknown) => {
+      this.#options.log.warn('listen handler did not close cleanly', { error });
+    });
   }
 
   /** Streams that count against the caps: every one but those marked to give way. */

@@ -38,12 +38,16 @@ import {
   INVITE_PATH,
   type InviteListing,
   type InviteRefusalReason,
+  InviteeIdSchema,
   InviteSecretSchema,
   inviteSecretOf,
   type JsonObject,
   type Limits,
   MAX_CONFIRMATION_FRAME_BYTES,
   MAX_DESCRIPTION_CHARS,
+  MAX_FIRST_CLASS_CHARS_PER_USER,
+  MAX_FIRST_CLASS_NAME_CHARS,
+  MAX_FIRST_CLASS_TOOLS_PER_USER,
   MAX_FRAME_BYTES,
   MAX_INVITE_LIFETIME_MS,
   MAX_LIVE_INVITES_PER_PAGE,
@@ -72,6 +76,7 @@ import {
 import { AuditRefusalBudget } from './audit-budget.ts';
 import { foldName, type UserAccount } from './auth.ts';
 import { MIN_REQUEST_BYTES, type ResolvedConfig } from './config.ts';
+import { type FirstClassTool, firstClassEntry, firstClassToolPart } from './first-class.ts';
 import type { LogFields, Logger, LogLevel } from './log.ts';
 import { SlidingWindowLimiter } from './rate-limit.ts';
 import { RepeatedLines } from './repeated-lines.ts';
@@ -275,15 +280,25 @@ export interface ToolListing {
   inputSchema: JsonObject;
   annotations: ToolAnnotations;
   allowed: boolean;
+  /**
+   * With first-class tools on (ADR 0025), the caller's first-class name for
+   * the tool, or null when their list leaves it off; absent with them off.
+   */
+  firstClass?: string | null;
 }
 
 export type ToolsOutcome =
   { kind: 'tools'; pageId: string; origin: string; role: Role; tools: ToolListing[] } | HubError;
 
+/**
+ * How a call ended. callPageTool names the page tool it reached in `tool`,
+ * as the call resolved it, so a result's untrusted header reads the same
+ * whichever route named the tool (ADR 0025).
+ */
 export type CallOutcome =
-  | { kind: 'ok'; origin: string; content: string }
+  | { kind: 'ok'; origin: string; content: string; tool?: string }
   /** The page's handler failed; its message is page-supplied text. */
-  | { kind: 'tool_error'; origin: string; message: string }
+  | { kind: 'tool_error'; origin: string; message: string; tool?: string }
   /** The MCP client abandoned the call. */
   | { kind: 'cancelled' }
   | HubError;
@@ -305,6 +320,12 @@ interface CallTrace {
   reached: boolean;
   /** Returns what the call's request was charged against what waiting requests hold (#holdBytes). */
   release: (() => void) | null;
+  /**
+   * The page tool its record names: as the client wrote it until a
+   * first-class name resolves, then the page tool's own name, so a call by
+   * either route leaves the same line (S7, ADR 0025).
+   */
+  tool: string;
 }
 
 /** Why the relay tells a page to stop a call. */
@@ -381,7 +402,58 @@ interface ListedTool {
   check: ArgCheckEntry;
   /** What it is charged against limits.toolBytes, kept while it is reused unchanged (heldBytes). */
   held: number;
+  /**
+   * Its first-class entry, built once from the cut copy with first-class
+   * tools on (ADR 0025) and charged within `held`; null with them off, or
+   * when its schema's root keeps it off every list.
+   */
+  firstClass: FirstClassTool | null;
 }
+
+/**
+ * A page's first-class entries as its last tools frame left them, in the
+ * page's order: those whose names fit MAX_FIRST_CLASS_NAME_CHARS and that no
+ * other tool of the page maps to. `version` is new with every frame, so a
+ * user's list built from an older one is known to be stale.
+ */
+interface PageFirstClass {
+  version: number;
+  entries: { toolName: string; readOnly: boolean; tool: FirstClassTool; chars: number }[];
+}
+
+/**
+ * One member's first-class list (ADR 0025), kept while it still matches
+ * their attachments: `key` names each attachment it was built from, its
+ * role and its page's version, so any change to them shows as another key
+ * on the next look and the list is built again before it is served.
+ */
+interface FirstClassSnapshot {
+  key: string;
+  tools: FirstClassTool[];
+  /** Each page's listed tools by page tool name, to their first-class names, for list_page_tools. */
+  names: Map<string, Map<string, string>>;
+  /** SHA-256 of the list as clients receive it; the notifier compares it (page-tool-notifier.ts). */
+  digest: string;
+}
+
+/** What a member with no first-class tools is served, and the digest every notifier starts from. */
+export const EMPTY_FIRST_CLASS: Readonly<FirstClassList> = Object.freeze({
+  tools: [],
+  digest: createHash('sha256').update('[]').digest('hex'),
+});
+
+/** A user's first-class tools as tools/list carries them, with the list's digest. */
+export interface FirstClassList {
+  tools: readonly FirstClassTool[];
+  digest: string;
+}
+
+/**
+ * A page tool as a call names it: by its own name through call_page_tool,
+ * or by the part of a first-class name after `<page id>__` (ADR 0025), which
+ * the hub resolves at the step where it looks the tool up.
+ */
+export type PageToolRef = string | { firstClass: string };
 
 /** Logged once per tool and reason; fixed words, never the schema or the arguments. */
 const UNCHECKED_WARNINGS: Record<UncheckedReason, string> = {
@@ -987,6 +1059,13 @@ export class PageHub {
    */
   readonly #toolBytes = new Map<string, number>();
   #toolBytesHeld = 0;
+  /** Each awake page's first-class entries while first-class tools are on (ADR 0025). */
+  readonly #firstClassPages = new Map<string, PageFirstClass>();
+  #firstClassVersion = 0;
+  /** Members' first-class lists, rebuilt whenever what they were built from changed. */
+  readonly #firstClassLists = new Map<string, FirstClassSnapshot>();
+  /** Told the users whose first-class list may have changed; the notifier reads it later. */
+  #firstClassListener: ((userId: string) => void) | null = null;
   /** The only place CfWorker runs: a worker thread with a time budget per check (ADR 0010). */
   readonly #checker: ArgumentChecker;
   /** When each page last got a roster, for EXPIRY_ROSTER_REFRESH_MS. */
@@ -1980,6 +2059,7 @@ export class PageHub {
           ),
         );
         const check = { schema: null, uncompilable: false, warned: new Set<UncheckedReason>() };
+        const firstClass = this.#firstClassOf(pageId, page.origin, stub, tally);
         const held = heldBytes(tally, 0);
         // Over its own limit it always will be, so it is kept by hash and reused
         // unchanged without another walk, leaving the frame to the tools after it.
@@ -1990,6 +2070,7 @@ export class PageHub {
           tool: stub,
           check,
           held,
+          firstClass,
         });
         tools.push(stub);
         charge += held;
@@ -2005,6 +2086,7 @@ export class PageHub {
         if (schema === null) uncheckable.push(tool.name);
         check = { schema, uncompilable: false, warned: new Set() };
       }
+      const firstClass = this.#firstClassOf(pageId, page.origin, cut, tally);
       const held = heldBytes(tally, check.schema?.text.length ?? 0);
       // Hashed for the next frame only when the count covered all of it, so the
       // hash costs no more than the walk did; a schema too deep is walked again.
@@ -2014,6 +2096,7 @@ export class PageHub {
         tool: cut,
         check,
         held,
+        firstClass,
       });
       tools.push(cut);
       charge += held;
@@ -2064,6 +2147,84 @@ export class PageHub {
       heldBytes: charge,
       allPagesHeldBytes: this.#toolBytesHeld,
     });
+    if (this.#config.firstClassTools) {
+      this.#firstClassPages.set(pageId, this.#pageFirstClass(tools, listed));
+      this.#firstClassChanged(this.#usersOf(pageId));
+    }
+  }
+
+  /**
+   * A tool's first-class entry (ADR 0025), built from the cut copy once, as
+   * its frame arrives, and counted into the tool's tally, so what entries
+   * hold is charged against limits.toolBytes with the rest of the tool:
+   * the strings the relay wrote, and the schema's copy when it made one (a
+   * schema without an x-mcp-header key is shared, not copied). Null with
+   * first-class tools off, or when the schema's root keeps the tool off.
+   */
+  #firstClassOf(
+    pageId: string,
+    origin: string,
+    cut: PageTool,
+    tally: HeldTally,
+  ): FirstClassTool | null {
+    if (!this.#config.firstClassTools) return null;
+    const built = firstClassEntry(pageId, origin, cut);
+    if (built === null) return null;
+    const { entry, copied } = built;
+    holdValue(entry.name, tally);
+    holdValue(entry.title, tally);
+    holdValue(entry.description, tally);
+    if (copied) holdValue(entry.inputSchema, tally);
+    // The entry object, its keys, and its shared annotations and _meta.
+    holdValue({ annotations: null, _meta: null }, tally);
+    return entry;
+  }
+
+  /**
+   * What a page offers by first-class name, in its own order: a tool is left
+   * off when its whole name passes MAX_FIRST_CLASS_NAME_CHARS, or when
+   * another of the page's tools maps to the same name, both then, so a page
+   * cannot win a collision by the order it lists its tools in.
+   */
+  #pageFirstClass(tools: readonly PageTool[], listed: Map<string, ListedTool>): PageFirstClass {
+    const mapped = new Map<string, number>();
+    for (const tool of tools) {
+      const part = firstClassToolPart(tool.name);
+      mapped.set(part, (mapped.get(part) ?? 0) + 1);
+    }
+    const entries: PageFirstClass['entries'] = [];
+    for (const tool of tools) {
+      const entry = listed.get(tool.name)?.firstClass ?? null;
+      if (entry === null || entry.name.length > MAX_FIRST_CLASS_NAME_CHARS) continue;
+      if ((mapped.get(firstClassToolPart(tool.name)) ?? 0) > 1) continue;
+      entries.push({
+        toolName: tool.name,
+        readOnly: tool.annotations?.readOnlyHint === true,
+        tool: entry,
+        chars: JSON.stringify(entry).length,
+      });
+    }
+    this.#firstClassVersion += 1;
+    return { version: this.#firstClassVersion, entries };
+  }
+
+  /** The users attached to a page now. */
+  #usersOf(pageId: string): string[] {
+    return this.#store.attachments.listForPage(pageId).map((attachment) => attachment.userId);
+  }
+
+  /**
+   * These users' first-class lists may have changed. Their snapshots need
+   * nothing here, since each is checked against what it was built from
+   * before it is served; the listener, the notifier, only marks them, and
+   * looks at their lists later, outside the change (page-tool-notifier.ts).
+   * Invitees never hold a first-class name, so they are never marked.
+   */
+  #firstClassChanged(users: Iterable<string>): void {
+    if (this.#firstClassListener === null) return;
+    for (const userId of users) {
+      if (!InviteeIdSchema.safeParse(userId).success) this.#firstClassListener(userId);
+    }
   }
 
   /** Forgets a page's listed tools and what they were charged against limits.toolBytes. */
@@ -2071,6 +2232,7 @@ export class PageHub {
     this.#listed.delete(pageId);
     this.#toolBytesHeld -= this.#toolBytes.get(pageId) ?? 0;
     this.#toolBytes.delete(pageId);
+    if (this.#firstClassPages.delete(pageId)) this.#firstClassChanged(this.#usersOf(pageId));
   }
 
   #onClose(conn: Conn, code: number): void {
@@ -2501,6 +2663,7 @@ export class PageHub {
     };
     this.#store.attachments.put(attachment);
     this.#armExpiry(attachment);
+    this.#firstClassChanged([attachment.userId]);
     const page = this.#store.pages.get(request.pageId);
     this.#audit({
       v: AUDIT_VERSION,
@@ -2569,6 +2732,7 @@ export class PageHub {
       const previous = attachment.role;
       attachment.role = role;
       this.#store.attachments.put(attachment);
+      this.#firstClassChanged([frame.userId]);
       this.#log.info('role changed', { pageId, userId: frame.userId, role });
       this.#audit({
         v: AUDIT_VERSION,
@@ -2749,6 +2913,7 @@ export class PageHub {
       this.#store.attachments.delete(pageId, userId);
       this.#clearTimer(this.#expiryTimers, attachmentKey(pageId, userId));
     }
+    this.#firstClassChanged(users);
     const outcome = hubError('not_attached', message);
     // Queued calls first, so a running one settling does not hand the page a call that is ending.
     for (const call of [...(this.#queues.get(pageId)?.waiting ?? [])]) {
@@ -3072,6 +3237,89 @@ export class PageHub {
     return this.#store.attachments.listForUser(userId).length > 0;
   }
 
+  /**
+   * Who to tell when a user's first-class list may have changed (relay.ts
+   * hands it the notifier). Called inside the hub's own changes, so it must
+   * only mark the user and look later.
+   */
+  onFirstClassChange(listener: (userId: string) => void): void {
+    this.#firstClassListener = listener;
+  }
+
+  /**
+   * The user's first-class tools (ADR 0025), for tools/list: none with the
+   * flag off, for an invitee, or on an attachment an invite made (ADR 0016);
+   * otherwise, in the order the user attached, each awake page's entries in
+   * its own order, a driver all of them and an observer only those the page
+   * marked readOnlyHint, until the next would take the list past
+   * MAX_FIRST_CLASS_TOOLS_PER_USER tools or MAX_FIRST_CLASS_CHARS_PER_USER
+   * characters. A list is kept while every attachment, role and page version
+   * it was built from is still the same, and built again before it is served
+   * otherwise, so a list answered after a revoke, an attachment's end or a
+   * downgrade never shows what the change took away (S8, S13).
+   */
+  firstClassList(userId: string): FirstClassList {
+    const snapshot = this.#firstClassSnapshot(userId);
+    return snapshot === null ? EMPTY_FIRST_CLASS : snapshot;
+  }
+
+  #firstClassSnapshot(userId: string): FirstClassSnapshot | null {
+    if (!this.#config.firstClassTools) return null;
+    const parts: { pageId: string; role: Role; page: PageFirstClass }[] = [];
+    const attachments = this.#store.attachments
+      .listForUser(userId)
+      .filter((attachment) => attachment.kind === 'member' && attachment.inviteId === null)
+      .sort((a, b) => a.grantedAt - b.grantedAt);
+    for (const { pageId } of attachments) {
+      // One past its time is over however late its timer runs, and ends here.
+      if (!this.#chainInTime(pageId, userId)) continue;
+      const attachment = this.#store.attachments.get(pageId, userId);
+      const page = this.#firstClassPages.get(pageId);
+      if (attachment === undefined || page === undefined) continue;
+      parts.push({ pageId, role: attachment.role, page });
+    }
+    const key = parts
+      .map((part) => `${part.pageId}/${part.role}/${String(part.page.version)}`)
+      .join(' ');
+    if (parts.length === 0) {
+      this.#firstClassLists.delete(userId);
+      return null;
+    }
+    const kept = this.#firstClassLists.get(userId);
+    if (kept?.key === key) return kept;
+    const tools: FirstClassTool[] = [];
+    const names = new Map<string, Map<string, string>>();
+    let chars = 0;
+    build: for (const { pageId, role, page } of parts) {
+      for (const entry of page.entries) {
+        // S5: an observer is shown, and may call, only what the page marked read-only.
+        if (role === 'observer' && !entry.readOnly) continue;
+        if (
+          tools.length >= MAX_FIRST_CLASS_TOOLS_PER_USER ||
+          chars + entry.chars > MAX_FIRST_CLASS_CHARS_PER_USER
+        ) {
+          break build;
+        }
+        tools.push(entry.tool);
+        chars += entry.chars;
+        let ofPage = names.get(pageId);
+        if (ofPage === undefined) {
+          ofPage = new Map();
+          names.set(pageId, ofPage);
+        }
+        ofPage.set(entry.toolName, entry.tool.name);
+      }
+    }
+    const snapshot: FirstClassSnapshot = {
+      key,
+      tools,
+      names,
+      digest: createHash('sha256').update(JSON.stringify(tools)).digest('hex'),
+    };
+    this.#firstClassLists.set(userId, snapshot);
+    return snapshot;
+  }
+
   listPages(userId: string): PageListing[] {
     const listings: PageListing[] = [];
     for (const attachment of this.#store.attachments.listForUser(userId)) {
@@ -3143,6 +3391,10 @@ export class PageHub {
     const access = this.#access(userId, pageId);
     if (access.kind === 'error') return access;
     const { page, attachment } = access;
+    // With first-class tools on, each entry names the caller's first-class name for it, or null.
+    const firstClass = this.#config.firstClassTools
+      ? (this.#firstClassSnapshot(userId)?.names.get(pageId) ?? new Map<string, string>())
+      : null;
     return {
       kind: 'tools',
       pageId,
@@ -3158,6 +3410,7 @@ export class PageHub {
           inputSchema: tool.inputSchema,
           annotations,
           allowed: attachment.role === 'driver' || annotations.readOnlyHint === true,
+          ...(firstClass === null ? {} : { firstClass: firstClass.get(tool.name) ?? null }),
         };
       }),
     };
@@ -3815,7 +4068,7 @@ export class PageHub {
   async callPageTool(
     caller: CallerIdentity,
     pageId: string,
-    tool: string,
+    tool: PageToolRef,
     args: JsonObject,
     signal: AbortSignal,
     marks: CallMarks | null = null,
@@ -3827,11 +4080,17 @@ export class PageHub {
     // record's schema refuses, and the call would lose its line (S7).
     const startedMono = performance.now();
     let auditOutcome: AuditOutcome = 'relay_error';
-    const trace: CallTrace = { reached: false, release: null };
+    const trace: CallTrace = {
+      reached: false,
+      release: null,
+      tool: typeof tool === 'string' ? tool : tool.firstClass,
+    };
     try {
       const outcome = await this.#call(caller, pageId, tool, args, signal, marks, trace, heldBytes);
       auditOutcome = outcome.kind === 'error' ? outcome.code : outcome.kind;
-      return outcome;
+      return outcome.kind === 'ok' || outcome.kind === 'tool_error'
+        ? { ...outcome, tool: trace.tool }
+        : outcome;
     } catch (error) {
       // The SDK still answers the client with an error result; the log keeps the cause.
       this.#log.error('call failed inside the relay', { pageId, error });
@@ -3848,7 +4107,7 @@ export class PageHub {
         origin: this.#store.pages.get(pageId)?.origin ?? null,
         userId: caller.userId,
         client: caller.client,
-        tool: auditToolName(tool),
+        tool: auditToolName(trace.tool),
         outcome: auditOutcome,
         durationMs: Math.round(performance.now() - startedMono),
       };
@@ -3966,7 +4225,7 @@ export class PageHub {
   async #call(
     caller: CallerIdentity,
     pageId: string,
-    toolName: string,
+    toolRef: PageToolRef,
     args: JsonObject,
     signal: AbortSignal,
     marks: CallMarks | null,
@@ -3995,8 +4254,11 @@ export class PageHub {
     // Every call moves the expiry, but only one that passes every check names
     // its client (#nameClient): refused calls must not add names to the roster.
     const rosterAtArrival = this.#touchAttachment(attachment, arrivedAt);
-    const tool = page.tools.find((candidate) => candidate.name === toolName);
-    if (!tool) return hubError('tool_not_found', `page ${pageId} has no tool named ${toolName}`);
+    const resolved = this.#resolveTool(page, attachment, toolRef);
+    if (resolved.kind === 'error') return resolved;
+    const { tool } = resolved;
+    const toolName = tool.name;
+    trace.tool = toolName;
     // S5, relay half: observers run only tools the page marked read-only.
     if (attachment.role === 'observer' && tool.annotations?.readOnlyHint !== true) {
       return hubError(
@@ -4304,6 +4566,42 @@ export class PageHub {
       'timeout',
       `the page did not take what the relay had already sent it within ${String(this.#config.timings.callDeadlineMs)} ms, so the call never reached it`,
     );
+  }
+
+  /**
+   * The page tool a call names, looked up at the same step for both routes.
+   * A first-class name (ADR 0025) is the one tool of the page that maps to
+   * it, whether or not the caller's list shows it (a tool left off for a
+   * cap or its schema stays reachable); tool_not_found when none or two map
+   * to it, and on an attachment an invite made, or an invitee's, which ADR
+   * 0016 keeps on the fixed tools. Every later check is the same code.
+   */
+  #resolveTool(
+    page: PageRecord,
+    attachment: AttachmentRecord,
+    ref: PageToolRef,
+  ): { kind: 'ok'; tool: PageTool } | HubError {
+    const { pageId } = page;
+    if (typeof ref === 'string') {
+      const tool = page.tools.find((candidate) => candidate.name === ref);
+      return tool
+        ? { kind: 'ok', tool }
+        : hubError('tool_not_found', `page ${pageId} has no tool named ${ref}`);
+    }
+    if (attachment.kind !== 'member' || attachment.inviteId !== null) {
+      return hubError(
+        'tool_not_found',
+        `page ${pageId} offers no first-class tools to an attachment an invite made; use call_page_tool`,
+      );
+    }
+    const matches = page.tools.filter(
+      (candidate) => firstClassToolPart(candidate.name) === ref.firstClass,
+    );
+    const [only] = matches;
+    if (only === undefined || matches.length > 1) {
+      return hubError('tool_not_found', `page ${pageId} has no tool named ${ref.firstClass}`);
+    }
+    return { kind: 'ok', tool: only };
   }
 
   /**
