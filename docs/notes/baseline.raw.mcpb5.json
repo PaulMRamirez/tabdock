@@ -1,0 +1,315 @@
+{
+  "measuredAt": "2026-10-05T08:26:42.228Z",
+  "node": "v22.22.0",
+  "mcpb": {
+    "polyfill": "@mcp-b/webmcp-polyfill@5.1.0",
+    "localRelay": "@mcp-b/webmcp-local-relay@5.1.0"
+  },
+  "browserVersion": "141.0.7390.37",
+  "polyfillMarker": true,
+  "page": {
+    "runtime": {
+      "documentModelContext": true,
+      "navigatorAliasIsSame": true,
+      "executeToolPresent": true,
+      "contextConstructor": "ModelContext"
+    },
+    "getTools": {
+      "ms": 1,
+      "names": [
+        "add_item",
+        "clear_board",
+        "get_view",
+        "highlight_item",
+        "list_items",
+        "move_view"
+      ],
+      "sample": {
+        "name": "clear_board",
+        "title": "Clear board",
+        "description": "Remove every item from the board. This cannot be undone.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        },
+        "origin": "http://127.0.0.1:37515",
+        "window": "[Window]",
+        "annotations": {
+          "readOnlyHint": false,
+          "untrustedContentHint": false
+        }
+      }
+    },
+    "registration": {
+      "registerResolvedMs": 0.2,
+      "toolchangeAfterRegisterMs": 0.2,
+      "eventBeforeResolve": true,
+      "eventType": "toolchange",
+      "eventDetail": null,
+      "unregisterToolchangeMs": 4.3,
+      "burstOfFiveEvents": 5,
+      "duplicateName": {
+        "label": "duplicate name",
+        "ok": false,
+        "kind": "InvalidStateError",
+        "value": "Tool already registered: baseline_probe",
+        "ms": 0.3
+      },
+      "annotationsRoundTrip": {
+        "readOnlyHint": true,
+        "untrustedContentHint": true
+      }
+    },
+    "inputMode": "string",
+    "execute": [
+      {
+        "label": "args as JSON string",
+        "ok": true,
+        "kind": "string",
+        "value": "{\"n\":1}",
+        "ms": 0
+      },
+      {
+        "label": "args as object",
+        "ok": false,
+        "kind": "UnknownError",
+        "value": "Failed to parse input arguments",
+        "ms": 0.2
+      },
+      {
+        "label": "args omitted",
+        "ok": false,
+        "kind": "UnknownError",
+        "value": "Failed to parse input arguments",
+        "ms": 0.1
+      },
+      {
+        "label": "args violate inputSchema (n is a string)",
+        "ok": true,
+        "kind": "string",
+        "value": "{\"n\":\"one\"}",
+        "ms": 0
+      },
+      {
+        "label": "tool passed by name only",
+        "ok": false,
+        "kind": "TypeError",
+        "value": "RegisteredTool.description is required",
+        "ms": 0.1
+      },
+      {
+        "label": "handler throws (highlight unknown id)",
+        "ok": false,
+        "kind": "UnknownError",
+        "value": "Tool was executed but the invocation failed. For example, the script function threw an error: No item with id item-999",
+        "ms": 16.5
+      },
+      {
+        "label": "returns string",
+        "ok": true,
+        "kind": "string",
+        "value": "plain text",
+        "ms": 0
+      },
+      {
+        "label": "returns number",
+        "ok": true,
+        "kind": "string",
+        "value": "42",
+        "ms": 0.1
+      },
+      {
+        "label": "returns undefined",
+        "ok": true,
+        "kind": "string",
+        "value": "undefined",
+        "ms": 0.1
+      },
+      {
+        "label": "returns MCP CallToolResult",
+        "ok": true,
+        "kind": "string",
+        "value": "{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}",
+        "ms": 0.1
+      }
+    ],
+    "abort": {
+      "rejection": {
+        "label": "abort after 100 ms",
+        "ok": false,
+        "kind": "AbortError",
+        "value": "signal is aborted without reason",
+        "ms": 100.4
+      },
+      "handlerSawAbort": false,
+      "handlerSignalReason": "none",
+      "handlerSecondArg": "undefined"
+    },
+    "lifecycle": {
+      "unregisterMidRun": {
+        "label": "unregister 100 ms into a 300 ms handler",
+        "ok": false,
+        "kind": "UnknownError",
+        "value": "Tool unregistered",
+        "ms": 100.3,
+        "handlerFinishedFirst": false
+      },
+      "vanishedTool": {
+        "label": "tool unregistered before the call",
+        "ok": false,
+        "kind": "UnknownError",
+        "value": "Tool not found: baseline_vanished",
+        "ms": 0.2
+      }
+    }
+  },
+  "relay": {
+    "toolsVisibleAfterLoadMs": 255,
+    "serverInfo": {
+      "name": "webmcp-local-relay",
+      "version": "0.0.0"
+    },
+    "serverCapabilities": {
+      "tools": {
+        "listChanged": true
+      }
+    },
+    "listedTools": [
+      {
+        "name": "webmcp_list_sources",
+        "annotations": {
+          "readOnlyHint": true,
+          "idempotentHint": true
+        }
+      },
+      {
+        "name": "webmcp_list_tools",
+        "annotations": {
+          "readOnlyHint": true,
+          "idempotentHint": true
+        }
+      },
+      {
+        "name": "webmcp_open_page",
+        "annotations": {
+          "readOnlyHint": false
+        }
+      },
+      {
+        "name": "add_item",
+        "annotations": {
+          "readOnlyHint": false
+        }
+      },
+      {
+        "name": "clear_board",
+        "annotations": {
+          "readOnlyHint": false
+        }
+      },
+      {
+        "name": "get_view",
+        "annotations": {
+          "readOnlyHint": true
+        }
+      },
+      {
+        "name": "highlight_item",
+        "annotations": {
+          "readOnlyHint": false
+        }
+      },
+      {
+        "name": "list_items",
+        "annotations": {
+          "readOnlyHint": true
+        }
+      },
+      {
+        "name": "move_view",
+        "annotations": {
+          "readOnlyHint": false
+        }
+      }
+    ],
+    "clearBoardAsListed": {
+      "name": "clear_board",
+      "title": "Clear board",
+      "description": "[WebMCP 99451787-9455-40c3-b4f6-3dcaf5d6c59b • Tabdock demo board] Remove every item from the board. This cannot be undone.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false
+      }
+    },
+    "callSample": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"x\":0,\"y\":0,\"zoom\":1,\"width\":960,\"height\":432,\"visibleItemIds\":[\"item-1\",\"item-2\",\"item-3\"]}"
+        }
+      ],
+      "structuredContent": {
+        "x": 0,
+        "y": 0,
+        "zoom": 1,
+        "width": 960,
+        "height": 432,
+        "visibleItemIds": [
+          "item-1",
+          "item-2",
+          "item-3"
+        ]
+      },
+      "isError": false
+    },
+    "errorSample": {
+      "content": [
+        {
+          "type": "text",
+          "text": "Tool was executed but the invocation failed. For example, the script function threw an error: No item with id item-999"
+        }
+      ],
+      "isError": true
+    },
+    "badArgsSample": {
+      "content": [
+        {
+          "type": "text",
+          "text": "Input validation error: Invalid arguments for tool move_view: data must have required property 'y', data/x must be number"
+        }
+      ],
+      "isError": true
+    },
+    "lateToolCallSample": {
+      "content": [
+        {
+          "type": "text",
+          "text": "late"
+        }
+      ],
+      "structuredContent": {
+        "result": "late"
+      },
+      "isError": false
+    },
+    "getToolsWithEmbedMs": [
+      0.1,
+      0.1,
+      0
+    ],
+    "getViewRoundTripMs": {
+      "n": 50,
+      "failed": 0,
+      "p50": 1.9,
+      "p95": 3.6,
+      "max": 4.2
+    },
+    "lateToolListChangedMs": 25,
+    "lateToolVisibleMs": 30
+  }
+}
