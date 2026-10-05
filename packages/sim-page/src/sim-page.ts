@@ -5,6 +5,10 @@
 // controls and the pause switch, and reload() drops the socket without a
 // goodbye and boots a fresh page on the same storage; navigate() does the
 // same at another path, as moving to another page of the site in one tab does.
+// From M5 a policy may choose confirmVia 'client' (ADR 0026): the core then
+// takes an invoke's confirmation for a member driver's consequential call
+// without asking, as a browser page would, and `prompts` shows whether the
+// page asked.
 
 import {
   type ActivityEntry,
@@ -16,6 +20,7 @@ import {
   type InviteOptions,
   type InviteResult,
   type Logger,
+  type PendingConfirm,
   type RevokeOptions,
   type SocketFactory,
   type StorageLike,
@@ -69,6 +74,12 @@ export interface SimPageOptions {
   profile?: RuntimeProfile;
   /** The Origin header to send; null sends none, as a non-browser client would. */
   origin?: string | null;
+  /**
+   * The page's attach() policy, sent in hello. With confirmVia 'client' the
+   * page lets a member driver whose attachment no invite made confirm a
+   * consequential call in their own client (ADR 0026); its tools frame marks
+   * consequential tools either way.
+   */
   policy?: PolicyInput;
   operator?: SimOperator;
   /** Builds the page's tools; createDefaultTools by default. */
@@ -109,8 +120,18 @@ export interface SimPage {
   readonly lastSocketError: string | null;
   /** The last close the relay sent, or null. */
   readonly lastClose: { code: number; reason: string } | null;
-  /** The current page's activity log, newest first; a reload starts a fresh one, as in a browser. */
+  /**
+   * The current page's activity log, newest first; a reload starts a fresh
+   * one, as in a browser. A call the page ran on the caller's confirmation in
+   * their client carries confirmedBy 'client' (ADR 0026).
+   */
   readonly activity: readonly ActivityEntry[];
+  /**
+   * Every consequential-call prompt the page raised, oldest first, across
+   * reloads: whether it was answered or not, it shows the page asked, and an
+   * absent one that it did not (S6, ADR 0026).
+   */
+  readonly prompts: readonly PendingConfirm[];
   /** The operator's role switch on the current page (Dock.setRole). */
   setRole(userId: string, role: Role): boolean;
   /**
@@ -194,6 +215,9 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
   const storage = new MemoryStorage();
   const store = createSimStore();
   const logs: string[] = [];
+  const prompts: PendingConfirm[] = [];
+  // A prompt is one frozen object for as long as it waits, so identity tells a new one.
+  const seenPrompts = new WeakSet<PendingConfirm>();
   let socket: WebSocket | null = null;
   let connections = 0;
   let lastSocketError: string | null = null;
@@ -248,6 +272,13 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
       timers: options.timers,
       crypto: options.crypto,
     });
+    core.dock.on('state', (state) => {
+      for (const pending of state.pendingConfirms) {
+        if (seenPrompts.has(pending)) continue;
+        seenPrompts.add(pending);
+        prompts.push(pending);
+      }
+    });
     core.start();
     return { core, context };
   }
@@ -279,6 +310,7 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
     storage,
     store,
     logs,
+    prompts,
     get socket() {
       return socket;
     },

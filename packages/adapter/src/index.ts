@@ -48,6 +48,7 @@ export type {
   AttachmentView,
   AttachVia,
   ClientInfo,
+  ConfirmVia,
   InvitePolicy,
   Pairing,
   PolicyInput,
@@ -60,6 +61,13 @@ export { ADAPTER_VERSION };
 export interface AttachOptions {
   /** The relay's page endpoint, such as wss://relay.example/page. */
   relay: string;
+  /**
+   * SPEC section 8's page policy. From M5 confirmVia 'client' (default
+   * 'page') lets member drivers whose attachment no invite made confirm a
+   * consequential call in their own MCP client instead of the operator here,
+   * under consequential 'confirm' only; everyone else still gets the on-page
+   * prompt (ADR 0026).
+   */
   policy?: PolicyInput;
   /** Mount the on-page widget; true unless set to false, in which case the handle answers prompts. */
   ui?: boolean;

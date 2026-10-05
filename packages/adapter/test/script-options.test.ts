@@ -18,6 +18,7 @@ describe('readScriptOptions', () => {
         consequential: 'deny',
         consequentialTools: 'clear_board, wipe,,',
         invites: ' all ',
+        confirmVia: ' client ',
       }),
     ).toEqual({
       ok: true,
@@ -28,8 +29,28 @@ describe('readScriptOptions', () => {
         consequential: 'deny',
         consequentialTools: ['clear_board', 'wipe'],
         invites: 'all',
+        confirmVia: 'client',
       },
     });
+  });
+
+  it('reads data-confirm-via as page or client, and leaves it out when absent (ADR 0026)', () => {
+    const relay = 'ws://127.0.0.1:8787/page';
+    for (const confirmVia of ['page', 'client'] as const) {
+      expect(readScriptOptions({ relay, confirmVia })).toEqual({
+        ok: true,
+        relay,
+        policy: { confirmVia },
+      });
+    }
+    // Absent, attach() fills in 'page': the operator confirms, as before M5.
+    expect(readScriptOptions({ relay })).toMatchObject({ ok: true, policy: {} });
+    for (const confirmVia of ['Client', 'both', '', 'operator']) {
+      expect(readScriptOptions({ relay, confirmVia })).toEqual({
+        ok: false,
+        error: 'invalid data attributes for confirmVia',
+      });
+    }
   });
 
   it('leaves absent attributes out, so "no list given" stays distinguishable (ADR 0002)', () => {
@@ -50,6 +71,7 @@ describe('readScriptOptions', () => {
       { consequential: 'sometimes' },
       { consequentialTools: 'has space' },
       { invites: 'everyone' },
+      { confirmVia: 'whoever' },
     ]) {
       const result = readScriptOptions({ relay: 'ws://127.0.0.1:8787/page', ...data });
       expect(result.ok).toBe(false);

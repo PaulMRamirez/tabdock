@@ -334,6 +334,13 @@ export interface ActivityEntry {
   readonly client: ClientInfo | null;
   readonly tool: string;
   readonly outcome: ActivityOutcome;
+  /**
+   * 'client' when the page ran this consequential call without its prompt
+   * because the caller confirmed it in their own MCP client, which the page
+   * takes only under its own policy, rule and grant (ADR 0026); null
+   * otherwise, including every call the operator confirmed here.
+   */
+  readonly confirmedBy: 'client' | null;
   /** Milliseconds from arrival to the end; null while the call runs. */
   readonly durationMs: number | null;
   /**
@@ -570,9 +577,14 @@ const POLYFILL_UNREGISTERED = 'Tool unregistered';
 /** Its UnknownError for a tool already gone when the call starts, before any handler runs. */
 const POLYFILL_NOT_FOUND = /^Tool not found/;
 
+/**
+ * Names both majors' entry points: MCP-B 6 exports only installWebMCP(), and
+ * 5.x only initializeWebMCPPolyfill() (docs/notes/verified.md, ADR 0001's notes).
+ */
 const POLYFILL_HINT =
   'document.modelContext is missing, so Tabdock stays idle. Load a WebMCP polyfill first ' +
-  "(for example @mcp-b/webmcp-polyfill's initializeWebMCPPolyfill()) or use a browser with WebMCP enabled.";
+  "(for example @mcp-b/webmcp-polyfill's installWebMCP() on 6.x, or initializeWebMCPPolyfill() on 5.x) " +
+  'or use a browser with WebMCP enabled.';
 
 const HINT_NOTICE =
   "This browser's WebMCP does not report consequentialHint, so every tool that is not read-only " +
@@ -1328,11 +1340,16 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       if (grant.endsAt !== undefined && grant.endsAt > now) next = Math.min(next, grant.endsAt);
     }
     if (next === Infinity) return;
-    grantEndTimer = timers.setTimeout(() => {
-      grantEndTimer = null;
-      setState({});
-      armGrantEnd();
-    }, next - now);
+    // An end read back from storage can lie past the timer maximum, which
+    // would fire at once and rearm forever; waking early only rearms.
+    grantEndTimer = timers.setTimeout(
+      () => {
+        grantEndTimer = null;
+        setState({});
+        armGrantEnd();
+      },
+      Math.min(next - now, MAX_TIMER_MS),
+    );
   }
 
   loadGrants();
@@ -1612,8 +1629,14 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       MARKER_ROOM * 2,
       Math.min(MAX_RESULT_CHARS, frame.limits.maxResultChars),
     );
-    // Never shorter than the protocol's own: a tiny value would turn the watchdog into a reconnect loop.
-    silenceLimit = Math.max(IDLE_TIMEOUT_MS, frame.limits.idleTimeoutMs) + SILENCE_GRACE_MS;
+    // Never shorter than the protocol's own: a tiny value would turn the
+    // watchdog into a reconnect loop. Nor past the timer maximum: the schema
+    // takes any positive integer, and a longer timer fires at once in
+    // Chromium, the same loop (ADR 0030, as for deadlineMs).
+    silenceLimit = Math.min(
+      MAX_TIMER_MS,
+      Math.max(IDLE_TIMEOUT_MS, frame.limits.idleTimeoutMs) + SILENCE_GRACE_MS,
+    );
     armWatchdog();
     setState({
       link: 'linked',
@@ -1823,10 +1846,26 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       if (lastToolsKey === null && send({ t: 'tools', tools: [] })) lastToolsKey = '[]';
       return;
     }
-    const tools = fitTools(snapshot.tools.map((tool) => tool.page));
+    const tools = fitTools(snapshot.tools.map((tool) => wireTool(tool.page, snapshot)));
     const key = JSON.stringify(tools);
     if (key === lastToolsKey) return;
     if (send({ t: 'tools', tools })) lastToolsKey = key;
+  }
+
+  /**
+   * A tool as the tools frame carries it: marked consequential: true when
+   * ADR 0002's rule classes it so, whose inputs (the runtime's hint support
+   * and this page's list) only the page has, so the relay knows when a page
+   * that opted in may have the caller confirm in their client (ADR 0026).
+   * Marked whatever confirmVia and the consequential policy say, since the
+   * mark says what the tool is, not who confirms; the page's own rule, not
+   * the mark, still decides whether it prompts. Unmarked tools carry no key,
+   * so their entries stay as an older adapter sent them.
+   */
+  function wireTool(tool: PageTool, snapshot: ToolSnapshot): PageTool {
+    return isConsequential(tool, snapshot.hintSupport, policy, pageListedTools)
+      ? { ...tool, consequential: true }
+      : tool;
   }
 
   /** Drops tools from the end until the frame fits; only a page with huge schemas gets here. */
@@ -1864,6 +1903,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       client: client === null ? null : Object.freeze({ ...client }),
       tool: frame.tool,
       outcome: 'running',
+      confirmedBy: null,
       durationMs: null,
       handlerRunning: false,
     });
@@ -2108,21 +2148,28 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         return;
       }
       if (policy.consequential === 'confirm') {
-        const allowed = await askConfirm(call);
-        if (isDone(call)) return;
-        if (!allowed) {
-          finish(call, {
-            ok: false,
-            code: 'denied_by_operator',
-            message: 'the operator denied this call',
-          });
-          return;
-        }
-        // The operator may have lowered this caller's role while the prompt was up.
-        const again = check(frame, snapshot);
-        if (!again.ok) {
-          finish(call, again.refusal);
-          return;
+        if (takesClientConfirmation(call)) {
+          // Nothing is awaited between check() and the handler, so the
+          // grant, roster and role this read are the ones the call runs under.
+          logCall(call, 'confirmed in their client, so the page did not ask');
+          updateEntry(call, { confirmedBy: 'client' });
+        } else {
+          const allowed = await askConfirm(call);
+          if (isDone(call)) return;
+          if (!allowed) {
+            finish(call, {
+              ok: false,
+              code: 'denied_by_operator',
+              message: 'the operator denied this call',
+            });
+            return;
+          }
+          // The operator may have lowered this caller's role while the prompt was up.
+          const again = check(frame, snapshot);
+          if (!again.ok) {
+            finish(call, again.refusal);
+            return;
+          }
         }
       }
     }
@@ -2234,6 +2281,48 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       );
       return run(other);
     }
+  }
+
+  /**
+   * S6 under ADR 0026: whether an invoke's confirmation lets this
+   * consequential call skip the on-page prompt. The relay's word is taken
+   * only where this page itself would have let the caller confirm: its own
+   * attach() policy chose confirmVia 'client' under consequential 'confirm',
+   * the caller's id is a member's, this page's own grant for them names no
+   * invite (nor does the roster's entry, which can only refuse here), and the
+   * least of that grant, the roster and the invoke's role is driver. proceed
+   * asks only for a tool the page's own rule calls consequential, so a tool
+   * the relay calls consequential and the page does not runs as it always
+   * did. Anything else prompts exactly as before, so a crafted frame skips no
+   * prompt on a page that did not opt in, nor for an invitee, an invite-made
+   * attachment or an observer.
+   */
+  function takesClientConfirmation(call: CallRecord): boolean {
+    const { frame } = call;
+    if (frame.confirmation === undefined) return false;
+    const problem = clientConfirmationProblem(frame);
+    if (problem === null) return true;
+    logCall(call, `asking on the page, as ${problem}, whatever the relay says of their client`);
+    return false;
+  }
+
+  /**
+   * Why the page asks despite an invoke's confirmation, or null when it may
+   * take it; see takesClientConfirmation, which proceed calls only under
+   * consequential 'confirm'. A caller with no grant here never passes the
+   * last check: callerRole gives driver only through a grant.
+   */
+  function clientConfirmationProblem(frame: InvokeFrame): string | null {
+    if (policy.confirmVia !== 'client') return "this page's policy has the operator confirm";
+    const { userId } = frame.caller;
+    if (isInvitee(userId)) return 'the caller is an invitee';
+    if (grants.get(userId)?.inviteId !== undefined) return "an invite made the caller's grant";
+    const listed = state.roster.find((attachment) => attachment.userId === userId);
+    if ((listed?.inviteId ?? null) !== null) {
+      return "the relay lists the caller's attachment as an invite's";
+    }
+    if (callerRole(frame.caller) !== 'driver') return 'the caller is not a driver here';
+    return null;
   }
 
   function askConfirm(call: CallRecord): Promise<boolean> {

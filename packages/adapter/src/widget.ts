@@ -311,6 +311,19 @@ function clientText(client: { name: string; version: string }): string {
   return `${client.name} ${client.version}`.trim();
 }
 
+/**
+ * What an activity line adds for a call the page ran without asking because
+ * the caller confirmed it in their own client (ADR 0026): which client and
+ * who, so the operator sees after the fact every call nobody confirmed here.
+ * Empty for every other call. The client's name is its own claim, shown as
+ * text like the rest of the line.
+ */
+export function confirmedText(entry: ActivityEntry): string {
+  if (entry.confirmedBy !== 'client') return '';
+  const named = entry.client === null ? '' : clientText(entry.client);
+  return `, confirmed in ${named === '' ? 'their client' : named} by ${personText(entry.user)}`;
+}
+
 function timeText(epochMs: number): string {
   return new Date(epochMs).toLocaleTimeString([], { hour12: false });
 }
@@ -1335,7 +1348,10 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const lingering = entry.handlerRunning ? ', but its handler is still running' : '';
     dom.append(line, `${timeText(entry.time)} ${personText(entry.user)}`);
     if (shortId(entry.user.userId) !== null) dom.append(line, badge(true));
-    dom.append(line, `${via}: ${entry.tool}, ${entry.outcome}${took}${lingering}`);
+    dom.append(
+      line,
+      `${via}: ${entry.tool}${confirmedText(entry)}, ${entry.outcome}${took}${lingering}`,
+    );
     return line;
   }
 
