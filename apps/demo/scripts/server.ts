@@ -1,10 +1,12 @@
 // Builds the demo page with esbuild and serves it on localhost.
 //   node scripts/server.ts           watch and serve (pnpm dev)
 //   node scripts/server.ts --build   one-off static build into dist/
-// The e2e harness imports startDemoServer() to serve the page on a free port.
+// The e2e harness imports startDemoServer() to serve the page on a free port,
+// and apps/site imports buildDemo() to put the static build at the site's root.
 
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { copyFile, mkdir, readFile, rm } from 'node:fs/promises';
+import { readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type ServerResponse } from 'node:http';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -62,17 +64,83 @@ const buildOptions = {
 } satisfies esbuild.BuildOptions;
 
 /**
- * Static build for hosting elsewhere (GitHub Pages from M4, ADR 0021). It
- * leaves out MCP-B's vendored files: a static host cannot send
- * frame-ancestors, and a frameable widget.html is exactly the injection the
- * dev server's headers prevent. For the same reason the board itself refuses
- * to link to a relay inside a frame (src/main.ts), in this build and every other.
+ * Static build for hosting elsewhere (GitHub Pages, ADRs 0021 and 0029), into
+ * dist/ or `outDir`, which it empties first. It leaves out MCP-B's vendored
+ * files: a static host cannot send frame-ancestors, and a frameable
+ * widget.html is exactly the injection the dev server's headers prevent. For
+ * the same reason the board itself refuses to link to a relay inside a frame
+ * (src/main.ts), in this build and every other. Its index.html carries the
+ * policy staticIndexHtml writes, since a static host sends no headers of ours.
  */
-export async function buildDemo(): Promise<void> {
-  await rm(distDir, { recursive: true, force: true });
-  await esbuild.build(buildOptions);
-  await mkdir(distDir, { recursive: true });
-  await copyFile(join(appDir, 'index.html'), join(distDir, 'index.html'));
+export async function buildDemo(options: { outDir?: string } = {}): Promise<void> {
+  const outDir = options.outDir ?? distDir;
+  await rm(outDir, { recursive: true, force: true });
+  // minifySyntax drops the code behind the false ?e2e hook outright, so not
+  // even dead code for it reaches a published copy (ADR 0029).
+  await esbuild.build({ ...buildOptions, minifySyntax: true, outfile: join(outDir, 'main.js') });
+  const html = await readFile(join(appDir, 'index.html'), 'utf8');
+  await writeFile(join(outDir, 'index.html'), staticIndexHtml(html));
+}
+
+/**
+ * The static build's policy (ADR 0029). Scripts come from this origin only
+ * and styles from the one inline block named by its hash; `connect-src` names
+ * ws: as a scheme because CSP's host grammar cannot name [::1], which costs
+ * nothing, since a browser refuses ws: from an https page to anything but
+ * loopback. `worker-src blob:` is ?busy's worker. A policy in <meta> cannot
+ * carry frame-ancestors, so the board's own refusal to link in a frame stays
+ * its framing defence.
+ */
+export function staticPolicy(styleHash: string): string {
+  return [
+    "default-src 'none'",
+    "script-src 'self'",
+    `style-src 'self' 'sha256-${styleHash}'`,
+    "img-src 'self'",
+    'connect-src wss: ws:',
+    'worker-src blob:',
+    "base-uri 'none'",
+    "form-action 'none'",
+  ].join('; ');
+}
+
+/**
+ * index.html as the static build serves it: the policy and a no-referrer
+ * meta first in <head>, so they govern everything after them, with the hash
+ * of the page's one inline <style> computed here, so a style edit can never
+ * leave a stale hash behind. It refuses a page the policy would break: a
+ * second style block, a style attribute, or a script that is inline or not
+ * loaded by a relative path.
+ */
+export function staticIndexHtml(html: string): string {
+  const styles = [...html.matchAll(/<style>([\s\S]*?)<\/style>/g)];
+  if (styles.length !== 1 || (html.match(/<style\b/g) ?? []).length !== 1) {
+    throw new Error('index.html must hold exactly one inline <style> block');
+  }
+  if (/\sstyle\s*=/i.test(html)) throw new Error('index.html must hold no style attribute');
+  const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)];
+  if ((html.match(/<script\b/g) ?? []).length !== scripts.length || scripts.length === 0) {
+    throw new Error('index.html must load its script with one plain <script> element');
+  }
+  for (const [, attributes = '', body = ''] of scripts) {
+    if (body.trim() !== '' || !/\ssrc="\.\/[^"/:]+"/.test(attributes)) {
+      throw new Error('index.html may load scripts only by relative paths, with no inline script');
+    }
+  }
+  const style = styles[0]?.[1] ?? '';
+  const hash = createHash('sha256').update(style, 'utf8').digest('base64');
+  const charset = '<meta charset="utf-8" />';
+  if (html.split(charset).length !== 2) {
+    throw new Error(`index.html must open its <head> with ${charset} exactly once`);
+  }
+  return html.replace(
+    charset,
+    [
+      charset,
+      `    <meta http-equiv="Content-Security-Policy" content="${staticPolicy(hash)}" />`,
+      '    <meta name="referrer" content="no-referrer" />',
+    ].join('\n'),
+  );
 }
 
 export interface DemoServer {
@@ -136,7 +204,11 @@ export async function startDemoServer(
     }
     const entry = STATIC_FILES[path];
     if (!entry) {
-      send(response, 404, 'text/plain; charset=utf-8', 'Not found');
+      // The board links to the tour beside it, which only the Pages site holds.
+      const body = path.startsWith('/tour/')
+        ? 'The tour is part of the published site (pnpm site:build); in a clone, read docs/tour.'
+        : 'Not found';
+      send(response, 404, 'text/plain; charset=utf-8', body);
       return;
     }
     readFile(entry.file).then(

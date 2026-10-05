@@ -1,5 +1,7 @@
-# Deploys one image digest to the reference deployment on Fly.io, then
-# publishes the demo page to GitHub Pages (docs/deploy.md, "The workflows").
+# Deploys one image digest to the reference deployment on Fly.io and checks
+# the live relay (docs/deploy.md, "The workflows"); the demo and the tour are
+# published by pages.yml on their own (ADR 0029), so a relay deploy never
+# republishes the site and a tour fix needs no relay deploy.
 # It runs only when dispatched on main, and its deploy job names the
 # production environment, so it waits for the owner's approval before it can
 # read a single secret. It deploys only a digest that the Image workflow on
@@ -149,33 +151,3 @@ jobs:
             exit 1
           fi
           echo "The relay answers: /healthz 200, /mcp 401 with its metadata, the metadata naming the connector URL and the issuer."
-
-  pages:
-    name: Publish the demo page
-    needs: deploy
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    environment:
-      name: github-pages
-      url: ${{ steps.publish.outputs.page_url }}
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version-file: .nvmrc
-      - run: corepack enable pnpm
-      - run: pnpm install --frozen-lockfile --filter '@tabdock/demo...'
-      # The demo's own static build, unchanged: it leaves out what a static host cannot frame-protect.
-      - run: pnpm --filter @tabdock/demo build
-      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
-        with:
-          path: apps/demo/dist
-      - id: publish
-        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

@@ -33,6 +33,9 @@ jobs:
       - run: pnpm test
       - name: Install Chromium for Playwright
         run: pnpm --filter @tabdock/e2e exec playwright install --with-deps chromium
+      # The Pages site from its own lockfile (ADR 0029): its checks and tests, then the
+      # build, which draws the diagrams in the Chromium installed above.
+      - run: pnpm site:build
       - run: pnpm test:e2e
       - run: pnpm demo:m0
       - run: pnpm demo:m1

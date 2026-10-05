@@ -19,6 +19,7 @@
     "dev": "node scripts/dev.ts",
     "dev:public": "node scripts/dev.ts --public",
     "dev:demo": "pnpm --filter @tabdock/demo dev",
+    "site:build": "pnpm --dir apps/site install --frozen-lockfile --ignore-workspace && pnpm --dir apps/site run check && pnpm --dir apps/site run build",
     "lint": "eslint . && prettier --check .",
     "format": "prettier --write .",
     "typecheck": "tsc -p tsconfig.json && tsc -p scripts/spike/tsconfig.json && pnpm -r --if-present typecheck",
