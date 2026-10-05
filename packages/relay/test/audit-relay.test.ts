@@ -390,17 +390,22 @@ describe('pnpm audit:log', () => {
     return { code, out, err };
   }
 
-  it('filters by user, type, outcome and time, and escapes what a client wrote', async () => {
+  it('filters by user, type, outcome and time, and records what a client wrote as one plain line', async () => {
     const dir = await populated();
     const all = run(['--dir', dir]);
     expect(all.code).toBe(0);
     expect(all.out).toHaveLength(5);
     expect(all.out[0]).toMatch(/^1 \d{4}-\d\d-\d\dT.* relay_start /);
-    // Neither the bidi override nor the escape sequence reaches the terminal as itself.
+    // The relay dropped the bidi override and made the escape a space
+    // (parseClientInfo), so neither is in the record to reach a terminal.
     const joined = all.out.join('\n');
     expect(rawEscapes(joined)).toBe(false);
-    expect(joined).toContain('\\u202e');
-    expect(joined).toContain('\\u001b');
+    expect(joined).toContain('client={"name":"evil [31mclient"');
+    const names = records(dir).flatMap((record) =>
+      'client' in record && record.client !== null ? [record.client.name] : [],
+    );
+    expect(names).toContain('evil [31mclient');
+    expect(names.some(rawEscapes)).toBe(false);
 
     expect(run(['--dir', dir, '--user', 'bob']).out).toHaveLength(1);
     expect(run(['--dir', dir, '--type', 'relay_start,relay_stop']).out).toHaveLength(2);
@@ -428,6 +433,41 @@ describe('pnpm audit:log', () => {
     expect(rawEscapes(json.join('\n'))).toBe(false);
     // The directory may come from the environment instead.
     expect(run([], { TABDOCK_AUDIT_DIR: dir }).out).toHaveLength(5);
+  });
+
+  it('escapes what a client wrote in a record from a relay that kept it as written', async () => {
+    const dir = join(scratch(), 'audit');
+    const audit = FileAuditLog.open({
+      dir,
+      retentionDays: 30,
+      maxBytes: 64 * 1024 * 1024,
+      log: createLogger({ sink: quiet }),
+    });
+    audit.append({
+      v: AUDIT_VERSION,
+      type: 'call',
+      at: Date.now(),
+      pageId: 'pg_1',
+      origin: 'https://app.example',
+      userId: 'alice',
+      client: { name: 'evil\u202e\u001b[31mclient', version: '1.0.0' },
+      tool: 'get_view',
+      outcome: 'ok',
+      durationMs: 3,
+    });
+    await audit.close();
+    // Neither the bidi override nor the escape sequence reaches the terminal as itself.
+    for (const argv of [
+      ['--dir', dir],
+      ['--dir', dir, '--json'],
+    ]) {
+      const result = run(argv);
+      expect(result.code).toBe(0);
+      const joined = result.out.join('\n');
+      expect(rawEscapes(joined)).toBe(false);
+      expect(joined).toContain('\\u202e');
+      expect(joined).toContain('\\u001b');
+    }
   });
 
   it('verifies the chain, against a checkpoint too, and exits 1 when it is broken', async () => {

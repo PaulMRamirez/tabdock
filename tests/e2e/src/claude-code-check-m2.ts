@@ -148,7 +148,7 @@ try {
   const writeLine = write && lines.find((line) => line.data.activityId === write.callId);
   const lineNamesClaude =
     writeLine?.data.outcome === 'ok' &&
-    /^\S+ Alice via claude-code \S+: add_item, ok in \d+ ms$/.test(writeLine.text);
+    /^\S+ Alice via "claude-code \S+": add_item, ok in \d+ ms$/.test(writeLine.text);
 
   const strip = await activityStrip(page);
   console.log("The demo page's own activity strip, newest first:");
