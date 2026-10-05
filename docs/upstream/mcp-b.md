@@ -10,7 +10,7 @@
 
 ## Problem Statement
 
-When an MCP client cancels a relayed tool call, or the relay's 65 s invoke timeout fires, the relay drops its pending invocation, but nothing tells the page. The relay-to-browser frames are `server-hello`, `hello/accepted`, `hello/rejected`, `invoke`, `ping` and `reload`; the dynamic tool handler does not pass on the request's abort signal; and the embed calls `executeTool(tool, args)` with no signal. So the page's handler keeps running: a timed-out "submit order" can still submit after the agent was told it failed. The pieces to stop it now exist. On the 6.0 polyfill, as on Chrome 155 and later, `executeTool(tool, input, { signal })` hands the handler the caller's signal; we measured a handler seeing the abort 100 ms in.
+When an MCP client cancels a relayed tool call, the relay ignores it: the dynamic tool handler takes no abort signal, so the pending invocation stays until the page answers, the relay's 65 s invoke timeout fires, the page's socket closes or the relay stops. When the timeout fires, the relay drops the pending entry and answers the client with an error. In neither case is the page told: the relay-to-browser frames are `server-hello`, `hello/accepted`, `hello/rejected`, `invoke`, `ping` and `reload`, and the embed calls `executeTool(tool, args)` with no signal. So the page's handler keeps running: a timed-out "submit order" can still submit after the agent was told it failed. The pieces to stop it now exist. On the 6.0 polyfill, as on Chrome 155 and later, `executeTool(tool, input, { signal })` hands the handler the caller's signal; we measured a handler seeing the abort 100 ms in.
 
 Separately, hosted MCP clients cannot spawn a stdio process, so they need a relay they can reach over the network; issue 158, "webmcp-server-relay", asks about one in a line, and we need one for pages shared by several people. Today's relay is not safe to expose, as its README says: `--widget-origin` defaults to `*`, a socket without an `Origin` header is judged by the origin it claims in `hello`, `webmcp-relay.v1` is refused only to sockets that send `Origin`, and the MCP side has no authentication, which is fine over stdio on one's own machine. The widget also refuses a relay host that is not loopback.
 
@@ -18,7 +18,7 @@ Separately, hosted MCP clients cannot spawn a stdio process, so they need a rela
 
 **Part 1: a `cancel` frame (small, backward compatible).** Add a relay-to-browser frame `{ type: "cancel", callId, reason }`, with `reason` one of `client`, `timeout` or `shutdown`.
 
-1. The relay sends it when the MCP request's signal aborts (the client cancelled), when the invoke timeout fires, and for every pending call when it stops, then drops the pending entry as today; a late `result` for that `callId` is already ignored as unknown.
+1. The relay sends it when the MCP request's signal aborts (the client cancelled), when the invoke timeout fires, and for every pending call when it stops. On the request's abort it also drops the pending entry and clears its timer, which is new, as the timeout and a stop already do; a late `result` for that `callId` is already ignored as unknown.
 2. The widget passes it to the embed as a new `postMessage` type carrying the host request's id.
 3. The embed keeps an `AbortController` per invocation, passes its signal to `executeTool(tool, args, { signal })`, and aborts it on `cancel`.
 
