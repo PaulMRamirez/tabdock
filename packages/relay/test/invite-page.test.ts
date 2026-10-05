@@ -21,6 +21,7 @@ import {
 } from './helpers/invites.ts';
 import { PAGE_ORIGIN } from './helpers/page-client.ts';
 import { Phone } from './helpers/phone.ts';
+import { bodyOf } from './helpers/results.ts';
 import { PUBLIC_ORIGIN } from './helpers/tunnel.ts';
 
 let current: InviteRelay | undefined;
@@ -276,7 +277,7 @@ describe('Join at /i', () => {
     // The same account on Claude finds the page.
     const claude = await relay.claude('sub-guest', 'guest@example.com');
     const listed = await claude.callTool({ name: 'list_pages', arguments: {} });
-    expect(listed.structuredContent).toMatchObject({
+    expect(bodyOf(listed)).toMatchObject({
       pages: [{ page: page.pageId, role: 'observer' }],
     });
   });

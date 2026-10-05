@@ -57,7 +57,7 @@ test.use({ viewport: { width: 1280, height: 1200 } });
 let demo: DemoServer;
 
 test.beforeAll(async () => {
-  demo = await startDemoServer();
+  demo = await startDemoServer({ e2eHook: true });
 });
 test.afterAll(async () => {
   await demo.close();
@@ -129,7 +129,7 @@ async function openWithFakeRelay(page: Page): Promise<FakeRelay> {
       list();
     });
   });
-  await page.goto(demoPageUrl(demo.url, FAKE_RELAY));
+  await page.goto(demoPageUrl(demo, FAKE_RELAY));
   await page.waitForSelector('html[data-tools="ready"]');
   await waitForDock(page, (state) => state.link === 'linked');
   return {

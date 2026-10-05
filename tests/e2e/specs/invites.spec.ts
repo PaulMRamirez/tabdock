@@ -60,7 +60,7 @@ let consoleLines: string[];
 let cspViolations: (() => Promise<string[]>) | null;
 
 test.beforeAll(async () => {
-  demo = await startDemoServer();
+  demo = await startDemoServer({ e2eHook: true });
 });
 test.afterAll(async () => {
   await demo.close();
@@ -217,7 +217,7 @@ async function openWithInviteRelay(
       }
     });
   });
-  const url = demoPageUrl(demo.url, FAKE_RELAY);
+  const url = demoPageUrl(demo, FAKE_RELAY);
   await page.goto(options.query ? `${url}&${options.query}` : url);
   await page.waitForSelector('html[data-tools="ready"]');
   await waitForDock(page, (state) => state.link === 'linked' && state.invitesOffered !== null);
@@ -701,7 +701,7 @@ test('the board does not link to a relay inside a frame, so a framing site canno
   });
   // A page at the demo's own origin frames it; the demo server's frame-ancestors 'self' allows that much.
   const framer = new URL('/framer', demo.url).href;
-  const framed = demoPageUrl(demo.url, FAKE_RELAY);
+  const framed = demoPageUrl(demo, FAKE_RELAY);
   await page.route(framer, (route) =>
     route.fulfill({
       contentType: 'text/html',

@@ -51,7 +51,7 @@ let pageErrors: string[];
 let expectedErrors: string[];
 
 test.beforeAll(async () => {
-  demo = await startDemoServer();
+  demo = await startDemoServer({ e2eHook: true });
 });
 test.afterAll(async () => {
   await demo.close();
@@ -158,7 +158,7 @@ async function openWithFakeRelay(
       );
     });
   });
-  const url = new URL(demoPageUrl(demo.url, FAKE_RELAY));
+  const url = new URL(demoPageUrl(demo, FAKE_RELAY));
   if (options.confirmViaClient === true) url.searchParams.set('confirm', 'client');
   await page.goto(url.href);
   await page.waitForSelector('html[data-tools="ready"]');

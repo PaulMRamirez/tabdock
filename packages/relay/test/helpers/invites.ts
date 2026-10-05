@@ -28,6 +28,7 @@ import { connectPage, PAGE_ORIGIN, type PageOptions, type TestPage, TOOLS } from
 import { Phone } from './phone.ts';
 import { PAIR_CLIENT, startProvider, type TestProvider } from './provider.ts';
 import { FAST_TIMINGS } from './relay.ts';
+import { resultJson } from './results.ts';
 import { PUBLIC_MCP_URL, PUBLIC_ORIGIN, tunnelFetch } from './tunnel.ts';
 
 export const MEMBERS: OAuthUser[] = [
@@ -234,7 +235,11 @@ export async function call(
 ): Promise<ToolText> {
   const result = await client.callTool({ name, arguments: args });
   const text = result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n');
-  return { isError: result.isError === true, text, structured: result.structuredContent };
+  return {
+    isError: result.isError === true,
+    text,
+    structured: resultJson(text, result.structuredContent),
+  };
 }
 
 /** A member pairs by code and the page approves with `role`. */

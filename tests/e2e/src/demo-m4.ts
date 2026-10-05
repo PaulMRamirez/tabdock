@@ -15,7 +15,7 @@
 // secret or its hash, a cookie or a subject: links appear masked, and every
 // line is checked against the secrets seen so far before it is printed (S11).
 
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
@@ -224,7 +224,15 @@ try {
   const home = join(scratch, 'tabdock home');
   say('Part one: local mode, with no .env and no account (ADR 0022)\n');
   say(`1. pnpm dev, with nothing set but a throwaway TABDOCK_HOME (${home}).`);
-  dev = runPnpm(['dev'], { ...blankEnv(), TABDOCK_HOME: home, TABDOCK_PORT: '0', DEMO_PORT: '0' });
+  // The board's ?e2e hook, which drives it here, exists only under a key pnpm dev is given.
+  const e2eKey = randomBytes(16).toString('base64url');
+  dev = runPnpm(['dev'], {
+    ...blankEnv(),
+    TABDOCK_HOME: home,
+    TABDOCK_PORT: '0',
+    DEMO_PORT: '0',
+    DEMO_E2E_KEY: e2eKey,
+  });
   await dev.waitFor('Relay logs follow');
   const printed = dev.stdout();
   const banner = readBanner(printed);
@@ -281,7 +289,7 @@ try {
 
   const demoLink = /Demo board linked to the relay: (\S+)/.exec(printed)?.[1] ?? '';
   const localBoardUrl = new URL(demoLink);
-  localBoardUrl.searchParams.set('e2e', '');
+  localBoardUrl.searchParams.set('e2e', e2eKey);
   const localBoard = await linkedBoard(browser, localBoardUrl.href);
   say(
     `\n3. The demo board it printed, open in Chromium ${browser.version()}, linked as ${localBoard.pageId}, shows the code ${maskCode(localBoard.code)}.`,

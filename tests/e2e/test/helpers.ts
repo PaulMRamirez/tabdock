@@ -27,6 +27,7 @@ import {
   startSimPage,
 } from '@tabdock/sim-page';
 import { expect } from 'vitest';
+import { resultJson } from '@tabdock/relay/test/results';
 
 /** Fresh random tokens on every run, so no usable credential ever sits in the repo. */
 function devUser(userId: string, displayName: string): DevTokenUser {
@@ -130,7 +131,11 @@ export async function callTool(
 ): Promise<ToolOutcome> {
   const result = await client.callTool({ name, arguments: args });
   const text = result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n');
-  return { isError: result.isError === true, text, structured: result.structuredContent };
+  return {
+    isError: result.isError === true,
+    text,
+    structured: resultJson(text, result.structuredContent),
+  };
 }
 
 /** The SPEC section 7 code at the start of a Tabdock error, or null for anything else. */

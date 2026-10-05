@@ -9,10 +9,18 @@ import { type BoardUi, mountBoard } from './render.ts';
 import { createTools } from './tools.ts';
 
 /**
- * Set by esbuild: true when the dev and test server bundles the page, false in
- * the static build, so the ?e2e test hook below cannot exist on a hosted copy.
+ * Set by esbuild: true only when a dev or test server is asked for the ?e2e
+ * test hook, which pnpm dev never is, and false in the static build, so the
+ * hook below cannot exist on a hosted copy.
  */
 declare const __TABDOCK_E2E_HOOK__: boolean;
+
+/**
+ * Set by esbuild beside the hook: the random key that server's ?e2e must
+ * carry, so a link from another site cannot skip the Connect click even on
+ * a server that offers the hook (ADR 0029's notes). Empty without the hook.
+ */
+declare const __TABDOCK_E2E_KEY__: string;
 
 /**
  * Set by esbuild: true in the dev and test bundle, false in the static build,
@@ -123,6 +131,8 @@ function attachToRelay(params: URLSearchParams, ui: BoardUi, registered: string)
     return;
   }
   const policy = linkPolicyFromQuery(params);
+  // Each use repeats the constant, so the static build, where it is false, drops the code outright.
+  const e2eHook = __TABDOCK_E2E_HOOK__ && params.get('e2e') === __TABDOCK_E2E_KEY__;
   const link = (): void => {
     const dock = attach({ relay: relay.url, policy: policyInput(policy) });
     // The status line names the relay, so the person at the tab can see where it dials.
@@ -133,18 +143,16 @@ function attachToRelay(params: URLSearchParams, ui: BoardUi, registered: string)
     showPolicy(status, policyNotes(policy));
     document.documentElement.dataset.link = 'chosen';
     // Test hook for the Playwright specs and the demo scripts, nothing else:
-    // ?e2e puts the control handle on window so a script can read the pairing
-    // code and answer prompts. The adapter never offers this; only the code that
-    // called attach() holds the handle, and a real page keeps it to itself.
-    if (__TABDOCK_E2E_HOOK__ && params.has('e2e')) window.__tabdockDock = dock;
+    // ?e2e=<key> puts the control handle on window so a script can read the
+    // pairing code and answer prompts. The adapter never offers this; only the
+    // code that called attach() holds the handle, and a real page keeps it to itself.
+    if (__TABDOCK_E2E_HOOK__ && e2eHook) window.__tabdockDock = dock;
   };
-  // Only the dev and test bundle's ?e2e skips the click: the static build
-  // defines the hook false, so esbuild drops this test and a published copy
-  // always waits for its visitor (tests/e2e/test/demo-static-build.test.ts).
-  if (
-    (__TABDOCK_E2E_HOOK__ && params.has('e2e')) ||
-    wasChosen(store, relay.url, policyTag(policy))
-  ) {
+  // Only ?e2e=<key>, on a server asked for the hook, skips the click: the
+  // static build and pnpm dev define the hook false, so esbuild drops this
+  // test from a published copy, which always waits for its visitor
+  // (tests/e2e/test/demo-static-build.test.ts, tests/e2e/specs/connect.spec.ts).
+  if ((__TABDOCK_E2E_HOOK__ && e2eHook) || wasChosen(store, relay.url, policyTag(policy))) {
     link();
     return;
   }
