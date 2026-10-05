@@ -11,8 +11,10 @@ export type ScriptOptions =
  * data-max-drivers, data-consequential, data-consequential-tools (a comma
  * list), data-invites (off, watch or all; ADR 0016) and data-confirm-via
  * (page or client; ADR 0026). Absent attributes stay absent, so the policy
- * defaults apply, an omitted tool list still means "the page gave none" (ADR
- * 0002), and an omitted data-confirm-via keeps the operator's prompt.
+ * defaults apply and an omitted data-confirm-via keeps the operator's prompt.
+ * A data-consequential-tools that names no tool, empty or only commas, reads as
+ * an empty list, which like an absent one leaves ADR 0002's fallback on where
+ * the runtime drops the hint (ADR 0034).
  */
 export function readScriptOptions(
   data: Readonly<Record<string, string | undefined>>,

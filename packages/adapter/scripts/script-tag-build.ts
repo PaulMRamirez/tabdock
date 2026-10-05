@@ -2,7 +2,7 @@
 // writes dist/tabdock-adapter.js, and by the size test
 // (tests/e2e/test/adapter-size.test.ts), which builds the same file in memory
 // and holds it under 150,000 bytes (ADR 0028), so the size measured is the
-// size shipped.
+// size shipped; tests/e2e/specs/widget.spec.ts loads that same file in a page.
 
 import { join, resolve, sep } from 'node:path';
 import * as esbuild from 'esbuild';
@@ -52,10 +52,18 @@ export function scriptTagOptions(): esbuild.BuildOptions & { metafile: true } {
   };
 }
 
-/** The minified script-tag file as the build writes it, built in memory; its bytes. */
-export async function scriptTagBytes(): Promise<number> {
+/**
+ * The minified script-tag file as the build writes it, built in memory, so a
+ * browser spec (widget.spec.ts) loads what ships without a build step first.
+ */
+export async function scriptTagFile(): Promise<Uint8Array> {
   const result = await esbuild.build({ ...scriptTagOptions(), write: false });
   const file = result.outputFiles.find((output) => output.path === SCRIPT_TAG_FILE);
   if (file === undefined) throw new Error('the script-tag build wrote no tabdock-adapter.js');
-  return file.contents.byteLength;
+  return file.contents;
+}
+
+/** The script-tag file's size in bytes, as scriptTagFile builds it. */
+export async function scriptTagBytes(): Promise<number> {
+  return (await scriptTagFile()).byteLength;
 }

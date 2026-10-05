@@ -53,15 +53,18 @@ describe('readScriptOptions', () => {
     }
   });
 
-  it('leaves absent attributes out, so "no list given" stays distinguishable (ADR 0002)', () => {
-    expect(readScriptOptions({ relay: 'ws://127.0.0.1:8787/page' })).toEqual({
-      ok: true,
-      relay: 'ws://127.0.0.1:8787/page',
-      policy: {},
-    });
-    expect(
-      readScriptOptions({ relay: 'ws://127.0.0.1:8787/page', consequentialTools: '' }),
-    ).toMatchObject({ ok: true, policy: { consequentialTools: [] } });
+  it('leaves absent attributes out, and reads a tool list that names no tool as an empty one', () => {
+    const relay = 'ws://127.0.0.1:8787/page';
+    expect(readScriptOptions({ relay })).toEqual({ ok: true, relay, policy: {} });
+    // An empty list names none, so like an absent one it leaves ADR 0002's
+    // fallback on; core.test.ts runs these through attach() (ADR 0034).
+    for (const consequentialTools of ['', ' ', ' , ', ',,']) {
+      expect(readScriptOptions({ relay, consequentialTools })).toEqual({
+        ok: true,
+        relay,
+        policy: { consequentialTools: [] },
+      });
+    }
   });
 
   it('names the bad attribute without echoing its value', () => {

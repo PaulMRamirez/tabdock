@@ -55,6 +55,14 @@ import {
   until,
   welcome,
 } from './harness.ts';
+import { readScriptOptions } from '../src/script-options.ts';
+
+/** The policy the script-tag build hands attach() for this data-consequential-tools value. */
+function scriptTagPolicy(consequentialTools: string): PolicyInput {
+  const options = readScriptOptions({ relay: RELAY_URL, consequentialTools });
+  if (!options.ok) throw new Error(options.error);
+  return options.policy;
+}
 
 describe('linking', () => {
   it('dials with tabdock.v1 and says hello first, without the page query or a token', () => {
@@ -316,10 +324,14 @@ describe('tool sync', () => {
       ]);
     });
 
-    it('marks every tool that is not read-only where the runtime drops the hint and the page gave no list', async () => {
+    it('marks every tool that is not read-only where the runtime drops the hint and the page names none', async () => {
       expect(await marked(polyfillTools())).toEqual(['set_value', 'wipe']);
       expect(await marked(polyfillTools(), { consequentialTools: ['wipe'] })).toEqual(['wipe']);
-      expect(await marked(polyfillTools(), { consequentialTools: [] })).toEqual([]);
+      // An empty list names none, so the fallback still decides (ADR 0034).
+      expect(await marked(polyfillTools(), { consequentialTools: [] })).toEqual([
+        'set_value',
+        'wipe',
+      ]);
       expect(await marked([runtimeTool('set_value')])).toEqual([]);
     });
 
@@ -1035,25 +1047,53 @@ describe('roles and consequential tools', () => {
       expect(results(socket).map((frame) => frame.callId)).toEqual(['call-2']);
     });
 
-    it('takes the page list as authoritative, even an empty one', async () => {
+    it('takes a list that names tools as authoritative', async () => {
       const listed = setup({
         tools: polyfillTools(),
         core: { policy: { consequentialTools: ['wipe'] } },
       });
-      const first = await link(listed);
+      const socket = await link(listed);
       expect(listed.dock.state.notice).toBeNull();
-      first.deliver(invoke('set_value'));
-      first.deliver(invoke('wipe', { callId: 'call-2' }));
+      socket.deliver(invoke('set_value'));
+      socket.deliver(invoke('wipe', { callId: 'call-2' }));
       await flush();
-      expect(results(first).map((frame) => frame.callId)).toEqual(['call-1']);
+      expect(results(socket).map((frame) => frame.callId)).toEqual(['call-1']);
       expect(listed.dock.state.pendingConfirms.map((item) => item.tool)).toEqual(['wipe']);
-
-      const none = setup({ tools: polyfillTools(), core: { policy: { consequentialTools: [] } } });
-      const second = await link(none);
-      second.deliver(invoke('wipe'));
-      await flush();
-      expect(results(second)[0]?.ok).toBe(true);
     });
+
+    // README and SPEC section 8 once showed consequentialTools: [] in their
+    // example, so a page that copied either must still fail safe (ADR 0034).
+    it.each<[string, PolicyInput]>([
+      ['attach() given consequentialTools: []', { consequentialTools: [] }],
+      ['the script tag given data-consequential-tools=""', scriptTagPolicy('')],
+      ['the script tag given data-consequential-tools=" , "', scriptTagPolicy(' , ')],
+    ])(
+      'counts an empty list as naming none, for %s: every write is marked, prompts, and the notice shows',
+      async (_how, policy) => {
+        expect(policy.consequentialTools).toEqual([]);
+        const h = setup({ tools: polyfillTools(), core: { policy } });
+        const socket = await link(h);
+        expect(h.dock.state.notice).toMatch(/consequentialTools/);
+        expect(
+          socket
+            .framesOf('tools')[0]
+            ?.tools.filter((tool) => tool.consequential === true)
+            .map((tool) => tool.name),
+        ).toEqual(['set_value', 'wipe']);
+        socket.deliver(invoke('wipe'));
+        socket.deliver(invoke('get_value', { callId: 'call-2' }));
+        await flush();
+        expect(h.dock.state.pendingConfirms.map((item) => item.tool)).toEqual(['wipe']);
+        expect(results(socket).map((frame) => frame.callId)).toEqual(['call-2']);
+        expect(h.dock.confirm('call-1', false)).toBe(true);
+        await flush();
+        expect(results(socket).map((frame) => [frame.callId, frame.error?.code ?? 'ok'])).toEqual([
+          ['call-2', 'ok'],
+          ['call-1', 'denied_by_operator'],
+        ]);
+        expect(h.context.attempts.map((attempt) => attempt.tool)).toEqual(['get_value']);
+      },
+    );
 
     it('assumes nothing when no tool carries annotations at all', async () => {
       const h = setup({ tools: [runtimeTool('set_value')] });

@@ -1066,7 +1066,6 @@ function forgetLegacyRecords(storage: StorageLike | undefined, relayUrl: string)
 export function createAdapterCore(options: CoreOptions): AdapterCore {
   checkRelayUrl(options.relayUrl);
   const policy = checkPolicy(options.policy ?? {});
-  const pageListedTools = options.policy?.consequentialTools !== undefined;
   const context = options.modelContext;
   const log = options.logger ?? consoleLogger;
   const clock = options.clock ?? (() => Date.now());
@@ -1856,9 +1855,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       lastProblemsKey = problemsKey;
       for (const problem of snapshot.problems) log.warn(problem);
     }
-    const notice = needsHintNotice(snapshot.hintSupport, policy, pageListedTools)
-      ? HINT_NOTICE
-      : null;
+    const notice = needsHintNotice(snapshot.hintSupport, policy) ? HINT_NOTICE : null;
     if (notice !== state.notice) setState({ notice });
     return snapshot;
   }
@@ -1891,7 +1888,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    * so their entries stay as an older adapter sent them.
    */
   function wireTool(tool: PageTool, snapshot: ToolSnapshot): PageTool {
-    return isConsequential(tool, snapshot.hintSupport, policy, pageListedTools)
+    return isConsequential(tool, snapshot.hintSupport, policy)
       ? { ...tool, consequential: true }
       : tool;
   }
@@ -2172,7 +2169,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     snapshot: ToolSnapshot,
   ): Promise<void> {
     const { frame } = call;
-    if (isConsequential(tool.page, snapshot.hintSupport, policy, pageListedTools)) {
+    if (isConsequential(tool.page, snapshot.hintSupport, policy)) {
       if (policy.consequential === 'deny') {
         finish(call, {
           ok: false,

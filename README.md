@@ -34,11 +34,13 @@ const dock = attach({
     maxDrivers: 1,
     consequential: 'confirm',
     confirmVia: 'page',
-    consequentialTools: [],
+    consequentialTools: ['clear_board'],
     invites: 'watch',
   },
 });
 ```
+
+Name your consequential tools in `consequentialTools`. MCP-B 5.x and Chrome 153 drop `consequentialHint`, so there the list is what marks a tool consequential; a page that names none, with no list or an empty one, has every tool that is not read-only prompt instead, and the widget says how to fix it (ADRs 0002 and 0034). A page that wants no prompts at all says `consequential: 'allow'`.
 
 ## Security in brief
 

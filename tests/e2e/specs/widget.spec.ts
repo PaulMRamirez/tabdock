@@ -31,6 +31,7 @@ import {
   widgetText,
   widgetVisible,
 } from '../src/tabdock-harness.ts';
+import { scriptTagFile } from '../../../packages/adapter/scripts/script-tag-build.ts';
 
 // The operator's widget against a scripted relay. Playwright's routeWebSocket
 // stands in for the relay, so a test controls every frame the page sees, and
@@ -110,9 +111,8 @@ function attachRequest(
 }
 
 /**
- * Opens the demo page against a scripted relay that welcomes every hello
- * (resuming when the hello carries a token) with an empty roster, and waits
- * for the link. The clock is installed first, so a test can pause it later.
+ * Opens the demo page against a scripted relay (routeFakeRelay) and waits for
+ * the link. The clock is installed first, so a test can pause it later.
  * pairingUrl goes in the welcome's pairing, as a relay with a public URL sends it;
  * confirmViaClient opens the board with ?confirm=client (ADR 0026).
  */
@@ -120,10 +120,24 @@ async function openWithFakeRelay(
   page: Page,
   options: { pairingUrl?: string; confirmViaClient?: boolean } = {},
 ): Promise<FakeRelay> {
+  await page.clock.install();
+  const relay = await routeFakeRelay(page, options.pairingUrl);
+  const url = new URL(demoPageUrl(demo, FAKE_RELAY));
+  if (options.confirmViaClient === true) url.searchParams.set('confirm', 'client');
+  await page.goto(url.href);
+  await page.waitForSelector('html[data-tools="ready"]');
+  await waitForDock(page, (state) => state.link === 'linked');
+  return relay;
+}
+
+/**
+ * Answers FAKE_RELAY with a scripted relay that welcomes every hello
+ * (resuming when the hello carries a token) with an empty roster.
+ */
+async function routeFakeRelay(page: Page, pairingUrl?: string): Promise<FakeRelay> {
   const frames: PageFrame[] = [];
   let current: WebSocketRoute | null = null;
   let connections = 0;
-  await page.clock.install();
   await page.routeWebSocket(FAKE_RELAY, (ws) => {
     current = ws;
     connections += 1;
@@ -140,7 +154,7 @@ async function openWithFakeRelay(
           resumed: parsed.frame.resumeToken !== undefined,
           pairing: {
             code: 'ABCDE-FGHJK',
-            ...(options.pairingUrl === undefined ? {} : { url: options.pairingUrl }),
+            ...(pairingUrl === undefined ? {} : { url: pairingUrl }),
             expiresAt: Date.now() + 120_000,
           },
           roster: [],
@@ -158,11 +172,6 @@ async function openWithFakeRelay(
       );
     });
   });
-  const url = new URL(demoPageUrl(demo, FAKE_RELAY));
-  if (options.confirmViaClient === true) url.searchParams.set('confirm', 'client');
-  await page.goto(url.href);
-  await page.waitForSelector('html[data-tools="ready"]');
-  await waitForDock(page, (state) => state.link === 'linked');
   return {
     frames,
     get connections() {
@@ -848,6 +857,74 @@ test('on the MCP-B polyfill, a write whose tool the page unregisters mid-run hol
     ['call-2', false],
     ['call-1', false],
   ]);
+});
+
+/** The widget's notice line, which has no data-role of its own, read from beside the activity log. */
+const NOTICE_TEXT = `function () {
+  const notice = this.getRootNode().querySelector('.notice');
+  return notice && !notice.hidden ? notice.textContent : null;
+}`;
+
+test('on the MCP-B polyfill 5.1, the script tag with an empty data-consequential-tools marks every write, prompts for clear_board and says why (ADR 0034)', async ({
+  page,
+}) => {
+  const relay = await routeFakeRelay(page);
+  const adapter = Buffer.from(await scriptTagFile());
+  await page.route(`${demo.url}tabdock-adapter.js`, (route) =>
+    route.fulfill({ contentType: 'text/javascript', body: adapter }),
+  );
+  // Without ?relay the board registers its tools and attaches nothing itself.
+  await page.goto(demo.url);
+  await page.waitForSelector('html[data-tools="ready"]');
+  const runtime = await page.evaluate(async () => {
+    const context = (
+      document as unknown as {
+        modelContext: {
+          getTools(): Promise<{ name: string; annotations?: Record<string, unknown> }[]>;
+        };
+      }
+    ).modelContext;
+    const tools = await context.getTools();
+    return {
+      polyfill: Reflect.get(context, '__isWebMCPPolyfill') === true,
+      hinted: tools
+        .filter((tool) => tool.annotations !== undefined && 'consequentialHint' in tool.annotations)
+        .map((tool) => tool.name),
+    };
+  });
+  // 5.1.0 drops clear_board's consequentialHint, the case ADR 0002 is about.
+  expect(runtime).toEqual({ polyfill: true, hinted: [] });
+
+  // The README's old example as a script tag: a list that names no tool.
+  await page.evaluate((relayUrl) => {
+    const script = document.createElement('script');
+    script.src = '/tabdock-adapter.js';
+    script.dataset.relay = relayUrl;
+    script.dataset.consequentialTools = '';
+    document.head.append(script);
+  }, FAKE_RELAY);
+  await expect.poll(() => framesOf(relay, 'tools').length).toBeGreaterThan(0);
+  // Every write is marked, so a relay may ask a client on a page that opted in (ADR 0026).
+  expect(
+    (framesOf(relay, 'tools').at(-1)?.tools ?? [])
+      .filter((tool) => tool.consequential === true)
+      .map((tool) => tool.name)
+      .sort(),
+  ).toEqual(['add_item', 'clear_board', 'highlight_item', 'move_view']);
+  await expect
+    .poll(() => widgetEvaluate(page, 'activity', NOTICE_TEXT))
+    .toMatch(/consequentialTools/);
+
+  relay.send(attachRequest('req-alice', 'alice'));
+  await clickInWidget(page, { action: 'approve-driver', requestId: 'req-alice' });
+  await expect.poll(() => decisions(relay).map((frame) => frame.allow)).toEqual([true]);
+  relay.send({ t: 'roster', attachments: [attachment('alice', 'Alice')] });
+  relay.send(invokeFrame('call-1', 'clear_board'));
+  await clickInWidget(page, { action: 'confirm-deny', callId: 'call-1' });
+  await expect
+    .poll(() => framesOf(relay, 'result').map((frame) => [frame.callId, frame.error?.code ?? 'ok']))
+    .toEqual([['call-1', 'denied_by_operator']]);
+  await expect(page.locator('[data-role="view"]')).toHaveText(/3 items/);
 });
 
 test('pause answers calls with page_busy, shows on the badge, and holds across a reload', async ({

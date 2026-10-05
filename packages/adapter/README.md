@@ -15,6 +15,8 @@ dock.on('state', (state) => {
 });
 ```
 
+Name each consequential tool in `consequentialTools`. MCP-B 5.x and Chrome 153 drop `consequentialHint`, so there the list is what marks a tool consequential; a page that names none, with no list or an empty one, has every tool that is not read-only prompt instead, and the widget says how to fix it (ADRs 0002 and 0034). A page that wants no prompts says `consequential: 'allow'`.
+
 A page gets the adapter in one of two ways (ADR 0028). An app with a build step runs `npm install @tabdock/adapter` and calls `attach()` as above; the package is compiled JavaScript with type declarations, ESM only, and exports `.` alone. Any other page loads the script-tag build, `dist/tabdock-adapter.js` in the same package, one self-contained file held under 150,000 bytes, from its own origin or from a CDN copy of that npm file pinned to an exact version with the `integrity` digest each release publishes and `crossorigin="anonymous"`:
 
 ```html
