@@ -20,7 +20,8 @@
     "demo:m1": "node src/demo-m1.ts",
     "demo:m2": "node src/demo-m2.ts",
     "demo:m3": "node src/demo-m3.ts",
-    "demo:m4": "node src/demo-m4.ts"
+    "demo:m4": "node src/demo-m4.ts",
+    "demo:m5": "node src/demo-m5.ts"
   },
   "devDependencies": {
     "@mcp-b/webmcp-local-relay": "5.1.0",

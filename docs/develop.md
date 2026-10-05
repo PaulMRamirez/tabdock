@@ -25,6 +25,7 @@ pnpm demo:m1       # an MCP client pairs with the demo board through the Tabdock
 pnpm demo:m2       # two users and three clients share the board: roles, the write queue, revoke
 pnpm demo:m3       # sign-in, pairing by code and by the widget's QR code from a phone-sized browser
 pnpm demo:m4       # local mode, then a page shared by watch and control invites, and the audit log
+pnpm demo:m5       # first-class page tools on both MCP revisions, and a call confirmed in the client
 
 pnpm site:build    # the Pages site into apps/site/dist: the demo at / and docs/tour at /tour/
 

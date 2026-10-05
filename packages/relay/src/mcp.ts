@@ -99,7 +99,7 @@ import { SlidingWindowLimiter } from './rate-limit.ts';
 import type { Spike } from './spike.ts';
 
 export const RELAY_NAME = 'tabdock-relay';
-export const RELAY_VERSION = '0.0.0';
+export const RELAY_VERSION = '0.1.0';
 
 /**
  * What the HTTP layer puts in authInfo.extra. The token itself is never

@@ -31,6 +31,7 @@
     "demo:m2": "pnpm --filter @tabdock/e2e demo:m2",
     "demo:m3": "pnpm --filter @tabdock/e2e demo:m3",
     "demo:m4": "pnpm --filter @tabdock/e2e demo:m4",
+    "demo:m5": "pnpm --filter @tabdock/e2e demo:m5",
     "spike:latency": "node scripts/spike/latency.ts",
     "spike:soak": "node scripts/spike/soak.ts"
   },

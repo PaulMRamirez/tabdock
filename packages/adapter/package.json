@@ -1,6 +1,6 @@
 {
   "name": "@tabdock/adapter",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Tabdock page adapter: links a page's WebMCP tools to a Tabdock relay.",
   "license": "Apache-2.0",
   "repository": {

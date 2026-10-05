@@ -49,6 +49,7 @@ jobs:
       - run: pnpm demo:m2
       - run: pnpm demo:m3
       - run: pnpm demo:m4
+      - run: pnpm demo:m5
 
   # A5.5 (ADR 0028): the three packages built and packed as a release packs
   # them, checked file by file, run through `npx @tabdock/relay@<version>`

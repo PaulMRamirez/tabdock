@@ -1,6 +1,6 @@
 {
   "name": "@tabdock/relay",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Tabdock relay: page WebSocket endpoint, MCP endpoint, pairing, auth plugins and audit log.",
   "license": "Apache-2.0",
   "repository": {
