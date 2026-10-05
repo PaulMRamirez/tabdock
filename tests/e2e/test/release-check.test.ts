@@ -4,8 +4,11 @@
 // source file, an install script, a second bin or a stray dependency into a
 // package, ships a shrinkwrap npm would install an incomplete tree from, or
 // documents an import the package does not export never reaches the stage
-// job (ADR 0028's notes). The real tarballs are checked in CI by the
-// pack-install job.
+// job (ADR 0028's notes). Since the A5.6 review it also refuses a dependency
+// the allowlist does not name, an optional, peer or bundled one, a bin on a
+// library, and a shrinkwrap entry not fetched from its own registry URL with
+// a whole sha512, or that runs a script on install. The real tarballs are
+// checked in CI by the pack-install job.
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -20,10 +23,27 @@ import {
   readmeProblems,
   REPOSITORY_URL,
   ROOT,
+  RUNTIME_DEPENDENCIES,
   tarballName,
 } from '../../../scripts/release-check.ts';
 
 type Json = Record<string, unknown>;
+
+/** A well-formed sha512 integrity, as npm writes one, standing for a package's tarball. */
+function sha512(of: string): string {
+  return `sha512-${createHash('sha512').update(of).digest('base64')}`;
+}
+
+interface Shrinkwrap {
+  packages: Record<string, Record<string, unknown>>;
+}
+
+/** Changes the relay fixture's shrinkwrap in place. */
+function editShrinkwrap(f: Record<PackageName, Fixture>, change: (s: Shrinkwrap) => void): void {
+  const shrinkwrap = JSON.parse(String(f.relay.files['npm-shrinkwrap.json'])) as Shrinkwrap;
+  change(shrinkwrap);
+  f.relay.files['npm-shrinkwrap.json'] = JSON.stringify(shrinkwrap);
+}
 
 interface Fixture {
   files: Record<string, string | Buffer>;
@@ -116,12 +136,12 @@ function wellFormed(version = '0.0.0'): Record<PackageName, Fixture> {
             'node_modules/ws': {
               version: '8.22.0',
               resolved: 'https://registry.npmjs.org/ws/-/ws-8.22.0.tgz',
-              integrity: 'sha512-abc',
+              integrity: sha512('ws'),
             },
             'node_modules/zod': {
               version: '4.6.5',
               resolved: 'https://registry.npmjs.org/zod/-/zod-4.6.5.tgz',
-              integrity: 'sha512-def',
+              integrity: sha512('zod'),
             },
           },
         }),
@@ -328,7 +348,7 @@ describe('the release check', () => {
         };
         f.relay.files['npm-shrinkwrap.json'] = JSON.stringify(shrinkwrap);
       },
-      /takes node_modules\/ws from "file:\.\.\/ws\.tgz", not the npm registry/,
+      /takes node_modules\/ws from "file:\.\.\/ws\.tgz", not https:\/\/registry\.npmjs\.org\/ws\/-\/ws-8\.22\.0\.tgz/,
     ],
     [
       'a shrinkwrap that leaves out @tabdock/protocol, which npm would then never install',
@@ -372,6 +392,158 @@ describe('the release check', () => {
         );
       },
       /takes node_modules\/@tabdock\/protocol from "file:\.\.\/tabdock-protocol-0\.0\.0\.tgz", not https:\/\/registry\.npmjs\.org\/@tabdock\/protocol\/-\/protocol-0\.0\.0\.tgz/,
+    ],
+    [
+      'a runtime dependency the allowlist does not name, such as a dev-only suite',
+      (f) => {
+        const conformance = { '@modelcontextprotocol/conformance': '0.2.0-alpha.12' };
+        f.relay.manifest.dependencies = {
+          ...(f.relay.manifest.dependencies as Json),
+          ...conformance,
+        };
+        editShrinkwrap(f, (shrinkwrap) => {
+          const root = shrinkwrap.packages[''] ?? {};
+          root.dependencies = { ...(root.dependencies as Json), ...conformance };
+          shrinkwrap.packages['node_modules/@modelcontextprotocol/conformance'] = {
+            version: '0.2.0-alpha.12',
+            resolved:
+              'https://registry.npmjs.org/@modelcontextprotocol/conformance/-/conformance-0.2.0-alpha.12.tgz',
+            integrity: sha512('conformance'),
+          };
+        });
+      },
+      /@tabdock\/relay depends on @modelcontextprotocol\/conformance, which its allowlist of runtime dependencies does not name/,
+    ],
+    [
+      "a dependency another package may have but this one's allowlist does not name",
+      (f) => {
+        f.protocol.manifest.dependencies = { zod: '4.6.5', ws: '8.22.0' };
+      },
+      /@tabdock\/protocol depends on ws, which its allowlist of runtime dependencies does not name/,
+    ],
+    [
+      'optional dependencies, which npm installs when it can',
+      (f) => {
+        f.adapter.manifest.optionalDependencies = { '@mcp-b/webmcp-polyfill': '^6.0.0-beta' };
+      },
+      /@tabdock\/adapter has optionalDependencies/,
+    ],
+    [
+      'optional dependencies on the relay, an SDK range among them',
+      (f) => {
+        f.relay.manifest.optionalDependencies = { '@modelcontextprotocol/sdk': '^1.29.0' };
+      },
+      /@tabdock\/relay has optionalDependencies/,
+    ],
+    [
+      'peer dependencies, which npm 7 and later install',
+      (f) => {
+        f.adapter.manifest.peerDependencies = { '@modelcontextprotocol/sdk': '*' };
+      },
+      /@tabdock\/adapter has peerDependencies/,
+    ],
+    [
+      'peer dependency metadata',
+      (f) => {
+        f.protocol.manifest.peerDependenciesMeta = { zod: { optional: true } };
+      },
+      /@tabdock\/protocol has peerDependenciesMeta/,
+    ],
+    [
+      'bundled dependencies',
+      (f) => {
+        f.adapter.manifest.bundleDependencies = ['zod'];
+      },
+      /@tabdock\/adapter has bundleDependencies/,
+    ],
+    [
+      'bundled dependencies by their other spelling',
+      (f) => {
+        f.relay.manifest.bundledDependencies = ['ws'];
+      },
+      /@tabdock\/relay has bundledDependencies/,
+    ],
+    [
+      "a bin on a library, which would shadow node and npm in a consumer's node_modules/.bin",
+      (f) => {
+        f.adapter.manifest.bin = { node: './dist/index.js', npm: './dist/index.js' };
+      },
+      /@tabdock\/adapter has a bin; only @tabdock\/relay may/,
+    ],
+    [
+      'a bin on the protocol, given as a string',
+      (f) => {
+        f.protocol.manifest.bin = './dist/index.js';
+      },
+      /@tabdock\/protocol has a bin; only @tabdock\/relay may/,
+    ],
+    [
+      'a bin directory, which npm links file by file as bins',
+      (f) => {
+        f.relay.manifest.directories = { bin: './dist' };
+      },
+      /@tabdock\/relay names a bin directory/,
+    ],
+    [
+      "a shrinkwrap entry fetched from another package's registry URL",
+      (f) => {
+        editShrinkwrap(f, (shrinkwrap) => {
+          const ws = shrinkwrap.packages['node_modules/ws'] ?? {};
+          ws.resolved =
+            'https://registry.npmjs.org/some-other-package/-/some-other-package-9.9.9.tgz';
+        });
+      },
+      /takes node_modules\/ws from "https:\/\/registry\.npmjs\.org\/some-other-package\/-\/some-other-package-9\.9\.9\.tgz", not https:\/\/registry\.npmjs\.org\/ws\/-\/ws-8\.22\.0\.tgz/,
+    ],
+    [
+      "a shrinkwrap entry fetched from another version's registry URL",
+      (f) => {
+        editShrinkwrap(f, (shrinkwrap) => {
+          const zod = shrinkwrap.packages['node_modules/zod'] ?? {};
+          zod.resolved = 'https://registry.npmjs.org/zod/-/zod-3.0.0.tgz';
+        });
+      },
+      /takes node_modules\/zod from "https:\/\/registry\.npmjs\.org\/zod\/-\/zod-3\.0\.0\.tgz", not https:\/\/registry\.npmjs\.org\/zod\/-\/zod-4\.6\.5\.tgz/,
+    ],
+    [
+      'a shrinkwrap entry with a truncated sha512',
+      (f) => {
+        editShrinkwrap(f, (shrinkwrap) => {
+          const ws = shrinkwrap.packages['node_modules/ws'] ?? {};
+          ws.integrity = 'sha512-x';
+        });
+      },
+      /pins node_modules\/ws without a whole sha512 integrity/,
+    ],
+    [
+      'a shrinkwrap entry with a sha512 of the wrong length',
+      (f) => {
+        editShrinkwrap(f, (shrinkwrap) => {
+          const ws = shrinkwrap.packages['node_modules/ws'] ?? {};
+          ws.integrity = 'sha512-AAAA';
+        });
+      },
+      /pins node_modules\/ws without a whole sha512 integrity/,
+    ],
+    [
+      'a shrinkwrap entry that runs a script on install',
+      (f) => {
+        editShrinkwrap(f, (shrinkwrap) => {
+          const ws = shrinkwrap.packages['node_modules/ws'] ?? {};
+          ws.hasInstallScript = true;
+        });
+      },
+      /pins node_modules\/ws, which runs a script on install/,
+    ],
+    [
+      'a shrinkwrap root with optional dependencies',
+      (f) => {
+        editShrinkwrap(f, (shrinkwrap) => {
+          const root = shrinkwrap.packages[''] ?? {};
+          root.optionalDependencies = { '@modelcontextprotocol/sdk': '1.29.0' };
+        });
+      },
+      /npm-shrinkwrap\.json's root has optionalDependencies/,
     ],
     [
       'a script-tag build at the ceiling',
@@ -455,6 +627,19 @@ describe('the release check', () => {
         readmeProblems(name, readme, (other) => exportsOf.get(other)),
         name,
       ).toEqual([]);
+    }
+  });
+
+  it("holds this repository's runtime dependencies to the allowlist", () => {
+    // So a dependency added to a package fails here, on its pull request,
+    // and not first on release day.
+    for (const name of PACKAGES) {
+      const manifest = JSON.parse(
+        readFileSync(join(ROOT, 'packages', name, 'package.json'), 'utf8'),
+      ) as { dependencies?: Record<string, string> };
+      for (const dependency of Object.keys(manifest.dependencies ?? {})) {
+        expect(RUNTIME_DEPENDENCIES[name], `@tabdock/${name}`).toContain(dependency);
+      }
     }
   });
 

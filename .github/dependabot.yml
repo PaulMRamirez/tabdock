@@ -5,6 +5,13 @@
 # pinned inside workflows (BuildKit, its SBOM scanner, the volume-owner helper)
 # and flyctl's version are no FROM line or action, so they are bumped by hand
 # with the Dockerfile's base, as docs/deploy.md says.
+#
+# npm too (ADR 0028's A5.6 notes): the relay's shrinkwrap pins its whole tree
+# for every `npx` user, so a fix anywhere in it reaches them only in a new
+# release, and these pull requests are what prompt one. Security updates,
+# which the owner turns on in the repository's settings
+# (docs/checklists/M5.md), read these entries too and come one pull request
+# per advisory; weekly version updates come grouped.
 
 version: 2
 updates:
@@ -24,3 +31,32 @@ updates:
       interval: weekly
     commit-message:
       prefix: image
+
+  # The pnpm workspace: the three published packages, the demo and the tests.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      runtime:
+        dependency-type: production
+      tooling:
+        dependency-type: development
+    ignore:
+      # The client matrix (ADR 0027) holds these old releases of the v1 SDK on
+      # purpose, as aliases in tests/e2e; none ships in a package.
+      - dependency-name: '@modelcontextprotocol/sdk'
+      - dependency-name: 'mcp-sdk-*'
+    commit-message:
+      prefix: deps
+
+  # The Pages site keeps its own lockfile (ADR 0029).
+  - package-ecosystem: npm
+    directory: /apps/site
+    schedule:
+      interval: weekly
+    groups:
+      site:
+        patterns: ['*']
+    commit-message:
+      prefix: site
