@@ -878,6 +878,7 @@ export function createMcpFactory(
           formElicitation: declaresFormElicitation(envelope?.[CLIENT_CAPABILITIES_META_KEY]),
           retry,
           elicit: null,
+          mint: (recordId) => codec.mint(recordId, ctx),
         };
       }
       return {
@@ -900,35 +901,26 @@ export function createMcpFactory(
               relatedRequestId: ctx.mcpReq.id,
             },
           ),
+        mint: null,
       };
     };
 
     /**
-     * A 2026-07-28 first round the hub would ask about: the record's id
-     * signed into the state, and the relay's question under `confirm`. A
-     * state that fails to mint leaves no record behind.
+     * A 2026-07-28 first round the hub asks about: the relay's question
+     * under `confirm`, and the state the hub had the record's id signed
+     * into (ConfirmLeg's `mint`), which it held only once the record was
+     * still there after signing.
      */
-    const askInClient = async (
-      asked: AskInClient,
-      ctx: ServerContext,
-    ): Promise<InputRequiredResult> => {
-      let requestState: string;
-      try {
-        requestState = await codec.mint(asked.recordId, ctx);
-      } catch (error) {
-        hub.discardConfirmation(asked.recordId);
-        throw error;
-      }
-      return inputRequired({
+    const askInClient = (asked: AskInClient): InputRequiredResult =>
+      inputRequired({
         inputRequests: {
           [CONFIRM_FIELD]: inputRequired.elicit({
             message: asked.question.message,
             requestedSchema: asked.question.requestedSchema,
           }),
         },
-        requestState,
+        requestState: asked.requestState,
       });
-    };
 
     /**
      * Both routes to a page tool end here: call_page_tool, and a first-class
@@ -956,7 +948,7 @@ export function createMcpFactory(
         heldBytes(ctx),
         confirmLeg(ctx, retry),
       );
-      if (outcome.kind === 'ask') return askInClient(outcome, ctx);
+      if (outcome.kind === 'ask') return askInClient(outcome);
       const result = callResult(label, outcome);
       return spike && timer
         ? spike.finishCall(timer, result, { userId: who.userId, pageId: page, tool: label })

@@ -268,6 +268,12 @@ export interface ConfirmationRecord {
   readonly pageTool: string;
   /** argumentsDigest of the arguments asked about. */
   readonly digest: string;
+  /**
+   * The grantedAt of the caller's attachment it was asked under: a retry
+   * passes only while that attachment is still the caller's, so a revoke and
+   * a fresh approval leave it nothing to confirm (ADR 0026).
+   */
+  readonly grantedAt: number;
   /** For the expiry's call line (S7): the page's origin and the client that was asked. */
   readonly origin: string;
   readonly client: ClientInfo | null;
@@ -381,6 +387,11 @@ export class PendingConfirmations {
   /** Removes a record whose question never went out, its state having failed to mint. */
   discard(id: string): void {
     this.#forget(id);
+  }
+
+  /** Whether a record is still held, as a drop, the sweep or a shutdown may take it while its state is signed. */
+  holds(id: string): boolean {
+    return this.#records.has(id);
   }
 
   #forget(id: string): ConfirmationRecord | null {

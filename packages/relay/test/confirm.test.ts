@@ -211,6 +211,7 @@ function fields(userId = 'alice', pageId = 'pg_0123456789'): NewRecord {
     calledAs: 'call_page_tool',
     pageTool: 'wipe',
     digest: '0'.repeat(64),
+    grantedAt: 0,
     origin: 'http://localhost:5173',
     client: null,
   };
