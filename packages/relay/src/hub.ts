@@ -112,11 +112,15 @@ type AttachRefusal = AuditEventOf<'attach_refused'>['outcome'];
 type ExpireReason = AuditEventOf<'expire'>['reason'];
 type InviteCloseReason = AuditEventOf<'invite_closed'>['reason'];
 
-/** The fixed tools whose requests ADR 0018's per-user budget can refuse, with what each names. */
+/**
+ * The fixed tools whose requests ADR 0018's per-user budget can refuse, with
+ * what each names; a call by a first-class name is refused as the
+ * call_page_tool it stands for (ADR 0025).
+ */
 export type BudgetRefusal =
   | { tool: 'list_pages' }
   | { tool: 'list_page_tools' | 'detach_page'; page: string }
-  | { tool: 'call_page_tool'; page: string; pageTool: string }
+  | { tool: 'call_page_tool'; page: string; pageTool: PageToolRef }
   | { tool: 'pair_page'; via: 'code' | 'invite' };
 
 /** The lesser of two roles: an invite-made attachment never passes its invite's (ADR 0017). */
@@ -321,9 +325,11 @@ interface CallTrace {
   /** Returns what the call's request was charged against what waiting requests hold (#holdBytes). */
   release: (() => void) | null;
   /**
-   * The page tool its record names: as the client wrote it until a
-   * first-class name resolves, then the page tool's own name, so a call by
-   * either route leaves the same line (S7, ADR 0025).
+   * The page tool its record names: from the start the page tool's own
+   * name whenever the relay holds the page's tools (#calledToolName), so a
+   * call by either route leaves the same line even when it is refused
+   * before the lookup (S7, ADR 0025); else as the client wrote it until a
+   * first-class name resolves.
    */
   tool: string;
 }
@@ -4083,7 +4089,7 @@ export class PageHub {
     const trace: CallTrace = {
       reached: false,
       release: null,
-      tool: typeof tool === 'string' ? tool : tool.firstClass,
+      tool: this.#calledToolName(pageId, tool),
     };
     try {
       const outcome = await this.#call(caller, pageId, tool, args, signal, marks, trace, heldBytes);
@@ -4160,7 +4166,7 @@ export class PageHub {
           origin: this.#store.pages.get(refused.page)?.origin ?? null,
           userId,
           client,
-          tool: auditToolName(refused.pageTool),
+          tool: auditToolName(this.#calledToolName(refused.page, refused.pageTool)),
           outcome: 'rate_limited',
           durationMs: 0,
         });
@@ -4566,6 +4572,28 @@ export class PageHub {
       'timeout',
       `the page did not take what the relay had already sent it within ${String(this.#config.timings.callDeadlineMs)} ms, so the call never reached it`,
     );
+  }
+
+  /**
+   * The name a call's record gives the page tool it named, before or
+   * without the lookup: a first-class name's tool part becomes the page
+   * tool's own name whenever exactly one of the page's tools maps to it,
+   * whether or not the caller holds the page, so a call refused before the
+   * lookup (not_attached, rate_limited, page_busy) leaves the record
+   * call_page_tool would (S7, ADR 0025). The record is the operator's and
+   * the answer never names the tool, so nothing reaches a caller who does
+   * not hold the page (S13). An unknown, asleep or gone page's tools are not
+   * held (S9), and a `.` mapped to `_` cannot be mapped back, so its record
+   * keeps the name as called, as ADR 0025's notes record.
+   */
+  #calledToolName(pageId: string, ref: PageToolRef): string {
+    if (typeof ref === 'string') return ref;
+    const tools = this.#store.pages.get(pageId)?.tools ?? [];
+    const matches = tools.filter(
+      (candidate) => firstClassToolPart(candidate.name) === ref.firstClass,
+    );
+    const [only] = matches;
+    return only !== undefined && matches.length === 1 ? only.name : ref.firstClass;
   }
 
   /**

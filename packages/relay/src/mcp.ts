@@ -881,8 +881,13 @@ export function createMcpFactory(
       const firstClass = firstClassOn ? parseFirstClassName(name) : null;
       if (firstClass !== null) {
         const { pageId, toolPart } = firstClass;
-        if (!within)
-          return refuse(who, { tool: 'call_page_tool', page: pageId, pageTool: toolPart });
+        if (!within) {
+          return refuse(who, {
+            tool: 'call_page_tool',
+            page: pageId,
+            pageTool: { firstClass: toolPart },
+          });
+        }
         const args: JsonObject = request.params.arguments ?? {};
         return answer(() => callPage(who, pageId, { firstClass: toolPart }, args, toolPart, ctx));
       }
