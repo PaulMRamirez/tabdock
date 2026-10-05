@@ -218,6 +218,11 @@ describe.each(RUNTIME_PROFILES)('the sim page as %s', (profile) => {
     expect(wipe?.annotations?.consequentialHint).toBe(
       profile === 'polyfill-5.1' ? undefined : true,
     );
+    // ADR 0026: the page's own verdict under ADR 0002 rides on each tool, so
+    // on the polyfill, which drops the hint, every write is marked.
+    expect(tools.tools.filter((tool) => tool.consequential === true).map((t) => t.name)).toEqual(
+      profile === 'polyfill-5.1' ? ['set_value', 'wipe'] : ['wipe'],
+    );
   });
 
   it('runs calls in the runtime input form and reports handler errors', async () => {
@@ -489,6 +494,49 @@ describe('startSimPage', () => {
     for (const secret of ['token-1', 'ABCDE-FGHJK', 'argument-value-xyz']) {
       expect(logs).not.toContain(secret);
     }
+  });
+});
+
+describe("confirmation in the caller's client on the sim page (ADR 0026)", () => {
+  const confirmedWipe = (): RelayFrame => ({
+    t: 'invoke',
+    callId: 'c1',
+    tool: 'wipe',
+    arguments: {},
+    caller: { ...alice, client: { name: 'claude-code', version: '2.1.289' } },
+    deadlineMs: 5000,
+    confirmation: { by: 'client', confirmationId: 'cf_1', at: Date.now() },
+  });
+
+  it("passes confirmVia to the core: hello says it, and a member driver's confirmed call runs with no prompt", async () => {
+    const askConfirm = vi.fn(() => true);
+    const { sim, connection } = await linked({
+      policy: { confirmVia: 'client' },
+      operator: { askConfirm },
+    });
+    expect((await frameOf(connection, 'hello')).policy.confirmVia).toBe('client');
+    await approveAlice(sim, connection);
+    send(connection, confirmedWipe());
+    expect(await frameOf(connection, 'result')).toMatchObject({ callId: 'c1', ok: true });
+    expect(askConfirm).not.toHaveBeenCalled();
+    expect(sim.prompts).toEqual([]);
+    expect(sim.activity[0]).toMatchObject({ callId: 'c1', outcome: 'ok', confirmedBy: 'client' });
+  });
+
+  it('records each prompt, across a reload, where the page did not opt in', async () => {
+    const askConfirm = vi.fn(() => true);
+    const { relay, sim, connection } = await linked({ operator: { askConfirm } });
+    expect((await frameOf(connection, 'hello')).policy.confirmVia).toBe('page');
+    await approveAlice(sim, connection);
+    send(connection, confirmedWipe());
+    expect(await frameOf(connection, 'result')).toMatchObject({ callId: 'c1', ok: true });
+    expect(askConfirm).toHaveBeenCalledTimes(1);
+    expect(sim.prompts.map((prompt) => [prompt.callId, prompt.tool])).toEqual([['c1', 'wipe']]);
+    expect(sim.activity[0]?.confirmedBy).toBeNull();
+
+    await sim.reload();
+    await frameOf(await relay.connection(1), 'hello');
+    expect(sim.prompts.map((prompt) => prompt.callId)).toEqual(['c1']);
   });
 });
 

@@ -493,6 +493,8 @@ describe('the activity log (S7)', () => {
         client: { name: 'claude-code', version: '2.1.287' },
         tool: 'get_value',
         outcome: 'running',
+        // Nobody confirmed it in a client: it is not consequential (ADR 0026).
+        confirmedBy: null,
         durationMs: null,
         handlerRunning: false,
       },
