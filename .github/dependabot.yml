@@ -1,0 +1,26 @@
+# Keeps the pins current (docs/deploy.md, "The image"): every action is pinned
+# by commit SHA and the Dockerfile's bases by digest, which nobody would
+# otherwise notice going stale. Dependabot proposes each update as a pull
+# request the owner reviews; nothing merges on its own. The image digests
+# pinned inside workflows (BuildKit, its SBOM scanner, the volume-owner helper)
+# and flyctl's version are no FROM line or action, so they are bumped by hand
+# with the Dockerfile's base, as docs/deploy.md says.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']
+    commit-message:
+      prefix: ci
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: image

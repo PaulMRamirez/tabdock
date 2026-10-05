@@ -22,7 +22,7 @@ import { SlidingWindowLimiter } from '../src/rate-limit.ts';
 import { connectPage, PAGE_ORIGIN, type TestPage, TOOLS } from './helpers/page-client.ts';
 import { type JsonAnswer, Phone } from './helpers/phone.ts';
 import { MOCK_SUBJECT, PAIR_CLIENT, startProvider, type TestProvider } from './helpers/provider.ts';
-import { delay, eventually, startRelay } from './helpers/relay.ts';
+import { delay, eventually, startRelay, TestFence } from './helpers/relay.ts';
 import {
   PUBLIC_MCP_URL,
   PUBLIC_ORIGIN,
@@ -45,6 +45,7 @@ let relay: Relay | undefined;
 let lines: string[] = [];
 const pages: TestPage[] = [];
 const clients: Client[] = [];
+const fence = new TestFence();
 
 beforeEach(async () => {
   provider = await startProvider();
@@ -52,26 +53,42 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  for (const client of clients.splice(0)) await client.close();
-  for (const opened of pages.splice(0)) opened.ws.terminate();
-  await relay?.close();
+  fence.end();
+  // A test that timed out inside a spied stretch never reached the finally
+  // that restores it, so a clock 121 s ahead or a stubbed fetch would carry
+  // on into the next test.
+  vi.restoreAllMocks();
+  const ending = relay;
   relay = undefined;
-  await provider.stop();
+  // The relay and provider close even if a client will not, so none outlives its test.
+  try {
+    for (const client of clients.splice(0)) await client.close();
+  } finally {
+    for (const opened of pages.splice(0)) opened.ws.terminate();
+    await ending?.close();
+    await provider.stop();
+  }
 });
 
 async function start(options: Partial<RelayOptions> = {}): Promise<Relay> {
-  relay = await createRelay({
-    auth: createOAuthAuth({ issuer: provider.issuer, resource: PUBLIC_MCP_URL, users: USERS }),
-    publicUrl: PUBLIC_ORIGIN,
-    pairClient: PAIR_CLIENT,
-    allowedOrigins: [PAGE_ORIGIN],
-    port: 0,
-    logLevel: 'debug',
-    logSink: (line) => {
-      lines.push(line);
-    },
-    ...options,
-  });
+  // This test's lines, taken now: a relay that a timed-out test started late
+  // logs as it starts, and must not write into the next test's lines.
+  const own = lines;
+  relay = await fence.keep(
+    createRelay({
+      auth: createOAuthAuth({ issuer: provider.issuer, resource: PUBLIC_MCP_URL, users: USERS }),
+      publicUrl: PUBLIC_ORIGIN,
+      pairClient: PAIR_CLIENT,
+      allowedOrigins: [PAGE_ORIGIN],
+      port: 0,
+      logLevel: 'debug',
+      logSink: (line) => {
+        own.push(line);
+      },
+      ...options,
+    }),
+    (late) => late.close(),
+  );
   return relay;
 }
 
@@ -81,12 +98,17 @@ function current(): Relay {
 }
 
 async function page(options: Parameters<typeof connectPage>[1] = {}): Promise<TestPage> {
-  const opened = await connectPage(current().pageUrl, {
-    tools: TOOLS,
-    title: 'Board',
-    onInvoke: (frame) => ({ ok: true, content: JSON.stringify({ tool: frame.tool }) }),
-    ...options,
-  });
+  const opened = await fence.keep(
+    connectPage(current().pageUrl, {
+      tools: TOOLS,
+      title: 'Board',
+      onInvoke: (frame) => ({ ok: true, content: JSON.stringify({ tool: frame.tool }) }),
+      ...options,
+    }),
+    (late) => {
+      late.ws.terminate();
+    },
+  );
   pages.push(opened);
   return opened;
 }
@@ -112,11 +134,14 @@ async function signedIn(subject: string | null = null): Promise<Phone> {
 async function claudeAs(sub: string): Promise<{ client: Client; token: string }> {
   const token = await provider.token({ sub, aud: PUBLIC_MCP_URL });
   const client = new Client({ name: 'claude-phone', version: '1.0.0' });
-  await client.connect(
-    new StreamableHTTPClientTransport(new URL(PUBLIC_MCP_URL), {
-      authProvider: { token: () => Promise.resolve(token) },
-      fetch: tunnelFetch(current().url),
-    }),
+  await fence.keep(
+    client.connect(
+      new StreamableHTTPClientTransport(new URL(PUBLIC_MCP_URL), {
+        authProvider: { token: () => Promise.resolve(token) },
+        fetch: tunnelFetch(current().url),
+      }),
+    ),
+    () => client.close(),
   );
   clients.push(client);
   return { client, token };
@@ -255,6 +280,11 @@ describe('the /pair page', () => {
 });
 
 describe('scan to first call', () => {
+  // A timeout of its own: the whole journey, from the provider's discovery
+  // and a signed ID token checked against its keys to an MCP client with a
+  // signed access token, takes well over a dozen HTTP round trips; about
+  // 0.4 s alone, and past vitest's default 5 s with three test runs sharing
+  // four cores.
   it('previews, signs in with PKCE, claims, waits for the operator, and the same user then drives the page from /mcp', async () => {
     // The spike flag on, for the scan-to-first-call milestones (A3.3) checked at the end.
     await start({ spike: true });
@@ -285,7 +315,8 @@ describe('scan to first call', () => {
     expect(asked.get('response_type')).toBe('code');
     expect(asked.get('client_id')).toBe(PAIR_CLIENT.clientId);
     expect(asked.get('redirect_uri')).toBe(`${PUBLIC_ORIGIN}/pair/callback`);
-    expect(asked.get('scope')).toBe('openid');
+    // ADR 0020: the email claims too, which name an invitee; a member's are never kept.
+    expect(asked.get('scope')).toBe('openid email');
     expect(asked.get('code_challenge_method')).toBe('S256');
     for (const name of ['code_challenge', 'state', 'nonce']) {
       expect(asked.get(name), name).toMatch(/^[A-Za-z0-9_-]{43}$/);
@@ -395,7 +426,7 @@ describe('scan to first call', () => {
     expect(next?.trace).not.toBe(trace);
     // Only the first call after the approval is the first call.
     expect(milestones.filter((event) => event.stage === 'first_call')).toHaveLength(1);
-  });
+  }, 20_000);
 
   it('logs no pairing milestones with the spike flag off', async () => {
     await start();

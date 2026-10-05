@@ -1,0 +1,13 @@
+# Everything is left out of the image's build context unless named here, so a
+# local .env, an owner token, audit files or anything else a checkout holds
+# can never reach a layer. Only what the Dockerfile copies is let in.
+*
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!packages/protocol/package.json
+!packages/protocol/src/
+!packages/relay/package.json
+!packages/relay/src/
+**/*.test.ts
+**/.env*

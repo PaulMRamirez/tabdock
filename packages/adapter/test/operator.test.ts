@@ -553,7 +553,7 @@ describe("the operator's role switch", () => {
     const h = setup();
     const socket = await link(h, {}, { bob: 'observer' });
     expect(h.dock.setRole('bob', 'driver')).toBe(true);
-    expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: 'driver' } });
+    expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: { role: 'driver' } } });
     expect(socket.last()).toEqual({ t: 'set_role', userId: 'bob', role: 'driver' });
 
     // Until the relay lists Bob as a driver, the lesser role holds.
@@ -623,23 +623,23 @@ describe("the operator's role switch", () => {
       ],
     });
     expect(h.dock.state.pageRoles).toEqual([
-      { userId: 'mallory', role: null, revoked: false },
-      { userId: 'alice', role: 'driver', revoked: false },
-      { userId: 'bob', role: 'observer', revoked: false },
+      { userId: 'mallory', role: null, revoked: false, inviteRole: null },
+      { userId: 'alice', role: 'driver', revoked: false, inviteRole: null },
+      { userId: 'bob', role: 'observer', revoked: false, inviteRole: null },
     ]);
     // A demotion holds on the page before the relay applies it, and a revoke at once.
     expect(h.dock.setRole('alice', 'observer')).toBe(true);
     expect(h.dock.revoke('bob')).toBe(true);
     expect(h.dock.state.pageRoles).toEqual([
-      { userId: 'mallory', role: null, revoked: false },
-      { userId: 'alice', role: 'observer', revoked: false },
-      { userId: 'bob', role: null, revoked: true },
+      { userId: 'mallory', role: null, revoked: false, inviteRole: null },
+      { userId: 'alice', role: 'observer', revoked: false, inviteRole: null },
+      { userId: 'bob', role: null, revoked: true, inviteRole: null },
     ]);
 
     const auto = setup({ core: { policy: { autoApprove: 'observer' } } });
     await link(auto, { roster: [attachment('carol', 'driver')] }, {});
     expect(auto.dock.state.pageRoles).toEqual([
-      { userId: 'carol', role: 'observer', revoked: false },
+      { userId: 'carol', role: 'observer', revoked: false, inviteRole: null },
     ]);
   });
 
@@ -665,7 +665,7 @@ describe("the operator's role switch", () => {
     socket.drop(1006);
     expect(h.dock.setRole('bob', 'driver')).toBe(false);
     expect(socket.framesOf('set_role')).toEqual([]);
-    expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: 'observer' } });
+    expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: { role: 'observer' } } });
   });
 });
 
@@ -685,8 +685,9 @@ describe('revoke (S8)', () => {
     expect(h.dock.revoke('bob')).toBe(true);
     const after = socket.frames().slice(before);
     expect(after[0]).toEqual({ t: 'revoke', userId: 'bob' });
+    // The relay ends Bob's request as it applies the revoke, so the page sends
+    // no decision for it: one would only reach a request already gone (A4.3).
     expect(after.slice(1)).toEqual([
-      { t: 'attach_decision', requestId: 'bob-again', allow: false },
       {
         t: 'result',
         callId: 'bob-read',
@@ -703,7 +704,7 @@ describe('revoke (S8)', () => {
     expect(h.context.runs.find((run) => run.tool === 'get_value')?.signal.aborted).toBe(true);
     expect(h.dock.state.pendingConfirms).toEqual([]);
     expect(h.dock.state.pendingRequests).toEqual([]);
-    expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { alice: 'driver' } });
+    expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { alice: { role: 'driver' } } });
 
     // The relay has not sent its new roster yet, and Bob still gets nothing.
     socket.deliver(invoke('get_value', { callId: 'bob-later', caller: caller('bob') }));
@@ -725,8 +726,25 @@ describe('revoke (S8)', () => {
       user: { userId: 'carol', displayName: 'Carol' },
     });
     expect(h.dock.approve('carol-1', 'observer')).toBe(true);
-    expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { carol: 'observer' } });
+    expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { carol: { role: 'observer' } } });
     expect(h.dock.revoke('*')).toBe(true);
+  });
+
+  it('sends one revoke for * and no decision for any request it ends, however many wait', async () => {
+    const h = setup();
+    const socket = await link(h, {}, { alice: 'driver' });
+    for (let i = 0; i < 21; i += 1) {
+      socket.deliver({
+        ...attachRequest(h.clock, `wait-${String(i)}`),
+        user: { userId: `user${String(i)}`, displayName: `User ${String(i)}` },
+      });
+    }
+    expect(h.dock.state.pendingRequests).toHaveLength(21);
+    const before = socket.sent.length;
+    expect(h.dock.revoke('*')).toBe(true);
+    // Each would reach a request the relay's revoke had already ended (A4.3).
+    expect(socket.frames().slice(before)).toEqual([{ t: 'revoke', userId: '*' }]);
+    expect(h.dock.state.pendingRequests).toEqual([]);
   });
 
   it('refuses a malformed id and a user with nothing to revoke', async () => {

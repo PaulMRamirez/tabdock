@@ -6,19 +6,49 @@
 // order (SPEC section 5); read-only calls go straight to the page. The section 9
 // limits and attachment idle expiry follow ADR 0009, argument checks ADR 0008
 // and ADR 0010: they run in a worker thread with a time budget, never here.
+// From M4 the hub also keeps a page's invites (ADRs 0016 and 0017): only their
+// secrets' digests, their sponsor, what is pending on them and who is barred;
+// every redemption still goes to the page as an attach request carrying the
+// presented secret, since the adapter alone decides whether an invite is good.
+// Every audit record (S7, ADR 0019) is written here, and a refusal that never
+// reached a page passes the refusal budget first (audit-budget.ts). A page
+// frame that changes nothing writes its lines only within a budget per socket
+// and per address, past which they are counted, and never closes the page
+// (ADR 0023); the lines each page connection writes have a budget per address
+// too. What the hub sends a page that has stopped reading is held only up to
+// a bound, past which the socket is closed, and a call whose invoke would
+// fill that bound waits for room instead (ADR 0024 and its notes).
 
 import {
   type AttachmentView,
+  AttachRefusalSchema,
+  type AttachVia,
+  AUDIT_VERSION,
+  type AuditCallEvent,
+  type AuditEvent,
+  type AuditEventOf,
+  auditPageId,
+  auditToolName,
   type ClientInfo,
   CLOSE_DETACH,
   CLOSE_REPLACED,
   encodeFrame,
   type ErrorCode,
+  INVITE_BURN_REFUSALS,
+  INVITE_PATH,
+  type InviteListing,
+  type InviteRefusalReason,
+  InviteSecretSchema,
+  inviteSecretOf,
   type JsonObject,
   type Limits,
   MAX_DESCRIPTION_CHARS,
   MAX_FRAME_BYTES,
+  MAX_INVITE_LIFETIME_MS,
+  MAX_LIVE_INVITES_PER_PAGE,
   MAX_RESULT_CHARS,
+  MEMBER_RESERVED_SEATS,
+  MIN_INVITE_REMAINING_MS,
   type PageErrorCode,
   type PageFrame,
   type PageTool,
@@ -28,6 +58,7 @@ import {
   type Role,
   type ToolAnnotations,
   truncate,
+  UNVERIFIED_EMAIL,
 } from '@tabdock/protocol';
 import { createHash } from 'node:crypto';
 import type { RawData, WebSocket } from 'ws';
@@ -37,9 +68,12 @@ import {
   prepareForCheck,
   type UncheckedReason,
 } from './argument-checker.ts';
+import { AuditRefusalBudget } from './audit-budget.ts';
+import { foldName, type UserAccount } from './auth.ts';
 import type { ResolvedConfig } from './config.ts';
-import type { Logger } from './log.ts';
+import type { LogFields, Logger, LogLevel } from './log.ts';
 import { SlidingWindowLimiter } from './rate-limit.ts';
+import { RepeatedLines } from './repeated-lines.ts';
 import {
   digest,
   digestHex,
@@ -53,22 +87,61 @@ import {
   SINGLE_USE_SECRET_PATTERN,
 } from './secrets.ts';
 import type { CallMarks, SpikeHooks } from './spike.ts';
-import type {
-  AttachmentRecord,
-  AttachRequestRecord,
-  AuditOutcome,
-  PageRecord,
-  PageState,
-  RelayStore,
-  SingleUseTicketRecord,
+import {
+  type AttachmentRecord,
+  type AttachRequestRecord,
+  type AuditOutcome,
+  type InviteRecord,
+  type PageRecord,
+  type PageState,
+  recordAudit,
+  type RelayStore,
+  type SingleUseTicketRecord,
 } from './store.ts';
 
 type FrameOf<T extends PageFrame['t']> = Extract<PageFrame, { t: T }>;
+
+/** How a pairing or redemption ended without an attachment, as its attach_refused record names it. */
+type AttachRefusal = AuditEventOf<'attach_refused'>['outcome'];
+type ExpireReason = AuditEventOf<'expire'>['reason'];
+type InviteCloseReason = AuditEventOf<'invite_closed'>['reason'];
+
+/** The fixed tools whose requests ADR 0018's per-user budget can refuse, with what each names. */
+export type BudgetRefusal =
+  | { tool: 'list_pages' }
+  | { tool: 'list_page_tools' | 'detach_page'; page: string }
+  | { tool: 'call_page_tool'; page: string; pageTool: string }
+  | { tool: 'pair_page'; via: 'code' | 'invite' };
+
+/** The lesser of two roles: an invite-made attachment never passes its invite's (ADR 0017). */
+function lesserRole(a: Role, b: Role): Role {
+  return a === 'observer' || b === 'observer' ? 'observer' : 'driver';
+}
+
+/** The code a refused pairing or redemption ended with, as its attach_refused record names it. */
+function attachRefusalOf(code: ErrorCode): AttachRefusal {
+  const parsed = AttachRefusalSchema.safeParse(code);
+  // Every refusal a request can end with is one of them; anything else would be a relay bug.
+  return parsed.success ? parsed.data : 'denied_by_operator';
+}
+
+/**
+ * The digest a revoke bars an invitee's verified email by (ADR 0017): of the
+ * address folded as display names are, so a second sign-up under another
+ * capitalisation is the same address. Never logged or audited (ADR 0019).
+ */
+export function emailBarDigest(email: string): string {
+  return digestHex(`invitee email ${foldName(email)}`);
+}
 
 /** Who is asking, as the MCP side established it. */
 export interface CallerIdentity {
   userId: string;
   displayName: string;
+  /** Member or invitee, and any verified email, as the auth plugin said (ADRs 0017 and 0020). */
+  account: UserAccount;
+  /** The access token's client_id, for the audit log's attach records (ADR 0019); null for none. */
+  oauthClientId: string | null;
   client: ClientInfo | null;
 }
 
@@ -79,7 +152,19 @@ export interface HubError {
 }
 
 export type PairOutcome =
-  { kind: 'attached'; pageId: string; origin: string; role: Role; existing: boolean } | HubError;
+  | {
+      kind: 'attached';
+      pageId: string;
+      origin: string;
+      role: Role;
+      existing: boolean;
+      /**
+       * For an attachment an invite made, the sponsor's display name, so
+       * pair_page can say "shared by <sponsor>" as /i does (ADR 0016).
+       */
+      sponsor?: string;
+    }
+  | HubError;
 
 /** What /pair shows for a live QR nonce before anyone claims it; looking uses nothing up. */
 export interface PairPreview {
@@ -100,6 +185,63 @@ export interface PairPreview {
  */
 export type ClaimOutcome =
   HubError | { kind: 'claimed'; pageId: string; settled: Promise<PairOutcome> };
+
+/** What /i shows for a live invite before anyone joins (ADR 0016); looking uses nothing up. */
+export interface InvitePreview {
+  /** From the page socket's Origin header (S1), never from the page's own words. */
+  origin: string;
+  /** Written by the page (S10): capped, and shown as the page's own words. */
+  title: string;
+  titleCut: boolean;
+  /** The operator's label for the invite, page-written like the title. */
+  label: string;
+  /** observer for Can watch, driver for Can control. */
+  role: Role;
+  /** "Shared by": the sponsor's name, fixed when the invite was minted. */
+  sponsor: string;
+  expiresAt: number;
+}
+
+/**
+ * The hub's invite surface (ADRs 0016 and 0017); /i, pair_page and the
+ * invitee session pool call it. The page side arrives as invite_create and
+ * invite_cancel frames, which a relay with invites off ignores, as it sends
+ * no invites frame at all. With them on, by ADR 0017's notes: every
+ * redemption reaches the page as an attach_request via invite with the
+ * presented secret, autoApprove or not; an invites frame follows every
+ * welcome, answers every invite_create and goes out on every change; and a
+ * revoke of one user bars them from the invite that let them in but never
+ * cancels it.
+ */
+export interface InviteHub {
+  /**
+   * pair_page's invite input: a link minted for one use, or its secret.
+   * Counted like a code per user and per page, and per invite; waits for the
+   * operator like pairPage when the invite needs a prompt.
+   */
+  redeemInvite(
+    caller: CallerIdentity,
+    invite: string,
+    signal: AbortSignal,
+    heldBytes?: number,
+  ): Promise<PairOutcome>;
+  /** What /i shows; null for an unknown, used, cancelled, expired or unsponsored secret alike. */
+  previewInvite(secret: string): InvitePreview | null;
+  /** /i's Join, like claimPairNonce: refused at once, or claimed with the outcome to come. */
+  claimInvite(caller: CallerIdentity, secret: string): ClaimOutcome;
+  /** Whether the user holds any attachment, which decides an invitee's session pool and audit budget. */
+  holds(userId: string): boolean;
+}
+
+/** What #grant takes from an attach request, or from a caller let in without one. */
+type GrantRequest = Pick<
+  AttachRequestRecord,
+  'pageId' | 'userId' | 'displayName' | 'account' | 'oauthClientId' | 'client' | 'via'
+> &
+  Partial<Pick<AttachRequestRecord, 'joined'>>;
+
+/** A redemption that needs the page's answer, or one settled at once. */
+type Started = PairOutcome | { kind: 'pending'; record: AttachRequestRecord };
 
 /** A page title longer than this is cut before /pair shows it (S10). */
 export const MAX_PAIR_TITLE_CHARS = 120;
@@ -153,6 +295,20 @@ export interface SocketRefusal {
   message: string;
 }
 
+/**
+ * Whether a call reached its page: such a call is always written to the
+ * audit log in full, and one refused before only within the refusal budget
+ * (S7, ADR 0019).
+ */
+interface CallTrace {
+  reached: boolean;
+  /** Returns what the call's request was charged against what waiting requests hold (#holdBytes). */
+  release: (() => void) | null;
+}
+
+/** Why the relay tells a page to stop a call. */
+type CancelReason = NonNullable<Extract<RelayFrame, { t: 'cancel' }>['reason']>;
+
 /** One call_page_tool call from arrival until it settles. */
 interface PendingCall {
   callId: string;
@@ -176,10 +332,16 @@ interface PendingCall {
    * argument check runs; the queue stops at it until the check answers.
    */
   checking: boolean;
-  /** The socket its invoke went out on; null while it waits in the queue. */
+  /** The socket its invoke went out on; null while it waits in the queue or for room. */
   conn: Conn | null;
+  /** The socket whose queue it waits on for room to send its invoke (#hold); null otherwise. */
+  heldOn: Conn | null;
+  /** Its invoke frame's size when it arrived, for the room check while it is held. */
+  invokeBytes: number;
   /** Filled in for the spike's timing (spike.ts); null otherwise. */
   marks: CallMarks | null;
+  /** Whether its invoke went out, which decides how its audit record is written. */
+  trace: CallTrace;
   timer: NodeJS.Timeout | null;
   done: boolean;
   settle: (outcome: CallOutcome) => void;
@@ -216,6 +378,8 @@ interface ListedTool {
   /** As clients are shown it, cut (S10). */
   tool: PageTool;
   check: ArgCheckEntry;
+  /** What it is charged against limits.toolBytes, kept while it is reused unchanged (heldBytes). */
+  held: number;
 }
 
 /** Logged once per tool and reason; fixed words, never the schema or the arguments. */
@@ -255,6 +419,124 @@ interface Conn {
   inflight: Map<string, PendingCall>;
   /** When this socket's recent tools frames arrived, for toolsFramesPerSocket. */
   toolsFrames: number[];
+  /** When this socket's recent frames that changed nothing arrived, for ignoredFramesPerSocket. */
+  ignoredFrames: number[];
+  /**
+   * Frames handed to ws that ws has not yet handed the kernel, counted
+   * exactly through each send's callback (#write): all of them, and those
+   * that count toward closing a page that is not reading, which is every
+   * frame but a call's invoke and cancel. Both counts start over, with a new
+   * epoch, whenever the socket's queue is seen empty, since a callback comes
+   * a tick after its bytes left (#observe).
+   */
+  queue: { epoch: number; frames: number; counted: number };
+  /** Calls whose invoke waits for room on this socket, oldest first (#hold). */
+  held: PendingCall[];
+}
+
+/**
+ * Client addresses whose held-back lines one window tracks; past it the rest
+ * share one count, as auth-log.ts does, since behind a host edge every IPv6
+ * /56 is an address of its own.
+ */
+const MAX_ADDRESSES_HOLDING_LINES = 10_000;
+/**
+ * How long past a request's own lifetime a page's decision for it is still
+ * expected once the relay has ended it: the page's timer runs on its own
+ * clock and its answer crosses the network (#decision).
+ */
+const ENDED_REQUEST_GRACE_MS = 30_000;
+/** Ended requests remembered at once; pairing limits keep the real number far below. */
+const MAX_ENDED_REQUESTS = 10_000;
+
+/** One line a frame's handler wrote, held until it is known whether the frame changed anything. */
+interface HeldLine {
+  level: LogLevel;
+  message: string;
+  fields: LogFields | undefined;
+  /** An audit record's stderr copy, which is written whatever the frame did (ADR 0019). */
+  kept: boolean;
+}
+
+/**
+ * The hub's logger, which can hold the lines one page frame's handler writes
+ * (hold) and then write them all, or only those it must keep (write).
+ * Handlers run synchronously, so nothing else writes while lines are held.
+ */
+class FrameLog implements Logger {
+  readonly #inner: Logger;
+  #held: HeldLine[] | null = null;
+  /**
+   * The same logger for audit records' stderr copies, which are never held
+   * back: while the audit disk fails they are the only copy (ADR 0019).
+   */
+  readonly kept: Logger;
+
+  constructor(inner: Logger) {
+    this.#inner = inner;
+    this.kept = {
+      debug: (message, fields) => {
+        this.#line('debug', message, fields, true);
+      },
+      info: (message, fields) => {
+        this.#line('info', message, fields, true);
+      },
+      warn: (message, fields) => {
+        this.#line('warn', message, fields, true);
+      },
+      error: (message, fields) => {
+        this.#line('error', message, fields, true);
+      },
+    };
+  }
+
+  debug(message: string, fields?: LogFields): void {
+    this.#line('debug', message, fields, false);
+  }
+
+  info(message: string, fields?: LogFields): void {
+    this.#line('info', message, fields, false);
+  }
+
+  warn(message: string, fields?: LogFields): void {
+    this.#line('warn', message, fields, false);
+  }
+
+  error(message: string, fields?: LogFields): void {
+    this.#line('error', message, fields, false);
+  }
+
+  /**
+   * Runs a handler, holding every line it writes; its answer, and those
+   * lines. A handler that throws has its lines written first, as they would
+   * have been without holding them.
+   */
+  hold<T>(handle: () => T): { result: T; lines: HeldLine[] } {
+    const outer = this.#held;
+    const lines: HeldLine[] = [];
+    this.#held = lines;
+    try {
+      return { result: handle(), lines };
+    } catch (error) {
+      this.#held = outer;
+      this.write(lines, true);
+      throw error;
+    } finally {
+      this.#held = outer;
+    }
+  }
+
+  /** Writes held lines in order: all of them, or only those that must be kept. */
+  write(lines: readonly HeldLine[], all: boolean): void {
+    for (const { level, message, fields, kept } of lines) {
+      if (all || kept) this.#inner[level](message, fields);
+    }
+  }
+
+  #line(level: LogLevel, message: string, fields: LogFields | undefined, kept: boolean): void {
+    if (this.#held === null) this.#inner[level](message, fields);
+    else this.#held.push({ level, message, fields, kept });
+  }
 }
 
 const CLOSE_POLICY = 1008;
@@ -264,6 +546,29 @@ const CLOSE_TRY_AGAIN_LATER = 1013;
 /** A newer socket resumed this page's session. */
 export const CLOSE_RESUMED_ELSEWHERE = CLOSE_REPLACED;
 const CLOSE_GRACE_MS = 2000;
+/**
+ * What the relay keeps queued for one page that has not read it: the bytes
+ * on its socket past what the kernel took, and the frames among them that
+ * are not a call's (ADR 0024). /page takes no credential, and the relay
+ * answers pings, revokes, invite frames and rotate_pairing with frames of
+ * its own, so a socket that stopped reading while it sent them held every
+ * answer in memory: 80 to 140 MiB of heap for a million pings. Each small
+ * frame queued costs a few hundred bytes beside its own, so the frames are
+ * counted as well as the bytes. Past either the page is closed.
+ */
+export const MAX_UNREAD_BYTES = 2 * MAX_FRAME_BYTES;
+export const MAX_UNREAD_FRAMES = 256;
+/**
+ * The most a page's queue may hold, its own invoke included, for an invoke
+ * to go out; one always goes onto an empty queue. Past it the call waits
+ * for room (#hold), so a member's calls never close a page: a page that
+ * stopped reading held every invoke sent it, 116 MiB for 120 calls of 1 MB,
+ * and a page reading on a slow link was closed by the next pong once
+ * invokes had filled its queue (ADR 0024's notes). Half MAX_UNREAD_BYTES,
+ * so what invokes hold leaves a frame of the largest size of room for
+ * everything else, and what else the relay sends a page is far smaller.
+ */
+export const INVOKE_ROOM = MAX_FRAME_BYTES;
 const MAX_ROSTER_CLIENTS = 20;
 /**
  * Each call moves its attachment's expiresAt, but the roster carrying it is
@@ -271,6 +576,16 @@ const MAX_ROSTER_CLIENTS = 20;
  * keep the operator's roster rows moving under their pointer.
  */
 export const EXPIRY_ROSTER_REFRESH_MS = 60_000;
+/**
+ * Promotions and minted invites one page may make together per rate-limit
+ * window. Each writes audit records the operator caused, which ADR 0019
+ * writes in full, and a page session needs no credential, so a page with
+ * one member attached could otherwise toggle a role or mint and cancel
+ * invites fast enough to rotate every other record out of the log. Ten a
+ * minute is more than a person clicking needs; what takes access away
+ * (a demotion, a revoke, a cancel) is never counted or refused.
+ */
+export const OPERATOR_GRANTS_PER_PAGE = 10;
 
 /**
  * Page error codes become SPEC section 7 codes. tool_error is not here: it
@@ -297,6 +612,14 @@ const PAGE_ERRORS: Record<Exclude<PageErrorCode, 'tool_error'>, HubError> = {
 function hubError(code: ErrorCode, message: string): HubError {
   return { kind: 'error', code, message };
 }
+
+/** "2.5 MiB", for messages about memory. */
+function mebibytes(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+/** A request's charge against what requests waiting on pages may hold, and its return. */
+type HeldBytes = { kind: 'held'; release: () => void } | HubError;
 
 function notAttached(pageId: string): HubError {
   return hubError('not_attached', `you are not attached to page ${pageId}`);
@@ -402,21 +725,68 @@ class SchemaTooDeep extends Error {}
 class SchemaKeyTooLong extends Error {}
 
 /**
+ * What a listed tool keeps on the heap, counted as it is cut: the values and
+ * object keys of the copy clients are shown, and the characters of every
+ * string it holds. limits.toolBytes is charged from this (heldBytes), never
+ * from the frame's size on the wire (S9, ADR 0018).
+ */
+interface HeldTally {
+  nodes: number;
+  chars: number;
+}
+
+/**
+ * Counts a string the cut copy keeps. A cut string is a new one that may
+ * still point into the page's original, so both are counted.
+ */
+function holdText(text: string, tally: HeldTally): string {
+  const cut = truncate(text, MAX_DESCRIPTION_CHARS);
+  tally.nodes += 1;
+  tally.chars += cut.truncated ? text.length + cut.text.length : text.length;
+  return cut.text;
+}
+
+/** Counts a small value the relay made itself and keeps as it is, such as a stub schema. */
+function holdValue(value: unknown, tally: HeldTally): void {
+  tally.nodes += 1;
+  if (typeof value === 'string') tally.chars += value.length;
+  else if (Array.isArray(value)) for (const item of value) holdValue(item, tally);
+  else if (typeof value === 'object' && value !== null) {
+    for (const [key, item] of Object.entries(value)) {
+      tally.nodes += 1;
+      tally.chars += key.length;
+      holdValue(item, tally);
+    }
+  }
+}
+
+/**
  * Every string anywhere in a schema is page text: enum values, defaults,
  * examples, patterns and comments reach the model as surely as descriptions do,
  * so all of them are cut to the description cap (S10).
  */
-function cutSchemaText(value: unknown, depth: number, position: SchemaPosition): unknown {
+function cutSchemaText(
+  value: unknown,
+  depth: number,
+  position: SchemaPosition,
+  tally: HeldTally,
+): unknown {
   if (depth > MAX_SCHEMA_DEPTH) throw new SchemaTooDeep();
-  if (typeof value === 'string') return truncate(value, MAX_DESCRIPTION_CHARS).text;
-  if (Array.isArray(value)) return value.map((item) => cutSchemaText(item, depth + 1, position));
+  if (typeof value === 'string') return holdText(value, tally);
+  tally.nodes += 1;
+  if (Array.isArray(value)) {
+    return value.map((item) => cutSchemaText(item, depth + 1, position, tally));
+  }
   if (typeof value !== 'object' || value === null) return value;
   // fromEntries defines own properties, so a "__proto__" key stays a plain key.
   return Object.fromEntries(
     Object.entries(value).map(([key, item]) => {
       // A key cannot be cut without changing what it names, so a long one removes the schema.
       if (key.length > MAX_DESCRIPTION_CHARS) throw new SchemaKeyTooLong();
-      return [key, cutSchemaEntry(key, item, depth + 1, position)];
+      // A key is a slot in its object, and its text when no other object shares it.
+      tally.nodes += 1;
+      tally.chars += key.length;
+      return [key, cutSchemaEntry(key, item, depth + 1, position, tally)];
     }),
   );
 }
@@ -426,18 +796,21 @@ function cutSchemaEntry(
   item: unknown,
   depth: number,
   position: SchemaPosition,
+  tally: HeldTally,
 ): unknown {
-  if (position === 'names') return cutSchemaText(item, depth, 'schema');
-  if (position === 'data') return cutSchemaText(item, depth, 'data');
+  if (position === 'names') return cutSchemaText(item, depth, 'schema', tally);
+  if (position === 'data') return cutSchemaText(item, depth, 'data', tally);
   if (SCHEMA_TEXT_KEYS.has(key) && typeof item !== 'string') {
-    return `[tabdock: non-string ${key} removed]`;
+    const removed = `[tabdock: non-string ${key} removed]`;
+    holdValue(removed, tally);
+    return removed;
   }
   const next = SCHEMA_NAME_MAP_KEYS.has(key)
     ? 'names'
     : SCHEMA_DATA_KEYS.has(key)
       ? 'data'
       : 'schema';
-  return cutSchemaText(item, depth, next);
+  return cutSchemaText(item, depth, next, tally);
 }
 
 function removedSchema(why: string): JsonObject {
@@ -449,31 +822,75 @@ function removedSchema(why: string): JsonObject {
  * big or too deep to pass along, or with a key too long to pass, is replaced by
  * a stub that says so (S9).
  */
-function cutSchema(schema: JsonObject): JsonObject {
+function cutSchema(schema: JsonObject, tally: HeldTally): JsonObject {
+  // Counted apart, since a copy replaced by a stub is not kept.
+  const counted: HeldTally = { nodes: 0, chars: 0 };
+  const stub = (why: string): JsonObject => {
+    const removed = removedSchema(why);
+    holdValue(removed, tally);
+    return removed;
+  };
   let cut: JsonObject;
   try {
-    cut = cutSchemaText(schema, 0, 'schema') as JsonObject;
+    cut = cutSchemaText(schema, 0, 'schema', counted) as JsonObject;
   } catch (error) {
     if (error instanceof SchemaTooDeep) {
-      return removedSchema(`nested more than ${String(MAX_SCHEMA_DEPTH)} levels deep`);
+      return stub(`nested more than ${String(MAX_SCHEMA_DEPTH)} levels deep`);
     }
     if (error instanceof SchemaKeyTooLong) {
-      return removedSchema(`a key longer than ${String(MAX_DESCRIPTION_CHARS)} characters`);
+      return stub(`a key longer than ${String(MAX_DESCRIPTION_CHARS)} characters`);
     }
     throw error;
   }
   const size = JSON.stringify(cut).length;
-  return size > MAX_SCHEMA_CHARS ? removedSchema(`${String(size)} characters`) : cut;
+  if (size > MAX_SCHEMA_CHARS) return stub(`${String(size)} characters`);
+  tally.nodes += counted.nodes;
+  tally.chars += counted.chars;
+  return cut;
 }
 
-/** Every page-written string in a tool is capped once, as it arrives, before any client sees it. */
-function cutTool(tool: PageTool, inputSchema = cutSchema(tool.inputSchema)): PageTool {
-  return {
-    ...tool,
-    description: truncate(tool.description, MAX_DESCRIPTION_CHARS).text,
-    inputSchema,
-  };
+/**
+ * Every page-written string in a tool is capped once, as it arrives, before
+ * any client sees it. What the copy keeps, a stub schema given in place of the
+ * page's included, is added to the tally.
+ */
+function cutTool(tool: PageTool, tally: HeldTally, stubSchema?: JsonObject): PageTool {
+  let inputSchema: JsonObject;
+  if (stubSchema === undefined) {
+    inputSchema = cutSchema(tool.inputSchema, tally);
+  } else {
+    holdValue(stubSchema, tally);
+    inputSchema = stubSchema;
+  }
+  // The spread keeps the parsed tool's name, title and annotations as they are.
+  holdValue(tool.name, tally);
+  if (tool.title !== undefined) holdValue(tool.title, tally);
+  if (tool.annotations !== undefined) holdValue(tool.annotations, tally);
+  return { ...tool, description: holdText(tool.description, tally), inputSchema };
 }
+
+/**
+ * What one listed tool is charged against limits.toolBytes (S9, ADR 0018): an
+ * upper bound on the heap it holds, never its size on the wire. A frame of
+ * small empty objects or arrays holds many times its size in the copies
+ * clients are shown, while long text the relay cuts or replaces holds little
+ * of it. Each value and key of the cut copy costs TOOL_NODE_HEAP_BYTES, which
+ * covers an object, its hidden class when its keys are its own, and its slot
+ * in its parent; each character kept, the prepared schema's included, costs
+ * two bytes, since one character past Latin-1 makes V8 store a whole string at
+ * two bytes each; and TOOL_HEAP_BYTES covers the rest of the tool's record
+ * (its hashes, its check and the maps that hold them). The constants were
+ * measured with a probe of node-dense, string-heavy and two-byte frames under
+ * --expose-gc, and sit above the most any of them held (tool-heap.test.ts).
+ */
+function heldBytes(tally: HeldTally, preparedChars: number): number {
+  return TOOL_HEAP_BYTES + tally.nodes * TOOL_NODE_HEAP_BYTES + 2 * (tally.chars + preparedChars);
+}
+
+/** Heap a listed tool holds besides its nodes and characters; see heldBytes. */
+export const TOOL_HEAP_BYTES = 1024;
+/** Heap one value or key of a tool's cut copy may hold; see heldBytes. */
+export const TOOL_NODE_HEAP_BYTES = 128;
 
 /**
  * Schema nodes (objects, arrays and plain values) the main thread walks for
@@ -562,6 +979,13 @@ export class PageHub {
    * checks prepared from the page's own schemas (ADR 0008).
    */
   readonly #listed = new Map<string, Map<string, ListedTool>>();
+  /**
+   * What each page's listed tools are charged against limits.toolBytes: an
+   * upper bound on the heap their cut copies and prepared schemas hold
+   * (heldBytes), which a frame's size on the wire is not (S9, ADR 0018).
+   */
+  readonly #toolBytes = new Map<string, number>();
+  #toolBytesHeld = 0;
   /** The only place CfWorker runs: a worker thread with a time budget per check (ADR 0010). */
   readonly #checker: ArgumentChecker;
   /** When each page last got a roster, for EXPIRY_ROSTER_REFRESH_MS. */
@@ -583,8 +1007,48 @@ export class PageHub {
   readonly #userLimiter: SlidingWindowLimiter;
   readonly #pageLimiter: SlidingWindowLimiter;
   readonly #callLimiter: SlidingWindowLimiter;
+  /**
+   * What the /mcp requests waiting on a page hold on the heap, by user and
+   * in all, each charged its body's upper bound (request-heap.ts) from
+   * when it may start waiting until it is answered (#holdBytes).
+   */
+  readonly #heldBytes = new Map<string, number>();
+  #heldTotal = 0;
   /** Tools frames per remote address, shared by its sockets and kept across reconnects. */
   readonly #toolsFrameLimiter: SlidingWindowLimiter;
+  /**
+   * Lines of frames that changed nothing, per remote address: written in full
+   * up to ignoredFramesPerAddress a window, across the address's sockets and
+   * reconnects, then held back and counted (#ignored, ADR 0023).
+   */
+  readonly #ignoredLines: RepeatedLines;
+  /**
+   * Lines each page connection writes, per remote address: written in full
+   * up to connectionLinesPerAddress a window, then counted by message into
+   * one line for the address (#connectionLine, ADR 0023's notes).
+   */
+  readonly #connectionLines: RepeatedLines;
+  /** The hub's own lines, which a frame's handler can hold until it is known whether it changed anything. */
+  readonly #frameLog: FrameLog;
+  /**
+   * Requests each page just had ended, by id, oldest first: a decision the
+   * page sends for one is expected, since the page may not yet know (#decision).
+   */
+  readonly #endedRequests = new Map<string, { pageId: string; until: number }>();
+  /**
+   * Redemptions of one invite, whoever makes them (ADR 0017), keyed by page
+   * and invite id, so only live invites, which a page holds ten of at most,
+   * are ever keys.
+   */
+  readonly #inviteLimiter: SlidingWindowLimiter;
+  /** One per live invite, keyed by inviteKey: fires at the invite's expiresAt. */
+  readonly #inviteTimers = new Map<string, NodeJS.Timeout>();
+  /** Promotions and mints per page (OPERATOR_GRANTS_PER_PAGE), kept across its reconnects. */
+  readonly #grantLimiter: SlidingWindowLimiter;
+  /** One warning per page and window once its grants run out, so a flood writes no line per frame. */
+  readonly #grantWarnings: SlidingWindowLimiter;
+  /** Refusals that reached no page pass this before the audit log (ADR 0019). */
+  readonly #budget: AuditRefusalBudget;
   /** The M3 spike's pairing milestones (spike.ts), when TABDOCK_SPIKE is on. */
   readonly #spike: SpikeHooks | null;
   #closed = false;
@@ -597,7 +1061,8 @@ export class PageHub {
   ) {
     this.#config = config;
     this.#store = store;
-    this.#log = log;
+    this.#frameLog = new FrameLog(log);
+    this.#log = this.#frameLog;
     this.#spike = spike;
     const {
       pairAttemptsPerUser,
@@ -606,12 +1071,53 @@ export class PageHub {
       windowMs,
       toolsFramesPerAddress,
       toolsFramesWindowMs,
+      ignoredFramesPerAddress,
+      connectionLinesPerAddress,
+      redemptionsPerInvite,
+      auditRefusalsPerUser,
+      auditRefusalsForStrangers,
     } = config.rateLimits;
     this.#userLimiter = new SlidingWindowLimiter(pairAttemptsPerUser, windowMs);
     this.#pageLimiter = new SlidingWindowLimiter(pairAttemptsPerPage, windowMs);
     this.#callLimiter = new SlidingWindowLimiter(callsPerUserPerPage, windowMs);
     this.#toolsFrameLimiter = new SlidingWindowLimiter(toolsFramesPerAddress, toolsFramesWindowMs);
+    this.#ignoredLines = new RepeatedLines({
+      linesPerKey: ignoredFramesPerAddress,
+      windowMs,
+      maxKeys: MAX_ADDRESSES_HOLDING_LINES,
+      summary: (address, held) => {
+        log.warn('page frames that changed nothing went unlogged', {
+          ...(address === null ? { addresses: 'more than tracked' } : { address }),
+          repeated: held.repeated,
+          frames: held.reasons,
+        });
+      },
+    });
+    this.#connectionLines = new RepeatedLines({
+      linesPerKey: connectionLinesPerAddress,
+      windowMs,
+      maxKeys: MAX_ADDRESSES_HOLDING_LINES,
+      summary: (address, held) => {
+        log.warn('page connection lines went unlogged', {
+          ...(address === null ? { addresses: 'more than tracked' } : { address }),
+          repeated: held.repeated,
+          lines: held.reasons,
+        });
+      },
+    });
+    this.#inviteLimiter = new SlidingWindowLimiter(redemptionsPerInvite, windowMs);
+    this.#grantLimiter = new SlidingWindowLimiter(OPERATOR_GRANTS_PER_PAGE, windowMs);
+    this.#grantWarnings = new SlidingWindowLimiter(1, windowMs);
     this.#checker = new ArgumentChecker({ budgetMs: config.timings.argumentCheckMs, log });
+    this.#budget = new AuditRefusalBudget({
+      perUser: auditRefusalsPerUser,
+      strangers: auditRefusalsForStrangers,
+      windowMs,
+      holds: (userId) => this.holds(userId),
+      write: (event) => {
+        this.#audit(event);
+      },
+    });
   }
 
   /**
@@ -635,17 +1141,39 @@ export class PageHub {
   admitSocket(address: string): SocketRefusal | null {
     const { pageSocketsPerAddress, pageSessions } = this.#config.limits;
     if ((this.#socketsByAddress.get(address) ?? 0) >= pageSocketsPerAddress) {
-      this.#log.warn('page socket refused: too many from one address', { address });
+      this.connectionLine(address, 'warn', 'page socket refused: too many from one address', {
+        address,
+      });
       return { status: 429, message: 'Too many page sockets from this address' };
     }
     // Ending asleep pages frees no sockets, so open ones alone are refused outright.
     if (this.#conns.size >= pageSessions) {
-      this.#log.warn('page socket refused: the relay holds the most page sockets allowed', {
+      this.connectionLine(
         address,
-      });
+        'warn',
+        'page socket refused: the relay holds the most page sockets allowed',
+        { address },
+      );
       return { status: 503, message: 'The relay holds as many pages as it can; try again later' };
     }
     return null;
+  }
+
+  /**
+   * A line one page connection writes, from an upgrade relay.ts refuses to
+   * the page it made going: within connectionLinesPerAddress a window for
+   * its remote address, and past that counted, by message, into one line
+   * for the address when the window ends (ADR 0023's notes). /page needs no
+   * credential and each connection writes a few such lines, so without this
+   * a script wrote them as fast as it could connect, to the stderr copy that
+   * carries the audit checkpoints (ADR 0019). The address is the key the
+   * per-address limits count by; a request whose client the edge did not
+   * name is keyed by what was wrong. Never held with a frame's own lines.
+   */
+  connectionLine(address: string, level: LogLevel, message: string, fields: LogFields): void {
+    if (this.#connectionLines.take(address, message, undefined)) {
+      this.#frameLog.kept[level](message, fields);
+    }
   }
 
   /**
@@ -662,25 +1190,36 @@ export class PageHub {
     if ((own?.pages.size ?? 0) >= pageSessionsPerAddress) {
       const oldest = firstOf(own?.asleep);
       if (oldest === undefined) {
-        this.#log.warn('page session refused: too many from one address', { address });
+        this.connectionLine(address, 'warn', 'page session refused: too many from one address', {
+          address,
+        });
         return 'too many pages from this address; try again later';
       }
-      this.#log.info("ended this address's page asleep longest to make room for its new one", {
-        pageId: oldest,
-      });
+      this.connectionLine(
+        address,
+        'info',
+        "ended this address's page asleep longest to make room for its new one",
+        { pageId: oldest },
+      );
       this.#gone(oldest);
     }
     if (this.#pageAddress.size >= pageSessions) {
       const oldest = firstOf(own?.asleep) ?? firstOf(this.#asleep);
       if (oldest === undefined) {
-        this.#log.warn('page session refused: the relay holds the most page sessions allowed', {
+        this.connectionLine(
           address,
-        });
+          'warn',
+          'page session refused: the relay holds the most page sessions allowed',
+          { address },
+        );
         return 'the relay holds as many pages as it can; try again later';
       }
-      this.#log.info('ended the page asleep longest to make room for a new one', {
-        pageId: oldest,
-      });
+      this.connectionLine(
+        address,
+        'info',
+        'ended the page asleep longest to make room for a new one',
+        { pageId: oldest },
+      );
       this.#gone(oldest);
     }
     return null;
@@ -703,22 +1242,37 @@ export class PageHub {
       idleTimer: null,
       inflight: new Map(),
       toolsFrames: [],
+      ignoredFrames: [],
+      queue: { epoch: 0, frames: 0, counted: 0 },
+      held: [],
     };
     this.#conns.add(conn);
     this.#socketsByAddress.set(address, (this.#socketsByAddress.get(address) ?? 0) + 1);
     conn.helloTimer = setTimeout(() => {
-      this.#log.info('closing page socket: no hello in time', { origin, address });
+      this.connectionLine(address, 'info', 'closing page socket: no hello in time', {
+        origin,
+        address,
+      });
       this.#closeSocket(conn, CLOSE_POLICY, 'hello timeout');
     }, this.#config.timings.helloTimeoutMs);
     conn.helloTimer.unref();
     ws.on('message', (data, isBinary) => {
       this.#onMessage(conn, data, isBinary);
     });
+    // The WebSocket ping control frame, which relay.ts stops ws answering on its
+    // own: its pong is queued like any frame the relay sends, within the same bound.
+    ws.on('ping', (data) => {
+      if (conn.closing || ws.readyState !== ws.OPEN) return;
+      if (!this.#roomFor(conn, data.length)) return;
+      this.#write(conn, true, (written) => {
+        ws.pong(data, false, written);
+      });
+    });
     ws.on('close', (code) => {
       this.#onClose(conn, code);
     });
     ws.on('error', (error) => {
-      this.#log.warn('page socket error', { pageId: conn.pageId, error });
+      this.connectionLine(address, 'warn', 'page socket error', { pageId: conn.pageId, error });
     });
   }
 
@@ -726,20 +1280,36 @@ export class PageHub {
     if (conn.closing) return;
     conn.idleTimer?.refresh();
     if (isBinary) {
-      this.#log.warn('closing page socket: binary frame', { pageId: conn.pageId });
+      this.connectionLine(conn.address, 'warn', 'closing page socket: binary frame', {
+        pageId: conn.pageId,
+      });
       this.#closeSocket(conn, CLOSE_POLICY, 'binary frames are not accepted');
       return;
     }
-    const parsed = parsePageFrame(rawToText(data));
+    const text = rawToText(data);
+    const parsed = parsePageFrame(text);
     if (parsed.kind === 'unknown') {
-      this.#log.warn('ignored a frame of unknown type', {
-        pageId: conn.pageId,
-        frameType: parsed.type,
+      const { pageId } = conn;
+      // The first frame must be hello, whatever comes instead (ADR 0023).
+      if (pageId === null) {
+        this.connectionLine(
+          conn.address,
+          'warn',
+          'closing page socket: first frame was not hello',
+          { frameType: parsed.type },
+        );
+        this.#closeSocket(conn, CLOSE_POLICY, 'first frame must be hello');
+        return;
+      }
+      // A newer adapter's frame, or junk: ignored, and logged within the budget.
+      this.#mayChangeNothing(conn, 'unknown type', () => {
+        this.#log.warn('ignored a frame of unknown type', { pageId, frameType: parsed.type });
+        return false;
       });
       return;
     }
     if (parsed.kind === 'invalid') {
-      this.#log.warn('closing page socket: malformed frame', {
+      this.connectionLine(conn.address, 'warn', 'closing page socket: malformed frame', {
         pageId: conn.pageId,
         reason: parsed.reason,
       });
@@ -752,30 +1322,40 @@ export class PageHub {
       if (frame.t === 'hello') {
         this.#hello(conn, frame);
       } else {
-        this.#log.warn('closing page socket: first frame was not hello', { frameType: frame.t });
+        this.connectionLine(
+          conn.address,
+          'warn',
+          'closing page socket: first frame was not hello',
+          { frameType: frame.t },
+        );
         this.#closeSocket(conn, CLOSE_POLICY, 'first frame must be hello');
       }
       return;
     }
     switch (frame.t) {
       case 'hello':
-        this.#log.warn('closing page socket: second hello', { pageId });
+        this.connectionLine(conn.address, 'warn', 'closing page socket: second hello', { pageId });
         this.#closeSocket(conn, CLOSE_POLICY, 'hello sent twice');
         return;
       case 'tools':
-        if (this.#toolsFrameAllowed(conn)) this.#tools(pageId, frame);
+        if (this.#toolsFrameAllowed(conn)) this.#tools(conn, pageId, frame);
         return;
+      // Each of these says whether it changed anything; one that did not counts (#ignored).
       case 'attach_decision':
-        this.#decision(pageId, frame);
+        this.#mayChangeNothing(conn, frame.t, () => this.#decision(pageId, frame));
         return;
       case 'set_role':
-        this.#setRole(pageId, frame);
+        this.#mayChangeNothing(conn, frame.t, () => this.#setRole(pageId, frame));
         return;
       case 'revoke':
-        this.#revoke(pageId, frame);
+        this.#mayChangeNothing(conn, frame.t, () => this.#revoke(pageId, frame));
         return;
       case 'rotate_pairing':
         this.#rotateTicket(pageId, 'asked by page');
+        return;
+      case 'invite_create':
+      case 'invite_cancel':
+        this.#mayChangeNothing(conn, frame.t, () => this.#inviteFrame(pageId, frame));
         return;
       case 'result':
         this.#result(conn, pageId, frame);
@@ -786,6 +1366,352 @@ export class PageHub {
       case 'pong':
         return;
     }
+  }
+
+  /**
+   * A page minting or cancelling an invite (ADR 0017). A relay with invites
+   * off mints none and sends no invites frame at all (ADR 0017's notes), so a
+   * page that sends one anyway is ignored, its secret's hash unlogged.
+   * Answers whether it minted or closed an invite.
+   */
+  #inviteFrame(pageId: string, frame: FrameOf<'invite_create' | 'invite_cancel'>): boolean {
+    if (!this.#config.invites) {
+      this.#log.warn('ignored an invite frame: this relay mints no invites', {
+        pageId,
+        frameType: frame.t,
+      });
+      return false;
+    }
+    return frame.t === 'invite_create'
+      ? this.#inviteCreate(pageId, frame)
+      : this.#inviteCancel(pageId, frame);
+  }
+
+  // Invites (ADRs 0016 and 0017)
+
+  /** `<public URL>/i`, where links start, or null where no invite can be minted. */
+  #linkBase(): string | null {
+    const { publicUrl } = this.#config;
+    return publicUrl === null ? null : `${publicUrl}${INVITE_PATH}`;
+  }
+
+  /** The page's own terms back, with what only the relay knows: uses left, sponsor, pending, refusals. */
+  #listing(invite: InviteRecord): InviteListing {
+    return {
+      inviteId: invite.inviteId,
+      role: invite.role,
+      label: invite.label,
+      uses: invite.uses,
+      // On the page's clock, as it asked, so the adapter matches its own record.
+      expiresAt: invite.requestedExpiresAt,
+      usesLeft: invite.usesLeft,
+      sponsor: { ...invite.sponsor },
+      pending: this.#pendingOn(invite).length > 0,
+      refusals: invite.refusals,
+    };
+  }
+
+  /** Redemptions of this invite still waiting on the operator. */
+  #pendingOn(invite: InviteRecord): AttachRequestRecord[] {
+    return this.#store.requests
+      .listForPage(invite.pageId)
+      .filter((request) => request.inviteId === invite.inviteId);
+  }
+
+  /** The page's live invites, after each welcome and on every change; refused answers an invite_create. */
+  #sendInvites(pageId: string, refused?: { inviteId: string; reason: InviteRefusalReason }): void {
+    if (!this.#config.invites) return;
+    const conn = this.#live.get(pageId);
+    if (!conn) return;
+    this.#send(conn, {
+      t: 'invites',
+      linkBase: this.#linkBase(),
+      invites: this.#store.invites.listForPage(pageId).map((invite) => this.#listing(invite)),
+      ...(refused === undefined ? {} : { refused }),
+    });
+  }
+
+  /**
+   * The member attached longest, who sponsors whatever the page mints now
+   * and stays its sponsor: /i shows the name, so it never moves to another
+   * (ADR 0017). An attachment past its time sponsors nothing, and neither
+   * does one let in by the invite of a member past theirs, so each member is
+   * looked at through #chainInTime, which ends whoever is due as the timer
+   * would; otherwise the page would list a link that #findInvite refuses on
+   * arrival, at the cost of one of its grants.
+   */
+  #sponsorOf(pageId: string): AttachmentRecord | null {
+    let sponsor: AttachmentRecord | null = null;
+    for (const attachment of this.#store.attachments.listForPage(pageId)) {
+      if (attachment.kind !== 'member') continue;
+      // An earlier member's end may have ended this one already; the walk then says so.
+      if (!this.#chainInTime(pageId, attachment.userId)) continue;
+      if (sponsor === null || attachment.grantedAt < sponsor.grantedAt) sponsor = attachment;
+    }
+    return sponsor;
+  }
+
+  /**
+   * Mints an invite as far as the page's policy, its sponsor and the bounds
+   * allow, keeping only the digest of its secret, and answers with an invites
+   * frame either way, so the adapter's invite() always settles. The relay
+   * judges expiresAt on its own clock: one under MIN_INVITE_REMAINING_MS away
+   * says the page's clock runs behind, and none lasts past 24 hours.
+   * Answers whether it minted one.
+   */
+  #inviteCreate(pageId: string, frame: FrameOf<'invite_create'>): boolean {
+    const page = this.#store.pages.get(pageId);
+    if (!page) return false;
+    const now = Date.now();
+    const refuse = (reason: InviteRefusalReason): void => {
+      this.#log.info('invite refused', { pageId, inviteId: frame.inviteId, reason });
+      this.#sendInvites(pageId, { inviteId: frame.inviteId, reason });
+    };
+    // A secret digest is unique across the relay, so a lookup by it finds one invite.
+    if (
+      this.#store.invites.get(pageId, frame.inviteId) !== undefined ||
+      this.#store.invites.findBySecretHash(frame.secretHash) !== undefined
+    ) {
+      refuse('duplicate');
+      return false;
+    }
+    if (
+      page.policy.invites === 'off' ||
+      (frame.role === 'driver' && page.policy.invites !== 'all')
+    ) {
+      refuse('policy');
+      return false;
+    }
+    if (this.#linkBase() === null) {
+      refuse('no_public_url');
+      return false;
+    }
+    const sponsor = this.#sponsorOf(pageId);
+    if (sponsor === null) {
+      refuse('no_sponsor');
+      return false;
+    }
+    if (frame.expiresAt !== null && frame.expiresAt - now < MIN_INVITE_REMAINING_MS) {
+      refuse('expired');
+      return false;
+    }
+    // Past the page's grants, a mint is refused as one past the live limit is,
+    // so the adapter's invite() still settles and the page sees why.
+    if (
+      this.#store.invites.listForPage(pageId).length >= MAX_LIVE_INVITES_PER_PAGE ||
+      !this.#grantAllowed(pageId, now)
+    ) {
+      refuse('limit');
+      return false;
+    }
+    const longest = now + MAX_INVITE_LIFETIME_MS;
+    const invite: InviteRecord = {
+      inviteId: frame.inviteId,
+      pageId,
+      role: frame.role,
+      label: frame.label,
+      uses: frame.uses,
+      usesLeft: frame.uses,
+      createdAt: now,
+      requestedExpiresAt: frame.expiresAt,
+      expiresAt: frame.expiresAt === null ? longest : Math.min(frame.expiresAt, longest),
+      secretHash: frame.secretHash,
+      sponsor: { userId: sponsor.userId, displayName: sponsor.displayName },
+      pendingRequestId: null,
+      refusals: 0,
+      barredUserIds: [],
+      barredEmailHashes: [],
+    };
+    this.#store.invites.put(invite);
+    this.#armInviteExpiry(invite);
+    this.#audit({
+      v: AUDIT_VERSION,
+      type: 'invite_minted',
+      at: now,
+      pageId,
+      origin: page.origin,
+      inviteId: invite.inviteId,
+      role: invite.role,
+      uses: invite.uses,
+      expiresAt: invite.requestedExpiresAt,
+      sponsor: sponsor.userId,
+    });
+    this.#log.info('invite minted', {
+      pageId,
+      inviteId: invite.inviteId,
+      role: invite.role,
+      uses: invite.uses,
+    });
+    this.#sendInvites(pageId);
+    return true;
+  }
+
+  /**
+   * Counts one promotion or mint against the page's OPERATOR_GRANTS_PER_PAGE,
+   * or says it is past them. Keyed by page id, which only pairing gives an
+   * attachment, so a page that starts a new session to reset it needs its
+   * members to pair again, which their own limits bound.
+   */
+  #grantAllowed(pageId: string, now: number): boolean {
+    if (this.#grantLimiter.allows(pageId, now)) {
+      this.#grantLimiter.record(pageId, now);
+      return true;
+    }
+    if (this.#grantWarnings.allows(pageId, now)) {
+      this.#grantWarnings.record(pageId, now);
+      this.#log.warn('promotion or invite refused: the page made too many this window', {
+        pageId,
+      });
+    }
+    return false;
+  }
+
+  /**
+   * Closes one invite's link; the attachments it already made stay (ADR
+   * 0017's notes). Answers whether a live invite was named.
+   */
+  #inviteCancel(pageId: string, frame: FrameOf<'invite_cancel'>): boolean {
+    const invite = this.#store.invites.get(pageId, frame.inviteId);
+    if (invite) this.#closeInvite(invite, 'cancelled', false);
+    this.#sendInvites(pageId);
+    return invite !== undefined;
+  }
+
+  #armInviteExpiry(invite: InviteRecord): void {
+    const { pageId, inviteId } = invite;
+    this.#setTimer(
+      this.#inviteTimers,
+      attachmentKey(pageId, inviteId),
+      Math.max(0, invite.expiresAt - Date.now()),
+      () => {
+        const current = this.#store.invites.get(pageId, inviteId);
+        if (current) this.#closeInvite(current, 'expired');
+      },
+    );
+  }
+
+  /**
+   * An invite stops being live: its record and timer go, a redemption still
+   * waiting on it ends, and the page hears of it unless the caller sends one
+   * frame for several. The attachments it made stay; they keep their own cap,
+   * sponsor and end (store.ts).
+   */
+  #closeInvite(invite: InviteRecord, reason: InviteCloseReason, send = true): void {
+    const { pageId, inviteId } = invite;
+    if (!this.#store.invites.delete(pageId, inviteId)) return;
+    this.#clearTimer(this.#inviteTimers, attachmentKey(pageId, inviteId));
+    this.#audit({
+      v: AUDIT_VERSION,
+      type: 'invite_closed',
+      at: Date.now(),
+      pageId,
+      origin: this.#store.pages.get(pageId)?.origin ?? '',
+      inviteId,
+      reason,
+    });
+    this.#log.info('invite closed', { pageId, inviteId, reason });
+    const outcome: HubError =
+      reason === 'expired' || reason === 'used_up' || reason === 'burned'
+        ? hubError('pairing_expired', 'this invite is no longer live')
+        : reason === 'page_gone'
+          ? hubError('page_gone', 'the page closed and did not come back')
+          : reason === 'sponsor_gone'
+            ? hubError(
+                'denied_by_operator',
+                'the member who shared this invite is no longer attached, so it closed',
+              )
+            : hubError('denied_by_operator', 'the page operator closed this invite');
+    for (const request of this.#pendingOn(invite)) this.#endRequest(request.requestId, outcome);
+    if (send) this.#sendInvites(pageId);
+  }
+
+  /** Bars an account, and its verified email when it has one, from an invite for the invite's life. */
+  #bar(invite: InviteRecord, userId: string, emailHash: string | null): void {
+    if (!invite.barredUserIds.includes(userId)) invite.barredUserIds.push(userId);
+    if (emailHash !== null && !invite.barredEmailHashes.includes(emailHash)) {
+      invite.barredEmailHashes.push(emailHash);
+    }
+    this.#store.invites.put(invite);
+  }
+
+  #barred(invite: InviteRecord, userId: string, account: UserAccount): boolean {
+    if (invite.barredUserIds.includes(userId)) return true;
+    return (
+      account.kind === 'invitee' &&
+      account.email !== null &&
+      invite.barredEmailHashes.includes(emailBarDigest(account.email))
+    );
+  }
+
+  /** Invite-made attachments may hold every seat but MEMBER_RESERVED_SEATS (S14). */
+  #inviteSeatsFull(pageId: string, waiting: number): boolean {
+    const made = this.#store.attachments
+      .listForPage(pageId)
+      .filter((attachment) => attachment.inviteId !== null).length;
+    return made + waiting >= this.#config.limits.usersPerPage - MEMBER_RESERVED_SEATS;
+  }
+
+  /**
+   * A live invite by its presented secret: found by digest and confirmed in
+   * constant time, as codes and nonces are (S3), unexpired, with a use left
+   * and still sponsored (#sponsored). Unknown, spent, cancelled, expired and
+   * unsponsored look alike.
+   */
+  #findInvite(secret: string, now: number): InviteRecord | null {
+    if (!InviteSecretSchema.safeParse(secret).success) return null;
+    const hash = digest(secret);
+    const invite = this.#store.invites.findBySecretHash(hash.toString('hex'));
+    if (!invite || !sameDigest(Buffer.from(invite.secretHash, 'hex'), hash)) return null;
+    if (invite.expiresAt <= now || invite.usesLeft <= 0) return null;
+    return this.#sponsored(invite) ? invite : null;
+  }
+
+  /**
+   * Whether the invite still has its sponsor: their attachment, and each one
+   * above it, in time (#chainInTime). Ending any of those closes this invite
+   * and answers what waits on it (#loseSponsors); otherwise a redemption in
+   * the gap before a late timer would reach the page and could be approved.
+   */
+  #sponsored(invite: InviteRecord): boolean {
+    return this.#chainInTime(invite.pageId, invite.sponsor.userId);
+  }
+
+  /**
+   * Whether this user's attachment to the page, and each member's above it
+   * through the invites that let them in, is there and within its time. An
+   * expiry timer may run late, and an attachment past its time is over and
+   * sponsors nothing however late its timer runs, so each one found due is
+   * ended here as its timer would end it (#expireIfDue); that end takes the
+   * invites it sponsored and the attachments they made with it
+   * (#loseSponsors), so a guest below a lapsed member is ended too. A call,
+   * list_page_tools, list_pages, detach_page, a pairing and a redemption run
+   * it for their caller before relying on the attachment, and a mint for each
+   * member before naming a sponsor.
+   */
+  #chainInTime(pageId: string, userId: string): boolean {
+    const seen = new Set<string>();
+    let next: string | null = userId;
+    while (next !== null && !seen.has(next)) {
+      seen.add(next);
+      const attachment = this.#store.attachments.get(pageId, next);
+      // A sponsor's end ends what their invites made, so a missing sponsor is only a guard.
+      if (attachment === undefined || this.#expireIfDue(pageId, next)) return false;
+      next = attachment.sponsorId;
+    }
+    return true;
+  }
+
+  /** A control invite's prompt was refused or ran out: three burn it (ADR 0016). */
+  #inviteRefused(pageId: string, inviteId: string): void {
+    const invite = this.#store.invites.get(pageId, inviteId);
+    if (invite?.role !== 'driver') return;
+    invite.refusals = Math.min(INVITE_BURN_REFUSALS, invite.refusals + 1);
+    if (invite.refusals >= INVITE_BURN_REFUSALS) {
+      this.#closeInvite(invite, 'burned');
+      return;
+    }
+    this.#store.invites.put(invite);
+    this.#sendInvites(pageId);
   }
 
   #hello(conn: Conn, frame: FrameOf<'hello'>): void {
@@ -802,7 +1728,7 @@ export class PageHub {
         // The token stays a secret even when it is refused; only the reason is
         // logged. A refused token's session is left as it was, still resumable
         // by its own page.
-        this.#log.warn('resume refused; starting a new page session', {
+        this.connectionLine(conn.address, 'warn', 'resume refused; starting a new page session', {
           origin: conn.origin,
           reason: refused,
         });
@@ -832,7 +1758,7 @@ export class PageHub {
       // tell list_pages callers the page is ready while calls still wait.
       page.tools = [];
       page.toolsPending = true;
-      this.#listed.delete(page.pageId);
+      this.#dropListed(page.pageId);
       page.title = frame.title;
       page.url = frame.url;
       page.adapterVersion = frame.adapterVersion;
@@ -889,9 +1815,16 @@ export class PageHub {
       roster: this.#roster(page.pageId),
       limits: this.#limits(),
     });
+    // Right after every welcome with invites on, so the page knows at once
+    // whether it may mint and which of its invites the relay still holds.
+    this.#sendInvites(page.pageId);
     this.#rosterSentAt.set(page.pageId, now);
     this.#startHeartbeat(conn);
-    this.#log.info('page connected', { pageId: page.pageId, origin: page.origin, resumed });
+    this.connectionLine(conn.address, 'info', 'page connected', {
+      pageId: page.pageId,
+      origin: page.origin,
+      resumed,
+    });
   }
 
   #limits(): Limits {
@@ -914,7 +1847,9 @@ export class PageHub {
     }, pingIntervalMs);
     conn.pingTimer.unref();
     conn.idleTimer = setTimeout(() => {
-      this.#log.info('closing silent page socket', { pageId: conn.pageId });
+      this.connectionLine(conn.address, 'info', 'closing silent page socket', {
+        pageId: conn.pageId,
+      });
       this.#closeSocket(conn, CLOSE_GOING_AWAY, 'idle timeout');
     }, idleTimeoutMs);
     conn.idleTimer.unref();
@@ -934,15 +1869,19 @@ export class PageHub {
     const { toolsFramesPerSocket, toolsFramesWindowMs } = this.#config.rateLimits;
     conn.toolsFrames = conn.toolsFrames.filter((at) => at > now - toolsFramesWindowMs);
     if (conn.toolsFrames.length >= toolsFramesPerSocket) {
-      this.#log.warn('closing page socket: too many tools frames', { pageId: conn.pageId });
+      this.connectionLine(conn.address, 'warn', 'closing page socket: too many tools frames', {
+        pageId: conn.pageId,
+      });
       this.#closeSocket(conn, CLOSE_POLICY, 'too many tools frames');
       return false;
     }
     if (!this.#toolsFrameLimiter.allows(conn.address, now)) {
-      this.#log.warn('closing page socket: too many tools frames from its address', {
-        pageId: conn.pageId,
-        address: conn.address,
-      });
+      this.connectionLine(
+        conn.address,
+        'warn',
+        'closing page socket: too many tools frames from its address',
+        { pageId: conn.pageId, address: conn.address },
+      );
       this.#closeSocket(conn, CLOSE_POLICY, 'too many tools frames from this address');
       return false;
     }
@@ -951,7 +1890,45 @@ export class PageHub {
     return true;
   }
 
-  #tools(pageId: string, frame: FrameOf<'tools'>): void {
+  /**
+   * Handles a frame that may change nothing. `handle` answers whether it
+   * changed something (or was a frame the page was expected to send), and
+   * every line it writes is held until then: written as usual if it did,
+   * and otherwise only within the budget for frames that change nothing.
+   */
+  #mayChangeNothing(conn: Conn, kind: string, handle: () => boolean): void {
+    const { result: changed, lines } = this.#frameLog.hold(handle);
+    this.#frameLog.write(lines, changed || this.#ignored(conn, kind));
+  }
+
+  /**
+   * Whether the lines of a frame that changed nothing may be written; one
+   * that may not is counted by its kind, into a summary line for its address
+   * when the window ends (ADR 0023). /page needs no credential, so without
+   * a budget one socket could write a line to stderr for every 16-byte frame,
+   * to the copy that keeps the audit checkpoints and, while the audit disk
+   * fails, the records themselves (ADR 0019). Each socket may write the lines
+   * of ignoredFramesPerSocket such frames a window, and each remote address
+   * those of ignoredFramesPerAddress across its sockets and reconnects. Past
+   * either the lines are held back, never the page: a frame that only logs
+   * is no reason to close a socket, and whoever shares the page's address
+   * can at most spend the address's lines, never end the operator's page
+   * or the calls and requests waiting on it.
+   */
+  #ignored(conn: Conn, kind: string): boolean {
+    const now = Date.now();
+    const { ignoredFramesPerSocket, windowMs } = this.#config.rateLimits;
+    conn.ignoredFrames = conn.ignoredFrames.filter((at) => at > now - windowMs);
+    if (conn.ignoredFrames.length >= ignoredFramesPerSocket) {
+      this.#ignoredLines.hold(conn.address, kind, undefined, now);
+      return false;
+    }
+    if (!this.#ignoredLines.take(conn.address, kind, undefined, now)) return false;
+    conn.ignoredFrames.push(now);
+    return true;
+  }
+
+  #tools(conn: Conn, pageId: string, frame: FrameOf<'tools'>): void {
     const page = this.#store.pages.get(pageId);
     if (!page) return;
     // WebMCP itself refuses duplicate names, so a duplicate is a page bug: keep the first.
@@ -962,6 +1939,9 @@ export class PageHub {
     let nodesLeft = MAX_FRAME_SCHEMA_NODES;
     let overTool = 0;
     let overFrame = 0;
+    const uncheckable: string[] = [];
+    /** What the list as built would hold, in heldBytes's terms. */
+    let charge = 0;
     for (const tool of frame.tools) {
       if (seen.has(tool.name)) continue;
       seen.add(tool.name);
@@ -971,8 +1951,10 @@ export class PageHub {
       if (before && raw !== null && before.raw === raw) {
         listed.set(tool.name, before);
         tools.push(before.tool);
+        charge += before.held;
         continue;
       }
+      const tally: HeldTally = { nodes: 0, chars: 0 };
       // The count stops one node past the limit, and the frame is charged what
       // was counted, so the walk per frame stays within the frame's cap plus one
       // node per tool however many large tools it lists.
@@ -987,6 +1969,7 @@ export class PageHub {
         else overFrame += 1;
         const stub = cutTool(
           tool,
+          tally,
           removedSchema(
             own
               ? `more than ${String(MAX_TOOL_SCHEMA_NODES)} schema nodes`
@@ -994,6 +1977,7 @@ export class PageHub {
           ),
         );
         const check = { schema: null, uncompilable: false, warned: new Set<UncheckedReason>() };
+        const held = heldBytes(tally, 0);
         // Over its own limit it always will be, so it is kept by hash and reused
         // unchanged without another walk, leaving the frame to the tools after it.
         // One stubbed only for the frame's lack of room is walked again next time.
@@ -1002,20 +1986,23 @@ export class PageHub {
           capped: true,
           tool: stub,
           check,
+          held,
         });
         tools.push(stub);
+        charge += held;
         continue;
       }
-      const cut = cutTool(tool);
+      const cut = cutTool(tool, tally);
       // From the page's own schema, not the cut copy, so a long enum value still
       // matches. Prepared here and compiled in the worker, at the tool's first call.
       const schema = prepareForCheck(tool.inputSchema);
       // The same schema again keeps what is known about it, so nothing is logged twice.
       let check = before?.capped === false ? before.check : undefined;
       if (!check || !sameSchema(check.schema, schema)) {
-        if (schema === null) this.#warnUncheckable(pageId, tool.name);
+        if (schema === null) uncheckable.push(tool.name);
         check = { schema, uncompilable: false, warned: new Set() };
       }
+      const held = heldBytes(tally, check.schema?.text.length ?? 0);
       // Hashed for the next frame only when the count covered all of it, so the
       // hash costs no more than the walk did; a schema too deep is walked again.
       listed.set(tool.name, {
@@ -1023,9 +2010,30 @@ export class PageHub {
         capped: false,
         tool: cut,
         check,
+        held,
       });
       tools.push(cut);
+      charge += held;
     }
+    // One relay-wide budget for what every page's tools hold, so pages cannot
+    // fill the heap however they shape their frames (S9, ADR 0018). Charged
+    // what the list as built holds, so it is checked once it is built; the
+    // page's own last list is replaced, so only the difference counts. The
+    // frame already went against its address's tools-frame budget, and the
+    // close leaves the page asleep like any other policy close, its last list
+    // dropped with it.
+    const held = this.#toolBytes.get(pageId) ?? 0;
+    if (this.#toolBytesHeld - held + charge > this.#config.limits.toolBytes) {
+      this.connectionLine(
+        conn.address,
+        'warn',
+        'closing page socket: its tools would pass what all pages may hold',
+        { pageId, address: conn.address },
+      );
+      this.#closeSocket(conn, CLOSE_POLICY, 'tools would pass the relay tool list budget');
+      return;
+    }
+    for (const name of uncheckable) this.#warnUncheckable(pageId, name);
     if (tools.length !== frame.tools.length) {
       this.#log.warn('page listed a tool name twice; kept the first', { pageId });
     }
@@ -1045,7 +2053,21 @@ export class PageHub {
     page.toolsPending = false;
     this.#store.pages.put(page);
     this.#listed.set(pageId, listed);
-    this.#log.debug('page tools updated', { pageId, toolCount: tools.length });
+    this.#toolBytesHeld += charge - held;
+    this.#toolBytes.set(pageId, charge);
+    this.#log.debug('page tools updated', {
+      pageId,
+      toolCount: tools.length,
+      heldBytes: charge,
+      allPagesHeldBytes: this.#toolBytesHeld,
+    });
+  }
+
+  /** Forgets a page's listed tools and what they were charged against limits.toolBytes. */
+  #dropListed(pageId: string): void {
+    this.#listed.delete(pageId);
+    this.#toolBytesHeld -= this.#toolBytes.get(pageId) ?? 0;
+    this.#toolBytes.delete(pageId);
   }
 
   #onClose(conn: Conn, code: number): void {
@@ -1067,15 +2089,15 @@ export class PageHub {
     this.#failPageCalls(pageId, conn, outcome);
     this.#live.delete(pageId);
     if (this.#closed) return;
-    this.#sleep(pageId);
+    this.#sleep(pageId, conn.address);
     // A deliberate detach will not come back, so skip the resume window.
     if (detached) {
-      this.#log.info('page detached', { pageId });
+      this.connectionLine(conn.address, 'info', 'page detached', { pageId });
       this.#gone(pageId);
     }
   }
 
-  #sleep(pageId: string): void {
+  #sleep(pageId: string, address: string): void {
     const page = this.#store.pages.get(pageId);
     if (!page) return;
     page.state = 'asleep';
@@ -1084,7 +2106,7 @@ export class PageHub {
     // again after the welcome on resume, so they are not held (up to a 1 MB frame
     // of them) for the whole resume window.
     page.tools = [];
-    this.#listed.delete(pageId);
+    this.#dropListed(pageId);
     this.#store.pages.put(page);
     this.#asleep.add(pageId);
     const creator = this.#pageAddress.get(pageId);
@@ -1096,7 +2118,7 @@ export class PageHub {
     this.#setTimer(this.#lifecycleTimers, pageId, this.#config.timings.resumeWindowMs, () => {
       this.#gone(pageId);
     });
-    this.#log.info('page asleep', { pageId });
+    this.connectionLine(address, 'info', 'page asleep', { pageId });
   }
 
   #dropRequests(pageId: string): void {
@@ -1114,10 +2136,16 @@ export class PageHub {
   #gone(pageId: string): void {
     const page = this.#store.pages.get(pageId);
     if (page?.state !== 'asleep') return;
+    const now = Date.now();
+    // Invites end with their page session, and so does everything they made (S14).
+    for (const invite of this.#store.invites.listForPage(pageId)) {
+      this.#closeInvite(invite, 'page_gone', false);
+    }
     const attachments = this.#store.attachments.listForPage(pageId);
     for (const attachment of attachments) {
       this.#store.attachments.delete(pageId, attachment.userId);
       this.#clearTimer(this.#expiryTimers, attachmentKey(pageId, attachment.userId));
+      this.#auditExpire(page, attachment.userId, 'page_gone', now);
     }
     page.state = 'gone';
     page.goneAt = Date.now();
@@ -1129,7 +2157,7 @@ export class PageHub {
     page.adapterVersion = '';
     page.policy = { ...page.policy, consequentialTools: [] };
     this.#store.pages.put(page);
-    this.#listed.delete(pageId);
+    this.#dropListed(pageId);
     this.#rosterSentAt.delete(pageId);
     this.#callRosterAt.delete(pageId);
     this.#asleep.delete(pageId);
@@ -1151,7 +2179,11 @@ export class PageHub {
       this.#clearTimer(this.#lifecycleTimers, oldest);
       this.#forget(oldest);
     }
-    this.#log.info('page gone', { pageId, attachmentsDeleted: attachments.length });
+    // Its creator's address, whichever socket it last had: the one that made the session.
+    this.connectionLine(creator ?? '(no address)', 'info', 'page gone', {
+      pageId,
+      attachmentsDeleted: attachments.length,
+    });
   }
 
   /** A gone page is dropped for good; its former users hear not_attached from then on. */
@@ -1265,12 +2297,24 @@ export class PageHub {
     );
   }
 
-  #decision(pageId: string, frame: FrameOf<'attach_decision'>): void {
+  /**
+   * The page's answer to an attach request; false when it named none of the
+   * page's, live or just ended. A decision for one the relay just ended (its
+   * time run out, a revoke, its invite closed, the page full) is expected:
+   * the page's own timer runs on its clock and an operator's click can cross
+   * the end on the wire, so it is ignored without a warning and changes
+   * nothing a budget counts.
+   */
+  #decision(pageId: string, frame: FrameOf<'attach_decision'>): boolean {
     const request = this.#store.requests.get(frame.requestId);
     // A page may only answer its own requests; anything else is stale or forged.
     if (request?.pageId !== pageId) {
+      if (this.#justEnded(pageId, frame.requestId)) {
+        this.#log.debug('ignored a decision for an attach request that already ended', { pageId });
+        return true;
+      }
       this.#log.warn('ignored a decision for an unknown attach request', { pageId });
-      return;
+      return false;
     }
     if (!frame.allow) {
       this.#log.info('attach request denied', { pageId, userId: request.userId });
@@ -1280,7 +2324,14 @@ export class PageHub {
         code: 'denied_by_operator',
         message: 'the page operator denied the attach request',
       });
-      return;
+      // A control invite's prompt refused counts toward burning it.
+      if (request.inviteId !== null) this.#inviteRefused(pageId, request.inviteId);
+      return true;
+    }
+    const page = this.#store.pages.get(pageId);
+    if (request.inviteId !== null) {
+      this.#approveRedemption(request, frame.role ?? 'observer');
+      return true;
     }
     if (!this.#store.attachments.get(pageId, request.userId) && this.#pageFull(pageId)) {
       this.#log.info('approval refused: the page filled up while the operator decided', {
@@ -1289,11 +2340,10 @@ export class PageHub {
       });
       this.#spike?.pairingDecided(pageId, request.userId, false);
       this.#endRequest(request.requestId, this.#pageFullError('filled up meanwhile and has'));
-      return;
+      return true;
     }
     const attachment = this.#grant(request, frame.role ?? 'observer');
     this.#spike?.pairingDecided(pageId, request.userId, true);
-    const page = this.#store.pages.get(pageId);
     this.#endRequest(request.requestId, {
       kind: 'attached',
       pageId,
@@ -1301,31 +2351,155 @@ export class PageHub {
       role: attachment.role,
       existing: false,
     });
+    return true;
   }
 
-  #grant(
-    request: Pick<AttachRequestRecord, 'pageId' | 'userId' | 'displayName' | 'client'> &
-      Partial<Pick<AttachRequestRecord, 'joined'>>,
-    wanted: Role,
-  ): AttachmentRecord {
+  /**
+   * The page approved a redemption (ADR 0017). Whatever role the answer
+   * names, the attachment never passes the invite's, and the driver seats
+   * cap it as for anyone; it takes no seat members keep, ends at most 24
+   * hours from now, and a use is spent only now, on approval. Someone
+   * attached meanwhile keeps what they hold, and the invite keeps its use.
+   */
+  #approveRedemption(request: AttachRequestRecord, decided: Role): void {
+    const { pageId, userId } = request;
+    const invite =
+      request.inviteId === null ? undefined : this.#store.invites.get(pageId, request.inviteId);
+    const page = this.#store.pages.get(pageId);
+    const origin = page?.origin ?? '';
+    const existing = this.#store.attachments.get(pageId, userId);
+    if (existing) {
+      this.#endRequest(request.requestId, {
+        kind: 'attached',
+        pageId,
+        origin,
+        role: existing.role,
+        existing: true,
+        ...this.#sponsorNamed(existing),
+      });
+      return;
+    }
+    // Closing or burning an invite ends what waits on it, so this is only a guard.
+    if (invite === undefined || this.#barred(invite, userId, request.account)) {
+      this.#endRequest(
+        request.requestId,
+        hubError('pairing_expired', 'this invite is no longer live'),
+      );
+      return;
+    }
+    // The sponsor may have passed their end while the operator decided, with
+    // the timer not yet run; ending them now closes the invite, which answers
+    // this request as any sponsor's end does, so nothing is granted under it.
+    if (!this.#sponsored(invite)) {
+      if (this.#store.requests.get(request.requestId) !== undefined) {
+        this.#endRequest(
+          request.requestId,
+          hubError('pairing_expired', 'this invite is no longer live'),
+        );
+      }
+      return;
+    }
+    if (this.#pageFull(pageId) || this.#inviteSeatsFull(pageId, 0)) {
+      this.#log.info('approval refused: the page filled up while the operator decided', {
+        pageId,
+        userId,
+      });
+      this.#endRequest(request.requestId, this.#pageFullError('filled up meanwhile and has'));
+      return;
+    }
+    const attachment = this.#grant(request, lesserRole(invite.role, decided), invite);
+    invite.usesLeft -= 1;
+    this.#audit({
+      v: AUDIT_VERSION,
+      type: 'invite_redeemed',
+      at: Date.now(),
+      pageId,
+      origin,
+      inviteId: invite.inviteId,
+      userId,
+      kind: request.account.kind,
+      usesLeft: invite.usesLeft,
+    });
+    this.#endRequest(request.requestId, {
+      kind: 'attached',
+      pageId,
+      origin,
+      role: attachment.role,
+      existing: false,
+      sponsor: invite.sponsor.displayName,
+    });
+    if (invite.usesLeft <= 0) {
+      this.#closeInvite(invite, 'used_up');
+    } else {
+      this.#store.invites.put(invite);
+      this.#sendInvites(pageId);
+    }
+  }
+
+  /** "Shared by": the sponsor's name for an invite-made attachment, while they are attached. */
+  #sponsorNamed(attachment: AttachmentRecord): { sponsor?: string } {
+    if (attachment.sponsorId === null) return {};
+    const sponsor = this.#store.attachments.get(attachment.pageId, attachment.sponsorId);
+    return sponsor === undefined ? {} : { sponsor: sponsor.displayName };
+  }
+
+  /**
+   * Makes an attachment, or returns the one the user already holds. One an
+   * invite makes keeps the invite's role as its cap, its sponsor, the digest
+   * of an invitee's verified email and an end 24 hours on (ADR 0017), since
+   * the invite's own record may go first.
+   */
+  #grant(request: GrantRequest, wanted: Role, invite?: InviteRecord): AttachmentRecord {
     const existing = this.#store.attachments.get(request.pageId, request.userId);
     if (existing) return existing;
     const now = Date.now();
     // Newest first, as every roster lists clients; a joined device came after the first.
     const clients = [...(request.joined ?? [])].reverse();
     if (request.client) clients.push(request.client);
+    const endsAt = invite === undefined ? null : now + MAX_INVITE_LIFETIME_MS;
+    const idleEnd = now + this.#config.timings.attachmentIdleMs;
+    const { account } = request;
     const attachment: AttachmentRecord = {
       pageId: request.pageId,
       userId: request.userId,
       displayName: request.displayName,
-      role: this.#cappedRole(request.pageId, request.userId, wanted),
+      kind: account.kind,
+      role: this.#cappedRole(
+        request.pageId,
+        request.userId,
+        invite === undefined ? wanted : lesserRole(invite.role, wanted),
+      ),
       grantedAt: now,
       lastUsedAt: null,
-      expiresAt: now + this.#config.timings.attachmentIdleMs,
+      expiresAt: endsAt === null ? idleEnd : Math.min(idleEnd, endsAt),
       clients: clients.slice(0, MAX_ROSTER_CLIENTS),
+      inviteId: invite?.inviteId ?? null,
+      endsAt,
+      inviteRole: invite?.role ?? null,
+      sponsorId: invite?.sponsor.userId ?? null,
+      emailHash:
+        invite !== undefined && account.kind === 'invitee' && account.email !== null
+          ? emailBarDigest(account.email)
+          : null,
     };
     this.#store.attachments.put(attachment);
     this.#armExpiry(attachment);
+    const page = this.#store.pages.get(request.pageId);
+    this.#audit({
+      v: AUDIT_VERSION,
+      type: 'attach',
+      at: now,
+      pageId: attachment.pageId,
+      origin: page?.origin ?? '',
+      userId: attachment.userId,
+      kind: attachment.kind,
+      role: attachment.role,
+      via: request.via,
+      clientId: request.oauthClientId,
+      inviteId: attachment.inviteId,
+      // The only record that names a person by address (ADR 0019); stderr drops it.
+      ...(account.kind === 'invitee' ? { email: account.email ?? UNVERIFIED_EMAIL } : {}),
+    });
     this.#log.info('attached', {
       pageId: attachment.pageId,
       userId: attachment.userId,
@@ -1349,35 +2523,105 @@ export class PageHub {
     return 'driver';
   }
 
-  #setRole(pageId: string, frame: FrameOf<'set_role'>): void {
+  /** The operator's role change; false when nobody's role changed. */
+  #setRole(pageId: string, frame: FrameOf<'set_role'>): boolean {
     const attachment = this.#store.attachments.get(pageId, frame.userId);
     if (!attachment) {
       this.#log.warn('ignored set_role for a user who is not attached', { pageId });
-      return;
+      return false;
     }
-    const role = this.#cappedRole(pageId, frame.userId, frame.role);
-    if (role !== attachment.role) {
+    // ADR 0017: an invite-made attachment never passes its invite's role,
+    // whatever the page asks: a watch guest stays an observer.
+    const wanted =
+      attachment.inviteRole === null ? frame.role : lesserRole(attachment.inviteRole, frame.role);
+    if (wanted !== frame.role) {
+      this.#log.info('set_role refused: above the role of the invite that made the attachment', {
+        pageId,
+        userId: frame.userId,
+      });
+    }
+    const capped = this.#cappedRole(pageId, frame.userId, wanted);
+    // A promotion gives access, so it counts against the page's grants; a
+    // demotion only takes access away and never waits on them.
+    const role =
+      capped === 'driver' && attachment.role !== 'driver' && !this.#grantAllowed(pageId, Date.now())
+        ? attachment.role
+        : capped;
+    const changed = role !== attachment.role;
+    if (changed) {
+      const previous = attachment.role;
       attachment.role = role;
       this.#store.attachments.put(attachment);
       this.#log.info('role changed', { pageId, userId: frame.userId, role });
+      this.#audit({
+        v: AUDIT_VERSION,
+        type: 'role',
+        at: Date.now(),
+        pageId,
+        origin: this.#store.pages.get(pageId)?.origin ?? '',
+        userId: frame.userId,
+        role,
+        previous,
+      });
     }
     // Sent even when nothing changed, so the page shows a capped grant as it really is.
     this.#sendRoster(pageId);
+    return changed;
   }
 
-  #revoke(pageId: string, frame: FrameOf<'revoke'>): void {
-    const targets =
-      frame.userId === '*'
-        ? this.#store.attachments.listForPage(pageId)
-        : [this.#store.attachments.get(pageId, frame.userId)].filter(
-            (attachment) => attachment !== undefined,
-          );
+  /**
+   * The operator's revoke (S8): attachments end now, with their calls, and
+   * so does any request waiting on the page. Someone an invite let in, or
+   * whose redemption was waiting, is barred from that invite for its life,
+   * by account and verified email, so no redemption brings them back; the
+   * invite itself stays unless the page cancels it. Revoke all also closes
+   * every live invite (ADR 0017). Answers whether it ended anything: an
+   * attachment, a waiting request or an invite.
+   */
+  #revoke(pageId: string, frame: FrameOf<'revoke'>): boolean {
+    const everyone = frame.userId === '*';
+    const now = Date.now();
+    const targets = everyone
+      ? this.#store.attachments.listForPage(pageId)
+      : [this.#store.attachments.get(pageId, frame.userId)].filter(
+          (attachment) => attachment !== undefined,
+        );
     const users = new Set(targets.map((attachment) => attachment.userId));
-    if (frame.userId !== '*') users.add(frame.userId);
+    if (!everyone) users.add(frame.userId);
+    let barred = false;
+    for (const target of targets) {
+      const invite =
+        target.inviteId === null ? undefined : this.#store.invites.get(pageId, target.inviteId);
+      if (invite !== undefined) {
+        this.#bar(invite, target.userId, target.emailHash);
+        barred = true;
+      }
+    }
     // Revocation is immediate (S8): calls on the page are cancelled now, queued ones dropped.
     this.#endAttachments(pageId, users, 'revoked', 'the page operator revoked your attachment');
+    const origin = this.#store.pages.get(pageId)?.origin ?? '';
+    for (const target of targets) {
+      this.#audit({
+        v: AUDIT_VERSION,
+        type: 'revoke',
+        at: now,
+        pageId,
+        origin,
+        userId: target.userId,
+        everyone,
+      });
+    }
+    let ended = targets.length;
     for (const request of this.#store.requests.listForPage(pageId)) {
-      if (frame.userId === '*' || users.has(request.userId)) {
+      if (everyone || users.has(request.userId)) {
+        ended += 1;
+        const invite =
+          request.inviteId === null ? undefined : this.#store.invites.get(pageId, request.inviteId);
+        if (invite !== undefined && !everyone) {
+          const email = request.account.kind === 'invitee' ? request.account.email : null;
+          this.#bar(invite, request.userId, email === null ? null : emailBarDigest(email));
+          barred = true;
+        }
         this.#endRequest(request.requestId, {
           kind: 'error',
           code: 'denied_by_operator',
@@ -1385,8 +2629,91 @@ export class PageHub {
         });
       }
     }
+    if (everyone) {
+      for (const invite of this.#store.invites.listForPage(pageId)) {
+        ended += 1;
+        this.#closeInvite(invite, 'revoked', false);
+      }
+    }
     this.#log.info('attachments revoked', { pageId, count: targets.length });
+    this.#loseSponsors(pageId, targets);
     this.#sendRoster(pageId);
+    if (everyone || barred) this.#sendInvites(pageId);
+    return ended > 0;
+  }
+
+  /**
+   * A sponsor's attachment ended, however it ended, so their invites close
+   * and the attachments those made end too (ADR 0017): a script can open a
+   * page session claiming any allowed origin, so an invite is only good
+   * while a member who shared it is still there. A member let in by such an
+   * invite may have sponsored invites of their own, which end in turn.
+   */
+  #loseSponsors(pageId: string, ended: readonly AttachmentRecord[]): void {
+    const queue = ended.filter((attachment) => attachment.kind === 'member');
+    const seen = new Set<string>();
+    let changed = false;
+    for (let next = queue.shift(); next !== undefined; next = queue.shift()) {
+      const sponsor = next.userId;
+      if (seen.has(sponsor)) continue;
+      seen.add(sponsor);
+      const invites = this.#store.invites
+        .listForPage(pageId)
+        .filter((invite) => invite.sponsor.userId === sponsor);
+      for (const invite of invites) this.#closeInvite(invite, 'sponsor_gone', false);
+      const made = this.#store.attachments
+        .listForPage(pageId)
+        .filter((attachment) => attachment.sponsorId === sponsor);
+      if (made.length > 0) {
+        this.#endAttachments(
+          pageId,
+          new Set(made.map((attachment) => attachment.userId)),
+          'revoked',
+          'the member who shared this page with you is no longer attached, so access through their invite ended',
+        );
+        const page = this.#store.pages.get(pageId);
+        const now = Date.now();
+        for (const attachment of made) {
+          if (page) this.#auditExpire(page, attachment.userId, 'sponsor_gone', now);
+        }
+        queue.push(...made.filter((attachment) => attachment.kind === 'member'));
+      }
+      if (invites.length > 0 || made.length > 0) {
+        changed = true;
+        this.#audit({
+          v: AUDIT_VERSION,
+          type: 'sponsor_gone',
+          at: Date.now(),
+          pageId,
+          origin: this.#store.pages.get(pageId)?.origin ?? '',
+          sponsor,
+          invites: invites.length,
+          attachments: made.length,
+        });
+        this.#log.info('sponsor gone: their invites and what those made ended', {
+          pageId,
+          userId: sponsor,
+          invites: invites.length,
+          attachments: made.length,
+        });
+      }
+    }
+    if (changed) {
+      this.#sendRoster(pageId);
+      this.#sendInvites(pageId);
+    }
+  }
+
+  #auditExpire(page: PageRecord, userId: string, reason: ExpireReason, at: number): void {
+    this.#audit({
+      v: AUDIT_VERSION,
+      type: 'expire',
+      at,
+      pageId: page.pageId,
+      origin: page.origin,
+      userId,
+      reason,
+    });
   }
 
   /**
@@ -1411,9 +2738,13 @@ export class PageHub {
       if (users.has(call.caller.userId)) call.settle(outcome);
     }
     const conn = this.#live.get(pageId);
+    // Those waiting for room never reached the page either.
+    for (const call of [...(conn?.held ?? [])]) {
+      if (users.has(call.caller.userId)) call.settle(outcome);
+    }
     for (const call of [...(conn?.inflight.values() ?? [])]) {
       if (!users.has(call.caller.userId)) continue;
-      if (conn) this.#send(conn, { t: 'cancel', callId: call.callId, reason });
+      if (conn) this.#sendCancel(conn, call.callId, reason);
       call.settle(outcome);
     }
   }
@@ -1430,23 +2761,34 @@ export class PageHub {
     });
   }
 
-  /** Ends an attachment past its expiresAt like a revoke, without an audit record. True if it ended. */
+  /**
+   * Ends an attachment past its expiresAt like a revoke, with an expire
+   * record: unused too long, or an invite-made one at its end, 24 hours
+   * after redemption however much it is used (S14). True if it ended.
+   */
   #expireIfDue(pageId: string, userId: string): boolean {
     const attachment = this.#store.attachments.get(pageId, userId);
     if (!attachment || attachment.expiresAt === null) return false;
-    if (attachment.expiresAt > Date.now()) {
+    const now = Date.now();
+    if (attachment.expiresAt > now) {
       // The timer ran early or a call moved the expiry meanwhile.
       this.#armExpiry(attachment);
       return false;
     }
+    const ended = attachment.endsAt !== null && attachment.endsAt <= now;
     const idle = formatDuration(this.#config.timings.attachmentIdleMs);
     this.#endAttachments(
       pageId,
       new Set([userId]),
       'revoked',
-      `your attachment expired after ${idle} without a call; pair again to use the page`,
+      ended
+        ? `your access through an invite ended ${formatDuration(MAX_INVITE_LIFETIME_MS)} after you joined; ask for a new invite to use the page`
+        : `your attachment expired after ${idle} without a call; pair again to use the page`,
     );
-    this.#log.info('attachment expired', { pageId, userId });
+    const page = this.#store.pages.get(pageId);
+    if (page) this.#auditExpire(page, userId, ended ? 'ends_at' : 'idle', now);
+    this.#log.info('attachment expired', { pageId, userId, reason: ended ? 'ends_at' : 'idle' });
+    this.#loseSponsors(pageId, [attachment]);
     this.#sendRoster(pageId);
     return true;
   }
@@ -1455,11 +2797,14 @@ export class PageHub {
     return this.#store.attachments.listForPage(pageId).map((attachment) => ({
       userId: attachment.userId,
       displayName: attachment.displayName,
+      kind: attachment.kind,
       role: attachment.role,
       grantedAt: attachment.grantedAt,
       lastUsedAt: attachment.lastUsedAt,
       expiresAt: attachment.expiresAt,
       clients: attachment.clients.slice(0, MAX_ROSTER_CLIENTS),
+      inviteId: attachment.inviteId,
+      endsAt: attachment.endsAt,
     }));
   }
 
@@ -1472,10 +2817,125 @@ export class PageHub {
     this.#rosterSentAt.set(pageId, Date.now());
   }
 
+  /**
+   * Remembers a request that just ended for as long as its page may still
+   * show it: the page's prompt lasts at most the request's lifetime from when
+   * it arrived, and a request never ends before it is made, so the end plus
+   * that lifetime and a grace for the page's clock and the wire covers it.
+   * Ends come in time order, so the oldest is always first.
+   */
+  #rememberEnded(pageId: string, requestId: string): void {
+    const now = Date.now();
+    this.#forgetEnded(now);
+    if (this.#endedRequests.size >= MAX_ENDED_REQUESTS) {
+      const oldest = this.#endedRequests.keys().next().value;
+      if (oldest !== undefined) this.#endedRequests.delete(oldest);
+    }
+    const until = now + this.#config.timings.attachRequestTtlMs + ENDED_REQUEST_GRACE_MS;
+    this.#endedRequests.set(requestId, { pageId, until });
+  }
+
+  /** Whether this page had this request ended recently enough that a decision for it is expected. */
+  #justEnded(pageId: string, requestId: string): boolean {
+    this.#forgetEnded(Date.now());
+    return this.#endedRequests.get(requestId)?.pageId === pageId;
+  }
+
+  #forgetEnded(now: number): void {
+    for (const [requestId, ended] of this.#endedRequests) {
+      if (ended.until > now) return;
+      this.#endedRequests.delete(requestId);
+    }
+  }
+
+  /**
+   * A request the page saw ends, approved or not, and everyone waiting on it
+   * hears how. A refusal writes its attach_refused record in full, since the
+   * request reached the page, whose pairing limit bounds them (ADR 0019).
+   */
   #endRequest(requestId: string, outcome: PairOutcome): void {
+    const request = this.#store.requests.get(requestId);
     this.#store.requests.delete(requestId);
     this.#clearTimer(this.#requestTimers, requestId);
+    if (request !== undefined) this.#rememberEnded(request.pageId, requestId);
+    if (request !== undefined && outcome.kind === 'error' && !this.#closed) {
+      this.#audit({
+        v: AUDIT_VERSION,
+        type: 'attach_refused',
+        at: Date.now(),
+        pageId: request.pageId,
+        origin: this.#store.pages.get(request.pageId)?.origin ?? '',
+        userId: request.userId,
+        kind: request.account.kind,
+        via: request.via,
+        inviteId: request.inviteId,
+        outcome: attachRefusalOf(outcome.code),
+      });
+    }
+    if (request?.inviteId !== null && request?.inviteId !== undefined) {
+      const invite = this.#store.invites.get(request.pageId, request.inviteId);
+      if (invite?.pendingRequestId === requestId) {
+        invite.pendingRequestId = this.#pendingOn(invite)[0]?.requestId ?? null;
+        this.#store.invites.put(invite);
+      }
+      // Whether anything still waits on it shows in the page's list.
+      if (invite !== undefined) this.#sendInvites(request.pageId);
+    }
     for (const waiter of [...(this.#pairWaiters.get(requestId) ?? [])]) waiter(outcome);
+  }
+
+  // What requests waiting on a page hold
+
+  /**
+   * Charges a request that may wait on a page (a call, or a pairing waiting
+   * for the operator) its body's upper bound on the heap, `bytes`, until
+   * release. Past what one user's such requests may hold together
+   * (limits.requestBytesPerUser) it is refused rate_limited, and past what
+   * all may hold (limits.requestBytes) `relayFull`: the request budget
+   * alone let one member hold 120 calls of 1 MB arguments, about 2 MB of
+   * heap each, and crash a relay with the image's 192 MiB heap (ADR 0018's
+   * notes). A request charged nothing, as from a caller with no HTTP body,
+   * is always held.
+   */
+  #holdBytes(userId: string, bytes: number, relayFull: 'page_busy' | 'rate_limited'): HeldBytes {
+    if (bytes <= 0) return { kind: 'held', release: () => undefined };
+    const { requestBytes, requestBytesPerUser } = this.#config.limits;
+    const own = this.#heldBytes.get(userId) ?? 0;
+    if (bytes > requestBytesPerUser) {
+      this.#log.debug('request refused: it alone would hold more than a user may', { userId });
+      return hubError(
+        'rate_limited',
+        `this request would hold ${mebibytes(bytes)} of the relay's memory while it waits, more than one user's requests may hold together (${mebibytes(requestBytesPerUser)}); send less`,
+      );
+    }
+    if (own + bytes > requestBytesPerUser) {
+      this.#log.debug('request refused: the user holds too much in requests waiting', { userId });
+      return hubError(
+        'rate_limited',
+        `your requests waiting on pages already hold ${mebibytes(own)} of the relay's memory, and one user's may hold ${mebibytes(requestBytesPerUser)}; wait for some to finish`,
+      );
+    }
+    if (this.#heldTotal + bytes > requestBytes) {
+      this.#log.debug('request refused: requests waiting hold all the relay allows', { userId });
+      return hubError(
+        relayFull,
+        "requests waiting on pages hold as much of the relay's memory as it allows; try again shortly",
+      );
+    }
+    this.#heldBytes.set(userId, own + bytes);
+    this.#heldTotal += bytes;
+    let held = true;
+    return {
+      kind: 'held',
+      release: () => {
+        if (!held) return;
+        held = false;
+        this.#heldTotal -= bytes;
+        const left = (this.#heldBytes.get(userId) ?? bytes) - bytes;
+        if (left > 0) this.#heldBytes.set(userId, left);
+        else this.#heldBytes.delete(userId);
+      },
+    };
   }
 
   // Calls
@@ -1512,15 +2972,26 @@ export class PageHub {
   }
 
   #failInflight(conn: Conn, outcome: CallOutcome): void {
+    // Those still waiting for room first, so a write settling cannot send one of them.
+    for (const call of [...conn.held]) call.settle(outcome);
     for (const call of [...conn.inflight.values()]) call.settle(outcome);
   }
 
   // MCP side
 
+  /**
+   * Whether the user holds an attachment to any page (InviteHub.holds). An
+   * invitee's session pool and audit budget turn on it (ADRs 0016 and 0019),
+   * and relay.ts hands it to the MCP sessions for that.
+   */
+  holds(userId: string): boolean {
+    return this.#store.attachments.listForUser(userId).length > 0;
+  }
+
   listPages(userId: string): PageListing[] {
     const listings: PageListing[] = [];
     for (const attachment of this.#store.attachments.listForUser(userId)) {
-      if (this.#expireIfDue(attachment.pageId, userId)) continue;
+      if (!this.#chainInTime(attachment.pageId, userId)) continue;
       const page = this.#store.pages.get(attachment.pageId);
       if (!page) continue;
       listings.push({
@@ -1553,9 +3024,11 @@ export class PageHub {
     userId: string,
     pageId: string,
   ): { kind: 'ok'; page: PageRecord; attachment: AttachmentRecord; conn: Conn } | HubError {
-    // An expiry timer may run late; an attachment past its time is over either way.
-    this.#expireIfDue(pageId, userId);
-    const attachment = this.#store.attachments.get(pageId, userId);
+    // An expiry timer may run late; an attachment past its time is over either
+    // way, and so is one whose sponsor, or a member above them, is past theirs.
+    const attachment = this.#chainInTime(pageId, userId)
+      ? this.#store.attachments.get(pageId, userId)
+      : undefined;
     const page = this.#store.pages.get(pageId);
     if (attachment && page) {
       const conn = this.#live.get(pageId);
@@ -1606,18 +3079,52 @@ export class PageHub {
     };
   }
 
-  async pairPage(caller: CallerIdentity, code: string, signal: AbortSignal): Promise<PairOutcome> {
+  /**
+   * `heldBytes` as for callPageTool: the request waits for the operator, so
+   * it is charged what it holds, and refused before its code is looked at
+   * past what waiting requests may hold.
+   */
+  async pairPage(
+    caller: CallerIdentity,
+    code: string,
+    signal: AbortSignal,
+    heldBytes = 0,
+  ): Promise<PairOutcome> {
     const now = Date.now();
-    const limited = this.#pairingLimited(caller.userId, now);
+    const limited = this.#pairingLimited(caller, 'code', now);
     if (limited) return limited;
+    // Before the code is even looked at, so an invitee neither spends nor
+    // rotates one: a code seen on a shared screen cannot summon prompts from
+    // strangers (ADR 0016).
+    const required = this.#inviteRequired(caller, 'code');
+    if (required) return required;
+    const held = this.#holdBytes(caller.userId, heldBytes, 'rate_limited');
+    if (held.kind === 'error') return this.#refusedBeforePage(caller, 'code', null, held);
+    try {
+      return await this.#pairByCode(caller, code, signal, now);
+    } finally {
+      held.release();
+    }
+  }
 
+  async #pairByCode(
+    caller: CallerIdentity,
+    code: string,
+    signal: AbortSignal,
+    now: number,
+  ): Promise<PairOutcome> {
     const normalised = normalisePairingCode(code);
     const pageId = normalised === null ? null : this.#matchTicket(normalised, now);
     const live = pageId === null ? null : this.#livePage(pageId);
     // Wrong and expired look the same: telling them apart would confirm a code once existed.
     if (!live) {
       this.#log.info('pairing refused: no live code matched', { userId: caller.userId });
-      return hubError('pairing_expired', 'code is invalid or expired');
+      return this.#refusedBeforePage(
+        caller,
+        'code',
+        null,
+        hubError('pairing_expired', 'code is invalid or expired'),
+      );
     }
     const started = this.#startPairing(caller, live.page, live.conn, 'code', now);
     return started.kind === 'pending' ? this.#waitForDecision(started.record, signal) : started;
@@ -1654,13 +3161,22 @@ export class PageHub {
    */
   claimPairNonce(caller: CallerIdentity, nonce: string): ClaimOutcome {
     const now = Date.now();
-    const limited = this.#pairingLimited(caller.userId, now);
+    const limited = this.#pairingLimited(caller, 'qr', now);
     if (limited) return limited;
+    // After the attempt is counted and before the nonce is looked at, so an
+    // invitee's claim at /pair/claim neither spends nor rotates it (ADR 0017).
+    const required = this.#inviteRequired(caller, 'qr');
+    if (required) return required;
     const ticket = this.#pairTicket(nonce, now, true);
     const live = ticket === null ? null : this.#livePage(ticket.pageId);
     if (!ticket || !live) {
       this.#log.info('qr pairing refused: no live nonce matched', { userId: caller.userId });
-      return hubError('pairing_expired', 'this pairing link is invalid or expired');
+      return this.#refusedBeforePage(
+        caller,
+        'qr',
+        null,
+        hubError('pairing_expired', 'this pairing link is invalid or expired'),
+      );
     }
     const started = this.#startPairing(caller, live.page, live.conn, 'qr', now);
     if (started.kind === 'error') return started;
@@ -1672,11 +3188,286 @@ export class PageHub {
     };
   }
 
+  // Redemption (ADRs 0016 and 0017)
+
+  /**
+   * pair_page's invite: a link minted for one use, or its secret. A link
+   * this relay did not mint, a secret minted for several uses (a link pasted
+   * into a chat stays in its history), and an unknown, spent, cancelled,
+   * expired or unsponsored one all get one answer, so no answer says a
+   * secret is live.
+   */
+  async redeemInvite(
+    caller: CallerIdentity,
+    invite: string,
+    signal: AbortSignal,
+    heldBytes = 0,
+  ): Promise<PairOutcome> {
+    // As for pairPage, before anything is spent: the request may wait for the operator.
+    const held = this.#holdBytes(caller.userId, heldBytes, 'rate_limited');
+    if (held.kind === 'error') return this.#refusedBeforePage(caller, 'invite', null, held);
+    try {
+      const secret = inviteSecretOf(invite, this.#linkBase());
+      const started = this.#redeem(caller, secret, true, Date.now());
+      return started.kind === 'pending'
+        ? await this.#waitForDecision(started.record, signal)
+        : started;
+    } finally {
+      held.release();
+    }
+  }
+
+  /**
+   * What /i shows for a live invite: the page's origin, its title and the
+   * invite's label as the page wrote them, what it lets someone do, and who
+   * shared it. Uses nothing up; null for an unknown, spent, cancelled,
+   * expired or unsponsored secret alike (#findInvite), and while its page is
+   * not linked.
+   */
+  previewInvite(secret: string): InvitePreview | null {
+    const invite = this.#findInvite(secret, Date.now());
+    const live = invite === null ? null : this.#livePage(invite.pageId);
+    if (invite === null || live === null) return null;
+    const title = firstCharacters(live.page.title, MAX_PAIR_TITLE_CHARS);
+    return {
+      origin: live.page.origin,
+      title: title.text,
+      titleCut: title.cut,
+      label: invite.label,
+      role: invite.role,
+      sponsor: invite.sponsor.displayName,
+      expiresAt: invite.expiresAt,
+    };
+  }
+
+  /** /i's Join, which takes any live invite, multi-use ones too, since its link never leaves the browser's fragment. */
+  claimInvite(caller: CallerIdentity, secret: string): ClaimOutcome {
+    const started = this.#redeem(caller, secret, false, Date.now());
+    if (started.kind === 'error') return started;
+    if (started.kind === 'pending') {
+      return {
+        kind: 'claimed',
+        pageId: started.record.pageId,
+        settled: this.#waitForEnd(started.record),
+      };
+    }
+    return { kind: 'claimed', pageId: started.pageId, settled: Promise.resolve(started) };
+  }
+
+  /**
+   * Everything a redemption must pass before its page hears of it: the
+   * user's pairing limit, a live invite (minted for one use, when pair_page
+   * asks, and still sponsored: #sponsored ends a sponsor, or a member above
+   * them, past their time as the timer would), the invite's own limit, its
+   * bars, a linked page, the page's pairing limit, and the invite still live
+   * once the caller's own lapsed attachment has ended; then the caller is
+   * already attached, joins the request they have waiting, is refused while
+   * the invite's one prompt or its last uses are taken or the seats invites
+   * may use are full, or raises a new request. Never autoApprove: the
+   * adapter honours an invite only against its own record and the presented
+   * secret (ADR 0017's notes).
+   */
+  #redeem(caller: CallerIdentity, secret: string | null, oneUse: boolean, now: number): Started {
+    const limited = this.#pairingLimited(caller, 'invite', now);
+    if (limited) return limited;
+    const found = secret === null ? null : this.#findInvite(secret, now);
+    const invite = found !== null && (!oneUse || found.uses === 1) ? found : null;
+    if (secret === null || invite === null) {
+      this.#log.info('redemption refused: no live invite matched', { userId: caller.userId });
+      return this.#refusedBeforePage(
+        caller,
+        'invite',
+        null,
+        hubError('pairing_expired', 'this invite is invalid, used up or expired'),
+      );
+    }
+    const refuse = (error: HubError): HubError =>
+      this.#refusedBeforePage(caller, 'invite', invite.inviteId, error);
+    const inviteKey = attachmentKey(invite.pageId, invite.inviteId);
+    if (!this.#inviteLimiter.allows(inviteKey, now)) {
+      this.#log.warn('redemption refused: too many for one invite', {
+        pageId: invite.pageId,
+        inviteId: invite.inviteId,
+      });
+      return refuse(
+        hubError(
+          'rate_limited',
+          'too many redemptions of this invite; wait a minute and try again',
+        ),
+      );
+    }
+    this.#inviteLimiter.record(inviteKey, now);
+    // No redemption clears a revoke, by this account or a new one with its verified email.
+    if (this.#barred(invite, caller.userId, caller.account)) {
+      this.#log.info('redemption refused: the account was revoked from this invite', {
+        pageId: invite.pageId,
+        userId: caller.userId,
+      });
+      return refuse(
+        hubError(
+          'denied_by_operator',
+          "the page operator revoked this account's access through this invite",
+        ),
+      );
+    }
+    const live = this.#livePage(invite.pageId);
+    if (live === null) {
+      return refuse(
+        hubError(
+          'page_asleep',
+          'the page is not connected right now; try the invite again when it is back',
+        ),
+      );
+    }
+    const { page, conn } = live;
+    // The page's own pairing limit counts every redemption that lands on it (S14).
+    if (!this.#pageLimiter.allows(page.pageId, now)) {
+      this.#log.warn('redemption refused: too many pairings for one page', {
+        pageId: page.pageId,
+        userId: caller.userId,
+      });
+      return refuse(
+        hubError(
+          'rate_limited',
+          'too many pairing attempts on this page; wait a minute and try again',
+        ),
+      );
+    }
+    this.#pageLimiter.record(page.pageId, now);
+
+    // Someone attached keeps what they hold only while it, and each member's
+    // above it, is in time, so a caller past their own end with the timer not
+    // yet run is ended here as the timer would end them, and the page is asked
+    // rather than the caller told they were attached already. An end here
+    // that would close this invite (sponsor_gone, ADR 0017) is its sponsor's
+    // or one above them, which #findInvite has already ended if due; the put
+    // below would bring a closed invite back with no sponsor and no timer,
+    // though, so a closed one still gets every dead invite's answer.
+    this.#chainInTime(page.pageId, caller.userId);
+    if (this.#store.invites.get(invite.pageId, invite.inviteId) === undefined) {
+      this.#log.info('redemption refused: the invite closed as the caller expired', {
+        pageId: page.pageId,
+        userId: caller.userId,
+      });
+      return refuse(hubError('pairing_expired', 'this invite is invalid, used up or expired'));
+    }
+    const existing = this.#store.attachments.get(page.pageId, caller.userId);
+    if (existing) {
+      // Someone already attached keeps what they hold, and the invite its use (ADR 0017).
+      if (this.#recordClient(existing, caller.client)) this.#sendRoster(page.pageId);
+      this.#store.attachments.put(existing);
+      return {
+        kind: 'attached',
+        pageId: page.pageId,
+        origin: page.origin,
+        role: existing.role,
+        existing: true,
+        ...this.#sponsorNamed(existing),
+      };
+    }
+    const mine = this.#store.requests
+      .listForPage(page.pageId)
+      .find((candidate) => candidate.userId === caller.userId);
+    if (mine) {
+      this.#joinRequest(mine, caller.client, 'invite');
+      return { kind: 'pending', record: mine };
+    }
+    const waiting = this.#pendingOn(invite);
+    // A control invite allows one prompt at a time; a watch invite as many as it has uses left.
+    if (invite.role === 'driver' ? waiting.length > 0 : invite.usesLeft - waiting.length <= 0) {
+      return refuse(
+        hubError(
+          'page_busy',
+          "someone else's redemption of this invite is waiting on the operator; try again shortly",
+        ),
+      );
+    }
+    const waitingOnInvites = this.#store.requests
+      .listForPage(page.pageId)
+      .filter((request) => request.inviteId !== null).length;
+    if (this.#pageFull(page.pageId) || this.#inviteSeatsFull(page.pageId, waitingOnInvites)) {
+      this.#log.info('redemption refused: the seats invites may use are taken', {
+        pageId: page.pageId,
+        userId: caller.userId,
+      });
+      return refuse(
+        hubError(
+          'page_busy',
+          'the page has no seat left for someone joining by invite; its operator can revoke someone to make room',
+        ),
+      );
+    }
+    const record = this.#raiseRequest(
+      caller,
+      page,
+      conn,
+      'invite',
+      { inviteId: invite.inviteId, secret, label: invite.label },
+      now,
+    );
+    invite.pendingRequestId ??= record.requestId;
+    this.#store.invites.put(invite);
+    this.#sendInvites(page.pageId);
+    return { kind: 'pending', record };
+  }
+
+  /**
+   * ADR 0017: a pairing code or QR nonce is for members, and an invitee is
+   * told so before anything is matched, after its attempt was counted.
+   */
+  #inviteRequired(caller: CallerIdentity, via: 'code' | 'qr'): HubError | null {
+    if (caller.account.kind !== 'invitee') return null;
+    this.#log.info('pairing refused: an invitee offered a pairing code', {
+      userId: caller.userId,
+      via,
+    });
+    return this.#refusedBeforePage(
+      caller,
+      via,
+      null,
+      hubError(
+        'invite_required',
+        "this account joins pages only by invite; ask the page's operator for an invite link",
+      ),
+    );
+  }
+
+  /**
+   * A pairing or redemption refused before any page saw it: its
+   * attach_refused record goes through the refusal budget (ADR 0019).
+   */
+  #refusedBeforePage(
+    caller: CallerIdentity,
+    via: AttachVia,
+    inviteId: string | null,
+    error: HubError,
+  ): HubError {
+    this.#budget.refused({
+      v: AUDIT_VERSION,
+      type: 'attach_refused',
+      at: Date.now(),
+      pageId: null,
+      origin: null,
+      userId: caller.userId,
+      kind: caller.account.kind,
+      via,
+      inviteId,
+      outcome: attachRefusalOf(error.code),
+    });
+    return error;
+  }
+
   /** Counts one pairing attempt for the user, or refuses it past the limit (S3). */
-  #pairingLimited(userId: string, now: number): HubError | null {
+  #pairingLimited(caller: CallerIdentity, via: AttachVia, now: number): HubError | null {
+    const { userId } = caller;
     if (!this.#userLimiter.allows(userId, now)) {
       this.#log.warn('pairing attempt rate limited', { userId });
-      return hubError('rate_limited', 'too many pairing attempts; wait a minute and try again');
+      return this.#refusedBeforePage(
+        caller,
+        via,
+        null,
+        hubError('rate_limited', 'too many pairing attempts; wait a minute and try again'),
+      );
     }
     this.#userLimiter.record(userId, now);
     return null;
@@ -1692,9 +3483,9 @@ export class PageHub {
     caller: CallerIdentity,
     page: PageRecord,
     conn: Conn,
-    via: AttachRequestRecord['via'],
+    via: 'code' | 'qr',
     now: number,
-  ): PairOutcome | { kind: 'pending'; record: AttachRequestRecord } {
+  ): Started {
     // Before the rotation below, which issues the next ticket: the spike times
     // this claim from the ticket that matched, not from its replacement.
     this.#spike?.pairingClaimed(page.pageId, caller.userId, via);
@@ -1709,14 +3500,21 @@ export class PageHub {
         userId: caller.userId,
       });
       this.#spike?.pairingDecided(page.pageId, caller.userId, false);
-      return hubError(
-        'rate_limited',
-        'too many pairing attempts on this page; wait a minute and try again',
+      return this.#refusedBeforePage(
+        caller,
+        via,
+        null,
+        hubError(
+          'rate_limited',
+          'too many pairing attempts on this page; wait a minute and try again',
+        ),
       );
     }
     this.#pageLimiter.record(page.pageId, now);
 
-    this.#expireIfDue(page.pageId, caller.userId);
+    // An attachment past its time, or made by the invite of a member past
+    // theirs, is over, so its holder pairs as anyone not attached does.
+    this.#chainInTime(page.pageId, caller.userId);
     const existing = this.#store.attachments.get(page.pageId, caller.userId);
     if (existing) {
       // Named at once: this device used a code the operator just showed, so it cannot churn.
@@ -1731,15 +3529,9 @@ export class PageHub {
         origin: page.origin,
         role: existing.role,
         existing: true,
+        ...this.#sponsorNamed(existing),
       };
     }
-
-    const request = {
-      pageId: page.pageId,
-      userId: caller.userId,
-      displayName: caller.displayName,
-      client: caller.client,
-    };
 
     // One person has at most one request per page. A retry after the wait ran
     // out, or the same person on a second device, waits on the request the
@@ -1749,21 +3541,7 @@ export class PageHub {
       .listForPage(page.pageId)
       .find((candidate) => candidate.userId === caller.userId);
     if (pending) {
-      const joining = caller.client;
-      const known = [pending.client, ...pending.joined].some(
-        (seen) => seen !== null && joining !== null && sameClient(seen, joining),
-      );
-      // Bounded like the roster's own list; each join already spent a fresh code.
-      if (joining && !known && pending.joined.length < MAX_ROSTER_CLIENTS) {
-        pending.joined.push(joining);
-        this.#store.requests.put(pending);
-      }
-      this.#log.info('pairing joined a pending attach request', {
-        pageId: pending.pageId,
-        userId: pending.userId,
-        requestId: pending.requestId,
-        via,
-      });
+      this.#joinRequest(pending, caller.client, via);
       return { kind: 'pending', record: pending };
     }
 
@@ -1774,11 +3552,22 @@ export class PageHub {
         userId: caller.userId,
       });
       this.#spike?.pairingDecided(page.pageId, caller.userId, false);
-      return this.#pageFullError('already has');
+      return this.#refusedBeforePage(caller, via, null, this.#pageFullError('already has'));
     }
 
     if (page.policy.autoApprove === 'observer') {
-      const attachment = this.#grant(request, 'observer');
+      const attachment = this.#grant(
+        {
+          pageId: page.pageId,
+          userId: caller.userId,
+          displayName: caller.displayName,
+          account: caller.account,
+          oauthClientId: caller.oauthClientId,
+          client: caller.client,
+          via,
+        },
+        'observer',
+      );
       this.#spike?.pairingDecided(page.pageId, caller.userId, true);
       return {
         kind: 'attached',
@@ -1789,11 +3578,52 @@ export class PageHub {
       };
     }
 
+    return { kind: 'pending', record: this.#raiseRequest(caller, page, conn, via, null, now) };
+  }
+
+  /** The same person's next device or retry waits on the request already shown, named on it. */
+  #joinRequest(pending: AttachRequestRecord, joining: ClientInfo | null, via: AttachVia): void {
+    const known = [pending.client, ...pending.joined].some(
+      (seen) => seen !== null && joining !== null && sameClient(seen, joining),
+    );
+    // Bounded like the roster's own list; each join already spent a fresh code.
+    if (joining && !known && pending.joined.length < MAX_ROSTER_CLIENTS) {
+      pending.joined.push(joining);
+      this.#store.requests.put(pending);
+    }
+    this.#log.info('pairing joined a pending attach request', {
+      pageId: pending.pageId,
+      userId: pending.userId,
+      requestId: pending.requestId,
+      via,
+    });
+  }
+
+  /**
+   * A new attach request the operator sees, which silence denies when its
+   * time runs out. A redemption's carries the invite and the secret as it was
+   * presented, which the relay forwards and never keeps, so the adapter can
+   * check it against its own record (ADR 0017).
+   */
+  #raiseRequest(
+    caller: CallerIdentity,
+    page: PageRecord,
+    conn: Conn,
+    via: AttachVia,
+    invite: { inviteId: string; secret: string; label: string } | null,
+    now: number,
+  ): AttachRequestRecord {
     const { attachRequestTtlMs } = this.#config.timings;
     const record: AttachRequestRecord = {
-      ...request,
+      pageId: page.pageId,
+      userId: caller.userId,
+      displayName: caller.displayName,
+      account: caller.account,
+      oauthClientId: caller.oauthClientId,
+      client: caller.client,
       requestId: newId('rq'),
       via,
+      inviteId: invite?.inviteId ?? null,
       joined: [],
       expiresAt: now + attachRequestTtlMs,
     };
@@ -1809,12 +3639,20 @@ export class PageHub {
         code: 'timeout',
         message: 'the operator did not answer in time, so the request was denied',
       });
+      // Silence on a control invite's prompt counts as a refusal (ADR 0016).
+      if (record.inviteId !== null) this.#inviteRefused(record.pageId, record.inviteId);
     });
     this.#send(conn, {
       t: 'attach_request',
       requestId: record.requestId,
       user: { userId: record.userId, displayName: record.displayName },
+      // A member's name comes from the owner's own settings; an invitee's is verified only with an email.
+      account: {
+        kind: record.account.kind,
+        verified: record.account.kind === 'member' || record.account.email !== null,
+      },
       via: record.via,
+      ...(invite === null ? {} : { invite }),
       client: record.client,
       expiresAt: record.expiresAt,
     });
@@ -1824,7 +3662,7 @@ export class PageHub {
       requestId: record.requestId,
       via,
     });
-    return { kind: 'pending', record };
+    return record;
   }
 
   /**
@@ -1885,6 +3723,11 @@ export class PageHub {
     });
   }
 
+  /**
+   * `heldBytes` is an upper bound on what the call's own request holds on
+   * the heap while it waits (request-heap.ts), which relay.ts measures from
+   * its body; 0 for a caller with none.
+   */
   async callPageTool(
     caller: CallerIdentity,
     pageId: string,
@@ -1892,11 +3735,17 @@ export class PageHub {
     args: JsonObject,
     signal: AbortSignal,
     marks: CallMarks | null = null,
+    heldBytes = 0,
   ): Promise<CallOutcome> {
     const started = Date.now();
+    // The duration comes from a clock that only runs forward: a wall clock
+    // stepped back during the call would give a negative one, which the
+    // record's schema refuses, and the call would lose its line (S7).
+    const startedMono = performance.now();
     let auditOutcome: AuditOutcome = 'relay_error';
+    const trace: CallTrace = { reached: false, release: null };
     try {
-      const outcome = await this.#call(caller, pageId, tool, args, signal, marks);
+      const outcome = await this.#call(caller, pageId, tool, args, signal, marks, trace, heldBytes);
       auditOutcome = outcome.kind === 'error' ? outcome.code : outcome.kind;
       return outcome;
     } catch (error) {
@@ -1904,32 +3753,131 @@ export class PageHub {
       this.#log.error('call failed inside the relay', { pageId, error });
       throw error;
     } finally {
+      trace.release?.();
       // In finally, so every attempt leaves a record even when the relay itself fails (S7).
-      const record = {
+      const record: AuditCallEvent = {
+        v: AUDIT_VERSION,
+        type: 'call',
         at: started,
-        pageId,
+        // The client's own text: kept when it is an id or a tool name, else only its length (ADR 0019).
+        pageId: auditPageId(pageId),
         origin: this.#store.pages.get(pageId)?.origin ?? null,
         userId: caller.userId,
         client: caller.client,
-        tool,
+        tool: auditToolName(tool),
         outcome: auditOutcome,
-        durationMs: Date.now() - started,
+        durationMs: Math.round(performance.now() - startedMono),
       };
-      this.#store.audit.append(record);
-      // Arguments are never part of the record (S7), and the logger redacts them anyway.
-      this.#log.info('call', { audit: record });
+      // A call that reached its page is always written in full; one refused
+      // before it went out, or failed by the relay before it could, only
+      // within the refusal budget (ADR 0019).
+      if (trace.reached || auditOutcome === 'relay_error') this.#audit(record);
+      else this.#budget.refused(record);
       this.#spike?.callFinished(pageId, caller.userId, auditOutcome);
     }
   }
 
   /**
+   * A call_page_tool whose own arguments do not fit its schema, a page id
+   * of 101 characters say, is a call refused before any page saw it, so it
+   * keeps its call line within the refusal budget like any other (S7, ADR
+   * 0019). The page and tool are the client's text, stored only when valid.
+   */
+  refusedMalformedCall(caller: CallerIdentity, page: string, pageTool: string): void {
+    this.#budget.refused({
+      v: AUDIT_VERSION,
+      type: 'call',
+      at: Date.now(),
+      pageId: auditPageId(page),
+      origin: this.#store.pages.get(page)?.origin ?? null,
+      userId: caller.userId,
+      client: caller.client,
+      tool: auditToolName(pageTool),
+      outcome: 'invalid_arguments',
+      durationMs: 0,
+    });
+  }
+
+  /**
+   * ADR 0018's per-user request budget refused a request before its tool
+   * ran: a call stays a call record and a pairing an attach_refused one, so
+   * every attempt of each keeps its kind of line, and the other tools get a
+   * request_refused record, each within the refusal budget (ADR 0019).
+   */
+  refusedByBudget(caller: CallerIdentity, refused: BudgetRefusal): void {
+    const at = Date.now();
+    const { userId, client } = caller;
+    switch (refused.tool) {
+      case 'call_page_tool':
+        this.#budget.refused({
+          v: AUDIT_VERSION,
+          type: 'call',
+          at,
+          pageId: auditPageId(refused.page),
+          origin: this.#store.pages.get(refused.page)?.origin ?? null,
+          userId,
+          client,
+          tool: auditToolName(refused.pageTool),
+          outcome: 'rate_limited',
+          durationMs: 0,
+        });
+        return;
+      case 'pair_page':
+        this.#refusedBeforePage(
+          caller,
+          refused.via,
+          null,
+          hubError('rate_limited', 'too many requests'),
+        );
+        return;
+      case 'list_pages':
+        this.#budget.refused({
+          v: AUDIT_VERSION,
+          type: 'request_refused',
+          at,
+          userId,
+          kind: caller.account.kind,
+          client,
+          tool: 'list_pages',
+          pageId: null,
+          outcome: 'rate_limited',
+        });
+        return;
+      default:
+        this.#budget.refused({
+          v: AUDIT_VERSION,
+          type: 'request_refused',
+          at,
+          userId,
+          kind: caller.account.kind,
+          client,
+          tool: refused.tool,
+          pageId: auditPageId(refused.page),
+          outcome: 'rate_limited',
+        });
+    }
+  }
+
+  /**
+   * Every audit record the hub writes goes through here: into the audit log
+   * and, as its off-host copy with whatever the file line added, to the log,
+   * whose redaction drops an invitee's email (recordAudit, ADR 0019).
+   * Arguments are never part of a record (S7). Refusals that reached no page
+   * come here only through the refusal budget.
+   */
+  #audit(event: AuditEvent): void {
+    recordAudit(this.#store.audit, this.#frameLog.kept, event);
+  }
+
+  /**
    * Everything a call must pass, in order: access, the rate limit (so a refused
-   * call still counts and nobody spins on invalid calls for free), the tool, the
-   * role, the frame size, the queue depth for a mutating call, and the
-   * arguments. A mutating call takes its place in its page's queue on arrival,
-   * before its argument check answers, so a later write whose check is quicker
-   * or skipped never overtakes it (SPEC section 5); a read-only one goes to the
-   * page once its check answers.
+   * call still counts and nobody spins on invalid calls for free), what its
+   * request may hold while it waits, the tool, the role, the frame size, the
+   * queue depth for a mutating call, and the arguments. A mutating call takes
+   * its place in its page's queue on arrival, before its argument check
+   * answers, so a later write whose check is quicker or skipped never
+   * overtakes it (SPEC section 5); a read-only one goes to the page once its
+   * check answers.
    */
   async #call(
     caller: CallerIdentity,
@@ -1938,6 +3886,8 @@ export class PageHub {
     args: JsonObject,
     signal: AbortSignal,
     marks: CallMarks | null,
+    trace: CallTrace,
+    heldBytes: number,
   ): Promise<CallOutcome> {
     const arrivedAt = Date.now();
     const access = this.#access(caller.userId, pageId);
@@ -1954,6 +3904,9 @@ export class PageHub {
       );
     }
     this.#callLimiter.record(rateKey, arrivedAt);
+    const held = this.#holdBytes(caller.userId, heldBytes, 'page_busy');
+    if (held.kind === 'error') return held;
+    trace.release = held.release;
 
     // Every call moves the expiry, but only one that passes every check names
     // its client (#nameClient): refused calls must not add names to the roster.
@@ -1981,7 +3934,10 @@ export class PageHub {
       waited: false,
       checking: false,
       conn: null,
+      heldOn: null,
+      invokeBytes: 0,
       marks,
+      trace,
       timer: null,
       done: false,
       settle: () => undefined,
@@ -1989,6 +3945,7 @@ export class PageHub {
     // Checked before anything waits: the size cannot grow later, as the role and deadline only shrink.
     const encoded = this.#encodeInvoke(call, attachment.role, this.#config.timings.callDeadlineMs);
     if (encoded.kind === 'error') return encoded;
+    call.invokeBytes = encoded.bytes;
 
     if (!call.mutating) {
       // Read-only calls run side by side, so nothing is held while this one is checked.
@@ -2062,10 +4019,8 @@ export class PageHub {
   ): Promise<CallOutcome> {
     return new Promise((resolve) => {
       const onAbort = (): void => {
-        // A queued call simply leaves the queue; the page never heard of it.
-        if (call.conn) {
-          this.#send(call.conn, { t: 'cancel', callId: call.callId, reason: 'client' });
-        }
+        // A queued or held call simply leaves; the page never heard of it.
+        if (call.conn) this.#sendCancel(call.conn, call.callId, 'client');
         call.settle({ kind: 'cancelled' });
       };
       call.settle = (outcome) => {
@@ -2147,7 +4102,7 @@ export class PageHub {
     call: PendingCall,
     role: Role,
     deadlineMs: number,
-  ): { kind: 'frame'; text: string } | HubError {
+  ): { kind: 'frame'; text: string; bytes: number } | HubError {
     let text: string;
     try {
       text = encodeFrame({
@@ -2169,13 +4124,14 @@ export class PageHub {
     }
     // The adapter drops any frame over the cap by closing the socket, so an
     // oversized call must stop here rather than knock the page offline.
-    if (Buffer.byteLength(text, 'utf8') > MAX_FRAME_BYTES) {
+    const bytes = Buffer.byteLength(text, 'utf8');
+    if (bytes > MAX_FRAME_BYTES) {
       return hubError(
         'invalid_arguments',
         `the arguments are too large to forward; one page link frame carries at most ${String(MAX_FRAME_BYTES)} bytes`,
       );
     }
-    return { kind: 'frame', text };
+    return { kind: 'frame', text, bytes };
   }
 
   /**
@@ -2235,12 +4191,12 @@ export class PageHub {
     call.timer = setTimeout(
       () => {
         if (call.conn) {
-          this.#send(call.conn, { t: 'cancel', callId: call.callId, reason: 'timeout' });
+          this.#sendCancel(call.conn, call.callId, 'timeout');
           call.settle(
             hubError('timeout', `the page did not answer within ${String(callDeadlineMs)} ms`),
           );
         } else {
-          call.settle(this.#queuedTooLong());
+          call.settle(call.heldOn ? this.#heldTooLong() : this.#queuedTooLong());
         }
       },
       Math.max(0, due - Date.now()),
@@ -2252,6 +4208,13 @@ export class PageHub {
     return hubError(
       'timeout',
       `the call waited ${String(this.#config.timings.callDeadlineMs)} ms behind other calls that change the page and never ran`,
+    );
+  }
+
+  #heldTooLong(): HubError {
+    return hubError(
+      'timeout',
+      `the page did not take what the relay had already sent it within ${String(this.#config.timings.callDeadlineMs)} ms, so the call never reached it`,
     );
   }
 
@@ -2280,7 +4243,9 @@ export class PageHub {
 
   /**
    * Sends a call to its page, checking again what may have changed while it
-   * waited: the attachment, the page, the tool and the role. True if it went out.
+   * waited: the attachment, the page, the tool and the role. A call that
+   * finds no room on the page's socket, or calls already waiting for it,
+   * waits behind them (#hold). True if it went out or waits for room.
    */
   #dispatch(call: PendingCall): boolean {
     const current = this.#recheck(call);
@@ -2288,11 +4253,20 @@ export class PageHub {
       call.settle(current);
       return false;
     }
-    const { attachment, conn } = current;
+    const { conn } = current;
+    if (conn.held.length > 0 || !this.#roomForInvoke(conn, call.invokeBytes)) {
+      this.#hold(call, conn);
+      return true;
+    }
+    return this.#sendInvoke(call, current.attachment, conn);
+  }
+
+  /** The invoke itself, once every check has passed and the socket has room. True if it went out. */
+  #sendInvoke(call: PendingCall, attachment: AttachmentRecord, conn: Conn): boolean {
     const { callDeadlineMs } = this.#config.timings;
     const remaining = call.waited ? callDeadlineMs - (Date.now() - call.arrivedAt) : callDeadlineMs;
     if (remaining <= 0) {
-      call.settle(this.#queuedTooLong());
+      call.settle(call.heldOn ? this.#heldTooLong() : this.#queuedTooLong());
       return false;
     }
     const encoded = this.#encodeInvoke(call, attachment.role, remaining);
@@ -2300,12 +4274,54 @@ export class PageHub {
       call.settle(encoded);
       return false;
     }
+    call.heldOn = null;
     call.conn = conn;
+    call.trace.reached = true;
     conn.inflight.set(call.callId, call);
     this.#armCallTimer(call);
     if (call.marks) call.marks.invokeOut = performance.now();
-    conn.ws.send(encoded.text);
+    this.#write(conn, false, (written) => {
+      conn.ws.send(encoded.text, written);
+    });
     return true;
+  }
+
+  /**
+   * A call whose invoke would take the page's queue past INVOKE_ROOM waits,
+   * holding nothing the call does not already hold, until the page takes
+   * enough of what it was sent (#sendHeld) or its deadline passes. Its
+   * deadline runs on meanwhile, as in the write queue.
+   */
+  #hold(call: PendingCall, conn: Conn): void {
+    call.heldOn = conn;
+    call.waited = true;
+    conn.held.push(call);
+    this.#log.debug('call waits for room on the page link', {
+      pageId: call.pageId,
+      callId: call.callId,
+      held: conn.held.length,
+    });
+  }
+
+  /**
+   * Sends the calls waiting for room on this socket, oldest first, while
+   * there is room for the next. Each is looked at once more as it goes,
+   * since its caller may have been revoked or demoted meanwhile.
+   */
+  #sendHeld(conn: Conn): void {
+    while (!conn.closing && conn.ws.readyState === conn.ws.OPEN) {
+      const call = conn.held[0];
+      if (call === undefined || !this.#roomForInvoke(conn, call.invokeBytes)) return;
+      conn.held.shift();
+      const current = this.#recheck(call);
+      if (current.kind === 'error') call.settle(current);
+      else if (current.conn === conn) this.#sendInvoke(call, current.attachment, conn);
+      else {
+        // The page resumed on another socket; the call follows it.
+        call.heldOn = null;
+        this.#dispatch(call);
+      }
+    }
   }
 
   /**
@@ -2335,9 +4351,14 @@ export class PageHub {
     }
   }
 
-  /** Takes a settled call out of its socket's in-flight set and its page's queue. */
+  /** Takes a settled call out of its socket's in-flight set or wait for room, and its page's queue. */
   #detachCall(call: PendingCall): void {
     call.conn?.inflight.delete(call.callId);
+    if (call.heldOn) {
+      const at = call.heldOn.held.indexOf(call);
+      if (at !== -1) call.heldOn.held.splice(at, 1);
+      call.heldOn = null;
+    }
     const queue = this.#queues.get(call.pageId);
     if (!queue) return;
     const at = queue.waiting.indexOf(call);
@@ -2353,7 +4374,10 @@ export class PageHub {
    */
   #touchAttachment(attachment: AttachmentRecord, now: number): boolean {
     attachment.lastUsedAt = now;
-    attachment.expiresAt = now + this.#config.timings.attachmentIdleMs;
+    const idleEnd = now + this.#config.timings.attachmentIdleMs;
+    // Use moves the idle expiry, never past an invite-made attachment's end.
+    attachment.expiresAt =
+      attachment.endsAt === null ? idleEnd : Math.min(idleEnd, attachment.endsAt);
     this.#armExpiry(attachment);
     this.#store.attachments.put(attachment);
     if (now - (this.#rosterSentAt.get(attachment.pageId) ?? 0) < this.#rosterStep()) return false;
@@ -2416,12 +4440,24 @@ export class PageHub {
   }
 
   detachPage(userId: string, pageId: string): DetachOutcome {
-    this.#expireIfDue(pageId, userId);
+    // One past its time, or below a member past theirs, ends as it would have, not as a detach.
+    this.#chainInTime(pageId, userId);
     const attachment = this.#store.attachments.get(pageId, userId);
     if (attachment) {
       this.#endAttachments(pageId, new Set([userId]), 'client', 'you detached from this page');
-      this.#sendRoster(pageId);
+      const page = this.#store.pages.get(pageId);
+      this.#audit({
+        v: AUDIT_VERSION,
+        type: 'detach',
+        at: Date.now(),
+        pageId,
+        origin: page?.origin ?? '',
+        userId,
+      });
       this.#log.info('detached', { pageId, userId });
+      // A sponsor who leaves takes their invites, and what those made, with them (S14).
+      this.#loseSponsors(pageId, [attachment]);
+      this.#sendRoster(pageId);
       return { kind: 'detached', pageId };
     }
     const page = this.#store.pages.get(pageId);
@@ -2438,9 +4474,97 @@ export class PageHub {
 
   // Plumbing
 
+  /** Any frame but an invoke (#sendInvoke) or a cancel (#sendCancel), within ADR 0024's bound. */
   #send(conn: Conn, frame: RelayFrame): void {
     if (conn.ws.readyState !== conn.ws.OPEN) return;
-    conn.ws.send(encodeFrame(frame));
+    const text = encodeFrame(frame);
+    const bytes = Buffer.byteLength(text, 'utf8');
+    if (!this.#roomFor(conn, bytes)) return;
+    this.#write(conn, true, (written) => {
+      conn.ws.send(text, written);
+    });
+  }
+
+  /**
+   * A cancel never closes a page: at most one follows each invoke that went
+   * out, so the call limits bound them, and a member cancelling a burst of
+   * calls must not end the page for everyone (ADR 0024's notes).
+   */
+  #sendCancel(conn: Conn, callId: string, reason: CancelReason): void {
+    if (conn.ws.readyState !== conn.ws.OPEN) return;
+    const text = encodeFrame({ t: 'cancel', callId, reason });
+    this.#write(conn, false, (written) => {
+      conn.ws.send(text, written);
+    });
+  }
+
+  /**
+   * Hands ws one frame and counts it in the socket's queue until ws reports
+   * it handed to the kernel; each such report is the page making progress,
+   * so calls waiting for room are looked at again.
+   */
+  #write(conn: Conn, counted: boolean, send: (written: () => void) => void): void {
+    this.#observe(conn);
+    const { queue } = conn;
+    const epoch = queue.epoch;
+    queue.frames += 1;
+    if (counted) queue.counted += 1;
+    send(() => {
+      if (queue.epoch === epoch) {
+        queue.frames -= 1;
+        if (counted) queue.counted -= 1;
+      }
+      if (conn.held.length > 0) this.#sendHeld(conn);
+    });
+  }
+
+  /**
+   * Starts the socket's counts over when its queue (bufferedAmount: what ws
+   * has not yet handed the kernel) is empty: nothing is unread then, though
+   * the callbacks of what just left may still be a tick away.
+   */
+  #observe(conn: Conn): void {
+    if (conn.ws.bufferedAmount !== 0) return;
+    conn.queue.epoch += 1;
+    conn.queue.frames = 0;
+    conn.queue.counted = 0;
+  }
+
+  /**
+   * Whether an invoke of this many bytes may go out now (INVOKE_ROOM): onto
+   * an empty queue always, otherwise while the queue and it stay within
+   * INVOKE_ROOM and the frames queued below MAX_UNREAD_FRAMES. Never closes.
+   */
+  #roomForInvoke(conn: Conn, bytes: number): boolean {
+    this.#observe(conn);
+    const queued = conn.ws.bufferedAmount;
+    return queued === 0 || (queued + bytes <= INVOKE_ROOM && conn.queue.frames < MAX_UNREAD_FRAMES);
+  }
+
+  /**
+   * Whether a frame of this many bytes may be queued for the page (ADR 0024).
+   * The socket's queue (bufferedAmount) holds only what the kernel has not
+   * taken yet, so it stays empty while the page reads, and drains on a slow
+   * link as fast as the link takes it. Past MAX_UNREAD_FRAMES frames that
+   * count still in it, or MAX_UNREAD_BYTES queued in all, the page is not
+   * reading what it is sent, and its socket is closed with 1008 and cut off
+   * after CLOSE_GRACE_MS, which frees what it held; the page sleeps and may
+   * resume like after any close. Invokes never fill more than INVOKE_ROOM
+   * of it, so what a member's calls queue cannot close a page by itself.
+   */
+  #roomFor(conn: Conn, bytes: number): boolean {
+    this.#observe(conn);
+    const queued = conn.ws.bufferedAmount;
+    if (queued === 0) return true;
+    if (conn.queue.counted < MAX_UNREAD_FRAMES && queued + bytes <= MAX_UNREAD_BYTES) return true;
+    this.connectionLine(conn.address, 'warn', 'closing page socket: the page is not reading', {
+      pageId: conn.pageId,
+      address: conn.address,
+      queuedBytes: queued,
+      queuedFrames: conn.queue.counted,
+    });
+    this.#closeSocket(conn, CLOSE_POLICY, 'page is not reading');
+    return false;
   }
 
   #closeSocket(conn: Conn, code: number, reason: string, graceMs = CLOSE_GRACE_MS): void {
@@ -2488,6 +4612,10 @@ export class PageHub {
    * every timer and terminates the argument check worker.
    */
   async shutdown(): Promise<void> {
+    // The refusal counts still held go out first, while the audit log is open.
+    this.#budget.close();
+    // So do the counts of page lines held back.
+    this.#ignoredLines.flush();
     this.#closed = true;
     // Checks still waiting on it come back unchecked, and their calls then see #closed.
     const checkerClosed = this.#checker.close();
@@ -2501,7 +4629,7 @@ export class PageHub {
     const closing: Promise<void>[] = [];
     for (const conn of [...this.#conns]) {
       for (const callId of [...conn.inflight.keys()]) {
-        this.#send(conn, { t: 'cancel', callId, reason: 'shutdown' });
+        this.#sendCancel(conn, callId, 'shutdown');
       }
       this.#failInflight(conn, shuttingDown);
       if (conn.ws.readyState === conn.ws.CLOSED) continue;
@@ -2520,11 +4648,14 @@ export class PageHub {
       this.#requestTimers,
       this.#expiryTimers,
       this.#rosterTimers,
+      this.#inviteTimers,
     ]) {
       for (const timer of map.values()) clearTimeout(timer);
       map.clear();
     }
     this.#liveCodes.clear();
     await Promise.all([...closing, checkerClosed]);
+    // Once every socket has closed, so the lines their closes counted go out too.
+    this.#connectionLines.flush();
   }
 }

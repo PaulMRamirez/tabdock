@@ -1,5 +1,5 @@
 # @tabdock/protocol
 
-Message types and zod schemas for the page link between the adapter and the relay (SPEC.md section 6). Both sides validate every frame with these schemas, so this package is the single place the wire format is defined.
+Message types and zod schemas shared by the relay and the adapter (SPEC.md sections 5 to 7). Both sides validate every frame with these schemas and infer their TypeScript types from them, so this package is the single place the wire format is defined.
 
-M0 holds only the fixed constants (subprotocol, size limits, error codes). M1 adds the frame schemas.
+`constants.ts` holds the fixed numbers (the subprotocol, size limits, invite bounds) and `errors.ts` the error codes MCP clients see, `invite_required` among them from M4. `page-link.ts` defines the page link's frames, M4's `invite_create`, `invite_cancel` and `invites` included; `invites.ts` the invite link `<public URL>/i#<secret>` and `pair_page`'s input (ADR 0017); `storage.ts` what the adapter keeps in the tab's storage beside its resume token, read back as warily as a frame (ADR 0011); and `audit.ts` the relay's audit records and file lines (ADR 0019), each type a strict object listing exactly the fields it may hold, so nothing else can reach the log. zod runs jitless (`zod-config.ts`), so loading the adapter on a page that enforces Trusted Types reports no violation.

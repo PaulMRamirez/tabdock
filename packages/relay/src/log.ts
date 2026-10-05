@@ -32,10 +32,26 @@ export const REDACTED_FIELDS: readonly string[] = [
   'id_token',
   'access_token',
   'refresh_token',
+  // Invites (ADR 0017): a link or its secret as pair_page takes it, and the
+  // digest the relay keeps, which ADR 0019 keeps out of every record too.
+  'invite',
+  'link',
+  'secrethash',
+  // People (ADR 0020): an invitee's address reaches its page and the audit
+  // file's attach record, never stderr or a platform's logs.
+  'email',
+  'displayname',
 ];
 
 const REDACTED = '[redacted]';
 const MAX_DEPTH = 6;
+/**
+ * An error's message is kept to this many characters. A library's message
+ * may quote what a request sent (the MCP SDK's refusals quote a body's method
+ * and protocol version and the headers beside them), so without a cap one
+ * request of two page frames wrote a 2 MiB line (A4.3).
+ */
+export const MAX_ERROR_MESSAGE_CHARS = 200;
 const LEVELS: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
 const RESERVED = new Set(['ts', 'level', 'msg']);
 
@@ -47,7 +63,12 @@ export function redact(value: unknown, depth = 0): unknown {
   }
   if (depth >= MAX_DEPTH) return '[nested]';
   // Error messages from our own code never carry secrets; stacks add noise, not signal.
-  if (value instanceof Error) return { name: value.name, message: value.message };
+  if (value instanceof Error) {
+    const { name, message } = value;
+    return message.length <= MAX_ERROR_MESSAGE_CHARS
+      ? { name, message }
+      : { name, message: message.slice(0, MAX_ERROR_MESSAGE_CHARS), messageChars: message.length };
+  }
   if (Buffer.isBuffer(value) || ArrayBuffer.isView(value)) return '[bytes]';
   if (Array.isArray(value)) return value.map((item) => redact(item, depth + 1));
   const out: Record<string, unknown> = {};

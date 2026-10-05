@@ -8,6 +8,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./test/provider": "./test/helpers/provider.ts",
+    "./test/secrecy": "./test/helpers/secrecy.ts",
     "./test/tunnel": "./test/helpers/tunnel.ts"
   },
   "scripts": {

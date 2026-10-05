@@ -11,6 +11,8 @@
   },
   "scripts": {
     "build": "pnpm -r --if-present build",
+    "relay": "node packages/relay/src/main.ts",
+    "audit:log": "node packages/relay/src/audit-cli.ts",
     "dev": "node scripts/dev.ts",
     "dev:public": "node scripts/dev.ts --public",
     "dev:demo": "pnpm --filter @tabdock/demo dev",
@@ -23,6 +25,7 @@
     "demo:m1": "pnpm --filter @tabdock/e2e demo:m1",
     "demo:m2": "pnpm --filter @tabdock/e2e demo:m2",
     "demo:m3": "pnpm --filter @tabdock/e2e demo:m3",
+    "demo:m4": "pnpm --filter @tabdock/e2e demo:m4",
     "spike:latency": "node scripts/spike/latency.ts",
     "spike:soak": "node scripts/spike/soak.ts"
   },

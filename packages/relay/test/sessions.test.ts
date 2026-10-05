@@ -28,6 +28,7 @@ import {
   pairAndApprove,
   sessionIdOf,
   startRelay,
+  TestFence,
   type TestRelay,
 } from './helpers/relay.ts';
 
@@ -35,33 +36,47 @@ let current: TestRelay | undefined;
 const pages: TestPage[] = [];
 const clients: Client[] = [];
 const streams: OpenStream[] = [];
+const fence = new TestFence();
 
 async function setup(options: Parameters<typeof startRelay>[0] = {}): Promise<TestRelay> {
   // A listening stream's headers go out with its first keep-alive, so keep that short.
-  current = await startRelay({ ...options, timings: { sseKeepAliveMs: 50, ...options.timings } });
+  current = await fence.keep(
+    startRelay({ ...options, timings: { sseKeepAliveMs: 50, ...options.timings } }),
+    (late) => late.close(),
+  );
   return current;
 }
 
 async function client(user = ALICE, options: ClientOptions = {}): Promise<Client> {
   if (!current) throw new Error('no relay');
-  const connected = await connectClient(current.relay, user, options);
+  const connected = await fence.keep(connectClient(current.relay, user, options), (late) =>
+    late.close(),
+  );
   clients.push(connected);
   return connected;
 }
 
 async function stream(user: typeof ALICE, sessionId: string): Promise<OpenStream> {
   if (!current) throw new Error('no relay');
-  const opened = await openStream(current.relay, user, sessionId);
+  const opened = await fence.keep(openStream(current.relay, user, sessionId), (late) => {
+    late.close();
+  });
   streams.push(opened);
   return opened;
 }
 
 afterEach(async () => {
-  for (const opened of streams.splice(0)) opened.close();
-  for (const connected of clients.splice(0)) await connected.close();
-  for (const opened of pages.splice(0)) opened.ws.terminate();
-  await current?.close();
+  fence.end();
+  const ending = current;
   current = undefined;
+  // The relay closes even if a client will not, so none outlives its test.
+  try {
+    for (const opened of streams.splice(0)) opened.close();
+    for (const connected of clients.splice(0)) await connected.close();
+  } finally {
+    for (const opened of pages.splice(0)) opened.ws.terminate();
+    await ending?.close();
+  }
 });
 
 const NOT_FOUND = {
@@ -86,7 +101,12 @@ describe('sessions for 2025-era clients', () => {
 
   it("answers another user's session id with the same 404 as an unknown one, before any tool runs (S13)", async () => {
     const { relay } = await setup();
-    const opened = await connectPage(relay.pageUrl, { tools: TOOLS });
+    // The page answers, so the owner's call below ends when it does rather
+    // than at the call deadline, which held this test 3 s for nothing.
+    const opened = await connectPage(relay.pageUrl, {
+      tools: TOOLS,
+      onInvoke: () => ({ ok: true, content: '{"view":1}' }),
+    });
     pages.push(opened);
     const alice = await client(ALICE);
     await pairAndApprove(alice, opened);
@@ -111,6 +131,7 @@ describe('sessions for 2025-era clients', () => {
       tool: 'get_view',
     });
     expect(own.status).toBe(200);
+    expect(own.result?.isError ?? false, own.body).toBe(false);
     expect(opened.all('invoke').map((frame) => frame.caller.userId)).toEqual(['alice']);
   });
 

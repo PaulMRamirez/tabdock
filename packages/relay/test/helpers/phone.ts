@@ -115,10 +115,13 @@ export class Phone {
   /**
    * Taps "Sign in": /pair/login, the provider's /authorize (the mock signs
    * whoever it is told to in at once), and /pair/callback with the code.
-   * Returns each hop's answer for tests that look at them.
+   * Returns each hop's answer for tests that look at them. /i's link to sign
+   * in is `/pair/login?to=i`.
    */
-  async signIn(): Promise<{ login: RawAnswer; authorize: URL; callback: RawAnswer }> {
-    const login = await this.request('/pair/login');
+  async signIn(
+    loginPath = '/pair/login',
+  ): Promise<{ login: RawAnswer; authorize: URL; callback: RawAnswer }> {
+    const login = await this.request(loginPath);
     const authorize = new URL(login.headers.get('location') ?? '');
     this.requested.push(authorize.href);
     const atProvider = await fetch(authorize, { redirect: 'manual' });

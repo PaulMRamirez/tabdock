@@ -1,0 +1,78 @@
+# The volume ownership fallback (docs/deploy.md, "Volume ownership fallback").
+# The image runs as uid 65532, and production refuses to start when it cannot
+# write its audit directory on the tabdock_audit volume. Fly documents no way
+# to set a volume's owner, so if the first deploy shows the volume belongs to
+# root, this one-off job hands it to the relay's user: it destroys the relay's
+# Machine (which is failing to start anyway, and holds the volume), runs a
+# throwaway Machine from the image's own pinned build base that chowns the
+# volume and exits, and leaves the next Deploy run to create the relay's
+# Machine again on the same volume. It never runs on its own: it is
+# dispatched on main, typed confirmation and all, and waits for the owner's
+# approval in the production environment like a deploy.
+
+name: Volume owner
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type chown to stop the relay, hand the tabdock_audit volume to uid 65532, and leave the next Deploy run to start the relay again
+        required: true
+        type: string
+
+permissions: {}
+
+# Shares the deploy's group, so the two never run at once.
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  chown:
+    name: Hand the audit volume to the relay's user
+    if: github.ref == 'refs/heads/main' && inputs.confirm == 'chown'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: production
+    permissions:
+      contents: read
+    steps:
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # v1.6
+        with:
+          version: 0.4.111
+      - name: Chown the volume from a throwaway Machine
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP: ${{ secrets.FLY_APP }}
+          # The Dockerfile's build base, the same digest: root by default, with chown.
+          HELPER: node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c
+        run: |
+          set -euo pipefail
+          volumes=$(flyctl volumes list --app "$FLY_APP" --json)
+          count=$(jq '[.[] | select(.name == "tabdock_audit")] | length' <<<"$volumes")
+          if [[ "$count" != 1 ]]; then
+            echo "::error::expected exactly one tabdock_audit volume, found $count"
+            exit 1
+          fi
+          volume=$(jq -r '.[] | select(.name == "tabdock_audit") | .id' <<<"$volumes")
+          region=$(jq -r '.[] | select(.name == "tabdock_audit") | .region' <<<"$volumes")
+          # A volume attaches to one Machine at a time; the relay's goes, the volume stays.
+          for machine in $(flyctl machine list --app "$FLY_APP" --quiet); do
+            flyctl machine destroy "$machine" --app "$FLY_APP" --force
+          done
+          flyctl machine run "$HELPER" chown 65532:65532 /data \
+            --app "$FLY_APP" \
+            --region "$region" \
+            --volume "${volume}:/data" \
+            --restart no \
+            --rm
+          # Wait until the throwaway Machine has exited and freed the volume.
+          for _ in $(seq 1 60); do
+            if [[ -z "$(flyctl machine list --app "$FLY_APP" --quiet)" ]]; then
+              echo "The volume belongs to uid 65532. Dispatch Deploy with the same digest to start the relay again."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::the throwaway Machine did not finish within 5 minutes; check fly machine list"
+          exit 1

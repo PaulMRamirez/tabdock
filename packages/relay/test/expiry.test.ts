@@ -21,38 +21,51 @@ import {
   eventually,
   pairAndApprove,
   startRelay,
+  TestFence,
   type TestRelay,
 } from './helpers/relay.ts';
 
 let current: TestRelay | undefined;
 const pages: TestPage[] = [];
 const clients: Client[] = [];
+const fence = new TestFence();
 
 async function setup(options: Parameters<typeof startRelay>[0] = {}): Promise<TestRelay> {
-  current = await startRelay(options);
+  current = await fence.keep(startRelay(options), (late) => late.close());
   return current;
 }
 
 async function page(options: PageOptions = {}): Promise<TestPage> {
   if (!current) throw new Error('no relay');
-  const opened = await connectPage(current.relay.pageUrl, { tools: TOOLS, ...options });
+  const opened = await fence.keep(
+    connectPage(current.relay.pageUrl, { tools: TOOLS, ...options }),
+    (late) => {
+      late.ws.terminate();
+    },
+  );
   pages.push(opened);
   return opened;
 }
 
 async function client(user = ALICE): Promise<Client> {
   if (!current) throw new Error('no relay');
-  const connected = await connectClient(current.relay, user);
+  const connected = await fence.keep(connectClient(current.relay, user), (late) => late.close());
   clients.push(connected);
   return connected;
 }
 
 afterEach(async () => {
+  fence.end();
   vi.restoreAllMocks();
-  for (const connected of clients.splice(0)) await connected.close();
-  for (const opened of pages.splice(0)) opened.ws.terminate();
-  await current?.close();
+  const ending = current;
   current = undefined;
+  // The relay closes even if a client will not, so none outlives its test.
+  try {
+    for (const connected of clients.splice(0)) await connected.close();
+  } finally {
+    for (const opened of pages.splice(0)) opened.ws.terminate();
+    await ending?.close();
+  }
 });
 
 const getView = (who: Client, pageId: string) =>
@@ -233,19 +246,30 @@ describe('attachment idle expiry', () => {
     expect(JSON.stringify(opened.all('roster'))).not.toContain('stranger');
   });
 
+  // This test and the three after it wait out whole roster refresh steps, so
+  // each has a 20 s timeout of its own. Those waits alone take about 2 to
+  // 3.5 s of vitest's default 5 s, and on a loaded machine the setup, pairing
+  // and calls around them pushed a test past it with nothing wrong. A step
+  // passing is a time, not an event, so there is no condition to wait on
+  // instead.
   it('sends at most one roster per refresh step for new clients, and a trailing one carries the rest', async () => {
     // A tenth of the idle time: a 1.5 s refresh step.
     const { relay } = await setup({ timings: { attachmentIdleMs: 15_000 } });
     const opened = await page({ onInvoke: () => ({ ok: true, content: '{}' }) });
+    // Connected before the pairing, since only its calls name a client: the
+    // burst timed below is then the calls alone, which a loaded machine
+    // stretched past 1 s with each connect inside it, and the first still
+    // comes right after the pairing's roster.
+    const renamed: Client[] = [];
+    for (let i = 1; i <= 8; i += 1) {
+      renamed.push(await connectClient(relay, ALICE, { name: `c${String(i)}`, modern: true }));
+    }
+    clients.push(...renamed);
     await pairAndApprove(await client(), opened);
     await opened.sync();
     const before = opened.all('roster').length;
     const started = Date.now();
-    for (let i = 1; i <= 8; i += 1) {
-      const renamed = await connectClient(relay, ALICE, { name: `c${String(i)}`, modern: true });
-      clients.push(renamed);
-      expect((await getView(renamed, opened.pageId)).isError).toBe(false);
-    }
+    for (const each of renamed) expect((await getView(each, opened.pageId)).isError).toBe(false);
     await opened.sync();
     // The burst fits well inside one step, so only the first new client went out at once.
     expect(Date.now() - started).toBeLessThan(1000);
@@ -263,7 +287,7 @@ describe('attachment idle expiry', () => {
     ).toEqual(['c8', 'c7', 'c6', 'c5', 'c4', 'c3', 'c2', 'c1']);
     await delay(300);
     expect(opened.all('roster')).toHaveLength(before + 2);
-  });
+  }, 20_000);
 
   it('names a new client in the roster its own call sends after a quiet step, for a read and for a write', async () => {
     // A tenth of the idle time: a 1 s refresh step.
@@ -292,7 +316,7 @@ describe('attachment idle expiry', () => {
       expect(opened.all('roster')).toHaveLength(before + 2);
       expect(opened.all('roster').at(-1)?.attachments[0]?.clients[0]?.name).toBe(name);
     }
-  });
+  }, 20_000);
 
   it('holds a late name to the trailing roster when another call sent the last one, so a slow check adds no third roster to a step', async () => {
     // Each level references the next twice, so the check runs its whole budget and gives up.
@@ -361,7 +385,7 @@ describe('attachment idle expiry', () => {
     expect(opened.all('roster')).toHaveLength(before + 3);
     await eventually(() => opened.all('roster').length === before + 4, 3000);
     expect(opened.all('roster').at(-1)?.attachments[0]?.clients[0]?.name).toBe('slow');
-  });
+  }, 20_000);
 
   it('after a quiet step, a burst of new clients sends the arrival roster and the first name at once, and one trailing roster for the rest', async () => {
     // A tenth of the idle time: a 1.5 s refresh step.
@@ -395,7 +419,7 @@ describe('attachment idle expiry', () => {
     ).toEqual(['r6', 'r5', 'r4', 'r3', 'r2', 'r1']);
     await delay(300);
     expect(opened.all('roster')).toHaveLength(before + 3);
-  });
+  }, 20_000);
 
   it('formats idle times in the unit that divides them', () => {
     expect(formatDuration(8 * 60 * 60_000)).toBe('8 hours');

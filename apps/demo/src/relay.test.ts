@@ -20,6 +20,28 @@ describe('relayFromQuery', () => {
     });
   });
 
+  it('asks an https page for wss:, except for a relay on this machine', () => {
+    const onHttps = (value: string) =>
+      relayFromQuery(new URLSearchParams({ relay: value }), 'https:');
+    expect(onHttps('wss://relay.example/page')).toEqual({
+      kind: 'ok',
+      url: 'wss://relay.example/page',
+    });
+    expect(onHttps('ws://relay.example/page')).toEqual({
+      kind: 'invalid',
+      message: '?relay must be a wss: URL on an https page',
+    });
+    for (const value of [
+      'ws://127.0.0.1:8787/page',
+      'ws://localhost:8787/page',
+      'ws://[::1]:8787/page',
+    ]) {
+      expect(onHttps(value).kind, value).toBe('ok');
+    }
+    // A plain http page, as the dev server serves, may dial ws: anywhere it likes.
+    expect(read('?relay=ws://relay.example/page').kind).toBe('ok');
+  });
+
   it('refuses every other scheme, garbage and embedded credentials', () => {
     for (const value of [
       'http://127.0.0.1:8787/page',

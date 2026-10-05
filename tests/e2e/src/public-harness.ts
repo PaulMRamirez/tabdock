@@ -1,7 +1,9 @@
-// Tabdock in public URL mode in a real browser, for the QR flow at /pair: the
-// relay with the oauth plugin against the relay tests' stand-in provider
-// (oauth2-mock-server), the demo page on this machine, and a stand-in tunnel
-// for a phone's browser context.
+// Tabdock in public URL mode in a real browser, for the QR flow at /pair and,
+// with invites on, the invite page at /i: the relay with the oauth plugin
+// against the relay tests' stand-in provider (oauth2-mock-server), the demo
+// page on this machine, and a stand-in tunnel for a phone's browser context.
+// Any account the provider signs in that is not on the users list is an
+// invitee when invites are on (ADR 0017), as a stranger who signs up is.
 //
 // The tunnel is Playwright request routing: requests for https://relay.test
 // go to the loopback relay with the public Host, as ngrok forwards them, so
@@ -44,6 +46,10 @@ export interface PublicTabdockOptions {
   spike?: boolean;
   /** More accounts the provider may sign in, beside Alice. */
   users?: { sub: string; userId: string; displayName: string }[];
+  /** TABDOCK_INVITES: accounts off the list become invitees, and pages mint invites (ADR 0017). */
+  invites?: boolean;
+  /** TABDOCK_AUDIT_DIR, an absolute path: the persistent audit log instead of the memory ring (ADR 0019). */
+  auditDir?: string;
 }
 
 /** The mock provider signs in MOCK_SUBJECT, who is Alice here. */
@@ -70,6 +76,8 @@ export async function startPublicTabdock(
       logLevel: 'debug',
       logSink: options.logSink ?? (() => undefined),
       spike: options.spike === true,
+      invites: options.invites === true,
+      ...(options.auditDir === undefined ? {} : { audit: { dir: options.auditDir } }),
     });
   } catch (error) {
     await demo.close();

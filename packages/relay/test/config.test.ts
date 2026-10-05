@@ -37,10 +37,11 @@ function requestWith(authorization?: string): IncomingMessage {
 }
 
 describe('host binding (S12)', () => {
+  // Outside hosted mode (ADR 0018), which test/hosted.test.ts covers.
   it.each(['0.0.0.0', '::', '192.168.1.20', '10.0.0.1', '127.0.0.2', 'relay.example', ''])(
-    'refuses %j and says TLS arrives in M4',
+    'refuses %j and names hosted mode as the only way off loopback',
     (host) => {
-      expect(() => resolveConfig({ auth, host })).toThrow(/loopback.*TLS arrives in M4/);
+      expect(() => resolveConfig({ auth, host })).toThrow(/only on loopback.*unless.*hosted mode/);
     },
   );
 
@@ -91,7 +92,9 @@ describe('Host headers (RFC 9110)', () => {
   });
 
   it('refuses before listening, and defaults to 127.0.0.1 on a free port', async () => {
-    await expect(createRelay({ auth, host: '0.0.0.0', logSink: quiet })).rejects.toThrow(/M4/);
+    await expect(createRelay({ auth, host: '0.0.0.0', logSink: quiet })).rejects.toThrow(
+      /hosted mode/,
+    );
     const relay = await createRelay({ auth, logSink: quiet });
     try {
       expect(relay.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
@@ -196,6 +199,8 @@ describe('origin policy (S1, S2)', () => {
     expect(limits).toEqual({
       sessionsPerUser: 20,
       sessions: 1000,
+      inviteeSessions: 50,
+      sessionsPerInvitee: 2,
       usersPerPage: 10,
       queueDepth: 32,
       pageSocketsPerAddress: 20,
@@ -203,6 +208,10 @@ describe('origin policy (S1, S2)', () => {
       pageSessions: 1000,
       pairSessions: 200,
       pairSignInsInFlight: 8,
+      signInsInFlightPerAddress: 2,
+      toolBytes: 64 * 1024 * 1024,
+      requestBytes: 64 * 1024 * 1024,
+      requestBytesPerUser: 24 * 1024 * 1024,
     });
     expect(rateLimits.callsPerUserPerPage).toBe(120);
     expect(rateLimits.pairSignIns).toBe(60);
@@ -312,6 +321,8 @@ describe('loadConfigFromEnv', () => {
     expect(config.limits).toEqual({
       sessionsPerUser: 5,
       sessions: 50,
+      inviteeSessions: 50,
+      sessionsPerInvitee: 2,
       usersPerPage: 4,
       queueDepth: 8,
       pageSocketsPerAddress: 3,
@@ -319,6 +330,10 @@ describe('loadConfigFromEnv', () => {
       pageSessions: 30,
       pairSessions: 200,
       pairSignInsInFlight: 4,
+      signInsInFlightPerAddress: 2,
+      toolBytes: 64 * 1024 * 1024,
+      requestBytes: 64 * 1024 * 1024,
+      requestBytesPerUser: 24 * 1024 * 1024,
     });
     expect(config.rateLimits.callsPerUserPerPage).toBe(60);
     expect(config.rateLimits.pairSignIns).toBe(20);
@@ -346,8 +361,17 @@ describe('loadConfigFromEnv', () => {
     }
   });
 
+  it('runs local mode with no settings at all, where M1 refused (ADR 0022)', () => {
+    // The vitest setup points HOME and the rest at throwaway directories, and
+    // an empty environment names none, so the injected home directory is used.
+    const options = loadConfigFromEnv({});
+    expect(options.auth.name).toBe('dev-token');
+    expect(options.auth.loopbackOnly).toBe(true);
+    expect(options.localMode?.tokenPath.endsWith('owner-token')).toBe(true);
+    expect(options.port).toBe(DEFAULT_CLI_PORT);
+  });
+
   it('names the bad variable and never echoes a token', () => {
-    expect(() => loadConfigFromEnv({})).toThrow(/TABDOCK_DEV_TOKENS/);
     expect(() => loadConfigFromEnv({ TABDOCK_DEV_TOKENS: tokens, TABDOCK_PORT: 'x' })).toThrow(
       /TABDOCK_PORT/,
     );
@@ -375,7 +399,7 @@ describe('loadConfigFromEnv', () => {
     const options = loadConfigFromEnv({ TABDOCK_DEV_TOKENS: tokens, TABDOCK_ENV: 'production' });
     await expect(createRelay({ ...options, logSink: quiet })).rejects.toThrow(/allowedOrigins/);
     const open = loadConfigFromEnv({ TABDOCK_DEV_TOKENS: tokens, TABDOCK_HOST: '0.0.0.0' });
-    await expect(createRelay({ ...open, logSink: quiet })).rejects.toThrow(/M4/);
+    await expect(createRelay({ ...open, logSink: quiet })).rejects.toThrow(/hosted mode/);
   });
 });
 
@@ -430,13 +454,16 @@ describe('dev-token auth', () => {
       { userId: 'alice', displayName: 'Alice', token: TOKEN },
       { userId: 'bob', displayName: 'Bob', token: 'b'.repeat(40) },
     ]);
+    // A dev token names a member with no verified email and no OAuth client (ADRs 0017 and 0019).
     expect(await two.authenticate(requestWith(`Bearer ${TOKEN}`))).toEqual({
       kind: 'user',
-      user: { userId: 'alice', displayName: 'Alice' },
+      user: { userId: 'alice', displayName: 'Alice', account: { kind: 'member', email: null } },
+      oauthClientId: null,
     });
     expect(await two.authenticate(requestWith(`bearer ${'b'.repeat(40)}`))).toEqual({
       kind: 'user',
-      user: { userId: 'bob', displayName: 'Bob' },
+      user: { userId: 'bob', displayName: 'Bob', account: { kind: 'member', email: null } },
+      oauthClientId: null,
     });
     for (const header of [
       undefined,
@@ -455,6 +482,9 @@ describe('dev-token auth', () => {
         reason: 'no valid dev token',
         body: 'Unauthorized',
         headers: { 'WWW-Authenticate': 'Bearer realm="tabdock"' },
+        // Nothing to say about an account or a client before a token matches (ADR 0020).
+        accountKind: null,
+        oauthClientId: null,
       });
     }
   });

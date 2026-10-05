@@ -38,3 +38,4 @@ jobs:
       - run: pnpm demo:m1
       - run: pnpm demo:m2
       - run: pnpm demo:m3
+      - run: pnpm demo:m4

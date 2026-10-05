@@ -10,9 +10,13 @@ import {
   type ActivityEntry,
   createAdapterCore,
   type AdapterCore,
+  type CryptoLike,
   type Dock,
   type DockState,
+  type InviteOptions,
+  type InviteResult,
   type Logger,
+  type RevokeOptions,
   type SocketFactory,
   type StorageLike,
   type Timers,
@@ -77,6 +81,12 @@ export interface SimPageOptions {
   adapterVersion?: string;
   /** Timers for the adapter core; a test can shorten one, such as the silence watchdog. */
   timers?: Timers;
+  /**
+   * WebCrypto for minting and checking invites (ADR 0017); Node's global
+   * crypto unless set, which mints for real. A test can pass one without
+   * subtle to play a page outside a secure context.
+   */
+  crypto?: CryptoLike;
 }
 
 export interface SimPage {
@@ -103,8 +113,22 @@ export interface SimPage {
   readonly activity: readonly ActivityEntry[];
   /** The operator's role switch on the current page (Dock.setRole). */
   setRole(userId: string, role: Role): boolean;
-  /** The operator's Revoke, or Revoke all with '*' (Dock.revoke). */
-  revoke(userId: string): boolean;
+  /**
+   * The operator's Revoke, or Revoke all with '*' (Dock.revoke); for someone an
+   * invite let in, closeInvite also closes its link (ADR 0017).
+   */
+  revoke(userId: string, options?: RevokeOptions): boolean;
+  /** The Cancel beside one live invite in the widget's list (Dock.cancelInvite, ADR 0017). */
+  cancelInvite(inviteId: string): boolean;
+  /**
+   * The operator's Invite form on the current page (Dock.invite, ADR 0017):
+   * resolves with the link once, or the reason there is none. The page keeps
+   * the invite's record, never its secret, in storage, so reload() keeps it
+   * while the relay resumes the session; a redemption is then honoured only
+   * against that record, a Can watch one without asking the operator and a
+   * Can control one through operator.askAttach, whose request names the invite.
+   */
+  invite(options: InviteOptions): Promise<InviteResult>;
   /** The operator's pause switch (Dock.pause); it survives reload(), as the adapter stores it. */
   pause(paused: boolean): void;
   /** Resolves with the first state, current or later, that matches; rejects after timeoutMs (5000). */
@@ -222,6 +246,7 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
       adapterVersion: options.adapterVersion ?? '0.0.0-sim',
       logger,
       timers: options.timers,
+      crypto: options.crypto,
     });
     core.start();
     return { core, context };
@@ -272,8 +297,14 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
     setRole(userId, role) {
       return current.core.dock.setRole(userId, role);
     },
-    revoke(userId) {
-      return current.core.dock.revoke(userId);
+    revoke(userId, revokeOptions) {
+      return current.core.dock.revoke(userId, revokeOptions);
+    },
+    cancelInvite(inviteId) {
+      return current.core.dock.cancelInvite(inviteId);
+    },
+    invite(inviteOptions) {
+      return current.core.dock.invite(inviteOptions);
     },
     pause(paused) {
       current.core.dock.pause(paused);

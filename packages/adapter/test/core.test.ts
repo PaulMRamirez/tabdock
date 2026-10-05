@@ -53,6 +53,7 @@ describe('linking', () => {
           maxDrivers: 1,
           consequential: 'confirm',
           consequentialTools: [],
+          invites: 'watch',
         },
       },
     ]);
@@ -114,11 +115,14 @@ describe('linking', () => {
     const attachment = {
       userId: 'bob',
       displayName: 'Bob',
+      kind: 'member' as const,
       role: 'driver' as const,
       grantedAt: h.clock.now,
       lastUsedAt: null,
       expiresAt: null,
       clients: [],
+      inviteId: null,
+      endsAt: null,
     };
     socket.deliver({ t: 'roster', attachments: [attachment] });
     expect(h.dock.state.roster).toEqual([attachment]);
@@ -464,11 +468,14 @@ describe('roles and consequential tools', () => {
         {
           userId: 'alice',
           displayName: 'Alice',
+          kind: 'member',
           role: 'observer',
           grantedAt: h.clock.now,
           lastUsedAt: null,
           expiresAt: null,
           clients: [],
+          inviteId: null,
+          endsAt: null,
         },
       ],
     });
@@ -532,7 +539,7 @@ describe('roles and consequential tools', () => {
       socket.deliver(invoke('set_value', { caller: bob() }));
       await flush();
       expect(codes(socket)).toEqual(['ok']);
-      expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: 'driver' } });
+      expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: { role: 'driver' } } });
     });
 
     it('keeps an existing grant when a second request from the user goes unanswered', async () => {
@@ -549,7 +556,7 @@ describe('roles and consequential tools', () => {
       socket.deliver(invoke('set_value', { caller: bob() }));
       await flush();
       expect(codes(socket)).toEqual(['ok']);
-      expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: 'driver' } });
+      expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: { role: 'driver' } } });
     });
 
     it('keeps the first role when a second request from the user is approved as another', async () => {
@@ -560,7 +567,7 @@ describe('roles and consequential tools', () => {
       socket.deliver(invoke('set_value', { caller: bob() }));
       await flush();
       expect(codes(socket)).toEqual(['role_denied']);
-      expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: 'observer' } });
+      expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: { role: 'observer' } } });
     });
 
     it('lets a later approval replace one the relay ignored, before the user is listed', async () => {
@@ -577,7 +584,7 @@ describe('roles and consequential tools', () => {
       socket.deliver(invoke('set_value', { caller: bob() }));
       await flush();
       expect(codes(socket)).toEqual(['ok']);
-      expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: 'driver' } });
+      expect(storedGrants(h)).toEqual({ pageId: 'page-1', grants: { bob: { role: 'driver' } } });
     });
 
     it.each(['denies', 'leaves unanswered'] as const)(
@@ -662,7 +669,7 @@ describe('roles and consequential tools', () => {
       await link(first, {}, { bob: 'driver' });
       expect(JSON.parse(first.storage.getItem(GRANTS_KEY) ?? 'null')).toEqual({
         pageId: 'page-1',
-        grants: { bob: 'driver' },
+        grants: { bob: { role: 'driver' } },
       });
       first.core.close('unload');
 
@@ -702,7 +709,7 @@ describe('roles and consequential tools', () => {
       );
       expect(JSON.parse(first.storage.getItem(GRANTS_KEY) ?? 'null')).toEqual({
         pageId: 'page-1',
-        grants: { carol: 'observer' },
+        grants: { carol: { role: 'observer' } },
       });
       socket.deliver({
         t: 'roster',

@@ -6,7 +6,21 @@
 // First, before zod builds anything: no eval probe on Trusted Types pages.
 import './zod-config.ts';
 import { z } from 'zod';
-import { MAX_TOOLS_PER_PAGE, PROTOCOL_VERSION } from './constants.ts';
+import {
+  CONTROL_INVITE_USES,
+  INVITE_BURN_REFUSALS,
+  INVITE_PATH,
+  INVITE_SECRET_CHARS,
+  INVITEE_ID_PREFIX,
+  INVITEE_KEY_HEX_CHARS,
+  MAX_DISPLAY_NAME_CHARS,
+  MAX_EMAIL_CHARS,
+  MAX_INVITE_LABEL_CHARS,
+  MAX_INVITE_USES,
+  MAX_LIVE_INVITES_PER_PAGE,
+  MAX_TOOLS_PER_PAGE,
+  PROTOCOL_VERSION,
+} from './constants.ts';
 
 // Building blocks
 
@@ -50,6 +64,14 @@ export const PageToolSchema = z.object({
 export type PageTool = z.infer<typeof PageToolSchema>;
 
 /**
+ * How far a page lets its operator share it by invite (ADR 0016): not at all,
+ * Can watch invites only (the default, so control invites need a page that
+ * opts in), or Can control invites too.
+ */
+export const InvitePolicySchema = z.enum(['off', 'watch', 'all']);
+export type InvitePolicy = z.infer<typeof InvitePolicySchema>;
+
+/**
  * Page policy, sent in hello. consequentialTools is ADR 0002's option C
  * (accepted): tools the page declares consequential even when the runtime drops
  * consequentialHint.
@@ -59,15 +81,151 @@ export const PolicySchema = z.object({
   maxDrivers: z.number().int().min(1).max(100).default(1),
   consequential: z.enum(['confirm', 'allow', 'deny']).default('confirm'),
   consequentialTools: z.array(ToolNameSchema).max(MAX_TOOLS_PER_PAGE).default([]),
+  invites: InvitePolicySchema.default('watch'),
 });
 export type Policy = z.infer<typeof PolicySchema>;
 export type PolicyInput = z.input<typeof PolicySchema>;
 
 export const UserSchema = z.object({
   userId: IdSchema,
-  displayName: z.string().min(1).max(100),
+  displayName: z.string().min(1).max(MAX_DISPLAY_NAME_CHARS),
 });
 export type User = z.infer<typeof UserSchema>;
+
+// Accounts (ADRs 0016, 0017 and 0020)
+
+/**
+ * Who an account is to the relay: a member is on the owner's allowlist; an
+ * invitee signed in at the provider without being on it and can reach a page
+ * only through an invite minted there.
+ */
+export const UserKindSchema = z.enum(['member', 'invitee']);
+export type UserKind = z.infer<typeof UserKindSchema>;
+
+/** An invitee's user id: the prefix and its account key, a digest of the provider's subject, never the subject. */
+export const InviteeIdSchema = z
+  .string()
+  .regex(new RegExp(`^${INVITEE_ID_PREFIX}[0-9a-f]{${String(INVITEE_KEY_HEX_CHARS)}}$`));
+
+/**
+ * An email address as an identity provider vouches for it: one '@', no
+ * space or control character, at most MAX_EMAIL_CHARS. Loose on purpose,
+ * since the provider has already checked the address; this only keeps
+ * anything that is not one from being shown or stored as one.
+ */
+export const EmailSchema = z
+  .string()
+  .max(MAX_EMAIL_CHARS)
+  .regex(/^[^\s@\p{Cc}]+@[^\s@\p{Cc}]+$/u);
+
+/**
+ * What an attach request says about the account behind it (ADR 0017). An
+ * invitee is verified when its name is an email the provider vouches for, and
+ * shows as UNVERIFIED_ACCOUNT_NAME otherwise; a member's name comes from the
+ * owner's own settings, so a member is always verified.
+ */
+export const AccountSchema = z
+  .object({ kind: UserKindSchema, verified: z.boolean() })
+  .refine((account) => account.kind === 'invitee' || account.verified, {
+    message: 'a member is always verified',
+  });
+export type Account = z.infer<typeof AccountSchema>;
+
+// Invites (ADR 0017)
+
+/** An invite secret: 128 bits from getRandomValues as 22 base64url characters. */
+export const InviteSecretSchema = z
+  .string()
+  .regex(new RegExp(`^[A-Za-z0-9_-]{${String(INVITE_SECRET_CHARS)}}$`));
+
+/**
+ * SHA-256 of the secret's UTF-8 text, as 64 lower-case hex characters: what
+ * the adapter sends and the relay keeps instead of the secret.
+ */
+export const InviteSecretHashSchema = z.string().regex(/^[0-9a-f]{64}$/);
+
+/** The operator's label for an invite: page-written text, capped and shown as written (S10). */
+export const InviteLabelSchema = z.string().min(1).max(MAX_INVITE_LABEL_CHARS);
+
+/**
+ * Why the relay refused to mint an invite. expired: its expiresAt was less
+ * than MIN_INVITE_REMAINING_MS away on the relay's own clock, which says the
+ * page's clock runs behind (ADR 0017's notes).
+ */
+export const InviteRefusalReasonSchema = z.enum([
+  'no_sponsor',
+  'policy',
+  'limit',
+  'duplicate',
+  'no_public_url',
+  'expired',
+]);
+export type InviteRefusalReason = z.infer<typeof InviteRefusalReasonSchema>;
+
+/**
+ * An invite's terms as the adapter set them. role observer is Can watch and
+ * driver Can control; expiresAt null is "while the page is open", which the
+ * relay still ends MAX_INVITE_LIFETIME_MS after minting.
+ */
+const InviteTermsShape = {
+  inviteId: IdSchema,
+  role: RoleSchema,
+  label: InviteLabelSchema,
+  uses: z.number().int().min(1).max(MAX_INVITE_USES),
+  expiresAt: EpochMsSchema.nullable(),
+};
+
+/** A control invite is never approved in advance, so it is good for exactly one use. */
+export function controlForOneUse(terms: { role: Role; uses: number }): boolean {
+  return terms.role === 'observer' || terms.uses === CONTROL_INVITE_USES;
+}
+const CONTROL_FOR_ONE_USE = { message: 'a control invite has exactly one use' };
+
+/**
+ * An https origin as the URL parser serialises one (lower-case host or
+ * bracketed IPv6, optional port), then the invite path. No credentials, query
+ * or fragment can match, and the protocol package needs no URL global.
+ */
+const INVITE_LINK_BASE = new RegExp(
+  `^https://(?:[a-z0-9-]+(?:\\.[a-z0-9-]+)*|\\[[0-9a-f:.]+\\])(?::\\d{1,5})?${INVITE_PATH}$`,
+);
+
+/** Where invite links start: `<public URL>/i`, so the adapter appends `#<secret>` and nothing else. */
+export function isInviteLinkBase(text: string): boolean {
+  return text.length <= 2048 && INVITE_LINK_BASE.test(text);
+}
+
+/** One live invite as the relay lists it to its page. */
+export const InviteListingSchema = z
+  .object({
+    ...InviteTermsShape,
+    usesLeft: z.number().int().min(0).max(MAX_INVITE_USES),
+    /** The member attached longest when it was minted; fixed, since /i has shown the name (ADR 0017). */
+    sponsor: UserSchema,
+    /** A redemption waits on the operator's prompt; a control invite allows one at a time. */
+    pending: z.boolean(),
+    /** Refusals and timeouts so far; INVITE_BURN_REFUSALS burns a control invite. */
+    refusals: z.number().int().min(0).max(INVITE_BURN_REFUSALS),
+  })
+  .refine(controlForOneUse, CONTROL_FOR_ONE_USE)
+  .refine((invite) => invite.usesLeft <= invite.uses, {
+    message: 'an invite cannot have more uses left than it had',
+  });
+export type InviteListing = z.infer<typeof InviteListingSchema>;
+
+/**
+ * The invite an attach request came through. The relay forwards the secret
+ * it was shown, so the adapter checks it against its own record and a relay
+ * that never saw the secret cannot make up a redemption.
+ */
+export const AttachInviteSchema = z.object({
+  inviteId: IdSchema,
+  secret: InviteSecretSchema,
+  label: InviteLabelSchema,
+});
+
+export const AttachViaSchema = z.enum(['code', 'qr', 'invite']);
+export type AttachVia = z.infer<typeof AttachViaSchema>;
 
 /** MCP client name and version, for attribution only; null when the client did not say. */
 export const ClientInfoSchema = z.object({
@@ -82,14 +240,35 @@ export const CallerSchema = UserSchema.extend({
 });
 export type Caller = z.infer<typeof CallerSchema>;
 
+/**
+ * ADR 0017: an account is an invitee exactly when its id is an invitee's, so
+ * the page can tell a caller's kind from its id alone (Caller carries none)
+ * and a frame that says otherwise is malformed.
+ */
+export function kindMatchesId(kind: UserKind, userId: string): boolean {
+  return (kind === 'invitee') === InviteeIdSchema.safeParse(userId).success;
+}
+const KIND_MATCHES_ID = {
+  message: "an invitee's id is g_ and its account key, and only an invitee's is",
+};
+
 export const AttachmentViewSchema = UserSchema.extend({
+  kind: UserKindSchema,
   role: RoleSchema,
   grantedAt: EpochMsSchema,
   lastUsedAt: EpochMsSchema.nullable(),
   expiresAt: EpochMsSchema.nullable(),
   /** Clients seen calling through this attachment, newest first. */
   clients: z.array(ClientInfoSchema).max(20),
-});
+  /** The invite that made this attachment, or null for one an approval or autoApprove made (ADR 0017). */
+  inviteId: IdSchema.nullable(),
+  /** When an invite-made attachment ends whatever its use, at most 24 hours after redemption; null otherwise. */
+  endsAt: EpochMsSchema.nullable(),
+})
+  .refine((view) => kindMatchesId(view.kind, view.userId), KIND_MATCHES_ID)
+  .refine((view) => (view.inviteId === null) === (view.endsAt === null), {
+    message: 'an invite-made attachment has its end, and no other has one',
+  });
 export type AttachmentView = z.infer<typeof AttachmentViewSchema>;
 
 export const PairingSchema = z.object({
@@ -161,6 +340,24 @@ export const RevokeFrameSchema = z.object({
 
 export const RotatePairingFrameSchema = z.object({ t: z.literal('rotate_pairing') });
 
+/**
+ * Mints an invite (ADR 0017). The adapter draws inviteId, so it can store its
+ * own record before the relay answers, and sends only the secret's hash: the
+ * secret itself goes into the link, never onto the wire from the page.
+ */
+export const InviteCreateFrameSchema = z
+  .object({
+    t: z.literal('invite_create'),
+    ...InviteTermsShape,
+    secretHash: InviteSecretHashSchema,
+  })
+  .refine(controlForOneUse, CONTROL_FOR_ONE_USE);
+
+export const InviteCancelFrameSchema = z.object({
+  t: z.literal('invite_cancel'),
+  inviteId: IdSchema,
+});
+
 /** Outcome of one call: `content` (the runtime's string result) when ok, `error` otherwise. */
 export const ResultFrameSchema = z
   .object({
@@ -184,6 +381,8 @@ export const PageFrameSchema = z.discriminatedUnion('t', [
   SetRoleFrameSchema,
   RevokeFrameSchema,
   RotatePairingFrameSchema,
+  InviteCreateFrameSchema,
+  InviteCancelFrameSchema,
   ResultFrameSchema,
   PingFrameSchema,
   PongFrameSchema,
@@ -205,14 +404,22 @@ export const WelcomeFrameSchema = z.object({
   limits: LimitsSchema,
 });
 
-export const AttachRequestFrameSchema = z.object({
-  t: z.literal('attach_request'),
-  requestId: IdSchema,
-  user: UserSchema,
-  via: z.enum(['code', 'qr']),
-  client: ClientInfoSchema.nullable(),
-  expiresAt: EpochMsSchema,
-});
+export const AttachRequestFrameSchema = z
+  .object({
+    t: z.literal('attach_request'),
+    requestId: IdSchema,
+    user: UserSchema,
+    account: AccountSchema,
+    via: AttachViaSchema,
+    /** Present exactly when via is invite (ADR 0017). */
+    invite: AttachInviteSchema.optional(),
+    client: ClientInfoSchema.nullable(),
+    expiresAt: EpochMsSchema,
+  })
+  .refine((frame) => (frame.via === 'invite') === (frame.invite !== undefined), {
+    message: 'an invite request carries its invite, and no other request does',
+  })
+  .refine((frame) => kindMatchesId(frame.account.kind, frame.user.userId), KIND_MATCHES_ID);
 
 export const RosterFrameSchema = z.object({
   t: z.literal('roster'),
@@ -220,6 +427,18 @@ export const RosterFrameSchema = z.object({
 });
 
 export const PairingFrameSchema = PairingSchema.extend({ t: z.literal('pairing') });
+
+/**
+ * The page's live invites (ADR 0017), after each welcome and on every change.
+ * linkBase is `<public URL>/i`, or null where the relay mints none (no public
+ * URL); refused answers an invite_create the relay turned down.
+ */
+export const InvitesFrameSchema = z.object({
+  t: z.literal('invites'),
+  linkBase: z.string().max(2048).refine(isInviteLinkBase).nullable(),
+  invites: z.array(InviteListingSchema).max(MAX_LIVE_INVITES_PER_PAGE),
+  refused: z.object({ inviteId: IdSchema, reason: InviteRefusalReasonSchema }).optional(),
+});
 
 export const InvokeFrameSchema = z.object({
   t: z.literal('invoke'),
@@ -241,6 +460,7 @@ export const RelayFrameSchema = z.discriminatedUnion('t', [
   AttachRequestFrameSchema,
   RosterFrameSchema,
   PairingFrameSchema,
+  InvitesFrameSchema,
   InvokeFrameSchema,
   CancelFrameSchema,
   PingFrameSchema,
@@ -255,6 +475,8 @@ export const PAGE_FRAME_TYPES = [
   'set_role',
   'revoke',
   'rotate_pairing',
+  'invite_create',
+  'invite_cancel',
   'result',
   'ping',
   'pong',
@@ -265,6 +487,7 @@ export const RELAY_FRAME_TYPES = [
   'attach_request',
   'roster',
   'pairing',
+  'invites',
   'invoke',
   'cancel',
   'ping',
@@ -278,6 +501,17 @@ export type ParsedFrame<F> =
   /** Not JSON, not an object, or a known type with a bad shape. */
   | { kind: 'invalid'; reason: string };
 
+/**
+ * JSON.parse as it was when this module loaded, which in the adapter's
+ * bundle is before attach(): a page script that replaced JSON.parse later
+ * would otherwise be handed every relay frame's text, a redemption's invite
+ * secret with it. The checks that follow still run on the page's built-ins
+ * (Array.isArray is handed the parsed frame, here and in zod, and zod's
+ * regex checks call RegExp.prototype), so this narrows what a later script
+ * can read or change rather than closing it (docs/threat-model.md, B5).
+ */
+const parseJson = JSON.parse;
+
 function parseWith<F>(
   schema: z.ZodType<F>,
   known: readonly string[],
@@ -285,7 +519,7 @@ function parseWith<F>(
 ): ParsedFrame<F> {
   let value: unknown;
   try {
-    value = JSON.parse(text);
+    value = parseJson(text);
   } catch {
     return { kind: 'invalid', reason: 'not JSON' };
   }
@@ -317,6 +551,20 @@ export function parseRelayFrame(text: string): ParsedFrame<RelayFrame> {
   return parseWith(RelayFrameSchema, RELAY_FRAME_TYPES, text);
 }
 
+/**
+ * JSON.stringify as it was when this module loaded, for the same reason as
+ * parseJson: a page script that replaced JSON.stringify after attach() would
+ * otherwise be handed every frame the page sends, and could hand back other
+ * text, so that the operator's Deny left the page as Allow. It still looks up
+ * toJSON on every object in the frame, so a toJSON that such a script puts on
+ * Object.prototype is still called and can still read and rewrite each frame
+ * as it goes out. The adapter's schema check, which runs before this, hands
+ * each frame to page built-ins (Array.isArray among them) that such a script
+ * can patch to the same end; this narrows the routes rather than closing
+ * them (docs/threat-model.md, B5).
+ */
+const stringifyJson = JSON.stringify;
+
 export function encodeFrame(frame: PageFrameInput | RelayFrame): string {
-  return JSON.stringify(frame);
+  return stringifyJson(frame);
 }

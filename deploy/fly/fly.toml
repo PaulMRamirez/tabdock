@@ -1,0 +1,56 @@
+# The reference deployment's Fly.io configuration (ADR 0018, docs/deploy.md,
+# section "deploy/fly/fly.toml"). It names no app, organisation or domain:
+# the deploy workflow passes the app name through FLY_APP and the image by
+# digest, and every setting that names something of the owner's is a Fly
+# secret staged from the GitHub production environment. What is here is the
+# same for anyone deploying this way, so each change is a reviewed pull
+# request. tests/e2e/test/deploy-files.test.ts fails CI if [http_service]
+# (whose ports carry the HTTP handler that overwrites Fly-Client-IP) or the
+# tabdock_audit mount goes, or if the relay could run as more than one Machine.
+
+primary_region = "iad"
+# main.ts closes on SIGTERM within a second; Fly waits this many seconds before killing.
+kill_signal = "SIGTERM"
+kill_timeout = 5
+
+[deploy]
+  # One Machine with a volume: rolling stops the old Machine before starting
+  # the new, and Fly refuses bluegreen and canary with a volume anyway. Every
+  # deploy is a restart (ADR 0019).
+  strategy = "rolling"
+
+[env]
+  TABDOCK_ENV = "production"
+  # Hosted mode alone may bind 0.0.0.0 (S12): Fly's proxy and health checks reach the Machine there.
+  TABDOCK_HOST = "0.0.0.0"
+  TABDOCK_PORT = "8787"
+  TABDOCK_AUDIT_DIR = "/data/audit"
+  TABDOCK_INVITES = "1"
+  # The one header Fly's proxy overwrites with the client's address; never X-Forwarded-For.
+  TABDOCK_CLIENT_ADDRESS_HEADER = "fly-client-ip"
+  # TABDOCK_TRUSTED_PROXY_CIDR is left to its RFC 1918 default until the first
+  # deploy logs the proxy's address; a pull request then narrows it here.
+
+[http_service]
+  internal_port = 8787
+  force_https = true
+  # One instance, always: the relay keeps its state in memory (ADR 0018).
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    timeout = "5s"
+    method = "GET"
+    path = "/healthz"
+
+[mounts]
+  # Created by hand before the first deploy (docs/deploy.md); only the audit log lives here.
+  source = "tabdock_audit"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

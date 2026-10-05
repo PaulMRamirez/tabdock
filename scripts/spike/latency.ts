@@ -5,8 +5,9 @@
 // With the relay's TABDOCK_SPIKE=1 the table also splits each round trip into
 // the relay's part (the page included) and the rest (tunnel, network, client).
 //
-// Local relay (http on loopback): a dev token from TABDOCK_DEV_TOKENS in .env
-// (the --user entry, else the first), or TABDOCK_SPIKE_TOKEN.
+// Local relay (http on loopback): TABDOCK_SPIKE_TOKEN, else a dev token from
+// TABDOCK_DEV_TOKENS in .env (the --user entry, else the first), else local
+// mode's owner token, read from its file (ADR 0022) and never created here.
 // Public URL (https): the SDK's OAuth sign-in, with a sign-in URL printed for
 // you to open in a browser on this machine and a loopback redirect.
 // Tokens and pairing codes are never printed.
@@ -21,7 +22,7 @@ import {
   latencyReport,
   measureCalls,
 } from '../../tests/e2e/src/spike/latency.ts';
-import { parseDevTokens } from '../../packages/relay/src/index.ts';
+import { parseDevTokens, readOwnerToken } from '../../packages/relay/src/index.ts';
 
 const USAGE = `pnpm spike:latency [options]
 
@@ -29,7 +30,8 @@ const USAGE = `pnpm spike:latency [options]
   --public              time <TABDOCK_PUBLIC_URL>/mcp instead, signing in through OAuth
   --code <code>         pair with the code the page shows (approve it on the page)
   --page <id>           reuse an attachment to this page (default: your one awake page)
-  --user <id>           dev-token user for a local relay (default: the first in TABDOCK_DEV_TOKENS)
+  --user <id>           dev-token user for a local relay (default: the first in TABDOCK_DEV_TOKENS;
+                        with none, local mode's owner token from its file)
   --tool <name>         page tool to call (default get_view)
   --args <json>         its arguments as a JSON object (default {})
   --warmup <n>          warm-up calls, not counted (default 5)
@@ -132,8 +134,19 @@ function bearerToken(): string {
   const explicit = process.env.TABDOCK_SPIKE_TOKEN?.trim() ?? '';
   if (explicit !== '') return explicit;
   const listed = process.env.TABDOCK_DEV_TOKENS?.trim() ?? '';
-  if (listed === '')
-    fail('set TABDOCK_DEV_TOKENS in .env (or TABDOCK_SPIKE_TOKEN) for a local relay');
+  if (listed === '') {
+    if (values.user !== undefined)
+      fail('--user names a dev-token user, and TABDOCK_DEV_TOKENS is not set');
+    // Local mode: read the relay's owner token, with every check the relay
+    // makes, and never draw one, which only the relay itself may do.
+    const owner = readOwnerToken(process.env);
+    if (owner === null) {
+      fail(
+        'no owner token yet: start the relay with pnpm relay (local mode draws one), or set TABDOCK_SPIKE_TOKEN or TABDOCK_DEV_TOKENS',
+      );
+    }
+    return owner.token;
+  }
   const users = parseDevTokens(listed);
   const user = values.user === undefined ? users[0] : users.find((u) => u.userId === values.user);
   if (!user) fail(`TABDOCK_DEV_TOKENS has no user ${values.user ?? ''}`);

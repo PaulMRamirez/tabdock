@@ -119,6 +119,93 @@ export interface OpenStream {
   close(): void;
 }
 
+export interface OpenListen extends OpenStream {
+  /** Whether the relay answered with an event stream, the listen's only success. */
+  streaming: boolean;
+  /** The body of an answer that was not a stream, such as a refusal; '' for a stream. */
+  text: string;
+}
+
+let nextListen = 0;
+
+/** What a test changes about a listen, to send one the SDK or the relay refuses. */
+export interface ListenOptions {
+  /** Spaces put inside the body, making it this many bytes larger. */
+  pad?: number;
+  /** In place of the usual params, notifications and _meta included. */
+  params?: Record<string, unknown>;
+  /** false sends it without an id, as a notification. */
+  id?: false;
+  /** Over the usual headers, such as another Content-Type. */
+  headers?: Record<string, string>;
+}
+
+/**
+ * A 2026-07-28 subscriptions/listen, as the SDK client sends it, held open
+ * until close(); an answer that is not a stream is read whole into `text`.
+ */
+export async function openListen(
+  relay: Relay,
+  user: DevTokenUser,
+  options: ListenOptions = {},
+): Promise<OpenListen> {
+  nextListen += 1;
+  const abort = new AbortController();
+  const message = {
+    jsonrpc: '2.0',
+    ...(options.id === false ? {} : { id: `listen:${String(nextListen)}` }),
+    method: 'subscriptions/listen',
+    params: options.params ?? {
+      _meta: {
+        'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+        'io.modelcontextprotocol/clientInfo': { name: 'raw-listen', version: '1.0.0' },
+        'io.modelcontextprotocol/clientCapabilities': {},
+      },
+      notifications: { toolsListChanged: true },
+    },
+  };
+  const json = JSON.stringify(message);
+  const body = options.pad === undefined ? json : `${json.slice(0, -1)}${' '.repeat(options.pad)}}`;
+  const response = await fetch(relay.mcpUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${user.token}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+      'Mcp-Method': 'subscriptions/listen',
+      'Mcp-Protocol-Version': '2026-07-28',
+      ...options.headers,
+    },
+    body,
+    signal: abort.signal,
+  });
+  const streaming = (response.headers.get('content-type') ?? '').startsWith('text/event-stream');
+  if (!streaming) {
+    const text = await response.text();
+    return { status: response.status, streaming, text, ended: Promise.resolve(), close: () => {} };
+  }
+  const reader = response.body?.getReader();
+  const ended = (async () => {
+    if (!reader) return;
+    try {
+      while (!(await reader.read()).done) {
+        // The acknowledgement and keep-alive comments only.
+      }
+    } catch {
+      // Ended by close().
+    }
+  })();
+  return {
+    status: response.status,
+    streaming,
+    text: '',
+    ended,
+    close: () => {
+      abort.abort();
+    },
+  };
+}
+
 /** The listening GET stream a 2025-era client keeps open on its session. */
 export async function openStream(
   relay: Relay,
