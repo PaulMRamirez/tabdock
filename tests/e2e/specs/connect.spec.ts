@@ -34,6 +34,11 @@ const OTHER_RELAY = 'ws://127.0.0.1:10/page';
 /** For the https copy, a wss: relay off loopback, as a published board would use. */
 const HOSTED_RELAY = 'wss://relay.example/page';
 const PAIRING_CODE = 'ABCDE-FGHJK';
+/** What the bar and the status area say of ?confirm=client&invites=all (policy.ts). */
+const POLICY_NOTES =
+  'members you approve confirm clear_board in their own MCP client, not on this board; the board offers Can control invites and a second driver seat.';
+const BAR_POLICY_LINE = `If you connect, this link also sets the board's policy: ${POLICY_NOTES}`;
+const POLICY_LINE = `This board's policy, from its link: ${POLICY_NOTES}`;
 /** Long enough for a dial the page would make at once to have been made. */
 const SETTLE_MS = 750;
 
@@ -169,15 +174,18 @@ test('the choice is remembered for this tab and this relay URL alone', async ({
   expect(dialled.urls).toHaveLength(2);
 });
 
-test('without ?relay the board offers a Connect form, checked by the same rules, that keeps the other parameters', async ({
+test('without ?relay the board offers a Connect form, checked by the same rules, that keeps the parameters that set no policy', async ({
   page,
   context,
 }) => {
   const dialled = await fakeRelays(context);
-  await openBoard(page, boardUrl(null, { invites: 'all' }));
+  // A link to the form may name a looser policy too, which the form shows unticked.
+  await openBoard(page, boardUrl(null, { invites: 'all', confirm: 'client', lang: 'en' }));
   const form = page.locator('form[data-role="connect-form"]');
   const input = form.getByLabel('Tabdock relay page URL');
   await expect(input).toBeVisible();
+  await expect(form.locator('input[data-option="confirm"]')).not.toBeChecked();
+  await expect(form.locator('input[data-option="invites"]')).not.toBeChecked();
 
   for (const [typed, message] of [
     [`${FAKE_RELAY}?token=abc`, 'The relay URL must not carry a query or a fragment'],
@@ -202,15 +210,212 @@ test('without ?relay the board offers a Connect form, checked by the same rules,
   expect(new URL(page.url()).searchParams.has('relay')).toBe(false);
   expect(dialled.urls).toEqual([]);
 
-  // A person's own submit records the choice and goes to ?relay=, which then dials without a second click.
+  // A person's own submit records the choice and goes to ?relay=, which then
+  // dials without a second click, under the default policy, as nothing was ticked.
   await Promise.all([page.waitForURL(/relay=/), input.press('Enter')]);
   const landed = new URL(page.url());
   expect(landed.searchParams.get('relay')).toBe(FAKE_RELAY);
-  expect(landed.searchParams.get('invites')).toBe('all');
+  expect(landed.searchParams.get('lang')).toBe('en');
+  expect(landed.searchParams.has('invites')).toBe(false);
+  expect(landed.searchParams.has('confirm')).toBe(false);
   await page.waitForSelector('html[data-tools="ready"]');
   await expect.poll(() => dialled.urls).toEqual([FAKE_RELAY]);
   await expect(page.locator('[data-role="connect-bar"]')).toHaveCount(0);
   await expect(page.locator('form[data-role="connect-form"]')).toHaveCount(0);
+  await expect(page.locator('[data-role="policy"]')).toHaveCount(0);
+});
+
+test('the Connect form sets ?confirm and ?invites only as its visitor ticks them, and remembers the choice with them', async ({
+  page,
+  context,
+}) => {
+  const dialled = await fakeRelays(context);
+  await openBoard(page, boardUrl(null));
+  const form = page.locator('form[data-role="connect-form"]');
+  await form.locator('input[data-option="confirm"]').check();
+  await form.locator('input[data-option="invites"]').check();
+  const input = form.getByLabel('Tabdock relay page URL');
+  await input.fill(FAKE_RELAY);
+  await Promise.all([page.waitForURL(/relay=/), input.press('Enter')]);
+  const landed = new URL(page.url());
+  expect(landed.searchParams.get('confirm')).toBe('client');
+  expect(landed.searchParams.get('invites')).toBe('all');
+  await page.waitForSelector('html[data-tools="ready"]');
+  await expect.poll(() => dialled.urls).toEqual([FAKE_RELAY]);
+  await expect(page.locator('[data-role="connect-bar"]')).toHaveCount(0);
+  await expect(page.locator('[data-role="policy"]')).toHaveText(POLICY_LINE);
+});
+
+test('a link that changes the page policy asks again, and the bar and the status name each change', async ({
+  page,
+  context,
+}) => {
+  const dialled = await fakeRelays(context);
+  await openBoard(page, boardUrl(FAKE_RELAY));
+  await page.getByRole('button', { name: 'Connect to 127.0.0.1:9' }).click();
+  await expect.poll(() => dialled.urls.length).toBe(1);
+  await expect(page.locator('[data-role="policy"]')).toHaveCount(0);
+
+  // Any page that can navigate this tab can link it to the relay it chose
+  // with a looser policy; that is a new choice, so it waits for a click.
+  await openBoard(page, boardUrl(FAKE_RELAY, { confirm: 'client', invites: 'all' }));
+  const bar = page.locator('[data-role="connect-bar"]');
+  await expect(bar).toBeVisible();
+  await expect(page.locator('html')).toHaveAttribute('data-link', 'waiting');
+  await expect(bar.locator('[data-role="connect-policy"]')).toHaveText(BAR_POLICY_LINE);
+  await page.waitForTimeout(SETTLE_MS);
+  expect(dialled.urls).toHaveLength(1);
+
+  // Chosen with that policy in view, it dials, the status area names the
+  // policy, and a reload under the same policy reconnects without a click.
+  await bar.getByRole('button', { name: 'Connect to 127.0.0.1:9' }).click();
+  await expect.poll(() => dialled.urls.length).toBe(2);
+  await expect(page.locator('[data-role="policy"]')).toHaveText(POLICY_LINE);
+  await page.reload();
+  await page.waitForSelector('html[data-tools="ready"]');
+  await expect.poll(() => dialled.urls.length).toBe(3);
+  await expect(page.locator('[data-role="connect-bar"]')).toHaveCount(0);
+  await expect(page.locator('[data-role="policy"]')).toHaveText(POLICY_LINE);
+
+  // One parameter fewer is another policy again, and so is a narrower one.
+  for (const extra of [{ confirm: 'client' }, { invites: 'off' }]) {
+    await openBoard(page, boardUrl(FAKE_RELAY, extra));
+    await expect(bar).toBeVisible();
+    await page.waitForTimeout(SETTLE_MS);
+    expect(dialled.urls).toHaveLength(3);
+  }
+  await expect(bar.locator('[data-role="connect-policy"]')).toHaveText(
+    "If you connect, this link also sets the board's policy: the board offers no invites.",
+  );
+});
+
+test('the Connect bar takes a click only once it has held still for half a second in a visible, focused tab', async ({
+  page,
+  context,
+}) => {
+  const dialled = await fakeRelays(context);
+  // Once the bar is up the page's timers stand still until the test moves
+  // them, so "too soon" is exact; the board needs them running to start.
+  await page.clock.install();
+  await openBoard(page, boardUrl(FAKE_RELAY));
+  const button = page.locator('[data-action="connect"]');
+  await expect(button).toBeVisible();
+  await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 50);
+  // Measured before the clock stopped, so this proves the first click too soon.
+  await expect(button).toHaveAttribute('data-armed', 'false');
+  /** The button's centre now, as a resize moves it. */
+  const centre = async (): Promise<{ x: number; y: number }> => {
+    const box = await button.boundingBox();
+    if (!box) throw new Error('the Connect button has no box');
+    return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  };
+  const clickBar = async (): Promise<void> => {
+    const { x, y } = await centre();
+    await page.mouse.click(x, y);
+  };
+  const refused = async (why: string): Promise<void> => {
+    await page.waitForTimeout(100);
+    expect(dialled.urls, why).toEqual([]);
+    await expect(button, why).toBeVisible();
+    await expect(button, why).toHaveAttribute('data-armed', 'false');
+  };
+
+  // A click the moment the bar appears, as a double-click's second half would land.
+  await clickBar();
+  await refused('a click as the bar appears');
+  await page.clock.runFor(400);
+  await expect(button).toHaveAttribute('data-armed', 'false');
+  await clickBar();
+  await refused('a click 400 ms after the last one, which started the wait again');
+  await page.clock.runFor(700);
+  await expect(button).toHaveAttribute('data-armed', 'true');
+
+  // The window regaining focus is a fresh sight of the bar, as when a popup
+  // closed on the first half of a double-click; so are pageshow and a resize.
+  // Headless Chromium fires no focus event of its own, so the test sends them.
+  const disturbances: [string, () => Promise<unknown>][] = [
+    ['focus', () => page.evaluate(() => window.dispatchEvent(new FocusEvent('focus')))],
+    [
+      'pageshow',
+      () => page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pageshow'))),
+    ],
+    [
+      'visibilitychange',
+      () => page.evaluate(() => document.dispatchEvent(new Event('visibilitychange'))),
+    ],
+    ['resize', () => page.setViewportSize({ width: 1000, height: 700 })],
+  ];
+  for (const [why, disturb] of disturbances) {
+    await disturb();
+    // The page's clock stands still, so measuring first lets no time count towards arming.
+    await clickBar();
+    await refused(`a click just after ${why}`);
+    await page.clock.runFor(700);
+    await expect(button, why).toHaveAttribute('data-armed', 'true');
+  }
+
+  // A press that began before the bar armed does not count when it ends after.
+  await page.evaluate(() => window.dispatchEvent(new FocusEvent('blur')));
+  await expect(button).toHaveAttribute('data-armed', 'false');
+  const pressAt = await centre();
+  await page.mouse.move(pressAt.x, pressAt.y);
+  await page.mouse.down();
+  await page.evaluate(() => window.dispatchEvent(new FocusEvent('focus')));
+  await page.clock.runFor(700);
+  await expect(button).toHaveAttribute('data-armed', 'true');
+  await page.mouse.up();
+  await refused('a press that began while the bar was not armed');
+
+  // A click once it has held still dials.
+  await page.clock.runFor(700);
+  await expect(button).toHaveAttribute('data-armed', 'true');
+  await clickBar();
+  await page.clock.resume();
+  await expect.poll(() => dialled.urls).toEqual([FAKE_RELAY]);
+});
+
+test('a long relay host wraps inside a phone-width page, the end of the host in view', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const host = [
+    'relay.example.com',
+    'a'.repeat(60),
+    'b'.repeat(60),
+    'c'.repeat(50),
+    'attacker.test',
+  ].join('.');
+  expect(host.length).toBeGreaterThanOrEqual(200);
+  await openBoard(page, boardUrl(`wss://${host}/page`));
+  const button = page.locator('[data-action="connect"]');
+  await expect(button).toHaveText(`Connect to ${host}`);
+  const layout = await page.evaluate(() => {
+    const target = document.querySelector('[data-role="connect-host"]');
+    const text = target?.firstChild;
+    const end = text?.textContent?.lastIndexOf('attacker.test') ?? -1;
+    if (!text || end < 0) return null;
+    const range = document.createRange();
+    range.setStart(text, end);
+    range.setEnd(text, end + 'attacker.test'.length);
+    const tail = range.getBoundingClientRect();
+    const rects = ['[data-action="connect"]', '[data-role="status"]'].map((selector) => {
+      const rect = document.querySelector(selector)?.getBoundingClientRect();
+      return rect ? { left: rect.left, right: rect.right } : null;
+    });
+    return {
+      scrollWidth: document.documentElement.scrollWidth,
+      clientWidth: document.documentElement.clientWidth,
+      tail: { left: tail.left, right: tail.right, bottom: tail.bottom },
+      rects,
+    };
+  });
+  if (!layout) throw new Error('the Connect bar shows no host element holding the host');
+  expect(layout.scrollWidth).toBeLessThanOrEqual(layout.clientWidth);
+  for (const rect of [...layout.rects, layout.tail]) {
+    expect(rect?.left).toBeGreaterThanOrEqual(0);
+    expect(rect?.right).toBeLessThanOrEqual(layout.clientWidth);
+  }
+  expect(layout.tail.bottom).toBeLessThanOrEqual(844);
 });
 
 test('a ?relay with a query or fragment is refused before any bar, and the form is offered instead', async ({
@@ -352,6 +557,21 @@ test.describe("the demo's static build, as Pages serves it", () => {
     });
     expect(ran).toBeNull();
     await expect.poll(() => policyErrors.length).toBeGreaterThan(0);
+  });
+
+  test('ignores ?mcpb, so a copy under a subpath fetches no script from the root of a host it shares', async ({
+    page,
+  }) => {
+    await serveStatic(page, '/tabdock/');
+    const requested: string[] = [];
+    page.on('request', (request) => {
+      requested.push(new URL(request.url()).pathname);
+    });
+    await page.goto('https://board.example/tabdock/?mcpb=9444');
+    await page.waitForSelector('html[data-tools="ready"]');
+    await page.waitForTimeout(SETTLE_MS);
+    expect(requested.filter((path) => !path.startsWith('/tabdock/'))).toEqual([]);
+    expect(await page.locator('script[src*="webmcp-local-relay"]').count()).toBe(0);
   });
 
   test('loads its script by a relative path, so a copy under a subpath works', async ({ page }) => {

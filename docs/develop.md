@@ -38,7 +38,7 @@ Every setting is optional and comes from a `.env` at the root, which git ignores
 
 ## The demo board
 
-The board dials only a relay its visitor chose (ADR 0029): `pnpm dev` prints a link with `?relay=` set, and the board then waits behind a `Connect to <host>` bar until you click it; without `?relay` it offers a Connect form. The choice is remembered for that tab and relay URL, so a reload reconnects. The Playwright specs and demo scripts open it with `?e2e`, a hook only the dev and test bundle has, which skips the click and hands the script the adapter's control handle. `apps/demo/README.md` lists the board's other parameters.
+The board dials only a relay its visitor chose (ADR 0029): `pnpm dev` prints a link with `?relay=` set, and the board then waits behind a `Connect to <host>` bar until you click it; without `?relay` it offers a Connect form. The bar's button takes a click only once it has held still for half a second, and names any page policy the link sets; the choice is remembered for that tab, relay URL and policy, so a reload reconnects. The Playwright specs and demo scripts open it with `?e2e`, a hook only the dev and test bundle has, which skips the click and hands the script the adapter's control handle. `apps/demo/README.md` lists the board's other parameters.
 
 ## The site
 
