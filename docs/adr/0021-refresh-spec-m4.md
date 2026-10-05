@@ -1,6 +1,6 @@
 # 0021: Refresh SPEC sections 3, 10, 11 and 12 for M4
 
-Status: Accepted by the owner, 3 October 2026. Changes SPEC sections 3, 10, 11 (its second paragraph, which ADR 0022 splits off) and 12.
+Status: Accepted by the owner, 3 October 2026; amended by ADR 0029 (the Pages publish leaves `deploy.yml` for its own `pages.yml`, which puts the demo at `/` and the tour at `/tour/`, and the published demo dials a relay only after its visitor clicks to connect). Changes SPEC sections 3, 10, 11 (its second paragraph, which ADR 0022 splits off) and 12.
 
 ## Context
 

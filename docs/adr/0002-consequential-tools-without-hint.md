@@ -17,3 +17,7 @@ C. Add `policy.consequentialTools: string[]` to `attach()`. On runtimes that rep
 ## Recommendation
 
 C. It keeps S6 fail-safe on every runtime, gives page authors a one-line fix that also documents intent, and costs one optional field. The demo would pass `consequentialTools: ['clear_board']`. A2.5 gains a case on the polyfill with and without the list.
+
+## Notes from ADR 0026 (5 October 2026)
+
+From M5 the adapter also reports this rule's result in the `tools` frame as `consequential: true`, which the relay uses only to decide whether to ask a client on a page with `confirmVia: 'client'`; the adapter's own rule still decides whether it prompts.
