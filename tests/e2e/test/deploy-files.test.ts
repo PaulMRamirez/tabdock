@@ -310,11 +310,16 @@ describe('the workflows', () => {
     expect(raw).toMatch(
       /setup-flyctl@[0-9a-f]{40} # v[\d.]+\n {8}with:\n {10}version: \d+\.\d+\.\d+\n/,
     );
-    // Every job that reads a secret first waits for the environment's approval.
+    // Every job that reads a secret first waits for the environment's approval:
+    // production for a deploy, npm for publish.yml's stage job (ADR 0028).
     for (const { name, text } of workflows) {
       if (!text.includes('secrets.') || name === 'image.yml') continue;
       for (const job of text.split(/\n {2}(?=[a-z][\w-]*:\n)/).slice(1)) {
-        if (job.includes('secrets.')) expect(job, name).toMatch(/environment: production/);
+        if (job.includes('secrets.')) {
+          expect(job, name).toMatch(
+            name === 'publish.yml' ? /environment: npm\n/ : /environment: production/,
+          );
+        }
       }
     }
   });
