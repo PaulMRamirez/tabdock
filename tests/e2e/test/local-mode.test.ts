@@ -238,6 +238,13 @@ describe.skipIf(process.platform === 'win32')('local mode from a clean checkout'
     const demoLink = /Demo board linked to the relay: (\S+)/.exec(printed)?.[1] ?? '';
     expect(new URL(demoLink).searchParams.get('relay')).toBe(banner.pageUrl);
     expect((await fetch(demoLink)).status).toBe(200);
+    // The board dials only once its visitor clicks (ADR 0029), so the line
+    // under its link says so, naming the host the Connect bar names.
+    const lines = printed.split('\n');
+    const linkLine = lines.findIndex((line) => line.includes('Demo board linked to the relay:'));
+    expect(lines[linkLine + 1]?.trim()).toBe(
+      `(it dials the relay once you click Connect to ${new URL(banner.pageUrl).host} on it)`,
+    );
     const token = readFileSync(banner.tokenPath, 'latin1').trim();
     expect(helperHeader(banner.command) === `Bearer ${token}`).toBe(true);
     expect(await toolNames(banner.mcpUrl, token)).toHaveLength(5);

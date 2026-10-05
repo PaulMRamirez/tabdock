@@ -2,6 +2,7 @@ import type { Client } from '@modelcontextprotocol/client';
 import { expect, test, type Page } from '@playwright/test';
 import { startDemoServer, type DemoServer } from '@tabdock/demo/server';
 import {
+  type PageFrame,
   parsePageFrame,
   parseRelayFrame,
   type RelayFrame,
@@ -127,6 +128,15 @@ function framesToPage<T extends RelayFrame['t']>(type: T): Extract<RelayFrame, {
     return parsed.kind === 'ok' && parsed.frame.t === type
       ? [parsed.frame as Extract<RelayFrame, { t: T }>]
       : [];
+  });
+}
+
+/** The tools frames the page sent, as the relay received them. */
+function toolsFramesFromPage(): Extract<PageFrame, { t: 'tools' }>[] {
+  return linkFrames.flatMap(({ from, text }) => {
+    if (from !== 'page') return [];
+    const parsed = parsePageFrame(text);
+    return parsed.kind === 'ok' && parsed.frame.t === 'tools' ? [parsed.frame] : [];
   });
 }
 
@@ -491,6 +501,21 @@ test('consequential: clear_board prompts on the page and Deny returns denied_by_
   expect(added.isError, added.text).toBe(false);
   expect((await dockState(page))?.pendingConfirms).toEqual([]);
   expect((await dockState(page))?.notice ?? null).toBeNull();
+
+  // The tools frame marks exactly what the page counts as consequential
+  // (ADR 0026): the listed tool and the one 6 reports the hint for.
+  const marks = toolsFramesFromPage()
+    .at(-1)
+    ?.tools.map((tool) => [tool.name, 'consequential' in tool ? tool.consequential : 'unmarked']);
+  expect(Object.fromEntries(marks ?? [])).toEqual({
+    get_view: 'unmarked',
+    list_items: 'unmarked',
+    add_item: 'unmarked',
+    move_view: 'unmarked',
+    highlight_item: 'unmarked',
+    clear_board: true,
+    stamp_board: true,
+  });
 
   expect(
     ((await dockState(page))?.activity ?? []).map((entry) => [entry.tool, entry.outcome]),

@@ -34,7 +34,7 @@ const say = (text: string): void => {
 const version = spawnSync('claude', ['--version'], { encoding: 'utf8' });
 if (version.error !== undefined || version.status !== 0) {
   say(
-    'check:claude-code:local skipped: no `claude` on the PATH. Claude Code is not a repo dependency, so docs/checklists/M4.md keeps this check for a run by hand: pnpm relay, paste the printed claude mcp add line, then claude mcp list.',
+    'check:claude-code:local skipped: no `claude` on the PATH. Claude Code is not a repo dependency, so docs/checklists/M4.md keeps this check for a run by hand: pnpm relay, paste the printed claude mcp add-json line, then claude mcp list.',
   );
   process.exit(0);
 }

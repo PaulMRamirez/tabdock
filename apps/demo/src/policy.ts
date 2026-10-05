@@ -7,6 +7,11 @@
 // the board two driver seats, so a guest with control can drive beside the
 // operator's own client; `off` offers none; anything else, or nothing, keeps
 // the adapter's default, Can watch only.
+//
+// From M5, ?confirm=client lets a member driver whose attachment no invite
+// made confirm clear_board in their own MCP client instead of on the board
+// (ADR 0026); the adapter still prompts here for everyone else. Anything
+// else, or nothing, keeps the adapter's default, the board's own prompt.
 
 import type { PolicyInput } from '@tabdock/adapter';
 
@@ -17,6 +22,7 @@ export const DEMO_SHARED_DRIVERS = 2;
 
 export function policyFromQuery(params: URLSearchParams): PolicyInput {
   const policy: PolicyInput = { consequentialTools: [...DEMO_CONSEQUENTIAL_TOOLS] };
+  if (params.get('confirm') === 'client') policy.confirmVia = 'client';
   const invites = params.get('invites');
   if (invites === 'all') return { ...policy, invites: 'all', maxDrivers: DEMO_SHARED_DRIVERS };
   if (invites === 'off') return { ...policy, invites: 'off' };

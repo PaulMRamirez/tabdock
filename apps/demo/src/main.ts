@@ -82,7 +82,8 @@ function loadMcpbRelayEmbed(params: URLSearchParams): void {
  * or that same choice made earlier in this tab. The adapter reads the tools
  * registered above from document.modelContext, so it needs no handle on them.
  * The policy comes from the query too (policy.ts): clear_board always prompts,
- * and `?invites=all` offers Can control invites.
+ * `?invites=all` offers Can control invites, and `?confirm=client` lets a
+ * member driver confirm clear_board in their own client (ADR 0026).
  */
 function attachToRelay(params: URLSearchParams, ui: BoardUi, registered: string): void {
   const status = requiredElement('[data-role="status"]');

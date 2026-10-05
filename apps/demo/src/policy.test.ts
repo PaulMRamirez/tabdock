@@ -27,4 +27,22 @@ describe('policyFromQuery', () => {
       });
     }
   });
+
+  it('lets member drivers confirm in their own client with ?confirm=client, beside ?invites', () => {
+    expect(read('?confirm=client')).toEqual({
+      consequentialTools: ['clear_board'],
+      confirmVia: 'client',
+    });
+    expect(read('?invites=all&confirm=client')).toEqual({
+      consequentialTools: ['clear_board'],
+      confirmVia: 'client',
+      invites: 'all',
+      maxDrivers: 2,
+    });
+    for (const value of ['page', 'CLIENT', 'client ', '', 'operator']) {
+      expect(read(`?confirm=${encodeURIComponent(value)}`), value).toEqual({
+        consequentialTools: ['clear_board'],
+      });
+    }
+  });
 });
