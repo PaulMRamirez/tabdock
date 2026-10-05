@@ -9,7 +9,11 @@
 // call-heap.test.ts measures the charge against the heap and runs the
 // image's relay against it.
 
-import type { FetchLike } from '@modelcontextprotocol/client';
+import {
+  Client,
+  type FetchLike,
+  StreamableHTTPClientTransport,
+} from '@modelcontextprotocol/client';
 import type { PageTool } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
 import { MIN_REQUEST_BYTES } from '../src/config.ts';
@@ -305,6 +309,66 @@ describe('what requests waiting on a page may hold', () => {
     const request = await other.next('attach_request');
     other.send({ t: 'attach_decision', requestId: request.requestId, allow: true, role: 'driver' });
     expect((await later).isError).toBe(false);
+  }, 60_000);
+
+  it('holds a 2025-era call charged while its question waits in the client, from before it asks until it ends (ADR 0026)', async () => {
+    const relay = await tightRelay();
+    const wipe: PageTool = {
+      name: 'wipe',
+      description: 'Clear everything.',
+      inputSchema: { type: 'object' },
+      annotations: { readOnlyHint: false },
+      consequential: true,
+    };
+    const page = await connectPage(relay.relay.pageUrl, {
+      policy: { consequential: 'confirm', confirmVia: 'client' },
+      tools: [SEARCH, wipe],
+      onInvoke: () => ({ ok: true, content: 'done' }),
+    });
+    pages.push(page);
+    // A 2025-era client whose questions wait until let go, every call padded as above.
+    const answers: ((result: { action: 'decline' }) => void)[] = [];
+    const client = new Client(
+      { name: 'asked', version: '1.0.0' },
+      { capabilities: { elicitation: { form: {} } } },
+    );
+    client.setRequestHandler(
+      'elicitation/create',
+      () =>
+        new Promise((resolve) => {
+          answers.push(resolve);
+        }),
+    );
+    await client.connect(
+      new StreamableHTTPClientTransport(new URL(relay.relay.mcpUrl), {
+        requestInit: { headers: { Authorization: `Bearer ${ALICE.token}` } },
+        fetch: padding(1.25 * MIB),
+      }),
+    );
+    closers.push(() => client.close());
+    await pairAndApprove(client, page);
+    const asked = [0, 1].map(() =>
+      callTool(client, 'call_page_tool', { page: page.pageId, tool: 'wipe', arguments: {} }),
+    );
+    while (answers.length < 2) await new Promise((resolve) => setTimeout(resolve, 10));
+    // Two questions waiting hold the 4 MiB share, so a third call is refused for it.
+    const third = await callTool(client, 'call_page_tool', {
+      page: page.pageId,
+      tool: SEARCH.name,
+      arguments: { text: 'x' },
+    });
+    expect(third.text).toMatch(/^rate_limited: your requests waiting on pages already hold/);
+    for (const answer of answers.splice(0)) answer({ action: 'decline' });
+    for (const outcome of await Promise.all(asked)) expect(outcome.text).toMatch(/^not_confirmed:/);
+    // Answered, they hold nothing: the next call goes to the page.
+    const after = await callTool(client, 'call_page_tool', {
+      page: page.pageId,
+      tool: SEARCH.name,
+      arguments: { text: 'x' },
+    });
+    expect(after.isError, after.text).toBe(false);
+    await page.sync();
+    expect(page.all('invoke').map((frame) => frame.tool)).toEqual(['search']);
   }, 60_000);
 
   it.each([

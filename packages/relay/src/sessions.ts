@@ -23,6 +23,7 @@ import {
   type AuthInfo,
   type HandleRequestOptions,
   isInitializeRequest,
+  type JSONRPCMessage,
   readRequestBody,
   type Transport,
   WebStandardStreamableHTTPServerTransport,
@@ -108,6 +109,12 @@ export interface SessionOptions {
   lines?: RepeatedLog | undefined;
   /** The window PRESENTED_LINES_PER_USER counts over; a minute by default. */
   windowMs?: number | undefined;
+  /**
+   * Each message the transport hands the session's server passes this first.
+   * The relay uses it for a requestState the SDK would refuse before any
+   * handler runs, which it answers in its own handler instead (ADR 0026).
+   */
+  inbound?: ((message: JSONRPCMessage) => JSONRPCMessage) | undefined;
 }
 
 /**
@@ -335,6 +342,15 @@ export class McpSessions {
     } catch (error) {
       this.#forget(session);
       throw error;
+    }
+    // connect() set the server's handler; the transport reads onmessage as
+    // each message arrives, so every one passes `inbound` first.
+    const { inbound } = this.#options;
+    const deliver = transport.onmessage;
+    if (inbound !== undefined && deliver !== undefined) {
+      transport.onmessage = (message, extra) => {
+        deliver(inbound(message), extra);
+      };
     }
     const response = await this.#dispatch(session, request, { authInfo, parsedBody: initialize });
     if (!session.ready) {

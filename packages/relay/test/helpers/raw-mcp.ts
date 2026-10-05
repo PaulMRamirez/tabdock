@@ -31,22 +31,29 @@ export function rawPost(
   });
 }
 
-export function initializeBody(name = 'raw-client'): unknown {
+export function initializeBody(
+  name = 'raw-client',
+  capabilities: Record<string, unknown> = {},
+): unknown {
   return {
     jsonrpc: '2.0',
     id: 1,
     method: 'initialize',
-    params: { protocolVersion: PROTOCOL, capabilities: {}, clientInfo: { name, version: '1.0.0' } },
+    params: { protocolVersion: PROTOCOL, capabilities, clientInfo: { name, version: '1.0.0' } },
   };
 }
 
-/** Initializes a session and acknowledges it, as a client does; returns its id. */
+/**
+ * Initializes a session and acknowledges it, as a client does; returns its
+ * id. `capabilities` are what the client declares, none by default.
+ */
 export async function openSession(
   relay: Relay,
   user: DevTokenUser,
   name?: string,
+  capabilities?: Record<string, unknown>,
 ): Promise<string> {
-  const response = await rawPost(relay, user, initializeBody(name));
+  const response = await rawPost(relay, user, initializeBody(name, capabilities));
   const text = await response.text();
   const id = response.headers.get('mcp-session-id');
   if (response.status !== 200 || id === null) {

@@ -134,11 +134,22 @@ export const InviteeIdSchema = z
  * An email address as an identity provider vouches for it: one '@', no
  * space or control character, at most MAX_EMAIL_CHARS. Loose on purpose,
  * since the provider has already checked the address; this only keeps
- * anything that is not one from being shown or stored as one.
+ * anything that is not one from being shown or stored as one. Nothing that
+ * shows as nothing passes either: an invitee's name is its email, which the
+ * widget, /i and the audit show beside a member's, so a right-to-left
+ * override (U+202E) could turn the shown address around, and a zero-width
+ * character could make two addresses read alike. Format characters (the
+ * bidirectional controls among them), surrogate halves and every other
+ * default-ignorable code point are refused, as plainLine drops them.
  */
 export const EmailSchema = z
   .string()
-  .check(z.maxLength(MAX_EMAIL_CHARS), z.regex(/^[^\s@\p{Cc}]+@[^\s@\p{Cc}]+$/u));
+  .check(
+    z.maxLength(MAX_EMAIL_CHARS),
+    z.regex(
+      /^[^\s@\p{Cc}\p{Cf}\p{Cs}\p{Default_Ignorable_Code_Point}]+@[^\s@\p{Cc}\p{Cf}\p{Cs}\p{Default_Ignorable_Code_Point}]+$/u,
+    ),
+  );
 
 /**
  * What an attach request says about the account behind it (ADR 0017). An
