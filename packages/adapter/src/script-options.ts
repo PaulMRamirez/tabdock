@@ -9,9 +9,12 @@ export type ScriptOptions =
 /**
  * `data` is a script element's dataset: data-relay, data-auto-approve,
  * data-max-drivers, data-consequential, data-consequential-tools (a comma
- * list) and data-invites (off, watch or all; ADR 0016). Absent attributes
- * stay absent, so the policy defaults apply and an omitted tool list still
- * means "the page gave none" (ADR 0002).
+ * list), data-invites (off, watch or all; ADR 0016) and data-confirm-via
+ * (page or client; ADR 0026). Absent attributes stay absent, so the policy
+ * defaults apply and an omitted data-confirm-via keeps the operator's prompt.
+ * A data-consequential-tools that names no tool, empty or only commas, reads as
+ * an empty list, which like an absent one leaves ADR 0002's fallback on where
+ * the runtime drops the hint (ADR 0034).
  */
 export function readScriptOptions(
   data: Readonly<Record<string, string | undefined>>,
@@ -25,6 +28,9 @@ export function readScriptOptions(
   if (data.maxDrivers !== undefined) policy.maxDrivers = Number(data.maxDrivers.trim() || NaN);
   if (data.consequential !== undefined) policy.consequential = data.consequential.trim();
   if (data.invites !== undefined) policy.invites = data.invites.trim();
+  // Only 'page' or 'client' parses: a typo keeps the adapter from attaching,
+  // with the error below, rather than quietly choosing who confirms.
+  if (data.confirmVia !== undefined) policy.confirmVia = data.confirmVia.trim();
   if (data.consequentialTools !== undefined) {
     policy.consequentialTools = data.consequentialTools
       .split(',')

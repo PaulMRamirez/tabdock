@@ -18,6 +18,7 @@ describe('readScriptOptions', () => {
         consequential: 'deny',
         consequentialTools: 'clear_board, wipe,,',
         invites: ' all ',
+        confirmVia: ' client ',
       }),
     ).toEqual({
       ok: true,
@@ -28,19 +29,42 @@ describe('readScriptOptions', () => {
         consequential: 'deny',
         consequentialTools: ['clear_board', 'wipe'],
         invites: 'all',
+        confirmVia: 'client',
       },
     });
   });
 
-  it('leaves absent attributes out, so "no list given" stays distinguishable (ADR 0002)', () => {
-    expect(readScriptOptions({ relay: 'ws://127.0.0.1:8787/page' })).toEqual({
-      ok: true,
-      relay: 'ws://127.0.0.1:8787/page',
-      policy: {},
-    });
-    expect(
-      readScriptOptions({ relay: 'ws://127.0.0.1:8787/page', consequentialTools: '' }),
-    ).toMatchObject({ ok: true, policy: { consequentialTools: [] } });
+  it('reads data-confirm-via as page or client, and leaves it out when absent (ADR 0026)', () => {
+    const relay = 'ws://127.0.0.1:8787/page';
+    for (const confirmVia of ['page', 'client'] as const) {
+      expect(readScriptOptions({ relay, confirmVia })).toEqual({
+        ok: true,
+        relay,
+        policy: { confirmVia },
+      });
+    }
+    // Absent, attach() fills in 'page': the operator confirms, as before M5.
+    expect(readScriptOptions({ relay })).toMatchObject({ ok: true, policy: {} });
+    for (const confirmVia of ['Client', 'both', '', 'operator']) {
+      expect(readScriptOptions({ relay, confirmVia })).toEqual({
+        ok: false,
+        error: 'invalid data attributes for confirmVia',
+      });
+    }
+  });
+
+  it('leaves absent attributes out, and reads a tool list that names no tool as an empty one', () => {
+    const relay = 'ws://127.0.0.1:8787/page';
+    expect(readScriptOptions({ relay })).toEqual({ ok: true, relay, policy: {} });
+    // An empty list names none, so like an absent one it leaves ADR 0002's
+    // fallback on; core.test.ts runs these through attach() (ADR 0034).
+    for (const consequentialTools of ['', ' ', ' , ', ',,']) {
+      expect(readScriptOptions({ relay, consequentialTools })).toEqual({
+        ok: true,
+        relay,
+        policy: { consequentialTools: [] },
+      });
+    }
   });
 
   it('names the bad attribute without echoing its value', () => {
@@ -50,6 +74,7 @@ describe('readScriptOptions', () => {
       { consequential: 'sometimes' },
       { consequentialTools: 'has space' },
       { invites: 'everyone' },
+      { confirmVia: 'whoever' },
     ]) {
       const result = readScriptOptions({ relay: 'ws://127.0.0.1:8787/page', ...data });
       expect(result.ok).toBe(false);

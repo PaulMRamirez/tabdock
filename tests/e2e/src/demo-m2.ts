@@ -129,7 +129,7 @@ function queuedCalls(): Queued[] {
 
 say('Tabdock M2: two people and three MCP clients share one page through the Tabdock relay\n');
 const users = { alice: throwawayUser('alice', 'Alice'), bob: throwawayUser('bob', 'Bob') };
-const demo = await startDemoServer();
+const demo = await startDemoServer({ e2eHook: true });
 let relay: Relay | undefined;
 let browser: Browser | undefined;
 const clients: Client[] = [];
@@ -150,7 +150,7 @@ try {
 
   browser = await launchChromium(!headed);
   const page = await browser.newPage();
-  await page.goto(demoPageUrl(demo.url, live.pageUrl));
+  await page.goto(demoPageUrl(demo, live.pageUrl));
   await page.waitForSelector('html[data-tools="ready"]');
   const { pageId, code } = await waitForLink(page);
   say(

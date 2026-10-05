@@ -1,36 +1,68 @@
 import {
+  type Caller,
   CLOSE_DETACH,
   CLOSE_INVALID_FRAME_PAGE,
   CLOSE_SILENT,
   IDLE_TIMEOUT_MS,
+  INVITEE_SHORT_ID_CHARS,
   MAX_FRAME_BYTES,
+  MAX_INVITE_LIFETIME_MS,
   MAX_RESULT_CHARS,
+  MAX_TIMER_MS,
+  type PolicyInput,
   RECONNECT_MAX_MS,
   RECONNECT_MIN_MS,
   TOOL_POLL_MS,
 } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
-import { backoffDelay, createAdapterCore, type LocksLike, type RuntimeTool } from '../src/core.ts';
+import {
+  backoffDelay,
+  createAdapterCore,
+  type LocksLike,
+  MAX_DEADLINE_MS,
+  REMEMBERED_PROMPT_IDS,
+  type RuntimeTool,
+  type UiPort,
+} from '../src/core.ts';
 import {
   FRAME_WINDOW,
   GRANTS_KEY,
+  GUEST,
   HANDLER_FAILED,
+  type FakeSocket,
+  type Harness,
+  type InviteListing,
+  ManualClock,
   MapStorage,
   PAGE_WINDOW,
   RELAY_URL,
   RESUME_KEY,
   attachRequest,
   attachment,
+  chromeTools,
   flush,
   grant,
+  invitedAttachment,
+  invitesFrame,
   invoke,
   link,
+  mint,
   polyfillTools,
+  redemption,
   results,
   runtimeTool,
   setup,
+  until,
   welcome,
 } from './harness.ts';
+import { readScriptOptions } from '../src/script-options.ts';
+
+/** The policy the script-tag build hands attach() for this data-consequential-tools value. */
+function scriptTagPolicy(consequentialTools: string): PolicyInput {
+  const options = readScriptOptions({ relay: RELAY_URL, consequentialTools });
+  if (!options.ok) throw new Error(options.error);
+  return options.policy;
+}
 
 describe('linking', () => {
   it('dials with tabdock.v1 and says hello first, without the page query or a token', () => {
@@ -54,6 +86,8 @@ describe('linking', () => {
           consequential: 'confirm',
           consequentialTools: [],
           invites: 'watch',
+          // M5's default (ADR 0026): the operator confirms on the page.
+          confirmVia: 'page',
         },
       },
     ]);
@@ -97,6 +131,9 @@ describe('linking', () => {
     expect(h.sockets).toHaveLength(0);
     expect(h.dock.state.link).toBe('idle');
     expect(h.dock.state.error).toMatch(/polyfill/);
+    // Both majors' entry points: MCP-B 6 exports only installWebMCP(), 5.x only initializeWebMCPPolyfill().
+    expect(h.dock.state.error).toContain('installWebMCP()');
+    expect(h.dock.state.error).toContain('initializeWebMCPPolyfill()');
     expect(h.logs.some((line) => line.startsWith('error') && line.includes('polyfill'))).toBe(true);
   });
 
@@ -218,7 +255,14 @@ describe('tool sync', () => {
         inputSchema: { type: 'object', properties: { x: { type: 'string' } } },
         annotations: { readOnlyHint: true },
       },
-      { name: 'bare', description: '', inputSchema: { type: 'object', properties: {} } },
+      {
+        name: 'bare',
+        description: '',
+        inputSchema: { type: 'object', properties: {} },
+        // Not read-only, on a runtime that shows annotations without the hint
+        // and a page that listed none: consequential by ADR 0002's fallback.
+        consequential: true,
+      },
     ]);
     const warnings = h.logs.filter((line) => line.startsWith('warn'));
     expect(warnings).toEqual([
@@ -252,6 +296,102 @@ describe('tool sync', () => {
     await flush();
     expect(results(socket)[0]?.error?.code).toBe('tool_not_found');
     expect(h.context.attempts).toHaveLength(0);
+  });
+
+  describe("the consequential mark (ADR 0026, ADR 0002's rule)", () => {
+    async function firstFrame(tools: RuntimeTool[], policy: PolicyInput = {}) {
+      const h = setup({ tools, core: { policy } });
+      const socket = await link(h, {}, {});
+      return socket.framesOf('tools')[0]?.tools ?? [];
+    }
+
+    async function marked(tools: RuntimeTool[], policy: PolicyInput = {}): Promise<string[]> {
+      return (await firstFrame(tools, policy))
+        .filter((tool) => tool.consequential === true)
+        .map((tool) => tool.name);
+    }
+
+    it('marks each tool the hint or the page list calls consequential where the runtime reports hints', async () => {
+      expect(await marked(chromeTools())).toEqual(['wipe']);
+      expect(await marked(chromeTools(), { consequentialTools: ['set_value'] })).toEqual([
+        'set_value',
+        'wipe',
+      ]);
+      // Unmarked tools carry no key at all, as an older adapter sent them.
+      const frame = await firstFrame(chromeTools());
+      expect(frame.filter((tool) => 'consequential' in tool).map((tool) => tool.name)).toEqual([
+        'wipe',
+      ]);
+    });
+
+    it('marks every tool that is not read-only where the runtime drops the hint and the page names none', async () => {
+      expect(await marked(polyfillTools())).toEqual(['set_value', 'wipe']);
+      expect(await marked(polyfillTools(), { consequentialTools: ['wipe'] })).toEqual(['wipe']);
+      // An empty list names none, so the fallback still decides (ADR 0034).
+      expect(await marked(polyfillTools(), { consequentialTools: [] })).toEqual([
+        'set_value',
+        'wipe',
+      ]);
+      expect(await marked([runtimeTool('set_value')])).toEqual([]);
+    });
+
+    it('marks the same tools whatever the policy says about who confirms, or whether consequential tools run', async () => {
+      for (const policy of [
+        { confirmVia: 'client' },
+        { confirmVia: 'page' },
+        { consequential: 'allow' },
+        { consequential: 'deny', confirmVia: 'client' },
+      ] satisfies PolicyInput[]) {
+        expect(await marked(chromeTools(), policy), JSON.stringify(policy)).toEqual(['wipe']);
+        expect(await marked(polyfillTools(), policy), JSON.stringify(policy)).toEqual([
+          'set_value',
+          'wipe',
+        ]);
+      }
+    });
+
+    it('takes no mark from the runtime: only the page rule marks a tool', async () => {
+      expect(
+        await marked([
+          runtimeTool('get_value', { readOnlyHint: true }, { consequential: true }),
+          runtimeTool('wipe', { consequentialHint: true }, { consequential: false }),
+        ]),
+      ).toEqual(['wipe']);
+    });
+
+    it('sends a new frame when only a mark changes', async () => {
+      const h = setup({ tools: polyfillTools() });
+      const socket = await link(h, {}, {});
+      // A hint that is not a boolean stays off the wire, yet shows the runtime
+      // reports consequentialHint, so set_value is no longer consequential.
+      h.context.tools = polyfillTools().map((tool) =>
+        tool.name === 'get_value'
+          ? {
+              ...tool,
+              annotations: {
+                readOnlyHint: true,
+                untrustedContentHint: false,
+                consequentialHint: 'unknown',
+              },
+            }
+          : tool,
+      );
+      h.context.fireToolChange();
+      await h.clock.advance(100);
+      const [before, after] = socket.framesOf('tools').map((frame) => frame.tools);
+      const unmarked = (tools: typeof before) =>
+        tools?.map((tool) => {
+          const copy = { ...tool };
+          delete copy.consequential;
+          return copy;
+        });
+      expect(unmarked(after)).toEqual(unmarked(before));
+      expect(before?.filter((tool) => tool.consequential === true).map((t) => t.name)).toEqual([
+        'set_value',
+        'wipe',
+      ]);
+      expect(after?.filter((tool) => tool.consequential === true)).toEqual([]);
+    });
   });
 });
 
@@ -443,6 +583,34 @@ describe('cancel and deadline', () => {
     expect(results(socket)[0]?.error?.code).toBe('timeout');
     expect(h.context.runs[0]?.signal.aborted).toBe(true);
   });
+
+  // The schema takes any positive safe integer, so a relay the adapter does
+  // not trust can send a deadline no timer can hold; Chromium ran such a
+  // timer at once, ending the call as it began (ADR 0030).
+  it.each([
+    ['2^31 ms', 2 ** 31],
+    ['Number.MAX_SAFE_INTEGER ms', Number.MAX_SAFE_INTEGER],
+  ])(
+    'caps a deadline of %s under the timer maximum, so the call ends neither at once nor past the cap',
+    async (_, deadlineMs) => {
+      const h = setup({ browserTimers: true });
+      h.context.handlers.set('get_value', () => new Promise<string>(() => undefined));
+      const socket = await link(h);
+      socket.deliver(invoke('get_value', { deadlineMs }));
+      await h.clock.advance(1000);
+      expect(results(socket)).toEqual([]);
+      expect(h.context.runs[0]?.signal.aborted).toBe(false);
+      // On to just short of the cap at once, the relay's ping keeping the link alive meanwhile.
+      h.clock.now += MAX_DEADLINE_MS - 1000 - 1;
+      socket.deliver({ t: 'ping' });
+      await h.clock.advance(0);
+      expect(results(socket)).toEqual([]);
+      await h.clock.advance(1);
+      expect(results(socket)[0]?.error?.code).toBe('timeout');
+      expect(h.context.runs[0]?.signal.aborted).toBe(true);
+      expect(h.delays.filter((ms) => ms > MAX_TIMER_MS)).toEqual([]);
+    },
+  );
 });
 
 describe('roles and consequential tools', () => {
@@ -879,25 +1047,53 @@ describe('roles and consequential tools', () => {
       expect(results(socket).map((frame) => frame.callId)).toEqual(['call-2']);
     });
 
-    it('takes the page list as authoritative, even an empty one', async () => {
+    it('takes a list that names tools as authoritative', async () => {
       const listed = setup({
         tools: polyfillTools(),
         core: { policy: { consequentialTools: ['wipe'] } },
       });
-      const first = await link(listed);
+      const socket = await link(listed);
       expect(listed.dock.state.notice).toBeNull();
-      first.deliver(invoke('set_value'));
-      first.deliver(invoke('wipe', { callId: 'call-2' }));
+      socket.deliver(invoke('set_value'));
+      socket.deliver(invoke('wipe', { callId: 'call-2' }));
       await flush();
-      expect(results(first).map((frame) => frame.callId)).toEqual(['call-1']);
+      expect(results(socket).map((frame) => frame.callId)).toEqual(['call-1']);
       expect(listed.dock.state.pendingConfirms.map((item) => item.tool)).toEqual(['wipe']);
-
-      const none = setup({ tools: polyfillTools(), core: { policy: { consequentialTools: [] } } });
-      const second = await link(none);
-      second.deliver(invoke('wipe'));
-      await flush();
-      expect(results(second)[0]?.ok).toBe(true);
     });
+
+    // README and SPEC section 8 once showed consequentialTools: [] in their
+    // example, so a page that copied either must still fail safe (ADR 0034).
+    it.each<[string, PolicyInput]>([
+      ['attach() given consequentialTools: []', { consequentialTools: [] }],
+      ['the script tag given data-consequential-tools=""', scriptTagPolicy('')],
+      ['the script tag given data-consequential-tools=" , "', scriptTagPolicy(' , ')],
+    ])(
+      'counts an empty list as naming none, for %s: every write is marked, prompts, and the notice shows',
+      async (_how, policy) => {
+        expect(policy.consequentialTools).toEqual([]);
+        const h = setup({ tools: polyfillTools(), core: { policy } });
+        const socket = await link(h);
+        expect(h.dock.state.notice).toMatch(/consequentialTools/);
+        expect(
+          socket
+            .framesOf('tools')[0]
+            ?.tools.filter((tool) => tool.consequential === true)
+            .map((tool) => tool.name),
+        ).toEqual(['set_value', 'wipe']);
+        socket.deliver(invoke('wipe'));
+        socket.deliver(invoke('get_value', { callId: 'call-2' }));
+        await flush();
+        expect(h.dock.state.pendingConfirms.map((item) => item.tool)).toEqual(['wipe']);
+        expect(results(socket).map((frame) => frame.callId)).toEqual(['call-2']);
+        expect(h.dock.confirm('call-1', false)).toBe(true);
+        await flush();
+        expect(results(socket).map((frame) => [frame.callId, frame.error?.code ?? 'ok'])).toEqual([
+          ['call-2', 'ok'],
+          ['call-1', 'denied_by_operator'],
+        ]);
+        expect(h.context.attempts.map((attempt) => attempt.tool)).toEqual(['get_value']);
+      },
+    );
 
     it('assumes nothing when no tool carries annotations at all', async () => {
       const h = setup({ tools: [runtimeTool('set_value')] });
@@ -913,6 +1109,455 @@ describe('roles and consequential tools', () => {
       await link(h);
       expect(h.dock.state.notice).toBeNull();
     });
+  });
+});
+
+describe('an answer counts only for the prompt it was asked about (S6)', () => {
+  const consequential = { consequentialHint: true, untrustedContentHint: false };
+  /** A mild write the operator may well allow, beside chromeTools()'s wipe. */
+  const STAR = runtimeTool('star_item', { ...consequential, readOnlyHint: false });
+  /** Read-only and consequential, so its prompts stand side by side rather than queue. */
+  const PEEK = runtimeTool('peek', { ...consequential, readOnlyHint: true });
+  const IGNORED_ANSWER = 'warn ignored a UI port answer to a confirmation that was already settled';
+  const BOB = { userId: 'bob', displayName: 'Bob', client: null, role: 'driver' } as const;
+
+  /**
+   * A host dialog that resolves on a later click and ignores its abort
+   * signal, as a UI port may: it keeps every prompt it was shown, to answer later.
+   */
+  function lateDialog() {
+    const asked: { tool: string; answer: (allow: boolean) => void }[] = [];
+    const ui: UiPort = {
+      askConfirm: (pending) =>
+        new Promise<boolean>((resolve) => {
+          asked.push({ tool: pending.tool, answer: resolve });
+        }),
+    };
+    return { ui, asked };
+  }
+
+  const outcomes = (socket: FakeSocket) =>
+    results(socket).map((frame) => `${frame.callId}:${frame.error?.code ?? 'ok'}`);
+
+  it('runs nothing when the relay cancels a prompted call and reuses its id for another tool', async () => {
+    const dialog = lateDialog();
+    const h = setup({ tools: [...chromeTools(), STAR], core: { ui: dialog.ui } });
+    const socket = await link(h);
+    socket.deliver(invoke('star_item', { callId: 'c1' }));
+    await flush();
+    expect(dialog.asked.map((prompt) => prompt.tool)).toEqual(['star_item']);
+    socket.deliver({ t: 'cancel', callId: 'c1', reason: 'client' });
+    socket.deliver(invoke('wipe', { callId: 'c1' }));
+    await flush();
+    // The operator allows the star they were shown, late, then a host dialog
+    // keyed by call id answers through the Dock as well.
+    dialog.asked[0]?.answer(true);
+    await flush();
+    expect(h.dock.confirm('c1', true)).toBe(false);
+    await flush();
+    expect(h.context.runs).toEqual([]);
+    expect(outcomes(socket)).toEqual(['c1:cancelled']);
+    expect(h.dock.state.pendingConfirms).toEqual([]);
+    expect(dialog.asked.map((prompt) => prompt.tool)).toEqual(['star_item']);
+    expect(h.logs).toContain(
+      'warn ignored an invoke under call c1, whose id a prompt here has used',
+    );
+    expect(h.logs).toContain(IGNORED_ANSWER);
+  });
+
+  it.each(['a deadline', 'a revoke', 'a lost link'] as const)(
+    'takes no later call under the id of a prompt that ended by %s',
+    async (how) => {
+      const h = setup({ tools: [...chromeTools(), STAR] });
+      const socket = await link(h, {}, { alice: 'driver', bob: 'driver' });
+      socket.deliver(invoke('star_item', { callId: 'c1', deadlineMs: 1000 }));
+      await flush();
+      expect(h.dock.state.pendingConfirms.map((prompt) => prompt.tool)).toEqual(['star_item']);
+      let relay = socket;
+      if (how === 'a deadline') await h.clock.advance(1000);
+      if (how === 'a revoke') expect(h.dock.revoke('alice')).toBe(true);
+      if (how === 'a lost link') {
+        // The page keeps what it remembers across links, as a host's dialog outlives them.
+        socket.drop(1006);
+        await h.clock.advance(500);
+        relay = h.socket();
+        relay.accept();
+        relay.deliver(
+          welcome(h.clock, {
+            resumed: true,
+            roster: [attachment('alice', 'driver'), attachment('bob', 'driver')],
+          }),
+        );
+        await flush();
+      }
+      expect(h.dock.state.pendingConfirms).toEqual([]);
+      relay.deliver(invoke('wipe', { callId: 'c1', caller: BOB }));
+      await flush();
+      expect(h.dock.state.pendingConfirms).toEqual([]);
+      expect(h.dock.confirm('c1', true)).toBe(false);
+      await flush();
+      expect(h.context.runs).toEqual([]);
+      expect(results(relay).filter((frame) => frame.error?.code === undefined)).toEqual([]);
+      // A fresh id from the same relay prompts as ever.
+      relay.deliver(invoke('wipe', { callId: 'c2', caller: BOB }));
+      await flush();
+      expect(h.dock.state.pendingConfirms.map((prompt) => prompt.callId)).toEqual(['c2']);
+    },
+  );
+
+  it(`binds a UI port's answer to its prompt even once ${REMEMBERED_PROMPT_IDS} newer prompts have let the page forget the id`, async () => {
+    const dialog = lateDialog();
+    const h = setup({ tools: [...chromeTools(), STAR, PEEK], core: { ui: dialog.ui } });
+    const socket = await link(h);
+    socket.deliver(invoke('star_item', { callId: 'c1' }));
+    await flush();
+    socket.deliver({ t: 'cancel', callId: 'c1', reason: 'client' });
+    for (let index = 0; index < REMEMBERED_PROMPT_IDS; index += 1) {
+      socket.deliver(invoke('peek', { callId: `p${index}` }));
+    }
+    await flush();
+    expect(h.dock.state.pendingConfirms).toHaveLength(REMEMBERED_PROMPT_IDS);
+    for (let index = 0; index < REMEMBERED_PROMPT_IDS; index += 1) {
+      socket.deliver({ t: 'cancel', callId: `p${index}`, reason: 'client' });
+    }
+    socket.deliver(invoke('wipe', { callId: 'c1' }));
+    await flush();
+    // The page took the id again, so wipe has a prompt of its own.
+    expect(h.dock.state.pendingConfirms.map((prompt) => prompt.tool)).toEqual(['wipe']);
+    dialog.asked[0]?.answer(true);
+    await flush();
+    expect(h.context.runs).toEqual([]);
+    expect(h.dock.state.pendingConfirms.map((prompt) => prompt.tool)).toEqual(['wipe']);
+    expect(h.logs).toContain(IGNORED_ANSWER);
+    // Its own prompt still answers for it.
+    dialog.asked.at(-1)?.answer(false);
+    await flush();
+    expect(h.context.runs).toEqual([]);
+    expect(outcomes(socket).at(-1)).toBe('c1:denied_by_operator');
+  });
+});
+
+describe("confirmation in the caller's client (ADR 0026, S6)", () => {
+  const OPTED_IN: PolicyInput = { confirmVia: 'client' };
+  const CLIENT = { name: 'claude-code', version: '2.1.289' };
+  const HOUR = 60 * 60_000;
+  const alice: Caller = { userId: 'alice', displayName: 'Alice', client: CLIENT, role: 'driver' };
+  const guest: Caller = {
+    userId: GUEST,
+    displayName: 'guest@example.com',
+    client: CLIENT,
+    role: 'driver',
+  };
+  const bob: Caller = { userId: 'bob', displayName: 'Bob', client: CLIENT, role: 'driver' };
+
+  /** What a relay sends for a call the caller confirmed in their client. */
+  const confirmation = (h: Harness) =>
+    ({ by: 'client', confirmationId: 'cf_1', at: h.clock.now }) as const;
+
+  /** Links a page with Alice approved directly as driver, the one case the page takes a confirmation from. */
+  const memberDriver = (h: Harness) => link(h);
+
+  /**
+   * A page that offers invites, linked with Alice approved directly, and one
+   * Can control invite redeemed by `who` and approved as driver by the
+   * operator, so this page's own grant names the invite. The roster then
+   * lists them naming that invite when `rosterNamesInvite`, as a truthful
+   * relay would, or naming none, as a relay that lies would.
+   */
+  async function invitedDriver(
+    h: Harness,
+    who: { userId: string; displayName: string; kind: 'member' | 'invitee' },
+    rosterNamesInvite: boolean,
+  ): Promise<FakeSocket> {
+    const socket = await link(h);
+    socket.deliver(invitesFrame([]));
+    const listed: InviteListing[] = [];
+    const minted = await mint(h, socket, { label: 'Help', role: 'driver' }, listed);
+    socket.deliver(
+      redemption(h.clock, minted, {
+        user: { userId: who.userId, displayName: who.displayName },
+        account: { kind: who.kind, verified: true },
+      }),
+    );
+    await until(() => h.dock.state.pendingRequests.length > 0, 'the redemption prompt');
+    if (!h.dock.approve(`redeem-${minted.inviteId}`, 'driver')) throw new Error('not approved');
+    const endsAt = h.clock.now + MAX_INVITE_LIFETIME_MS;
+    const entry = rosterNamesInvite
+      ? invitedAttachment(who.userId, 'driver', minted.inviteId, endsAt, who.displayName)
+      : { ...attachment(who.userId, 'driver'), displayName: who.displayName, kind: who.kind };
+    socket.deliver({ t: 'roster', attachments: [attachment('alice', 'driver'), entry] });
+    await flush();
+    return socket;
+  }
+
+  /** Storage holding a bare driver grant for the guest, as an adapter before M4 kept one: no invite named. */
+  function storedGuestGrant(): MapStorage {
+    const storage = new MapStorage();
+    storage.setItem(
+      GRANTS_KEY,
+      JSON.stringify({ pageId: 'page-1', grants: { [GUEST]: 'driver' } }),
+    );
+    return storage;
+  }
+
+  interface Case {
+    readonly policy?: PolicyInput;
+    readonly tools?: () => RuntimeTool[];
+    readonly storage?: () => MapStorage;
+    readonly prepare: (h: Harness) => Promise<FakeSocket>;
+    readonly caller?: Caller;
+    readonly tool: string;
+    /** Whether the page puts the call to its operator, as it does today. */
+    readonly asks: boolean;
+  }
+
+  /**
+   * What the page does with one invoke, with or without the relay's
+   * confirmation: whether it asks, then, after the operator allows or stays
+   * silent past the deadline, what it answered, what ran and what the
+   * activity log shows.
+   */
+  async function trace(c: Case, answer: 'allow' | 'silence', confirmed: boolean) {
+    const h = setup({
+      core: { policy: c.policy ?? OPTED_IN },
+      ...(c.tools ? { tools: c.tools() } : {}),
+      ...(c.storage ? { storage: c.storage() } : {}),
+    });
+    const socket = await c.prepare(h);
+    socket.deliver(
+      invoke(c.tool, {
+        deadlineMs: 1000,
+        caller: c.caller ?? alice,
+        ...(confirmed ? { confirmation: confirmation(h) } : {}),
+      }),
+    );
+    await flush();
+    const asked = h.dock.state.pendingConfirms.map((pending) => pending.tool);
+    if (answer === 'allow') h.dock.confirm('call-1', true);
+    await h.clock.advance(1000);
+    return {
+      asked,
+      results: results(socket),
+      runs: h.context.runs.map((run) => run.tool),
+      activity: h.dock.state.activity.map(({ outcome, confirmedBy }) => ({ outcome, confirmedBy })),
+    };
+  }
+
+  const failing: [string, Case][] = [
+    ['a page that did not opt in', { policy: {}, prepare: memberDriver, tool: 'wipe', asks: true }],
+    [
+      'a page that opted in but denies consequential tools',
+      {
+        policy: { ...OPTED_IN, consequential: 'deny' },
+        prepare: memberDriver,
+        tool: 'wipe',
+        asks: false,
+      },
+    ],
+    [
+      'a page that opted in but allows consequential tools',
+      {
+        policy: { ...OPTED_IN, consequential: 'allow' },
+        prepare: memberDriver,
+        tool: 'wipe',
+        asks: false,
+      },
+    ],
+    [
+      'a paused page',
+      {
+        prepare: async (h) => {
+          const socket = await memberDriver(h);
+          h.dock.pause(true);
+          return socket;
+        },
+        tool: 'wipe',
+        asks: false,
+      },
+    ],
+    [
+      "an invitee's id, even on a driver grant that names no invite",
+      {
+        storage: storedGuestGrant,
+        prepare: (h) =>
+          link(
+            h,
+            {
+              resumed: true,
+              roster: [
+                {
+                  ...attachment(GUEST, 'driver'),
+                  displayName: 'guest@example.com',
+                  kind: 'invitee',
+                },
+              ],
+            },
+            {},
+          ),
+        caller: guest,
+        tool: 'wipe',
+        asks: true,
+      },
+    ],
+    [
+      'an invitee a Can control invite let in',
+      {
+        policy: { ...OPTED_IN, invites: 'all' },
+        prepare: (h) =>
+          invitedDriver(
+            h,
+            { userId: GUEST, displayName: 'guest@example.com', kind: 'invitee' },
+            true,
+          ),
+        caller: guest,
+        tool: 'wipe',
+        asks: true,
+      },
+    ],
+    [
+      "a member whose grant on this page an invite made, though the relay's roster names none",
+      {
+        policy: { ...OPTED_IN, invites: 'all' },
+        prepare: (h) =>
+          invitedDriver(h, { userId: 'bob', displayName: 'Bob', kind: 'member' }, false),
+        caller: bob,
+        tool: 'wipe',
+        asks: true,
+      },
+    ],
+    [
+      'a member approved here whom the relay lists as let in by an invite',
+      {
+        prepare: (h) =>
+          link(h, {
+            roster: [
+              {
+                ...attachment('alice', 'driver'),
+                inviteId: 'inv_relay',
+                endsAt: h.clock.now + HOUR,
+              },
+            ],
+          }),
+        tool: 'wipe',
+        asks: true,
+      },
+    ],
+    [
+      'an observer by the operator grant',
+      {
+        policy: { ...OPTED_IN, consequentialTools: ['get_value'] },
+        prepare: (h) => link(h, {}, { alice: 'observer' }),
+        tool: 'get_value',
+        asks: true,
+      },
+    ],
+    [
+      "an observer by the relay's roster",
+      {
+        policy: { ...OPTED_IN, consequentialTools: ['get_value'] },
+        prepare: (h) => link(h, { roster: [attachment('alice', 'observer')] }),
+        tool: 'get_value',
+        asks: true,
+      },
+    ],
+    [
+      'an observer by the role the invoke claims',
+      {
+        policy: { ...OPTED_IN, consequentialTools: ['get_value'] },
+        prepare: memberDriver,
+        caller: { ...alice, role: 'observer' },
+        tool: 'get_value',
+        asks: true,
+      },
+    ],
+    [
+      'an observer calling a consequential write',
+      {
+        prepare: (h) => link(h, {}, { alice: 'observer' }),
+        tool: 'wipe',
+        asks: false,
+      },
+    ],
+    [
+      'a tool the page does not count as consequential, whatever the relay thinks',
+      { prepare: memberDriver, tool: 'set_value', asks: false },
+    ],
+  ];
+
+  describe.each(failing)('for %s', (_, c) => {
+    it.each([
+      ['allows', 'allow'],
+      ['stays silent', 'silence'],
+    ] as const)(
+      'does exactly what it does without a confirmation when the operator %s',
+      async (_how, answer) => {
+        const crafted = await trace(c, answer, true);
+        expect(crafted.asked.length > 0).toBe(c.asks);
+        expect(crafted).toEqual(await trace(c, answer, false));
+        // The client is never credited with a call it did not let run.
+        expect(crafted.activity.every((entry) => entry.confirmedBy === null)).toBe(true);
+        if (c.asks) {
+          expect(crafted.results.map((frame) => frame.error?.code ?? 'ok')).toEqual([
+            answer === 'allow' ? 'ok' : 'denied_by_operator',
+          ]);
+        }
+      },
+    );
+  });
+
+  it("runs a member driver's consequential call with no prompt on a page that opted in, and says so", async () => {
+    const h = setup({ core: { policy: OPTED_IN } });
+    const socket = await memberDriver(h);
+    socket.deliver(invoke('wipe', { caller: alice, confirmation: confirmation(h) }));
+    await flush();
+    expect(h.dock.state.pendingConfirms).toEqual([]);
+    expect(results(socket)).toEqual([{ t: 'result', callId: 'call-1', ok: true, content: '{}' }]);
+    expect(h.context.runs.map((run) => run.tool)).toEqual(['wipe']);
+    expect(h.dock.state.activity).toMatchObject([
+      { callId: 'call-1', tool: 'wipe', client: CLIENT, outcome: 'ok', confirmedBy: 'client' },
+    ]);
+    expect(h.logs).toContain(
+      'info call call-1 wipe by Alice (driver): confirmed in their client, so the page did not ask',
+    );
+    expect(h.logs.join('\n')).not.toContain('cf_1');
+
+    // The same page still asks its operator about a call that comes unconfirmed.
+    socket.deliver(invoke('wipe', { callId: 'call-2', caller: alice }));
+    await flush();
+    expect(h.dock.state.pendingConfirms.map((pending) => pending.callId)).toEqual(['call-2']);
+    expect(h.context.runs).toHaveLength(1);
+  });
+
+  it('takes it for a tool consequential by the fallback, where the runtime drops the hint (ADR 0002)', async () => {
+    const h = setup({ tools: polyfillTools(), core: { policy: OPTED_IN } });
+    const socket = await memberDriver(h);
+    socket.deliver(invoke('set_value', { caller: alice, confirmation: confirmation(h) }));
+    await flush();
+    expect(h.dock.state.pendingConfirms).toEqual([]);
+    expect(results(socket)[0]?.ok).toBe(true);
+    expect(h.dock.state.activity[0]?.confirmedBy).toBe('client');
+  });
+
+  it('logs why it asks when it does not take a confirmation, naming nobody an invitee is', async () => {
+    const h = setup({ core: { policy: OPTED_IN }, storage: storedGuestGrant() });
+    const socket = await link(
+      h,
+      {
+        resumed: true,
+        roster: [
+          { ...attachment(GUEST, 'driver'), displayName: 'guest@example.com', kind: 'invitee' },
+        ],
+      },
+      {},
+    );
+    socket.deliver(invoke('wipe', { caller: guest, confirmation: confirmation(h) }));
+    await flush();
+    expect(h.dock.state.pendingConfirms).toHaveLength(1);
+    const line = h.logs.find((entry) => entry.includes('asking on the page'));
+    expect(line).toBe(
+      `info call call-1 wipe by invitee ${GUEST.slice(2, 2 + INVITEE_SHORT_ID_CHARS)} (driver): asking on the page, as the caller is an invitee, whatever the relay says of their client`,
+    );
+    expect(h.logs.join('\n')).not.toContain('guest@example.com');
   });
 });
 
@@ -1066,6 +1711,57 @@ describe('reconnecting', () => {
     expect(CLOSE_SILENT).not.toBe(CLOSE_DETACH);
     expect(h.dock.state.link).toBe('reconnecting');
     expect(h.storage.getItem(RESUME_KEY)).toBe('resume-1');
+  });
+
+  // The schema takes any positive integer for idleTimeoutMs, as for
+  // deadlineMs, and a silence timer past the maximum fired at once in
+  // Chromium: a reconnect loop on every welcome (ADR 0030).
+  it.each([
+    ['2^31 ms', 2 ** 31],
+    ['Number.MAX_SAFE_INTEGER ms', Number.MAX_SAFE_INTEGER],
+  ])(
+    'caps a relay idle timeout of %s at the timer maximum, so the link neither drops at once nor waits past it',
+    async (_, idleTimeoutMs) => {
+      const h = setup({ browserTimers: true });
+      const socket = await link(h, { limits: { ...welcome(h.clock).limits, idleTimeoutMs } });
+      await h.clock.advance(IDLE_TIMEOUT_MS * 4);
+      expect(h.sockets).toHaveLength(1);
+      expect(socket.closedWith).toBeNull();
+      expect(h.dock.state.link).toBe('linked');
+      expect(h.delays.filter((ms) => ms > MAX_TIMER_MS)).toEqual([]);
+      // On to just short of the cap at once: still linked, and gone at the cap.
+      h.clock.now += MAX_TIMER_MS - IDLE_TIMEOUT_MS * 4 - 1;
+      await h.clock.advance(0);
+      expect(socket.closedWith).toBeNull();
+      await h.clock.advance(1);
+      expect(socket.closedWith).toEqual({ code: CLOSE_SILENT, reason: 'relay silent' });
+    },
+  );
+
+  it('caps the timer for an invite-made grant whose stored end lies past the timer maximum', async () => {
+    // Storage is the page's, and only this adapter writes grants there, each
+    // ending 24 hours on; anything else in it must still not spin the page.
+    const storage = new MapStorage();
+    const endsAt = new ManualClock().now + 2 ** 31;
+    storage.setItem(
+      GRANTS_KEY,
+      JSON.stringify({
+        pageId: 'page-1',
+        grants: { bob: { role: 'observer', inviteId: 'inv_1', endsAt, inviteRole: 'observer' } },
+      }),
+    );
+    const h = setup({ browserTimers: true, storage });
+    await link(
+      h,
+      { resumed: true, roster: [invitedAttachment('bob', 'observer', 'inv_1', endsAt, 'Bob')] },
+      {},
+    );
+    expect(h.dock.state.pageRoles).toMatchObject([{ userId: 'bob', role: 'observer' }]);
+    expect(h.delays.filter((ms) => ms > MAX_TIMER_MS)).toEqual([]);
+    const before = h.delays.length;
+    await h.clock.advance(10_000);
+    // Polls rearm a few timers in 10 s, never the grant's end over and over.
+    expect(h.delays.length - before).toBeLessThan(20);
   });
 
   it('counts the frame cap in UTF-8 bytes, not string length', async () => {
@@ -1288,18 +1984,25 @@ describe('one approval covers one page (ADR 0011)', () => {
 });
 
 describe('createAdapterCore', () => {
-  it('rejects an invalid policy at once', () => {
-    expect(() =>
+  it('rejects an invalid policy at once, with a TypeError naming its fields and never their values (ADR 0032)', () => {
+    const attachWith = (policy: unknown) => () =>
       createAdapterCore({
         relayUrl: RELAY_URL,
-        policy: { maxDrivers: 0 },
+        policy: policy as PolicyInput,
         socketFactory: () => {
           throw new Error('unused');
         },
         pageUrl: '',
         pageInfo: () => ({ title: '' }),
         adapterVersion: '0',
-      }),
-    ).toThrow();
+      });
+    expect(attachWith({ maxDrivers: 0 })).toThrow(new TypeError('invalid policy for maxDrivers'));
+    expect(attachWith({ maxDrivers: 0, consequential: 'maybe' })).toThrow(
+      new TypeError('invalid policy for maxDrivers, consequential'),
+    );
+    expect(attachWith({ consequentialTools: ['ok', 5] })).toThrow(
+      new TypeError('invalid policy for consequentialTools.1'),
+    );
+    expect(attachWith('everything')).toThrow(new TypeError('invalid policy: it must be an object'));
   });
 });

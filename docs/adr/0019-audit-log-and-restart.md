@@ -117,3 +117,7 @@ These notes replace the sentences of the notes above that they contradict.
 ## Notes from the last A4.3 pass (4 October 2026)
 
 **Requests too large to wait.** An `/mcp` request whose body alone would hold more than one user's share of what waiting requests may hold is answered 413 before either leg parses it (ADR 0018's notes); its line, `mcp request refused: it would hold more than one user may`, is one more kind the per-kind budget covers, and a call or pairing refused for that share or the relay's total writes its refusal record within the per-user budget above, as any refused before it reaches a page. Tests: `request-bytes.test.ts`.
+
+## Notes from ADR 0026 (5 October 2026)
+
+A `call` record gains an optional `confirmedBy: 'client'`, present exactly when the call went out confirmed in its caller's client, and `not_confirmed` joins the outcomes; a pending client confirmation that expires with no retry writes one `not_confirmed` call record within the refusal budget when the sweep removes it; asking writes nothing, so one still pending when the relay restarts leaves no record unless its client retries, and that retry writes the `not_confirmed` record. Records still never hold arguments, their digest or a `requestState`. The format stays at version 1, since 0.1.0 is unreleased; an M4 `pnpm audit:log` refuses lines that carry the new field.

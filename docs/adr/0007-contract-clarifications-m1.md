@@ -25,3 +25,7 @@ B. Use the MCP SDK's own `Input validation error: ...` wording, which is what a 
 ## Consequences
 
 The spec matches the wire and the error texts clients actually see. Section 7 gains `invalid_arguments`, which the relay already returns for arguments too large for one frame, and M2's argument validation reuses it.
+
+## Notes from ADR 0026 (5 October 2026)
+
+A consequential call whose confirmation in the caller's client is declined, dismissed, expired, reused or mismatched answers `not_confirmed`, not `denied_by_operator`, since the operator never saw it; an unanswered on-page prompt still answers `denied_by_operator`.

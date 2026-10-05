@@ -1,6 +1,10 @@
 packages:
   - packages/*
   - apps/*
+  # The Pages site builds with mermaid's hundred-odd packages, so it keeps its
+  # own lockfile and installs only when the site is built (ADR 0029):
+  # `pnpm site:build`. A clean clone's `pnpm install` never fetches them.
+  - '!apps/site'
   - tests/*
 
 # pnpm blocks dependency build scripts unless they are allowed here. allowBuilds

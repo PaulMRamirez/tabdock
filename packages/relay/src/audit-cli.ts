@@ -10,12 +10,15 @@
 // runtime image has no pnpm or shell: on the reference deployment,
 // fly ssh console -C "/nodejs/bin/node /app/packages/relay/src/audit-cli.ts --verify"
 // (docs/deploy.md, "Reading the audit log"). It reads files and writes to
-// stdout only; it never changes the log.
+// stdout only; it never changes the log. The published command runs it as
+// `tabdock-relay audit` (cli.ts, ADR 0028), its usage naming that command, and
+// there it reads no .env file: settings come from the environment alone.
 
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { parseArgs } from 'node:util';
+import { parseArgs, type ParseArgsOptionsConfig } from 'node:util';
 import { AUDIT_EVENT_TYPES, type AuditLine } from '@tabdock/protocol';
+import { namedArgument } from './argument-names.ts';
 import {
   type AuditCheckpoint,
   readAuditLines,
@@ -24,8 +27,17 @@ import {
 } from './audit-file.ts';
 import { LOCAL_AUDIT_DIR } from './config.ts';
 import { ownerTokenDirectory } from './local-token.ts';
+import { PACKAGED } from './packaged.ts';
 
-export const AUDIT_CLI_USAGE = `Usage: pnpm audit:log [options]
+/** How a checkout runs the reader; the published command is `tabdock-relay audit`. */
+export const CHECKOUT_AUDIT_COMMAND = 'pnpm audit:log';
+
+/** The reader's usage, naming the command it runs under. */
+export function auditCliUsage(command: string): string {
+  return AUDIT_CLI_USAGE.replace(`Usage: ${CHECKOUT_AUDIT_COMMAND} `, `Usage: ${command} `);
+}
+
+export const AUDIT_CLI_USAGE = `Usage: ${CHECKOUT_AUDIT_COMMAND} [options]
 
 Reads the relay's audit log (ADR 0019) and prints its records, oldest first.
 
@@ -139,12 +151,91 @@ function list(values: string[] | undefined): string[] {
   );
 }
 
-/** The directory to read: --dir, then TABDOCK_AUDIT_DIR, then local mode's beside its token. */
-function auditDir(given: string | undefined, env: NodeJS.ProcessEnv): string {
-  if (given !== undefined) return resolve(given);
+interface AuditDir {
+  path: string;
+  /** How a message names the directory. */
+  named: string;
+  /** What a message about a missing directory suggests. */
+  hint: string;
+}
+
+/**
+ * The directory to read: --dir, then TABDOCK_AUDIT_DIR, then local mode's
+ * beside its token. A path the person gave is named only by where it came
+ * from, never repeated: the value after --dir or in the variable may be a
+ * token pasted in the wrong place, and stderr may reach a supervisor's or
+ * CI's log (ADR 0028). The default is shown, since the reader derived it
+ * from the token directory, which TABDOCK_HOME may name only absolutely.
+ */
+function auditDir(given: string | undefined, env: NodeJS.ProcessEnv): AuditDir {
+  if (given !== undefined) {
+    return { path: resolve(given), named: 'the path --dir gives', hint: 'check it' };
+  }
   const fromEnv = env.TABDOCK_AUDIT_DIR?.trim() ?? '';
-  if (fromEnv !== '') return fromEnv;
-  return join(ownerTokenDirectory(env), LOCAL_AUDIT_DIR);
+  if (fromEnv !== '') {
+    return {
+      path: fromEnv,
+      named: 'the path TABDOCK_AUDIT_DIR gives',
+      hint: 'check it, or give --dir',
+    };
+  }
+  const path = join(ownerTokenDirectory(env), LOCAL_AUDIT_DIR);
+  return { path, named: path, hint: 'give --dir or TABDOCK_AUDIT_DIR' };
+}
+
+const AUDIT_OPTIONS = {
+  dir: { type: 'string' },
+  user: { type: 'string', multiple: true },
+  page: { type: 'string', multiple: true },
+  type: { type: 'string', multiple: true },
+  outcome: { type: 'string', multiple: true },
+  since: { type: 'string' },
+  until: { type: 'string' },
+  json: { type: 'boolean' },
+  verify: { type: 'boolean' },
+  checkpoint: { type: 'string' },
+  help: { type: 'boolean' },
+} as const satisfies ParseArgsOptionsConfig;
+
+/**
+ * Why the arguments are refused, or null when node's strict parse will take
+ * them. Node's own messages quote the argument they stumble on, so the
+ * arguments are walked here first and each refusal names a flag by its name
+ * and anything else only by its place, as cli.ts does (ADR 0028): a token
+ * pasted in the wrong place is still a token. Values are never named.
+ */
+function refusalOf(argv: readonly string[]): string | null {
+  const { tokens } = parseArgs({
+    args: [...argv],
+    options: AUDIT_OPTIONS,
+    strict: false,
+    allowPositionals: true,
+    tokens: true,
+  });
+  for (const token of tokens) {
+    if (token.kind === 'option-terminator') continue;
+    if (token.kind === 'positional') {
+      return `${namedArgument(argv[token.index] ?? '', token.index + 1)} is not one this reader takes: it takes options only`;
+    }
+    const known = Object.hasOwn(AUDIT_OPTIONS, token.name)
+      ? AUDIT_OPTIONS[token.name as keyof typeof AUDIT_OPTIONS]
+      : undefined;
+    // Matched by its spelling too, so --Dir or a short form is not taken as --dir.
+    if (known === undefined || token.rawName !== `--${token.name}`) {
+      return `${namedArgument(argv[token.index] ?? '', token.index + 1)} is not one this reader takes`;
+    }
+    if (known.type === 'boolean' && token.value !== undefined) {
+      return `the option ${token.rawName} takes no value`;
+    }
+    // Node refuses a separate value that starts with a dash as ambiguous; --dir=-x passes.
+    if (
+      known.type === 'string' &&
+      (token.value === undefined || (!token.inlineValue && token.value.startsWith('-')))
+    ) {
+      return `the option ${token.rawName} needs a value`;
+    }
+  }
+  return null;
 }
 
 export interface CliIo {
@@ -152,45 +243,46 @@ export interface CliIo {
   err(line: string): void;
 }
 
-/** Runs the reader with these arguments; returns the exit code (0 fine, 1 a broken log, 2 a usage error). */
+/**
+ * Runs the reader with these arguments; returns the exit code (0 fine, 1 a
+ * broken log, 2 a usage error). `command` is what the usage calls it.
+ */
 export function runAuditCli(
   argv: readonly string[],
   env: NodeJS.ProcessEnv,
   io: CliIo,
   now: number = Date.now(),
+  command: string = CHECKOUT_AUDIT_COMMAND,
 ): number {
+  const usage = auditCliUsage(command);
+  const refused = refusalOf(argv);
+  if (refused !== null) {
+    io.err(refused);
+    io.err(usage);
+    return 2;
+  }
   let values;
   try {
     ({ values } = parseArgs({
       args: [...argv],
       strict: true,
       allowPositionals: false,
-      options: {
-        dir: { type: 'string' },
-        user: { type: 'string', multiple: true },
-        page: { type: 'string', multiple: true },
-        type: { type: 'string', multiple: true },
-        outcome: { type: 'string', multiple: true },
-        since: { type: 'string' },
-        until: { type: 'string' },
-        json: { type: 'boolean' },
-        verify: { type: 'boolean' },
-        checkpoint: { type: 'string' },
-        help: { type: 'boolean' },
-      },
+      options: AUDIT_OPTIONS,
     }));
-  } catch (error) {
-    io.err(escapeForTerminal(error instanceof Error ? error.message : String(error)));
-    io.err(AUDIT_CLI_USAGE);
+  } catch {
+    // refusalOf names every case node's parser refuses; its own message
+    // would repeat the argument, which may be a token pasted in the wrong place.
+    io.err('the arguments are not ones this reader takes');
+    io.err(usage);
     return 2;
   }
   if (values.help === true) {
-    io.out(AUDIT_CLI_USAGE);
+    io.out(usage);
     return 0;
   }
   let filter: AuditFilter;
   let checkpoint: AuditCheckpoint | undefined;
-  let dir: string;
+  let dir: AuditDir;
   try {
     const types = list(values.type);
     const unknown = types.find((type) => !(AUDIT_EVENT_TYPES as readonly string[]).includes(type));
@@ -223,18 +315,18 @@ export function runAuditCli(
     io.err(escapeForTerminal(error instanceof Error ? error.message : String(error)));
     return 2;
   }
-  if (!existsSync(dir)) {
-    io.err(escapeForTerminal(`no audit directory at ${dir}; give --dir or TABDOCK_AUDIT_DIR`));
+  if (!existsSync(dir.path)) {
+    io.err(escapeForTerminal(`no audit directory at ${dir.named}; ${dir.hint}`));
     return 2;
   }
 
   const lines: ReadLine[] = [];
   try {
-    for (const line of readAuditLines(dir)) lines.push(line);
+    for (const line of readAuditLines(dir.path)) lines.push(line);
   } catch (error) {
     const code =
       typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : 'error';
-    io.err(escapeForTerminal(`cannot read the audit directory ${dir} (${code})`));
+    io.err(escapeForTerminal(`cannot read the audit directory at ${dir.named} (${code})`));
     return 2;
   }
 
@@ -305,8 +397,10 @@ export function runAuditCli(
   return 0;
 }
 
-// Run as a script: the root .env, when there is one, may name TABDOCK_AUDIT_DIR, as main.ts reads it.
-if (import.meta.main) {
+// Run as a script in a checkout: the root .env, when there is one, may name
+// TABDOCK_AUDIT_DIR, as main.ts reads it. Never in the bundle, where every
+// module shares the entry's import.meta and cli.ts runs the reader itself.
+if (!PACKAGED && import.meta.main) {
   const envFile = resolve(import.meta.dirname, '../../../.env');
   if (existsSync(envFile)) process.loadEnvFile(envFile);
   process.exitCode = runAuditCli(process.argv.slice(2), process.env, {

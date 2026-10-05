@@ -182,25 +182,27 @@ export function isReadOnly(tool: PageTool): boolean {
 
 /**
  * ADR 0002 option C. A tool is consequential when its hint or the page's list
- * says so. When the runtime evidently drops the hint and the page gave no list,
- * every tool that is not read-only counts, so S6 fails safe.
+ * says so. When the runtime evidently drops the hint and the page names no
+ * tool, every tool that is not read-only counts, so S6 fails safe.
  */
-export function isConsequential(
-  tool: PageTool,
-  hintSupport: HintSupport,
-  policy: Policy,
-  pageListedTools: boolean,
-): boolean {
+export function isConsequential(tool: PageTool, hintSupport: HintSupport, policy: Policy): boolean {
   if (tool.annotations?.consequentialHint === true) return true;
   if (policy.consequentialTools.includes(tool.name)) return true;
-  return hintSupport === 'missing' && !pageListedTools && !isReadOnly(tool);
+  return hintSupport === 'missing' && !namesTools(policy) && !isReadOnly(tool);
 }
 
 /** True when the hint fallback is what decides, so the operator should be told how to fix it. */
-export function needsHintNotice(
-  hintSupport: HintSupport,
-  policy: Policy,
-  pageListedTools: boolean,
-): boolean {
-  return hintSupport === 'missing' && !pageListedTools && policy.consequential !== 'allow';
+export function needsHintNotice(hintSupport: HintSupport, policy: Policy): boolean {
+  return hintSupport === 'missing' && !namesTools(policy) && policy.consequential !== 'allow';
+}
+
+/**
+ * Whether the page named a consequential tool. An empty list names none, so
+ * it leaves the fallback on (ADR 0034): the README once showed
+ * `consequentialTools: []` as a default, and a page copying it on a runtime
+ * that drops the hint must not run its writes unprompted. A page that wants
+ * no prompts says `consequential: 'allow'`.
+ */
+function namesTools(policy: Policy): boolean {
+  return policy.consequentialTools.length > 0;
 }

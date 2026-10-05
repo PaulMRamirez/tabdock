@@ -1,17 +1,38 @@
 {
   "name": "@tabdock/protocol",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
   "description": "Page link message types and zod schemas shared by the Tabdock relay and adapter.",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PaulMRamirez/tabdock.git",
+    "directory": "packages/protocol"
+  },
+  "homepage": "https://github.com/PaulMRamirez/tabdock#readme",
+  "bugs": "https://github.com/PaulMRamirez/tabdock/issues",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
   },
+  "files": [
+    "dist",
+    "NOTICE"
+  ],
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
     "zod": "4.6.5"
+  },
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    },
+    "types": "./dist/index.d.ts"
   }
 }

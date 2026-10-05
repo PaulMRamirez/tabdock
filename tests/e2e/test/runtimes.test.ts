@@ -63,30 +63,39 @@ describe.each(RUNTIME_PROFILES)('runtime %s', (profile) => {
 });
 
 describe('the polyfill without a consequentialTools list (ADR 0002 option C)', () => {
-  it('treats every mutating tool as consequential and says how to fix it', async () => {
-    world = await startWorld();
-    const sim = await world.page({
-      profile: 'polyfill-5.1',
-      operator: { askAttach: () => 'driver', askConfirm: () => false },
-    });
-    const alice = await world.client(world.alice);
-    const paired = await callTool(alice, 'pair_page', {
-      code: (await sim.waitFor((s) => s.pairing !== null)).pairing?.code,
-    });
-    expect(paired.isError, paired.text).toBe(false);
-    const pageId = (paired.structured as { page: string }).page;
-    await waitForTools(alice, pageId, SIM_TOOL_COUNT);
-    expect(sim.state.notice).toMatch(/consequentialTools/);
+  // An empty list names none (ADR 0034), so a page that copied the old
+  // README's consequentialTools: [] fails safe like one that gave no list.
+  it.each([
+    ['no list', {}],
+    ['an empty list', { consequentialTools: [] }],
+  ])(
+    'treats every mutating tool as consequential and says how to fix it, given %s',
+    async (_how, policy) => {
+      world = await startWorld();
+      const sim = await world.page({
+        profile: 'polyfill-5.1',
+        policy,
+        operator: { askAttach: () => 'driver', askConfirm: () => false },
+      });
+      const alice = await world.client(world.alice);
+      const paired = await callTool(alice, 'pair_page', {
+        code: (await sim.waitFor((s) => s.pairing !== null)).pairing?.code,
+      });
+      expect(paired.isError, paired.text).toBe(false);
+      const pageId = (paired.structured as { page: string }).page;
+      await waitForTools(alice, pageId, SIM_TOOL_COUNT);
+      expect(sim.state.notice).toMatch(/consequentialTools/);
 
-    const set = await callTool(alice, 'call_page_tool', {
-      page: pageId,
-      tool: 'set_value',
-      arguments: { value: 'needs a yes' },
-    });
-    expect(errorCode(set), set.text).toBe('denied_by_operator');
-    expect(sim.store.value).toBeNull();
+      const set = await callTool(alice, 'call_page_tool', {
+        page: pageId,
+        tool: 'set_value',
+        arguments: { value: 'needs a yes' },
+      });
+      expect(errorCode(set), set.text).toBe('denied_by_operator');
+      expect(sim.store.value).toBeNull();
 
-    const read = await callTool(alice, 'call_page_tool', { page: pageId, tool: 'get_value' });
-    expect(read.isError, read.text).toBe(false);
-  });
+      const read = await callTool(alice, 'call_page_tool', { page: pageId, tool: 'get_value' });
+      expect(read.isError, read.text).toBe(false);
+    },
+  );
 });

@@ -6,7 +6,7 @@
 
 // First, before zod builds anything: no eval probe on Trusted Types pages.
 import './zod-config.ts';
-import { z } from 'zod';
+import * as z from 'zod/mini';
 import { INVITE_BURN_REFUSALS, MAX_INVITE_USES, MAX_LIVE_INVITES_PER_PAGE } from './constants.ts';
 import {
   controlForOneUse,
@@ -14,6 +14,7 @@ import {
   IdSchema,
   InviteLabelSchema,
   InviteSecretHashSchema,
+  type Role,
   RoleSchema,
 } from './page-link.ts';
 
@@ -32,20 +33,27 @@ export const StoredGrantSchema = z.union([
   z
     .strictObject({
       role: RoleSchema,
-      inviteId: IdSchema.optional(),
-      endsAt: EpochMsSchema.optional(),
-      inviteRole: RoleSchema.optional(),
+      inviteId: z.optional(IdSchema),
+      endsAt: z.optional(EpochMsSchema),
+      inviteRole: z.optional(RoleSchema),
     })
-    .refine(
-      (grant) =>
-        (grant.inviteId === undefined) === (grant.endsAt === undefined) &&
-        (grant.inviteId === undefined) === (grant.inviteRole === undefined),
-      { message: 'an invite-made grant names its invite, its end and its cap, and no other does' },
-    )
-    .refine((grant) => grant.inviteRole !== 'observer' || grant.role === 'observer', {
-      message: "a grant never passes its invite's role",
-    }),
-  RoleSchema.transform((role) => ({ role })),
+    .check(
+      z.refine(
+        (grant) =>
+          (grant.inviteId === undefined) === (grant.endsAt === undefined) &&
+          (grant.inviteId === undefined) === (grant.inviteRole === undefined),
+        {
+          message: 'an invite-made grant names its invite, its end and its cap, and no other does',
+        },
+      ),
+      z.refine((grant) => grant.inviteRole !== 'observer' || grant.role === 'observer', {
+        message: "a grant never passes its invite's role",
+      }),
+    ),
+  z.pipe(
+    RoleSchema,
+    z.transform((role: Role) => ({ role })),
+  ),
 ]);
 export type StoredGrant = z.infer<typeof StoredGrantSchema>;
 
@@ -60,24 +68,26 @@ export const StoredInviteSchema = z
     secretHash: InviteSecretHashSchema,
     role: RoleSchema,
     label: InviteLabelSchema,
-    uses: z.number().int().min(1).max(MAX_INVITE_USES),
-    usesLeft: z.number().int().min(0).max(MAX_INVITE_USES),
+    uses: z.number().check(z.int(), z.gte(1), z.lte(MAX_INVITE_USES)),
+    usesLeft: z.number().check(z.int(), z.gte(0), z.lte(MAX_INVITE_USES)),
     createdAt: EpochMsSchema,
     /** As the operator chose; null is "while the page is open", which still ends after 24 hours. */
-    expiresAt: EpochMsSchema.nullable(),
-    refusals: z.number().int().min(0).max(INVITE_BURN_REFUSALS),
+    expiresAt: z.nullable(EpochMsSchema),
+    refusals: z.number().check(z.int(), z.gte(0), z.lte(INVITE_BURN_REFUSALS)),
     /** User ids revoked from this invite; no redemption by them is honoured again. */
-    barred: z.array(IdSchema).max(MAX_INVITE_USES),
+    barred: z.array(IdSchema).check(z.maxLength(MAX_INVITE_USES)),
   })
-  .refine(controlForOneUse, { message: 'a control invite has exactly one use' })
-  .refine((invite) => invite.usesLeft <= invite.uses, {
-    message: 'an invite cannot have more uses left than it had',
-  });
+  .check(
+    z.refine(controlForOneUse, { message: 'a control invite has exactly one use' }),
+    z.refine((invite) => invite.usesLeft <= invite.uses, {
+      message: 'an invite cannot have more uses left than it had',
+    }),
+  );
 export type StoredInvite = z.infer<typeof StoredInviteSchema>;
 
 /** Every invite record of one page session, dropped with its grants when a session does not resume. */
 export const StoredInvitesSchema = z.strictObject({
   pageId: IdSchema,
-  invites: z.array(StoredInviteSchema).max(MAX_LIVE_INVITES_PER_PAGE),
+  invites: z.array(StoredInviteSchema).check(z.maxLength(MAX_LIVE_INVITES_PER_PAGE)),
 });
 export type StoredInvites = z.infer<typeof StoredInvitesSchema>;

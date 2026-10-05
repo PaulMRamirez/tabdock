@@ -19,3 +19,7 @@ B. Hold until the operator reloads the page, so writes never overlap, at the cos
 ## Consequences
 
 With A, section 6 gains 1013 and the second use of 1008, and section 5 gains one sentence naming the polyfill exception. Nothing changes for a page within its limits or on native WebMCP.
+
+## Notes after the M5 research (5 October 2026)
+
+On MCP-B 6 this hold cannot arise: 6 sets no marker and no longer rejects a call whose tool the page unregisters mid-run, so the adapter treats it as native (ADR 0001's notes, ADR 0031). The exception stays for 5.x pages.

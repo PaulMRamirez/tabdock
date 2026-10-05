@@ -13,6 +13,10 @@ export const ERROR_CODES = [
   'invalid_arguments',
   // From M4: an invitee offered a pairing code, which only members may use (ADR 0017).
   'invite_required',
+  // From M5: a confirmation in the caller's client that was declined, dismissed,
+  // expired, reused, forged or given for other arguments; the page never hears
+  // of such a call (ADR 0026).
+  'not_confirmed',
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];

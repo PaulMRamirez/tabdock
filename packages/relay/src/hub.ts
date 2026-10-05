@@ -38,11 +38,16 @@ import {
   INVITE_PATH,
   type InviteListing,
   type InviteRefusalReason,
+  InviteeIdSchema,
   InviteSecretSchema,
   inviteSecretOf,
   type JsonObject,
   type Limits,
+  MAX_CONFIRMATION_FRAME_BYTES,
   MAX_DESCRIPTION_CHARS,
+  MAX_FIRST_CLASS_CHARS_PER_USER,
+  MAX_FIRST_CLASS_NAME_CHARS,
+  MAX_FIRST_CLASS_TOOLS_PER_USER,
   MAX_FRAME_BYTES,
   MAX_INVITE_LIFETIME_MS,
   MAX_LIVE_INVITES_PER_PAGE,
@@ -70,10 +75,29 @@ import {
 } from './argument-checker.ts';
 import { AuditRefusalBudget } from './audit-budget.ts';
 import { foldName, type UserAccount } from './auth.ts';
-import type { ResolvedConfig } from './config.ts';
+import { MIN_REQUEST_BYTES, type ResolvedConfig } from './config.ts';
+import {
+  argumentsDigest,
+  asksClient,
+  type ConfirmationRecord,
+  confirmQuestion,
+  type ConfirmQuestion,
+  confirms,
+  type DroppedAnswer,
+  MAX_PENDING_CONFIRMATIONS,
+  PendingConfirmations,
+  type RetryState,
+} from './confirm.ts';
+import {
+  type FirstClassTool,
+  firstClassEntry,
+  firstClassName,
+  firstClassToolPart,
+} from './first-class.ts';
 import type { LogFields, Logger, LogLevel } from './log.ts';
 import { SlidingWindowLimiter } from './rate-limit.ts';
 import { RepeatedLines } from './repeated-lines.ts';
+import { childPosition, SCHEMA_TEXT_KEYS, type SchemaPosition } from './schema-keywords.ts';
 import {
   digest,
   digestHex,
@@ -106,11 +130,15 @@ type AttachRefusal = AuditEventOf<'attach_refused'>['outcome'];
 type ExpireReason = AuditEventOf<'expire'>['reason'];
 type InviteCloseReason = AuditEventOf<'invite_closed'>['reason'];
 
-/** The fixed tools whose requests ADR 0018's per-user budget can refuse, with what each names. */
+/**
+ * The fixed tools whose requests ADR 0018's per-user budget can refuse, with
+ * what each names; a call by a first-class name is refused as the
+ * call_page_tool it stands for (ADR 0025).
+ */
 export type BudgetRefusal =
   | { tool: 'list_pages' }
   | { tool: 'list_page_tools' | 'detach_page'; page: string }
-  | { tool: 'call_page_tool'; page: string; pageTool: string }
+  | { tool: 'call_page_tool'; page: string; pageTool: PageToolRef }
   | { tool: 'pair_page'; via: 'code' | 'invite' };
 
 /** The lesser of two roles: an invite-made attachment never passes its invite's (ADR 0017). */
@@ -274,18 +302,98 @@ export interface ToolListing {
   inputSchema: JsonObject;
   annotations: ToolAnnotations;
   allowed: boolean;
+  /**
+   * With first-class tools on (ADR 0025), the caller's first-class name for
+   * the tool, or null when their list leaves it off; absent with them off.
+   */
+  firstClass?: string | null;
 }
 
 export type ToolsOutcome =
   { kind: 'tools'; pageId: string; origin: string; role: Role; tools: ToolListing[] } | HubError;
 
-export type CallOutcome =
-  | { kind: 'ok'; origin: string; content: string }
+/**
+ * How a call ended. callPageTool names the page tool it reached in `tool`,
+ * as the call resolved it, so a result's untrusted header reads the same
+ * whichever route named the tool (ADR 0025).
+ */
+export type SettledCall =
+  | { kind: 'ok'; origin: string; content: string; tool?: string }
   /** The page's handler failed; its message is page-supplied text. */
-  | { kind: 'tool_error'; origin: string; message: string }
+  | { kind: 'tool_error'; origin: string; message: string; tool?: string }
   /** The MCP client abandoned the call. */
   | { kind: 'cancelled' }
   | HubError;
+
+/**
+ * A 2026-07-28 first round the relay answers with input_required (ADR
+ * 0026): every check before dispatch passed, a record waits for the retry,
+ * `requestState` carries its id signed (ConfirmLeg's `mint`), and mcp.ts
+ * puts `question` to the client. The call took no place in any queue, and
+ * the page never heard of it.
+ */
+export interface AskInClient {
+  kind: 'ask';
+  requestState: string;
+  question: ConfirmQuestion;
+}
+
+export type CallOutcome = SettledCall | AskInClient;
+
+/**
+ * How a call's own request can confirm it in its client (ADR 0026), as
+ * mcp.ts reads it from the request. The hub decides whether to ask
+ * (asksClient), so both routes to a page tool confirm alike.
+ */
+export interface ConfirmLeg {
+  /**
+   * Whether the request declared form elicitation: in its own envelope on
+   * 2026-07-28, in initialize on a 2025-era session. Without it the call
+   * goes out unconfirmed and the page prompts, so no client is ever asked
+   * for what it did not declare.
+   */
+  formElicitation: boolean;
+  /**
+   * 'retry' on 2026-07-28: a first round is answered input_required and the
+   * confirmation arrives on a retry. 'elicit' on a 2025-era session: the
+   * question is put inside the request (`elicit`).
+   */
+  mode: 'retry' | 'elicit';
+  /**
+   * A request that carried a requestState: what the dispatcher took for it
+   * before any other check (the record, out of the store already, or a
+   * refusal) and the client's answer as the SDK handed it over. null on a
+   * first round. A 2025-era session never asks this way, so there it is
+   * always a refusal.
+   */
+  retry: { state: RetryState; answer: unknown } | null;
+  /** elicit mode: puts the question to the client, resolving with its answer as given. */
+  elicit: ((question: ConfirmQuestion, signal: AbortSignal) => Promise<unknown>) | null;
+  /**
+   * retry mode: signs a record's id into the request state the question
+   * carries, bound to this request's caller. The hub awaits it, then looks
+   * again whether the record is still held, so a revoke while it signs puts
+   * no question (#ask).
+   */
+  mint: ((recordId: string) => Promise<string>) | null;
+}
+
+/** The confirmation an invoke carries, fresh for the call (ADR 0026). */
+interface ClientConfirmation {
+  /** A fresh relay id, never the record's. */
+  confirmationId: string;
+  /** When the confirming answer arrived. */
+  at: number;
+  /**
+   * The grantedAt of the caller's attachment the question was asked under,
+   * which names that attachment: a fresh one after a revoke or a detach
+   * comes from a new pairing, a round trip later, never in the same
+   * millisecond. The confirmation holds only while that attachment is still
+   * the caller's, so it never outlives it whatever the order of awaits;
+   * never sent to the page.
+   */
+  grantedAt: number;
+}
 
 export type DetachOutcome = { kind: 'detached'; pageId: string } | HubError;
 
@@ -304,6 +412,20 @@ interface CallTrace {
   reached: boolean;
   /** Returns what the call's request was charged against what waiting requests hold (#holdBytes). */
   release: (() => void) | null;
+  /**
+   * The page tool its record names: from the start the page tool's own
+   * name whenever the relay holds the page's tools (#calledToolName), so a
+   * call by either route leaves the same line even when it is refused
+   * before the lookup (S7, ADR 0025); else as the client wrote it, a
+   * first-class name whole, until the name resolves.
+   */
+  tool: string;
+  /**
+   * 'client' exactly when its invoke went out carrying a confirmation, so
+   * the record never credits a client with a call the operator decided
+   * (S7, ADR 0026).
+   */
+  confirmedBy: 'client' | null;
 }
 
 /** Why the relay tells a page to stop a call. */
@@ -336,8 +458,14 @@ interface PendingCall {
   conn: Conn | null;
   /** The socket whose queue it waits on for room to send its invoke (#hold); null otherwise. */
   heldOn: Conn | null;
-  /** Its invoke frame's size when it arrived, for the room check while it is held. */
+  /** Its invoke frame's size when it arrived, a confirmation's room included, for the room check while it is held. */
   invokeBytes: number;
+  /**
+   * Its caller's confirmation in their client, or null (ADR 0026). The
+   * invoke carries it only if what called for asking still holds as it goes
+   * out (#sendInvoke).
+   */
+  confirmation: ClientConfirmation | null;
   /** Filled in for the spike's timing (spike.ts); null otherwise. */
   marks: CallMarks | null;
   /** Whether its invoke went out, which decides how its audit record is written. */
@@ -380,7 +508,85 @@ interface ListedTool {
   check: ArgCheckEntry;
   /** What it is charged against limits.toolBytes, kept while it is reused unchanged (heldBytes). */
   held: number;
+  /**
+   * Its first-class entry, built once from the cut copy with first-class
+   * tools on (ADR 0025) and charged within `held`; null with them off, or
+   * when its schema's root keeps it off every list.
+   */
+  firstClass: FirstClassTool | null;
 }
+
+/**
+ * A page's first-class entries as its last tools frame left them, in the
+ * page's order: those whose names fit MAX_FIRST_CLASS_NAME_CHARS and that no
+ * other tool of the page maps to. `version` is new with every frame, so a
+ * user's list built from an older one is known to be stale.
+ */
+interface PageFirstClass {
+  version: number;
+  entries: { toolName: string; readOnly: boolean; tool: FirstClassTool; chars: number }[];
+}
+
+/**
+ * One member's first-class list (ADR 0025), kept while it still matches
+ * their attachments: `key` names each attachment it was built from, its
+ * role and its page's version, so any change to them shows as another key
+ * on the next look and the list is built again before it is served.
+ */
+interface FirstClassSnapshot {
+  key: string;
+  tools: FirstClassTool[];
+  /** Each page's listed tools by page tool name, to their first-class names, for list_page_tools. */
+  names: Map<string, Map<string, string>>;
+  /** SHA-256 of the list as clients receive it; the notifier compares it (page-tool-notifier.ts). */
+  digest: string;
+}
+
+/** What a member with no first-class tools is served, and the digest every notifier starts from. */
+export const EMPTY_FIRST_CLASS: Readonly<FirstClassList> = Object.freeze({
+  tools: [],
+  digest: createHash('sha256').update('[]').digest('hex'),
+});
+
+/** A user's first-class tools as tools/list carries them, with the list's digest. */
+export interface FirstClassList {
+  tools: readonly FirstClassTool[];
+  digest: string;
+}
+
+/**
+ * A page tool as a call names it: by its own name through call_page_tool,
+ * or by the part of a first-class name after `<page id>__` (ADR 0025), which
+ * the hub resolves at the step where it looks the tool up, with `calledAs`
+ * the whole name as the client called it. The MCP tool as called is what a
+ * confirmation's record binds beside the page tool (ADR 0026), so a
+ * confirmation asked about through one route never passes for the other.
+ */
+export type PageToolRef = string | { firstClass: string; calledAs: string };
+
+/** The MCP tool a call came through: call_page_tool, or its first-class name as called. */
+export function calledAsOf(ref: PageToolRef): string {
+  return typeof ref === 'string' ? 'call_page_tool' : ref.calledAs;
+}
+
+/** A call whose confirmation in its client failed; the page never hears of it (ADR 0026). */
+function notConfirmed(message: string): HubError {
+  return hubError('not_confirmed', message);
+}
+
+const NO_SUCH_CONFIRMATION =
+  'this relay holds no confirmation of yours for this call: it expired, was used already, belongs to another account or client, or came from before the relay restarted; call again to be asked anew. The page never heard of this call';
+const CONFIRMED_ANOTHER_CALL =
+  'the confirmation was given for another call (other arguments, another tool or another page); call again to be asked about this one. The page never heard of this call';
+const NOT_CONFIRMED_IN_CLIENT =
+  'you did not confirm this call in your client: it was declined, dismissed or answered without confirm set to true. The page never heard of it';
+const ASKED_UNDER_ENDED_ATTACHMENT =
+  'you were asked about this call under an attachment to this page that has since ended, so its confirmation ended with it; call again to be asked anew. The page never heard of this call';
+/** What a question held open on a page that ended answers (ADR 0026), as a later call would. */
+const PAGE_GONE_ANSWER: DroppedAnswer = {
+  code: 'page_gone',
+  message: 'the page closed and did not come back',
+};
 
 /** Logged once per tool and reason; fixed words, never the schema or the arguments. */
 const UNCHECKED_WARNINGS: Record<UncheckedReason, string> = {
@@ -695,31 +901,6 @@ export const MAX_SCHEMA_CHARS = 8192;
  * a few thousand levels deep would break every listing that serialises it.
  */
 export const MAX_SCHEMA_DEPTH = 64;
-/**
- * Schema keywords that clients show as prose. A string there is cut like any
- * other; anything else is replaced, because an array or object there would put
- * several capped strings into what a client shows as one description (S10).
- */
-const SCHEMA_TEXT_KEYS = new Set(['description', 'title']);
-/**
- * Keywords whose value maps names (property names, definition names, patterns)
- * to schemas: a "title" key in there is a property called title, not prose, and
- * must keep its schema.
- */
-const SCHEMA_NAME_MAP_KEYS = new Set([
-  'properties',
-  'patternProperties',
-  '$defs',
-  'definitions',
-  'dependentSchemas',
-  'dependentRequired',
-  'dependencies',
-]);
-/** Keywords whose value is instance data, where keys mean nothing to JSON Schema. */
-const SCHEMA_DATA_KEYS = new Set(['enum', 'const', 'default', 'examples']);
-
-/** What a value is to JSON Schema, so keyword rules apply only where keys are keywords. */
-type SchemaPosition = 'schema' | 'names' | 'data';
 
 class SchemaTooDeep extends Error {}
 class SchemaKeyTooLong extends Error {}
@@ -798,19 +979,12 @@ function cutSchemaEntry(
   position: SchemaPosition,
   tally: HeldTally,
 ): unknown {
-  if (position === 'names') return cutSchemaText(item, depth, 'schema', tally);
-  if (position === 'data') return cutSchemaText(item, depth, 'data', tally);
-  if (SCHEMA_TEXT_KEYS.has(key) && typeof item !== 'string') {
+  if (position === 'schema' && SCHEMA_TEXT_KEYS.has(key) && typeof item !== 'string') {
     const removed = `[tabdock: non-string ${key} removed]`;
     holdValue(removed, tally);
     return removed;
   }
-  const next = SCHEMA_NAME_MAP_KEYS.has(key)
-    ? 'names'
-    : SCHEMA_DATA_KEYS.has(key)
-      ? 'data'
-      : 'schema';
-  return cutSchemaText(item, depth, next, tally);
+  return cutSchemaText(item, depth, childPosition(key, position), tally);
 }
 
 function removedSchema(why: string): JsonObject {
@@ -986,6 +1160,13 @@ export class PageHub {
    */
   readonly #toolBytes = new Map<string, number>();
   #toolBytesHeld = 0;
+  /** Each awake page's first-class entries while first-class tools are on (ADR 0025). */
+  readonly #firstClassPages = new Map<string, PageFirstClass>();
+  #firstClassVersion = 0;
+  /** Members' first-class lists, rebuilt whenever what they were built from changed. */
+  readonly #firstClassLists = new Map<string, FirstClassSnapshot>();
+  /** Told the users whose first-class list may have changed; the notifier reads it later. */
+  #firstClassListener: ((userId: string) => void) | null = null;
   /** The only place CfWorker runs: a worker thread with a time budget per check (ADR 0010). */
   readonly #checker: ArgumentChecker;
   /** When each page last got a roster, for EXPIRY_ROSTER_REFRESH_MS. */
@@ -1008,12 +1189,14 @@ export class PageHub {
   readonly #pageLimiter: SlidingWindowLimiter;
   readonly #callLimiter: SlidingWindowLimiter;
   /**
-   * What the /mcp requests waiting on a page hold on the heap, by user and
-   * in all, each charged its body's upper bound (request-heap.ts) from
-   * when it may start waiting until it is answered (#holdBytes).
+   * What the /mcp requests waiting on a page hold on the heap, by user, in
+   * all, and for invitees together, each charged what request-heap.ts
+   * measures its body to hold, from when it may start waiting until it is
+   * answered (#holdBytes).
    */
   readonly #heldBytes = new Map<string, number>();
   #heldTotal = 0;
+  #heldByInvitees = 0;
   /** Tools frames per remote address, shared by its sockets and kept across reconnects. */
   readonly #toolsFrameLimiter: SlidingWindowLimiter;
   /**
@@ -1049,6 +1232,12 @@ export class PageHub {
   readonly #grantWarnings: SlidingWindowLimiter;
   /** Refusals that reached no page pass this before the audit log (ADR 0019). */
   readonly #budget: AuditRefusalBudget;
+  /**
+   * Questions in callers' clients (ADR 0026): 2026-07-28 records waiting
+   * for their retry and 2025-era questions held open, at most
+   * MAX_PENDING_CONFIRMATIONS a user, in memory only.
+   */
+  readonly #confirmations: PendingConfirmations;
   /** The M3 spike's pairing milestones (spike.ts), when TABDOCK_SPIKE is on. */
   readonly #spike: SpikeHooks | null;
   #closed = false;
@@ -1116,6 +1305,13 @@ export class PageHub {
       holds: (userId) => this.holds(userId),
       write: (event) => {
         this.#audit(event);
+      },
+    });
+    this.#confirmations = new PendingConfirmations({
+      ttlMs: config.timings.confirmationTtlMs,
+      perUser: MAX_PENDING_CONFIRMATIONS,
+      onExpired: (record) => {
+        this.#confirmationExpired(record);
       },
     });
   }
@@ -1977,6 +2173,7 @@ export class PageHub {
           ),
         );
         const check = { schema: null, uncompilable: false, warned: new Set<UncheckedReason>() };
+        const firstClass = this.#firstClassOf(pageId, page.origin, stub, tally);
         const held = heldBytes(tally, 0);
         // Over its own limit it always will be, so it is kept by hash and reused
         // unchanged without another walk, leaving the frame to the tools after it.
@@ -1987,6 +2184,7 @@ export class PageHub {
           tool: stub,
           check,
           held,
+          firstClass,
         });
         tools.push(stub);
         charge += held;
@@ -2002,6 +2200,7 @@ export class PageHub {
         if (schema === null) uncheckable.push(tool.name);
         check = { schema, uncompilable: false, warned: new Set() };
       }
+      const firstClass = this.#firstClassOf(pageId, page.origin, cut, tally);
       const held = heldBytes(tally, check.schema?.text.length ?? 0);
       // Hashed for the next frame only when the count covered all of it, so the
       // hash costs no more than the walk did; a schema too deep is walked again.
@@ -2011,6 +2210,7 @@ export class PageHub {
         tool: cut,
         check,
         held,
+        firstClass,
       });
       tools.push(cut);
       charge += held;
@@ -2061,6 +2261,84 @@ export class PageHub {
       heldBytes: charge,
       allPagesHeldBytes: this.#toolBytesHeld,
     });
+    if (this.#config.firstClassTools) {
+      this.#firstClassPages.set(pageId, this.#pageFirstClass(tools, listed));
+      this.#firstClassChanged(this.#usersOf(pageId));
+    }
+  }
+
+  /**
+   * A tool's first-class entry (ADR 0025), built from the cut copy once, as
+   * its frame arrives, and counted into the tool's tally, so what entries
+   * hold is charged against limits.toolBytes with the rest of the tool:
+   * the strings the relay wrote, and the schema's copy when it made one (a
+   * schema without an x-mcp-header key is shared, not copied). Null with
+   * first-class tools off, or when the schema's root keeps the tool off.
+   */
+  #firstClassOf(
+    pageId: string,
+    origin: string,
+    cut: PageTool,
+    tally: HeldTally,
+  ): FirstClassTool | null {
+    if (!this.#config.firstClassTools) return null;
+    const built = firstClassEntry(pageId, origin, cut);
+    if (built === null) return null;
+    const { entry, copied } = built;
+    holdValue(entry.name, tally);
+    holdValue(entry.title, tally);
+    holdValue(entry.description, tally);
+    if (copied) holdValue(entry.inputSchema, tally);
+    // The entry object, its keys, and its shared annotations and _meta.
+    holdValue({ annotations: null, _meta: null }, tally);
+    return entry;
+  }
+
+  /**
+   * What a page offers by first-class name, in its own order: a tool is left
+   * off when its whole name passes MAX_FIRST_CLASS_NAME_CHARS, or when
+   * another of the page's tools maps to the same name, both then, so a page
+   * cannot win a collision by the order it lists its tools in.
+   */
+  #pageFirstClass(tools: readonly PageTool[], listed: Map<string, ListedTool>): PageFirstClass {
+    const mapped = new Map<string, number>();
+    for (const tool of tools) {
+      const part = firstClassToolPart(tool.name);
+      mapped.set(part, (mapped.get(part) ?? 0) + 1);
+    }
+    const entries: PageFirstClass['entries'] = [];
+    for (const tool of tools) {
+      const entry = listed.get(tool.name)?.firstClass ?? null;
+      if (entry === null || entry.name.length > MAX_FIRST_CLASS_NAME_CHARS) continue;
+      if ((mapped.get(firstClassToolPart(tool.name)) ?? 0) > 1) continue;
+      entries.push({
+        toolName: tool.name,
+        readOnly: tool.annotations?.readOnlyHint === true,
+        tool: entry,
+        chars: JSON.stringify(entry).length,
+      });
+    }
+    this.#firstClassVersion += 1;
+    return { version: this.#firstClassVersion, entries };
+  }
+
+  /** The users attached to a page now. */
+  #usersOf(pageId: string): string[] {
+    return this.#store.attachments.listForPage(pageId).map((attachment) => attachment.userId);
+  }
+
+  /**
+   * These users' first-class lists may have changed. Their snapshots need
+   * nothing here, since each is checked against what it was built from
+   * before it is served; the listener, the notifier, only marks them, and
+   * looks at their lists later, outside the change (page-tool-notifier.ts).
+   * Invitees never hold a first-class name, so they are never marked.
+   */
+  #firstClassChanged(users: Iterable<string>): void {
+    if (this.#firstClassListener === null) return;
+    for (const userId of users) {
+      if (!InviteeIdSchema.safeParse(userId).success) this.#firstClassListener(userId);
+    }
   }
 
   /** Forgets a page's listed tools and what they were charged against limits.toolBytes. */
@@ -2068,6 +2346,7 @@ export class PageHub {
     this.#listed.delete(pageId);
     this.#toolBytesHeld -= this.#toolBytes.get(pageId) ?? 0;
     this.#toolBytes.delete(pageId);
+    if (this.#firstClassPages.delete(pageId)) this.#firstClassChanged(this.#usersOf(pageId));
   }
 
   #onClose(conn: Conn, code: number): void {
@@ -2137,6 +2416,8 @@ export class PageHub {
     const page = this.#store.pages.get(pageId);
     if (page?.state !== 'asleep') return;
     const now = Date.now();
+    // Questions about calls to it end with it, and one held open answers page_gone now (ADR 0026).
+    this.#confirmations.drop(pageId, null, PAGE_GONE_ANSWER);
     // Invites end with their page session, and so does everything they made (S14).
     for (const invite of this.#store.invites.listForPage(pageId)) {
       this.#closeInvite(invite, 'page_gone', false);
@@ -2387,6 +2668,20 @@ export class PageHub {
       );
       return;
     }
+    // The invite may have reached its end while the operator decided, with
+    // its timer not yet run: its lifetime holds on the relay's own clock at
+    // approval too (S14), so it closes now, which ends this request as its
+    // timer would, and nothing is granted under it.
+    if (invite.expiresAt <= Date.now()) {
+      this.#closeInvite(invite, 'expired');
+      if (this.#store.requests.get(request.requestId) !== undefined) {
+        this.#endRequest(
+          request.requestId,
+          hubError('pairing_expired', 'this invite is no longer live'),
+        );
+      }
+      return;
+    }
     // The sponsor may have passed their end while the operator decided, with
     // the timer not yet run; ending them now closes the invite, which answers
     // this request as any sponsor's end does, so nothing is granted under it.
@@ -2484,6 +2779,7 @@ export class PageHub {
     };
     this.#store.attachments.put(attachment);
     this.#armExpiry(attachment);
+    this.#firstClassChanged([attachment.userId]);
     const page = this.#store.pages.get(request.pageId);
     this.#audit({
       v: AUDIT_VERSION,
@@ -2552,6 +2848,7 @@ export class PageHub {
       const previous = attachment.role;
       attachment.role = role;
       this.#store.attachments.put(attachment);
+      this.#firstClassChanged([frame.userId]);
       this.#log.info('role changed', { pageId, userId: frame.userId, role });
       this.#audit({
         v: AUDIT_VERSION,
@@ -2732,7 +3029,11 @@ export class PageHub {
       this.#store.attachments.delete(pageId, userId);
       this.#clearTimer(this.#expiryTimers, attachmentKey(pageId, userId));
     }
+    this.#firstClassChanged(users);
     const outcome = hubError('not_attached', message);
+    // ADR 0026: no confirmation outlives the attachment it was given under,
+    // and a 2025-era call waiting on its question answers now (S8).
+    this.#confirmations.drop(pageId, users, outcome);
     // Queued calls first, so a running one settling does not hand the page a call that is ending.
     for (const call of [...(this.#queues.get(pageId)?.waiting ?? [])]) {
       if (users.has(call.caller.userId)) call.settle(outcome);
@@ -2888,17 +3189,25 @@ export class PageHub {
 
   /**
    * Charges a request that may wait on a page (a call, or a pairing waiting
-   * for the operator) its body's upper bound on the heap, `bytes`, until
-   * release. Past what one user's such requests may hold together
-   * (limits.requestBytesPerUser) it is refused rate_limited, and past what
-   * all may hold (limits.requestBytes) `relayFull`: the request budget
-   * alone let one member hold 120 calls of 1 MB arguments, about 2 MB of
-   * heap each, and crash a relay with the image's 192 MiB heap (ADR 0018's
-   * notes). A request charged nothing, as from a caller with no HTTP body,
-   * is always held.
+   * for the operator) what its body is measured to hold on the heap,
+   * `bytes`, until release. Past what one user's such requests may hold
+   * together (limits.requestBytesPerUser) it is refused rate_limited, and an
+   * invitee's past what one invitee may hold (#perInvitee) rate_limited too;
+   * an invitee's past what invitees may hold together (#inviteePool)
+   * `relayFull`; and anyone's past what all may hold (limits.requestBytes)
+   * `relayFull` too: the request budget alone let one member hold 120 calls
+   * of 1 MB arguments, about 2 MB of heap each, and crash a relay with the
+   * image's 192 MiB heap (ADR 0018's notes). A request charged nothing, as
+   * from a caller with no HTTP body, is always held.
    */
-  #holdBytes(userId: string, bytes: number, relayFull: 'page_busy' | 'rate_limited'): HeldBytes {
+  #holdBytes(
+    caller: CallerIdentity,
+    bytes: number,
+    relayFull: 'page_busy' | 'rate_limited',
+  ): HeldBytes {
     if (bytes <= 0) return { kind: 'held', release: () => undefined };
+    const { userId } = caller;
+    const invitee = caller.account.kind === 'invitee';
     const { requestBytes, requestBytesPerUser } = this.#config.limits;
     const own = this.#heldBytes.get(userId) ?? 0;
     if (bytes > requestBytesPerUser) {
@@ -2915,6 +3224,36 @@ export class PageHub {
         `your requests waiting on pages already hold ${mebibytes(own)} of the relay's memory, and one user's may hold ${mebibytes(requestBytesPerUser)}; wait for some to finish`,
       );
     }
+    if (invitee) {
+      const share = this.#perInvitee();
+      if (bytes > share) {
+        this.#log.debug('request refused: it alone would hold more than an invitee may', {
+          userId,
+        });
+        return hubError(
+          'rate_limited',
+          `this request would hold ${mebibytes(bytes)} of the relay's memory while it waits, more than one invited account's requests may hold together (${mebibytes(share)}); send less`,
+        );
+      }
+      if (own + bytes > share) {
+        this.#log.debug('request refused: the invitee holds its share in requests waiting', {
+          userId,
+        });
+        return hubError(
+          'rate_limited',
+          `your requests waiting on pages already hold ${mebibytes(own)} of the relay's memory, and one invited account's may hold ${mebibytes(share)}; wait for some to finish`,
+        );
+      }
+    }
+    if (invitee && this.#heldByInvitees + bytes > this.#inviteePool()) {
+      this.#log.debug('request refused: invitees hold all their requests waiting may', {
+        userId,
+      });
+      return hubError(
+        relayFull,
+        "requests from invited accounts already hold all of the relay's memory they may while they wait; try again shortly",
+      );
+    }
     if (this.#heldTotal + bytes > requestBytes) {
       this.#log.debug('request refused: requests waiting hold all the relay allows', { userId });
       return hubError(
@@ -2924,6 +3263,7 @@ export class PageHub {
     }
     this.#heldBytes.set(userId, own + bytes);
     this.#heldTotal += bytes;
+    if (invitee) this.#heldByInvitees += bytes;
     let held = true;
     return {
       kind: 'held',
@@ -2931,11 +3271,39 @@ export class PageHub {
         if (!held) return;
         held = false;
         this.#heldTotal -= bytes;
+        if (invitee) this.#heldByInvitees -= bytes;
         const left = (this.#heldBytes.get(userId) ?? bytes) - bytes;
         if (left > 0) this.#heldBytes.set(userId, left);
         else this.#heldBytes.delete(userId);
       },
     };
+  }
+
+  /**
+   * What invitees' waiting requests may hold together: a quarter of the
+   * relay's total, or one call of the largest arguments where a quarter is
+   * less, in every mode and with no setting of its own. Guests and strangers
+   * rank below members (ADR 0016's notes), so guests calling a frozen tab can
+   * no longer leave members page_busy everywhere, while members may still
+   * use the whole (S9, ADR 0030).
+   */
+  #inviteePool(): number {
+    return Math.max(Math.floor(this.#config.limits.requestBytes / 4), MIN_REQUEST_BYTES);
+  }
+
+  /**
+   * What one invitee's waiting requests may hold: a quarter of the invitees'
+   * pool, or one call of the largest arguments where that is less, and never
+   * more than any user's share. Without it one guest calling a page that
+   * holds calls filled the whole pool alone, and every other invitee on
+   * every page met page_busy (S9, ADR 0032); now that takes four, at the
+   * default total.
+   */
+  #perInvitee(): number {
+    return Math.min(
+      this.#config.limits.requestBytesPerUser,
+      Math.max(Math.floor(this.#inviteePool() / 4), MIN_REQUEST_BYTES),
+    );
   }
 
   // Calls
@@ -2986,6 +3354,89 @@ export class PageHub {
    */
   holds(userId: string): boolean {
     return this.#store.attachments.listForUser(userId).length > 0;
+  }
+
+  /**
+   * Who to tell when a user's first-class list may have changed (relay.ts
+   * hands it the notifier). Called inside the hub's own changes, so it must
+   * only mark the user and look later.
+   */
+  onFirstClassChange(listener: (userId: string) => void): void {
+    this.#firstClassListener = listener;
+  }
+
+  /**
+   * The user's first-class tools (ADR 0025), for tools/list: none with the
+   * flag off, for an invitee, or on an attachment an invite made (ADR 0016);
+   * otherwise, in the order the user attached, each awake page's entries in
+   * its own order, a driver all of them and an observer only those the page
+   * marked readOnlyHint, until the next would take the list past
+   * MAX_FIRST_CLASS_TOOLS_PER_USER tools or MAX_FIRST_CLASS_CHARS_PER_USER
+   * characters. A list is kept while every attachment, role and page version
+   * it was built from is still the same, and built again before it is served
+   * otherwise, so a list answered after a revoke, an attachment's end or a
+   * downgrade never shows what the change took away (S8, S13).
+   */
+  firstClassList(userId: string): FirstClassList {
+    const snapshot = this.#firstClassSnapshot(userId);
+    return snapshot === null ? EMPTY_FIRST_CLASS : snapshot;
+  }
+
+  #firstClassSnapshot(userId: string): FirstClassSnapshot | null {
+    if (!this.#config.firstClassTools) return null;
+    const parts: { pageId: string; role: Role; page: PageFirstClass }[] = [];
+    const attachments = this.#store.attachments
+      .listForUser(userId)
+      .filter((attachment) => attachment.kind === 'member' && attachment.inviteId === null)
+      .sort((a, b) => a.grantedAt - b.grantedAt);
+    for (const { pageId } of attachments) {
+      // One past its time is over however late its timer runs, and ends here.
+      if (!this.#chainInTime(pageId, userId)) continue;
+      const attachment = this.#store.attachments.get(pageId, userId);
+      const page = this.#firstClassPages.get(pageId);
+      if (attachment === undefined || page === undefined) continue;
+      parts.push({ pageId, role: attachment.role, page });
+    }
+    const key = parts
+      .map((part) => `${part.pageId}/${part.role}/${String(part.page.version)}`)
+      .join(' ');
+    if (parts.length === 0) {
+      this.#firstClassLists.delete(userId);
+      return null;
+    }
+    const kept = this.#firstClassLists.get(userId);
+    if (kept?.key === key) return kept;
+    const tools: FirstClassTool[] = [];
+    const names = new Map<string, Map<string, string>>();
+    let chars = 0;
+    build: for (const { pageId, role, page } of parts) {
+      for (const entry of page.entries) {
+        // S5: an observer is shown, and may call, only what the page marked read-only.
+        if (role === 'observer' && !entry.readOnly) continue;
+        if (
+          tools.length >= MAX_FIRST_CLASS_TOOLS_PER_USER ||
+          chars + entry.chars > MAX_FIRST_CLASS_CHARS_PER_USER
+        ) {
+          break build;
+        }
+        tools.push(entry.tool);
+        chars += entry.chars;
+        let ofPage = names.get(pageId);
+        if (ofPage === undefined) {
+          ofPage = new Map();
+          names.set(pageId, ofPage);
+        }
+        ofPage.set(entry.toolName, entry.tool.name);
+      }
+    }
+    const snapshot: FirstClassSnapshot = {
+      key,
+      tools,
+      names,
+      digest: createHash('sha256').update(JSON.stringify(tools)).digest('hex'),
+    };
+    this.#firstClassLists.set(userId, snapshot);
+    return snapshot;
   }
 
   listPages(userId: string): PageListing[] {
@@ -3059,6 +3510,10 @@ export class PageHub {
     const access = this.#access(userId, pageId);
     if (access.kind === 'error') return access;
     const { page, attachment } = access;
+    // With first-class tools on, each entry names the caller's first-class name for it, or null.
+    const firstClass = this.#config.firstClassTools
+      ? (this.#firstClassSnapshot(userId)?.names.get(pageId) ?? new Map<string, string>())
+      : null;
     return {
       kind: 'tools',
       pageId,
@@ -3074,6 +3529,7 @@ export class PageHub {
           inputSchema: tool.inputSchema,
           annotations,
           allowed: attachment.role === 'driver' || annotations.readOnlyHint === true,
+          ...(firstClass === null ? {} : { firstClass: firstClass.get(tool.name) ?? null }),
         };
       }),
     };
@@ -3098,7 +3554,7 @@ export class PageHub {
     // strangers (ADR 0016).
     const required = this.#inviteRequired(caller, 'code');
     if (required) return required;
-    const held = this.#holdBytes(caller.userId, heldBytes, 'rate_limited');
+    const held = this.#holdBytes(caller, heldBytes, 'rate_limited');
     if (held.kind === 'error') return this.#refusedBeforePage(caller, 'code', null, held);
     try {
       return await this.#pairByCode(caller, code, signal, now);
@@ -3204,7 +3660,7 @@ export class PageHub {
     heldBytes = 0,
   ): Promise<PairOutcome> {
     // As for pairPage, before anything is spent: the request may wait for the operator.
-    const held = this.#holdBytes(caller.userId, heldBytes, 'rate_limited');
+    const held = this.#holdBytes(caller, heldBytes, 'rate_limited');
     if (held.kind === 'error') return this.#refusedBeforePage(caller, 'invite', null, held);
     try {
       const secret = inviteSecretOf(invite, this.#linkBase());
@@ -3724,18 +4180,21 @@ export class PageHub {
   }
 
   /**
-   * `heldBytes` is an upper bound on what the call's own request holds on
-   * the heap while it waits (request-heap.ts), which relay.ts measures from
-   * its body; 0 for a caller with none.
+   * `heldBytes` is what the call's own request is measured to hold on the
+   * heap while it waits (request-heap.ts), which relay.ts measures from its
+   * body; 0 for a caller with none. `confirm` says how this request can
+   * confirm the call in its client (ADR 0026); null never asks, and the page
+   * prompts as before.
    */
   async callPageTool(
     caller: CallerIdentity,
     pageId: string,
-    tool: string,
+    tool: PageToolRef,
     args: JsonObject,
     signal: AbortSignal,
     marks: CallMarks | null = null,
     heldBytes = 0,
+    confirm: ConfirmLeg | null = null,
   ): Promise<CallOutcome> {
     const started = Date.now();
     // The duration comes from a clock that only runs forward: a wall clock
@@ -3743,38 +4202,95 @@ export class PageHub {
     // record's schema refuses, and the call would lose its line (S7).
     const startedMono = performance.now();
     let auditOutcome: AuditOutcome = 'relay_error';
-    const trace: CallTrace = { reached: false, release: null };
+    // Asking writes nothing: the retry, or the record's expiry, leaves the line (ADR 0026).
+    let asked = false;
+    const trace: CallTrace = {
+      reached: false,
+      release: null,
+      tool: this.#calledToolName(pageId, tool),
+      confirmedBy: null,
+    };
     try {
-      const outcome = await this.#call(caller, pageId, tool, args, signal, marks, trace, heldBytes);
+      const outcome = await this.#call(
+        caller,
+        pageId,
+        tool,
+        args,
+        signal,
+        marks,
+        trace,
+        heldBytes,
+        confirm,
+      );
+      if (outcome.kind === 'ask') {
+        asked = true;
+        return outcome;
+      }
       auditOutcome = outcome.kind === 'error' ? outcome.code : outcome.kind;
-      return outcome;
+      return outcome.kind === 'ok' || outcome.kind === 'tool_error'
+        ? { ...outcome, tool: trace.tool }
+        : outcome;
     } catch (error) {
       // The SDK still answers the client with an error result; the log keeps the cause.
       this.#log.error('call failed inside the relay', { pageId, error });
       throw error;
     } finally {
       trace.release?.();
-      // In finally, so every attempt leaves a record even when the relay itself fails (S7).
-      const record: AuditCallEvent = {
-        v: AUDIT_VERSION,
-        type: 'call',
-        at: started,
-        // The client's own text: kept when it is an id or a tool name, else only its length (ADR 0019).
-        pageId: auditPageId(pageId),
-        origin: this.#store.pages.get(pageId)?.origin ?? null,
-        userId: caller.userId,
-        client: caller.client,
-        tool: auditToolName(tool),
-        outcome: auditOutcome,
-        durationMs: Math.round(performance.now() - startedMono),
-      };
-      // A call that reached its page is always written in full; one refused
-      // before it went out, or failed by the relay before it could, only
-      // within the refusal budget (ADR 0019).
-      if (trace.reached || auditOutcome === 'relay_error') this.#audit(record);
-      else this.#budget.refused(record);
-      this.#spike?.callFinished(pageId, caller.userId, auditOutcome);
+      if (!asked) {
+        // In finally, so every attempt leaves a record even when the relay itself fails (S7).
+        const record: AuditCallEvent = {
+          v: AUDIT_VERSION,
+          type: 'call',
+          at: started,
+          // The client's own text: kept when it is an id or a tool name, else only its length (ADR 0019).
+          pageId: auditPageId(pageId),
+          origin: this.#store.pages.get(pageId)?.origin ?? null,
+          userId: caller.userId,
+          client: caller.client,
+          tool: auditToolName(trace.tool),
+          outcome: auditOutcome,
+          durationMs: Math.round(performance.now() - startedMono),
+          // Exactly when its invoke went out confirmed (S7, ADR 0026).
+          ...(trace.confirmedBy === null ? {} : { confirmedBy: trace.confirmedBy }),
+        };
+        // A call that reached its page is always written in full; one refused
+        // before it went out, or failed by the relay before it could, only
+        // within the refusal budget (ADR 0019).
+        if (trace.reached || auditOutcome === 'relay_error') this.#audit(record);
+        else this.#budget.refused(record);
+        this.#spike?.callFinished(pageId, caller.userId, auditOutcome);
+      }
     }
+  }
+
+  /**
+   * The dispatcher's first step for a page call that carries a state
+   * (mcp.ts): the record the state names, taken out before any other check,
+   * so a retry refused for any reason has spent it (ADR 0026); null when
+   * the relay holds none.
+   */
+  takeConfirmation(id: string): ConfirmationRecord | null {
+    return this.#confirmations.take(id);
+  }
+
+  /**
+   * A record no retry took before its expiry: one call line, within the
+   * refusal budget, so a question nobody answered leaves a line while the
+   * relay runs (S7, ADR 0026). Never its id or its digest.
+   */
+  #confirmationExpired(record: ConfirmationRecord): void {
+    this.#budget.refused({
+      v: AUDIT_VERSION,
+      type: 'call',
+      at: record.askedAt,
+      pageId: auditPageId(record.pageId),
+      origin: record.origin,
+      userId: record.userId,
+      client: record.client,
+      tool: auditToolName(record.pageTool),
+      outcome: 'not_confirmed',
+      durationMs: Math.max(0, Date.now() - record.askedAt),
+    });
   }
 
   /**
@@ -3817,7 +4333,7 @@ export class PageHub {
           origin: this.#store.pages.get(refused.page)?.origin ?? null,
           userId,
           client,
-          tool: auditToolName(refused.pageTool),
+          tool: auditToolName(this.#calledToolName(refused.page, refused.pageTool)),
           outcome: 'rate_limited',
           durationMs: 0,
         });
@@ -3882,74 +4398,349 @@ export class PageHub {
   async #call(
     caller: CallerIdentity,
     pageId: string,
-    toolName: string,
+    toolRef: PageToolRef,
     args: JsonObject,
     signal: AbortSignal,
     marks: CallMarks | null,
     trace: CallTrace,
     heldBytes: number,
+    confirm: ConfirmLeg | null,
   ): Promise<CallOutcome> {
-    const arrivedAt = Date.now();
-    const access = this.#access(caller.userId, pageId);
-    if (access.kind === 'error') return access;
-    const { page, attachment } = access;
-
-    const rateKey = attachmentKey(pageId, caller.userId);
-    if (!this.#callLimiter.allows(rateKey, arrivedAt)) {
-      this.#log.warn('call rate limited', { pageId, userId: caller.userId });
-      const { callsPerUserPerPage, windowMs } = this.#config.rateLimits;
-      return hubError(
-        'rate_limited',
-        `more than ${String(callsPerUserPerPage)} calls to this page in ${formatDuration(windowMs)}; wait and try again`,
-      );
+    // A confirmation already given, by a retry that checked out or by an
+    // answer inside a 2025-era request; null until then (ADR 0026).
+    let confirmation: ClientConfirmation | null = null;
+    // The page tool a retry's record or a 2025-era answer was about, which the name must still reach.
+    let confirmedTool: string | null = null;
+    if (confirm?.retry) {
+      const retried = this.#retried(caller, pageId, toolRef, args, confirm);
+      if (retried.kind === 'error') return retried;
+      confirmation = {
+        confirmationId: newId('cf'),
+        at: Date.now(),
+        grantedAt: retried.grantedAt,
+      };
+      confirmedTool = retried.pageTool;
     }
-    this.#callLimiter.record(rateKey, arrivedAt);
-    const held = this.#holdBytes(caller.userId, heldBytes, 'page_busy');
-    if (held.kind === 'error') return held;
-    trace.release = held.release;
+    // At most twice: a 2025-era call confirmed in its request passes every check again.
+    for (;;) {
+      const arrivedAt = Date.now();
+      const access = this.#access(caller.userId, pageId);
+      if (access.kind === 'error') return access;
+      const { page, attachment } = access;
+      // A confirmation ends with the attachment it was asked under, even
+      // when the operator has approved the caller afresh since (ADR 0026).
+      if (confirmation !== null && attachment.grantedAt !== confirmation.grantedAt) {
+        return notConfirmed(ASKED_UNDER_ENDED_ATTACHMENT);
+      }
 
-    // Every call moves the expiry, but only one that passes every check names
-    // its client (#nameClient): refused calls must not add names to the roster.
-    const rosterAtArrival = this.#touchAttachment(attachment, arrivedAt);
-    const tool = page.tools.find((candidate) => candidate.name === toolName);
-    if (!tool) return hubError('tool_not_found', `page ${pageId} has no tool named ${toolName}`);
-    // S5, relay half: observers run only tools the page marked read-only.
-    if (attachment.role === 'observer' && tool.annotations?.readOnlyHint !== true) {
-      return hubError(
-        'role_denied',
-        `you are an observer on this page, and ${toolName} is not marked read-only`,
+      const rateKey = attachmentKey(pageId, caller.userId);
+      if (!this.#callLimiter.allows(rateKey, arrivedAt)) {
+        this.#log.warn('call rate limited', { pageId, userId: caller.userId });
+        const { callsPerUserPerPage, windowMs } = this.#config.rateLimits;
+        return hubError(
+          'rate_limited',
+          `more than ${String(callsPerUserPerPage)} calls to this page in ${formatDuration(windowMs)}; wait and try again`,
+        );
+      }
+      this.#callLimiter.record(rateKey, arrivedAt);
+      // Once per request: a 2025-era call holds its charge from before its
+      // question until it ends (ADR 0026, S9).
+      if (trace.release === null) {
+        const held = this.#holdBytes(caller, heldBytes, 'page_busy');
+        if (held.kind === 'error') return held;
+        trace.release = held.release;
+      }
+
+      // Every call moves the expiry, but only one that passes every check names
+      // its client (#nameClient): refused calls must not add names to the roster.
+      const rosterAtArrival = this.#touchAttachment(attachment, arrivedAt);
+      const resolved = this.#resolveTool(page, attachment, toolRef);
+      if (resolved.kind === 'error') return resolved;
+      const { tool } = resolved;
+      const toolName = tool.name;
+      trace.tool = toolName;
+      if (confirmedTool !== null && toolName !== confirmedTool) {
+        // The name now reaches another tool than the one confirmed.
+        return notConfirmed(CONFIRMED_ANOTHER_CALL);
+      }
+      // S5, relay half: observers run only tools the page marked read-only.
+      if (attachment.role === 'observer' && tool.annotations?.readOnlyHint !== true) {
+        return hubError(
+          'role_denied',
+          `you are an observer on this page, and ${toolName} is not marked read-only`,
+        );
+      }
+
+      const callId = newId('cl');
+      const call: PendingCall = {
+        callId,
+        pageId,
+        caller,
+        toolName: tool.name,
+        args,
+        mutating: tool.annotations?.readOnlyHint !== true,
+        arrivedAt,
+        rosterAtArrival,
+        waited: false,
+        checking: false,
+        conn: null,
+        heldOn: null,
+        invokeBytes: 0,
+        confirmation,
+        marks,
+        trace,
+        timer: null,
+        done: false,
+        settle: () => undefined,
+      };
+      // Checked before anything waits: the size cannot grow later, as the role
+      // and deadline only shrink and a confirmation's room is counted already.
+      const encoded = this.#encodeInvoke(
+        call,
+        attachment.role,
+        this.#config.timings.callDeadlineMs,
+        null,
       );
-    }
+      if (encoded.kind === 'error') return encoded;
+      call.invokeBytes = encoded.bytes;
 
-    const callId = newId('cl');
-    const call: PendingCall = {
-      callId,
-      pageId,
-      caller,
-      toolName: tool.name,
-      args,
-      mutating: tool.annotations?.readOnlyHint !== true,
-      arrivedAt,
-      rosterAtArrival,
-      waited: false,
-      checking: false,
-      conn: null,
-      heldOn: null,
-      invokeBytes: 0,
-      marks,
-      trace,
-      timer: null,
-      done: false,
-      settle: () => undefined,
+      // ADR 0026: a call its caller's client may confirm is asked there,
+      // after every check that precedes dispatch, its argument check too, so
+      // nobody is asked about a call the relay would refuse; it takes no
+      // place in the queue until it is confirmed.
+      if (
+        confirmation === null &&
+        confirm?.formElicitation === true &&
+        asksClient(page.policy, tool, { account: caller.account.kind, attachment })
+      ) {
+        const argumentError = await this.#checkArguments(pageId, tool.name, args);
+        if (argumentError) return argumentError;
+        // The check waited on the worker, so the caller may have been revoked,
+        // detached or demoted, or the page may have ended or changed its
+        // tools or policy, before #endAttachments or #gone had a question to
+        // drop. All of it is looked at again here, and nothing is awaited
+        // from this look until the question's record or wait exists, so any
+        // later end drops it (S8, ADR 0026).
+        const current = this.#afterCheck(call);
+        if (current.kind === 'error') return current;
+        const latest = this.#store.pages.get(pageId);
+        if (latest === undefined || !this.#stillAsks(call, current.attachment)) {
+          // What called for asking changed: the page decides, as for any call.
+          return this.#proceed(call, signal, args);
+        }
+        const { grantedAt } = current.attachment;
+        const asked = await this.#ask(
+          caller,
+          latest,
+          { pageTool: tool.name, toolRef, grantedAt },
+          args,
+          signal,
+          confirm,
+        );
+        if (asked.kind !== 'confirmed') return asked;
+        confirmation = { confirmationId: newId('cf'), at: asked.at, grantedAt };
+        // The answer was about this page tool; a first-class name that now
+        // reaches another one, after the page re-listed, is not_confirmed,
+        // as a 2026-07-28 retry is.
+        confirmedTool = tool.name;
+        continue;
+      }
+
+      return this.#proceed(call, signal, args);
+    }
+  }
+
+  /**
+   * A retry's confirmation (ADR 0026), its record already out of the store:
+   * the page tool it was asked about when it checks out; otherwise
+   * not_confirmed, unless the access check would refuse the call as well,
+   * when it answers as that check does (not_attached, as S8 asks of every
+   * later call, or page_gone). A 2025-era session never asks this way, so
+   * any state there is refused.
+   */
+  #retried(
+    caller: CallerIdentity,
+    pageId: string,
+    toolRef: PageToolRef,
+    args: JsonObject,
+    confirm: ConfirmLeg,
+  ): { kind: 'ok'; pageTool: string; grantedAt: number } | HubError {
+    const refused = (message: string): HubError => {
+      const access = this.#access(caller.userId, pageId);
+      if (
+        access.kind === 'error' &&
+        (access.code === 'not_attached' || access.code === 'page_gone')
+      ) {
+        return access;
+      }
+      return notConfirmed(message);
     };
-    // Checked before anything waits: the size cannot grow later, as the role and deadline only shrink.
-    const encoded = this.#encodeInvoke(call, attachment.role, this.#config.timings.callDeadlineMs);
-    if (encoded.kind === 'error') return encoded;
-    call.invokeBytes = encoded.bytes;
+    const retry = confirm.retry;
+    if (retry === null || confirm.mode !== 'retry' || retry.state.kind !== 'record') {
+      return refused(NO_SUCH_CONFIRMATION);
+    }
+    const { record } = retry.state;
+    if (record.userId !== caller.userId) return refused(NO_SUCH_CONFIRMATION);
+    const sameCall =
+      record.pageId === pageId &&
+      record.calledAs === calledAsOf(toolRef) &&
+      (typeof toolRef !== 'string' || record.pageTool === toolRef) &&
+      record.digest === argumentsDigest(args);
+    if (!sameCall) return refused(CONFIRMED_ANOTHER_CALL);
+    if (!confirms(retry.answer)) return refused(NOT_CONFIRMED_IN_CLIENT);
+    return { kind: 'ok', pageTool: record.pageTool, grantedAt: record.grantedAt };
+  }
 
+  /**
+   * Puts the question: on 2026-07-28 a record for the retry and an `ask`
+   * outcome, its state signed, that mcp.ts answers input_required; on a
+   * 2025-era session the question inside the request. A fifth question
+   * waiting for one user answers rate_limited. `grantedAt` names the
+   * attachment it is asked under, which the caller looked at just before
+   * with nothing awaited since, so the record or wait exists before any
+   * later end of that attachment can look for it.
+   */
+  async #ask(
+    caller: CallerIdentity,
+    page: PageRecord,
+    about: { pageTool: string; toolRef: PageToolRef; grantedAt: number },
+    args: JsonObject,
+    signal: AbortSignal,
+    confirm: ConfirmLeg,
+  ): Promise<AskInClient | HubError | { kind: 'confirmed'; at: number }> {
+    const { pageTool, toolRef, grantedAt } = about;
+    const question = confirmQuestion({
+      tool: pageTool,
+      pageId: page.pageId,
+      origin: page.origin,
+      args,
+    });
+    if (confirm.mode === 'elicit') {
+      return confirm.elicit === null
+        ? notConfirmed(NOT_CONFIRMED_IN_CLIENT)
+        : this.#askInRequest(caller, page.pageId, question, signal, confirm.elicit);
+    }
+    const digest = argumentsDigest(args);
+    if (digest === null) {
+      return hubError('invalid_arguments', 'the arguments could not be encoded for the page link');
+    }
+    if (confirm.mint === null) return notConfirmed(NOT_CONFIRMED_IN_CLIENT);
+    const record = this.#confirmations.add({
+      userId: caller.userId,
+      pageId: page.pageId,
+      calledAs: calledAsOf(toolRef),
+      pageTool,
+      digest,
+      grantedAt,
+      origin: page.origin,
+      client: caller.client,
+    });
+    if (record === null) return this.#tooManyQuestions(caller);
+    let requestState: string;
+    try {
+      requestState = await confirm.mint(record.id);
+    } catch (error) {
+      // A question whose state never went out leaves no record behind.
+      this.#confirmations.discard(record.id);
+      throw error;
+    }
+    // Signing is awaited, so a revoke, the attachment's end, the page's end
+    // or a shutdown may have dropped the record meanwhile; the question
+    // would then ask about a call nobody may confirm, so the call answers as
+    // a later one would (S8).
+    if (!this.#confirmations.holds(record.id)) return this.#questionWithdrawn(caller, page.pageId);
+    this.#log.debug('call asked in its client', {
+      pageId: page.pageId,
+      userId: caller.userId,
+      tool: pageTool,
+    });
+    return { kind: 'ask', requestState, question };
+  }
+
+  /**
+   * What a call whose question lost its record before it went out answers:
+   * page_asleep at shutdown, else what the access check now says
+   * (not_attached, page_gone or page_asleep), else not_confirmed, since only
+   * a revoke and a fresh approval in between leave the caller attached.
+   */
+  #questionWithdrawn(caller: CallerIdentity, pageId: string): HubError {
+    if (this.#closed) return hubError('page_asleep', 'the relay is shutting down');
+    const access = this.#access(caller.userId, pageId);
+    return access.kind === 'error' ? access : notConfirmed(ASKED_UNDER_ENDED_ATTACHMENT);
+  }
+
+  /**
+   * A 2025-era question, asked inside the request under the relay's own
+   * timer and the client's signal (ADR 0026). A revoke, the attachment's end
+   * or the page's end answers at once as #endAttachments or #gone says; any
+   * other outcome but a confirming answer, a request its client closed
+   * included, is not_confirmed.
+   */
+  async #askInRequest(
+    caller: CallerIdentity,
+    pageId: string,
+    question: ConfirmQuestion,
+    signal: AbortSignal,
+    elicit: (question: ConfirmQuestion, signal: AbortSignal) => Promise<unknown>,
+  ): Promise<HubError | { kind: 'confirmed'; at: number }> {
+    const waiting = this.#confirmations.wait(caller.userId, pageId);
+    if (waiting === null) return this.#tooManyQuestions(caller);
+    const expiry = new AbortController();
+    const timer = setTimeout(() => {
+      expiry.abort();
+    }, this.#config.timings.confirmationTtlMs);
+    timer.unref();
+    const stop = AbortSignal.any([signal, waiting.signal, expiry.signal]);
+    this.#log.debug('call asked in its client', { pageId, userId: caller.userId });
+    try {
+      const unanswered = Symbol('unanswered');
+      const answer = await new Promise<unknown>((resolve) => {
+        if (stop.aborted) {
+          resolve(unanswered);
+          return;
+        }
+        stop.addEventListener(
+          'abort',
+          () => {
+            resolve(unanswered);
+          },
+          { once: true },
+        );
+        elicit(question, stop).then(resolve, () => {
+          resolve(unanswered);
+        });
+      });
+      const dropped = waiting.dropped;
+      if (dropped !== null) return hubError(dropped.code, dropped.message);
+      if (answer === unanswered && expiry.signal.aborted) {
+        return notConfirmed(
+          `nobody answered the question in your client within ${formatDuration(this.#config.timings.confirmationTtlMs)}. The page never heard of this call`,
+        );
+      }
+      if (!confirms(answer)) return notConfirmed(NOT_CONFIRMED_IN_CLIENT);
+      return { kind: 'confirmed', at: Date.now() };
+    } finally {
+      clearTimeout(timer);
+      waiting.done();
+    }
+  }
+
+  #tooManyQuestions(caller: CallerIdentity): HubError {
+    this.#log.debug("call refused: too many questions wait in the caller's clients", {
+      userId: caller.userId,
+    });
+    return hubError(
+      'rate_limited',
+      `${String(MAX_PENDING_CONFIRMATIONS)} calls already wait for your answer in your clients; answer one, or let it expire after ${formatDuration(this.#config.timings.confirmationTtlMs)}, and try again`,
+    );
+  }
+
+  /** Goes to the page, or to its place in the page's queue, once every check has passed. */
+  async #proceed(call: PendingCall, signal: AbortSignal, args: JsonObject): Promise<CallOutcome> {
+    const { pageId } = call;
     if (!call.mutating) {
       // Read-only calls run side by side, so nothing is held while this one is checked.
-      const argumentError = await this.#checkArguments(pageId, tool.name, args);
+      const argumentError = await this.#checkArguments(pageId, call.toolName, args);
       if (argumentError) return argumentError;
       const current = this.#afterCheck(call);
       if (current.kind === 'error') return current;
@@ -4097,11 +4888,15 @@ export class PageHub {
     this.#markWaited(call);
   }
 
-  /** The invoke frame for a call, or invalid_arguments when it cannot be sent at all. */
+  /**
+   * The invoke frame for a call, or invalid_arguments when it cannot be sent
+   * at all; `confirmation` only as the call goes out confirmed (#sendInvoke).
+   */
   #encodeInvoke(
     call: PendingCall,
     role: Role,
     deadlineMs: number,
+    confirmation: ClientConfirmation | null,
   ): { kind: 'frame'; text: string; bytes: number } | HubError {
     let text: string;
     try {
@@ -4117,14 +4912,29 @@ export class PageHub {
           role,
         },
         deadlineMs,
+        // Field by field: the attachment it was asked under stays the relay's.
+        ...(confirmation === null
+          ? {}
+          : {
+              confirmation: {
+                by: 'client',
+                confirmationId: confirmation.confirmationId,
+                at: confirmation.at,
+              },
+            }),
       });
     } catch {
       // JSON.stringify recurses: arguments nested a few thousand levels deep overflow the stack.
       return hubError('invalid_arguments', 'the arguments could not be encoded for the page link');
     }
     // The adapter drops any frame over the cap by closing the socket, so an
-    // oversized call must stop here rather than knock the page offline.
-    const bytes = Buffer.byteLength(text, 'utf8');
+    // oversized call must stop here rather than knock the page offline. The
+    // room a confirmation takes is kept on every call, since one confirmed in
+    // its client gains it just before it goes out (ADR 0026), so nobody is
+    // asked about a call that would then be too large to send (ADR 0032); a
+    // frame that carries one has used that room already.
+    const bytes =
+      Buffer.byteLength(text, 'utf8') + (confirmation === null ? MAX_CONFIRMATION_FRAME_BYTES : 0);
     if (bytes > MAX_FRAME_BYTES) {
       return hubError(
         'invalid_arguments',
@@ -4219,8 +5029,73 @@ export class PageHub {
   }
 
   /**
+   * The name a call's record gives the page tool it named, before or
+   * without the lookup: a first-class name becomes the page tool's own name
+   * whenever exactly one of the page's tools maps to it, whether or not the
+   * caller holds the page, so a call refused before the lookup
+   * (not_attached, rate_limited, page_busy) leaves the record call_page_tool
+   * would (S7, ADR 0025). The record is the operator's and the answer never
+   * names the tool, so nothing reaches a caller who does not hold the page
+   * (S13). An unknown, asleep or gone page's tools are not held (S9), and a
+   * `.` mapped to `_` cannot be mapped back, so where the relay holds no one
+   * tool the name maps to, the record keeps the whole first-class name as
+   * called. Never the mapped part alone, which reads as another tool's name:
+   * a refused `<page id>__doc_save` must not be recorded as a call to a
+   * `doc_save` the page may also have when it meant `doc.save`.
+   */
+  #calledToolName(pageId: string, ref: PageToolRef): string {
+    if (typeof ref === 'string') return ref;
+    let found: string | null = null;
+    for (const tool of this.#store.pages.get(pageId)?.tools ?? []) {
+      if (firstClassToolPart(tool.name) !== ref.firstClass) continue;
+      if (found !== null) return firstClassName(pageId, ref.firstClass);
+      found = tool.name;
+    }
+    return found ?? firstClassName(pageId, ref.firstClass);
+  }
+
+  /**
+   * The page tool a call names, looked up at the same step for both routes.
+   * A first-class name (ADR 0025) is the one tool of the page that maps to
+   * it, whether or not the caller's list shows it (a tool left off for a
+   * cap or its schema stays reachable); tool_not_found when none or two map
+   * to it, and on an attachment an invite made, or an invitee's, which ADR
+   * 0016 keeps on the fixed tools. Every later check is the same code.
+   */
+  #resolveTool(
+    page: PageRecord,
+    attachment: AttachmentRecord,
+    ref: PageToolRef,
+  ): { kind: 'ok'; tool: PageTool } | HubError {
+    const { pageId } = page;
+    if (typeof ref === 'string') {
+      const tool = page.tools.find((candidate) => candidate.name === ref);
+      return tool
+        ? { kind: 'ok', tool }
+        : hubError('tool_not_found', `page ${pageId} has no tool named ${ref}`);
+    }
+    if (attachment.kind !== 'member' || attachment.inviteId !== null) {
+      return hubError(
+        'tool_not_found',
+        `page ${pageId} offers no first-class tools to an attachment an invite made; use call_page_tool`,
+      );
+    }
+    const matches = page.tools.filter(
+      (candidate) => firstClassToolPart(candidate.name) === ref.firstClass,
+    );
+    const [only] = matches;
+    if (only === undefined || matches.length > 1) {
+      return hubError('tool_not_found', `page ${pageId} has no tool named ${ref.firstClass}`);
+    }
+    return { kind: 'ok', tool: only };
+  }
+
+  /**
    * What may have changed since a call arrived, looked at again: the
-   * attachment, the page, the tool and the role.
+   * attachment, the page, the tool and the role, and for a confirmed call
+   * that its attachment is still the one it was asked under. A read-only
+   * call waits on its check in no queue a revoke empties, so a revoke and
+   * a fresh approval meanwhile are caught here (ADR 0026).
    */
   #recheck(
     call: PendingCall,
@@ -4228,6 +5103,9 @@ export class PageHub {
     const access = this.#access(call.caller.userId, call.pageId);
     if (access.kind === 'error') return access;
     const { page, attachment, conn } = access;
+    if (call.confirmation !== null && attachment.grantedAt !== call.confirmation.grantedAt) {
+      return notConfirmed(ASKED_UNDER_ENDED_ATTACHMENT);
+    }
     const tool = page.tools.find((candidate) => candidate.name === call.toolName);
     if (!tool) {
       return hubError('tool_not_found', `page ${call.pageId} has no tool named ${call.toolName}`);
@@ -4261,15 +5139,51 @@ export class PageHub {
     return this.#sendInvoke(call, current.attachment, conn);
   }
 
+  /**
+   * Whether a confirmed call still calls for its caller's confirmation as it
+   * goes out: the page's current hello policy, its latest tools frame's mark
+   * on the tool and the caller's attachment as it is now (ADR 0026).
+   */
+  #stillAsks(call: PendingCall, attachment: AttachmentRecord): boolean {
+    const page = this.#store.pages.get(call.pageId);
+    const tool = page?.tools.find((candidate) => candidate.name === call.toolName);
+    return (
+      page !== undefined &&
+      tool !== undefined &&
+      asksClient(page.policy, tool, { account: call.caller.account.kind, attachment })
+    );
+  }
+
   /** The invoke itself, once every check has passed and the socket has room. True if it went out. */
   #sendInvoke(call: PendingCall, attachment: AttachmentRecord, conn: Conn): boolean {
+    // #access refuses a socket the relay is closing, but one the page began
+    // to close stays CLOSING until ws reports the close, up to its 30 s
+    // closeTimeout while the peer keeps TCP open, and ws sends nothing on it;
+    // written there, the call would wait out its deadline and be recorded as
+    // having reached the page (S7).
+    if (conn.closing || conn.ws.readyState !== conn.ws.OPEN) {
+      call.settle(hubError('page_asleep', 'the page disconnected before the call reached it'));
+      return false;
+    }
     const { callDeadlineMs } = this.#config.timings;
     const remaining = call.waited ? callDeadlineMs - (Date.now() - call.arrivedAt) : callDeadlineMs;
     if (remaining <= 0) {
       call.settle(call.heldOn ? this.#heldTooLong() : this.#queuedTooLong());
       return false;
     }
-    const encoded = this.#encodeInvoke(call, attachment.role, remaining);
+    // ADR 0026: a confirmation goes with the invoke only while what called
+    // for asking still holds; otherwise the page decides as for any call,
+    // and the record credits no client.
+    const confirmation =
+      call.confirmation !== null && this.#stillAsks(call, attachment) ? call.confirmation : null;
+    if (call.confirmation !== null && confirmation === null) {
+      this.#log.info('a confirmed call went out unconfirmed: what called for asking changed', {
+        pageId: call.pageId,
+        userId: call.caller.userId,
+        tool: call.toolName,
+      });
+    }
+    const encoded = this.#encodeInvoke(call, attachment.role, remaining, confirmation);
     if (encoded.kind === 'error') {
       call.settle(encoded);
       return false;
@@ -4277,6 +5191,7 @@ export class PageHub {
     call.heldOn = null;
     call.conn = conn;
     call.trace.reached = true;
+    call.trace.confirmedBy = confirmation === null ? null : 'client';
     conn.inflight.set(call.callId, call);
     this.#armCallTimer(call);
     if (call.marks) call.marks.invokeOut = performance.now();
@@ -4623,6 +5538,8 @@ export class PageHub {
       waiter(hubError('timeout', 'the relay is shutting down'));
     }
     const shuttingDown = hubError('page_asleep', 'the relay is shutting down');
+    // A restart voids every confirmation, failing closed (ADR 0026).
+    this.#confirmations.close(shuttingDown);
     for (const queue of [...this.#queues.values()]) {
       for (const call of [...queue.waiting]) call.settle(shuttingDown);
     }

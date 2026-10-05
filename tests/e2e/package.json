@@ -15,21 +15,31 @@
     "check:claude-code:m2": "node src/claude-code-check-m2.ts",
     "check:claude-code:m3": "node src/claude-code-check-m3.ts",
     "check:claude-code:local": "node src/claude-code-check-local.ts",
+    "conformance": "node src/conformance.ts",
+    "check:claude-code:m5": "node src/claude-code-check-m5.ts",
+    "check:claude-code:labels": "node src/claude-code-check-labels.ts",
     "demo:m1": "node src/demo-m1.ts",
     "demo:m2": "node src/demo-m2.ts",
     "demo:m3": "node src/demo-m3.ts",
-    "demo:m4": "node src/demo-m4.ts"
+    "demo:m4": "node src/demo-m4.ts",
+    "demo:m5": "node src/demo-m5.ts"
   },
   "devDependencies": {
     "@mcp-b/webmcp-local-relay": "5.1.0",
     "@modelcontextprotocol/client": "2.3.0",
+    "@modelcontextprotocol/conformance": "0.2.0-alpha.12",
     "@playwright/test": "1.56.1",
     "@tabdock/adapter": "workspace:*",
     "@tabdock/demo": "workspace:*",
+    "@tabdock/mcpb6": "workspace:*",
     "@tabdock/protocol": "workspace:*",
     "@tabdock/relay": "workspace:*",
     "@tabdock/sim-page": "workspace:*",
     "@types/ws": "8.18.2",
+    "mcp-sdk-1.10.2": "npm:@modelcontextprotocol/sdk@1.10.2",
+    "mcp-sdk-1.12.3": "npm:@modelcontextprotocol/sdk@1.12.3",
+    "mcp-sdk-1.24.0": "npm:@modelcontextprotocol/sdk@1.24.0",
+    "mcp-sdk-1.32.0": "npm:@modelcontextprotocol/sdk@1.32.0",
     "ws": "8.22.0"
   }
 }

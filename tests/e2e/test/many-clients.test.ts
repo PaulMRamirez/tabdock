@@ -325,8 +325,9 @@ describe('the write queue when a running write is answered early', () => {
       });
       const sim = await w.page({
         profile: 'polyfill-5.1',
-        // The polyfill drops consequentialHint; an empty list says none of these is consequential.
-        policy: { maxDrivers: 2, consequentialTools: [] },
+        // The polyfill drops consequentialHint, so the page names its one
+        // consequential tool, wipe, and these writes run with no prompt.
+        policy: { maxDrivers: 2, consequentialTools: ['wipe'] },
         tools: (store) => [
           ...createDefaultTools(store),
           write('slow_write', async () => {

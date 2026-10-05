@@ -27,6 +27,7 @@ import {
   startSimPage,
 } from '@tabdock/sim-page';
 import { expect } from 'vitest';
+import { resultJson } from '@tabdock/relay/test/results';
 
 /** Fresh random tokens on every run, so no usable credential ever sits in the repo. */
 function devUser(userId: string, displayName: string): DevTokenUser {
@@ -61,6 +62,8 @@ export interface WorldOptions {
   rateLimits?: RelayOptions['rateLimits'];
   /** The M3 spike's measurements (ADR 0014); off unless a test asks. */
   spike?: boolean;
+  /** First-class page tools (ADR 0025); off unless a test asks, as in every mode. */
+  firstClassTools?: boolean;
 }
 
 export async function startWorld(options: WorldOptions = {}): Promise<World> {
@@ -80,6 +83,7 @@ export async function startWorld(options: WorldOptions = {}): Promise<World> {
     limits: options.limits,
     rateLimits: options.rateLimits,
     spike: options.spike,
+    firstClassTools: options.firstClassTools,
   });
   const pages: SimPage[] = [];
   const clients: Client[] = [];
@@ -127,7 +131,11 @@ export async function callTool(
 ): Promise<ToolOutcome> {
   const result = await client.callTool({ name, arguments: args });
   const text = result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n');
-  return { isError: result.isError === true, text, structured: result.structuredContent };
+  return {
+    isError: result.isError === true,
+    text,
+    structured: resultJson(text, result.structuredContent),
+  };
 }
 
 /** The SPEC section 7 code at the start of a Tabdock error, or null for anything else. */

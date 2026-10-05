@@ -13,10 +13,12 @@ import {
   RESUME_WINDOW_MS,
   SUBPROTOCOL,
 } from '@tabdock/protocol';
+import type { Client } from '@modelcontextprotocol/client';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createDevTokenAuth, createRelay } from '../src/index.ts';
 import { CROCKFORD_ALPHABET } from '../src/secrets.ts';
 import {
+  connectionOf,
   connectPage,
   openSocket,
   PAGE_ORIGIN,
@@ -24,12 +26,21 @@ import {
   TOOLS,
   UpgradeRefused,
 } from './helpers/page-client.ts';
-import { ALICE, delay, startRelay, type TestRelay } from './helpers/relay.ts';
+import {
+  ALICE,
+  callTool,
+  connectClient,
+  delay,
+  pairAndApprove,
+  startRelay,
+  type TestRelay,
+} from './helpers/relay.ts';
 
 const SYMBOL = `[${CROCKFORD_ALPHABET}]`;
 
 let current: TestRelay | undefined;
 const pages: TestPage[] = [];
+const clients: Client[] = [];
 
 async function relayWith(options: Parameters<typeof startRelay>[0] = {}): Promise<TestRelay> {
   current = await startRelay(options);
@@ -66,6 +77,7 @@ function hello(extra: Record<string, unknown> = {}): Record<string, unknown> {
 }
 
 afterEach(async () => {
+  for (const client of clients.splice(0)) await client.close().catch(() => undefined);
   for (const opened of pages.splice(0)) opened.ws.terminate();
   await current?.close();
   current = undefined;
@@ -331,5 +343,35 @@ describe('pairing tickets', () => {
     const asked = await opened.next('pairing', 1000);
     expect(asked.code).not.toBe(rotated.code);
     expect(asked.code).toMatch(new RegExp(`^${SYMBOL}{5}-${SYMBOL}{5}$`));
+  });
+});
+
+describe('a socket the page has begun to close (ADR 0030)', () => {
+  it('answers a call page_asleep at once, recorded as never having reached the page', async () => {
+    const { relay } = await relayWith();
+    const opened = await page(relay.pageUrl, {
+      tools: TOOLS,
+      onInvoke: () => ({ ok: true, content: 'too late' }),
+    });
+    const client = await connectClient(relay, ALICE);
+    clients.push(client);
+    await pairAndApprove(client, opened);
+    // The page sends its close frame and then reads nothing and keeps TCP
+    // open, so ws on the relay holds the socket CLOSING, up to its 30 s
+    // closeTimeout, without reporting a close.
+    connectionOf(opened.ws).pause();
+    opened.ws.close(1000, 'leaving');
+    await delay(200);
+    const started = Date.now();
+    const answer = await callTool(client, 'call_page_tool', {
+      page: opened.pageId,
+      tool: 'get_view',
+    });
+    expect(answer.text).toMatch(/^page_asleep: /);
+    // Well inside the call's 3 s deadline, which it used to wait out.
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(relay.audit.records().filter((record) => record.tool === 'get_view')).toEqual([
+      expect.objectContaining({ outcome: 'page_asleep' }),
+    ]);
   });
 });

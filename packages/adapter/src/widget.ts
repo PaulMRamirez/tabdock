@@ -7,7 +7,13 @@
 // Everything shown comes from the Dock handle, every relay- or page-supplied
 // string goes in as text (the pairing URL only as a QR drawing built with DOM
 // calls; see qr.ts), nothing goes through an HTML parser, and nothing lands on
-// window.
+// window. Text nodes keep markup out, but not what a caller says of itself:
+// its client's name and version, shown beside the page's own words, could
+// still break a line to pass for another activity entry, or reverse the words
+// after it. So the widget makes them, and every person's name, one plain line
+// (plainLine) whatever the relay did, and where page words follow, in the
+// activity log and the attach prompt, sets each in a run of its own that
+// nothing inside can reach out of; see entryLine.
 // From M4 the panel also mints invites (ADR 0017): an invite link shows once,
 // as a QR drawing and as text to send, and only until the operator is done
 // with it or the invite ends; the adapter keeps no copy of its secret.
@@ -52,6 +58,7 @@ import {
   MAX_INVITE_LABEL_CHARS,
   MAX_INVITE_USES,
   MAX_LIVE_INVITES_PER_PAGE,
+  plainLine,
   type Role,
   UNVERIFIED_ACCOUNT_NAME,
 } from '@tabdock/protocol';
@@ -198,8 +205,22 @@ li { padding: 2px 0; }
   user-select: all; }
 .activity { height: 6.5em; overflow-y: auto; padding: 2px 6px; border: 1px solid #e5e7eb; border-radius: 6px;
   font-size: 12px; }
-.activity li { padding: 1px 0; }
+/* Each entry ruled off, its time in a column of its own: whatever an entry
+   holds wraps beside the time, so no text can start a line where a time goes. */
+.activity li { display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: 6px; padding: 1px 0;
+  border-top: 1px solid #e5e7eb; }
+.activity li:first-child { border-top: none; }
+.activity .time { color: #6b7280; font-variant-numeric: tabular-nums; }
 .activity [data-outcome='running'] { color: #92400e; }
+/* What a caller says of itself, or a person's name: isolated, so none of it
+   can reorder the words around it. A client's name also stays on one line,
+   cut short with an ellipsis, so it cannot wrap into what looks like an entry. */
+.claimed { unicode-bidi: isolate; }
+.quoted { white-space: nowrap; }
+.client { display: inline-block; max-width: min(14em, calc(100% - 1em)); overflow: hidden; white-space: nowrap;
+  text-overflow: ellipsis; vertical-align: bottom; unicode-bidi: isolate; }
+/* ADR 0026's mark, built by the page alone: a ground of its own that no client's text can draw. */
+.confirmed { padding: 0 6px; border-radius: 10px; background: #dcfce7; color: #14532d; }
 .pause { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 10px 0 0;
   padding: 6px 8px; border: 1px solid #e5e7eb; border-radius: 8px; }
 .pause.paused { border-color: #b91c1c; }
@@ -208,10 +229,11 @@ li { padding: 2px 0; }
   .badge, .panel { background: #111827; border-color: #374151; }
   .count { background: #374151; }
   .prompt { background: #3b2a06; }
-  .row, .activity, .pause { border-color: #374151; }
+  .row, .activity, .activity li, .pause { border-color: #374151; }
   .action, .field input { background: #1f2937; border-color: #4b5563; }
   .invited { background: #1e3a8a; color: #dbeafe; }
-  .muted, .label { color: #9ca3af; }
+  .confirmed { background: #14532d; color: #dcfce7; }
+  .muted, .label, .activity .time { color: #9ca3af; }
   .error { color: #fca5a5; }
   .join { color: #93c5fd; }
   .notice, .activity [data-outcome='running'] { color: #fcd34d; }
@@ -307,8 +329,29 @@ function expiryText(expiresAt: number | null): string {
   return `Expires in ${Math.floor(minutes / 60)} h ${minutes % 60} min`;
 }
 
+/**
+ * A client as it names itself, made one plain line here too, since the
+ * adapter does not trust the relay to have done it; empty when nothing is left.
+ */
 function clientText(client: { name: string; version: string }): string {
-  return `${client.name} ${client.version}`.trim();
+  return plainLine(`${client.name} ${client.version}`);
+}
+
+/**
+ * Who an activity line's badge names for a call the page ran without asking
+ * because the caller confirmed it in their own client (ADR 0026): the client
+ * as it names itself (null when it gave no name) and the person, so the
+ * operator sees after the fact every call nobody confirmed here. null for
+ * every other call. The widget builds the badge itself and sets each name in
+ * a run of its own, so a client's name can neither imitate the badge nor
+ * reorder it.
+ */
+export function confirmedIn(
+  entry: ActivityEntry,
+): { readonly client: string | null; readonly person: string } | null {
+  if (entry.confirmedBy !== 'client') return null;
+  const client = entry.client === null ? '' : clientText(entry.client);
+  return { client: client === '' ? null : client, person: personText(entry.user) };
 }
 
 function timeText(epochMs: number): string {
@@ -325,12 +368,15 @@ function shortId(userId: string): string | null {
 /**
  * How the widget names a person: a member by their name, an invitee by
  * their verified email, or "unverified account", always with the short id,
- * since a name alone could copy someone else's (S10).
+ * since a name alone could copy someone else's (S10). The name is made one
+ * plain line, as a client's is, and a member's that leaves nothing shows
+ * their id.
  */
 function personText(user: { userId: string; displayName: string }, account?: Account): string {
   const id = shortId(user.userId);
-  if (id === null) return user.displayName;
-  const name = account?.verified === false ? UNVERIFIED_ACCOUNT_NAME : user.displayName;
+  const shown = plainLine(user.displayName);
+  if (id === null) return shown === '' ? user.userId : shown;
+  const name = account?.verified === false ? UNVERIFIED_ACCOUNT_NAME : shown;
   return `${name} (${id})`;
 }
 
@@ -477,6 +523,39 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   function badge(show: boolean): HTMLElement {
     const node = element('span', 'invited', show ? 'invited' : '');
     dom.attr(node, 'data-role', 'invited');
+    return node;
+  }
+
+  /** A person's name, isolated from the words around it. */
+  function person(text: string): HTMLElement {
+    return element('span', 'claimed', text);
+  }
+
+  /**
+   * A client's name and version in the page's quotes, isolated and kept to
+   * one line cut short with an ellipsis, so whatever it says stays inside
+   * them; the quotes never wrap away from it.
+   */
+  function quotedClient(text: string): HTMLElement {
+    const node = element('span', 'quoted');
+    dom.append(node, '"', element('span', 'client', text), '"');
+    return node;
+  }
+
+  /**
+   * ADR 0026's mark for a call confirmed in the caller's client: the page's
+   * own words on a ground of their own, naming the client and the person in
+   * runs of their own, so no client's name can draw one or turn it around.
+   */
+  function confirmedBadge(confirmed: {
+    readonly client: string | null;
+    readonly person: string;
+  }): HTMLElement {
+    const node = element('span', 'confirmed');
+    dom.attr(node, 'data-role', 'confirmed');
+    if (confirmed.client === null) dom.append(node, 'confirmed in their client');
+    else dom.append(node, 'confirmed in ', quotedClient(confirmed.client));
+    dom.append(node, ' by ', person(confirmed.person));
     return node;
   }
 
@@ -826,8 +905,11 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
         element('p', 'muted', 'The driver seats are full, so they join as observer for now.'),
       );
     }
-    if (request.client) {
-      dom.append(box, element('p', 'muted', `Client: ${clientText(request.client)}`));
+    const client = request.client === null ? '' : clientText(request.client);
+    if (client !== '') {
+      const said = element('p', 'muted', 'Client: ');
+      dom.append(said, quotedClient(client));
+      dom.append(box, said);
     }
     const view = newPrompt(box, request.expiresAt);
     const buttons = element('div', 'buttons');
@@ -981,7 +1063,10 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const status = role ?? (revoking ? 'revoke pending' : 'not approved on this page');
     setText(view.name, `${personText(attachment)} (${status})`);
     setText(view.badge, invited(attachment) ? 'invited' : '');
-    const clients = attachment.clients.map(clientText).join(', ');
+    const clients = attachment.clients
+      .map(clientText)
+      .filter((text) => text !== '')
+      .join(', ');
     setText(view.clients, clients === '' ? 'No client seen yet' : `Clients: ${clients}`);
     const capped = access?.inviteRole === 'observer';
     const closable = invite !== undefined && invite.uses > 1 && invite.usesLeft > 0;
@@ -1325,17 +1410,33 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     if (!isNew) restartArming(pauseView);
   }
 
+  /**
+   * One call: its time in a column of its own, then who, through which
+   * client, what and how it ended. The person and the client are what the
+   * caller and the relay say, so each sits in a run of its own (person,
+   * quotedClient) and the ADR 0026 mark is the page's own badge; a client's
+   * name can then neither wrap into a line that passes for another entry nor
+   * reverse the page's words after it.
+   */
   function entryLine(entry: ActivityEntry): HTMLElement {
     const line = element('li');
     dom.attr(line, 'data-activity-id', entry.callId);
     dom.attr(line, 'data-outcome', entry.outcome);
-    const via = entry.client ? ` via ${clientText(entry.client)}` : '';
+    const what = element('span');
+    dom.append(what, person(personText(entry.user)));
+    if (shortId(entry.user.userId) !== null) dom.append(what, badge(true));
+    const client = entry.client === null ? '' : clientText(entry.client);
+    if (client !== '') dom.append(what, ' via ', quotedClient(client));
+    dom.append(what, `: ${entry.tool}`);
+    const confirmed = confirmedIn(entry);
+    if (confirmed !== null) dom.append(what, ', ', confirmedBadge(confirmed));
     const took = entry.durationMs === null ? '' : ` in ${entry.durationMs} ms`;
     // A write answered early still holds the page while its handler runs on.
     const lingering = entry.handlerRunning ? ', but its handler is still running' : '';
-    dom.append(line, `${timeText(entry.time)} ${personText(entry.user)}`);
-    if (shortId(entry.user.userId) !== null) dom.append(line, badge(true));
-    dom.append(line, `${via}: ${entry.tool}, ${entry.outcome}${took}${lingering}`);
+    dom.append(what, `, ${entry.outcome}${took}${lingering}`);
+    // The grid lays out no white space between its cells; the space keeps
+    // the entry's text, as a screen reader or a copy has it, readable.
+    dom.append(line, element('span', 'time', timeText(entry.time)), ' ', what);
     return line;
   }
 

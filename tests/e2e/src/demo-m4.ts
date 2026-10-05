@@ -15,14 +15,14 @@
 // secret or its hash, a cookie or a subject: links appear masked, and every
 // line is checked against the secrets seen so far before it is printed (S11).
 
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import type { Browser, Page } from '@playwright/test';
 import { type AuditLine, AuditLineSchema } from '@tabdock/protocol';
 import { EMAIL_CLAIM, EMAIL_VERIFIED_CLAIM, listAuditFiles } from '@tabdock/relay';
+import { privateTempRoot } from '@tabdock/relay/test/private-tmp';
 import { PAIR_CLIENT } from '@tabdock/relay/test/provider';
 import { leakIn } from '@tabdock/relay/test/secrecy';
 import { tunnelFetch } from '@tabdock/relay/test/tunnel';
@@ -212,7 +212,8 @@ async function linkedBoard(
 }
 
 say('Tabdock M4: local mode by default, then a page shared by invite\n');
-const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'tabdock-demo-m4-')));
+// Not the shared temporary directory, where local mode refuses its token (ADR 0028's notes).
+const scratch = realpathSync(mkdtempSync(join(privateTempRoot(), 'tabdock-demo-m4-')));
 let browser: Browser | undefined;
 let dev: Run | undefined;
 const clients: Client[] = [];
@@ -223,7 +224,15 @@ try {
   const home = join(scratch, 'tabdock home');
   say('Part one: local mode, with no .env and no account (ADR 0022)\n');
   say(`1. pnpm dev, with nothing set but a throwaway TABDOCK_HOME (${home}).`);
-  dev = runPnpm(['dev'], { ...blankEnv(), TABDOCK_HOME: home, TABDOCK_PORT: '0', DEMO_PORT: '0' });
+  // The board's ?e2e hook, which drives it here, exists only under a key pnpm dev is given.
+  const e2eKey = randomBytes(16).toString('base64url');
+  dev = runPnpm(['dev'], {
+    ...blankEnv(),
+    TABDOCK_HOME: home,
+    TABDOCK_PORT: '0',
+    DEMO_PORT: '0',
+    DEMO_E2E_KEY: e2eKey,
+  });
   await dev.waitFor('Relay logs follow');
   const printed = dev.stdout();
   const banner = readBanner(printed);
@@ -242,9 +251,17 @@ try {
     check((tokenDir.mode & 0o777) === 0o700, 'the token directory should be 0700');
   }
   check(banner.created, 'a first start should create the token');
-  say('   For Claude Code it printed this line, which reads the file when it runs:');
+  say(
+    '   For Claude Code it printed this line, whose header helper reads the file at each connection (ADR 0028):',
+  );
   say(`   ${banner.command}`);
-  check(banner.command.includes('$(cat '), 'the printed line should read the token file');
+  check(
+    process.platform === 'win32'
+      ? banner.command.includes('Get-Content')
+      : banner.command.startsWith('claude mcp add-json ') &&
+          banner.command.includes('claude-headers'),
+    'the printed line should hand Claude Code the helper that reads the token file',
+  );
 
   say(
     '\n2. An MCP client does what that line does: it reads the token from the file and sends it.',
@@ -272,7 +289,7 @@ try {
 
   const demoLink = /Demo board linked to the relay: (\S+)/.exec(printed)?.[1] ?? '';
   const localBoardUrl = new URL(demoLink);
-  localBoardUrl.searchParams.set('e2e', '');
+  localBoardUrl.searchParams.set('e2e', e2eKey);
   const localBoard = await linkedBoard(browser, localBoardUrl.href);
   say(
     `\n3. The demo board it printed, open in Chromium ${browser.version()}, linked as ${localBoard.pageId}, shows the code ${maskCode(localBoard.code)}.`,

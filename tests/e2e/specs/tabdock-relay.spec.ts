@@ -73,7 +73,7 @@ const ALICE_MODERN_CLIENT = 'tabdock-playwright-modern';
 const BOB_CLIENT = 'tabdock-playwright-bob';
 
 test.beforeAll(async () => {
-  demo = await startDemoServer();
+  demo = await startDemoServer({ e2eHook: true });
 });
 test.afterAll(async () => {
   await demo.close();
@@ -836,7 +836,7 @@ test.describe('M2: many clients, many users', () => {
       const [name, clientName, tool, outcome] = expected[index] ?? [];
       expect(line.text).toMatch(
         new RegExp(
-          `^\\S+ ${String(name)} via ${String(clientName)} 0\\.0\\.0: ${String(tool)}, ${String(outcome)} in \\d+ ms$`,
+          `^\\S+ ${String(name)} via "${String(clientName)} 0\\.0\\.0": ${String(tool)}, ${String(outcome)} in \\d+ ms$`,
         ),
       );
     });

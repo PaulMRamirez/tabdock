@@ -70,7 +70,15 @@ try {
   allowedOrigins = config.allowedOrigins;
   localMode = config.localMode;
   relay = await createRelay(config);
-  demo = await startDemoServer({ port: demoPort, watch: true });
+  // The board's ?e2e hook skips its Connect click, so pnpm dev offers it only
+  // under a key a script names (demo:m4, demo:m5) and never prints it: a link
+  // from another site to this predictable port must not dial for its visitor.
+  const e2eKey = process.env.DEMO_E2E_KEY?.trim() ?? '';
+  demo = await startDemoServer({
+    port: demoPort,
+    watch: true,
+    ...(e2eKey === '' ? {} : { e2eHook: e2eKey }),
+  });
 } catch (error) {
   await relay?.close();
   fail(`${command}: ${error instanceof Error ? error.message : String(error)}`);
@@ -84,12 +92,15 @@ if (allowedOrigins && !allowedOrigins.includes(demoOrigin)) {
 }
 // Readable rather than percent-encoded; browsers read the parameter the same way.
 const demoLink = `${demo.url}?relay=${relay.pageUrl}`;
+// The board dials only a relay its visitor chose (ADR 0029), so say why it sits idle until then.
+const waitsForClick = `${' '.repeat(34)}(it dials the relay once you click Connect to ${new URL(relay.pageUrl).host} on it)`;
 
 function localModeBanner(live: Relay, local: LocalModeInfo): string[] {
   return [
     'Tabdock dev: relay and demo board',
     '',
     `  Demo board linked to the relay: ${demoLink}`,
+    waitsForClick,
     '',
     ...localModeLines({
       mcpUrl: live.mcpUrl,
@@ -106,6 +117,7 @@ function devTokenLines(live: Relay): string[] {
     'Tabdock dev: relay and demo board',
     '',
     `  Demo board linked to the relay: ${demoLink}`,
+    waitsForClick,
     `  MCP endpoint:                   ${live.mcpUrl}`,
     `  Page socket:                    ${live.pageUrl}`,
     '',
@@ -128,6 +140,7 @@ function publicLines(live: Relay, publicUrl: string): string[] {
     `  Connector URL for Claude:       ${values.connectorUrl}`,
     `  QR pairing page:                ${values.pairPage}`,
     `  Demo board linked to the relay: ${demoLink}`,
+    waitsForClick,
     `  Relay on this machine:          ${live.url}  (point the tunnel's https address here)`,
     '',
     ...providerLines(values, issuer),

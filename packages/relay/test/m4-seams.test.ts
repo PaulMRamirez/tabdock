@@ -198,6 +198,14 @@ describe('inviteeUser, the one naming rule (ADR 0017)', () => {
       displayName: 'unverified account',
       account: { email: null },
     });
+    // Nor does one holding a right-to-left override, which would show its
+    // address turned around beside members' names, or a zero-width space.
+    for (const email of ['guest\u{202e}@example.com', 'gu\u{200b}est@example.com']) {
+      expect(inviteeUser(KEY, email, []), JSON.stringify(email)).toMatchObject({
+        displayName: 'unverified account',
+        account: { email: null },
+      });
+    }
   });
 
   it('cuts a long email to 97 characters and ..., never inside a surrogate pair', () => {
@@ -221,11 +229,20 @@ describe('inviteeUser, the one naming rule (ADR 0017)', () => {
   it.each([
     ['in another case', 'ALICE@Example.COM', 'alice@example.com'],
     ['in full-width letters', 'ａｌｉｃｅ@example.com', 'alice@example.com'],
-    ['with a zero-width space', 'ali​ce@example.com', 'alice@example.com'],
     ['with a sharp s', 'strasse@example.com', 'STRAßE@example.com'],
   ])("shows the short id for a name that copies a member's %s", (_name, email, member) => {
     expect(foldName(email)).toBe(foldName(member));
     expect(inviteeUser(KEY, email, ['Bob', member]).displayName).toBe(`invitee ${KEY.slice(0, 8)}`);
+  });
+
+  it("reads a copy of a member's name made with a zero-width space as no email at all", () => {
+    // foldName would still match it to the member, but the address is
+    // refused first, so it shows as unverified and never as the member.
+    const email = 'ali\u{200b}ce@example.com';
+    expect(foldName(email)).toBe(foldName('alice@example.com'));
+    expect(inviteeUser(KEY, email, ['Bob', 'alice@example.com']).displayName).toBe(
+      'unverified account',
+    );
   });
 });
 

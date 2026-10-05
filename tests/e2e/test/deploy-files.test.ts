@@ -11,12 +11,17 @@
 // the image installs filtered production dependencies from the lockfile; every
 // image is built, scanned with fail-build and smoke-tested read-only with no
 // capabilities (and on a writable root, for what the relay's user owns), and main's is pushed with provenance and an SBOM and attested,
-// by steps no condition can switch off; and a deploy verifies first, stages
-// settings through a pipe, checks the live relay and publishes the demo.
+// by steps no condition can switch off; a deploy verifies first, stages
+// settings through a pipe and checks the live relay; and the Pages site is
+// published by a workflow of its own, from main, by a deploy job that runs
+// nothing but deploy-pages after a build job that can only read (ADR 0029);
+// and Dependabot watches the npm trees as well as the action and image pins,
+// ignoring nothing a published package runs on (ADR 0028's A5.6 notes).
 
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { RUNTIME_DEPENDENCIES } from '../../../scripts/release-check.ts';
 
 const ROOT = resolve(import.meta.dirname, '../../..');
 const read = (path: string): string => readFileSync(join(ROOT, path), 'utf8');
@@ -68,6 +73,16 @@ function jobIf(job: string): string | null {
 /** Whether a step has a condition of its own, which could switch it off. */
 function stepIf(step: string): boolean {
   return /^ {6}- if:|^ {8}if:/m.test(step);
+}
+
+/** A job's own permissions, one `name: level` entry each, or null when it names none. */
+function permissionsOf(job: string): string[] | null {
+  const block = /^ {4}permissions:\n((?: {6}\S.*\n?)*)/m.exec(job);
+  if (block === null) return null;
+  return (block[1] ?? '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '');
 }
 
 /** The one step of a job that holds this text; it must be exactly one. */
@@ -310,11 +325,16 @@ describe('the workflows', () => {
     expect(raw).toMatch(
       /setup-flyctl@[0-9a-f]{40} # v[\d.]+\n {8}with:\n {10}version: \d+\.\d+\.\d+\n/,
     );
-    // Every job that reads a secret first waits for the environment's approval.
+    // Every job that reads a secret first waits for the environment's approval:
+    // production for a deploy, npm for publish.yml's stage job (ADR 0028).
     for (const { name, text } of workflows) {
       if (!text.includes('secrets.') || name === 'image.yml') continue;
       for (const job of text.split(/\n {2}(?=[a-z][\w-]*:\n)/).slice(1)) {
-        if (job.includes('secrets.')) expect(job, name).toMatch(/environment: production/);
+        if (job.includes('secrets.')) {
+          expect(job, name).toMatch(
+            name === 'publish.yml' ? /environment: npm\n/ : /environment: production/,
+          );
+        }
       }
     }
   });
@@ -327,10 +347,35 @@ describe('the workflows', () => {
     expect(image).not.toMatch(/trivy/);
   });
 
-  it('keep Dependabot on the action and image pins', () => {
-    const dependabot = read('.github/dependabot.yml');
-    expect(dependabot).toMatch(/package-ecosystem: github-actions/);
-    expect(dependabot).toMatch(/package-ecosystem: docker/);
+  it('keep Dependabot on the action and image pins and on both npm trees', () => {
+    const dependabot = hashCode(read('.github/dependabot.yml'));
+    const entries = dependabot
+      .split(/\n(?= {2}- package-ecosystem: )/)
+      .slice(1)
+      .map((entry) => ({
+        ecosystem: /^ {2}- package-ecosystem: (\S+)$/m.exec(entry)?.[1],
+        directory: /^ {4}directory: (\S+)$/m.exec(entry)?.[1],
+        text: entry,
+      }));
+    expect(
+      entries.map(({ ecosystem, directory }) => `${ecosystem ?? ''} ${directory ?? ''}`),
+    ).toEqual(['github-actions /', 'docker /', 'npm /', 'npm /apps/site']);
+    for (const { ecosystem, directory, text } of entries) {
+      const where = `${ecosystem ?? ''} ${directory ?? ''}`;
+      expect(text, where).toMatch(/^ {6}interval: weekly$/m);
+      // A limit of 0 turns version updates off; a target branch keeps
+      // security updates from reading the entry at all.
+      expect(text, where).not.toMatch(/open-pull-requests-limit:\s*0\b|target-branch:/);
+    }
+    // Ignoring a package the published three run on would hide the very
+    // pull requests that prompt a release of the relay.
+    const runtime = new Set(Object.values(RUNTIME_DEPENDENCIES).flat());
+    for (const match of dependabot.matchAll(/dependency-name: '([^']+)'/g)) {
+      const glob = match[1] ?? '';
+      const escaped = glob.replace(/[.+?^${}()|[\]\\/]/g, '\\$&').replace(/\*/g, '.*');
+      const pattern = new RegExp(`^${escaped}$`);
+      for (const name of runtime) expect(pattern.test(name), `${glob} ignores ${name}`).toBe(false);
+    }
   });
 });
 
@@ -406,9 +451,12 @@ describe('the image and the workflows, as they run (comments left out)', () => {
     expect(smoke).toMatch(/check\(\s*app\.writes\.every\(\(code\) => code === 'EACCES'\),/);
   });
 
-  it('deploys only after its checks, then checks the live relay and publishes the demo, none of it switchable', () => {
-    const jobs = jobsOf(read(`${dir}/deploy.yml`));
-    expect([...jobs.keys()]).toEqual(['verify', 'deploy', 'pages']);
+  it('deploys only after its checks, then checks the live relay, none of it switchable', () => {
+    const raw = read(`${dir}/deploy.yml`);
+    const jobs = jobsOf(raw);
+    // The site left for pages.yml (ADR 0029): nothing here can publish to Pages.
+    expect([...jobs.keys()]).toEqual(['verify', 'deploy']);
+    expect(hashCode(raw)).not.toMatch(/pages: write|id-token: write|github-pages|-pages@/);
     for (const [name, job] of jobs) {
       expect(jobIf(job), name).toBe("github.ref == 'refs/heads/main'");
       expect(stepsOf(job).filter(stepIf), name).toEqual([]);
@@ -424,10 +472,65 @@ describe('the image and the workflows, as they run (comments left out)', () => {
     const live = stepWith(deploy, '/healthz');
     expect(live).toMatch(/^ {6}- name: Check the live relay$/m);
     expect(live).toContain('resource_metadata=');
-    const pages = jobs.get('pages') ?? '';
-    expect(pages).toMatch(/^ {4}needs: deploy$/m);
-    stepWith(pages, 'uses: actions/upload-pages-artifact@');
-    stepWith(pages, 'uses: actions/deploy-pages@');
+    // The live check is the deploy's last word.
+    expect(stepsOf(deploy).at(-1)).toBe(live);
+  });
+
+  it('publishes the site from main only: a build that can only read, then a deploy that runs only deploy-pages (ADR 0029)', () => {
+    const raw = read(`${dir}/pages.yml`);
+    const pages = hashCode(raw);
+    expect(pages).toMatch(/^on:\n {2}workflow_dispatch:\n/m);
+    expect(pages).not.toMatch(
+      /^ {2}(push|pull_request|pull_request_target|schedule|workflow_run|release):/m,
+    );
+    expect(pages).toMatch(/^permissions: \{\}$/m);
+    expect(pages).toMatch(/^concurrency:\n {2}group: pages\n {2}cancel-in-progress: false$/m);
+    const jobs = jobsOf(raw);
+    expect([...jobs.keys()]).toEqual(['build', 'deploy']);
+    for (const [name, job] of jobs) {
+      expect(jobIf(job), name).toBe("github.ref == 'refs/heads/main'");
+      expect(stepsOf(job).filter(stepIf), name).toEqual([]);
+    }
+
+    const build = jobs.get('build') ?? '';
+    expect(permissionsOf(build)).toEqual(['contents: read']);
+    expect(build).not.toMatch(/^ {4}environment:/m);
+    expect(stepWith(build, 'uses: actions/checkout@')).toMatch(
+      /^ {6}- uses: actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n {8}with:\n {10}persist-credentials: false$/m,
+    );
+    expect(stepWith(build, 'uses: actions/setup-node@')).toContain(
+      'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
+    );
+    expect(stepWith(build, 'pnpm site:build')).toMatch(/^ {6}- run: pnpm site:build$/m);
+    expect(stepWith(build, '--ignore-workspace')).toMatch(
+      /^ {6}- run: pnpm --dir apps\/site install --frozen-lockfile --ignore-workspace$/m,
+    );
+    const upload = stepWith(build, 'uses: actions/upload-pages-artifact@');
+    expect(upload).toContain(
+      'actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9',
+    );
+    expect(upload).toMatch(/^ {10}path: apps\/site\/dist$/m);
+
+    // The job that can publish runs no package and no script: deploy-pages alone.
+    const deploy = jobs.get('deploy') ?? '';
+    expect(deploy).toMatch(/^ {4}needs: build$/m);
+    expect(permissionsOf(deploy)).toEqual(['pages: write', 'id-token: write']);
+    expect(deploy).toMatch(/^ {4}environment:\n {6}name: github-pages\n/m);
+    const steps = stepsOf(deploy);
+    expect(steps).toHaveLength(1);
+    expect(steps[0]?.trimEnd()).toMatch(
+      /^ {6}- id: publish\n {8}uses: actions\/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346$/,
+    );
+    expect(deploy).not.toMatch(/^\s*(- )?run:/m);
+  });
+
+  it('builds the site in CI, with the Chromium installed for Playwright', () => {
+    const steps = stepsOf(jobsOf(read(`${dir}/ci.yml`)).get('check') ?? '');
+    const install = steps.findIndex((step) => step.includes('playwright install'));
+    const site = steps.findIndex((step) => /^ {6}- run: pnpm site:build$/m.test(step));
+    expect(install).toBeGreaterThan(-1);
+    expect(site).toBeGreaterThan(install);
+    expect(steps.filter(stepIf)).toEqual([]);
   });
 
   it('reads workflows the way it means to: a disabled step or job is seen', () => {

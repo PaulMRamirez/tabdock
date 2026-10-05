@@ -17,3 +17,11 @@ C. Add `policy.consequentialTools: string[]` to `attach()`. On runtimes that rep
 ## Recommendation
 
 C. It keeps S6 fail-safe on every runtime, gives page authors a one-line fix that also documents intent, and costs one optional field. The demo would pass `consequentialTools: ['clear_board']`. A2.5 gains a case on the polyfill with and without the list.
+
+## Notes from ADR 0026 (5 October 2026)
+
+From M5 the adapter also reports this rule's result in the `tools` frame as `consequential: true`, which the relay uses only to decide whether to ask a client on a page with `confirmVia: 'client'`; the adapter's own rule still decides whether it prompts.
+
+## Notes from ADR 0034 (5 October 2026)
+
+An empty `consequentialTools` list names no tool. Where the runtime drops the hint, a page whose list is empty or missing gets option B and the widget's notice, as one that gave no list always did; the adapter once took an explicitly empty list as authoritative, and the README and SPEC example showed one, so a page copying it on MCP-B 5.1.0 ran its consequential tools unprompted. A page that wants no prompts says `consequential: 'allow'` or names its tools.

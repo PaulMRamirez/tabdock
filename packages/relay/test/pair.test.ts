@@ -23,6 +23,7 @@ import { connectPage, PAGE_ORIGIN, type TestPage, TOOLS } from './helpers/page-c
 import { type JsonAnswer, Phone } from './helpers/phone.ts';
 import { MOCK_SUBJECT, PAIR_CLIENT, startProvider, type TestProvider } from './helpers/provider.ts';
 import { delay, eventually, startRelay, TestFence } from './helpers/relay.ts';
+import { bodyOf } from './helpers/results.ts';
 import {
   PUBLIC_MCP_URL,
   PUBLIC_ORIGIN,
@@ -376,7 +377,8 @@ describe('scan to first call', () => {
     // Claude on the phone, signed in as the same person, finds the page and drives it.
     const { client } = await claudeAs(MOCK_SUBJECT);
     const listed = await client.callTool({ name: 'list_pages', arguments: {} });
-    expect(listed.structuredContent).toEqual({
+    expect(listed.structuredContent).toBeUndefined();
+    expect(bodyOf(listed)).toEqual({
       pages: [
         {
           page: opened.pageId,

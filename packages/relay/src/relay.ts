@@ -28,17 +28,20 @@
 // path or query, so no secret a URL carries reaches a log, and a line a
 // signed-in client can cause at will on /mcp is written once per kind a window,
 // the rest counted (repeated-lines.ts, A4.3), as is each /page upgrade refused,
-// within its address's budget (hub.ts). The client address
-// that /page and /pair count by, and that /mcp's refusal line names, comes
-// from one place (client-address.ts), which answers 400 on a route that counts
-// by address when a host edge names no client (ADR 0018). With an audit
-// directory (production, local mode, or TABDOCK_AUDIT_DIR) the audit log is a
-// FileAuditLog there, bracketed by relay_start and relay_stop records so a
-// restart shows as a gap (ADR 0019); production refuses to start without one,
-// or if relay_start does not reach the disk. The plugin says who someone is
-// and the relay decides whether an invitee may in (ADR 0020). The M3 spike's
-// measurements (spike.ts) hook in here when TABDOCK_SPIKE is on; nothing over
-// HTTP controls them.
+// within its address's budget (hub.ts). Every 2026-07-28 request spends the
+// caller's request budget once, and an /mcp response its client leaves unread
+// is cut off once it stops moving, or once its user has more such responses
+// than they may (response-stalls.ts, ADRs 0030 and 0032).
+// The client address that /page and /pair count by, and that /mcp's refusal
+// line names, comes from one place (client-address.ts), which answers 400 on
+// a route that counts by address when a host edge names no client (ADR 0018).
+// With an audit directory (production, local mode, or TABDOCK_AUDIT_DIR) the
+// audit log is a FileAuditLog there, bracketed by relay_start and relay_stop
+// records so a restart shows as a gap (ADR 0019); production refuses to start
+// without one, or if relay_start does not reach the disk. The plugin says who
+// someone is and the relay decides whether an invitee may in (ADR 0020). The
+// M3 spike's measurements (spike.ts) hook in here when TABDOCK_SPIKE is on;
+// nothing over HTTP controls them.
 
 import { lookup } from 'node:dns/promises';
 import { createServer, type IncomingMessage, type ServerResponse, STATUS_CODES } from 'node:http';
@@ -48,9 +51,13 @@ import { type NodeIncomingMessageLike, toNodeHandler } from '@modelcontextprotoc
 import {
   type AuthInfo,
   createMcpHandler,
+  isJSONRPCRequest,
   isJsonContentType,
   isLegacyRequest,
+  isSpecType,
   type McpHandlerRequestOptions,
+  type McpHttpHandler,
+  ProtocolErrorCode,
   readRequestBody,
 } from '@modelcontextprotocol/server';
 import {
@@ -72,6 +79,7 @@ import {
   notAllowedRefusal,
 } from './auth.ts';
 import { createClientAddresses, loggedAddress } from './client-address.ts';
+import { withStringRequestState } from './confirm.ts';
 import {
   HOSTED_WILDCARD_HOST,
   isLoopbackAddress,
@@ -82,20 +90,29 @@ import {
   type ResolvedConfig,
   resolveConfig,
 } from './config.ts';
-import { PageHub } from './hub.ts';
+import { parseFirstClassName } from './first-class.ts';
+import { EMPTY_FIRST_CLASS, PageHub } from './hub.ts';
 import { ListenStreams } from './listen-streams.ts';
 import { createLogger, type Logger } from './log.ts';
 import {
   type AuthExtra,
   AuthExtraSchema,
+  BUDGET_CODE,
+  callsPageTool,
+  createClientLines,
   createMcpFactory,
   createRequestBudget,
+  envelopeOf,
+  FIXED_TOOL_NAMES,
   RELAY_VERSION,
   userIdOf,
 } from './mcp.ts';
+import { OriginRefusals } from './origin-refusals.ts';
+import { PageToolNotifier } from './page-tool-notifier.ts';
 import { createPairFlow, PAIR_ROUTES, type PairFlow } from './pair.ts';
 import { createRepeatedLog, errorKind } from './repeated-lines.ts';
 import { requestHeapBytes } from './request-heap.ts';
+import { inSlices, ResponseStalls } from './response-stalls.ts';
 import { type InviteeSessionOptions, McpSessions } from './sessions.ts';
 import { createSignInGate } from './sign-in-gate.ts';
 import { Spike, type SpikeControl } from './spike.ts';
@@ -245,6 +262,43 @@ async function readModernBody(request: Request): Promise<ModernBody> {
   }
 }
 
+/**
+ * A 2026-07-28 message that spends a request of its caller's budget as it
+ * arrives, before the SDK sees it (S9, ADRs 0030 and 0032): every JSON-RPC
+ * request but a subscriptions/listen, which spends in listen-streams.ts.
+ * tools/call is no exception, so neither a name the relay does not serve nor
+ * params the SDK refuses before any tool runs, a requestState that is not a
+ * string for one, make a request free, whatever checks the SDK makes there.
+ * `toolAnswers` says whether one past the budget still goes on, to be
+ * refused in the dispatcher with its audit record: a tools/call the SDK's
+ * own schema takes, whose requestState the SDK will not refuse first, naming
+ * one of the five fixed tools, refused in that tool's own words as in M4,
+ * or, while first-class tools are on, a first-class name, refused as
+ * call_page_tool is, so both routes answer and record a call past the budget
+ * alike (SPEC section 7, ADR 0025's notes). relay.ts answers any other
+ * request past the budget itself. A notification carries no request, and a
+ * batch, a response or anything else that is not one request spends only if
+ * the SDK refuses it (refusedBySdk).
+ */
+function arrivalOf(
+  message: unknown,
+  firstClassTools: boolean,
+): { id: string | number; toolAnswers: boolean } | null {
+  if (!isJSONRPCRequest(message)) return null;
+  if (message.method === 'subscriptions/listen') return null;
+  return { id: message.id, toolAnswers: answeredInTool(message, firstClassTools) };
+}
+
+/** Whether the SDK hands this request to the dispatcher for a fixed tool or a first-class name. */
+function answeredInTool(message: unknown, firstClassTools: boolean): boolean {
+  if (!isSpecType.CallToolRequest(message)) return false;
+  // The SDK refuses a present requestState that is not a string before any handler runs.
+  const state: unknown = (message.params as { requestState?: unknown }).requestState;
+  if (state !== undefined && typeof state !== 'string') return false;
+  const { name } = message.params;
+  return FIXED_TOOL_NAMES.has(name) || (firstClassTools && parseFirstClassName(name) !== null);
+}
+
 /** A subscriptions/listen request's JSON-RPC id, or null for any other message. */
 function listenOf(message: unknown): { id: unknown } | null {
   if (typeof message !== 'object' || message === null || Array.isArray(message)) return null;
@@ -261,6 +315,96 @@ function listenOf(message: unknown): { id: unknown } | null {
 function refusedBySdk(response: Response): boolean {
   return response.status >= 400 && response.status < 500 && response.status !== 499;
 }
+
+/**
+ * Every revision /mcp serves, newest first (ADR 0027): 2026-07-28 on the
+ * strict leg, the 2025 revisions on a session, and 2024-11-05 as best effort.
+ */
+export const SERVED_REVISIONS: readonly string[] = [
+  '2026-07-28',
+  '2025-11-25',
+  '2025-06-18',
+  '2025-03-26',
+  '2024-11-05',
+];
+
+function recordAt(value: unknown, key: string): Record<string, unknown> | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const field = (value as Record<string, unknown>)[key];
+  return typeof field === 'object' && field !== null && !Array.isArray(field)
+    ? (field as Record<string, unknown>)
+    : null;
+}
+
+/**
+ * A JSON answer of the strict leg with this status, as `edit` leaves it when
+ * it says it changed something, and otherwise exactly as the SDK wrote it.
+ * The edit works on the parsed answer in place, so every key keeps its place.
+ */
+async function editedAnswer(
+  response: Response,
+  status: number,
+  edit: (message: unknown) => boolean,
+): Promise<Response> {
+  if (response.status !== status) return response;
+  if (!(response.headers.get('content-type') ?? '').includes('application/json')) return response;
+  const body = await response.text();
+  let message: unknown;
+  try {
+    message = JSON.parse(body);
+  } catch {
+    return new Response(body, response);
+  }
+  if (!edit(message)) return new Response(body, response);
+  const headers = new Headers(response.headers);
+  headers.delete('content-length');
+  return new Response(JSON.stringify(message), { status: response.status, headers });
+}
+
+/**
+ * The strict leg's answer to a revision it does not serve, with every
+ * revision /mcp serves in its data.supported, as 2026-07-28 says a server
+ * MUST list them (ADR 0027): the SDK fills the list from the strict leg's
+ * own revisions, and the endpoint serves the 2025 ones too. Nothing else in
+ * the answer changes, and any other answer passes untouched. If a later SDK
+ * lists them all itself, this goes.
+ */
+function withServedRevisions(response: Response): Promise<Response> {
+  return editedAnswer(response, 400, (message) => {
+    const error = recordAt(message, 'error');
+    if (error?.code !== ProtocolErrorCode.UnsupportedProtocolVersion) return false;
+    error.data = { ...recordAt(error, 'data'), supported: [...SERVED_REVISIONS] };
+    return true;
+  });
+}
+
+/**
+ * The strict leg's server/discover answer with every revision /mcp serves in
+ * its supportedVersions, the same list the -32022 answer gives (ADR 0027's
+ * Step 3 review notes): a client that reads the refusal's list against
+ * discover's, as the conformance suite does, finds each one there, and a
+ * client picks the first of its own revisions on the list, which for every
+ * 2026-07-28 client is 2026-07-28. Nothing else in the answer changes.
+ */
+function discoverWithServedRevisions(response: Response): Promise<Response> {
+  return editedAnswer(response, 200, (message) => {
+    const result = recordAt(message, 'result');
+    if (result === null || !Array.isArray(result.supportedVersions)) return false;
+    result.supportedVersions = [...SERVED_REVISIONS];
+    return true;
+  });
+}
+
+function isDiscover(message: unknown): boolean {
+  return isJSONRPCRequest(message) && message.method === 'server/discover';
+}
+
+/** The allowlist's refusal of an Origin, in the shape of the SDK's own guard (ADR 0027). */
+const ORIGIN_REFUSAL = JSON.stringify({
+  jsonrpc: '2.0',
+  error: { code: -32000, message: 'Invalid Origin' },
+  id: null,
+});
 
 /** Paths the relay answers whatever its mode; any other is logged as OTHER_ROUTE. */
 const FIXED_ROUTES: readonly string[] = ['/healthz', '/mcp', '/page', ...PAIR_ROUTES];
@@ -443,33 +587,57 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   const budget = createRequestBudget(config);
   // Lines a signed-in client can cause at will on /mcp: one per kind a window, the rest counted (A4.3).
   const mcpLines = createRepeatedLog(log, config.rateLimits.windowMs);
+  // Which revision each client speaks, one line per user, client and leg an hour (ADR 0027).
+  const clientLines = createClientLines(log);
+  // Refused Origins on /mcp, a few named in full each window apart from the lines above (ADR 0027).
+  const originRefusals = new OriginRefusals(log, config.rateLimits.windowMs);
+  // Responses a client leaves unread are cut off once they stop moving, and a
+  // user's oldest once more of theirs wait than they may, an invitee a
+  // quarter as many as a member (responsesWaitingFor, ADR 0030 and its notes).
+  const stalls = new ResponseStalls({ lines: mcpLines });
   // What each /mcp request's body holds on the heap, measured before either
   // leg reads it, so a call or pairing that waits on a page is charged it
   // (request-heap.ts, ADR 0018's notes). Keyed by the request's own auth
   // object, which handleMcp makes once per request and the SDK hands each
   // tool handler as ctx.http.authInfo.
   const heldBytes = new WeakMap<AuthInfo, number>();
-  const factory = createMcpFactory(hub, config, spike, budget, (authInfo) =>
-    authInfo === undefined ? 0 : (heldBytes.get(authInfo) ?? 0),
-  );
-  const mcp = createMcpHandler(factory, {
-    legacy: 'reject',
-    maxRequestBodySize: MAX_MCP_BODY_BYTES,
-    keepAliveMs: config.timings.sseKeepAliveMs,
-    // The relay's own total for listen streams (listen-streams.ts) refuses
-    // first. A stream marked to give way stays open until the SDK has served
-    // the listen it gives way to, and each listen being answered marks at
-    // most one, so the SDK may hold up to twice the total for a moment; its
-    // default of 1024 would otherwise bind before a larger setting.
-    maxSubscriptions: 2 * config.limits.sessions,
-    onerror: (error) => {
-      // Most are refusals of what a client sent, quoting it; redact() cuts the message short.
-      mcpLines.write('warn', 'mcp handler error', { error }, errorKind(error));
-    },
+  // Whether each 2026-07-28 request spent its budget as it arrived, under the
+  // same key, so the dispatcher neither spends again nor serves one past it.
+  const paidOnArrival = new WeakMap<AuthInfo, boolean>();
+  const refusedLine = (userId: string): void => {
+    mcpLines.write('warn', 'mcp request refused: past the request budget', { userId });
+  };
+  /** A tools/call name the dispatcher sends to a page tool, the calls a confirmation can be for (ADR 0026). */
+  const isPageCall = (name: string): boolean => callsPageTool(name, config.firstClassTools);
+  const factory = createMcpFactory(hub, config, {
+    spike,
+    budget,
+    heldBytesOf: (authInfo) => (authInfo === undefined ? 0 : (heldBytes.get(authInfo) ?? 0)),
+    paidOnArrival: (authInfo) => (authInfo === undefined ? undefined : paidOnArrival.get(authInfo)),
+    refusedLine,
+    clientLines,
   });
-  spike?.setModernNotifier(() => {
-    mcp.notify.toolsChanged();
-  });
+  /**
+   * A strict 2026-07-28 handler. One serves every request but a listen; each
+   * user's listens get one of their own (listen-streams.ts, ADR 0025). The
+   * relay's own caps for listen streams refuse first: a stream marked to
+   * give way stays open until the SDK has served the listen it gives way
+   * to, so a handler may hold up to twice the relay's total for a moment,
+   * and its cap sits there, above anything the gate lets one user hold; the
+   * SDK's default of 1024 would otherwise bind before a larger setting.
+   */
+  const strictHandler = (): McpHttpHandler =>
+    createMcpHandler(factory, {
+      legacy: 'reject',
+      maxRequestBodySize: MAX_MCP_BODY_BYTES,
+      keepAliveMs: config.timings.sseKeepAliveMs,
+      maxSubscriptions: 2 * config.limits.sessions,
+      onerror: (error) => {
+        // Most are refusals of what a client sent, quoting it; redact() cuts the message short.
+        mcpLines.write('warn', 'mcp handler error', { error }, errorKind(error));
+      },
+    });
+  const mcp = strictHandler();
   // The invitee tier (ADRs 0016 and 0017), for 2025-era sessions and listen streams alike.
   const invitees: InviteeSessionOptions = {
     pool: config.limits.inviteeSessions,
@@ -489,6 +657,9 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     log,
     lines: mcpLines,
     windowMs: config.rateLimits.windowMs,
+    // As on the strict leg: a page call's requestState that is not a string
+    // reaches the dispatcher, which answers it not_confirmed (ADR 0026's notes).
+    inbound: (message) => withStringRequestState(message, isPageCall),
   });
   const listens = new ListenStreams({
     perUser: config.limits.sessionsPerUser,
@@ -497,17 +668,53 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     budget,
     log,
     lines: mcpLines,
+    createHandler: strictHandler,
   });
+  // The marker concerns every member, who all list it (spike.ts).
+  spike?.setNotifier(() => {
+    listens.notifyAll();
+    return sessions.notifyAll((userId) => !invitees.isInvitee(userId));
+  });
+  // A member hears of a change to their own first-class list only, on their
+  // own sessions and listen streams, at most once every 10 s and only when
+  // the list changed (page-tool-notifier.ts, ADRs 0025 and 0032).
+  const notifier = config.firstClassTools
+    ? new PageToolNotifier({
+        digestOf: (userId) => hub.firstClassList(userId).digest,
+        emptyDigest: EMPTY_FIRST_CLASS.digest,
+        send: (userId) => {
+          sessions.notifyUser(userId);
+          listens.notifyUser(userId);
+        },
+      })
+    : null;
+  if (notifier !== null) {
+    hub.onFirstClassChange((userId) => {
+      notifier.changed(userId);
+    });
+  }
   /**
    * The 2026-07-28 leg (A4.3). The body is read once, here, and the SDK
    * handed the parsed value, so no copy of a body stays queued in the
    * request for as long as a stream it opened lives. A listen over its own
    * cap is refused before it costs anything, and every other listen passes
-   * the relay's bounds (listen-streams.ts). A request the SDK refuses reached
-   * no tool, which would have spent the caller's budget itself, so it spends
-   * one here: refusals cost like calls, and a flood of them runs dry.
+   * the relay's bounds (listen-streams.ts) to its user's own handler. Every
+   * other request spends one request of its caller's budget as it arrives
+   * (arrivalOf), tools/call included: each builds a server of its own
+   * (createMcpFactory), so 50 tools/list on a budget of 3 all answered in
+   * M4, and a tools/call with an unknown name or a requestState that is not
+   * a string still passed in M5's first build. Past the budget it is
+   * answered 429 in the budget's own words, with no audit record, since it
+   * asks nothing of a page, as a refused listen is; only a call that a fixed
+   * tool will answer goes on, so that tool refuses it with its record (S7).
+   * A body that is not one request and that the SDK refuses reached no tool
+   * either, so it spends one then: refusals cost like calls, and a flood of
+   * them runs dry. Each request counts once. Each request that paid also
+   * names its client for the hour's `mcp client` line, and server/discover
+   * and an answer to a revision the leg does not serve both list every
+   * revision /mcp serves (ADR 0027 and its Step 3 review notes).
    */
-  const modern = async (
+  const strictLeg = async (
     request: Request,
     options?: McpHandlerRequestOptions,
   ): Promise<Response> => {
@@ -517,24 +724,50 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     const caller = { userId: extra.data.userId, kind: extra.data.kind };
     const body = await readModernBody(request);
     let response: Response;
+    let spent = false;
     if (body.kind === 'unread') {
       response = await mcp.fetch(request, options);
     } else if (body.kind === 'answered') {
       response = body.response;
     } else {
-      const listen = listenOf(body.message);
-      const parsed = { ...options, parsedBody: body.message };
+      // A call to a page tool whose requestState is not a string is a forged
+      // retry: as a string the codec refuses, it is answered not_confirmed
+      // with its call line, not the SDK's frozen -32602 (ADR 0026's notes).
+      const message = withStringRequestState(body.message, isPageCall);
+      const listen = listenOf(message);
+      const parsed = { ...options, parsedBody: message };
+      const arrival = listen === null ? arrivalOf(message, config.firstClassTools) : null;
+      if (arrival !== null) {
+        spent = true;
+        const paid = budget.spend(caller.userId, caller.kind);
+        if (options?.authInfo !== undefined) paidOnArrival.set(options.authInfo, paid);
+        if (!paid && !arrival.toolAnswers) {
+          refusedLine(caller.userId);
+          return jsonRpcError(429, BUDGET_CODE, budget.refusal(caller.kind), arrival.id);
+        }
+        // Only a request that paid names its client, so requests refused
+        // past the budget, which cost their sender nothing more, write no
+        // line; a listen spends in its own gate and its client's other
+        // requests name it.
+        const envelope = paid && isJSONRPCRequest(message) ? envelopeOf(message) : null;
+        if (envelope !== null) {
+          clientLines.write({ userId: caller.userId, leg: 'strict', ...envelope });
+        }
+      }
       if (listen === null) {
         response = await mcp.fetch(request, parsed);
+        if (isDiscover(message)) response = await discoverWithServedRevisions(response);
       } else if (body.bytes > MAX_LISTEN_BODY_BYTES) {
         response = tooLarge(MAX_LISTEN_BODY_BYTES, listen.id);
       } else {
-        return listens.open(caller, listen.id, request.signal, () => mcp.fetch(request, parsed));
+        return listens.open(caller, listen.id, request.signal, (own) => own.fetch(request, parsed));
       }
     }
-    if (refusedBySdk(response)) budget.spend(caller.userId, caller.kind);
+    if (!spent && refusedBySdk(response)) budget.spend(caller.userId, caller.kind);
     return response;
   };
+  const modern = async (request: Request, options?: McpHandlerRequestOptions): Promise<Response> =>
+    withServedRevisions(await strictLeg(request, options));
   const legs = {
     fetch: async (request: Request, options?: McpHandlerRequestOptions): Promise<Response> => {
       if (request.method === 'POST' && options?.authInfo !== undefined) {
@@ -576,7 +809,20 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         : forward(request);
     },
   };
-  const mcpNode = toNodeHandler(legs, {
+  // Every answer goes to the adapter in slices, so a client reading a large
+  // one shows progress as each slice is written (response-stalls.ts, ADR 0032).
+  // Before it is written its user's oldest responses waiting past their cap
+  // go, so answers that arrive between two checks cannot pile up unread
+  // (ADR 0030's notes).
+  const sliced = {
+    fetch: async (request: Request, options?: McpHandlerRequestOptions): Promise<Response> => {
+      const answer = await legs.fetch(request, options);
+      const userId = userIdOf(options?.authInfo);
+      if (userId !== null) stalls.answering(userId);
+      return inSlices(answer);
+    },
+  };
+  const mcpNode = toNodeHandler(sliced, {
     maxRequestBodySize: MAX_MCP_BODY_BYTES,
     onerror: (error) => {
       // undici's message for a Request it cannot build quotes the URL, query and all.
@@ -666,6 +912,16 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     // Named in refusal lines only: /mcp never counts by address (ADR 0016),
     // so a header that names no client is no reason to refuse it.
     const client = addresses.of(request);
+    // ADR 0027 (S12): a present Origin must be exactly an allowed one, checked
+    // before anything that spends, challenges or answers, on either leg. Node
+    // joins two Origin lines with a comma, which matches no origin. A request
+    // with none passes: the header is a browser's, and Claude Code sends none.
+    const origin = request.headers.origin;
+    if (origin !== undefined && !config.isMcpOriginAllowed(origin)) {
+      originRefusals.refused(origin, loggedAddress(client));
+      send(response, 403, ORIGIN_REFUSAL, { 'Content-Type': 'application/json' });
+      return;
+    }
     // Before the plugin, so a proxied request never even gets a challenge.
     if (config.publicUrl === null && !madeLocally(request)) {
       mcpLines.write('info', 'mcp request refused: not made on this machine', {
@@ -708,6 +964,9 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     // under exactOptionalPropertyTypes (method is string | undefined there).
     const withAuth = request as IncomingMessage & { auth?: AuthInfo };
     withAuth.auth = authInfo;
+    // Until it finishes or closes: one the client leaves unread is cut off
+    // (ADR 0030), and one queued on a connection that closes is ended with it.
+    stalls.track(response, outcome.user.userId, request.socket);
     await mcpNode(withAuth as NodeIncomingMessageLike, response);
   }
 
@@ -878,8 +1137,13 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     await hub.shutdown();
     await closeAudit(store.audit);
     await mcp.close();
+    await listens.closeAll();
     await sessions.closeAll();
+    notifier?.close();
+    stalls.close();
     mcpLines.close();
+    originRefusals.close();
+    clientLines.close();
     auth.stop?.();
     throw error;
   }
@@ -896,8 +1160,10 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     env: config.env,
     auth: auth.name,
     origins: config.originPolicy,
+    mcpOrigins: config.mcpOriginPolicy,
     allowMissingOrigin: config.allowMissingOrigin,
     spike: config.spike,
+    firstClassTools: config.firstClassTools,
   });
   if (spike) {
     log.warn(
@@ -930,11 +1196,16 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
           });
         });
         await mcp.close();
+        await listens.closeAll();
         await sessions.closeAll();
+        notifier?.close();
+        stalls.close();
+        clientLines.close();
         auth.stop?.();
         // The counts of repeated refusals still held go out before the last line.
         refusals.close();
         mcpLines.close();
+        originRefusals.close();
         server.closeAllConnections();
         await new Promise<void>((resolveClose) => {
           server.close(() => {

@@ -266,15 +266,20 @@ const HeaderValueSchema = z.string().regex(/^[\x20-\x7e]{0,2000}$/);
  * never even starts with g_ (ADR 0017), so no member can pass for an invitee
  * or the reverse.
  */
-const AuthUserSchema = UserSchema.extend({
-  account: z.object({ kind: UserKindSchema, email: EmailSchema.nullable() }),
-}).refine(
-  (user) =>
-    user.account.kind === 'invitee'
-      ? InviteeIdSchema.safeParse(user.userId).success
-      : !isInviteePrefixed(user.userId),
-  { message: "an invitee's user id is g_ and its account key, and only an invitee's is" },
-);
+const AuthUserSchema = z
+  .object({
+    // The protocol's schemas are zod/mini (ADR 0028), so its object is
+    // extended by spreading its shape into one of the relay's own.
+    ...UserSchema.shape,
+    account: z.object({ kind: UserKindSchema, email: z.nullable(EmailSchema) }),
+  })
+  .refine(
+    (user) =>
+      user.account.kind === 'invitee'
+        ? InviteeIdSchema.safeParse(user.userId).success
+        : !isInviteePrefixed(user.userId),
+    { message: "an invitee's user id is g_ and its account key, and only an invitee's is" },
+  );
 
 /**
  * The relay checks what a plugin returns before acting on it, as it checks
@@ -284,7 +289,7 @@ export const AuthOutcomeSchema = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('user'),
     user: AuthUserSchema,
-    oauthClientId: OAuthClientIdSchema.nullable(),
+    oauthClientId: z.nullable(OAuthClientIdSchema),
   }),
   z.object({
     kind: z.literal('refused'),
@@ -292,8 +297,8 @@ export const AuthOutcomeSchema = z.discriminatedUnion('kind', [
     reason: z.string().min(1).max(200),
     body: z.string().max(2000),
     headers: z.record(HeaderNameSchema, HeaderValueSchema),
-    accountKind: UserKindSchema.nullable(),
-    oauthClientId: OAuthClientIdSchema.nullable(),
+    accountKind: z.nullable(UserKindSchema),
+    oauthClientId: z.nullable(OAuthClientIdSchema),
   }),
 ]);
 

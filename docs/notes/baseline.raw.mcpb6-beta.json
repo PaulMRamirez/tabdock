@@ -1,0 +1,319 @@
+{
+  "measuredAt": "2026-10-05T08:26:39.059Z",
+  "node": "v22.22.0",
+  "mcpb": {
+    "polyfill": "@mcp-b/webmcp-polyfill@6.0.0-beta.20261001010549",
+    "localRelay": "@mcp-b/webmcp-local-relay@6.0.0-beta.20261001010549"
+  },
+  "browserVersion": "141.0.7390.37",
+  "polyfillMarker": null,
+  "page": {
+    "runtime": {
+      "documentModelContext": true,
+      "navigatorAliasIsSame": false,
+      "executeToolPresent": true,
+      "contextConstructor": "ModelContext"
+    },
+    "getTools": {
+      "ms": 0.4,
+      "names": [
+        "add_item",
+        "clear_board",
+        "get_view",
+        "highlight_item",
+        "list_items",
+        "move_view"
+      ],
+      "sample": {
+        "annotations": {
+          "consequentialHint": true,
+          "debugging": false,
+          "readOnlyHint": false,
+          "untrustedContentHint": false
+        },
+        "description": "Remove every item from the board. This cannot be undone.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        },
+        "name": "clear_board",
+        "origin": "http://127.0.0.1:37693",
+        "title": "Clear board",
+        "window": "[Window]"
+      }
+    },
+    "registration": {
+      "registerResolvedMs": 0.1,
+      "toolchangeAfterRegisterMs": 0.1,
+      "eventBeforeResolve": true,
+      "eventType": "toolchange",
+      "eventDetail": null,
+      "unregisterToolchangeMs": 0.3,
+      "burstOfFiveEvents": 5,
+      "duplicateName": {
+        "label": "duplicate name",
+        "ok": false,
+        "kind": "InvalidStateError",
+        "value": "A tool named baseline_probe is already registered",
+        "ms": 0.7
+      },
+      "annotationsRoundTrip": {
+        "consequentialHint": true,
+        "debugging": false,
+        "readOnlyHint": true,
+        "untrustedContentHint": true
+      }
+    },
+    "inputMode": "object",
+    "execute": [
+      {
+        "label": "args as JSON string",
+        "ok": false,
+        "kind": "TypeError",
+        "value": "inputObject must be an object",
+        "ms": 0.2
+      },
+      {
+        "label": "args as object",
+        "ok": true,
+        "kind": "string",
+        "value": "{\"n\":1}",
+        "ms": 0.2
+      },
+      {
+        "label": "args omitted",
+        "ok": true,
+        "kind": "string",
+        "value": "{}",
+        "ms": 0.1
+      },
+      {
+        "label": "args violate inputSchema (n is a string)",
+        "ok": true,
+        "kind": "string",
+        "value": "{\"n\":\"one\"}",
+        "ms": 0.2
+      },
+      {
+        "label": "tool passed by name only",
+        "ok": false,
+        "kind": "TypeError",
+        "value": "description is required",
+        "ms": 0.1
+      },
+      {
+        "label": "handler throws (highlight unknown id)",
+        "ok": false,
+        "kind": "UnknownError",
+        "value": "Tool execution failed",
+        "ms": 19
+      },
+      {
+        "label": "returns string",
+        "ok": true,
+        "kind": "string",
+        "value": "\"plain text\"",
+        "ms": 0.1
+      },
+      {
+        "label": "returns number",
+        "ok": true,
+        "kind": "string",
+        "value": "42",
+        "ms": 0.1
+      },
+      {
+        "label": "returns undefined",
+        "ok": false,
+        "kind": "UnknownError",
+        "value": "Tool execution failed",
+        "ms": 0.2
+      },
+      {
+        "label": "returns MCP CallToolResult",
+        "ok": true,
+        "kind": "string",
+        "value": "{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}",
+        "ms": 0.2
+      }
+    ],
+    "abort": {
+      "rejection": {
+        "label": "abort after 100 ms",
+        "ok": false,
+        "kind": "AbortError",
+        "value": "signal is aborted without reason",
+        "ms": 100.4
+      },
+      "handlerSawAbort": true,
+      "handlerSignalReason": "AbortError: signal is aborted without reason",
+      "handlerSecondArg": "object with keys [signal], signal is an AbortSignal"
+    },
+    "lifecycle": {
+      "unregisterMidRun": {
+        "label": "unregister 100 ms into a 300 ms handler",
+        "ok": true,
+        "kind": "string",
+        "value": "\"finished\"",
+        "ms": 300.7,
+        "handlerFinishedFirst": true
+      },
+      "vanishedTool": {
+        "label": "tool unregistered before the call",
+        "ok": false,
+        "kind": "UnknownError",
+        "value": "Tool execution failed",
+        "ms": 0.4
+      }
+    }
+  },
+  "relay": {
+    "toolsVisibleAfterLoadMs": 742,
+    "serverInfo": {
+      "name": "webmcp-local-relay",
+      "version": "0.0.0"
+    },
+    "serverCapabilities": {
+      "tools": {
+        "listChanged": true
+      }
+    },
+    "listedTools": [
+      {
+        "name": "webmcp_list_sources",
+        "annotations": {
+          "readOnlyHint": true,
+          "idempotentHint": true
+        }
+      },
+      {
+        "name": "webmcp_list_tools",
+        "annotations": {
+          "readOnlyHint": true,
+          "idempotentHint": true
+        }
+      },
+      {
+        "name": "webmcp_open_page",
+        "annotations": {
+          "readOnlyHint": false
+        }
+      },
+      {
+        "name": "add_item",
+        "annotations": {
+          "readOnlyHint": false
+        }
+      },
+      {
+        "name": "clear_board",
+        "annotations": {
+          "readOnlyHint": false
+        }
+      },
+      {
+        "name": "get_view",
+        "annotations": {
+          "readOnlyHint": true
+        }
+      },
+      {
+        "name": "highlight_item",
+        "annotations": {
+          "readOnlyHint": false
+        }
+      },
+      {
+        "name": "list_items",
+        "annotations": {
+          "readOnlyHint": true
+        }
+      },
+      {
+        "name": "move_view",
+        "annotations": {
+          "readOnlyHint": false
+        }
+      }
+    ],
+    "clearBoardAsListed": {
+      "name": "clear_board",
+      "title": "Clear board",
+      "description": "[WebMCP 217de144-9ca2-4c8f-a8e5-1cdb38e57144 • Tabdock demo board] Remove every item from the board. This cannot be undone.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false
+      }
+    },
+    "callSample": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"x\":0,\"y\":0,\"zoom\":1,\"width\":960,\"height\":432,\"visibleItemIds\":[\"item-1\",\"item-2\",\"item-3\"]}"
+        }
+      ],
+      "structuredContent": {
+        "x": 0,
+        "y": 0,
+        "zoom": 1,
+        "width": 960,
+        "height": 432,
+        "visibleItemIds": [
+          "item-1",
+          "item-2",
+          "item-3"
+        ]
+      },
+      "isError": false
+    },
+    "errorSample": {
+      "content": [
+        {
+          "type": "text",
+          "text": "Tool execution failed"
+        }
+      ],
+      "isError": true
+    },
+    "badArgsSample": {
+      "content": [
+        {
+          "type": "text",
+          "text": "Input validation error: Invalid arguments for tool move_view: data must have required property 'y', data/x must be number"
+        }
+      ],
+      "isError": true
+    },
+    "lateToolCallSample": {
+      "content": [
+        {
+          "type": "text",
+          "text": "late"
+        }
+      ],
+      "structuredContent": {
+        "result": "late"
+      },
+      "isError": false
+    },
+    "getToolsWithEmbedMs": [
+      0.2,
+      0.1,
+      0.2
+    ],
+    "getViewRoundTripMs": {
+      "n": 50,
+      "failed": 0,
+      "p50": 2.3,
+      "p95": 4.1,
+      "max": 7.3
+    },
+    "lateToolListChangedMs": 22,
+    "lateToolVisibleMs": 26
+  }
+}

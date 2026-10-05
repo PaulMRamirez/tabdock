@@ -11,6 +11,15 @@ export const PROTOCOL_VERSION = 1;
 /** Largest page link frame either side accepts, in bytes. */
 export const MAX_FRAME_BYTES = 1024 * 1024;
 
+/**
+ * The most an invoke's confirmation (ADR 0026) adds to its encoded frame:
+ * `,"confirmation":{"by":"client","confirmationId":"<64 id characters>","at":<a
+ * safe integer>}`. The relay measures every invoke with this much to spare,
+ * so a call that fits when it arrives still fits once confirmed, and nobody
+ * is asked about a call too large to send (ADR 0032).
+ */
+export const MAX_CONFIRMATION_FRAME_BYTES = 137;
+
 /** Tool results longer than this many characters are truncated with a visible marker. */
 export const MAX_RESULT_CHARS = 120_000;
 
@@ -42,6 +51,14 @@ export const PAIR_WAIT_MS = 50_000;
 
 /** Default time a page gets to answer one call. */
 export const DEFAULT_CALL_DEADLINE_MS = 45_000;
+
+/**
+ * The longest delay setTimeout honours, in browsers and Node alike. A longer
+ * one fires early: Chromium ran a 2^31 ms timer at once and wrapped 2^32 +
+ * 5000 ms to 5 s, and Node runs it after 1 ms. So the relay refuses timings
+ * past it and the adapter caps a relay's deadline under it (ADR 0030).
+ */
+export const MAX_TIMER_MS = 2_147_483_647;
 
 /** The adapter re-reads the tool list this often in case toolchange never fires. */
 export const TOOL_POLL_MS = 2000;
@@ -108,6 +125,36 @@ export const UNVERIFIED_ACCOUNT_NAME = 'unverified account';
 export const MAX_EMAIL_CHARS = 320;
 /** A user's display name on the wire; an invitee's email is cut to 97 characters and '...' to fit. */
 export const MAX_DISPLAY_NAME_CHARS = 100;
+
+// First-class page tools (ADR 0025): SPEC section 7's and S9's numbers. Only
+// the relay uses them, and they live here beside the rest so a number changes
+// here or nowhere.
+
+/**
+ * The longest first-class name, `<page id>__<tool>`, the relay lists: connector
+ * review's cap, which leaves 49 characters for the tool's own name.
+ */
+export const MAX_FIRST_CLASS_NAME_CHARS = 64;
+/** Page tools in one user's first-class list (S9). */
+export const MAX_FIRST_CLASS_TOOLS_PER_USER = 64;
+/** Characters of one user's first-class entries, counted as JSON text (S9). */
+export const MAX_FIRST_CLASS_CHARS_PER_USER = 100_000;
+/** A first-class entry's whole description, the relay's prefix included (S10). */
+export const MAX_FIRST_CLASS_DESCRIPTION_CHARS = 500;
+/** A first-class entry's title, the origin's host included; the page's part is what is cut. */
+export const MAX_FIRST_CLASS_TITLE_CHARS = 120;
+/** Characters of the page's origin that the description's prefix names. */
+export const MAX_FIRST_CLASS_ORIGIN_CHARS = 100;
+/** ttlMs on a 2026-07-28 tools/list while first-class tools are on, always with cacheScope private. */
+export const FIRST_CLASS_LIST_TTL_MS = 10_000;
+/**
+ * The least time between two tool list change notifications to one user: a
+ * list's own ttlMs. Every 2026-07-28 tools/list spends the request budget
+ * (ADR 0030), and a client lists again on each change, so at one a second a
+ * page that kept changing its tools spent a member's whole 240 a minute
+ * through four clients; at one every 10 s four clients spend 24 (ADR 0032).
+ */
+export const FIRST_CLASS_NOTIFY_INTERVAL_MS = 10_000;
 
 // The audit log (ADR 0019).
 

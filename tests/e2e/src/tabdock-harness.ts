@@ -1,6 +1,6 @@
 // Shared setup for Tabdock in a real browser: the relay on a free port with
 // throwaway dev tokens, the demo page served beside it and opened with ?relay
-// and ?e2e, and MCP clients from the official SDK with a bearer header. The
+// and ?e2e=<its key>, and MCP clients from the official SDK with a bearer header. The
 // Playwright specs, the milestone demos and the Claude Code checks all use it.
 
 import { randomBytes } from 'node:crypto';
@@ -18,6 +18,7 @@ import {
   type Relay,
   type RelayOptions,
 } from '@tabdock/relay';
+import { resultJson } from '@tabdock/relay/test/results';
 
 declare global {
   interface Window {
@@ -50,7 +51,7 @@ export async function startTabdock(
   } = {},
 ): Promise<Tabdock> {
   const users = { alice: throwawayUser('alice', 'Alice'), bob: throwawayUser('bob', 'Bob') };
-  const demo = options.demo ?? (await startDemoServer());
+  const demo = options.demo ?? (await startDemoServer({ e2eHook: true }));
   let relay: Relay;
   try {
     relay = await createRelay({
@@ -70,7 +71,7 @@ export async function startTabdock(
     relay,
     demo,
     users,
-    pageUrl: demoPageUrl(demo.url, relay.pageUrl),
+    pageUrl: demoPageUrl(demo, relay.pageUrl),
     async close() {
       await relay.close();
       if (!options.demo) await demo.close();
@@ -78,10 +79,18 @@ export async function startTabdock(
   };
 }
 
-export function demoPageUrl(demoUrl: string, relayPageUrl: string, e2e = true): string {
-  const url = new URL(demoUrl);
+/**
+ * The board linked to `relayPageUrl`, by default with the ?e2e test hook
+ * under the demo server's own key, which only a server started with
+ * `e2eHook` offers (ADR 0029's notes).
+ */
+export function demoPageUrl(demo: DemoServer, relayPageUrl: string, e2e = true): string {
+  const url = new URL(demo.url);
   url.searchParams.set('relay', relayPageUrl);
-  if (e2e) url.searchParams.set('e2e', '');
+  if (e2e) {
+    if (demo.e2eKey === null) throw new Error('start the demo server with e2eHook: true');
+    url.searchParams.set('e2e', demo.e2eKey);
+  }
   return url.href;
 }
 
@@ -129,7 +138,11 @@ export async function callTool(
 ): Promise<ToolOutcome> {
   const result = await client.callTool({ name, arguments: args });
   const text = result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n');
-  return { isError: result.isError === true, text, structured: result.structuredContent };
+  return {
+    isError: result.isError === true,
+    text,
+    structured: resultJson(text, result.structuredContent),
+  };
 }
 
 export function errorCode(outcome: ToolOutcome): ErrorCode | null {
@@ -393,6 +406,33 @@ export async function widgetText(page: Page, role: string): Promise<string | nul
   } finally {
     await cdp.detach();
   }
+}
+
+/**
+ * What a function returns, by value, when run in the page with `this` as the
+ * widget node whose data-role is `role`; null while there is no such node.
+ * For a spec that needs the widget as it is laid out on screen, which the
+ * closed shadow root keeps from page script and from Playwright's selectors.
+ */
+export async function widgetEvaluate(
+  page: Page,
+  role: string,
+  functionDeclaration: string,
+): Promise<unknown> {
+  return withCdp(page, async (cdp) => {
+    const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
+    const node = findNode(root, (n) => attribute(n, 'data-role') === role);
+    if (!node) return null;
+    const { object } = await cdp.send('DOM.resolveNode', { backendNodeId: node.backendNodeId });
+    if (object.objectId === undefined) return null;
+    const { result, exceptionDetails } = await cdp.send('Runtime.callFunctionOn', {
+      objectId: object.objectId,
+      functionDeclaration,
+      returnByValue: true,
+    });
+    if (exceptionDetails) throw new Error(`the function threw: ${exceptionDetails.text}`);
+    return result.value as unknown;
+  });
 }
 
 /** One entry of a widget list as the operator sees it: its text, and its data-* attributes for telling entries apart. */

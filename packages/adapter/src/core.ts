@@ -33,6 +33,7 @@ import {
   MAX_INVITE_USES,
   MAX_LIVE_INVITES_PER_PAGE,
   MAX_RESULT_CHARS,
+  MAX_TIMER_MS,
   type PageErrorCode,
   type PageFrameInput,
   PageFrameSchema,
@@ -58,6 +59,7 @@ import {
   truncate,
   type User,
 } from '@tabdock/protocol';
+import * as z from 'zod/mini';
 import { apply } from './taken.ts';
 import {
   isConsequential,
@@ -332,6 +334,13 @@ export interface ActivityEntry {
   readonly client: ClientInfo | null;
   readonly tool: string;
   readonly outcome: ActivityOutcome;
+  /**
+   * 'client' when the page ran this consequential call without its prompt
+   * because the caller confirmed it in their own MCP client, which the page
+   * takes only under its own policy, rule and grant (ADR 0026); null
+   * otherwise, including every call the operator confirmed here.
+   */
+  readonly confirmedBy: 'client' | null;
   /** Milliseconds from arrival to the end; null while the call runs. */
   readonly durationMs: number | null;
   /**
@@ -505,6 +514,26 @@ export const MAX_WAITING_WRITES = 32;
  */
 export const UNWATCHED_HANDLER_GRACE_MS = 2000;
 
+/**
+ * The longest deadline the page takes from a relay. The schema takes any
+ * positive safe integer, since refusing the frame would close the link over
+ * one odd deadline; but a timer past MAX_TIMER_MS fires at once, ending the
+ * call early, and holdUnwatched adds its grace on top. Tabdock's own relay
+ * never sends more; this is for one the adapter does not trust (ADR 0030).
+ */
+export const MAX_DEADLINE_MS = MAX_TIMER_MS - UNWATCHED_HANDLER_GRACE_MS;
+
+/**
+ * How many ids of calls that put a prompt before the operator the page
+ * remembers, taking no later call under any of them (onInvoke), so an answer
+ * keyed by call id, such as Dock.confirm's, can only ever reach the prompt it
+ * was about. Tabdock's relay draws a fresh random id for every call, so only
+ * a relay that lies reuses one, and to reuse one past this bound it must
+ * first raise this many newer prompts before the operator. A UI port's
+ * answer is bound to its own prompt whatever this remembers (askConfirm).
+ */
+export const REMEMBERED_PROMPT_IDS = 1000;
+
 /** Results are cut this far under the cap so the truncation marker fits under it too. */
 const MARKER_ROOM = 100;
 
@@ -559,9 +588,14 @@ const POLYFILL_UNREGISTERED = 'Tool unregistered';
 /** Its UnknownError for a tool already gone when the call starts, before any handler runs. */
 const POLYFILL_NOT_FOUND = /^Tool not found/;
 
+/**
+ * Names both majors' entry points: MCP-B 6 exports only installWebMCP(), and
+ * 5.x only initializeWebMCPPolyfill() (docs/notes/verified.md, ADR 0001's notes).
+ */
 const POLYFILL_HINT =
   'document.modelContext is missing, so Tabdock stays idle. Load a WebMCP polyfill first ' +
-  "(for example @mcp-b/webmcp-polyfill's initializeWebMCPPolyfill()) or use a browser with WebMCP enabled.";
+  "(for example @mcp-b/webmcp-polyfill's installWebMCP() on 6.x, or initializeWebMCPPolyfill() on 5.x) " +
+  'or use a browser with WebMCP enabled.';
 
 const HINT_NOTICE =
   "This browser's WebMCP does not report consequentialHint, so every tool that is not read-only " +
@@ -613,8 +647,16 @@ interface CallRecord {
   /** From the executeTool call until the runtime settles it, which may be after the call was answered. */
   executing: boolean;
   deadline: unknown;
-  /** Set while the call waits for the operator's confirmation. */
-  confirm: { readonly resolve: (allow: boolean) => void; readonly port: AbortController } | null;
+  /**
+   * Set while the call waits for the operator's confirmation. The prompt and
+   * its port name this one prompt, so an answer is checked against them,
+   * never only against the call id a relay chose.
+   */
+  confirm: {
+    readonly resolve: (allow: boolean) => void;
+    readonly port: AbortController;
+    readonly pending: PendingConfirm;
+  } | null;
 }
 
 type Checked = { ok: true; tool: NormalisedTool } | { ok: false; refusal: Refusal };
@@ -866,7 +908,7 @@ function parseRevoked(text: string): { pageId: string; users: string[] } | null 
   const record = JsonObjectSchema.safeParse(parseJson(text));
   if (!record.success) return null;
   const pageId = IdSchema.safeParse(record.data.pageId);
-  const users = IdSchema.array().safeParse(record.data.users);
+  const users = z.array(IdSchema).safeParse(record.data.users);
   if (!pageId.success || !users.success) return null;
   return { pageId: pageId.data, users: users.data };
 }
@@ -983,6 +1025,29 @@ function checkRelayUrl(relayUrl: string): void {
 }
 
 /**
+ * A bad policy is a page bug; throwing here surfaces it at attach(). The
+ * error is a TypeError naming the fields, as for a bad relay URL, so zod's
+ * own error class never becomes part of attach()'s contract, and it never
+ * quotes a value the page passed (ADR 0032).
+ */
+function checkPolicy(input: unknown): Policy {
+  const parsed = PolicySchema.safeParse(input);
+  if (parsed.success) return parsed.data;
+  const fields = [
+    ...new Set(
+      parsed.error.issues
+        .map((issue) => issue.path.map((part) => String(part)).join('.'))
+        .filter((field) => field !== ''),
+    ),
+  ];
+  throw new TypeError(
+    fields.length === 0
+      ? 'invalid policy: it must be an object'
+      : `invalid policy for ${fields.join(', ')}`,
+  );
+}
+
+/**
  * Removes what an adapter before ADR 0011 kept under the relay URL alone, for
  * every page of the origin at once. None of it is read, as it may belong to
  * another page; removing it keeps a stale token out of storage. A pause
@@ -1000,9 +1065,7 @@ function forgetLegacyRecords(storage: StorageLike | undefined, relayUrl: string)
 
 export function createAdapterCore(options: CoreOptions): AdapterCore {
   checkRelayUrl(options.relayUrl);
-  // A bad policy is a page bug; throwing here surfaces it at attach().
-  const policy = PolicySchema.parse(options.policy ?? {});
-  const pageListedTools = options.policy?.consequentialTools !== undefined;
+  const policy = checkPolicy(options.policy ?? {});
   const context = options.modelContext;
   const log = options.logger ?? consoleLogger;
   const clock = options.clock ?? (() => Date.now());
@@ -1069,6 +1132,15 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   let silenceLimit = IDLE_TIMEOUT_MS + SILENCE_GRACE_MS;
   let lock: { release: () => void } | null = null;
   const calls = new Map<string, CallRecord>();
+  /**
+   * Ids of calls that put a prompt before the operator, oldest first, up to
+   * REMEMBERED_PROMPT_IDS, for as long as this page runs: across links too,
+   * since a host's dialog outlives a link. Dock.confirm finds a prompt by
+   * its call id alone, so a relay that cancelled a prompted call and sent
+   * another under its id would have a host dialog still showing the first
+   * prompt, or a click landing as it changes, confirm the second.
+   */
+  const promptedIds = new Set<string>();
   const requests = new Map<string, RequestRecord>();
   /**
    * The roles the operator granted on this page, by user id: the root of S5's
@@ -1295,11 +1367,16 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       if (grant.endsAt !== undefined && grant.endsAt > now) next = Math.min(next, grant.endsAt);
     }
     if (next === Infinity) return;
-    grantEndTimer = timers.setTimeout(() => {
-      grantEndTimer = null;
-      setState({});
-      armGrantEnd();
-    }, next - now);
+    // An end read back from storage can lie past the timer maximum, which
+    // would fire at once and rearm forever; waking early only rearms.
+    grantEndTimer = timers.setTimeout(
+      () => {
+        grantEndTimer = null;
+        setState({});
+        armGrantEnd();
+      },
+      Math.min(next - now, MAX_TIMER_MS),
+    );
   }
 
   loadGrants();
@@ -1579,8 +1656,14 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       MARKER_ROOM * 2,
       Math.min(MAX_RESULT_CHARS, frame.limits.maxResultChars),
     );
-    // Never shorter than the protocol's own: a tiny value would turn the watchdog into a reconnect loop.
-    silenceLimit = Math.max(IDLE_TIMEOUT_MS, frame.limits.idleTimeoutMs) + SILENCE_GRACE_MS;
+    // Never shorter than the protocol's own: a tiny value would turn the
+    // watchdog into a reconnect loop. Nor past the timer maximum: the schema
+    // takes any positive integer, and a longer timer fires at once in
+    // Chromium, the same loop (ADR 0030, as for deadlineMs).
+    silenceLimit = Math.min(
+      MAX_TIMER_MS,
+      Math.max(IDLE_TIMEOUT_MS, frame.limits.idleTimeoutMs) + SILENCE_GRACE_MS,
+    );
     armWatchdog();
     setState({
       link: 'linked',
@@ -1772,9 +1855,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       lastProblemsKey = problemsKey;
       for (const problem of snapshot.problems) log.warn(problem);
     }
-    const notice = needsHintNotice(snapshot.hintSupport, policy, pageListedTools)
-      ? HINT_NOTICE
-      : null;
+    const notice = needsHintNotice(snapshot.hintSupport, policy) ? HINT_NOTICE : null;
     if (notice !== state.notice) setState({ notice });
     return snapshot;
   }
@@ -1790,10 +1871,26 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       if (lastToolsKey === null && send({ t: 'tools', tools: [] })) lastToolsKey = '[]';
       return;
     }
-    const tools = fitTools(snapshot.tools.map((tool) => tool.page));
+    const tools = fitTools(snapshot.tools.map((tool) => wireTool(tool.page, snapshot)));
     const key = JSON.stringify(tools);
     if (key === lastToolsKey) return;
     if (send({ t: 'tools', tools })) lastToolsKey = key;
+  }
+
+  /**
+   * A tool as the tools frame carries it: marked consequential: true when
+   * ADR 0002's rule classes it so, whose inputs (the runtime's hint support
+   * and this page's list) only the page has, so the relay knows when a page
+   * that opted in may have the caller confirm in their client (ADR 0026).
+   * Marked whatever confirmVia and the consequential policy say, since the
+   * mark says what the tool is, not who confirms; the page's own rule, not
+   * the mark, still decides whether it prompts. Unmarked tools carry no key,
+   * so their entries stay as an older adapter sent them.
+   */
+  function wireTool(tool: PageTool, snapshot: ToolSnapshot): PageTool {
+    return isConsequential(tool, snapshot.hintSupport, policy)
+      ? { ...tool, consequential: true }
+      : tool;
   }
 
   /** Drops tools from the end until the frame fits; only a page with huge schemas gets here. */
@@ -1821,7 +1918,14 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       log.warn(`ignored a repeated invoke for call ${frame.callId}`);
       return;
     }
+    // S6: an id that named a prompt keeps naming only that prompt
+    // (REMEMBERED_PROMPT_IDS), so an answer meant for it settles no other call.
+    if (promptedIds.has(frame.callId)) {
+      log.warn(`ignored an invoke under call ${frame.callId}, whose id a prompt here has used`);
+      return;
+    }
     const now = clock();
+    const deadlineMs = Math.min(frame.deadlineMs, MAX_DEADLINE_MS);
     const { userId, displayName, client } = frame.caller;
     const entry: ActivityEntry = Object.freeze({
       callId: frame.callId,
@@ -1830,13 +1934,14 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       client: client === null ? null : Object.freeze({ ...client }),
       tool: frame.tool,
       outcome: 'running',
+      confirmedBy: null,
       durationMs: null,
       handlerRunning: false,
     });
     const call: CallRecord = {
       frame,
       seq: nextSeq++,
-      deadlineAt: now + frame.deadlineMs,
+      deadlineAt: now + deadlineMs,
       controller: new AbortController(),
       entry,
       stage: 'admitting',
@@ -1849,7 +1954,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     setState({ activity: [entry, ...state.activity].slice(0, ACTIVITY_LIMIT) });
     call.deadline = timers.setTimeout(() => {
       onDeadline(call);
-    }, frame.deadlineMs);
+    }, deadlineMs);
     if (state.paused) {
       finish(call, PAUSED);
       return;
@@ -2064,7 +2169,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     snapshot: ToolSnapshot,
   ): Promise<void> {
     const { frame } = call;
-    if (isConsequential(tool.page, snapshot.hintSupport, policy, pageListedTools)) {
+    if (isConsequential(tool.page, snapshot.hintSupport, policy)) {
       if (policy.consequential === 'deny') {
         finish(call, {
           ok: false,
@@ -2074,21 +2179,28 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         return;
       }
       if (policy.consequential === 'confirm') {
-        const allowed = await askConfirm(call);
-        if (isDone(call)) return;
-        if (!allowed) {
-          finish(call, {
-            ok: false,
-            code: 'denied_by_operator',
-            message: 'the operator denied this call',
-          });
-          return;
-        }
-        // The operator may have lowered this caller's role while the prompt was up.
-        const again = check(frame, snapshot);
-        if (!again.ok) {
-          finish(call, again.refusal);
-          return;
+        if (takesClientConfirmation(call)) {
+          // Nothing is awaited between check() and the handler, so the
+          // grant, roster and role this read are the ones the call runs under.
+          logCall(call, 'confirmed in their client, so the page did not ask');
+          updateEntry(call, { confirmedBy: 'client' });
+        } else {
+          const allowed = await askConfirm(call);
+          if (isDone(call)) return;
+          if (!allowed) {
+            finish(call, {
+              ok: false,
+              code: 'denied_by_operator',
+              message: 'the operator denied this call',
+            });
+            return;
+          }
+          // The operator may have lowered this caller's role while the prompt was up.
+          const again = check(frame, snapshot);
+          if (!again.ok) {
+            finish(call, again.refusal);
+            return;
+          }
         }
       }
     }
@@ -2202,6 +2314,48 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     }
   }
 
+  /**
+   * S6 under ADR 0026: whether an invoke's confirmation lets this
+   * consequential call skip the on-page prompt. The relay's word is taken
+   * only where this page itself would have let the caller confirm: its own
+   * attach() policy chose confirmVia 'client' under consequential 'confirm',
+   * the caller's id is a member's, this page's own grant for them names no
+   * invite (nor does the roster's entry, which can only refuse here), and the
+   * least of that grant, the roster and the invoke's role is driver. proceed
+   * asks only for a tool the page's own rule calls consequential, so a tool
+   * the relay calls consequential and the page does not runs as it always
+   * did. Anything else prompts exactly as before, so a crafted frame skips no
+   * prompt on a page that did not opt in, nor for an invitee, an invite-made
+   * attachment or an observer.
+   */
+  function takesClientConfirmation(call: CallRecord): boolean {
+    const { frame } = call;
+    if (frame.confirmation === undefined) return false;
+    const problem = clientConfirmationProblem(frame);
+    if (problem === null) return true;
+    logCall(call, `asking on the page, as ${problem}, whatever the relay says of their client`);
+    return false;
+  }
+
+  /**
+   * Why the page asks despite an invoke's confirmation, or null when it may
+   * take it; see takesClientConfirmation, which proceed calls only under
+   * consequential 'confirm'. A caller with no grant here never passes the
+   * last check: callerRole gives driver only through a grant.
+   */
+  function clientConfirmationProblem(frame: InvokeFrame): string | null {
+    if (policy.confirmVia !== 'client') return "this page's policy has the operator confirm";
+    const { userId } = frame.caller;
+    if (isInvitee(userId)) return 'the caller is an invitee';
+    if (grants.get(userId)?.inviteId !== undefined) return "an invite made the caller's grant";
+    const listed = state.roster.find((attachment) => attachment.userId === userId);
+    if ((listed?.inviteId ?? null) !== null) {
+      return "the relay lists the caller's attachment as an invite's";
+    }
+    if (callerRole(frame.caller) !== 'driver') return 'the caller is not a driver here';
+    return null;
+  }
+
   function askConfirm(call: CallRecord): Promise<boolean> {
     return new Promise<boolean>((resolve) => {
       const { callId, tool, caller } = call.frame;
@@ -2212,7 +2366,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         expiresAt: call.deadlineAt,
       });
       const port = new AbortController();
-      call.confirm = { resolve, port };
+      call.confirm = { resolve, port, pending };
+      rememberPrompt(callId);
       setState({ pendingConfirms: [...state.pendingConfirms, pending] });
       const ui = options.ui;
       if (!ui?.askConfirm) return;
@@ -2220,7 +2375,16 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         .then(() => ui.askConfirm?.(pending, port.signal))
         .then(
           (answer) => {
-            if (typeof answer === 'boolean') confirmCall(callId, answer);
+            if (typeof answer !== 'boolean') return;
+            // Only while this very prompt still waits, as for attach requests
+            // (show): a port that ignores its signal can answer after the
+            // prompt was settled, by then perhaps under an id the page has
+            // since forgotten and the relay reused for another tool.
+            if (port.signal.aborted || call.confirm?.port !== port) {
+              log.warn('ignored a UI port answer to a confirmation that was already settled');
+              return;
+            }
+            settleConfirmPromise(call, answer);
           },
           (error: unknown) => {
             log.warn(`the UI port failed to ask for a confirmation: ${describe(error)}`);
@@ -2235,9 +2399,17 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     call.confirm = null;
     confirm.port.abort();
     setState({
-      pendingConfirms: state.pendingConfirms.filter((item) => item.callId !== call.frame.callId),
+      pendingConfirms: state.pendingConfirms.filter((item) => item !== confirm.pending),
     });
     confirm.resolve(allow);
+  }
+
+  /** Oldest first, so passing the bound needs that many newer prompts before the operator. */
+  function rememberPrompt(callId: string): void {
+    promptedIds.add(callId);
+    if (promptedIds.size <= REMEMBERED_PROMPT_IDS) return;
+    const oldest = promptedIds.values().next();
+    if (oldest.done !== true) promptedIds.delete(oldest.value);
   }
 
   function confirmCall(callId: string, allow: boolean): boolean {

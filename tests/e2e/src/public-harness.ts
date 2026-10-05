@@ -57,7 +57,7 @@ export async function startPublicTabdock(
   options: PublicTabdockOptions = {},
 ): Promise<PublicTabdock> {
   const provider = await startProvider();
-  const demo = await startDemoServer();
+  const demo = await startDemoServer({ e2eHook: true });
   let relay: Relay;
   try {
     relay = await createRelay({
@@ -88,7 +88,7 @@ export async function startPublicTabdock(
     relay,
     provider,
     demo,
-    pageUrl: demoPageUrl(demo.url, relay.pageUrl),
+    pageUrl: demoPageUrl(demo, relay.pageUrl),
     async close() {
       await relay.close();
       await demo.close();

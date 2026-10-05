@@ -49,6 +49,7 @@ import {
   startRelay,
   type TestRelay,
 } from './helpers/relay.ts';
+import { leakIn } from './helpers/secrecy.ts';
 
 const scratches: string[] = [];
 const relays: TestRelay[] = [];
@@ -390,17 +391,22 @@ describe('pnpm audit:log', () => {
     return { code, out, err };
   }
 
-  it('filters by user, type, outcome and time, and escapes what a client wrote', async () => {
+  it('filters by user, type, outcome and time, and records what a client wrote as one plain line', async () => {
     const dir = await populated();
     const all = run(['--dir', dir]);
     expect(all.code).toBe(0);
     expect(all.out).toHaveLength(5);
     expect(all.out[0]).toMatch(/^1 \d{4}-\d\d-\d\dT.* relay_start /);
-    // Neither the bidi override nor the escape sequence reaches the terminal as itself.
+    // The relay dropped the bidi override and made the escape a space
+    // (parseClientInfo), so neither is in the record to reach a terminal.
     const joined = all.out.join('\n');
     expect(rawEscapes(joined)).toBe(false);
-    expect(joined).toContain('\\u202e');
-    expect(joined).toContain('\\u001b');
+    expect(joined).toContain('client={"name":"evil [31mclient"');
+    const names = records(dir).flatMap((record) =>
+      'client' in record && record.client !== null ? [record.client.name] : [],
+    );
+    expect(names).toContain('evil [31mclient');
+    expect(names.some(rawEscapes)).toBe(false);
 
     expect(run(['--dir', dir, '--user', 'bob']).out).toHaveLength(1);
     expect(run(['--dir', dir, '--type', 'relay_start,relay_stop']).out).toHaveLength(2);
@@ -428,6 +434,41 @@ describe('pnpm audit:log', () => {
     expect(rawEscapes(json.join('\n'))).toBe(false);
     // The directory may come from the environment instead.
     expect(run([], { TABDOCK_AUDIT_DIR: dir }).out).toHaveLength(5);
+  });
+
+  it('escapes what a client wrote in a record from a relay that kept it as written', async () => {
+    const dir = join(scratch(), 'audit');
+    const audit = FileAuditLog.open({
+      dir,
+      retentionDays: 30,
+      maxBytes: 64 * 1024 * 1024,
+      log: createLogger({ sink: quiet }),
+    });
+    audit.append({
+      v: AUDIT_VERSION,
+      type: 'call',
+      at: Date.now(),
+      pageId: 'pg_1',
+      origin: 'https://app.example',
+      userId: 'alice',
+      client: { name: 'evil\u202e\u001b[31mclient', version: '1.0.0' },
+      tool: 'get_view',
+      outcome: 'ok',
+      durationMs: 3,
+    });
+    await audit.close();
+    // Neither the bidi override nor the escape sequence reaches the terminal as itself.
+    for (const argv of [
+      ['--dir', dir],
+      ['--dir', dir, '--json'],
+    ]) {
+      const result = run(argv);
+      expect(result.code).toBe(0);
+      const joined = result.out.join('\n');
+      expect(rawEscapes(joined)).toBe(false);
+      expect(joined).toContain('\\u202e');
+      expect(joined).toContain('\\u001b');
+    }
   });
 
   it('verifies the chain, against a checkpoint too, and exits 1 when it is broken', async () => {
@@ -544,5 +585,75 @@ describe('pnpm audit:log', () => {
     expect(run(['--dir', join(scratch(), 'missing')]).code).toBe(2);
     expect(escapeForTerminal('a\u202eb\u0007c\u2028d')).toBe('a\\u202eb\\u0007c\\u2028d');
     expect(run(['--help']).out.join('\n')).toContain('Usage: pnpm audit:log');
+  });
+
+  it('never repeats an argument it refuses that could be a token pasted in the wrong place (ADR 0028)', () => {
+    const token = `tabdock_${'SECRETsecret'.repeat(3)}SECRET1`;
+    const cases: [string[], string][] = [
+      [[token], 'argument 1 is not one this reader takes: it takes options only'],
+      [['--verify', token], 'argument 2 is not one this reader takes: it takes options only'],
+      [[`--${token}`], 'argument 1 is not one this reader takes'],
+      [[`--header=Bearer ${token}`], 'argument 1 is not one this reader takes'],
+      [[`-H${token}`], 'argument 1 is not one this reader takes'],
+      [['--nonsense'], 'the option --nonsense is not one this reader takes'],
+      [[`--json=${token}`], 'the option --json takes no value'],
+      [['--dir'], 'the option --dir needs a value'],
+      [['--dir', `-${token}`], 'the option --dir needs a value'],
+      [['--', token], 'argument 2 is not one this reader takes: it takes options only'],
+    ];
+    for (const [argv, reason] of cases) {
+      const ran = run(argv);
+      const said = [...ran.out, ...ran.err].join('\n');
+      expect(ran.code, String(argv.length)).toBe(2);
+      expect(leakIn(said, token), reason).toBeNull();
+      expect(ran.err[0], reason).toBe(reason);
+      expect(ran.err[1]).toContain('Usage: pnpm audit:log');
+    }
+  });
+
+  it('never repeats a directory --dir or TABDOCK_AUDIT_DIR gives, which could be a token, and shows the default it derived (ADR 0028)', () => {
+    const token = `tabdock_${'SECRETsecret'.repeat(3)}SECRET1`;
+    const base = scratch();
+    // A file where the directory should be: it exists, and reading it fails.
+    const notADirectory = join(scratch(), token);
+    writeFileSync(notADirectory, '');
+    const cases: [string[], NodeJS.ProcessEnv, string][] = [
+      [['--dir', token], {}, 'no audit directory at the path --dir gives; check it'],
+      [[`--dir=${token}`], {}, 'no audit directory at the path --dir gives; check it'],
+      [['--dir', join(base, token)], {}, 'no audit directory at the path --dir gives; check it'],
+      [
+        [],
+        { TABDOCK_AUDIT_DIR: token },
+        'no audit directory at the path TABDOCK_AUDIT_DIR gives; check it, or give --dir',
+      ],
+      [
+        [],
+        { TABDOCK_AUDIT_DIR: join(base, token) },
+        'no audit directory at the path TABDOCK_AUDIT_DIR gives; check it, or give --dir',
+      ],
+      [
+        ['--dir', notADirectory],
+        {},
+        'cannot read the audit directory at the path --dir gives (ENOTDIR)',
+      ],
+      [
+        [],
+        { TABDOCK_AUDIT_DIR: notADirectory },
+        'cannot read the audit directory at the path TABDOCK_AUDIT_DIR gives (ENOTDIR)',
+      ],
+    ];
+    for (const [argv, env, reason] of cases) {
+      const ran = run(argv, env);
+      expect(ran.code, reason).toBe(2);
+      expect(leakIn([...ran.out, ...ran.err].join('\n'), token), reason).toBeNull();
+      expect(ran.err, reason).toEqual([reason]);
+    }
+    // The default comes from the token directory, never from a value given for the directory.
+    const home = scratch();
+    const derived = run([], { TABDOCK_HOME: home });
+    expect(derived.code).toBe(2);
+    expect(derived.err).toEqual([
+      `no audit directory at ${join(home, 'audit')}; give --dir or TABDOCK_AUDIT_DIR`,
+    ]);
   });
 });

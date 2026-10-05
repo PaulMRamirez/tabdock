@@ -16,6 +16,9 @@
 // directory and bounds (ADR 0019), and the OAuth token age cap and client
 // list (ADR 0020). Hosted mode alone may bind 0.0.0.0, which a platform's
 // proxy and health checks need; every other mode keeps M3's loopback rule.
+// M5 adds two settings that every mode allows: first-class page tools (ADR
+// 0025), off by default, and the origins /mcp accepts beside its mode's own
+// (ADR 0027).
 
 import { BlockList, isIP, isIPv6 } from 'node:net';
 import { dirname, isAbsolute, join } from 'node:path';
@@ -24,6 +27,7 @@ import {
   DEFAULT_CALL_DEADLINE_MS,
   IDLE_TIMEOUT_MS,
   MAX_FRAME_BYTES,
+  MAX_TIMER_MS,
   MEMBER_RESERVED_SEATS,
   PAIR_WAIT_MS,
   PAIRING_TTL_MS,
@@ -32,10 +36,12 @@ import {
   RESUME_WINDOW_MS,
 } from '@tabdock/protocol';
 import { type AuthPlugin, createDevTokenAuth, parseDevTokens } from './auth.ts';
+import { CONFIRMATION_TTL_MS } from './confirm.ts';
 import { LOCAL_USER, type LocalTokenSystem, loadOwnerToken } from './local-token.ts';
 import type { LogLevel, LogSink } from './log.ts';
 import { createOAuthAuth, parseOAuthClientIds, parseOAuthUsers } from './oauth.ts';
 import type { RelayStore } from './store.ts';
+import { holdingTokenLock } from './token-lock.ts';
 
 export type RelayEnv = 'development' | 'production';
 
@@ -70,6 +76,12 @@ export interface RelayTimings {
   argumentCheckMs: number;
   /** How long a browser stays signed in at /pair, counted from sign-in. */
   pairSessionMs: number;
+  /**
+   * How long a question in the caller's client waits for its answer (ADR
+   * 0026): a 2026-07-28 record's life and a 2025-era call's own timer. 120 s,
+   * and never more; a test may shorten it.
+   */
+  confirmationTtlMs: number;
 }
 
 export interface RelayRateLimits {
@@ -149,8 +161,9 @@ export interface RelayRateLimits {
   /**
    * Requests one member may make to /mcp per window, every tool counted,
    * checked right after sign-in and before the access check, so refusals
-   * count too (ADR 0018), and every 2026-07-28 subscriptions/listen and
-   * every 2026-07-28 request the SDK refuses before a tool runs (A4.3).
+   * count too (ADR 0018), every 2026-07-28 subscriptions/listen (A4.3), and
+   * every other 2026-07-28 request once, as it arrives, tools/list and
+   * server/discover included (ADR 0030).
    */
   requestsPerUser: number;
   /** The same for an invitee, smaller since anyone can become one (ADR 0018). */
@@ -235,16 +248,21 @@ export interface RelayLimits {
   /**
    * Heap the /mcp requests that may wait on a page (call_page_tool, and
    * pair_page while the operator decides) may hold together, each charged
-   * an upper bound on what its body and its parsed copy hold
-   * (request-heap.ts) until it is answered; past it a call is refused
-   * page_busy and a pairing rate_limited (S9, ADR 0018's notes). At least
-   * MIN_REQUEST_BYTES.
+   * what its body and its parsed copy are measured to hold (request-heap.ts,
+   * set above what every shape in call-shapes.ts was measured to hold on
+   * both legs) until it is answered; past it a call is refused page_busy and
+   * a pairing rate_limited (S9, ADR 0018's notes). Invitees' requests
+   * together may hold a quarter of it, or MIN_REQUEST_BYTES where a quarter
+   * is less, and are refused the same way past that (ADR 0030); one
+   * invitee's may hold a quarter of that, or MIN_REQUEST_BYTES where that is
+   * less, and are refused rate_limited past it (ADR 0032). At least
+   * MIN_REQUEST_BYTES, and with invites on at least twice that.
    */
   requestBytes: number;
   /**
    * The same for one user's requests, past which they are refused
    * rate_limited, so one account cannot spend the whole of requestBytes.
-   * At least MIN_REQUEST_BYTES.
+   * At least MIN_REQUEST_BYTES and at most requestBytes (ADR 0030).
    */
   requestBytesPerUser: number;
 }
@@ -296,6 +314,15 @@ export interface RelayOptions {
   /** Development only: accept page sockets with no Origin header (the Node sim page). */
   allowMissingOrigin?: boolean | undefined;
   /**
+   * Origins /mcp accepts in an Origin header besides its mode's own
+   * (TABDOCK_MCP_ALLOWED_ORIGINS, ADR 0027): loopback http and https without
+   * a public URL, the public origin with one. Each must be a serialised http
+   * or https origin, compared exactly as written; any other entry stops the
+   * relay at start. Allowed in every mode, and empty adds nothing. These admit
+   * nothing to /page, and allowedOrigins admits nothing to /mcp.
+   */
+  mcpAllowedOrigins?: readonly string[] | undefined;
+  /**
    * The https origin a tunnel serves the relay at, such as
    * https://relay.example. Setting it switches on public URL mode (ADR 0014):
    * its host passes the Host check, `<publicUrl>/mcp` is the resource OAuth
@@ -338,6 +365,13 @@ export interface RelayOptions {
    */
   invites?: boolean | undefined;
   /**
+   * First-class page tools (TABDOCK_FIRST_CLASS_TOOLS, ADR 0025), off unless
+   * exactly true, in every mode, local mode included, and allowed in
+   * production: members' clients list each attached page's tools as
+   * `<page id>__<tool>` beside the five fixed tools. Off, the tool surface is M4's.
+   */
+  firstClassTools?: boolean | undefined;
+  /**
    * Hosted mode (ADR 0018): the one header a host edge in front of the relay
    * sets to the client's address, replacing any value a client sent. Only in
    * production with a public URL; client-address.ts reads it.
@@ -377,12 +411,6 @@ export const SSE_KEEP_ALIVE_MS = 15_000;
 export const ARGUMENT_CHECK_MS = 50;
 /** Long enough to sign in and scan a few codes, short enough that a forgotten phone is soon signed out. */
 export const PAIR_SESSION_MS = 15 * 60_000;
-/**
- * The longest delay setTimeout honours. Node runs a longer one after 1 ms
- * instead, which would expire every attachment at once.
- */
-export const MAX_TIMER_MS = 2_147_483_647;
-
 export const DEFAULT_TIMINGS: RelayTimings = {
   pairingTtlMs: PAIRING_TTL_MS,
   attachRequestTtlMs: ATTACH_REQUEST_TTL_MS,
@@ -399,6 +427,7 @@ export const DEFAULT_TIMINGS: RelayTimings = {
   sseKeepAliveMs: SSE_KEEP_ALIVE_MS,
   argumentCheckMs: ARGUMENT_CHECK_MS,
   pairSessionMs: PAIR_SESSION_MS,
+  confirmationTtlMs: CONFIRMATION_TTL_MS,
 };
 
 export const DEFAULT_RATE_LIMITS: RelayRateLimits = {
@@ -440,10 +469,11 @@ export const DEFAULT_LIMITS: RelayLimits = {
   // page slot filled up to it leaves the relay well inside that heap
   // (tool-heap.test.ts).
   toolBytes: 64 * 1024 * 1024,
-  // Sized with the same heap (ADR 0018's notes): charged an upper bound on
-  // what a waiting request holds, the whole of it filled beside a full tool
-  // budget leaves the image's relay serving (call-heap.test.ts), and one
-  // member's share holds seven calls of 1 MB string arguments.
+  // Sized with the same heap (ADR 0018's notes): charged what a waiting
+  // request is measured to hold, set above every shape measured on both legs
+  // (ADR 0030), the whole of it filled beside a full tool budget leaves the
+  // image's relay serving (call-heap.test.ts), and one member's share holds
+  // seven calls of 1 MB string arguments.
   requestBytes: 64 * 1024 * 1024,
   requestBytesPerUser: 24 * 1024 * 1024,
 };
@@ -503,6 +533,14 @@ export interface ResolvedConfig {
   isOriginAllowed: (origin: string) => boolean;
   /** For the startup log line: the list, or a note that the dev default applies. */
   originPolicy: string;
+  /**
+   * Whether an Origin header value, exactly as received, may reach /mcp (ADR
+   * 0027). A request with no Origin header never asks: the header is a
+   * browser's, and Claude Code sends none.
+   */
+  isMcpOriginAllowed: (origin: string) => boolean;
+  /** The /mcp origin policy, as the startup log line names it beside the page one. */
+  mcpOriginPolicy: string;
   timings: RelayTimings;
   rateLimits: RelayRateLimits;
   limits: RelayLimits;
@@ -512,6 +550,8 @@ export interface ResolvedConfig {
   mode: RelayMode;
   /** Invites are on (ADR 0017): the invitee tier, /i, and minting in the widget. */
   invites: boolean;
+  /** First-class page tools are on (ADR 0025). */
+  firstClassTools: boolean;
   /** Production with a public URL behind an edge that names the client in clientAddressHeader (ADR 0018). */
   hosted: boolean;
   /** The edge's client address header, lower-cased; null outside hosted mode. */
@@ -550,6 +590,25 @@ export function parseOrigin(value: string): string | null {
   const url = URL.parse(value);
   if (!url || (url.protocol !== 'http:' && url.protocol !== 'https:')) return null;
   return url.origin === value ? url.origin : null;
+}
+
+/**
+ * TABDOCK_MCP_ALLOWED_ORIGINS's entries as origins (ADR 0027), each held to
+ * parseOrigin's exact form, as page origins are, so an entry with a path, a
+ * trailing slash or upper case never matches what a browser sends. A bad
+ * entry is named by its place, never echoed, since a token may sit in the
+ * wrong variable.
+ */
+export function parseMcpAllowedOrigins(entries: readonly string[]): string[] {
+  return entries.map((entry, index) => {
+    const parsed = parseOrigin(entry.trim());
+    if (parsed === null) {
+      throw new Error(
+        `TABDOCK_MCP_ALLOWED_ORIGINS entry ${String(index + 1)} is not an http or https origin written as a browser sends one, such as https://app.example or http://localhost:6274: lower case, no path and no trailing slash (ADR 0027)`,
+      );
+    }
+    return parsed;
+  });
 }
 
 /** The Host names the SDK's localhost guard accepts, as its own helper lists them. */
@@ -659,6 +718,10 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
       'spike (TABDOCK_SPIKE) is the M3 spike measurement flag; production refuses to start with it (ADR 0014)',
     );
   }
+  // First-class page tools change what members' clients list (ADR 0025), and
+  // nothing about who may reach what, so every mode allows them, production
+  // included; only true turns them on, so a stray value leaves them off.
+  const firstClassTools = options.firstClassTools === true;
   const host = options.host ?? DEFAULT_HOST;
   // ADR 0022: a plugin marked loopbackOnly, local mode's above all, serves
   // this machine and nothing else, whatever its name, so a public URL,
@@ -749,6 +812,22 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     originPolicy = [...allowed].join(', ');
   }
 
+  // ADR 0027: /mcp takes loopback origins without a public URL and the public
+  // origin with one, compared as written like page origins rather than by
+  // hostname as the SDK's guard would, so the public host on another port or
+  // over http never passes; and in every mode the listed ones.
+  const mcpListed = new Set(parseMcpAllowedOrigins(options.mcpAllowedOrigins ?? []));
+  const isMcpOriginAllowed = (origin: string): boolean => {
+    if (mcpListed.has(origin)) return true;
+    if (publicUrl !== null) return origin === publicUrl;
+    const parsed = parseOrigin(origin);
+    return parsed !== null && DEV_ORIGIN_HOSTS.has(new URL(parsed).hostname);
+  };
+  const mcpOriginPolicy = [
+    publicUrl ?? 'loopback: http and https on localhost, 127.0.0.1 and [::1]',
+    ...mcpListed,
+  ].join(', ');
+
   // The QR page signs phones in at the same provider as the plugin, with a
   // client of the relay's own, so both are needed in public URL mode and the
   // client means nothing without it.
@@ -807,6 +886,13 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
       `callDeadlineMs plus callDeadlineGraceMs must be at most ${String(MAX_TIMER_MS)}`,
     );
   }
+  // A longer wait would keep a confirmation good past what ADR 0026 allows
+  // and hold a 2025-era request open past hosted Claude's 240 s per call.
+  if (timings.confirmationTtlMs > CONFIRMATION_TTL_MS) {
+    throw new Error(
+      `confirmationTtlMs must be at most ${String(CONFIRMATION_TTL_MS)}: a question in a client lives 120 s at most (ADR 0026)`,
+    );
+  }
   const limits = positiveIntegers(
     hosted ? { ...DEFAULT_LIMITS, ...HOSTED_LIMITS } : DEFAULT_LIMITS,
     options.limits,
@@ -826,8 +912,24 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
       );
     }
   }
+  // relay.ts answers 413 unparsed only past the share, so a share above the
+  // total would let a body charged between the two be parsed, only for the
+  // hub to refuse it page_busy.
+  if (limits.requestBytesPerUser > limits.requestBytes) {
+    throw new Error(
+      "requestBytesPerUser (TABDOCK_MAX_REQUEST_BYTES_PER_USER) must be at most requestBytes (TABDOCK_MAX_REQUEST_BYTES): one user's share of what waiting requests hold cannot pass the relay's total, so lower the share with the total (ADR 0030)",
+    );
+  }
   // Only true turns invites on, so a stray value from JavaScript leaves them off.
   const invites = options.invites === true;
+  // Invitees together may hold a quarter of the total or MIN_REQUEST_BYTES,
+  // whichever is more, so below twice that floor they could hold more than
+  // half of it, and all of it at the least total, leaving members nothing.
+  if (invites && limits.requestBytes < 2 * MIN_REQUEST_BYTES) {
+    throw new Error(
+      `invites (TABDOCK_INVITES) need requestBytes (TABDOCK_MAX_REQUEST_BYTES) of at least ${String(2 * MIN_REQUEST_BYTES)}: invited accounts' requests may hold ${String(MIN_REQUEST_BYTES)} together at the least, and must never hold more than half of the total (ADR 0032)`,
+    );
+  }
   if (invites && limits.usersPerPage <= MEMBER_RESERVED_SEATS) {
     throw new Error(
       `invites (TABDOCK_INVITES) always leave members ${String(MEMBER_RESERVED_SEATS)} seats of usersPerPage (TABDOCK_MAX_USERS_PER_PAGE), so it must be at least ${String(MEMBER_RESERVED_SEATS + 1)} (ADR 0017)`,
@@ -856,12 +958,15 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     allowMissingOrigin,
     isOriginAllowed,
     originPolicy,
+    isMcpOriginAllowed,
+    mcpOriginPolicy,
     timings,
     rateLimits: positiveIntegers(DEFAULT_RATE_LIMITS, options.rateLimits),
     limits,
     spike,
     mode,
     invites,
+    firstClassTools,
     hosted,
     clientAddressHeader,
     trustedProxies,
@@ -1123,7 +1228,13 @@ function authFromEnv(
   }
   const owner = loadOwnerToken(env, system);
   return {
-    auth: createDevTokenAuth([{ ...LOCAL_USER, token: owner.token }], { loopbackOnly: true }),
+    // The token directory stays locked while the relay runs, whatever its
+    // audit directory, so no second relay serves this token beside it and no
+    // --new-token replaces it under a relay still taking the old one.
+    auth: holdingTokenLock(
+      createDevTokenAuth([{ ...LOCAL_USER, token: owner.token }], { loopbackOnly: true }),
+      dirname(owner.path),
+    ),
     localMode: { tokenPath: owner.path, created: owner.created },
   };
 }
@@ -1214,6 +1325,19 @@ export function loadConfigFromEnv(
           .map((entry) => entry.trim())
           .filter((entry) => entry.length > 0);
 
+  // Parsed like TABDOCK_ALLOWED_ORIGINS, and checked here as well, so a bad
+  // entry stops the relay before local mode draws a token.
+  const mcpOriginsText = env.TABDOCK_MCP_ALLOWED_ORIGINS?.trim() ?? '';
+  const mcpAllowedOrigins =
+    mcpOriginsText === ''
+      ? undefined
+      : parseMcpAllowedOrigins(
+          mcpOriginsText
+            .split(',')
+            .map((entry) => entry.trim())
+            .filter((entry) => entry.length > 0),
+        );
+
   const hostText = env.TABDOCK_HOST?.trim() ?? '';
   const host = hostText === '' ? undefined : hostText;
   const relayEnv: RelayEnv = envName === '' ? 'development' : envName;
@@ -1270,6 +1394,7 @@ export function loadConfigFromEnv(
     ),
   };
   const invites = parseFlag('TABDOCK_INVITES', env.TABDOCK_INVITES);
+  const firstClassTools = parseFlag('TABDOCK_FIRST_CLASS_TOOLS', env.TABDOCK_FIRST_CLASS_TOOLS);
   const headerText = env.TABDOCK_CLIENT_ADDRESS_HEADER?.trim() ?? '';
   const cidrText = env.TABDOCK_TRUSTED_PROXY_CIDR?.trim() ?? '';
   const auditDirText = env.TABDOCK_AUDIT_DIR?.trim() ?? '';
@@ -1305,11 +1430,13 @@ export function loadConfigFromEnv(
     env: relayEnv,
     allowedOrigins,
     allowMissingOrigin,
+    mcpAllowedOrigins,
     spike,
     timings,
     rateLimits,
     limits,
     invites,
+    firstClassTools,
     clientAddressHeader: headerText === '' ? undefined : headerText,
     trustedProxyCidr:
       cidrText === ''

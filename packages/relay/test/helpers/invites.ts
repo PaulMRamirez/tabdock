@@ -6,7 +6,11 @@
 // with its own secrets, hashed as the adapter hashes them.
 
 import { createHash, randomBytes } from 'node:crypto';
-import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import {
+  Client,
+  type FetchLike,
+  StreamableHTTPClientTransport,
+} from '@modelcontextprotocol/client';
 import type { RelayFrame, Role } from '@tabdock/protocol';
 import { expect } from 'vitest';
 import {
@@ -24,6 +28,7 @@ import { connectPage, PAGE_ORIGIN, type PageOptions, type TestPage, TOOLS } from
 import { Phone } from './phone.ts';
 import { PAIR_CLIENT, startProvider, type TestProvider } from './provider.ts';
 import { FAST_TIMINGS } from './relay.ts';
+import { resultJson } from './results.ts';
 import { PUBLIC_MCP_URL, PUBLIC_ORIGIN, tunnelFetch } from './tunnel.ts';
 
 export const MEMBERS: OAuthUser[] = [
@@ -45,8 +50,19 @@ export interface InviteRelay {
   /** Every log line, parsed. */
   events(): Record<string, unknown>[];
   page(options?: PageOptions): Promise<TestPage>;
-  /** Claude signed in as `sub`, with the namespaced email claims ADR 0020's template adds. */
-  claude(sub: string, email?: string | null, verified?: boolean): Promise<Client>;
+  /**
+   * Claude signed in as `sub`, with the namespaced email claims ADR 0020's
+   * template adds; `wrap`, if given, wraps the tunnel's fetch, to change what
+   * the client sends; `modern` pins the client to 2026-07-28, where without
+   * it the SDK's default speaks a 2025 revision on a session.
+   */
+  claude(
+    sub: string,
+    email?: string | null,
+    verified?: boolean,
+    wrap?: (base: FetchLike) => FetchLike,
+    modern?: boolean,
+  ): Promise<Client>;
   close(): Promise<void>;
 }
 
@@ -113,15 +129,18 @@ export async function startInviteRelay(options: InviteRelayOptions = {}): Promis
       pages.push(opened);
       return opened;
     },
-    async claude(sub, email = null, verified = true) {
-      const client = new Client({ name: `claude-${sub}`, version: '1.0.0' });
+    async claude(sub, email = null, verified = true, wrap = (base) => base, modern = false) {
+      const client = new Client(
+        { name: `claude-${sub}`, version: '1.0.0' },
+        modern ? { versionNegotiation: { mode: { pin: '2026-07-28' } } } : {},
+      );
       await client.connect(
         new StreamableHTTPClientTransport(new URL(PUBLIC_MCP_URL), {
           authProvider: {
             token: () =>
               provider.token({ sub, aud: PUBLIC_MCP_URL, ...emailClaims(email, verified) }),
           },
-          fetch: tunnelFetch(relay.url),
+          fetch: wrap(tunnelFetch(relay.url)),
         }),
       );
       clients.push(client);
@@ -216,7 +235,11 @@ export async function call(
 ): Promise<ToolText> {
   const result = await client.callTool({ name, arguments: args });
   const text = result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n');
-  return { isError: result.isError === true, text, structured: result.structuredContent };
+  return {
+    isError: result.isError === true,
+    text,
+    structured: resultJson(text, result.structuredContent),
+  };
 }
 
 /** A member pairs by code and the page approves with `role`. */

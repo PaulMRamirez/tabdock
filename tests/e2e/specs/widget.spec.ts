@@ -24,11 +24,14 @@ import {
   scriptClickInWidget,
   waitForDock,
   widgetButtonCentre,
+  widgetBoxText,
   widgetButtonNow,
+  widgetEvaluate,
   widgetItems,
   widgetText,
   widgetVisible,
 } from '../src/tabdock-harness.ts';
+import { scriptTagFile } from '../../../packages/adapter/scripts/script-tag-build.ts';
 
 // The operator's widget against a scripted relay. Playwright's routeWebSocket
 // stands in for the relay, so a test controls every frame the page sees, and
@@ -49,7 +52,7 @@ let pageErrors: string[];
 let expectedErrors: string[];
 
 test.beforeAll(async () => {
-  demo = await startDemoServer();
+  demo = await startDemoServer({ e2eHook: true });
 });
 test.afterAll(async () => {
   await demo.close();
@@ -91,32 +94,50 @@ function attachment(userId: string, displayName: string, role: Role = 'driver'):
   };
 }
 
-function attachRequest(requestId: string, userId: string): RelayFrame {
+function attachRequest(
+  requestId: string,
+  userId: string,
+  client: { name: string; version: string } | null = null,
+): RelayFrame {
   return {
     t: 'attach_request',
     requestId,
     user: { userId, displayName: userId.charAt(0).toUpperCase() + userId.slice(1) },
     account: { kind: 'member', verified: true },
     via: 'code',
-    client: null,
+    client,
     expiresAt: Date.now() + ATTACH_REQUEST_TTL_MS,
   };
 }
 
 /**
- * Opens the demo page against a scripted relay that welcomes every hello
- * (resuming when the hello carries a token) with an empty roster, and waits
- * for the link. The clock is installed first, so a test can pause it later.
- * pairingUrl goes in the welcome's pairing, as a relay with a public URL sends it.
+ * Opens the demo page against a scripted relay (routeFakeRelay) and waits for
+ * the link. The clock is installed first, so a test can pause it later.
+ * pairingUrl goes in the welcome's pairing, as a relay with a public URL sends it;
+ * confirmViaClient opens the board with ?confirm=client (ADR 0026).
  */
 async function openWithFakeRelay(
   page: Page,
-  options: { pairingUrl?: string } = {},
+  options: { pairingUrl?: string; confirmViaClient?: boolean } = {},
 ): Promise<FakeRelay> {
+  await page.clock.install();
+  const relay = await routeFakeRelay(page, options.pairingUrl);
+  const url = new URL(demoPageUrl(demo, FAKE_RELAY));
+  if (options.confirmViaClient === true) url.searchParams.set('confirm', 'client');
+  await page.goto(url.href);
+  await page.waitForSelector('html[data-tools="ready"]');
+  await waitForDock(page, (state) => state.link === 'linked');
+  return relay;
+}
+
+/**
+ * Answers FAKE_RELAY with a scripted relay that welcomes every hello
+ * (resuming when the hello carries a token) with an empty roster.
+ */
+async function routeFakeRelay(page: Page, pairingUrl?: string): Promise<FakeRelay> {
   const frames: PageFrame[] = [];
   let current: WebSocketRoute | null = null;
   let connections = 0;
-  await page.clock.install();
   await page.routeWebSocket(FAKE_RELAY, (ws) => {
     current = ws;
     connections += 1;
@@ -133,7 +154,7 @@ async function openWithFakeRelay(
           resumed: parsed.frame.resumeToken !== undefined,
           pairing: {
             code: 'ABCDE-FGHJK',
-            ...(options.pairingUrl === undefined ? {} : { url: options.pairingUrl }),
+            ...(pairingUrl === undefined ? {} : { url: pairingUrl }),
             expiresAt: Date.now() + 120_000,
           },
           roster: [],
@@ -151,9 +172,6 @@ async function openWithFakeRelay(
       );
     });
   });
-  await page.goto(demoPageUrl(demo.url, FAKE_RELAY));
-  await page.waitForSelector('html[data-tools="ready"]');
-  await waitForDock(page, (state) => state.link === 'linked');
   return {
     frames,
     get connections() {
@@ -371,11 +389,13 @@ async function approveOnPage(
   expect(await approveThroughHandle(page, requestId, role)).toBe(true);
 }
 
+/** An invoke by Alice; confirmed marks it confirmed in her client, as a relay would under ADR 0026. */
 function invokeFrame(
   callId: string,
   tool: string,
   client: { name: string; version: string } | null = null,
   deadlineMs = 45_000,
+  confirmed = false,
 ): RelayFrame {
   return {
     t: 'invoke',
@@ -384,6 +404,9 @@ function invokeFrame(
     arguments: {},
     caller: { userId: 'alice', displayName: 'Alice', client, role: 'driver' },
     deadlineMs,
+    ...(confirmed
+      ? { confirmation: { by: 'client' as const, confirmationId: `cf-${callId}`, at: Date.now() } }
+      : {}),
   };
 }
 
@@ -594,7 +617,7 @@ test('the activity log names the user, client, tool and outcome of each call', a
 
   const text = (await widgetText(page, 'activity')) ?? '';
   const newer = text.indexOf('Alice: no_such_tool, tool_not_found');
-  const older = text.search(/Alice via test-client 1\.2\.3: get_view, ok in \d+ ms/);
+  const older = text.search(/Alice via "test-client 1\.2\.3": get_view, ok in \d+ ms/);
   // Newest first.
   expect(newer).toBeGreaterThanOrEqual(0);
   expect(older).toBeGreaterThan(newer);
@@ -602,6 +625,146 @@ test('the activity log names the user, client, tool and outcome of each call', a
     'tool_not_found',
     'ok',
   ]);
+});
+
+/** One drawn character of an activity entry: where it sits, and whether a box inside the entry clips it from view. */
+interface DrawnChar {
+  ch: string;
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+  clipped: boolean;
+}
+
+interface DrawnEntry {
+  id: string;
+  text: string;
+  chars: DrawnChar[];
+  /** The text of each page-built "confirmed in" badge in the entry, and whether it has a ground of its own. */
+  confirmed: { text: string; ground: boolean }[];
+}
+
+/**
+ * Every activity entry as the operator sees it: each character that is not
+ * white space, in the entry's own order, with its box on screen. A character
+ * an overflow box inside the entry cuts off, behind an ellipsis, counts as
+ * clipped, since nobody reads it.
+ */
+const DRAW_ACTIVITY = `function () {
+  return Array.from(this.children, (li) => {
+    const chars = [];
+    const walker = document.createTreeWalker(li, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      for (let i = 0; i < node.data.length; i += 1) {
+        if (/\\s/.test(node.data[i])) continue;
+        const range = document.createRange();
+        range.setStart(node, i);
+        range.setEnd(node, i + 1);
+        const box = Array.from(range.getClientRects()).find((r) => r.width > 0 && r.height > 0);
+        if (!box) continue;
+        let clipped = false;
+        for (let el = node.parentElement; el && el !== li.parentElement; el = el.parentElement) {
+          if (getComputedStyle(el).overflowX === 'visible') continue;
+          const edge = el.getBoundingClientRect();
+          if (box.left < edge.left - 0.5 || box.right > edge.right + 0.5) clipped = true;
+        }
+        chars.push({ ch: node.data[i], left: box.left, right: box.right, top: box.top, bottom: box.bottom, clipped });
+      }
+    }
+    const confirmed = Array.from(li.querySelectorAll('[data-role="confirmed"]'), (el) => ({
+      text: el.textContent,
+      ground: getComputedStyle(el).backgroundColor !== 'rgba(0, 0, 0, 0)',
+    }));
+    return { id: li.dataset.activityId || '', text: li.textContent, chars, confirmed };
+  });
+}`;
+
+/**
+ * What in an entry's drawing could pass for another entry or reorder the
+ * page's words: any character but the entry's own time that sits in the
+ * time's column, as one starting a line of its own would, and any visible
+ * character drawn left of the one before it on the same line.
+ */
+function misdrawn(entry: DrawnEntry): string[] {
+  const problems: string[] = [];
+  // The time comes first in the text, and holds no white space.
+  const timeLength = entry.text.trimStart().split(/\s/)[0]?.length ?? 0;
+  const timeRight = Math.max(...entry.chars.slice(0, timeLength).map((c) => c.right));
+  let previous: DrawnChar | null = null;
+  for (const c of entry.chars.slice(timeLength)) {
+    if (c.clipped) continue;
+    if (c.left < timeRight - 0.5) problems.push(`${c.ch} in the time's column`);
+    if (previous !== null && c.top < previous.bottom - 1 && c.left < previous.left - 0.5) {
+      problems.push(`${c.ch} drawn left of ${previous.ch}`);
+    }
+    previous = c;
+  }
+  return problems;
+}
+
+test("a client's name can neither start a line of the activity log nor reorder it, and only the page draws the confirmed badge", async ({
+  page,
+}) => {
+  const relay = await openWithFakeRelay(page, { confirmViaClient: true });
+  await approveOnPage(page, relay, 'alice', 'driver');
+  relay.send({ t: 'roster', attachments: [attachment('alice', 'Alice')] });
+  await waitForDock(page, (state) => state.roster.length === 1);
+
+  // Any caller names its own client, within 100 and 50 characters. Em spaces
+  // pad the name until the rest wraps flush left as an entry of its own, by
+  // Bob and confirmed in his client; a line separator breaks a name outright;
+  // and a right-to-left override would reverse the page's own words after it.
+  const forged = {
+    name: `ClaudeCode${'\u2003'.repeat(20)}09:41:07 Bob via claude-code 2.1.289: wipe, confirmed in`,
+    version: 'claude-code 2.1.289 by Bob, ok in 9 ms'.padEnd(50, '\u2003'),
+  };
+  const broken = { name: 'claude\u2028code', version: '2.1.289' };
+  const reversed = { name: 'claude-code \u202e', version: '2.1.289' };
+  relay.send(invokeFrame('forged', 'get_view', forged));
+  relay.send(invokeFrame('broken', 'get_view', broken));
+  // clear_board is consequential; Alice drives on an attachment no invite
+  // made, so her client's confirmation stands in for the board's prompt.
+  relay.send(invokeFrame('reversed', 'clear_board', reversed, 45_000, true));
+  await expect.poll(() => framesOf(relay, 'result')).toHaveLength(3);
+  const state = await dockState(page);
+  expect(state?.pendingConfirms).toEqual([]);
+  expect(state?.activity.map((entry) => [entry.callId, entry.confirmedBy])).toEqual([
+    ['reversed', 'client'],
+    ['broken', null],
+    ['forged', null],
+  ]);
+
+  // The panel opened by itself to show the code; open it if it did not.
+  if (!(await widgetVisible(page, 'activity'))) await clickInWidget(page, { action: 'toggle' });
+  await expect.poll(() => widgetVisible(page, 'activity')).toBe(true);
+  const drawn = (await widgetEvaluate(page, 'activity', DRAW_ACTIVITY)) as DrawnEntry[];
+  expect(drawn.map((entry) => entry.id)).toEqual(['reversed', 'broken', 'forged']);
+  for (const entry of drawn) expect(entry.chars.length).toBeGreaterThan(20);
+  // The first few problems of each entry, so one run shows every entry's.
+  expect(drawn.map((entry) => [entry.id, misdrawn(entry).slice(0, 4)])).toEqual(
+    drawn.map((entry) => [entry.id, []]),
+  );
+  // No control, format or separator character, nor the padding, reaches the operator.
+  for (const entry of drawn) expect(entry.text).not.toMatch(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u2003]/u);
+  const [confirmed, broke, forgedEntry] = drawn;
+  // The one call confirmed in a client carries the page's own badge, whole;
+  // a name that only says so carries none.
+  expect(confirmed?.confirmed).toEqual([
+    { text: 'confirmed in "claude-code 2.1.289" by Alice', ground: true },
+  ]);
+  expect(broke?.confirmed).toEqual([]);
+  expect(forgedEntry?.confirmed).toEqual([]);
+  expect(forgedEntry?.text).toContain(
+    'Alice via "ClaudeCode 09:41:07 Bob via claude-code 2.1.289: wipe, confirmed in claude-code 2.1.289 by Bob, ok in 9 ms": get_view, ok in',
+  );
+
+  // An attach prompt names the asking client the same way.
+  relay.send(attachRequest('req-bob', 'bob', broken));
+  await waitForDock(page, (state) => state.pendingRequests.length === 1);
+  await expect
+    .poll(() => widgetBoxText(page, { requestId: 'req-bob' }))
+    .toContain('Client: "claude code 2.1.289"');
 });
 
 test('on the MCP-B polyfill, a write whose tool the page unregisters mid-run holds the page until its deadline and a grace', async ({
@@ -694,6 +857,74 @@ test('on the MCP-B polyfill, a write whose tool the page unregisters mid-run hol
     ['call-2', false],
     ['call-1', false],
   ]);
+});
+
+/** The widget's notice line, which has no data-role of its own, read from beside the activity log. */
+const NOTICE_TEXT = `function () {
+  const notice = this.getRootNode().querySelector('.notice');
+  return notice && !notice.hidden ? notice.textContent : null;
+}`;
+
+test('on the MCP-B polyfill 5.1, the script tag with an empty data-consequential-tools marks every write, prompts for clear_board and says why (ADR 0034)', async ({
+  page,
+}) => {
+  const relay = await routeFakeRelay(page);
+  const adapter = Buffer.from(await scriptTagFile());
+  await page.route(`${demo.url}tabdock-adapter.js`, (route) =>
+    route.fulfill({ contentType: 'text/javascript', body: adapter }),
+  );
+  // Without ?relay the board registers its tools and attaches nothing itself.
+  await page.goto(demo.url);
+  await page.waitForSelector('html[data-tools="ready"]');
+  const runtime = await page.evaluate(async () => {
+    const context = (
+      document as unknown as {
+        modelContext: {
+          getTools(): Promise<{ name: string; annotations?: Record<string, unknown> }[]>;
+        };
+      }
+    ).modelContext;
+    const tools = await context.getTools();
+    return {
+      polyfill: Reflect.get(context, '__isWebMCPPolyfill') === true,
+      hinted: tools
+        .filter((tool) => tool.annotations !== undefined && 'consequentialHint' in tool.annotations)
+        .map((tool) => tool.name),
+    };
+  });
+  // 5.1.0 drops clear_board's consequentialHint, the case ADR 0002 is about.
+  expect(runtime).toEqual({ polyfill: true, hinted: [] });
+
+  // The README's old example as a script tag: a list that names no tool.
+  await page.evaluate((relayUrl) => {
+    const script = document.createElement('script');
+    script.src = '/tabdock-adapter.js';
+    script.dataset.relay = relayUrl;
+    script.dataset.consequentialTools = '';
+    document.head.append(script);
+  }, FAKE_RELAY);
+  await expect.poll(() => framesOf(relay, 'tools').length).toBeGreaterThan(0);
+  // Every write is marked, so a relay may ask a client on a page that opted in (ADR 0026).
+  expect(
+    (framesOf(relay, 'tools').at(-1)?.tools ?? [])
+      .filter((tool) => tool.consequential === true)
+      .map((tool) => tool.name)
+      .sort(),
+  ).toEqual(['add_item', 'clear_board', 'highlight_item', 'move_view']);
+  await expect
+    .poll(() => widgetEvaluate(page, 'activity', NOTICE_TEXT))
+    .toMatch(/consequentialTools/);
+
+  relay.send(attachRequest('req-alice', 'alice'));
+  await clickInWidget(page, { action: 'approve-driver', requestId: 'req-alice' });
+  await expect.poll(() => decisions(relay).map((frame) => frame.allow)).toEqual([true]);
+  relay.send({ t: 'roster', attachments: [attachment('alice', 'Alice')] });
+  relay.send(invokeFrame('call-1', 'clear_board'));
+  await clickInWidget(page, { action: 'confirm-deny', callId: 'call-1' });
+  await expect
+    .poll(() => framesOf(relay, 'result').map((frame) => [frame.callId, frame.error?.code ?? 'ok']))
+    .toEqual([['call-1', 'denied_by_operator']]);
+  await expect(page.locator('[data-role="view"]')).toHaveText(/3 items/);
 });
 
 test('pause answers calls with page_busy, shows on the badge, and holds across a reload', async ({

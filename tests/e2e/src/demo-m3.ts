@@ -17,6 +17,7 @@ import type { Browser, BrowserContext, Page } from '@playwright/test';
 import type { DockState } from '@tabdock/adapter';
 import { qrPath } from '@tabdock/adapter/qr';
 import { PAIR_CLIENT } from '@tabdock/relay/test/provider';
+import { bodyOf } from '@tabdock/relay/test/results';
 import { tunnelFetch } from '@tabdock/relay/test/tunnel';
 import { launchChromium } from './harness.ts';
 import {
@@ -389,7 +390,7 @@ try {
     .join('\n');
   report(
     'get_view from bob-phone',
-    { isError: timed.isError === true, text: timedText, structured: timed.structuredContent },
+    { isError: timed.isError === true, text: timedText, structured: bodyOf(timed) },
     'ok',
   );
   const timing = timed._meta?.['tabdock/spikeTiming'] as

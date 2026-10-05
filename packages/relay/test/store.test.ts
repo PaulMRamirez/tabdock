@@ -25,6 +25,7 @@ function pageRecord(pageId: string, resumeTokenHash: string): PageRecord {
       consequential: 'confirm',
       consequentialTools: [],
       invites: 'watch',
+      confirmVia: 'page',
     },
     tools: [],
     toolsPending: false,

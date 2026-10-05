@@ -1,19 +1,36 @@
 {
   "name": "@tabdock/relay",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
   "description": "Tabdock relay: page WebSocket endpoint, MCP endpoint, pairing, auth plugins and audit log.",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PaulMRamirez/tabdock.git",
+    "directory": "packages/relay"
+  },
+  "homepage": "https://github.com/PaulMRamirez/tabdock#readme",
+  "bugs": "https://github.com/PaulMRamirez/tabdock/issues",
   "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
   "exports": {
     ".": "./src/index.ts",
+    "./test/private-tmp": "./test/helpers/private-tmp.ts",
     "./test/provider": "./test/helpers/provider.ts",
+    "./test/results": "./test/helpers/results.ts",
     "./test/secrecy": "./test/helpers/secrecy.ts",
     "./test/tunnel": "./test/helpers/tunnel.ts"
   },
+  "files": [
+    "dist",
+    "NOTICE",
+    "npm-shrinkwrap.json"
+  ],
   "scripts": {
+    "build": "node scripts/build.ts",
     "start": "node src/main.ts",
-    "typecheck": "tsc -p tsconfig.json"
+    "typecheck": "tsc -p tsconfig.json && tsc -p scripts/tsconfig.json"
   },
   "dependencies": {
     "@modelcontextprotocol/node": "2.1.1",
@@ -27,6 +44,16 @@
   "devDependencies": {
     "@modelcontextprotocol/client": "2.3.0",
     "@types/ws": "8.18.2",
+    "esbuild": "0.28.2",
     "oauth2-mock-server": "9.2.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "bin": {
+      "tabdock-relay": "./dist/cli.js"
+    },
+    "exports": {
+      "./package.json": "./package.json"
+    }
   }
 }

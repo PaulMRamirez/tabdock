@@ -2,7 +2,7 @@
 // operator's role switch, revoke (S8) and pause, driven through the core with
 // the test relay socket from harness.ts.
 
-import { RECONNECT_MIN_MS } from '@tabdock/protocol';
+import { MAX_TIMER_MS, RECONNECT_MIN_MS } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
 import {
   ACTIVITY_LIMIT,
@@ -355,6 +355,24 @@ describe('the write queue', () => {
     },
   );
 
+  // A deadline within the timer maximum, plus the hold's grace, used to pass
+  // it, and Chromium ran that timer at once, freeing the page under a handler
+  // still running (ADR 0030).
+  it('on the polyfill, holds the page for a write whose relay deadline is near the timer maximum', async () => {
+    const h = setup({ polyfill: true, tools: queueTools(), browserTimers: true });
+    holdHandlers(h, ['set_value', 'add_item']);
+    const socket = await link(h);
+    socket.deliver(invoke('set_value', { callId: 'first', deadlineMs: MAX_TIMER_MS - 1000 }));
+    socket.deliver(invoke('add_item', { callId: 'second' }));
+    await flush();
+    h.context.unregister('set_value');
+    await flush();
+    expect(outcomes(socket)).toEqual({ first: 'tool_error' });
+    await h.clock.advance(1000);
+    expect(h.context.runs.map((run) => run.tool)).toEqual(['set_value']);
+    expect(h.delays.filter((ms) => ms > MAX_TIMER_MS)).toEqual([]);
+  });
+
   it.each([
     ['its handler throws', 'tool_error'],
     ['its tool is gone before the handler starts', 'tool_error'],
@@ -475,6 +493,8 @@ describe('the activity log (S7)', () => {
         client: { name: 'claude-code', version: '2.1.287' },
         tool: 'get_value',
         outcome: 'running',
+        // Nobody confirmed it in a client: it is not consequential (ADR 0026).
+        confirmedBy: null,
         durationMs: null,
         handlerRunning: false,
       },
