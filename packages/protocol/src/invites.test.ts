@@ -364,6 +364,35 @@ describe('accounts', () => {
       expect(EmailSchema.safeParse(text).success, text).toBe(false);
     }
   });
+
+  it('refuse an email holding anything that shows as nothing, a right-to-left override above all', () => {
+    // An invitee's name is its email, shown beside members' names in the
+    // widget, at /i and in the audit: U+202E would show 'moc.elpmaxe@tseug'
+    // the wrong way round, and a zero-width character makes two addresses
+    // read alike.
+    for (const text of [
+      'guest\u{202e}@example.com',
+      'guest@exa\u{202e}mple.com',
+      'guest@example.com\u{202c}',
+      '\u{2066}guest@example.com',
+      'gu\u{200b}est@example.com',
+      'guest@exam\u{200d}ple.com',
+      'guest\u{ad}@example.com',
+      'guest@example.com\u{feff}',
+      'guest\u{e0041}@example.com',
+      'gue\u{34f}st@example.com',
+      'guest@exa\u{180e}mple.com',
+      'guest\u{115f}@example.com',
+      'guest@example.co\ud800m',
+      'guest@example.com\u{2028}',
+    ]) {
+      expect(EmailSchema.safeParse(text).success, JSON.stringify(text)).toBe(false);
+    }
+    // Letters of any script still pass: look-alikes are a residual the threat model accepts.
+    for (const text of ['gäst@example.com', 'гость@пример.рф', '客人@例子.中国']) {
+      expect(EmailSchema.safeParse(text).success, text).toBe(true);
+    }
+  });
 });
 
 describe('invite links', () => {

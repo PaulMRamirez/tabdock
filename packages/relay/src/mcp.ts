@@ -35,6 +35,8 @@ import {
   CLIENT_CAPABILITIES_META_KEY,
   CLIENT_INFO_META_KEY,
   type CallToolResult,
+  inputRequired,
+  type InputRequiredResult,
   isInputRequiredResult,
   type ListToolsResult,
   type McpRequestContext,
@@ -68,19 +70,27 @@ import {
 import { z } from 'zod';
 import type { ResolvedConfig } from './config.ts';
 import {
+  CONFIRM_FIELD,
+  createConfirmationCodec,
+  REFUSED_RETRY,
+  type RetryState,
+} from './confirm.ts';
+import {
   CALL_PAGE_TOOL_ANNOTATIONS,
   type FirstClassTool,
   MAX_RESULT_SIZE_META,
   parseFirstClassName,
 } from './first-class.ts';
 import {
+  type AskInClient,
   type BudgetRefusal,
   type CallerIdentity,
-  type CallOutcome,
+  type ConfirmLeg,
   formatDuration,
   type PageHub,
   type PageToolRef,
   type PairOutcome,
+  type SettledCall,
   type ToolListing,
   type ToolsOutcome,
 } from './hub.ts';
@@ -297,7 +307,7 @@ function toolListResult(outcome: Extract<ToolsOutcome, { kind: 'tools' }>): Call
 }
 
 /** `tool` names the page tool in the result's header, unless the hub named the one the call reached. */
-export function callResult(asked: string, outcome: CallOutcome): CallToolResult {
+export function callResult(asked: string, outcome: SettledCall): CallToolResult {
   const tool =
     outcome.kind === 'ok' || outcome.kind === 'tool_error' ? (outcome.tool ?? asked) : asked;
   switch (outcome.kind) {
@@ -619,6 +629,36 @@ function thrownResult(error: unknown): CallToolResult {
   return { content: [text(error instanceof Error ? error.message : String(error))], isError: true };
 }
 
+/**
+ * How long the SDK may wait on a 2025-era elicitation beyond the relay's own
+ * timer, so the relay's timer, with its own words and audit line, always
+ * decides first.
+ */
+const ELICIT_SLACK_MS = 5000;
+
+/**
+ * What a confirmation's request state is bound to (ADR 0026): the user,
+ * the token's OAuth client (empty for a dev token, which has none) and the
+ * method, so a state minted for one of them is refused for any other. The
+ * codec keeps only a keyed tag of it, never these words.
+ */
+function confirmationBinding(ctx: ServerContext): string {
+  const extra = AuthExtraSchema.safeParse(ctx.http?.authInfo?.extra);
+  // Only reachable if the HTTP layer forgot to authenticate; minting then fails and verifying refuses.
+  if (!extra.success) throw new Error('no authenticated user to bind a confirmation to');
+  return JSON.stringify([extra.data.userId, extra.data.oauthClientId ?? '', ctx.mcpReq.method]);
+}
+
+/** What the verify hook resolved for a request's state, read back; anything else is a refusal. */
+function retryStateOf(value: unknown): RetryState {
+  if (typeof value !== 'object' || value === null) return REFUSED_RETRY;
+  const state = value as Partial<RetryState>;
+  return state.kind === 'record' && 'record' in state ? (state as RetryState) : REFUSED_RETRY;
+}
+
+/** A dispatcher's answer: a tool's result, or a 2026-07-28 question for the client (ADR 0026). */
+type ToolAnswer = CallToolResult | InputRequiredResult;
+
 export function createMcpFactory(
   hub: PageHub,
   config: ResolvedConfig,
@@ -632,6 +672,24 @@ export function createMcpFactory(
   const clientLines = options.clientLines ?? null;
   const fixed = fixedEntries(config);
   const firstClassOn = config.firstClassTools;
+  // One codec per relay process, its key drawn here, so a restart voids every state (ADR 0026).
+  const codec = createConfirmationCodec({
+    ttlMs: config.timings.confirmationTtlMs,
+    bind: confirmationBinding,
+  });
+  /**
+   * The SDK's requestState.verify hook, run before any handler on every
+   * request whose requestState is a string. It never throws: a throw would
+   * become the SDK's frozen -32602 with no call line (S7), answered unlike a
+   * reused state. A state that opens gives up its record here, before any
+   * other check, the budget included, so a retry refused for any reason has
+   * spent it; the dispatcher reads what is left (ADR 0026).
+   */
+  const verifyRetry = async (state: string, ctx: ServerContext): Promise<RetryState> => {
+    const id = await codec.open(state, ctx);
+    const record = id === null ? null : hub.takeConfirmation(id);
+    return record === null ? REFUSED_RETRY : { kind: 'record', record };
+  };
 
   return ({ authInfo, era }) => {
     const owner = identityFrom(authInfo);
@@ -653,6 +711,11 @@ export function createMcpFactory(
               },
             }
           : {}),
+        // ADR 0026: no legacy shim, so a 2025-era question is the relay's own
+        // elicitation and every outcome, a timeout or a missing capability
+        // among them, stays in its handler with its code and its call line.
+        inputRequired: { legacyShim: false },
+        requestState: { verify: verifyRetry },
       },
     );
     if (era === 'legacy' && clientLines !== null) {
@@ -772,10 +835,75 @@ export function createMcpFactory(
     };
 
     /**
+     * How this request can confirm a call in its client (ADR 0026). On
+     * 2026-07-28 the question goes out as input_required and its answer
+     * comes back on a retry, which carries the state the verify hook has
+     * already read; a 2025-era session puts it inside the request, and never
+     * takes a retry, since it never asks for one. The capability is the
+     * request's own on 2026-07-28 and initialize's on a session.
+     */
+    const confirmLeg = (ctx: ServerContext): ConfirmLeg => {
+      const state: unknown = ctx.mcpReq.requestState();
+      const retry =
+        state === undefined
+          ? null
+          : { state: retryStateOf(state), answer: ctx.mcpReq.inputResponses?.[CONFIRM_FIELD] };
+      if (era === 'modern') {
+        const envelope = ctx.mcpReq.envelope as Record<string, unknown> | undefined;
+        return {
+          mode: 'retry',
+          formElicitation: declaresFormElicitation(envelope?.[CLIENT_CAPABILITIES_META_KEY]),
+          retry,
+          elicit: null,
+        };
+      }
+      return {
+        mode: 'elicit',
+        // The documented way to read what a 2025 session's client declared in initialize.
+        // eslint-disable-next-line @typescript-eslint/no-deprecated
+        formElicitation: declaresFormElicitation(server.getClientCapabilities()),
+        retry,
+        elicit: (question, signal) =>
+          // eslint-disable-next-line @typescript-eslint/no-deprecated
+          ctx.mcpReq.elicitInput(
+            { mode: 'form', message: question.message, requestedSchema: question.requestedSchema },
+            { signal, timeout: config.timings.confirmationTtlMs + ELICIT_SLACK_MS },
+          ),
+      };
+    };
+
+    /**
+     * A 2026-07-28 first round the hub would ask about: the record's id
+     * signed into the state, and the relay's question under `confirm`. A
+     * state that fails to mint leaves no record behind.
+     */
+    const askInClient = async (
+      asked: AskInClient,
+      ctx: ServerContext,
+    ): Promise<InputRequiredResult> => {
+      let requestState: string;
+      try {
+        requestState = await codec.mint(asked.recordId, ctx);
+      } catch (error) {
+        hub.discardConfirmation(asked.recordId);
+        throw error;
+      }
+      return inputRequired({
+        inputRequests: {
+          [CONFIRM_FIELD]: inputRequired.elicit({
+            message: asked.question.message,
+            requestedSchema: asked.question.requestedSchema,
+          }),
+        },
+        requestState,
+      });
+    };
+
+    /**
      * Both routes to a page tool end here: call_page_tool, and a first-class
      * name (ADR 0025), whose reference the hub resolves where it looks the
      * tool up. One function, so both get the same checks, prompts, queue,
-     * audit records, cancellation and errors.
+     * audit records, cancellation, errors and confirmation in the client.
      */
     const callPage = async (
       who: CallerIdentity,
@@ -784,7 +912,7 @@ export function createMcpFactory(
       args: JsonObject,
       label: string,
       ctx: ServerContext,
-    ): Promise<CallToolResult> => {
+    ): Promise<ToolAnswer> => {
       const timer = spike?.startCall(authOf(ctx));
       const outcome = await hub.callPageTool(
         who,
@@ -794,7 +922,9 @@ export function createMcpFactory(
         ctx.mcpReq.signal,
         timer?.marks ?? null,
         heldBytes(ctx),
+        confirmLeg(ctx),
       );
+      if (outcome.kind === 'ask') return askInClient(outcome, ctx);
       const result = callResult(label, outcome);
       return spike && timer
         ? spike.finishCall(timer, result, { userId: who.userId, pageId: page, tool: label })
@@ -806,7 +936,7 @@ export function createMcpFactory(
       raw: unknown,
       within: boolean,
       ctx: ServerContext,
-    ): Promise<CallToolResult> => {
+    ): Promise<ToolAnswer> => {
       const input = checked(CALL_PAGE_TOOL_INPUT, raw);
       const page = fieldOf(input, 'page');
       const tool = fieldOf(input, 'tool');
@@ -838,7 +968,7 @@ export function createMcpFactory(
       raw: unknown,
       within: boolean,
       ctx: ServerContext,
-    ): CallToolResult | Promise<CallToolResult> => {
+    ): ToolAnswer | Promise<ToolAnswer> => {
       switch (name) {
         case 'list_pages':
           return listPages(who, raw, within);
@@ -857,9 +987,7 @@ export function createMcpFactory(
      * A handler's answer as McpServer gave it: a result through the
      * negotiated codec, and a throw as an isError result in its words.
      */
-    const answer = async (
-      run: () => CallToolResult | Promise<CallToolResult>,
-    ): Promise<CallToolResult> => {
+    const answer = async (run: () => ToolAnswer | Promise<ToolAnswer>): Promise<ToolAnswer> => {
       try {
         const result = await run();
         if (isInputRequiredResult(result)) return result;
@@ -906,18 +1034,16 @@ export function createMcpFactory(
       const firstClass = firstClassOn ? parseFirstClassName(name) : null;
       if (firstClass !== null) {
         const { pageId, toolPart } = firstClass;
+        // The name as called, which a confirmation's record binds (ADR 0026).
+        const ref: PageToolRef = { firstClass: toolPart, calledAs: name };
         // Recorded under the page tool call_page_tool would name, which the
         // hub reads from the page record, or else the whole first-class name
         // (S7, ADR 0025).
         if (!within) {
-          return refuse(who, {
-            tool: 'call_page_tool',
-            page: pageId,
-            pageTool: { firstClass: toolPart },
-          });
+          return refuse(who, { tool: 'call_page_tool', page: pageId, pageTool: ref });
         }
         const args: JsonObject = request.params.arguments ?? {};
-        return answer(() => callPage(who, pageId, { firstClass: toolPart }, args, toolPart, ctx));
+        return answer(() => callPage(who, pageId, ref, args, toolPart, ctx));
       }
       const marker = member ? (spike?.markerTool() ?? null) : null;
       if (marker?.entry.name === name) {

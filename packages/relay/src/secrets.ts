@@ -17,8 +17,8 @@ const RESUME_TOKEN_BYTES = 32;
 export const SINGLE_USE_SECRET_BYTES = 16;
 const SESSION_SECRET_BYTES = 32;
 
-/** Pages, attach requests, calls, QR claims, and the spike's trace ids that follow one pairing ticket in the logs. */
-export type IdPrefix = 'pg' | 'rq' | 'cl' | 'qc' | 'tr';
+/** Pages, attach requests, calls, QR claims, the spike's trace ids that follow one pairing ticket in the logs, and the confirmations an invoke carries (ADR 0026). */
+export type IdPrefix = 'pg' | 'rq' | 'cl' | 'qc' | 'tr' | 'cf';
 
 /** Each byte's low 5 bits pick a symbol; 256 is a multiple of 32, so there is no bias. */
 export function randomCrockford(length: number): string {

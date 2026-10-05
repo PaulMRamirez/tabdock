@@ -36,6 +36,7 @@ import {
   RESUME_WINDOW_MS,
 } from '@tabdock/protocol';
 import { type AuthPlugin, createDevTokenAuth, parseDevTokens } from './auth.ts';
+import { CONFIRMATION_TTL_MS } from './confirm.ts';
 import { LOCAL_USER, type LocalTokenSystem, loadOwnerToken } from './local-token.ts';
 import type { LogLevel, LogSink } from './log.ts';
 import { createOAuthAuth, parseOAuthClientIds, parseOAuthUsers } from './oauth.ts';
@@ -75,6 +76,12 @@ export interface RelayTimings {
   argumentCheckMs: number;
   /** How long a browser stays signed in at /pair, counted from sign-in. */
   pairSessionMs: number;
+  /**
+   * How long a question in the caller's client waits for its answer (ADR
+   * 0026): a 2026-07-28 record's life and a 2025-era call's own timer. 120 s,
+   * and never more; a test may shorten it.
+   */
+  confirmationTtlMs: number;
 }
 
 export interface RelayRateLimits {
@@ -420,6 +427,7 @@ export const DEFAULT_TIMINGS: RelayTimings = {
   sseKeepAliveMs: SSE_KEEP_ALIVE_MS,
   argumentCheckMs: ARGUMENT_CHECK_MS,
   pairSessionMs: PAIR_SESSION_MS,
+  confirmationTtlMs: CONFIRMATION_TTL_MS,
 };
 
 export const DEFAULT_RATE_LIMITS: RelayRateLimits = {
@@ -876,6 +884,13 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
   if (timings.callDeadlineMs + timings.callDeadlineGraceMs > MAX_TIMER_MS) {
     throw new Error(
       `callDeadlineMs plus callDeadlineGraceMs must be at most ${String(MAX_TIMER_MS)}`,
+    );
+  }
+  // A longer wait would keep a confirmation good past what ADR 0026 allows
+  // and hold a 2025-era request open past hosted Claude's 240 s per call.
+  if (timings.confirmationTtlMs > CONFIRMATION_TTL_MS) {
+    throw new Error(
+      `confirmationTtlMs must be at most ${String(CONFIRMATION_TTL_MS)}: a question in a client lives 120 s at most (ADR 0026)`,
     );
   }
   const limits = positiveIntegers(

@@ -78,6 +78,7 @@ import {
   notAllowedRefusal,
 } from './auth.ts';
 import { createClientAddresses, loggedAddress } from './client-address.ts';
+import { withStringRequestState } from './confirm.ts';
 import {
   HOSTED_WILDCARD_HOST,
   isLoopbackAddress,
@@ -571,6 +572,9 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   const refusedLine = (userId: string): void => {
     mcpLines.write('warn', 'mcp request refused: past the request budget', { userId });
   };
+  /** A tools/call name the dispatcher sends to a page tool, the calls a confirmation can be for (ADR 0026). */
+  const isPageCall = (name: string): boolean =>
+    name === 'call_page_tool' || (config.firstClassTools && parseFirstClassName(name) !== null);
   const factory = createMcpFactory(hub, config, {
     spike,
     budget,
@@ -619,6 +623,9 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     log,
     lines: mcpLines,
     windowMs: config.rateLimits.windowMs,
+    // As on the strict leg: a page call's requestState that is not a string
+    // reaches the dispatcher, which answers it not_confirmed (ADR 0026's notes).
+    inbound: (message) => withStringRequestState(message, isPageCall),
   });
   const listens = new ListenStreams({
     perUser: config.limits.sessionsPerUser,
@@ -689,9 +696,13 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     } else if (body.kind === 'answered') {
       response = body.response;
     } else {
-      const listen = listenOf(body.message);
-      const parsed = { ...options, parsedBody: body.message };
-      const arrival = listen === null ? arrivalOf(body.message, config.firstClassTools) : null;
+      // A call to a page tool whose requestState is not a string is a forged
+      // retry: as a string the codec refuses, it is answered not_confirmed
+      // with its call line, not the SDK's frozen -32602 (ADR 0026's notes).
+      const message = withStringRequestState(body.message, isPageCall);
+      const listen = listenOf(message);
+      const parsed = { ...options, parsedBody: message };
+      const arrival = listen === null ? arrivalOf(message, config.firstClassTools) : null;
       if (arrival !== null) {
         spent = true;
         const paid = budget.spend(caller.userId, caller.kind);
@@ -704,7 +715,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         // past the budget, which cost their sender nothing more, write no
         // line; a listen spends in its own gate and its client's other
         // requests name it.
-        const envelope = paid && isJSONRPCRequest(body.message) ? envelopeOf(body.message) : null;
+        const envelope = paid && isJSONRPCRequest(message) ? envelopeOf(message) : null;
         if (envelope !== null) {
           clientLines.write({ userId: caller.userId, leg: 'strict', ...envelope });
         }
