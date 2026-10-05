@@ -19,8 +19,9 @@ import {
   StreamableHTTPClientTransport,
 } from '@modelcontextprotocol/client';
 import { MAX_CONFIRMATION_FRAME_BYTES, MAX_FRAME_BYTES, type PageTool } from '@tabdock/protocol';
-import { afterEach, describe, expect, it } from 'vitest';
-import { canonicalJson } from '../src/confirm.ts';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ArgumentChecker } from '../src/argument-checker.ts';
+import { canonicalJson, PendingConfirmations } from '../src/confirm.ts';
 import { createMemoryStore, type DevTokenUser } from '../src/index.ts';
 import {
   attachMember,
@@ -96,6 +97,7 @@ const pages: TestPage[] = [];
 let inviteRelay: InviteRelay | undefined;
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const client of clients.splice(0)) await client.close().catch(() => undefined);
   for (const page of pages.splice(0)) page.ws.terminate();
   for (const relay of relays.splice(0)) await relay.close();
@@ -344,6 +346,88 @@ function callRecords(
 ): ReturnType<TestRelay['relay']['audit']['records']> {
   if (!on) throw new Error('no relay');
   return on.relay.audit.records();
+}
+
+/** A step in the relay held until a test releases it. */
+interface Hold {
+  /** Resolves once the relay waits on the held step. */
+  started: Promise<undefined>;
+  release: () => void;
+}
+
+/**
+ * Holds the relay's argument check of the `nth` call to `tool` until
+ * released, so a test lands a revoke, a detach or the page's end exactly
+ * while the relay waits on its worker, however quick the check would be.
+ */
+function holdCheck(tool: string, nth = 1): Hold {
+  const started = deferred<undefined>();
+  const gate = deferred<undefined>();
+  // Called below with the relay's own checker as `this`.
+  // eslint-disable-next-line @typescript-eslint/unbound-method
+  const check = ArgumentChecker.prototype.check;
+  let seen = 0;
+  vi.spyOn(ArgumentChecker.prototype, 'check').mockImplementation(async function (
+    this: ArgumentChecker,
+    name,
+    schema,
+    args,
+  ) {
+    if (name === tool) {
+      seen += 1;
+      if (seen === nth) {
+        started.resolve(undefined);
+        await gate.promise;
+      }
+    }
+    return check.call(this, name, schema, args);
+  });
+  return {
+    started: started.promise,
+    release: () => {
+      gate.resolve(undefined);
+    },
+  };
+}
+
+/**
+ * Holds the next HMAC the SDK's request state codec computes, which a
+ * 2026-07-28 first round awaits as it signs its record's id into the state,
+ * so a test lands a change after the record exists and before the answer.
+ */
+function holdSigning(): Hold {
+  const started = deferred<undefined>();
+  const gate = deferred<undefined>();
+  const { subtle } = globalThis.crypto;
+  const sign = subtle.sign.bind(subtle);
+  let held = false;
+  vi.spyOn(subtle, 'sign').mockImplementation(async (algorithm, key, data) => {
+    if (!held) {
+      held = true;
+      started.resolve(undefined);
+      await gate.promise;
+    }
+    return sign(algorithm, key, data);
+  });
+  return {
+    started: started.promise,
+    release: () => {
+      gate.resolve(undefined);
+    },
+  };
+}
+
+/** Waits until the relay has ended the page, which a deliberate detach does at once (ADR 0007). */
+async function pageEnded(pageId: string): Promise<void> {
+  await eventually(
+    () =>
+      current?.relay.audit
+        .events()
+        .some(
+          (event) =>
+            event.type === 'expire' && event.pageId === pageId && event.reason === 'page_gone',
+        ) === true,
+  );
 }
 
 describe.each(ERAS)('confirmation in the client (%s)', (_label, modern) => {
@@ -678,6 +762,137 @@ describe.each(ERAS)('confirmation in the client (%s)', (_label, modern) => {
   });
 });
 
+describe.each(ERAS)('a change while the relay checks a call (%s)', (_label, modern) => {
+  // Short, so a question asked and left waiting would answer within the test's time, and fail it.
+  const TTL_MS = 3000;
+
+  it.each([
+    ['the operator revokes the caller', 'not_attached'],
+    ['the caller detaches through another client', 'not_attached'],
+    ['the page detaches', 'page_gone'],
+  ] as const)(
+    'asks nothing about a call when %s during its argument check, and answers %s at once',
+    async (how, code) => {
+      await relay({ timings: { confirmationTtlMs: TTL_MS } });
+      const { page, invokes } = await board();
+      const pairing = await asking(ALICE, false, () => DECLINE, { capable: false });
+      await pairAndApprove(pairing.client, page, 'driver');
+      const alice = await asking(ALICE, modern, () => ACCEPT);
+      const hold = holdCheck('wipe');
+      const before = callRecords().length;
+      const started = performance.now();
+      const pending = wipe(alice.client, page.pageId, { why: 'raced' });
+      await hold.started;
+      if (how === 'the operator revokes the caller') {
+        page.send({ t: 'revoke', userId: 'alice' });
+        await page.sync();
+      } else if (how === 'the caller detaches through another client') {
+        const detached = await callTool(pairing.client, 'detach_page', { page: page.pageId });
+        expect(detached.isError, detached.text).toBe(false);
+      } else {
+        page.ws.close(4000, 'detach');
+        await pageEnded(page.pageId);
+      }
+      hold.release();
+      const outcome = await pending;
+      // At once, not when a question nobody may confirm would have expired (S8).
+      expect(performance.now() - started).toBeLessThan(TTL_MS - 1000);
+      expect(codeOf(outcome), outcome.text).toBe(code);
+      expect(alice.asked).toEqual([]);
+      expect(invokes).toEqual([]);
+      expect(callRecords().slice(before)).toEqual([
+        expect.objectContaining({ tool: 'wipe', outcome: code }),
+      ]);
+    },
+  );
+
+  it('asks no observer: a caller demoted during the check of a read-only tool gets the page prompt instead', async () => {
+    await relay({ timings: { confirmationTtlMs: TTL_MS } });
+    const { page, invokes } = await board();
+    const alice = await asking(ALICE, modern, () => ACCEPT);
+    await pairAndApprove(alice.client, page, 'driver');
+    const hold = holdCheck('peek');
+    const pending = callTool(alice.client, 'call_page_tool', {
+      page: page.pageId,
+      tool: 'peek',
+      arguments: {},
+    });
+    await hold.started;
+    page.send({ t: 'set_role', userId: 'alice', role: 'observer' });
+    await page.sync();
+    hold.release();
+    const outcome = await pending;
+    expect(outcome.isError, outcome.text).toBe(false);
+    expect(alice.asked).toEqual([]);
+    expect(invokes).toHaveLength(1);
+    expect(invokes[0]).toMatchObject({ tool: 'peek', caller: { role: 'observer' } });
+    expect(invokes[0]).not.toHaveProperty('confirmation');
+    expect(callRecords().at(-1)).not.toHaveProperty('confirmedBy');
+  });
+
+  it('sends nothing on a confirmation whose attachment was revoked and approved afresh while the relay checked the confirmed call', async () => {
+    await relay({ timings: { confirmationTtlMs: TTL_MS } });
+    const { page, invokes } = await board();
+    const pairing = await asking(ALICE, false, () => DECLINE, { capable: false });
+    await pairAndApprove(pairing.client, page, 'driver');
+    const alice = await asking(ALICE, modern, () => ACCEPT);
+    // A read-only call goes to the page once its check answers, in no queue a
+    // revoke empties. Its first check comes before the question, its second
+    // after the confirming answer.
+    const hold = holdCheck('peek', 2);
+    const before = callRecords().length;
+    const pending = callTool(alice.client, 'call_page_tool', {
+      page: page.pageId,
+      tool: 'peek',
+      arguments: {},
+    });
+    await hold.started;
+    expect(alice.asked).toHaveLength(1);
+    page.send({ t: 'revoke', userId: 'alice' });
+    await page.sync();
+    await pairAndApprove(pairing.client, page, 'driver');
+    hold.release();
+    const outcome = await pending;
+    expect(codeOf(outcome), outcome.text).toBe('not_confirmed');
+    await page.sync();
+    expect(invokes).toEqual([]);
+    const records = callRecords().slice(before);
+    expect(records).toEqual([expect.objectContaining({ tool: 'peek', outcome: 'not_confirmed' })]);
+    expect(records[0]).not.toHaveProperty('confirmedBy');
+  });
+
+  it('binds a confirmation to the attachment it was asked under, even where an end of that attachment missed its question', async () => {
+    await relay({ timings: { confirmationTtlMs: TTL_MS } });
+    const { page, invokes } = await board();
+    const pairing = await asking(ALICE, false, () => DECLINE, { capable: false });
+    await pairAndApprove(pairing.client, page, 'driver');
+    // As if some later way to end an attachment forgot the questions asked under it.
+    vi.spyOn(PendingConfirmations.prototype, 'drop').mockImplementation(() => undefined);
+    const replaced = async (): Promise<void> => {
+      page.send({ t: 'revoke', userId: 'alice' });
+      await page.sync();
+      await pairAndApprove(pairing.client, page, 'driver');
+    };
+    let answer: string;
+    if (modern) {
+      const target = devTarget(ALICE);
+      const { state } = await firstRound(target, wipeParams(page.pageId));
+      await replaced();
+      const after = await retry(target, wipeParams(page.pageId), state);
+      answer = after.result?.content?.[0]?.text ?? JSON.stringify(after);
+    } else {
+      const alice = await asking(ALICE, false, async () => {
+        await replaced();
+        return ACCEPT;
+      });
+      answer = (await wipe(alice.client, page.pageId)).text;
+    }
+    expect(answer).toMatch(/^not_confirmed: you were asked about this call under an attachment/);
+    await page.sync();
+    expect(invokes).toEqual([]);
+  });
+});
+
 /** A tools/call on a fresh 2025-era session, raw, so its params can be anything; the answer's text. */
 async function sessionCall(user: DevTokenUser, params: Record<string, unknown>): Promise<string> {
   if (!current) throw new Error('no relay');
@@ -912,6 +1127,26 @@ describe('a 2026-07-28 retry', () => {
     const later = await retry(target, wipeParams(page.pageId), state);
     expect(rawCode(later)).toBe('not_confirmed');
     expect(invokes).toEqual([]);
+  });
+
+  it('puts no question once the operator revokes while its state is signed, answering not_attached with its call line', async () => {
+    await relay();
+    const { page, invokes, target } = await attachedDriver();
+    const hold = holdSigning();
+    const before = callRecords().length;
+    const pending = rawCall(target, wipeParams(page.pageId));
+    await hold.started;
+    page.send({ t: 'revoke', userId: 'alice' });
+    await page.sync();
+    hold.release();
+    const answer = await pending;
+    expect(answer.result?.requestState, JSON.stringify(answer)).toBeUndefined();
+    expect(rawCode(answer), JSON.stringify(answer)).toBe('not_attached');
+    await page.sync();
+    expect(invokes).toEqual([]);
+    expect(callRecords().slice(before)).toEqual([
+      expect.objectContaining({ tool: 'wipe', outcome: 'not_attached' }),
+    ]);
   });
 
   it('finds no record after a revoke and a fresh approval', async () => {

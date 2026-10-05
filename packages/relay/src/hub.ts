@@ -327,14 +327,14 @@ export type SettledCall =
 
 /**
  * A 2026-07-28 first round the relay answers with input_required (ADR
- * 0026): every check before dispatch passed, the record `recordId` names
- * waits for the retry, and mcp.ts signs that id into the request state and
+ * 0026): every check before dispatch passed, a record waits for the retry,
+ * `requestState` carries its id signed (ConfirmLeg's `mint`), and mcp.ts
  * puts `question` to the client. The call took no place in any queue, and
  * the page never heard of it.
  */
 export interface AskInClient {
   kind: 'ask';
-  recordId: string;
+  requestState: string;
   question: ConfirmQuestion;
 }
 
@@ -369,6 +369,13 @@ export interface ConfirmLeg {
   retry: { state: RetryState; answer: unknown } | null;
   /** elicit mode: puts the question to the client, resolving with its answer as given. */
   elicit: ((question: ConfirmQuestion, signal: AbortSignal) => Promise<unknown>) | null;
+  /**
+   * retry mode: signs a record's id into the request state the question
+   * carries, bound to this request's caller. The hub awaits it, then looks
+   * again whether the record is still held, so a revoke while it signs puts
+   * no question (#ask).
+   */
+  mint: ((recordId: string) => Promise<string>) | null;
 }
 
 /** The confirmation an invoke carries, fresh for the call (ADR 0026). */
@@ -377,6 +384,15 @@ interface ClientConfirmation {
   confirmationId: string;
   /** When the confirming answer arrived. */
   at: number;
+  /**
+   * The grantedAt of the caller's attachment the question was asked under,
+   * which names that attachment: a fresh one after a revoke or a detach
+   * comes from a new pairing, a round trip later, never in the same
+   * millisecond. The confirmation holds only while that attachment is still
+   * the caller's, so it never outlives it whatever the order of awaits;
+   * never sent to the page.
+   */
+  grantedAt: number;
 }
 
 export type DetachOutcome = { kind: 'detached'; pageId: string } | HubError;
@@ -564,6 +580,8 @@ const CONFIRMED_ANOTHER_CALL =
   'the confirmation was given for another call (other arguments, another tool or another page); call again to be asked about this one. The page never heard of this call';
 const NOT_CONFIRMED_IN_CLIENT =
   'you did not confirm this call in your client: it was declined, dismissed or answered without confirm set to true. The page never heard of it';
+const ASKED_UNDER_ENDED_ATTACHMENT =
+  'you were asked about this call under an attachment to this page that has since ended, so its confirmation ended with it; call again to be asked anew. The page never heard of this call';
 /** What a question held open on a page that ended answers (ADR 0026), as a later call would. */
 const PAGE_GONE_ANSWER: DroppedAnswer = {
   code: 'page_gone',
@@ -4255,11 +4273,6 @@ export class PageHub {
     return this.#confirmations.take(id);
   }
 
-  /** A record whose question never went out, its request state having failed to mint. */
-  discardConfirmation(id: string): void {
-    this.#confirmations.discard(id);
-  }
-
   /**
    * A record no retry took before its expiry: one call line, within the
    * refusal budget, so a question nobody answered leaves a line while the
@@ -4401,7 +4414,11 @@ export class PageHub {
     if (confirm?.retry) {
       const retried = this.#retried(caller, pageId, toolRef, args, confirm);
       if (retried.kind === 'error') return retried;
-      confirmation = { confirmationId: newId('cf'), at: Date.now() };
+      confirmation = {
+        confirmationId: newId('cf'),
+        at: Date.now(),
+        grantedAt: retried.grantedAt,
+      };
       confirmedTool = retried.pageTool;
     }
     // At most twice: a 2025-era call confirmed in its request passes every check again.
@@ -4410,6 +4427,11 @@ export class PageHub {
       const access = this.#access(caller.userId, pageId);
       if (access.kind === 'error') return access;
       const { page, attachment } = access;
+      // A confirmation ends with the attachment it was asked under, even
+      // when the operator has approved the caller afresh since (ADR 0026).
+      if (confirmation !== null && attachment.grantedAt !== confirmation.grantedAt) {
+        return notConfirmed(ASKED_UNDER_ENDED_ATTACHMENT);
+      }
 
       const rateKey = attachmentKey(pageId, caller.userId);
       if (!this.#callLimiter.allows(rateKey, arrivedAt)) {
@@ -4493,9 +4515,30 @@ export class PageHub {
       ) {
         const argumentError = await this.#checkArguments(pageId, tool.name, args);
         if (argumentError) return argumentError;
-        const asked = await this.#ask(caller, page, tool.name, toolRef, args, signal, confirm);
+        // The check waited on the worker, so the caller may have been revoked,
+        // detached or demoted, or the page may have ended or changed its
+        // tools or policy, before #endAttachments or #gone had a question to
+        // drop. All of it is looked at again here, and nothing is awaited
+        // from this look until the question's record or wait exists, so any
+        // later end drops it (S8, ADR 0026).
+        const current = this.#afterCheck(call);
+        if (current.kind === 'error') return current;
+        const latest = this.#store.pages.get(pageId);
+        if (latest === undefined || !this.#stillAsks(call, current.attachment)) {
+          // What called for asking changed: the page decides, as for any call.
+          return this.#proceed(call, signal, args);
+        }
+        const { grantedAt } = current.attachment;
+        const asked = await this.#ask(
+          caller,
+          latest,
+          { pageTool: tool.name, toolRef, grantedAt },
+          args,
+          signal,
+          confirm,
+        );
         if (asked.kind !== 'confirmed') return asked;
-        confirmation = { confirmationId: newId('cf'), at: asked.at };
+        confirmation = { confirmationId: newId('cf'), at: asked.at, grantedAt };
         // The answer was about this page tool; a first-class name that now
         // reaches another one, after the page re-listed, is not_confirmed,
         // as a 2026-07-28 retry is.
@@ -4521,7 +4564,7 @@ export class PageHub {
     toolRef: PageToolRef,
     args: JsonObject,
     confirm: ConfirmLeg,
-  ): { kind: 'ok'; pageTool: string } | HubError {
+  ): { kind: 'ok'; pageTool: string; grantedAt: number } | HubError {
     const refused = (message: string): HubError => {
       const access = this.#access(caller.userId, pageId);
       if (
@@ -4545,24 +4588,27 @@ export class PageHub {
       record.digest === argumentsDigest(args);
     if (!sameCall) return refused(CONFIRMED_ANOTHER_CALL);
     if (!confirms(retry.answer)) return refused(NOT_CONFIRMED_IN_CLIENT);
-    return { kind: 'ok', pageTool: record.pageTool };
+    return { kind: 'ok', pageTool: record.pageTool, grantedAt: record.grantedAt };
   }
 
   /**
    * Puts the question: on 2026-07-28 a record for the retry and an `ask`
-   * outcome that mcp.ts answers input_required; on a 2025-era session the
-   * question inside the request. A fifth question waiting for one user
-   * answers rate_limited.
+   * outcome, its state signed, that mcp.ts answers input_required; on a
+   * 2025-era session the question inside the request. A fifth question
+   * waiting for one user answers rate_limited. `grantedAt` names the
+   * attachment it is asked under, which the caller looked at just before
+   * with nothing awaited since, so the record or wait exists before any
+   * later end of that attachment can look for it.
    */
   async #ask(
     caller: CallerIdentity,
     page: PageRecord,
-    pageTool: string,
-    toolRef: PageToolRef,
+    about: { pageTool: string; toolRef: PageToolRef; grantedAt: number },
     args: JsonObject,
     signal: AbortSignal,
     confirm: ConfirmLeg,
   ): Promise<AskInClient | HubError | { kind: 'confirmed'; at: number }> {
+    const { pageTool, toolRef, grantedAt } = about;
     const question = confirmQuestion({
       tool: pageTool,
       pageId: page.pageId,
@@ -4578,22 +4624,49 @@ export class PageHub {
     if (digest === null) {
       return hubError('invalid_arguments', 'the arguments could not be encoded for the page link');
     }
+    if (confirm.mint === null) return notConfirmed(NOT_CONFIRMED_IN_CLIENT);
     const record = this.#confirmations.add({
       userId: caller.userId,
       pageId: page.pageId,
       calledAs: calledAsOf(toolRef),
       pageTool,
       digest,
+      grantedAt,
       origin: page.origin,
       client: caller.client,
     });
     if (record === null) return this.#tooManyQuestions(caller);
+    let requestState: string;
+    try {
+      requestState = await confirm.mint(record.id);
+    } catch (error) {
+      // A question whose state never went out leaves no record behind.
+      this.#confirmations.discard(record.id);
+      throw error;
+    }
+    // Signing is awaited, so a revoke, the attachment's end, the page's end
+    // or a shutdown may have dropped the record meanwhile; the question
+    // would then ask about a call nobody may confirm, so the call answers as
+    // a later one would (S8).
+    if (!this.#confirmations.holds(record.id)) return this.#questionWithdrawn(caller, page.pageId);
     this.#log.debug('call asked in its client', {
       pageId: page.pageId,
       userId: caller.userId,
       tool: pageTool,
     });
-    return { kind: 'ask', recordId: record.id, question };
+    return { kind: 'ask', requestState, question };
+  }
+
+  /**
+   * What a call whose question lost its record before it went out answers:
+   * page_asleep at shutdown, else what the access check now says
+   * (not_attached, page_gone or page_asleep), else not_confirmed, since only
+   * a revoke and a fresh approval in between leave the caller attached.
+   */
+  #questionWithdrawn(caller: CallerIdentity, pageId: string): HubError {
+    if (this.#closed) return hubError('page_asleep', 'the relay is shutting down');
+    const access = this.#access(caller.userId, pageId);
+    return access.kind === 'error' ? access : notConfirmed(ASKED_UNDER_ENDED_ATTACHMENT);
   }
 
   /**
@@ -4839,7 +4912,16 @@ export class PageHub {
           role,
         },
         deadlineMs,
-        ...(confirmation === null ? {} : { confirmation: { by: 'client', ...confirmation } }),
+        // Field by field: the attachment it was asked under stays the relay's.
+        ...(confirmation === null
+          ? {}
+          : {
+              confirmation: {
+                by: 'client',
+                confirmationId: confirmation.confirmationId,
+                at: confirmation.at,
+              },
+            }),
       });
     } catch {
       // JSON.stringify recurses: arguments nested a few thousand levels deep overflow the stack.
@@ -5010,7 +5092,10 @@ export class PageHub {
 
   /**
    * What may have changed since a call arrived, looked at again: the
-   * attachment, the page, the tool and the role.
+   * attachment, the page, the tool and the role, and for a confirmed call
+   * that its attachment is still the one it was asked under. A read-only
+   * call waits on its check in no queue a revoke empties, so a revoke and
+   * a fresh approval meanwhile are caught here (ADR 0026).
    */
   #recheck(
     call: PendingCall,
@@ -5018,6 +5103,9 @@ export class PageHub {
     const access = this.#access(call.caller.userId, call.pageId);
     if (access.kind === 'error') return access;
     const { page, attachment, conn } = access;
+    if (call.confirmation !== null && attachment.grantedAt !== call.confirmation.grantedAt) {
+      return notConfirmed(ASKED_UNDER_ENDED_ATTACHMENT);
+    }
     const tool = page.tools.find((candidate) => candidate.name === call.toolName);
     if (!tool) {
       return hubError('tool_not_found', `page ${call.pageId} has no tool named ${call.toolName}`);
