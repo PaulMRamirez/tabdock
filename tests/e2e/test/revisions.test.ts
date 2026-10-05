@@ -17,6 +17,7 @@
 // have to agree with it.
 
 import { Client as ClientV2, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import { resultJson } from '@tabdock/relay/test/results';
 import type { SimPage } from '@tabdock/sim-page';
 import { Client as Client1102 } from 'mcp-sdk-1.10.2/client/index.js';
 import { StreamableHTTPClientTransport as Http1102 } from 'mcp-sdk-1.10.2/client/streamableHttp.js';
@@ -69,7 +70,11 @@ function outcomeOf(result: unknown): Outcome {
   const text = (fields.content ?? [])
     .map((block) => (block.type === 'text' ? (block.text ?? '') : ''))
     .join('\n');
-  return { isError: fields.isError === true, text, structured: fields.structuredContent };
+  return {
+    isError: fields.isError === true,
+    text,
+    structured: resultJson(text, fields.structuredContent),
+  };
 }
 
 /**

@@ -1,10 +1,11 @@
 // Builds the demo page with esbuild and serves it on localhost.
 //   node scripts/server.ts           watch and serve (pnpm dev)
 //   node scripts/server.ts --build   one-off static build into dist/
-// The e2e harness imports startDemoServer() to serve the page on a free port,
-// and apps/site imports buildDemo() to put the static build at the site's root.
+// The e2e harness imports startDemoServer({ e2eHook: true }) to serve the page
+// on a free port with its ?e2e test hook under a key of its own, and apps/site
+// imports buildDemo() to put the static build at the site's root.
 
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type ServerResponse } from 'node:http';
@@ -60,7 +61,11 @@ const buildOptions = {
   outfile: join(distDir, 'main.js'),
   sourcemap: true,
   logLevel: 'warning',
-  define: { __TABDOCK_E2E_HOOK__: 'false', __TABDOCK_MCPB_EMBED__: 'false' },
+  define: {
+    __TABDOCK_E2E_HOOK__: 'false',
+    __TABDOCK_E2E_KEY__: '""',
+    __TABDOCK_MCPB_EMBED__: 'false',
+  },
 } satisfies esbuild.BuildOptions;
 
 /**
@@ -143,24 +148,58 @@ export function staticIndexHtml(html: string): string {
   );
 }
 
+export interface DemoServerOptions {
+  port?: number;
+  watch?: boolean;
+  /**
+   * The ?e2e test hook (src/main.ts), off unless asked for, and so off for
+   * pnpm dev: true draws a random key, and a string is the key itself, at
+   * least E2E_KEY's 22 characters. The page honours only ?e2e=<key>, so a
+   * link from another site cannot skip the Connect click (ADR 0029's notes).
+   */
+  e2eHook?: boolean | string;
+}
+
 export interface DemoServer {
   url: string;
+  /** The ?e2e value this server's page honours, or null when it offers no hook. */
+  e2eKey: string | null;
   close: () => Promise<void>;
+}
+
+/** A hook key: 128 bits or more as base64url, never guessed by a site that would link here. */
+const E2E_KEY = /^[A-Za-z0-9_-]{22,128}$/;
+
+function hookKey(asked: DemoServerOptions['e2eHook']): string | null {
+  if (asked === undefined || asked === false) return null;
+  if (asked === true) return randomBytes(16).toString('base64url');
+  if (!E2E_KEY.test(asked)) {
+    throw new Error(
+      "the demo's ?e2e hook key must be 22 to 128 letters, digits, - or _ (DEMO_E2E_KEY)",
+    );
+  }
+  return asked;
 }
 
 /**
  * Serves the demo on 127.0.0.1 only; port 0 picks a free port. The bundle lives
  * in memory, so several servers (parallel test workers, pnpm dev) never share files.
+ * It answers only its own loopback names at its own port, so a site whose name
+ * someone rebinds to 127.0.0.1 cannot read the bundle and the hook key in it.
  */
-export async function startDemoServer(
-  options: { port?: number; watch?: boolean } = {},
-): Promise<DemoServer> {
+export async function startDemoServer(options: DemoServerOptions = {}): Promise<DemoServer> {
+  const e2eKey = hookKey(options.e2eHook);
   let bundle = new Map<string, Uint8Array>();
   const ctx = await esbuild.context({
     ...buildOptions,
-    // Only the local dev and test server may offer the ?e2e hook, or load the
-    // MCP-B embed it serves from /vendor for ?mcpb; see src/main.ts.
-    define: { __TABDOCK_E2E_HOOK__: 'true', __TABDOCK_MCPB_EMBED__: 'true' },
+    // Only the local dev and test server may load the MCP-B embed it serves
+    // from /vendor for ?mcpb, and only a server asked for it offers the ?e2e
+    // hook, under its own key; see src/main.ts.
+    define: {
+      __TABDOCK_E2E_HOOK__: String(e2eKey !== null),
+      __TABDOCK_E2E_KEY__: JSON.stringify(e2eKey ?? ''),
+      __TABDOCK_MCPB_EMBED__: 'true',
+    },
     write: false,
     plugins: [
       {
@@ -182,7 +221,19 @@ export async function startDemoServer(
   await ctx.rebuild();
   if (options.watch) await ctx.watch();
 
+  /** This server's own names: the loopback ones, at the port it listens on. */
+  const ownHost = (host: string | undefined): boolean => {
+    const address = server.address();
+    if (host === undefined || address === null || typeof address === 'string') return false;
+    const port = String(address.port);
+    return [`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`].includes(host.toLowerCase());
+  };
+
   const server = createServer((request, response) => {
+    if (!ownHost(request.headers.host)) {
+      send(response, 421, 'text/plain; charset=utf-8', 'Misdirected request');
+      return;
+    }
     // Any page can make the browser send odd request targets here (an <img src>
     // is enough), so parse defensively: a throw in this handler would kill pnpm dev.
     const raw = request.url ?? '/';
@@ -236,6 +287,7 @@ export async function startDemoServer(
 
   return {
     url: `http://127.0.0.1:${String(port)}/`,
+    e2eKey,
     close: async () => {
       server.closeAllConnections();
       await new Promise<void>((resolveClose) => {
@@ -270,7 +322,13 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   } else {
     loadDotEnv();
     const port = Number(process.env.DEMO_PORT ?? 5173);
-    const server = await startDemoServer({ port, watch: true });
+    // No ?e2e hook unless a script names its key, as scripts/dev.ts does.
+    const e2eKey = process.env.DEMO_E2E_KEY?.trim() ?? '';
+    const server = await startDemoServer({
+      port,
+      watch: true,
+      ...(e2eKey === '' ? {} : { e2eHook: e2eKey }),
+    });
     console.log(`Demo board: ${server.url}`);
     console.log(`With MCP-B's local relay embed: ${server.url}?mcpb`);
   }

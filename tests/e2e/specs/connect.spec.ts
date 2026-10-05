@@ -137,8 +137,48 @@ test('a ?relay link waits behind a Connect bar until a trusted click, and script
     /Tabdock relay 127\.0\.0\.1:9: linked/,
   );
   await expect.poll(() => widgetText(page, 'pairing-code')).toContain(PAIRING_CODE);
-  // The dev bundle offers the ?e2e hook, but only with ?e2e.
+  // The board as pnpm dev serves it offers no ?e2e hook at all.
   expect(await page.evaluate(() => window.__tabdockDock === undefined)).toBe(true);
+});
+
+test("a crafted link's ?e2e never skips the click: pnpm dev's board has no hook, and a board that has one honours only its server's key", async ({
+  page,
+  context,
+}) => {
+  // A5.6: any site could send a tab to the board pnpm dev serves at its
+  // predictable port with ?e2e and a relay and policy of its choosing.
+  const dialled = await fakeRelays(context);
+  const waiting = async (): Promise<void> => {
+    await expect(page.locator('[data-role="connect-bar"]')).toBeVisible();
+    await expect(page.locator('html')).toHaveAttribute('data-link', 'waiting');
+    await page.waitForTimeout(SETTLE_MS);
+    expect(dialled.urls).toEqual([]);
+    expect(await page.evaluate(() => window.__tabdockDock === undefined)).toBe(true);
+  };
+  for (const e2e of ['', 'x'.repeat(22)]) {
+    await openBoard(page, boardUrl(FAKE_RELAY, { e2e, confirm: 'client', invites: 'all' }));
+    await waiting();
+  }
+  const hooked = await startDemoServer({ e2eHook: true });
+  try {
+    const key = hooked.e2eKey ?? '';
+    const at = (e2e: string): string => {
+      const url = new URL(hooked.url);
+      url.searchParams.set('relay', FAKE_RELAY);
+      url.searchParams.set('e2e', e2e);
+      return url.href;
+    };
+    for (const wrong of ['', 'x'.repeat(22), `${key}x`, key.slice(1)]) {
+      await openBoard(page, at(wrong));
+      await waiting();
+    }
+    // The yardstick: its own key skips the click, as the specs and demo scripts use it.
+    await openBoard(page, at(key));
+    await expect.poll(() => dialled.urls).toEqual([FAKE_RELAY]);
+    expect(await page.evaluate(() => window.__tabdockDock !== undefined)).toBe(true);
+  } finally {
+    await hooked.close();
+  }
 });
 
 test('the choice is remembered for this tab and this relay URL alone', async ({

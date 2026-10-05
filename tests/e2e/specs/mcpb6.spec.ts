@@ -60,7 +60,7 @@ const ALICE_CLIENT = 'tabdock-playwright-mcpb6';
 const ALICE_MODERN_CLIENT = 'tabdock-playwright-mcpb6-modern';
 
 test.beforeAll(async () => {
-  demo = await startDemoServer();
+  demo = await startDemoServer({ e2eHook: true });
 });
 test.afterAll(async () => {
   await demo.close();

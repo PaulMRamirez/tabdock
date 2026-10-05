@@ -739,7 +739,7 @@ describe('untrusted page content (S10, S9)', () => {
       `[tabdock: truncated, ${String(big.length - MAX_RESULT_CHARS)} of ${String(big.length)} characters removed]`,
     );
     expect(body.length).toBeLessThan(MAX_RESULT_CHARS + 200);
-    expect(result.structured).toBeUndefined();
+    expect(result.structuredContent).toBeUndefined();
   });
 
   it('refuses arguments too large for one frame without knocking the page offline', async () => {
@@ -800,8 +800,8 @@ describe('untrusted page content (S10, S9)', () => {
     });
     expect(result.isError).toBe(false);
     expect(result.text).toBe(`${untrustedHeader(PAGE_ORIGIN, 'get_view')}\n${deep}`);
-    // Too deep to serialise as structured content, so it stays text only.
-    expect(result.structured).toBeUndefined();
+    // Page text travels as labelled text alone, so nothing this deep reaches the SDK's serialiser.
+    expect(result.structuredContent).toBeUndefined();
     expect(relay.audit.records().map((record) => [record.tool, record.outcome])).toEqual([
       ['get_view', 'ok'],
     ]);

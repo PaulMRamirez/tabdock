@@ -18,6 +18,7 @@
 // tells which calls a client confirmed. It never prints the owner token or a
 // pairing code, and checks every line against them before printing it (S11).
 
+import { randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import {
@@ -266,11 +267,14 @@ try {
   const home = join(scratch, 'tabdock home');
   say('Part one: first-class page tools (ADR 0025)\n');
   say('1. pnpm dev in local mode, with a throwaway TABDOCK_HOME and TABDOCK_FIRST_CLASS_TOOLS=1.');
+  // The board's ?e2e hook, which drives it here, exists only under a key pnpm dev is given.
+  const e2eKey = randomBytes(16).toString('base64url');
   dev = runPnpm(['dev'], {
     ...blankEnv(),
     TABDOCK_HOME: home,
     TABDOCK_PORT: '0',
     DEMO_PORT: '0',
+    DEMO_E2E_KEY: e2eKey,
     TABDOCK_FIRST_CLASS_TOOLS: '1',
   });
   await dev.waitFor('Relay logs follow');
@@ -290,7 +294,7 @@ try {
 
   const demoLink = /Demo board linked to the relay: (\S+)/.exec(printed)?.[1] ?? '';
   const boardUrl = new URL(demoLink);
-  boardUrl.searchParams.set('e2e', '');
+  boardUrl.searchParams.set('e2e', e2eKey);
   const board = await linkedBoard(browser, boardUrl.href);
   say(
     `\n2. The demo board it printed, open in Chromium ${browser.version()}, is linked as ${board.pageId}.`,

@@ -73,7 +73,7 @@ const ALICE_MODERN_CLIENT = 'tabdock-playwright-modern';
 const BOB_CLIENT = 'tabdock-playwright-bob';
 
 test.beforeAll(async () => {
-  demo = await startDemoServer();
+  demo = await startDemoServer({ e2eHook: true });
 });
 test.afterAll(async () => {
   await demo.close();

@@ -1,5 +1,6 @@
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { expect, test } from '@playwright/test';
+import { bodyOf } from '@tabdock/relay/test/results';
 import { tunnelFetch } from '@tabdock/relay/test/tunnel';
 import {
   MOCK_SUBJECT,
@@ -119,7 +120,7 @@ test('a phone opens the QR code URL, signs in, joins, and the operator approves 
     );
     try {
       const listed = await claude.callTool({ name: 'list_pages', arguments: {} });
-      expect(listed.structuredContent).toMatchObject({ pages: [{ page: pageId, role: 'driver' }] });
+      expect(bodyOf(listed)).toMatchObject({ pages: [{ page: pageId, role: 'driver' }] });
       const called = await claude.callTool({
         name: 'call_page_tool',
         arguments: { page: pageId, tool: 'get_view', arguments: {} },

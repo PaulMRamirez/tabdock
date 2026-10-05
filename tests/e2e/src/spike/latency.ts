@@ -275,6 +275,21 @@ function field(value: unknown, key: string): unknown {
     : undefined;
 }
 
+/**
+ * A list's JSON, which follows its label line: page titles are page text, so
+ * list_pages sends them only there and never as structured content (ADR
+ * 0025's notes); an empty list has no label and sends structured content.
+ */
+function listBody(content: string, structured: unknown): unknown {
+  if (structured !== undefined) return structured;
+  const [, body = ''] = content.split('\n', 2);
+  try {
+    return JSON.parse(body) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
 /** The awake pages in a list_pages result. */
 function awakePages(structured: unknown): string[] {
   const pages = field(structured, 'pages');
@@ -307,7 +322,7 @@ export async function choosePage(client: Client, choice: PageChoice): Promise<st
     return paired;
   }
   const listed = await client.callTool({ name: 'list_pages', arguments: {} });
-  const awake = awakePages(listed.structuredContent);
+  const awake = awakePages(listBody(text(listed.content), listed.structuredContent));
   const only = awake[0];
   if (awake.length !== 1 || only === undefined) {
     throw new Error(

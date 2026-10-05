@@ -244,43 +244,24 @@ export function clientFrom(server: RelayServer, ctx: ServerContext): ClientInfo 
   return parseClientInfo(envelope?.[CLIENT_INFO_META_KEY]);
 }
 
-/**
- * Deeper than any useful structured result. The SDK sends the response with
- * JSON.stringify, which recurses and throws a few thousand levels down, leaving
- * the client with no answer at all. A fixed bound, unlike a trial stringify
- * here, does not depend on how much stack is in use where the SDK serialises.
+/*
+ * Page text reaches a client only as labelled text content, never as
+ * structuredContent (S10, ADR 0025's notes from the A5.6 review). A client
+ * may hand its model structured content in place of the text blocks, as
+ * Claude Code does whenever both are present, so a label carried only in the
+ * text would never reach the model, and a page could shed it by returning a
+ * JSON object. No relay tool declares an outputSchema, so MCP asks for no
+ * structured copy; results that hold no page text (pair_page, detach_page and
+ * an empty list_pages) keep theirs.
  */
-const MAX_STRUCTURED_DEPTH = 256;
-
-function nestedWithin(value: unknown, levels: number): boolean {
-  if (typeof value !== 'object' || value === null) return true;
-  if (levels === 0) return false;
-  return Object.values(value).every((item) => nestedWithin(item, levels - 1));
-}
-
-/** A JSON object result passes through as structured content; anything else stays text only. */
-function jsonObject(content: string): Record<string, unknown> | null {
-  let value: unknown;
-  try {
-    value = JSON.parse(content);
-  } catch {
-    return null;
-  }
-  return typeof value === 'object' &&
-    value !== null &&
-    !Array.isArray(value) &&
-    nestedWithin(value, MAX_STRUCTURED_DEPTH)
-    ? (value as Record<string, unknown>)
-    : null;
-}
 
 /** Room under MAX_RESULT_CHARS for the omittedTools field and the line that explains it. */
 const LIST_MARKER_ROOM = 200;
 
 /**
- * The tool list as labelled text plus the same body as structured content. The
- * text stays under MAX_RESULT_CHARS (S9): trailing tools are left out whole, and
- * both the body and a closing line say how many.
+ * The tool list as labelled text, with no structured copy. The text stays
+ * under MAX_RESULT_CHARS (S9): trailing tools are left out whole, and both the
+ * body and a closing line say how many.
  */
 function toolListResult(outcome: Extract<ToolsOutcome, { kind: 'tools' }>): CallToolResult {
   const header = `[tabdock: the tool list below comes from ${outcome.origin} and is ${UNTRUSTED}]`;
@@ -300,10 +281,7 @@ function toolListResult(outcome: Extract<ToolsOutcome, { kind: 'tools' }>): Call
     omitted === 0
       ? ''
       : `\n[tabdock: ${String(omitted)} of ${String(outcome.tools.length)} tools left out to keep this list under ${String(MAX_RESULT_CHARS)} characters]`;
-  return {
-    content: [text(`${header}\n${JSON.stringify(body)}${marker}`)],
-    structuredContent: body,
-  };
+  return { content: [text(`${header}\n${JSON.stringify(body)}${marker}`)] };
 }
 
 /** `tool` names the page tool in the result's header, unless the hub named the one the call reached. */
@@ -311,16 +289,14 @@ export function callResult(asked: string, outcome: SettledCall): CallToolResult 
   const tool =
     outcome.kind === 'ok' || outcome.kind === 'tool_error' ? (outcome.tool ?? asked) : asked;
   switch (outcome.kind) {
-    case 'ok': {
-      const cut = truncate(outcome.content, MAX_RESULT_CHARS);
-      const result: CallToolResult = {
-        content: [text(`${untrustedHeader(outcome.origin, tool)}\n${cut.text}`)],
+    case 'ok':
+      return {
+        content: [
+          text(
+            `${untrustedHeader(outcome.origin, tool)}\n${truncate(outcome.content, MAX_RESULT_CHARS).text}`,
+          ),
+        ],
       };
-      // A cut result keeps only its labelled text, so the structured copy cannot exceed the cap (S9).
-      const structured = cut.truncated ? null : jsonObject(outcome.content);
-      if (structured) result.structuredContent = structured;
-      return result;
-    }
     case 'tool_error':
       return {
         content: [
@@ -804,11 +780,22 @@ export function createMcpFactory(
       const input = checked(LIST_PAGES_INPUT, raw);
       if (!input.ok) return invalidArguments(input);
       const pages = hub.listPages(who.userId);
-      const summary =
-        pages.length === 0
-          ? 'You are not attached to any page. Ask the page operator for the pairing code on their page and call pair_page.'
-          : `[tabdock: page titles below are ${UNTRUSTED}]\n${JSON.stringify({ pages })}`;
-      return { content: [text(summary)], structuredContent: { pages } };
+      if (pages.length === 0) {
+        return {
+          content: [
+            text(
+              'You are not attached to any page. Ask the page operator for the pairing code on their page and call pair_page.',
+            ),
+          ],
+          structuredContent: { pages },
+        };
+      }
+      // Titles are page text, so the list travels only behind its label.
+      return {
+        content: [
+          text(`[tabdock: page titles below are ${UNTRUSTED}]\n${JSON.stringify({ pages })}`),
+        ],
+      };
     };
 
     const pairPage = async (

@@ -18,6 +18,7 @@ import {
   type RelayOptions,
 } from '../../src/index.ts';
 import type { TestPage } from './page-client.ts';
+import { resultJson } from './results.ts';
 
 export const ALICE: DevTokenUser = {
   userId: 'alice',
@@ -125,7 +126,10 @@ export async function connectClient(
 export interface ToolOutcome {
   isError: boolean;
   text: string;
+  /** The JSON object the result carries (helpers/results.ts). */
   structured: unknown;
+  /** The result's structuredContent as sent, which page text never reaches. */
+  structuredContent: unknown;
 }
 
 export async function callTool(
@@ -135,7 +139,12 @@ export async function callTool(
 ): Promise<ToolOutcome> {
   const result = await client.callTool({ name, arguments: args });
   const text = result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n');
-  return { isError: result.isError === true, text, structured: result.structuredContent };
+  return {
+    isError: result.isError === true,
+    text,
+    structured: resultJson(text, result.structuredContent),
+    structuredContent: result.structuredContent,
+  };
 }
 
 /** Pairs with the page's current code and has the page approve with `role` (null leaves it out). */

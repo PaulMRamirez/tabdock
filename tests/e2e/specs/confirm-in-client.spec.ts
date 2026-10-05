@@ -33,7 +33,7 @@ let tabdock: Tabdock;
 const clients: Client[] = [];
 
 test.beforeAll(async () => {
-  demo = await startDemoServer();
+  demo = await startDemoServer({ e2eHook: true });
 });
 test.afterAll(async () => {
   await demo.close();
