@@ -6,9 +6,11 @@
 // annotations and _meta, on both eras, with first-class tools off and on.
 // The fixture was captured from the relay before the move (its _comment says
 // where); <RELAY_VERSION> stands for the version the release bumps. Beside
-// the lists, initialize and server/discover keep their answers, a name the
-// relay does not serve keeps M4's JSON-RPC error, and a handler that throws
-// still answers an isError result in the thrown message, as McpServer did.
+// the lists, initialize and server/discover keep their answers (discover's
+// supportedVersions now naming every revision /mcp serves, ADR 0027's Step 3
+// review notes), a name the relay does not serve keeps M4's JSON-RPC error,
+// and a handler that throws still answers an isError result in the thrown
+// message, as McpServer did.
 
 import { readFileSync } from 'node:fs';
 import { type AuthInfo, createMcpHandler } from '@modelcontextprotocol/server';
@@ -18,6 +20,7 @@ import { resolveConfig } from '../src/config.ts';
 import type { PageHub } from '../src/hub.ts';
 import { createDevTokenAuth } from '../src/index.ts';
 import { createMcpFactory, RELAY_VERSION } from '../src/mcp.ts';
+import { SERVED_REVISIONS } from '../src/relay.ts';
 import { connectPage, type TestPage, TOOLS } from './helpers/page-client.ts';
 import {
   ALICE,
@@ -96,7 +99,13 @@ describe('the five fixed tools stay as M4 sent them', () => {
       it('on 2026-07-28: server/discover, tools/list and an unknown name', async () => {
         current = await startRelay({ firstClassTools });
         const discover = await modernExchange(current.relay, ALICE, 'server/discover');
-        expectWire(asCaptured(discover), GOLDEN.modern.discover);
+        const captured = GOLDEN.modern.discover as { result: Record<string, unknown> };
+        // The one change to discover since M4: it lists every revision /mcp
+        // serves, as -32022 does (ADR 0027's Step 3 review notes), in place.
+        expectWire(asCaptured(discover), {
+          ...captured,
+          result: { ...captured.result, supportedVersions: [...SERVED_REVISIONS] },
+        });
         const list = await modernExchange(current.relay, ALICE, 'tools/list');
         const expected = GOLDEN.modern.toolsList as { result: Record<string, unknown> };
         // The one difference the flag makes to an empty list: ADR 0025's cache hint.

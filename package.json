@@ -25,6 +25,7 @@
     "typecheck": "tsc -p tsconfig.json && tsc -p scripts/spike/tsconfig.json && pnpm -r --if-present typecheck",
     "test": "vitest run",
     "test:e2e": "pnpm --filter @tabdock/e2e test:e2e",
+    "conformance": "pnpm --filter @tabdock/e2e conformance",
     "demo:m0": "pnpm --filter @tabdock/e2e demo:m0",
     "demo:m1": "pnpm --filter @tabdock/e2e demo:m1",
     "demo:m2": "pnpm --filter @tabdock/e2e demo:m2",

@@ -327,16 +327,25 @@ export const SERVED_REVISIONS: readonly string[] = [
   '2024-11-05',
 ];
 
+function recordAt(value: unknown, key: string): Record<string, unknown> | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const field = (value as Record<string, unknown>)[key];
+  return typeof field === 'object' && field !== null && !Array.isArray(field)
+    ? (field as Record<string, unknown>)
+    : null;
+}
+
 /**
- * The strict leg's answer to a revision it does not serve, with every
- * revision /mcp serves in its data.supported, as 2026-07-28 says a server
- * MUST list them (ADR 0027): the SDK fills the list from the strict leg's
- * own revisions, and the endpoint serves the 2025 ones too. Nothing else in
- * the answer changes, and any other answer passes untouched. If a later SDK
- * lists them all itself, this goes.
+ * A JSON answer of the strict leg with this status, as `edit` leaves it when
+ * it says it changed something, and otherwise exactly as the SDK wrote it.
+ * The edit works on the parsed answer in place, so every key keeps its place.
  */
-async function withServedRevisions(response: Response): Promise<Response> {
-  if (response.status !== 400) return response;
+async function editedAnswer(
+  response: Response,
+  status: number,
+  edit: (message: unknown) => boolean,
+): Promise<Response> {
+  if (response.status !== status) return response;
   if (!(response.headers.get('content-type') ?? '').includes('application/json')) return response;
   const body = await response.text();
   let message: unknown;
@@ -345,26 +354,48 @@ async function withServedRevisions(response: Response): Promise<Response> {
   } catch {
     return new Response(body, response);
   }
-  const error =
-    typeof message === 'object' && message !== null
-      ? (message as Record<string, unknown>).error
-      : undefined;
-  if (
-    typeof error !== 'object' ||
-    error === null ||
-    (error as Record<string, unknown>).code !== ProtocolErrorCode.UnsupportedProtocolVersion
-  ) {
-    return new Response(body, response);
-  }
-  const fields = error as Record<string, unknown>;
-  const data =
-    typeof fields.data === 'object' && fields.data !== null
-      ? (fields.data as Record<string, unknown>)
-      : {};
-  fields.data = { ...data, supported: [...SERVED_REVISIONS] };
+  if (!edit(message)) return new Response(body, response);
   const headers = new Headers(response.headers);
   headers.delete('content-length');
   return new Response(JSON.stringify(message), { status: response.status, headers });
+}
+
+/**
+ * The strict leg's answer to a revision it does not serve, with every
+ * revision /mcp serves in its data.supported, as 2026-07-28 says a server
+ * MUST list them (ADR 0027): the SDK fills the list from the strict leg's
+ * own revisions, and the endpoint serves the 2025 ones too. Nothing else in
+ * the answer changes, and any other answer passes untouched. If a later SDK
+ * lists them all itself, this goes.
+ */
+function withServedRevisions(response: Response): Promise<Response> {
+  return editedAnswer(response, 400, (message) => {
+    const error = recordAt(message, 'error');
+    if (error?.code !== ProtocolErrorCode.UnsupportedProtocolVersion) return false;
+    error.data = { ...recordAt(error, 'data'), supported: [...SERVED_REVISIONS] };
+    return true;
+  });
+}
+
+/**
+ * The strict leg's server/discover answer with every revision /mcp serves in
+ * its supportedVersions, the same list the -32022 answer gives (ADR 0027's
+ * Step 3 review notes): a client that reads the refusal's list against
+ * discover's, as the conformance suite does, finds each one there, and a
+ * client picks the first of its own revisions on the list, which for every
+ * 2026-07-28 client is 2026-07-28. Nothing else in the answer changes.
+ */
+function discoverWithServedRevisions(response: Response): Promise<Response> {
+  return editedAnswer(response, 200, (message) => {
+    const result = recordAt(message, 'result');
+    if (result === null || !Array.isArray(result.supportedVersions)) return false;
+    result.supportedVersions = [...SERVED_REVISIONS];
+    return true;
+  });
+}
+
+function isDiscover(message: unknown): boolean {
+  return isJSONRPCRequest(message) && message.method === 'server/discover';
 }
 
 /** The allowlist's refusal of an Origin, in the shape of the SDK's own guard (ADR 0027). */
@@ -676,9 +707,9 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
    * A body that is not one request and that the SDK refuses reached no tool
    * either, so it spends one then: refusals cost like calls, and a flood of
    * them runs dry. Each request counts once. Each request that paid also
-   * names its client for the hour's `mcp client` line, and an answer to a
-   * revision the leg does not serve lists every revision /mcp serves (ADR
-   * 0027).
+   * names its client for the hour's `mcp client` line, and server/discover
+   * and an answer to a revision the leg does not serve both list every
+   * revision /mcp serves (ADR 0027 and its Step 3 review notes).
    */
   const strictLeg = async (
     request: Request,
@@ -722,6 +753,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       }
       if (listen === null) {
         response = await mcp.fetch(request, parsed);
+        if (isDiscover(message)) response = await discoverWithServedRevisions(response);
       } else if (body.bytes > MAX_LISTEN_BODY_BYTES) {
         response = tooLarge(MAX_LISTEN_BODY_BYTES, listen.id);
       } else {

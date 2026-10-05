@@ -262,6 +262,48 @@ describe('without a public URL (dev tokens and local mode)', () => {
     expect(calls()).toBe(before);
   });
 
+  it('runs after the Host check and before the check that a request was made on this machine', async () => {
+    const { plugin, calls } = counted();
+    const started = await start({ auth: plugin });
+    const discover = OPENERS[4];
+    if (!discover) throw new Error('no opener');
+    // A foreign Host is refused for its Host, whatever its Origin says.
+    const rebound = await send(started, discover, {
+      origin: 'https://evil.example',
+      host: 'evil.example',
+      token: ALICE.token,
+    });
+    expect(rebound.status).toBe(403);
+    expect(JSON.parse(rebound.body)).toEqual({
+      ...REFUSAL,
+      error: { ...REFUSAL.error, message: 'Invalid Host' },
+    });
+    // A proxied request with a foreign Origin gets the Origin refusal, logged at info level...
+    const proxied: Opener = {
+      ...discover,
+      headers: { ...discover.headers, 'X-Forwarded-For': '203.0.113.9' },
+    };
+    const foreign = await send(started, proxied, {
+      origin: 'https://evil.example',
+      token: ALICE.token,
+    });
+    expect(foreign.status).toBe(403);
+    expect(JSON.parse(foreign.body)).toEqual(REFUSAL);
+    expect(logged('mcp request refused: origin not allowed')).toEqual([
+      expect.objectContaining({ level: 'info', origin: 'https://evil.example' }),
+    ]);
+    // ...and one with an allowed Origin, or none, gets the refusal of a proxied request.
+    for (const origin of ['http://localhost:5173', undefined]) {
+      const local = await send(started, proxied, {
+        token: ALICE.token,
+        ...(origin === undefined ? {} : { origin }),
+      });
+      expect(local.status, String(origin)).toBe(403);
+      expect(local.body, String(origin)).toBe('This relay serves only clients on its own machine');
+    }
+    expect(calls()).toBe(0);
+  });
+
   it('takes http and https on localhost, 127.0.0.1 and [::1] at any port, and a missing Origin', async () => {
     const started = await start({ auth: createDevTokenAuth([ALICE]) });
     const discover = OPENERS[4];
