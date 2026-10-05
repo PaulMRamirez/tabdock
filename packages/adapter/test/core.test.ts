@@ -20,7 +20,9 @@ import {
   createAdapterCore,
   type LocksLike,
   MAX_DEADLINE_MS,
+  REMEMBERED_PROMPT_IDS,
   type RuntimeTool,
+  type UiPort,
 } from '../src/core.ts';
 import {
   FRAME_WINDOW,
@@ -1067,6 +1069,131 @@ describe('roles and consequential tools', () => {
       await link(h);
       expect(h.dock.state.notice).toBeNull();
     });
+  });
+});
+
+describe('an answer counts only for the prompt it was asked about (S6)', () => {
+  const consequential = { consequentialHint: true, untrustedContentHint: false };
+  /** A mild write the operator may well allow, beside chromeTools()'s wipe. */
+  const STAR = runtimeTool('star_item', { ...consequential, readOnlyHint: false });
+  /** Read-only and consequential, so its prompts stand side by side rather than queue. */
+  const PEEK = runtimeTool('peek', { ...consequential, readOnlyHint: true });
+  const IGNORED_ANSWER = 'warn ignored a UI port answer to a confirmation that was already settled';
+  const BOB = { userId: 'bob', displayName: 'Bob', client: null, role: 'driver' } as const;
+
+  /**
+   * A host dialog that resolves on a later click and ignores its abort
+   * signal, as a UI port may: it keeps every prompt it was shown, to answer later.
+   */
+  function lateDialog() {
+    const asked: { tool: string; answer: (allow: boolean) => void }[] = [];
+    const ui: UiPort = {
+      askConfirm: (pending) =>
+        new Promise<boolean>((resolve) => {
+          asked.push({ tool: pending.tool, answer: resolve });
+        }),
+    };
+    return { ui, asked };
+  }
+
+  const outcomes = (socket: FakeSocket) =>
+    results(socket).map((frame) => `${frame.callId}:${frame.error?.code ?? 'ok'}`);
+
+  it('runs nothing when the relay cancels a prompted call and reuses its id for another tool', async () => {
+    const dialog = lateDialog();
+    const h = setup({ tools: [...chromeTools(), STAR], core: { ui: dialog.ui } });
+    const socket = await link(h);
+    socket.deliver(invoke('star_item', { callId: 'c1' }));
+    await flush();
+    expect(dialog.asked.map((prompt) => prompt.tool)).toEqual(['star_item']);
+    socket.deliver({ t: 'cancel', callId: 'c1', reason: 'client' });
+    socket.deliver(invoke('wipe', { callId: 'c1' }));
+    await flush();
+    // The operator allows the star they were shown, late, then a host dialog
+    // keyed by call id answers through the Dock as well.
+    dialog.asked[0]?.answer(true);
+    await flush();
+    expect(h.dock.confirm('c1', true)).toBe(false);
+    await flush();
+    expect(h.context.runs).toEqual([]);
+    expect(outcomes(socket)).toEqual(['c1:cancelled']);
+    expect(h.dock.state.pendingConfirms).toEqual([]);
+    expect(dialog.asked.map((prompt) => prompt.tool)).toEqual(['star_item']);
+    expect(h.logs).toContain(
+      'warn ignored an invoke under call c1, whose id a prompt here has used',
+    );
+    expect(h.logs).toContain(IGNORED_ANSWER);
+  });
+
+  it.each(['a deadline', 'a revoke', 'a lost link'] as const)(
+    'takes no later call under the id of a prompt that ended by %s',
+    async (how) => {
+      const h = setup({ tools: [...chromeTools(), STAR] });
+      const socket = await link(h, {}, { alice: 'driver', bob: 'driver' });
+      socket.deliver(invoke('star_item', { callId: 'c1', deadlineMs: 1000 }));
+      await flush();
+      expect(h.dock.state.pendingConfirms.map((prompt) => prompt.tool)).toEqual(['star_item']);
+      let relay = socket;
+      if (how === 'a deadline') await h.clock.advance(1000);
+      if (how === 'a revoke') expect(h.dock.revoke('alice')).toBe(true);
+      if (how === 'a lost link') {
+        // The page keeps what it remembers across links, as a host's dialog outlives them.
+        socket.drop(1006);
+        await h.clock.advance(500);
+        relay = h.socket();
+        relay.accept();
+        relay.deliver(
+          welcome(h.clock, {
+            resumed: true,
+            roster: [attachment('alice', 'driver'), attachment('bob', 'driver')],
+          }),
+        );
+        await flush();
+      }
+      expect(h.dock.state.pendingConfirms).toEqual([]);
+      relay.deliver(invoke('wipe', { callId: 'c1', caller: BOB }));
+      await flush();
+      expect(h.dock.state.pendingConfirms).toEqual([]);
+      expect(h.dock.confirm('c1', true)).toBe(false);
+      await flush();
+      expect(h.context.runs).toEqual([]);
+      expect(results(relay).filter((frame) => frame.error?.code === undefined)).toEqual([]);
+      // A fresh id from the same relay prompts as ever.
+      relay.deliver(invoke('wipe', { callId: 'c2', caller: BOB }));
+      await flush();
+      expect(h.dock.state.pendingConfirms.map((prompt) => prompt.callId)).toEqual(['c2']);
+    },
+  );
+
+  it(`binds a UI port's answer to its prompt even once ${REMEMBERED_PROMPT_IDS} newer prompts have let the page forget the id`, async () => {
+    const dialog = lateDialog();
+    const h = setup({ tools: [...chromeTools(), STAR, PEEK], core: { ui: dialog.ui } });
+    const socket = await link(h);
+    socket.deliver(invoke('star_item', { callId: 'c1' }));
+    await flush();
+    socket.deliver({ t: 'cancel', callId: 'c1', reason: 'client' });
+    for (let index = 0; index < REMEMBERED_PROMPT_IDS; index += 1) {
+      socket.deliver(invoke('peek', { callId: `p${index}` }));
+    }
+    await flush();
+    expect(h.dock.state.pendingConfirms).toHaveLength(REMEMBERED_PROMPT_IDS);
+    for (let index = 0; index < REMEMBERED_PROMPT_IDS; index += 1) {
+      socket.deliver({ t: 'cancel', callId: `p${index}`, reason: 'client' });
+    }
+    socket.deliver(invoke('wipe', { callId: 'c1' }));
+    await flush();
+    // The page took the id again, so wipe has a prompt of its own.
+    expect(h.dock.state.pendingConfirms.map((prompt) => prompt.tool)).toEqual(['wipe']);
+    dialog.asked[0]?.answer(true);
+    await flush();
+    expect(h.context.runs).toEqual([]);
+    expect(h.dock.state.pendingConfirms.map((prompt) => prompt.tool)).toEqual(['wipe']);
+    expect(h.logs).toContain(IGNORED_ANSWER);
+    // Its own prompt still answers for it.
+    dialog.asked.at(-1)?.answer(false);
+    await flush();
+    expect(h.context.runs).toEqual([]);
+    expect(outcomes(socket).at(-1)).toBe('c1:denied_by_operator');
   });
 });
 

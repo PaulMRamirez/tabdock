@@ -523,6 +523,17 @@ export const UNWATCHED_HANDLER_GRACE_MS = 2000;
  */
 export const MAX_DEADLINE_MS = MAX_TIMER_MS - UNWATCHED_HANDLER_GRACE_MS;
 
+/**
+ * How many ids of calls that put a prompt before the operator the page
+ * remembers, taking no later call under any of them (onInvoke), so an answer
+ * keyed by call id, such as Dock.confirm's, can only ever reach the prompt it
+ * was about. Tabdock's relay draws a fresh random id for every call, so only
+ * a relay that lies reuses one, and to reuse one past this bound it must
+ * first raise this many newer prompts before the operator. A UI port's
+ * answer is bound to its own prompt whatever this remembers (askConfirm).
+ */
+export const REMEMBERED_PROMPT_IDS = 1000;
+
 /** Results are cut this far under the cap so the truncation marker fits under it too. */
 const MARKER_ROOM = 100;
 
@@ -636,8 +647,16 @@ interface CallRecord {
   /** From the executeTool call until the runtime settles it, which may be after the call was answered. */
   executing: boolean;
   deadline: unknown;
-  /** Set while the call waits for the operator's confirmation. */
-  confirm: { readonly resolve: (allow: boolean) => void; readonly port: AbortController } | null;
+  /**
+   * Set while the call waits for the operator's confirmation. The prompt and
+   * its port name this one prompt, so an answer is checked against them,
+   * never only against the call id a relay chose.
+   */
+  confirm: {
+    readonly resolve: (allow: boolean) => void;
+    readonly port: AbortController;
+    readonly pending: PendingConfirm;
+  } | null;
 }
 
 type Checked = { ok: true; tool: NormalisedTool } | { ok: false; refusal: Refusal };
@@ -1114,6 +1133,15 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   let silenceLimit = IDLE_TIMEOUT_MS + SILENCE_GRACE_MS;
   let lock: { release: () => void } | null = null;
   const calls = new Map<string, CallRecord>();
+  /**
+   * Ids of calls that put a prompt before the operator, oldest first, up to
+   * REMEMBERED_PROMPT_IDS, for as long as this page runs: across links too,
+   * since a host's dialog outlives a link. Dock.confirm finds a prompt by
+   * its call id alone, so a relay that cancelled a prompted call and sent
+   * another under its id would have a host dialog still showing the first
+   * prompt, or a click landing as it changes, confirm the second.
+   */
+  const promptedIds = new Set<string>();
   const requests = new Map<string, RequestRecord>();
   /**
    * The roles the operator granted on this page, by user id: the root of S5's
@@ -1893,6 +1921,12 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       log.warn(`ignored a repeated invoke for call ${frame.callId}`);
       return;
     }
+    // S6: an id that named a prompt keeps naming only that prompt
+    // (REMEMBERED_PROMPT_IDS), so an answer meant for it settles no other call.
+    if (promptedIds.has(frame.callId)) {
+      log.warn(`ignored an invoke under call ${frame.callId}, whose id a prompt here has used`);
+      return;
+    }
     const now = clock();
     const deadlineMs = Math.min(frame.deadlineMs, MAX_DEADLINE_MS);
     const { userId, displayName, client } = frame.caller;
@@ -2335,7 +2369,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         expiresAt: call.deadlineAt,
       });
       const port = new AbortController();
-      call.confirm = { resolve, port };
+      call.confirm = { resolve, port, pending };
+      rememberPrompt(callId);
       setState({ pendingConfirms: [...state.pendingConfirms, pending] });
       const ui = options.ui;
       if (!ui?.askConfirm) return;
@@ -2343,7 +2378,16 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         .then(() => ui.askConfirm?.(pending, port.signal))
         .then(
           (answer) => {
-            if (typeof answer === 'boolean') confirmCall(callId, answer);
+            if (typeof answer !== 'boolean') return;
+            // Only while this very prompt still waits, as for attach requests
+            // (show): a port that ignores its signal can answer after the
+            // prompt was settled, by then perhaps under an id the page has
+            // since forgotten and the relay reused for another tool.
+            if (port.signal.aborted || call.confirm?.port !== port) {
+              log.warn('ignored a UI port answer to a confirmation that was already settled');
+              return;
+            }
+            settleConfirmPromise(call, answer);
           },
           (error: unknown) => {
             log.warn(`the UI port failed to ask for a confirmation: ${describe(error)}`);
@@ -2358,9 +2402,17 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     call.confirm = null;
     confirm.port.abort();
     setState({
-      pendingConfirms: state.pendingConfirms.filter((item) => item.callId !== call.frame.callId),
+      pendingConfirms: state.pendingConfirms.filter((item) => item !== confirm.pending),
     });
     confirm.resolve(allow);
+  }
+
+  /** Oldest first, so passing the bound needs that many newer prompts before the operator. */
+  function rememberPrompt(callId: string): void {
+    promptedIds.add(callId);
+    if (promptedIds.size <= REMEMBERED_PROMPT_IDS) return;
+    const oldest = promptedIds.values().next();
+    if (oldest.done !== true) promptedIds.delete(oldest.value);
   }
 
   function confirmCall(callId: string, allow: boolean): boolean {
