@@ -112,3 +112,19 @@ export function renderTourPage(markdown: string, stem: string, links: LinkContex
   if (title === '') throw new Error(`docs/tour/${stem}.md has no # title`);
   return { title, body, diagrams };
 }
+
+/**
+ * The Mermaid sources in a Markdown file the site does not publish, such as
+ * the README, in order, so the build can draw them as it draws the tour's
+ * and stop on one GitHub would show as an error (A5.5).
+ */
+export function mermaidSources(markdown: string): string[] {
+  const sources: string[] = [];
+  const marked = new Marked({ gfm: true });
+  marked.walkTokens(marked.lexer(markdown), (token) => {
+    if (token.type === 'code' && (token as Tokens.Code).lang?.trim() === 'mermaid') {
+      sources.push((token as Tokens.Code).text);
+    }
+  });
+  return sources;
+}

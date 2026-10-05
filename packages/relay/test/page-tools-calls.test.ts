@@ -111,6 +111,17 @@ async function bothRoutes(
   return { fixed, named, fixedRecord, namedRecord };
 }
 
+/** The fixed tools, the whole list an invitee or an invite-made attachment sees. */
+const FIXED_TOOLS = ['list_pages', 'pair_page', 'list_page_tools', 'call_page_tool', 'detach_page'];
+
+/** An invoke frame without the two fields each call has its own of. */
+function samePerCall(frame: InvokeFrame): Omit<InvokeFrame, 'callId' | 'deadlineMs'> {
+  const rest: Partial<InvokeFrame> = { ...frame };
+  delete rest.callId;
+  delete rest.deadlineMs;
+  return rest as Omit<InvokeFrame, 'callId' | 'deadlineMs'>;
+}
+
 /**
  * A record the relay can name only by what it was called: on a page whose
  * tools it no longer holds (unknown, asleep or gone), a first-class name
@@ -142,14 +153,16 @@ describe('a first-class call and call_page_tool', () => {
         });
         const alice = await client(ALICE, modern);
         await pairAndApprove(alice, opened);
-        const cases: [string, Record<string, unknown>, RegExp][] = [
-          ['get_view', {}, /^\[tabdock: untrusted content from/],
-          ['board.add', { label: 'x' }, /"ran":"board.add"/],
-          ['clear_board', {}, /the board is locked/],
-          ['board.add', { label: 5 }, /^invalid_arguments: /],
-          ['nope', {}, /^tool_not_found: /],
+        // The last field says whether the call reaches the page.
+        const cases: [string, Record<string, unknown>, RegExp, boolean][] = [
+          ['get_view', {}, /^\[tabdock: untrusted content from/, true],
+          ['board.add', { label: 'x' }, /"ran":"board.add"/, true],
+          ['clear_board', {}, /the board is locked/, true],
+          ['board.add', { label: 5 }, /^invalid_arguments: /, false],
+          ['nope', {}, /^tool_not_found: /, false],
         ];
-        for (const [tool, args, expected] of cases) {
+        for (const [tool, args, expected, reaches] of cases) {
+          const invoked = opened.all('invoke').length;
           const { fixed, named, fixedRecord, namedRecord } = await bothRoutes(
             alice,
             opened.pageId,
@@ -159,9 +172,18 @@ describe('a first-class call and call_page_tool', () => {
           expect(fixed.text, tool).toMatch(expected);
           expect(named, tool).toEqual(fixed);
           expect(namedRecord, tool).toEqual(fixedRecord);
+          // What the page is handed decides its prompts (the adapter's
+          // consequential rule reads the tool, arguments, caller and role),
+          // so both routes must hand it the same frame, but for the call's
+          // own id and deadline.
+          await opened.sync();
+          const frames = opened.all('invoke').slice(invoked).map(samePerCall);
+          expect(frames, tool).toHaveLength(reaches ? 2 : 0);
+          if (reaches) {
+            expect(frames[0], tool).toMatchObject({ tool, arguments: args });
+            expect(frames[1], tool).toEqual(frames[0]);
+          }
         }
-        // The page saw both routes' calls under the page tool's own name.
-        expect(opened.all('invoke').filter((frame) => frame.tool === 'board.add')).toHaveLength(2);
       });
     });
   }
@@ -394,40 +416,51 @@ describe('a first-class call and call_page_tool', () => {
 });
 
 describe('an invitee and an attachment an invite made', () => {
-  it('are answered tool_not_found for a first-class name, with a call line, and the page hears nothing', async () => {
-    invites = await startInviteRelay({ firstClassTools: true });
-    const opened = await invites.page();
-    const alice = await invites.claude('sub-alice');
-    await attachMember(alice, opened);
-    const guestLink = await mintOk(opened);
-    const guest = await invites.claude('sub-guest', 'guest@example.com');
-    expect((await redeem(guest, opened, guestLink.link)).outcome.isError).toBe(false);
-    const bobLink = await mintOk(opened);
-    const bob = await invites.claude('sub-bob');
-    expect((await redeem(bob, opened, bobLink.link)).outcome.isError).toBe(false);
-    await opened.sync();
-    const invoked = opened.all('invoke').length;
+  for (const modern of [false, true]) {
+    it(`are answered tool_not_found for a first-class name, with a call line, and the page hears nothing (${modern ? '2026-07-28' : '2025'})`, async () => {
+      invites = await startInviteRelay({ firstClassTools: true });
+      const opened = await invites.page();
+      const alice = await invites.claude('sub-alice', null, true, undefined, modern);
+      await attachMember(alice, opened);
+      const guestLink = await mintOk(opened);
+      const guest = await invites.claude('sub-guest', 'guest@example.com', true, undefined, modern);
+      expect((await redeem(guest, opened, guestLink.link)).outcome.isError).toBe(false);
+      const bobLink = await mintOk(opened);
+      const bob = await invites.claude('sub-bob', null, true, undefined, modern);
+      expect((await redeem(bob, opened, bobLink.link)).outcome.isError).toBe(false);
+      await opened.sync();
+      const invoked = opened.all('invoke').length;
+      // The member's own list shows the page's tools, so the flag is on.
+      const members = (await alice.listTools()).tools.map((tool) => tool.name);
+      expect(members).toContain(`${opened.pageId}__get_view`);
 
-    const name = `${opened.pageId}__get_view`;
-    for (const each of [guest, bob]) {
-      const listed = (await each.listTools()).tools.map((tool) => tool.name);
-      expect(listed.filter((tool) => tool.includes('__'))).toEqual([]);
-      const answer = await call(each, name);
-      expect(answer.isError).toBe(true);
-      expect(answer.text).toMatch(/^tool_not_found: .*invite/);
-      // call_page_tool still reaches the tool, as ADR 0016 keeps it.
-      const fixed = await call(each, 'call_page_tool', { page: opened.pageId, tool: 'get_view' });
-      expect(fixed.isError, fixed.text).toBe(false);
-    }
-    await opened.sync();
-    // Only the two call_page_tool calls reached the page.
-    expect(opened.all('invoke').length - invoked).toBe(2);
-    const refused = invites.relay.audit
-      .records()
-      .filter((record) => record.outcome === 'tool_not_found');
-    expect(refused).toHaveLength(2);
-    for (const record of refused)
-      expect(record).toMatchObject({ pageId: opened.pageId, tool: 'get_view' });
-    expect(refused.map((record) => record.userId)).toContain('bob');
-  });
+      const name = `${opened.pageId}__get_view`;
+      for (const each of [guest, bob]) {
+        // Exactly the five fixed tools, and nothing beside them (A5.1).
+        const listed = (await each.listTools()).tools.map((tool) => tool.name).sort();
+        expect(listed).toEqual([...FIXED_TOOLS].sort());
+        const answer = await call(each, name);
+        expect(answer.isError).toBe(true);
+        expect(answer.text).toMatch(/^tool_not_found: .*invite/);
+        // call_page_tool still reaches the tool, as ADR 0016 keeps it.
+        const fixed = await call(each, 'call_page_tool', { page: opened.pageId, tool: 'get_view' });
+        expect(fixed.isError, fixed.text).toBe(false);
+      }
+      await opened.sync();
+      // Only the two call_page_tool calls reached the page.
+      expect(opened.all('invoke').length - invoked).toBe(2);
+      const refused = invites.relay.audit
+        .records()
+        .filter((record) => record.outcome === 'tool_not_found');
+      expect(refused).toHaveLength(2);
+      for (const record of refused)
+        expect(record).toMatchObject({ pageId: opened.pageId, tool: 'get_view' });
+      expect(refused.map((record) => record.userId)).toContain('bob');
+      // Each client spoke the leg this test names, by the relay's own line.
+      const legs = invites
+        .events()
+        .filter((line) => line.msg === 'mcp client' && line.client === 'claude-sub-guest');
+      expect(legs.map((line) => line.leg)).toEqual([modern ? 'strict' : 'session']);
+    });
+  }
 });
