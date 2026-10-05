@@ -28,7 +28,7 @@
     "@mcp-b/webmcp-local-relay": "5.1.0",
     "@modelcontextprotocol/client": "2.3.0",
     "@modelcontextprotocol/conformance": "0.2.0-alpha.12",
-    "@playwright/test": "1.56.1",
+    "@playwright/test": "1.63.0",
     "@tabdock/adapter": "workspace:*",
     "@tabdock/demo": "workspace:*",
     "@tabdock/mcpb6": "workspace:*",
