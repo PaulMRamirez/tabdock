@@ -371,11 +371,11 @@ describe('what requests waiting on a page may hold', () => {
   );
 });
 
-describe('what invitees together may hold while their requests wait (S9, ADR 0030)', () => {
+describe('what invitees together may hold while their requests wait (S9, ADRs 0030 and 0032)', () => {
   it('refuses a guest past a quarter of the total, a call page_busy and a redemption rate_limited, and still holds a member', async () => {
     // Shares of 8 MiB and a total of 32 MiB, so invitees may hold 8 MiB
-    // together: twice what the least setting allows, so the quarter, not
-    // the floor, is what binds.
+    // together, twice what the least setting allows, so the quarter, not
+    // the floor, is what binds, and each invitee 4 MiB of it.
     const relay = await startInviteRelay({
       limits: { requestBytesPerUser: 2 * MIN_REQUEST_BYTES, requestBytes: 8 * MIN_REQUEST_BYTES },
       timings: { callDeadlineMs: 20_000 },
@@ -395,12 +395,13 @@ describe('what invitees together may hold while their requests wait (S9, ADR 003
       for (const answer of waiting.splice(0)) answer();
     };
     // Every tools/call body padded to 1.25 MiB, which the relay charges about
-    // 1.5 MiB with its fixed quarter MiB: five fit in 8 MiB and a sixth does not.
+    // 1.5 MiB with its fixed quarter MiB: two fit in one guest's 4 MiB, five
+    // in the guests' 8 MiB, and a sixth does not.
     const padded = (base: FetchLike): FetchLike => padding(1.25 * MIB, base);
     const alice = await relay.claude('sub-alice', null, true, padded);
     await attachMember(alice, page);
     const guests = [];
-    for (const n of [1, 2]) {
+    for (const n of [1, 2, 3, 4]) {
       const guest = await relay.claude(
         `sub-guest-${String(n)}`,
         `guest${String(n)}@example.com`,
@@ -411,26 +412,26 @@ describe('what invitees together may hold while their requests wait (S9, ADR 003
       expect((await redeem(guest, page, link)).outcome.isError).toBe(false);
       guests.push(guest);
     }
-    const [first, second] = guests;
-    if (first === undefined || second === undefined) throw new Error('no guests');
+    const [first, second, third, fourth] = guests;
+    if (!first || !second || !third || !fourth) throw new Error('no guests');
     const search = (client: typeof alice) =>
       inviteCall(client, 'call_page_tool', {
         page: page.pageId,
         tool: SEARCH.name,
         arguments: { text: 'x' },
       });
-    // The first guest's five calls hold about 7.5 MiB, more than the least
-    // setting (4 MiB) and within both the guest's share and the quarter.
-    const held = Array.from({ length: 5 }, () => search(first));
+    // Three guests' five calls hold about 7.5 MiB, more than the least
+    // setting (4 MiB) and within each guest's share and the quarter.
+    const held = [first, first, second, second, third].map((guest) => search(guest));
     while (page.all('invoke').length < 5) await page.next('invoke', 10_000);
-    const refused = await search(second);
+    const refused = await search(fourth);
     expect(refused.isError).toBe(true);
     expect(refused.text).toMatch(/^page_busy: requests from invited accounts already hold all/);
     // A redemption waits for the operator too, so it is held to the same
     // quarter, before anything of its invite is spent.
-    const third = await relay.claude('sub-guest-3', 'guest3@example.com', true, padded);
+    const fifth = await relay.claude('sub-guest-5', 'guest5@example.com', true, padded);
     const { link, inviteId } = await mintOk(page);
-    const redemption = await inviteCall(third, 'pair_page', { invite: link });
+    const redemption = await inviteCall(fifth, 'pair_page', { invite: link });
     expect(redemption.text).toMatch(
       /^rate_limited: requests from invited accounts already hold all/,
     );
@@ -442,10 +443,80 @@ describe('what invitees together may hold while their requests wait (S9, ADR 003
     for (const outcome of await Promise.all([...held, member])) {
       expect(outcome.isError, outcome.text).toBe(false);
     }
-    // What the guests held is back, so the second guest's call now waits on the page.
-    const later = search(second);
+    // What the guests held is back, so the fourth guest's call now waits on the page.
+    const later = search(fourth);
     while (page.all('invoke').length < 7) await page.next('invoke', 10_000);
     release();
     expect((await later).isError).toBe(false);
+  }, 60_000);
+
+  it("refuses an invitee past a share of the pool of its own, so one guest on a page that holds calls leaves room for another page's guests", async () => {
+    // The default limits: 64 MiB in all, invitees 16 MiB together, each 4 MiB.
+    const relay = await startInviteRelay({ timings: { callDeadlineMs: 20_000 } });
+    inviteRelay = relay;
+    // Alice's page holds every call, as a frozen tab would; Bob's answers at once.
+    const waiting: (() => void)[] = [];
+    const frozen = await relay.page({
+      tools: [SEARCH],
+      onInvoke: () =>
+        new Promise((resolve) => {
+          waiting.push(() => {
+            resolve({ ok: true, content: 'found' });
+          });
+        }),
+    });
+    const answering = await relay.page({
+      tools: [SEARCH],
+      onInvoke: () => ({ ok: true, content: 'found' }),
+    });
+    const alice = await relay.claude('sub-alice');
+    await attachMember(alice, frozen);
+    const bob = await relay.claude('sub-bob');
+    await attachMember(bob, answering);
+    // Mallory watches Alice's page and pads every call to 1.5 MiB, charged
+    // about 1.75 MiB; Carol watches Bob's.
+    const mallory = await relay.claude('sub-mallory', 'mallory@example.com', true, (base) =>
+      padding(1.5 * MIB, base),
+    );
+    const carol = await relay.claude('sub-carol', 'carol@example.com');
+    expect((await redeem(mallory, frozen, (await mintOk(frozen)).link)).outcome.isError).toBe(
+      false,
+    );
+    expect((await redeem(carol, answering, (await mintOk(answering)).link)).outcome.isError).toBe(
+      false,
+    );
+    const search = (client: typeof alice, page: TestPage) =>
+      inviteCall(client, 'call_page_tool', {
+        page: page.pageId,
+        tool: SEARCH.name,
+        arguments: { text: 'x' },
+      });
+    // Mallory calls until the relay refuses her: before, nine waited and
+    // filled the invitees' 16 MiB alone.
+    const held = [];
+    let refused: Awaited<ReturnType<typeof search>> | undefined;
+    for (let n = 0; n < 12 && refused === undefined; n += 1) {
+      const pending = search(mallory, frozen);
+      const outcome = await Promise.race([
+        pending,
+        frozen.next('invoke', 10_000).then(
+          () => null,
+          () => null,
+        ),
+      ]);
+      if (outcome === null) held.push(pending);
+      else refused = outcome;
+    }
+    expect(held).toHaveLength(2);
+    expect(refused?.isError).toBe(true);
+    expect(refused?.text).toMatch(
+      /^rate_limited: your requests waiting on pages already hold 3\.\d MiB of the relay's memory, and one invited account's may hold 4\.0 MiB/,
+    );
+    // Carol's call on another page, and Bob's, are still served.
+    const carols = await search(carol, answering);
+    expect(carols.isError, carols.text).toBe(false);
+    expect((await search(bob, answering)).isError).toBe(false);
+    for (const answer of waiting.splice(0)) answer();
+    for (const outcome of await Promise.all(held)) expect(outcome.isError).toBe(false);
   }, 60_000);
 });

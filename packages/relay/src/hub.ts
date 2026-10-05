@@ -42,6 +42,7 @@ import {
   inviteSecretOf,
   type JsonObject,
   type Limits,
+  MAX_CONFIRMATION_FRAME_BYTES,
   MAX_DESCRIPTION_CHARS,
   MAX_FRAME_BYTES,
   MAX_INVITE_LIFETIME_MS,
@@ -336,7 +337,7 @@ interface PendingCall {
   conn: Conn | null;
   /** The socket whose queue it waits on for room to send its invoke (#hold); null otherwise. */
   heldOn: Conn | null;
-  /** Its invoke frame's size when it arrived, for the room check while it is held. */
+  /** Its invoke frame's size when it arrived, a confirmation's room included, for the room check while it is held. */
   invokeBytes: number;
   /** Filled in for the spike's timing (spike.ts); null otherwise. */
   marks: CallMarks | null;
@@ -2906,8 +2907,9 @@ export class PageHub {
    * Charges a request that may wait on a page (a call, or a pairing waiting
    * for the operator) what its body is measured to hold on the heap,
    * `bytes`, until release. Past what one user's such requests may hold
-   * together (limits.requestBytesPerUser) it is refused rate_limited; an
-   * invitee's past what invitees may hold together (#inviteeShare)
+   * together (limits.requestBytesPerUser) it is refused rate_limited, and an
+   * invitee's past what one invitee may hold (#perInvitee) rate_limited too;
+   * an invitee's past what invitees may hold together (#inviteePool)
    * `relayFull`; and anyone's past what all may hold (limits.requestBytes)
    * `relayFull` too: the request budget alone let one member hold 120 calls
    * of 1 MB arguments, about 2 MB of heap each, and crash a relay with the
@@ -2938,7 +2940,28 @@ export class PageHub {
         `your requests waiting on pages already hold ${mebibytes(own)} of the relay's memory, and one user's may hold ${mebibytes(requestBytesPerUser)}; wait for some to finish`,
       );
     }
-    if (invitee && this.#heldByInvitees + bytes > this.#inviteeShare()) {
+    if (invitee) {
+      const share = this.#perInvitee();
+      if (bytes > share) {
+        this.#log.debug('request refused: it alone would hold more than an invitee may', {
+          userId,
+        });
+        return hubError(
+          'rate_limited',
+          `this request would hold ${mebibytes(bytes)} of the relay's memory while it waits, more than one invited account's requests may hold together (${mebibytes(share)}); send less`,
+        );
+      }
+      if (own + bytes > share) {
+        this.#log.debug('request refused: the invitee holds its share in requests waiting', {
+          userId,
+        });
+        return hubError(
+          'rate_limited',
+          `your requests waiting on pages already hold ${mebibytes(own)} of the relay's memory, and one invited account's may hold ${mebibytes(share)}; wait for some to finish`,
+        );
+      }
+    }
+    if (invitee && this.#heldByInvitees + bytes > this.#inviteePool()) {
       this.#log.debug('request refused: invitees hold all their requests waiting may', {
         userId,
       });
@@ -2980,8 +3003,23 @@ export class PageHub {
    * no longer leave members page_busy everywhere, while members may still
    * use the whole (S9, ADR 0030).
    */
-  #inviteeShare(): number {
+  #inviteePool(): number {
     return Math.max(Math.floor(this.#config.limits.requestBytes / 4), MIN_REQUEST_BYTES);
+  }
+
+  /**
+   * What one invitee's waiting requests may hold: a quarter of the invitees'
+   * pool, or one call of the largest arguments where that is less, and never
+   * more than any user's share. Without it one guest calling a page that
+   * holds calls filled the whole pool alone, and every other invitee on
+   * every page met page_busy (S9, ADR 0032); now that takes four, at the
+   * default total.
+   */
+  #perInvitee(): number {
+    return Math.min(
+      this.#config.limits.requestBytesPerUser,
+      Math.max(Math.floor(this.#inviteePool() / 4), MIN_REQUEST_BYTES),
+    );
   }
 
   // Calls
@@ -3988,7 +4026,8 @@ export class PageHub {
       done: false,
       settle: () => undefined,
     };
-    // Checked before anything waits: the size cannot grow later, as the role and deadline only shrink.
+    // Checked before anything waits: the size cannot grow later, as the role
+    // and deadline only shrink and a confirmation's room is counted already.
     const encoded = this.#encodeInvoke(call, attachment.role, this.#config.timings.callDeadlineMs);
     if (encoded.kind === 'error') return encoded;
     call.invokeBytes = encoded.bytes;
@@ -4169,8 +4208,11 @@ export class PageHub {
       return hubError('invalid_arguments', 'the arguments could not be encoded for the page link');
     }
     // The adapter drops any frame over the cap by closing the socket, so an
-    // oversized call must stop here rather than knock the page offline.
-    const bytes = Buffer.byteLength(text, 'utf8');
+    // oversized call must stop here rather than knock the page offline. The
+    // room a confirmation takes is kept on every call, since one confirmed in
+    // its client gains it just before it goes out (ADR 0026), so nobody is
+    // asked about a call that would then be too large to send (ADR 0032).
+    const bytes = Buffer.byteLength(text, 'utf8') + MAX_CONFIRMATION_FRAME_BYTES;
     if (bytes > MAX_FRAME_BYTES) {
       return hubError(
         'invalid_arguments',

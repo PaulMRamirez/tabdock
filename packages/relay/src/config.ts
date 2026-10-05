@@ -245,8 +245,10 @@ export interface RelayLimits {
    * both legs) until it is answered; past it a call is refused page_busy and
    * a pairing rate_limited (S9, ADR 0018's notes). Invitees' requests
    * together may hold a quarter of it, or MIN_REQUEST_BYTES where a quarter
-   * is less, and are refused the same way past that (ADR 0030). At least
-   * MIN_REQUEST_BYTES.
+   * is less, and are refused the same way past that (ADR 0030); one
+   * invitee's may hold a quarter of that, or MIN_REQUEST_BYTES where that is
+   * less, and are refused rate_limited past it (ADR 0032). At least
+   * MIN_REQUEST_BYTES, and with invites on at least twice that.
    */
   requestBytes: number;
   /**
@@ -904,6 +906,14 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
   }
   // Only true turns invites on, so a stray value from JavaScript leaves them off.
   const invites = options.invites === true;
+  // Invitees together may hold a quarter of the total or MIN_REQUEST_BYTES,
+  // whichever is more, so below twice that floor they could hold more than
+  // half of it, and all of it at the least total, leaving members nothing.
+  if (invites && limits.requestBytes < 2 * MIN_REQUEST_BYTES) {
+    throw new Error(
+      `invites (TABDOCK_INVITES) need requestBytes (TABDOCK_MAX_REQUEST_BYTES) of at least ${String(2 * MIN_REQUEST_BYTES)}: invited accounts' requests may hold ${String(MIN_REQUEST_BYTES)} together at the least, and must never hold more than half of the total (ADR 0032)`,
+    );
+  }
   if (invites && limits.usersPerPage <= MEMBER_RESERVED_SEATS) {
     throw new Error(
       `invites (TABDOCK_INVITES) always leave members ${String(MEMBER_RESERVED_SEATS)} seats of usersPerPage (TABDOCK_MAX_USERS_PER_PAGE), so it must be at least ${String(MEMBER_RESERVED_SEATS + 1)} (ADR 0017)`,

@@ -336,10 +336,26 @@ export function createRequestBudget(config: ResolvedConfig): RequestBudget {
 }
 
 /**
+ * The five fixed tools (SPEC section 7), each spending the request budget in
+ * its own handler. relay.ts lets a 2026-07-28 tools/call naming one of them
+ * past the budget on to that tool, so it is refused in the tool's words and
+ * with its record (ADR 0032); a test holds this set to what the server lists.
+ */
+export const FIXED_TOOL_NAMES: ReadonlySet<string> = new Set([
+  'list_pages',
+  'pair_page',
+  'list_page_tools',
+  'call_page_tool',
+  'detach_page',
+]);
+
+/**
  * `heldBytesOf` gives what a request holds on the heap (request-heap.ts),
  * from the auth object relay.ts made for it; a call or pairing that waits
  * on a page is charged that much (ADR 0018's notes). 0 where nothing
- * measured it.
+ * measured it. `paidOnArrival` says, from the same object, whether relay.ts
+ * spent the request's budget as it arrived (true), found it past the budget
+ * (false), or spent nothing (undefined), as on the 2025-era leg.
  */
 export function createMcpFactory(
   hub: PageHub,
@@ -347,16 +363,24 @@ export function createMcpFactory(
   spike: Spike | null = null,
   budget: RequestBudget = createRequestBudget(config),
   heldBytesOf: (authInfo: AuthInfo | undefined) => number = () => 0,
+  paidOnArrival: (authInfo: AuthInfo | undefined) => boolean | undefined = () => undefined,
 ): (ctx: McpRequestContext) => McpServer {
   const waitSeconds = Math.round(config.timings.pairWaitMs / 1000);
   /**
    * ADR 0018: counts one request against its caller's budget, before the
    * access check and before its arguments are checked, so a refused or
    * malformed request costs as much as any. Past it the request is answered
-   * rate_limited and recorded within the refusal budget.
+   * rate_limited and recorded within the refusal budget. A 2026-07-28
+   * request already counted as it arrived (`paid`, ADRs 0030 and 0032), so it
+   * counts nothing more here, and one that arrived past the budget is refused.
    */
-  const overBudget = (who: CallerIdentity, refusal: BudgetRefusal): CallToolResult | null => {
-    if (budget.spend(who.userId, who.account.kind)) return null;
+  const overBudget = (
+    who: CallerIdentity,
+    refusal: BudgetRefusal,
+    paid: boolean | undefined,
+  ): CallToolResult | null => {
+    if (paid === true) return null;
+    if (paid === undefined && budget.spend(who.userId, who.account.kind)) return null;
     hub.refusedByBudget(who, refusal);
     return errorResult('rate_limited', budget.refusal(who.account.kind));
   };
@@ -384,6 +408,9 @@ export function createMcpFactory(
     });
     /** What this request's body holds while it waits, measured by relay.ts. */
     const heldBytes = (ctx: ServerContext): number => heldBytesOf(ctx.http?.authInfo ?? authInfo);
+    /** Whether relay.ts spent this request's budget as it arrived. */
+    const paid = (ctx: ServerContext): boolean | undefined =>
+      paidOnArrival(ctx.http?.authInfo ?? authInfo);
 
     server.registerTool(
       'list_pages',
@@ -395,7 +422,7 @@ export function createMcpFactory(
       },
       (input, ctx) => {
         const who = caller(ctx);
-        const refused = overBudget(who, { tool: 'list_pages' });
+        const refused = overBudget(who, { tool: 'list_pages' }, paid(ctx));
         if (refused) return refused;
         if (!input.ok) return invalidArguments(input);
         const pages = hub.listPages(who.userId);
@@ -434,10 +461,11 @@ export function createMcpFactory(
       },
       async (shaped, ctx) => {
         const who = caller(ctx);
-        const refused = overBudget(who, {
-          tool: 'pair_page',
-          via: fieldOf(shaped, 'code') === '' ? 'invite' : 'code',
-        });
+        const refused = overBudget(
+          who,
+          { tool: 'pair_page', via: fieldOf(shaped, 'code') === '' ? 'invite' : 'code' },
+          paid(ctx),
+        );
         if (refused) return refused;
         if (!shaped.ok) return invalidArguments(shaped);
         const input = PairPageInputSchema.safeParse(shaped.args);
@@ -480,7 +508,11 @@ export function createMcpFactory(
       },
       (input, ctx) => {
         const who = caller(ctx);
-        const refused = overBudget(who, { tool: 'list_page_tools', page: fieldOf(input, 'page') });
+        const refused = overBudget(
+          who,
+          { tool: 'list_page_tools', page: fieldOf(input, 'page') },
+          paid(ctx),
+        );
         if (refused) return refused;
         if (!input.ok) return invalidArguments(input);
         const outcome = hub.listPageTools(who.userId, input.args.page);
@@ -511,7 +543,11 @@ export function createMcpFactory(
         const who = caller(ctx);
         const page = fieldOf(input, 'page');
         const tool = fieldOf(input, 'tool');
-        const refused = overBudget(who, { tool: 'call_page_tool', page, pageTool: tool });
+        const refused = overBudget(
+          who,
+          { tool: 'call_page_tool', page, pageTool: tool },
+          paid(ctx),
+        );
         if (refused) return refused;
         if (!input.ok) {
           // Every call attempt keeps a call line (S7), a malformed one too.
@@ -547,7 +583,11 @@ export function createMcpFactory(
       },
       (input, ctx) => {
         const who = caller(ctx);
-        const refused = overBudget(who, { tool: 'detach_page', page: fieldOf(input, 'page') });
+        const refused = overBudget(
+          who,
+          { tool: 'detach_page', page: fieldOf(input, 'page') },
+          paid(ctx),
+        );
         if (refused) return refused;
         if (!input.ok) return invalidArguments(input);
         const outcome = hub.detachPage(who.userId, input.args.page);

@@ -994,6 +994,29 @@ function checkRelayUrl(relayUrl: string): void {
 }
 
 /**
+ * A bad policy is a page bug; throwing here surfaces it at attach(). The
+ * error is a TypeError naming the fields, as for a bad relay URL, so zod's
+ * own error class never becomes part of attach()'s contract, and it never
+ * quotes a value the page passed (ADR 0032).
+ */
+function checkPolicy(input: unknown): Policy {
+  const parsed = PolicySchema.safeParse(input);
+  if (parsed.success) return parsed.data;
+  const fields = [
+    ...new Set(
+      parsed.error.issues
+        .map((issue) => issue.path.map((part) => String(part)).join('.'))
+        .filter((field) => field !== ''),
+    ),
+  ];
+  throw new TypeError(
+    fields.length === 0
+      ? 'invalid policy: it must be an object'
+      : `invalid policy for ${fields.join(', ')}`,
+  );
+}
+
+/**
  * Removes what an adapter before ADR 0011 kept under the relay URL alone, for
  * every page of the origin at once. None of it is read, as it may belong to
  * another page; removing it keeps a stale token out of storage. A pause
@@ -1011,8 +1034,7 @@ function forgetLegacyRecords(storage: StorageLike | undefined, relayUrl: string)
 
 export function createAdapterCore(options: CoreOptions): AdapterCore {
   checkRelayUrl(options.relayUrl);
-  // A bad policy is a page bug; throwing here surfaces it at attach().
-  const policy = PolicySchema.parse(options.policy ?? {});
+  const policy = checkPolicy(options.policy ?? {});
   const pageListedTools = options.policy?.consequentialTools !== undefined;
   const context = options.modelContext;
   const log = options.logger ?? consoleLogger;

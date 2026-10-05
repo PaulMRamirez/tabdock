@@ -153,6 +153,9 @@ importers:
       '@tabdock/demo':
         specifier: workspace:*
         version: link:../../apps/demo
+      '@tabdock/mcpb6':
+        specifier: workspace:*
+        version: link:../mcpb6
       '@tabdock/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
@@ -177,15 +180,18 @@ importers:
       mcp-sdk-1.32.0:
         specifier: npm:@modelcontextprotocol/sdk@1.32.0
         version: '@modelcontextprotocol/sdk@1.32.0(zod@4.6.5)'
+      ws:
+        specifier: 8.22.0
+        version: 8.22.0
+
+  tests/mcpb6:
+    dependencies:
       webmcp-local-relay-6-beta:
         specifier: npm:@mcp-b/webmcp-local-relay@6.0.0-beta.20261001010549
         version: '@mcp-b/webmcp-local-relay@6.0.0-beta.20261001010549'
       webmcp-polyfill-6-beta:
         specifier: npm:@mcp-b/webmcp-polyfill@6.0.0-beta.20261001010549
         version: '@mcp-b/webmcp-polyfill@6.0.0-beta.20261001010549'
-      ws:
-        specifier: 8.22.0
-        version: 8.22.0
 
 packages:
 

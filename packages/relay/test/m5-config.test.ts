@@ -8,8 +8,15 @@
 import { existsSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { FIRST_CLASS_NOTIFY_INTERVAL_MS } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
-import { parseMcpAllowedOrigins, resolveConfig } from '../src/config.ts';
+import {
+  DEFAULT_LIMITS,
+  DEFAULT_RATE_LIMITS,
+  MIN_REQUEST_BYTES,
+  parseMcpAllowedOrigins,
+  resolveConfig,
+} from '../src/config.ts';
 import { createDevTokenAuth, createRelay, loadConfigFromEnv } from '../src/index.ts';
 import { PAGE_ORIGIN } from './helpers/page-client.ts';
 import { PAIR_CLIENT } from './helpers/provider.ts';
@@ -280,5 +287,46 @@ describe('TABDOCK_MCP_ALLOWED_ORIGINS (ADR 0027)', () => {
       'https://a.example',
       'http://[::1]:1',
     ]);
+  });
+});
+
+describe('the request total with invites on (ADR 0032)', () => {
+  it('refuses a total under twice the least setting, so invitees never hold more than half of it', () => {
+    const memberOnly = { ...OAUTH, TABDOCK_MAX_REQUEST_BYTES_PER_USER: String(MIN_REQUEST_BYTES) };
+    const settings = { ...memberOnly, TABDOCK_INVITES: '1' };
+    const message = thrown(() =>
+      resolveEnv({ ...settings, TABDOCK_MAX_REQUEST_BYTES: String(2 * MIN_REQUEST_BYTES - 1) }),
+    );
+    expect(message).toMatch(
+      /^invites \(TABDOCK_INVITES\) need requestBytes \(TABDOCK_MAX_REQUEST_BYTES\)/,
+    );
+    expect(
+      resolveEnv({ ...settings, TABDOCK_MAX_REQUEST_BYTES: String(2 * MIN_REQUEST_BYTES) }).limits
+        .requestBytes,
+    ).toBe(2 * MIN_REQUEST_BYTES);
+    // Without invites the least setting still starts, as before.
+    expect(
+      resolveEnv({ ...memberOnly, TABDOCK_MAX_REQUEST_BYTES: String(MIN_REQUEST_BYTES) }).limits
+        .requestBytes,
+    ).toBe(MIN_REQUEST_BYTES);
+  });
+});
+
+describe('tool list changes against the request budget (ADRs 0025, 0030 and 0032)', () => {
+  // Every 2026-07-28 tools/list spends a request, and with first-class tools
+  // on every 2025-era one too, and a client lists again on each change. At one
+  // change a second, a page that kept changing its tools spent all of a
+  // member's 240 a minute through four clients, and every call they made on
+  // any page answered rate_limited.
+  const listsPerMinute = DEFAULT_RATE_LIMITS.windowMs / FIRST_CLASS_NOTIFY_INTERVAL_MS;
+
+  it("leaves four clients that list again on every change nine tenths of a member's requests", () => {
+    expect(4 * listsPerMinute).toBeLessThanOrEqual(DEFAULT_RATE_LIMITS.requestsPerUser / 10);
+  });
+
+  it('leaves half of them with every session a member may hold doing the same', () => {
+    expect(DEFAULT_LIMITS.sessionsPerUser * listsPerMinute).toBeLessThanOrEqual(
+      DEFAULT_RATE_LIMITS.requestsPerUser / 2,
+    );
   });
 });

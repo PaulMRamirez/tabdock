@@ -16,8 +16,10 @@
 // server/discover among them, and a tools/call it answers with an error in a
 // 200, still free: each builds a server of its own, and 50 tools/list passed a
 // budget of 3. Now every 2026-07-28 request spends once, as it arrives, but a
-// listen and a tools/call bound for a tool, which spend where they land (ADR
-// 0030).
+// listen, which spends where it lands (ADR 0030); the review of M5 Step 1
+// found a tools/call with an unknown name or a requestState that is not a
+// string still free, and now every tools/call spends as it arrives too, a
+// fixed tool spending nothing more (ADR 0032).
 
 import type { Client } from '@modelcontextprotocol/client';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -314,6 +316,73 @@ describe('lines a signed-in account can make /mcp write (A4.3)', () => {
     expect(relay.relay.audit.events()).toEqual([
       expect.objectContaining({ type: 'request_refused', tool: 'list_pages' }),
     ]);
+  });
+
+  it('spends a request on a 2026-07-28 tools/call naming a tool the relay does not serve, and refuses those past the budget (ADR 0030)', async () => {
+    const relay = await setup({ rateLimits: { requestsPerUser: 3 } });
+    const unknown = [];
+    for (let id = 1; id <= 6; id += 1) {
+      unknown.push(await modernRequest(ALICE, id, 'tools/call', { name: 'nope', arguments: {} }));
+    }
+    // The SDK answers an unknown name with an error in a 200, which in Step 1
+    // cost nothing, so twenty passed a budget of 3.
+    expect(unknown.map((answer) => answer.status)).toEqual([200, 200, 200, 429, 429, 429]);
+    expect(unknown[0]?.text).toMatch(/Tool nope not found/);
+    expect(unknown[3]?.text).toMatch(/more than 3 requests to this relay/);
+    const listed = await modernRequest(ALICE, 7, 'tools/call', {
+      name: 'list_pages',
+      arguments: {},
+    });
+    expect(listed.status).toBe(200);
+    expect(listed.text).toMatch(/rate_limited: more than 3 requests/);
+    // list_pages, refused in its own tool, keeps its record; the unknown names asked nothing of a page.
+    expect(relay.relay.audit.events()).toEqual([
+      expect.objectContaining({ type: 'request_refused', tool: 'list_pages' }),
+    ]);
+  });
+
+  it('spends one request, not two, on a 2026-07-28 call to a fixed tool, which refuses one past the budget in its own words and with its record', async () => {
+    const relay = await setup({ rateLimits: { requestsPerUser: 3 } });
+    const answers = [];
+    for (let id = 1; id <= 4; id += 1) {
+      answers.push(
+        await modernRequest(ALICE, id, 'tools/call', { name: 'list_pages', arguments: {} }),
+      );
+    }
+    expect(answers.map((answer) => answer.status)).toEqual([200, 200, 200, 200]);
+    for (const answer of answers.slice(0, 3)) expect(answer.text).not.toMatch(/rate_limited/);
+    expect(answers[3]?.text).toMatch(/rate_limited: more than 3 requests/);
+    expect(relay.relay.audit.events()).toEqual([
+      expect.objectContaining({ type: 'request_refused', tool: 'list_pages' }),
+    ]);
+  });
+
+  it('spends a request on a 2026-07-28 tools/call whose requestState is not a string, which the SDK refuses before any tool runs (ADR 0030)', async () => {
+    await setup({ rateLimits: { requestsPerUser: 3 } });
+    const answers = [];
+    for (const [id, requestState] of [
+      [1, 5],
+      [2, null],
+      [3, 5],
+      [4, null],
+    ] as const) {
+      answers.push(
+        await modernRequest(ALICE, id, 'tools/call', {
+          name: 'list_pages',
+          arguments: {},
+          requestState,
+        }),
+      );
+    }
+    // The SDK refuses each with a frozen -32602 in a 200, before list_pages runs and spends.
+    expect(answers.map((answer) => answer.status)).toEqual([200, 200, 200, 429]);
+    expect(answers[0]?.text).toMatch(/Invalid or expired requestState/);
+    expect(answers[1]?.text).toMatch(/Invalid or expired requestState/);
+    const listed = await modernRequest(ALICE, 5, 'tools/call', {
+      name: 'list_pages',
+      arguments: {},
+    });
+    expect(listed.text).toMatch(/rate_limited: more than 3 requests/);
   });
 
   it('writes refused 2025-era initializes once per reason a window, and counts the rest', async () => {

@@ -134,6 +134,12 @@ const CallShape = shape('call', {
    */
   confirmedBy: z.optional(z.literal('client')),
 });
+function callRule(record: { outcome: string; confirmedBy?: string | undefined }): boolean {
+  return record.confirmedBy === undefined || record.outcome !== 'not_confirmed';
+}
+const CALL_RULE = {
+  message: 'a call refused for its confirmation went out unconfirmed, so no client confirmed it',
+};
 
 /** An attachment made, by an approval, autoApprove or an invite. */
 const AttachShape = shape('attach', {
@@ -309,7 +315,7 @@ const LINE = {
 
 /** What the hub appends (AuditLog.append). */
 export const AuditEventSchema = z.discriminatedUnion('type', [
-  z.strictObject(CallShape),
+  z.strictObject(CallShape).check(z.refine(callRule, CALL_RULE)),
   z.strictObject(AttachShape).check(z.refine(attachRule, ATTACH_RULE)),
   z.strictObject(AttachRefusedShape).check(z.refine(attachRefusedRule, PAGE_RULE)),
   z.strictObject(RoleShape),
@@ -333,7 +339,7 @@ export type AuditCallEvent = AuditEventOf<'call'>;
 
 /** One line of the persistent log: an event with its sequence number and chain link. */
 export const AuditLineSchema = z.discriminatedUnion('type', [
-  z.strictObject({ ...CallShape, ...LINE }),
+  z.strictObject({ ...CallShape, ...LINE }).check(z.refine(callRule, CALL_RULE)),
   z.strictObject({ ...AttachShape, ...LINE }).check(z.refine(attachRule, ATTACH_RULE)),
   z.strictObject({ ...AttachRefusedShape, ...LINE }).check(z.refine(attachRefusedRule, PAGE_RULE)),
   z.strictObject({ ...RoleShape, ...LINE }),

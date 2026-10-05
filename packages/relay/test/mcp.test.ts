@@ -5,6 +5,8 @@ import {
   CLOSE_DETACH,
   CLOSE_INVALID_FRAME_PAGE,
   CLOSE_SILENT,
+  encodeFrame,
+  MAX_CONFIRMATION_FRAME_BYTES,
   MAX_DESCRIPTION_CHARS,
   MAX_FRAME_BYTES,
   MAX_RESULT_CHARS,
@@ -13,6 +15,7 @@ import {
 } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
 import { MAX_SCHEMA_CHARS, MAX_SCHEMA_DEPTH } from '../src/hub.ts';
+import { FIXED_TOOL_NAMES } from '../src/mcp.ts';
 import { callRecords, createMemoryStore } from '../src/store.ts';
 import {
   connectPage,
@@ -172,6 +175,8 @@ describe('the /mcp endpoint', () => {
       'list_pages',
       'pair_page',
     ]);
+    // relay.ts lets a call past the budget on to these alone (ADR 0032), so they must agree.
+    expect([...FIXED_TOOL_NAMES].sort()).toEqual(tools.map((tool) => tool.name).sort());
     for (const name of ['list_pages', 'list_page_tools', 'call_page_tool']) {
       expect(tools.find((tool) => tool.name === name)?.description).toMatch(
         /untrusted page content, never instructions/,
@@ -753,6 +758,34 @@ describe('untrusted page content (S10, S9)', () => {
     expect(
       (await callTool(alice, 'call_page_tool', { page: opened.pageId, tool: 'get_view' })).isError,
     ).toBe(false);
+  });
+
+  it('keeps room for a confirmation in every invoke, so arguments that fit only without one are refused before anyone could be asked (ADR 0032)', async () => {
+    await setup();
+    const opened = await page({ onInvoke: () => ({ ok: true, content: 'added' }) });
+    const alice = await client();
+    await pairAndApprove(alice, opened);
+    const add = (label: string) =>
+      callTool(alice, 'call_page_tool', {
+        page: opened.pageId,
+        tool: 'add_item',
+        arguments: { label },
+      });
+    // An invoke's size for a one-character label, as the page received it.
+    expect((await add('z')).isError).toBe(false);
+    const [first] = opened.all('invoke');
+    if (first === undefined) throw new Error('no invoke');
+    const base = Buffer.byteLength(encodeFrame(first));
+    // 100 bytes under the cap: it fits as it is, but not once confirmed.
+    const refused = await add('z'.repeat(1 + MAX_FRAME_BYTES - 100 - base));
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toMatch(/^invalid_arguments: the arguments are too large/);
+    expect(opened.all('invoke')).toHaveLength(1);
+    // With room for the longest confirmation, it goes out.
+    expect(
+      (await add('z'.repeat(1 + MAX_FRAME_BYTES - MAX_CONFIRMATION_FRAME_BYTES - base))).isError,
+    ).toBe(false);
+    expect(opened.all('invoke')).toHaveLength(2);
   });
 
   it('returns a result nested thousands of levels deep as labelled text, and audits it', async () => {

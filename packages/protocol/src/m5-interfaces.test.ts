@@ -20,6 +20,7 @@ import {
   IdSchema,
   InvokeFrameSchema,
   isErrorCode,
+  MAX_CONFIRMATION_FRAME_BYTES,
   MAX_FIRST_CLASS_CHARS_PER_USER,
   MAX_FIRST_CLASS_DESCRIPTION_CHARS,
   MAX_FIRST_CLASS_NAME_CHARS,
@@ -215,6 +216,28 @@ describe("the invoke frame's confirmation (ADR 0026)", () => {
     expect(ConfirmationSchema.parse({ ...confirmation, record: 'r_1' })).toEqual(confirmation);
   });
 
+  it('adds at most MAX_CONFIRMATION_FRAME_BYTES to an encoded invoke, the room the relay keeps for it (ADR 0032)', () => {
+    // Every character here is ASCII, so each is one byte on the wire.
+    const bytes = (text: string): number => text.length;
+    // The longest id, whose characters JSON never escapes, and the most digits a time may have.
+    const longest = {
+      by: 'client' as const,
+      confirmationId: 'x'.repeat(64),
+      at: Number.MAX_SAFE_INTEGER,
+    };
+    expect(ConfirmationSchema.safeParse(longest).success).toBe(true);
+    expect(
+      bytes(encodeFrame({ ...invoke, confirmation: longest })) - bytes(encodeFrame(invoke)),
+    ).toBe(MAX_CONFIRMATION_FRAME_BYTES);
+    for (const longer of [
+      { ...longest, confirmationId: 'x'.repeat(65) },
+      { ...longest, confirmationId: `${'x'.repeat(63)}"` },
+      { ...longest, at: Number.MAX_SAFE_INTEGER + 1 },
+    ]) {
+      expect(ConfirmationSchema.safeParse(longer).success).toBe(false);
+    }
+  });
+
   it('is dropped by an adapter older than M5, which then prompts as it always has', () => {
     const older = z.omit(InvokeFrameSchema, { confirmation: true });
     expect(older.parse({ ...invoke, confirmation })).toEqual(invoke);
@@ -235,6 +258,22 @@ describe('not_confirmed and confirmedBy (ADR 0026)', () => {
     expect(AuditLineSchema.parse(line)).toEqual(line);
     const refused = { ...call, outcome: 'not_confirmed' };
     expect(AuditEventSchema.parse(refused)).toEqual(refused);
+  });
+
+  it('refuses a call refused for its confirmation that credits a client with it, as event and as line (ADR 0032)', () => {
+    const contradictory = { ...call, outcome: 'not_confirmed', confirmedBy: 'client' };
+    const event = AuditEventSchema.safeParse(contradictory);
+    expect(event.success).toBe(false);
+    expect(event.error?.issues[0]?.message).toBe(
+      'a call refused for its confirmation went out unconfirmed, so no client confirmed it',
+    );
+    expect(
+      AuditLineSchema.safeParse({ ...contradictory, seq: 4, prev: 'a'.repeat(64) }).success,
+    ).toBe(false);
+    // Every other outcome may carry it, a confirmed call that then timed out among them.
+    expect(
+      AuditEventSchema.safeParse({ ...call, outcome: 'timeout', confirmedBy: 'client' }).success,
+    ).toBe(true);
   });
 
   it('keeps a call line without it as it was, and refuses any other confirmer', () => {
@@ -268,6 +307,8 @@ describe("ADR 0025's first-class numbers", () => {
     expect(MAX_FIRST_CLASS_TITLE_CHARS).toBe(120);
     expect(MAX_FIRST_CLASS_ORIGIN_CHARS).toBe(100);
     expect(FIRST_CLASS_LIST_TTL_MS).toBe(10_000);
-    expect(FIRST_CLASS_NOTIFY_INTERVAL_MS).toBe(1000);
+    expect(FIRST_CLASS_NOTIFY_INTERVAL_MS).toBe(10_000);
+    // A client that lists again on each change lists no more often than the list's cache allows.
+    expect(FIRST_CLASS_NOTIFY_INTERVAL_MS).toBeGreaterThanOrEqual(FIRST_CLASS_LIST_TTL_MS);
   });
 });

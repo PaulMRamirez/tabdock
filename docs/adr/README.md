@@ -35,3 +35,4 @@ Short records of decisions that change or refine `SPEC.md`, or that a future con
 | [0029](0029-tour-on-pages.md)                    | The tour on GitHub Pages and the demo's choice of relay         | Accepted |
 | [0030](0030-limits-from-the-m4-hunt.md)          | Limits and fixes from the last M4 review                        | Accepted |
 | [0031](0031-refresh-spec-m5.md)                  | Refresh SPEC sections 3, 10 and 12 for M5                       | Accepted |
+| [0032](0032-fixes-from-the-m5-step-1-review.md)  | Fixes from the M5 Step 1 review                                 | Accepted |

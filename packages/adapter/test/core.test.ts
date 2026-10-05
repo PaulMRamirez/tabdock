@@ -6,6 +6,7 @@ import {
   MAX_FRAME_BYTES,
   MAX_RESULT_CHARS,
   MAX_TIMER_MS,
+  type PolicyInput,
   RECONNECT_MAX_MS,
   RECONNECT_MIN_MS,
   TOOL_POLL_MS,
@@ -1325,18 +1326,25 @@ describe('one approval covers one page (ADR 0011)', () => {
 });
 
 describe('createAdapterCore', () => {
-  it('rejects an invalid policy at once', () => {
-    expect(() =>
+  it('rejects an invalid policy at once, with a TypeError naming its fields and never their values (ADR 0032)', () => {
+    const attachWith = (policy: unknown) => () =>
       createAdapterCore({
         relayUrl: RELAY_URL,
-        policy: { maxDrivers: 0 },
+        policy: policy as PolicyInput,
         socketFactory: () => {
           throw new Error('unused');
         },
         pageUrl: '',
         pageInfo: () => ({ title: '' }),
         adapterVersion: '0',
-      }),
-    ).toThrow();
+      });
+    expect(attachWith({ maxDrivers: 0 })).toThrow(new TypeError('invalid policy for maxDrivers'));
+    expect(attachWith({ maxDrivers: 0, consequential: 'maybe' })).toThrow(
+      new TypeError('invalid policy for maxDrivers, consequential'),
+    );
+    expect(attachWith({ consequentialTools: ['ok', 5] })).toThrow(
+      new TypeError('invalid policy for consequentialTools.1'),
+    );
+    expect(attachWith('everything')).toThrow(new TypeError('invalid policy: it must be an object'));
   });
 });

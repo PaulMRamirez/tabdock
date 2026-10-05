@@ -1,0 +1,18 @@
+{
+  "name": "@tabdock/mcpb6",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The MCP-B 6.0 beta for the test leg that runs the adapter on it, kept apart so its bins never shadow the 5.1.0 the demo and baseline use.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "webmcp-local-relay-6-beta": "npm:@mcp-b/webmcp-local-relay@6.0.0-beta.20261001010549",
+    "webmcp-polyfill-6-beta": "npm:@mcp-b/webmcp-polyfill@6.0.0-beta.20261001010549"
+  }
+}

@@ -30,17 +30,17 @@
 // the rest counted (repeated-lines.ts, A4.3), as is each /page upgrade refused,
 // within its address's budget (hub.ts). Every 2026-07-28 request spends the
 // caller's request budget once, and an /mcp response its client leaves unread
-// is cut off once it stops moving (response-stalls.ts, ADR 0030). The client address
-// that /page and /pair count by, and that /mcp's refusal line names, comes
-// from one place (client-address.ts), which answers 400 on a route that counts
-// by address when a host edge names no client (ADR 0018). With an audit
-// directory (production, local mode, or TABDOCK_AUDIT_DIR) the audit log is a
-// FileAuditLog there, bracketed by relay_start and relay_stop records so a
-// restart shows as a gap (ADR 0019); production refuses to start without one,
-// or if relay_start does not reach the disk. The plugin says who someone is
-// and the relay decides whether an invitee may in (ADR 0020). The M3 spike's
-// measurements (spike.ts) hook in here when TABDOCK_SPIKE is on; nothing over
-// HTTP controls them.
+// is cut off once it stops moving (response-stalls.ts, ADRs 0030 and 0032).
+// The client address that /page and /pair count by, and that /mcp's refusal
+// line names, comes from one place (client-address.ts), which answers 400 on
+// a route that counts by address when a host edge names no client (ADR 0018).
+// With an audit directory (production, local mode, or TABDOCK_AUDIT_DIR) the
+// audit log is a FileAuditLog there, bracketed by relay_start and relay_stop
+// records so a restart shows as a gap (ADR 0019); production refuses to start
+// without one, or if relay_start does not reach the disk. The plugin says who
+// someone is and the relay decides whether an invitee may in (ADR 0020). The
+// M3 spike's measurements (spike.ts) hook in here when TABDOCK_SPIKE is on;
+// nothing over HTTP controls them.
 
 import { lookup } from 'node:dns/promises';
 import { createServer, type IncomingMessage, type ServerResponse, STATUS_CODES } from 'node:http';
@@ -94,13 +94,14 @@ import {
   AuthExtraSchema,
   createMcpFactory,
   createRequestBudget,
+  FIXED_TOOL_NAMES,
   RELAY_VERSION,
   userIdOf,
 } from './mcp.ts';
 import { createPairFlow, PAIR_ROUTES, type PairFlow } from './pair.ts';
 import { createRepeatedLog, errorKind } from './repeated-lines.ts';
 import { requestHeapBytes } from './request-heap.ts';
-import { ResponseStalls } from './response-stalls.ts';
+import { inSlices, ResponseStalls } from './response-stalls.ts';
 import { type InviteeSessionOptions, McpSessions } from './sessions.ts';
 import { createSignInGate } from './sign-in-gate.ts';
 import { Spike, type SpikeControl } from './spike.ts';
@@ -252,20 +253,33 @@ async function readModernBody(request: Request): Promise<ModernBody> {
 
 /**
  * A 2026-07-28 message that spends a request of its caller's budget as it
- * arrives, before the SDK sees it (S9, ADR 0030): one JSON-RPC request,
- * tools/list, server/discover, ping and initialize included, but for two
- * that spend elsewhere: a subscriptions/listen, in listen-streams.ts, and a
- * tools/call that the SDK's own tools/call schema takes, which goes on to the
- * tool it names. A tools/call the SDK would refuse before any tool runs,
- * one with no name for instance, spends here like any other request. A
- * notification carries no request, and a batch, a response or anything else
- * that is not one request spends only if the SDK refuses it (refusedBySdk).
+ * arrives, before the SDK sees it (S9, ADRs 0030 and 0032): every JSON-RPC
+ * request but a subscriptions/listen, which spends in listen-streams.ts.
+ * tools/call is no exception, so neither a name the relay does not serve nor
+ * params the SDK refuses before any tool runs, a requestState that is not a
+ * string for one, make a request free, whatever checks the SDK makes there.
+ * `toolAnswers` says whether one past the budget still goes on, to be
+ * refused by the fixed tool it names in that tool's own words and with its
+ * audit record, as in M4: a tools/call the SDK's own schema takes, naming one
+ * of the five, whose requestState the SDK will not refuse first. relay.ts
+ * answers any other request past the budget itself. A notification carries
+ * no request, and a batch, a response or anything else that is not one
+ * request spends only if the SDK refuses it (refusedBySdk).
  */
-function spendsOnArrival(message: unknown): { id: string | number } | null {
+function arrivalOf(message: unknown): { id: string | number; toolAnswers: boolean } | null {
   if (!isJSONRPCRequest(message)) return null;
   if (message.method === 'subscriptions/listen') return null;
-  if (isSpecType.CallToolRequest(message)) return null;
-  return { id: message.id };
+  return { id: message.id, toolAnswers: answeredInTool(message) };
+}
+
+/** Whether the SDK hands this request to one of the five fixed tools. */
+function answeredInTool(message: unknown): boolean {
+  if (!isSpecType.CallToolRequest(message)) return false;
+  // The SDK refuses a present requestState that is not a string before any handler runs.
+  const state: unknown = (message.params as { requestState?: unknown }).requestState;
+  return (
+    FIXED_TOOL_NAMES.has(message.params.name) && (state === undefined || typeof state === 'string')
+  );
 }
 
 /** The SDK's server-error code, for a request the relay will not serve now. */
@@ -477,8 +491,16 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   // object, which handleMcp makes once per request and the SDK hands each
   // tool handler as ctx.http.authInfo.
   const heldBytes = new WeakMap<AuthInfo, number>();
-  const factory = createMcpFactory(hub, config, spike, budget, (authInfo) =>
-    authInfo === undefined ? 0 : (heldBytes.get(authInfo) ?? 0),
+  // Whether each 2026-07-28 request spent its budget as it arrived, under the
+  // same key, so a fixed tool neither spends again nor serves one past it.
+  const paidOnArrival = new WeakMap<AuthInfo, boolean>();
+  const factory = createMcpFactory(
+    hub,
+    config,
+    spike,
+    budget,
+    (authInfo) => (authInfo === undefined ? 0 : (heldBytes.get(authInfo) ?? 0)),
+    (authInfo) => (authInfo === undefined ? undefined : paidOnArrival.get(authInfo)),
   );
   const mcp = createMcpHandler(factory, {
     legacy: 'reject',
@@ -532,14 +554,17 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
    * request for as long as a stream it opened lives. A listen over its own
    * cap is refused before it costs anything, and every other listen passes
    * the relay's bounds (listen-streams.ts). Every other request spends one
-   * request of its caller's budget as it arrives, unless it is a tools/call
-   * bound for a tool that spends itself (spendsOnArrival): each builds a
-   * server of its own (createMcpFactory), so 50 tools/list on a budget of 3
-   * all answered in M4. Past the budget it is answered 429 in the budget's
-   * own words, with no audit record, since it asks nothing of a page, as a
-   * refused listen is. A request that spent nothing so far and that the SDK
-   * refuses reached no tool either, so it spends one then: refusals cost
-   * like calls, and a flood of them runs dry. Each request counts once.
+   * request of its caller's budget as it arrives (arrivalOf), tools/call
+   * included: each builds a server of its own (createMcpFactory), so 50
+   * tools/list on a budget of 3 all answered in M4, and a tools/call with an
+   * unknown name or a requestState that is not a string still passed in M5's
+   * first build. Past the budget it is answered 429 in the budget's own
+   * words, with no audit record, since it asks nothing of a page, as a
+   * refused listen is; only a call that a fixed tool will answer goes on, so
+   * that tool refuses it with its record (S7). A body that is not one
+   * request and that the SDK refuses reached no tool either, so it spends
+   * one then: refusals cost like calls, and a flood of them runs dry. Each
+   * request counts once.
    */
   const modern = async (
     request: Request,
@@ -559,10 +584,12 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     } else {
       const listen = listenOf(body.message);
       const parsed = { ...options, parsedBody: body.message };
-      const arrival = listen === null ? spendsOnArrival(body.message) : null;
+      const arrival = listen === null ? arrivalOf(body.message) : null;
       if (arrival !== null) {
         spent = true;
-        if (!budget.spend(caller.userId, caller.kind)) {
+        const paid = budget.spend(caller.userId, caller.kind);
+        if (options?.authInfo !== undefined) paidOnArrival.set(options.authInfo, paid);
+        if (!paid && !arrival.toolAnswers) {
           mcpLines.write('warn', 'mcp request refused: past the request budget', {
             userId: caller.userId,
           });
@@ -621,7 +648,13 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         : forward(request);
     },
   };
-  const mcpNode = toNodeHandler(legs, {
+  // Every answer goes to the adapter in slices, so a client reading a large
+  // one shows progress as each slice is written (response-stalls.ts, ADR 0032).
+  const sliced = {
+    fetch: async (request: Request, options?: McpHandlerRequestOptions): Promise<Response> =>
+      inSlices(await legs.fetch(request, options)),
+  };
+  const mcpNode = toNodeHandler(sliced, {
     maxRequestBodySize: MAX_MCP_BODY_BYTES,
     onerror: (error) => {
       // undici's message for a Request it cannot build quotes the URL, query and all.

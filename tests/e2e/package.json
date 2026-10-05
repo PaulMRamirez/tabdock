@@ -27,6 +27,7 @@
     "@playwright/test": "1.56.1",
     "@tabdock/adapter": "workspace:*",
     "@tabdock/demo": "workspace:*",
+    "@tabdock/mcpb6": "workspace:*",
     "@tabdock/protocol": "workspace:*",
     "@tabdock/relay": "workspace:*",
     "@tabdock/sim-page": "workspace:*",
@@ -35,8 +36,6 @@
     "mcp-sdk-1.12.3": "npm:@modelcontextprotocol/sdk@1.12.3",
     "mcp-sdk-1.24.0": "npm:@modelcontextprotocol/sdk@1.24.0",
     "mcp-sdk-1.32.0": "npm:@modelcontextprotocol/sdk@1.32.0",
-    "webmcp-local-relay-6-beta": "npm:@mcp-b/webmcp-local-relay@6.0.0-beta.20261001010549",
-    "webmcp-polyfill-6-beta": "npm:@mcp-b/webmcp-polyfill@6.0.0-beta.20261001010549",
     "ws": "8.22.0"
   }
 }

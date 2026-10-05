@@ -11,6 +11,15 @@ export const PROTOCOL_VERSION = 1;
 /** Largest page link frame either side accepts, in bytes. */
 export const MAX_FRAME_BYTES = 1024 * 1024;
 
+/**
+ * The most an invoke's confirmation (ADR 0026) adds to its encoded frame:
+ * `,"confirmation":{"by":"client","confirmationId":"<64 id characters>","at":<a
+ * safe integer>}`. The relay measures every invoke with this much to spare,
+ * so a call that fits when it arrives still fits once confirmed, and nobody
+ * is asked about a call too large to send (ADR 0032).
+ */
+export const MAX_CONFIRMATION_FRAME_BYTES = 137;
+
 /** Tool results longer than this many characters are truncated with a visible marker. */
 export const MAX_RESULT_CHARS = 120_000;
 
@@ -138,8 +147,14 @@ export const MAX_FIRST_CLASS_TITLE_CHARS = 120;
 export const MAX_FIRST_CLASS_ORIGIN_CHARS = 100;
 /** ttlMs on a 2026-07-28 tools/list while first-class tools are on, always with cacheScope private. */
 export const FIRST_CLASS_LIST_TTL_MS = 10_000;
-/** The least time between two tool list change notifications to one user. */
-export const FIRST_CLASS_NOTIFY_INTERVAL_MS = 1000;
+/**
+ * The least time between two tool list change notifications to one user: a
+ * list's own ttlMs. Every 2026-07-28 tools/list spends the request budget
+ * (ADR 0030), and a client lists again on each change, so at one a second a
+ * page that kept changing its tools spent a member's whole 240 a minute
+ * through four clients; at one every 10 s four clients spend 24 (ADR 0032).
+ */
+export const FIRST_CLASS_NOTIFY_INTERVAL_MS = 10_000;
 
 // The audit log (ADR 0019).
 
