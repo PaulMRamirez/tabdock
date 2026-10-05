@@ -10,7 +10,9 @@
 // runtime image has no pnpm or shell: on the reference deployment,
 // fly ssh console -C "/nodejs/bin/node /app/packages/relay/src/audit-cli.ts --verify"
 // (docs/deploy.md, "Reading the audit log"). It reads files and writes to
-// stdout only; it never changes the log.
+// stdout only; it never changes the log. The published command runs it as
+// `tabdock-relay audit` (cli.ts, ADR 0028), its usage naming that command, and
+// there it reads no .env file: settings come from the environment alone.
 
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -24,8 +26,17 @@ import {
 } from './audit-file.ts';
 import { LOCAL_AUDIT_DIR } from './config.ts';
 import { ownerTokenDirectory } from './local-token.ts';
+import { PACKAGED } from './packaged.ts';
 
-export const AUDIT_CLI_USAGE = `Usage: pnpm audit:log [options]
+/** How a checkout runs the reader; the published command is `tabdock-relay audit`. */
+export const CHECKOUT_AUDIT_COMMAND = 'pnpm audit:log';
+
+/** The reader's usage, naming the command it runs under. */
+export function auditCliUsage(command: string): string {
+  return AUDIT_CLI_USAGE.replace(`Usage: ${CHECKOUT_AUDIT_COMMAND} `, `Usage: ${command} `);
+}
+
+export const AUDIT_CLI_USAGE = `Usage: ${CHECKOUT_AUDIT_COMMAND} [options]
 
 Reads the relay's audit log (ADR 0019) and prints its records, oldest first.
 
@@ -152,13 +163,18 @@ export interface CliIo {
   err(line: string): void;
 }
 
-/** Runs the reader with these arguments; returns the exit code (0 fine, 1 a broken log, 2 a usage error). */
+/**
+ * Runs the reader with these arguments; returns the exit code (0 fine, 1 a
+ * broken log, 2 a usage error). `command` is what the usage calls it.
+ */
 export function runAuditCli(
   argv: readonly string[],
   env: NodeJS.ProcessEnv,
   io: CliIo,
   now: number = Date.now(),
+  command: string = CHECKOUT_AUDIT_COMMAND,
 ): number {
+  const usage = auditCliUsage(command);
   let values;
   try {
     ({ values } = parseArgs({
@@ -181,11 +197,11 @@ export function runAuditCli(
     }));
   } catch (error) {
     io.err(escapeForTerminal(error instanceof Error ? error.message : String(error)));
-    io.err(AUDIT_CLI_USAGE);
+    io.err(usage);
     return 2;
   }
   if (values.help === true) {
-    io.out(AUDIT_CLI_USAGE);
+    io.out(usage);
     return 0;
   }
   let filter: AuditFilter;
@@ -305,8 +321,10 @@ export function runAuditCli(
   return 0;
 }
 
-// Run as a script: the root .env, when there is one, may name TABDOCK_AUDIT_DIR, as main.ts reads it.
-if (import.meta.main) {
+// Run as a script in a checkout: the root .env, when there is one, may name
+// TABDOCK_AUDIT_DIR, as main.ts reads it. Never in the bundle, where every
+// module shares the entry's import.meta and cli.ts runs the reader itself.
+if (!PACKAGED && import.meta.main) {
   const envFile = resolve(import.meta.dirname, '../../../.env');
   if (existsSync(envFile)) process.loadEnvFile(envFile);
   process.exitCode = runAuditCli(process.argv.slice(2), process.env, {

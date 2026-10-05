@@ -130,7 +130,12 @@ export interface PrintedBanner {
   pageUrl: string;
   tokenPath: string;
   created: boolean;
-  /** The `claude mcp add` line, exactly as printed. */
+  /**
+   * The command that adds the relay to Claude Code, exactly as printed: on
+   * POSIX shells `claude mcp add-json` with the header helper (ADR 0028), or
+   * ADR 0022's `claude mcp add --header` line where the helper's path cannot
+   * be carried.
+   */
   command: string;
 }
 
@@ -150,6 +155,6 @@ export function readBanner(stdout: string): PrintedBanner {
     pageUrl: pick(/^ {2}Page socket: +(\S+)$/m, 'page socket'),
     tokenPath: token[1],
     created: token[2] === 'created just now',
-    command: pick(/^ {2}(claude mcp add .+)$/m, 'claude mcp add line'),
+    command: pick(/^ {2}(claude mcp add(?:-json)? .+)$/m, 'claude mcp add line'),
   };
 }
