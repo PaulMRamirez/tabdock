@@ -16,6 +16,7 @@
   },
   "exports": {
     ".": "./src/index.ts",
+    "./test/private-tmp": "./test/helpers/private-tmp.ts",
     "./test/provider": "./test/helpers/provider.ts",
     "./test/secrecy": "./test/helpers/secrecy.ts",
     "./test/tunnel": "./test/helpers/tunnel.ts"

@@ -1,19 +1,28 @@
 // Writes packages/relay/npm-shrinkwrap.json for the published relay (ADR
 // 0028), so `npx @tabdock/relay` installs the dependency tree this workspace
 // tested, as npm recommends for a command-line tool. It is made at pack time
-// and never committed: release-pack.ts writes it, packs, and removes it.
-//   node packages/relay/scripts/shrinkwrap.ts
+// and never committed: release-pack.ts packs the protocol, writes this, packs
+// the relay, and removes it.
+//   node packages/relay/scripts/shrinkwrap.ts <packed @tabdock/protocol tarball>
 //
 // npm writes the file, not this script: in a scratch directory it resolves
 // the relay's dependencies with `npm install --package-lock-only`, every
 // package pinned through `overrides` to the version pnpm resolved here, and
 // the result is then checked package by package against pnpm's tree, so a
 // version npm would pick differently stops the release instead of shipping.
-// @tabdock/protocol is left to npm, since it is published beside the relay at
-// the same exact version, and the root entry is made to match the packed
-// package.json.
+//
+// The shrinkwrap must hold every package the relay needs, @tabdock/protocol
+// included: npm installs a registry package that carries a shrinkwrap from
+// that file alone and never resolves anything it leaves out, so a relay
+// without the protocol in it fails to start from npx (ADR 0028's notes). The
+// protocol is not published yet when this runs, so npm resolves it from the
+// tarball release-pack.ts has just packed, the very file the stage job
+// publishes, and its entry then names the registry URL that tarball will
+// have, with npm's own sha512 of it, so an install fetches exactly those
+// bytes or fails. The root entry is made to match the packed package.json.
 
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
@@ -106,23 +115,58 @@ function pnpmVersions(): Map<string, string> {
   return single;
 }
 
-/** Makes the shrinkwrap; returns its path. Needs the npm registry. */
-export function writeShrinkwrap(): string {
+/** Where a published @tabdock package's tarball lives on the npm registry. */
+export function registryTarballUrl(name: string, version: string): string {
+  return `https://registry.npmjs.org/${name}/-/${name.slice(name.indexOf('/') + 1)}-${version}.tgz`;
+}
+
+/** The sha512 integrity of a tarball's bytes, as npm records and checks it. */
+export function tarballIntegrity(bytes: Buffer): string {
+  return `sha512-${createHash('sha512').update(bytes).digest('base64')}`;
+}
+
+/**
+ * Makes the shrinkwrap; returns its path. Needs the npm registry. `siblings`
+ * names the packed tarball of each @tabdock package the relay depends on,
+ * which this release publishes beside it.
+ */
+export function writeShrinkwrap(siblings: Readonly<Record<string, string>>): string {
   const manifest = ManifestSchema.parse(
     JSON.parse(readFileSync(join(RELAY_DIR, 'package.json'), 'utf8')),
   );
   const versions = pnpmVersions();
+  const ours = Object.keys(manifest.dependencies).filter((name) => name.startsWith('@tabdock/'));
+  const unpacked = ours.filter((name) => siblings[name] === undefined);
+  if (unpacked.length > 0) {
+    throw new Error(
+      `the relay depends on ${unpacked.join(', ')}, whose packed tarball the shrinkwrap needs`,
+    );
+  }
   const direct = Object.fromEntries(
     Object.entries(manifest.dependencies).filter(([name]) => !name.startsWith('@tabdock/')),
   );
   const overrides = Object.fromEntries(
     [...versions].filter(([name]) => !(name in direct)).sort(([a], [b]) => a.localeCompare(b)),
   );
+  const tarballs = new Map(ours.map((name) => [name, resolve(siblings[name] ?? '')]));
   const scratch = mkdtempSync(join(tmpdir(), 'tabdock-shrinkwrap-'));
   try {
     writeFileSync(
       join(scratch, 'package.json'),
-      `${JSON.stringify({ name: manifest.name, version: manifest.version, private: true, dependencies: direct, overrides }, null, 2)}\n`,
+      `${JSON.stringify(
+        {
+          name: manifest.name,
+          version: manifest.version,
+          private: true,
+          dependencies: {
+            ...direct,
+            ...Object.fromEntries([...tarballs].map(([name, file]) => [name, `file:${file}`])),
+          },
+          overrides,
+        },
+        null,
+        2,
+      )}\n`,
     );
     const ran = spawnSync(
       'npm',
@@ -144,6 +188,23 @@ export function writeShrinkwrap(): string {
     for (const [path, entry] of Object.entries(lock.packages)) {
       if (path === '') continue;
       const name = path.slice(path.lastIndexOf('node_modules/') + 'node_modules/'.length);
+      const tarball = tarballs.get(name);
+      if (tarball !== undefined) {
+        // npm took it from the packed file; the published copy is those bytes at the registry.
+        const integrity = tarballIntegrity(readFileSync(tarball));
+        if (
+          path !== `node_modules/${name}` ||
+          entry.version !== manifest.version ||
+          entry.integrity !== integrity
+        ) {
+          throw new Error(
+            `npm placed ${name}@${entry.version ?? '?'} at ${path}, not the packed ${name}@${manifest.version} beside the relay`,
+          );
+        }
+        entry.resolved = registryTarballUrl(name, manifest.version);
+        found.add(name);
+        continue;
+      }
       const want = versions.get(name);
       if (want === undefined || entry.version !== want) {
         throw new Error(
@@ -158,7 +219,7 @@ export function writeShrinkwrap(): string {
       }
       found.add(name);
     }
-    const missing = [...versions.keys()].filter((name) => !found.has(name));
+    const missing = [...versions.keys(), ...tarballs.keys()].filter((name) => !found.has(name));
     if (missing.length > 0)
       throw new Error(`npm left out ${missing.join(', ')}, which pnpm's tree holds`);
     const bin = manifest.publishConfig?.bin;
@@ -189,5 +250,9 @@ export function writeShrinkwrap(): string {
 }
 
 if (import.meta.main) {
-  console.log(writeShrinkwrap());
+  const protocol = process.argv[2];
+  if (protocol === undefined) {
+    throw new Error('give the packed @tabdock/protocol tarball: node shrinkwrap.ts <tarball>');
+  }
+  console.log(writeShrinkwrap({ '@tabdock/protocol': protocol }));
 }

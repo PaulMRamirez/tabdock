@@ -341,9 +341,12 @@ describe('refusals: each names the path and the fix, never the contents', () => 
       expect(message).toContain(home);
       expect(message).toMatch(/another account owns it.*delete it and start again/);
     }
-    // The same seen from the other side: the relay running as another account.
+    // The same seen from the other side: the relay running as another account,
+    // with the directories above played as root's, which every account trusts.
     const uid = (process.getuid?.() ?? 0) + 4242;
-    const seen = refusal(() => loadOwnerToken({ TABDOCK_HOME: home }, { uid }));
+    const above = (path: string): FileFacts =>
+      path === home ? lstatSync(path) : ownedBy(lstatSync(path), 0);
+    const seen = refusal(() => loadOwnerToken({ TABDOCK_HOME: home }, { uid, lstat: above }));
     expect(seen).toContain(`${home}: another account owns it`);
   });
 
@@ -488,6 +491,72 @@ describe('refusals: each names the path and the fix, never the contents', () => 
       // Refused, never rewritten.
       expect(readFileSync(file, 'latin1')).toBe(contents);
     }
+  });
+});
+
+describe.skipIf(!POSIX)('the directories above it (ADR 0028)', () => {
+  // Claude Code keeps running the header helper by its path long after the
+  // relay last checked it, so a directory another account could make again
+  // once it is gone would hand that account code execution as the user.
+  it('refuses a token directory below a sticky directory everyone can write, as /tmp is, making nothing', () => {
+    const shared = join(scratch(), 'shared');
+    mkdirSync(shared);
+    chmodSync(shared, 0o1777);
+    const home = join(shared, 'tabdock');
+    for (const load of [loadOwnerToken, readOwnerToken]) {
+      const message = refusal(() => load({ TABDOCK_HOME: home }));
+      expect(message).toBe(
+        `local mode refuses ${home} for its owner token: ${shared} above it can be written by other accounts (mode 1777), so another account could make the directory again once it is gone and have Claude Code run a header helper of its own; set TABDOCK_HOME to an absolute path under your home directory (ADR 0028)`,
+      );
+    }
+    expect(existsSync(home)).toBe(false);
+  });
+
+  it('refuses one below the real /tmp, whoever runs it', () => {
+    const tmp = realpathSync('/tmp');
+    if ((statSync(tmp).mode & 0o1022) !== 0o1022) return;
+    const home = join(tmp, `tabdock-review-${String(process.pid)}`, 'tabdock');
+    expect(refusal(() => loadOwnerToken({ TABDOCK_HOME: home }))).toContain(
+      `: ${tmp} above it can be written by other accounts (mode 1777)`,
+    );
+    expect(existsSync(join(tmp, `tabdock-review-${String(process.pid)}`))).toBe(false);
+  });
+
+  it('refuses one below a directory of its own its group may write, naming chmod as a fix', () => {
+    for (const mode of [0o775, 0o757, 0o722]) {
+      const parent = join(scratch(), 'group');
+      mkdirSync(parent);
+      chmodSync(parent, mode);
+      const home = join(parent, 'deeper', 'tabdock');
+      const message = refusal(() => loadOwnerToken({ TABDOCK_HOME: home }));
+      expect(message).toContain(
+        `: ${parent} above it can be written by other accounts (mode ${mode.toString(8)}), so another account could make the directory again`,
+      );
+      expect(message).toContain(
+        'run chmod go-w on it, or set TABDOCK_HOME to an absolute path under your home directory (ADR 0028)',
+      );
+      expect(existsSync(join(parent, 'deeper'))).toBe(false);
+    }
+  });
+
+  it('refuses one below a directory another account owns, and the default one under such a home', () => {
+    const base = scratch();
+    const theirs = join(base, 'theirs');
+    mkdirSync(theirs, { mode: 0o755 });
+    const other = (process.getuid?.() ?? 0) + 4242;
+    const lstat = (path: string): FileFacts =>
+      path === theirs ? ownedBy(lstatSync(path), other) : lstatSync(path);
+    const home = join(theirs, 'tabdock');
+    expect(refusal(() => loadOwnerToken({ TABDOCK_HOME: home }, { lstat }))).toContain(
+      `: ${theirs} above it belongs to another account (uid ${String(other)}), so another account could make the directory again once it is gone and have Claude Code run a header helper of its own; set TABDOCK_HOME to an absolute path under your home directory (ADR 0028)`,
+    );
+    const env = { HOME: theirs };
+    expect(refusal(() => loadOwnerToken(env, { lstat, platform: 'linux' }))).toContain(
+      `local mode refuses ${join(theirs, '.config', 'tabdock')} for its owner token: ${theirs} above it belongs to another account`,
+    );
+    expect(existsSync(join(theirs, '.config'))).toBe(false);
+    // Directories root owns, and ours that only we may write, are trusted.
+    expect(loadOwnerToken({ TABDOCK_HOME: join(base, 'mine', 'tabdock') }).created).toBe(true);
   });
 });
 
@@ -686,6 +755,39 @@ describe('the repository rule (ADR 0028), in a checkout and in the package alike
           refusal(() => loadOwnerToken({ TABDOCK_HOME: join(link, 'tabdock') }, systemFor(base))),
         ).toContain(`inside the git work tree ${repo},`);
         expect(existsSync(join(repo, 'docs', 'tabdock'))).toBe(false);
+      });
+
+      it("refuses the work tree of every other version control tool that could commit it, as git's", () => {
+        // Jujutsu snapshots new files into the working-copy commit on its own,
+        // so a token there needs no `add` at all to reach a push.
+        const tools: [string, string][] = [
+          ['.jj', 'Jujutsu'],
+          ['.hg', 'Mercurial'],
+          ['.sl', 'Sapling'],
+          ['.svn', 'Subversion'],
+          ['.bzr', 'Bazaar'],
+        ];
+        for (const [marker, tool] of tools) {
+          const base = scratch();
+          const repo = join(base, 'repo');
+          mkdirSync(join(repo, marker), { recursive: true });
+          const home = join(repo, '.tabdock');
+          for (const load of [loadOwnerToken, readOwnerToken]) {
+            const message = refusal(() => load({ TABDOCK_HOME: home }, systemFor(base)));
+            expect(message, marker).toContain(
+              `inside the ${tool} work tree ${repo}, where the token could be committed;`,
+            );
+          }
+          expect(existsSync(home), marker).toBe(false);
+        }
+        // A colocated Jujutsu repository holds both, and git's name comes first.
+        const base = scratch();
+        const both = join(base, 'colocated');
+        mkdirSync(join(both, '.jj'), { recursive: true });
+        mkdirSync(join(both, '.git'));
+        expect(
+          refusal(() => loadOwnerToken({ TABDOCK_HOME: join(both, 't') }, systemFor(base))),
+        ).toContain(`inside the git work tree ${both},`);
       });
 
       it('takes a directory under no work tree at all', () => {

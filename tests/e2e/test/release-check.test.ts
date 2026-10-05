@@ -2,10 +2,13 @@
 // here: three well-formed ones pass at 0.0.0, and each rule refuses the one
 // thing it is there to catch, so a pack that slips a test, a .env, a token, a
 // source file, an install script, a second bin or a stray dependency into a
-// package never reaches the stage job. The real tarballs are checked in CI by
-// the pack-install job.
+// package, ships a shrinkwrap npm would install an incomplete tree from, or
+// documents an import the package does not export never reaches the stage
+// job (ADR 0028's notes). The real tarballs are checked in CI by the
+// pack-install job.
 
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -13,6 +16,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   checkRelease,
   type PackageName,
+  PACKAGES,
+  readmeProblems,
   REPOSITORY_URL,
   ROOT,
   tarballName,
@@ -101,10 +106,22 @@ function wellFormed(version = '0.0.0'): Record<PackageName, Fixture> {
           lockfileVersion: 3,
           packages: {
             '': { name: '@tabdock/relay', version, dependencies: relayDependencies },
+            // pack() puts the packed protocol's integrity in place of the mark.
+            'node_modules/@tabdock/protocol': {
+              version,
+              resolved: `https://registry.npmjs.org/@tabdock/protocol/-/protocol-${version}.tgz`,
+              integrity: PROTOCOL_INTEGRITY,
+              dependencies: { zod: '4.6.5' },
+            },
             'node_modules/ws': {
               version: '8.22.0',
               resolved: 'https://registry.npmjs.org/ws/-/ws-8.22.0.tgz',
               integrity: 'sha512-abc',
+            },
+            'node_modules/zod': {
+              version: '4.6.5',
+              resolved: 'https://registry.npmjs.org/zod/-/zod-4.6.5.tgz',
+              integrity: 'sha512-def',
             },
           },
         }),
@@ -113,12 +130,29 @@ function wellFormed(version = '0.0.0'): Record<PackageName, Fixture> {
   };
 }
 
-/** Writes each fixture as a tarball, package/ and all, as npm and pnpm pack them. */
+/** Stands for the packed protocol's integrity in a fixture's shrinkwrap until pack() knows it. */
+const PROTOCOL_INTEGRITY = 'sha512-the-packed-protocol';
+
+/**
+ * Writes each fixture as a tarball, package/ and all, as npm and pnpm pack
+ * them: the protocol first, as release-pack.ts does, so the relay's
+ * shrinkwrap can pin that tarball's integrity.
+ */
 function pack(fixtures: Record<PackageName, Fixture>): string {
   const out = mkdtempSync(join(tmpdir(), 'tabdock-release-check-'));
   scratches.push(out);
-  for (const [name, fixture] of Object.entries(fixtures) as [PackageName, Fixture][]) {
+  for (const name of PACKAGES) {
+    const fixture = fixtures[name];
     const stage = join(out, `stage-${name}`);
+    const shrinkwrap = fixture.files['npm-shrinkwrap.json'];
+    if (typeof shrinkwrap === 'string' && shrinkwrap.includes(PROTOCOL_INTEGRITY)) {
+      const protocolVersion = String(fixtures.protocol.manifest.version);
+      const protocol = readFileSync(join(out, tarballName('protocol', protocolVersion)));
+      fixture.files['npm-shrinkwrap.json'] = shrinkwrap.replace(
+        PROTOCOL_INTEGRITY,
+        `sha512-${createHash('sha512').update(protocol).digest('base64')}`,
+      );
+    }
     const files = { ...fixture.files, 'package.json': JSON.stringify(fixture.manifest, null, 2) };
     for (const [path, contents] of Object.entries(files)) {
       const file = join(stage, 'package', path);
@@ -297,6 +331,49 @@ describe('the release check', () => {
       /takes node_modules\/ws from "file:\.\.\/ws\.tgz", not the npm registry/,
     ],
     [
+      'a shrinkwrap that leaves out @tabdock/protocol, which npm would then never install',
+      (f) => {
+        const shrinkwrap = JSON.parse(String(f.relay.files['npm-shrinkwrap.json'])) as {
+          packages: Record<string, unknown>;
+        };
+        delete shrinkwrap.packages['node_modules/@tabdock/protocol'];
+        f.relay.files['npm-shrinkwrap.json'] = JSON.stringify(shrinkwrap);
+      },
+      /npm-shrinkwrap\.json leaves out @tabdock\/protocol, which @tabdock\/relay depends on, so npm would never install it/,
+    ],
+    [
+      'a shrinkwrap that leaves out what a package in its tree depends on',
+      (f) => {
+        const shrinkwrap = JSON.parse(String(f.relay.files['npm-shrinkwrap.json'])) as {
+          packages: Record<string, Record<string, unknown>>;
+        };
+        const ws = shrinkwrap.packages['node_modules/ws'] ?? {};
+        ws.dependencies = { 'not-in-the-tree': '1.0.0' };
+        f.relay.files['npm-shrinkwrap.json'] = JSON.stringify(shrinkwrap);
+      },
+      /leaves out not-in-the-tree, which node_modules\/ws depends on/,
+    ],
+    [
+      'a shrinkwrap that pins a protocol other than the one packed beside the relay',
+      (f) => {
+        f.relay.files['npm-shrinkwrap.json'] = String(f.relay.files['npm-shrinkwrap.json']).replace(
+          PROTOCOL_INTEGRITY,
+          'sha512-another-protocol',
+        );
+      },
+      /pins node_modules\/@tabdock\/protocol with an integrity other than the packed @tabdock\/protocol's/,
+    ],
+    [
+      'a shrinkwrap that takes the protocol from anywhere but its registry URL',
+      (f) => {
+        f.relay.files['npm-shrinkwrap.json'] = String(f.relay.files['npm-shrinkwrap.json']).replace(
+          'https://registry.npmjs.org/@tabdock/protocol/-/protocol-0.0.0.tgz',
+          'file:../tabdock-protocol-0.0.0.tgz',
+        );
+      },
+      /takes node_modules\/@tabdock\/protocol from "file:\.\.\/tabdock-protocol-0\.0\.0\.tgz", not https:\/\/registry\.npmjs\.org\/@tabdock\/protocol\/-\/protocol-0\.0\.0\.tgz/,
+    ],
+    [
       'a script-tag build at the ceiling',
       (f) => {
         f.adapter.files['dist/tabdock-adapter.js'] = Buffer.alloc(150_000, 0x20);
@@ -318,6 +395,68 @@ describe('the release check', () => {
       /@tabdock\/protocol points at \.\/dist\/index\.d\.ts, which it does not hold/,
     ],
   ];
+
+  const readmeCases: [string, PackageName, string, RegExp][] = [
+    [
+      'a README that names a subpath the package does not export',
+      'adapter',
+      '`src/core.ts` (exported as `@tabdock/adapter/core`)',
+      /@tabdock\/adapter's README names @tabdock\/adapter\/core, which the packed @tabdock\/adapter does not export/,
+    ],
+    [
+      "a README that names another package's subpath it does not export",
+      'relay',
+      'The helpers are also exported as `@tabdock/relay/test/secrecy`.',
+      /@tabdock\/relay's README names @tabdock\/relay\/test\/secrecy, which the packed @tabdock\/relay does not export/,
+    ],
+    [
+      'a README that imports a package with no library entry point',
+      'protocol',
+      "```ts\nimport { createRelay } from '@tabdock/relay';\n```",
+      /@tabdock\/protocol's README imports @tabdock\/relay, which the packed @tabdock\/relay does not export/,
+    ],
+  ];
+  for (const [what, name, text, expected] of readmeCases) {
+    it(`refuses ${what}`, () => {
+      const problems = problemsWith((f) => {
+        f[name].files['README.md'] = `# readme\n\n${text}\n`;
+      });
+      expect(
+        problems.some((problem) => expected.test(problem)),
+        problems.join('\n'),
+      ).toBe(true);
+    });
+  }
+
+  it('passes a README naming only what the packages export, a CDN path and the package.json', () => {
+    const fixtures = wellFormed();
+    fixtures.adapter.files['README.md'] = [
+      "import { attach } from '@tabdock/adapter';",
+      'https://cdn.jsdelivr.net/npm/@tabdock/adapter@0.1.0/dist/tabdock-adapter.js',
+      "const p = await import('@tabdock/protocol');",
+      '`@tabdock/relay/package.json`, then `npx @tabdock/relay`.',
+      '',
+    ].join('\n');
+    expect(checkRelease(pack(fixtures))).toEqual([]);
+  });
+
+  it("holds this repository's READMEs to what each package publishes", () => {
+    const exportsOf = new Map(
+      PACKAGES.map((name) => {
+        const manifest = JSON.parse(
+          readFileSync(join(ROOT, 'packages', name, 'package.json'), 'utf8'),
+        ) as { publishConfig?: { exports?: unknown } };
+        return [name, manifest.publishConfig?.exports] as const;
+      }),
+    );
+    for (const name of PACKAGES) {
+      const readme = readFileSync(join(ROOT, 'packages', name, 'README.md'), 'utf8');
+      expect(
+        readmeProblems(name, readme, (other) => exportsOf.get(other)),
+        name,
+      ).toEqual([]);
+    }
+  });
 
   for (const [what, change, expected, tag] of cases) {
     it(`refuses ${what}`, () => {

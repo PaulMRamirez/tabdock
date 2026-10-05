@@ -17,12 +17,12 @@
 
 import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import type { Browser, Page } from '@playwright/test';
 import { type AuditLine, AuditLineSchema } from '@tabdock/protocol';
 import { EMAIL_CLAIM, EMAIL_VERIFIED_CLAIM, listAuditFiles } from '@tabdock/relay';
+import { privateTempRoot } from '@tabdock/relay/test/private-tmp';
 import { PAIR_CLIENT } from '@tabdock/relay/test/provider';
 import { leakIn } from '@tabdock/relay/test/secrecy';
 import { tunnelFetch } from '@tabdock/relay/test/tunnel';
@@ -212,7 +212,8 @@ async function linkedBoard(
 }
 
 say('Tabdock M4: local mode by default, then a page shared by invite\n');
-const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'tabdock-demo-m4-')));
+// Not the shared temporary directory, where local mode refuses its token (ADR 0028's notes).
+const scratch = realpathSync(mkdtempSync(join(privateTempRoot(), 'tabdock-demo-m4-')));
 let browser: Browser | undefined;
 let dev: Run | undefined;
 const clients: Client[] = [];

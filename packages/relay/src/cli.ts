@@ -22,8 +22,8 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { z } from 'zod';
+import { namedArgument as named } from './argument-names.ts';
 import { runAuditCli } from './audit-cli.ts';
-import type { AuthPlugin } from './auth.ts';
 import { type EnvConfig, loadConfigFromEnv } from './config.ts';
 import { localModeLines, shellFor } from './local-banner.ts';
 import { PACKAGED } from './packaged.ts';
@@ -78,11 +78,6 @@ const FLAGS: Readonly<Record<string, Command>> = {
   '--help': { kind: 'help' },
   '-h': { kind: 'help' },
 };
-
-/** An argument as a refusal names it: a flag by its name, anything else only by its place. */
-function named(arg: string, position: number): string {
-  return /^--?[a-z][a-z-]{0,31}$/.test(arg) ? `the option ${arg}` : `argument ${String(position)}`;
-}
 
 /** What the arguments ask for; a refusal says why without repeating anything but a flag's name. */
 export function parseCommand(argv: readonly string[]): Command {
@@ -140,23 +135,6 @@ export interface CommandContext {
   err(line: string): void;
 }
 
-/**
- * The plugin with `commit` run first in its start, which createRelay calls
- * only after it holds the audit directory's lock: so `--new-token` beside a
- * running relay that shares the directory refuses on the lock before the
- * token changes, and a start that fails later keeps the new token, which no
- * client has yet.
- */
-function committingFirst(auth: AuthPlugin, commit: () => void): AuthPlugin {
-  return {
-    ...auth,
-    async start(context) {
-      commit();
-      await auth.start?.(context);
-    },
-  };
-}
-
 export interface StartedRelay {
   relay: Relay;
   options: EnvConfig;
@@ -167,8 +145,11 @@ export interface StartedRelay {
 /**
  * Starts the relay from `context.env` and returns it with its banner. With
  * `newToken`, local mode's start draws a new token without reading the old
- * file and renames it into place once the audit directory is locked; outside
- * local mode the flag is refused by name before anything starts.
+ * file and renames it into place only once the relay listens: by then it
+ * holds the token directory's lock (token-lock.ts), so no relay sharing the
+ * directory still takes the old token, and a start that fails on the way, on
+ * a lock or a port in use, leaves the old token as it was. Outside local mode
+ * the flag is refused by name before anything starts.
  */
 export async function startRelay(
   context: CommandContext,
@@ -190,9 +171,15 @@ export async function startRelay(
       "--new-token replaces local mode's owner token, and this relay is not in local mode: an auth setting such as TABDOCK_DEV_TOKENS or TABDOCK_PUBLIC_URL is set, or TABDOCK_ENV is production (ADR 0028)",
     );
   }
-  const auth =
-    pending.commit === undefined ? options.auth : committingFirst(options.auth, pending.commit);
-  const relay = await createRelay({ ...options, auth });
+  const relay = await createRelay(options);
+  if (pending.commit !== undefined) {
+    try {
+      pending.commit();
+    } catch (error) {
+      await relay.close();
+      throw error;
+    }
+  }
   const local = options.localMode;
   const lines =
     relay.publicMcpUrl !== null

@@ -49,6 +49,7 @@ import {
   startRelay,
   type TestRelay,
 } from './helpers/relay.ts';
+import { leakIn } from './helpers/secrecy.ts';
 
 const scratches: string[] = [];
 const relays: TestRelay[] = [];
@@ -544,5 +545,29 @@ describe('pnpm audit:log', () => {
     expect(run(['--dir', join(scratch(), 'missing')]).code).toBe(2);
     expect(escapeForTerminal('a\u202eb\u0007c\u2028d')).toBe('a\\u202eb\\u0007c\\u2028d');
     expect(run(['--help']).out.join('\n')).toContain('Usage: pnpm audit:log');
+  });
+
+  it('never repeats an argument it refuses that could be a token pasted in the wrong place (ADR 0028)', () => {
+    const token = `tabdock_${'SECRETsecret'.repeat(3)}SECRET1`;
+    const cases: [string[], string][] = [
+      [[token], 'argument 1 is not one this reader takes: it takes options only'],
+      [['--verify', token], 'argument 2 is not one this reader takes: it takes options only'],
+      [[`--${token}`], 'argument 1 is not one this reader takes'],
+      [[`--header=Bearer ${token}`], 'argument 1 is not one this reader takes'],
+      [[`-H${token}`], 'argument 1 is not one this reader takes'],
+      [['--nonsense'], 'the option --nonsense is not one this reader takes'],
+      [[`--json=${token}`], 'the option --json takes no value'],
+      [['--dir'], 'the option --dir needs a value'],
+      [['--dir', `-${token}`], 'the option --dir needs a value'],
+      [['--', token], 'argument 2 is not one this reader takes: it takes options only'],
+    ];
+    for (const [argv, reason] of cases) {
+      const ran = run(argv);
+      const said = [...ran.out, ...ran.err].join('\n');
+      expect(ran.code, String(argv.length)).toBe(2);
+      expect(leakIn(said, token), reason).toBeNull();
+      expect(ran.err[0], reason).toBe(reason);
+      expect(ran.err[1]).toContain('Usage: pnpm audit:log');
+    }
   });
 });

@@ -40,6 +40,7 @@ import { LOCAL_USER, type LocalTokenSystem, loadOwnerToken } from './local-token
 import type { LogLevel, LogSink } from './log.ts';
 import { createOAuthAuth, parseOAuthClientIds, parseOAuthUsers } from './oauth.ts';
 import type { RelayStore } from './store.ts';
+import { holdingTokenLock } from './token-lock.ts';
 
 export type RelayEnv = 'development' | 'production';
 
@@ -1212,7 +1213,13 @@ function authFromEnv(
   }
   const owner = loadOwnerToken(env, system);
   return {
-    auth: createDevTokenAuth([{ ...LOCAL_USER, token: owner.token }], { loopbackOnly: true }),
+    // The token directory stays locked while the relay runs, whatever its
+    // audit directory, so no second relay serves this token beside it and no
+    // --new-token replaces it under a relay still taking the old one.
+    auth: holdingTokenLock(
+      createDevTokenAuth([{ ...LOCAL_USER, token: owner.token }], { loopbackOnly: true }),
+      dirname(owner.path),
+    ),
     localMode: { tokenPath: owner.path, created: owner.created },
   };
 }

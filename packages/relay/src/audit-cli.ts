@@ -16,8 +16,9 @@
 
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { parseArgs } from 'node:util';
+import { parseArgs, type ParseArgsOptionsConfig } from 'node:util';
 import { AUDIT_EVENT_TYPES, type AuditLine } from '@tabdock/protocol';
+import { namedArgument } from './argument-names.ts';
 import {
   type AuditCheckpoint,
   readAuditLines,
@@ -158,6 +159,61 @@ function auditDir(given: string | undefined, env: NodeJS.ProcessEnv): string {
   return join(ownerTokenDirectory(env), LOCAL_AUDIT_DIR);
 }
 
+const AUDIT_OPTIONS = {
+  dir: { type: 'string' },
+  user: { type: 'string', multiple: true },
+  page: { type: 'string', multiple: true },
+  type: { type: 'string', multiple: true },
+  outcome: { type: 'string', multiple: true },
+  since: { type: 'string' },
+  until: { type: 'string' },
+  json: { type: 'boolean' },
+  verify: { type: 'boolean' },
+  checkpoint: { type: 'string' },
+  help: { type: 'boolean' },
+} as const satisfies ParseArgsOptionsConfig;
+
+/**
+ * Why the arguments are refused, or null when node's strict parse will take
+ * them. Node's own messages quote the argument they stumble on, so the
+ * arguments are walked here first and each refusal names a flag by its name
+ * and anything else only by its place, as cli.ts does (ADR 0028): a token
+ * pasted in the wrong place is still a token. Values are never named.
+ */
+function refusalOf(argv: readonly string[]): string | null {
+  const { tokens } = parseArgs({
+    args: [...argv],
+    options: AUDIT_OPTIONS,
+    strict: false,
+    allowPositionals: true,
+    tokens: true,
+  });
+  for (const token of tokens) {
+    if (token.kind === 'option-terminator') continue;
+    if (token.kind === 'positional') {
+      return `${namedArgument(argv[token.index] ?? '', token.index + 1)} is not one this reader takes: it takes options only`;
+    }
+    const known = Object.hasOwn(AUDIT_OPTIONS, token.name)
+      ? AUDIT_OPTIONS[token.name as keyof typeof AUDIT_OPTIONS]
+      : undefined;
+    // Matched by its spelling too, so --Dir or a short form is not taken as --dir.
+    if (known === undefined || token.rawName !== `--${token.name}`) {
+      return `${namedArgument(argv[token.index] ?? '', token.index + 1)} is not one this reader takes`;
+    }
+    if (known.type === 'boolean' && token.value !== undefined) {
+      return `the option ${token.rawName} takes no value`;
+    }
+    // Node refuses a separate value that starts with a dash as ambiguous; --dir=-x passes.
+    if (
+      known.type === 'string' &&
+      (token.value === undefined || (!token.inlineValue && token.value.startsWith('-')))
+    ) {
+      return `the option ${token.rawName} needs a value`;
+    }
+  }
+  return null;
+}
+
 export interface CliIo {
   out(line: string): void;
   err(line: string): void;
@@ -175,28 +231,24 @@ export function runAuditCli(
   command: string = CHECKOUT_AUDIT_COMMAND,
 ): number {
   const usage = auditCliUsage(command);
+  const refused = refusalOf(argv);
+  if (refused !== null) {
+    io.err(refused);
+    io.err(usage);
+    return 2;
+  }
   let values;
   try {
     ({ values } = parseArgs({
       args: [...argv],
       strict: true,
       allowPositionals: false,
-      options: {
-        dir: { type: 'string' },
-        user: { type: 'string', multiple: true },
-        page: { type: 'string', multiple: true },
-        type: { type: 'string', multiple: true },
-        outcome: { type: 'string', multiple: true },
-        since: { type: 'string' },
-        until: { type: 'string' },
-        json: { type: 'boolean' },
-        verify: { type: 'boolean' },
-        checkpoint: { type: 'string' },
-        help: { type: 'boolean' },
-      },
+      options: AUDIT_OPTIONS,
     }));
-  } catch (error) {
-    io.err(escapeForTerminal(error instanceof Error ? error.message : String(error)));
+  } catch {
+    // refusalOf names every case node's parser refuses; its own message
+    // would repeat the argument, which may be a token pasted in the wrong place.
+    io.err('the arguments are not ones this reader takes');
     io.err(usage);
     return 2;
   }

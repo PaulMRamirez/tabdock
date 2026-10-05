@@ -9,14 +9,18 @@
 // dependency left on workspace:, or a sibling not pinned to the shared
 // version; a script npm would run on install; and for the relay, a second bin,
 // a library entry point, or a shrinkwrap that pins anything but registry
-// tarballs with their integrity. CI runs it on every pack (the pack-install
-// job) and publish.yml before staging.
+// tarballs with their integrity, that leaves out a package its tree needs, or
+// that pins a sibling other than the very tarball packed beside it; and a
+// README, which npm shows as the package's page, that names an import the
+// packed manifests would refuse with ERR_PACKAGE_PATH_NOT_EXPORTED. CI runs
+// it on every pack (the pack-install job) and publish.yml before staging.
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
+import { registryTarballUrl, tarballIntegrity } from '../packages/relay/scripts/shrinkwrap.ts';
 
 export const ROOT = resolve(import.meta.dirname, '..');
 export const DEFAULT_OUT = join(ROOT, 'dist', 'packages');
@@ -174,6 +178,15 @@ export function checkRelease(dir: string, options: CheckOptions = {}): string[] 
   }
   const license = readFileSync(join(root, 'LICENSE'));
   const notice = readFileSync(join(root, 'NOTICE'));
+  const exportsOf = new Map<PackageName, Json | undefined>();
+  const readmes = new Map<PackageName, string>();
+  // Each tarball's integrity, as the relay's shrinkwrap must pin its siblings.
+  const integrities = new Map(
+    [...versions].map(([name, tarballVersion]) => [
+      `@tabdock/${name}`,
+      tarballIntegrity(readFileSync(join(dir, tarballName(name, tarballVersion)))),
+    ]),
+  );
   for (const [name, tarballVersion] of versions) {
     const where = `@tabdock/${name}`;
     const tarball = readTarball(join(dir, tarballName(name, tarballVersion)));
@@ -194,10 +207,14 @@ export function checkRelease(dir: string, options: CheckOptions = {}): string[] 
     if (tarball.files.includes('NOTICE') && !tarball.read('NOTICE').equals(notice)) {
       problems.push(`${where}'s NOTICE is not the repository's`);
     }
+    if (tarball.files.includes('README.md')) {
+      readmes.set(name, tarball.read('README.md').toString('utf8'));
+    }
     if (!tarball.files.includes('package.json')) continue;
     const manifest = object(JSON.parse(tarball.read('package.json').toString('utf8')) as Json);
+    exportsOf.set(name, manifest.exports);
     problems.push(...checkManifest(name, manifest, version, tarball));
-    if (name === 'relay') problems.push(...checkRelay(manifest, version, tarball));
+    if (name === 'relay') problems.push(...checkRelay(manifest, version, tarball, integrities));
     if (name === 'adapter' && tarball.files.includes('dist/tabdock-adapter.js')) {
       const script = tarball.read('dist/tabdock-adapter.js');
       if (script.byteLength >= SCRIPT_TAG_LIMIT_BYTES) {
@@ -216,6 +233,9 @@ export function checkRelease(dir: string, options: CheckOptions = {}): string[] 
       }
     }
   }
+  for (const [name, readme] of readmes) {
+    problems.push(...readmeProblems(name, readme, (other) => exportsOf.get(other)));
+  }
   const sums = join(dir, 'SHA256SUMS');
   if (existsSync(sums)) {
     for (const line of readFileSync(sums, 'utf8')
@@ -233,6 +253,70 @@ export function checkRelease(dir: string, options: CheckOptions = {}): string[] 
     }
   }
   return problems;
+}
+
+/** Whether a manifest's `exports` lets an importer reach `subpath` ('.' or './x'). */
+function exported(exports: unknown, subpath: string): boolean {
+  if (exports === undefined || exports === null) return false;
+  // A string, or an object of conditions rather than paths, exports '.' alone.
+  if (typeof exports === 'string' || Array.isArray(exports)) return subpath === '.';
+  if (typeof exports !== 'object') return false;
+  const keys = Object.keys(exports);
+  if (!keys.every((key) => key.startsWith('.'))) return subpath === '.';
+  return keys.some((key) => {
+    if (key === subpath) return true;
+    const star = key.indexOf('*');
+    if (star === -1) return false;
+    const before = key.slice(0, star);
+    const after = key.slice(star + 1);
+    return (
+      subpath.length > before.length + after.length &&
+      subpath.startsWith(before) &&
+      subpath.endsWith(after)
+    );
+  });
+}
+
+const PUBLISHED = PACKAGES.join('|');
+/** `@tabdock/<package>/<subpath>`, which is an import whatever the prose around it says. */
+const SUBPATH_MENTION = new RegExp(`@tabdock/(${PUBLISHED})/([A-Za-z0-9_./-]*[A-Za-z0-9_-])`, 'g');
+/** An import, dynamic import or require of a package's root. */
+const ROOT_IMPORT = new RegExp(
+  `(?:\\bfrom\\s*|\\bimport\\s*\\(\\s*|\\brequire\\s*\\(\\s*|\\bimport\\s+)['"]@tabdock/(${PUBLISHED})['"]`,
+  'g',
+);
+
+/**
+ * What a packed README tells its reader to import that the packed manifests
+ * do not export: npm shows the README as the package's page, and a reader who
+ * follows it would meet ERR_PACKAGE_PATH_NOT_EXPORTED. A CDN path such as
+ * `@tabdock/adapter@0.1.0/dist/...` names a version, not an import, and passes.
+ */
+export function readmeProblems(
+  name: PackageName,
+  readme: string,
+  exportsOf: (name: PackageName) => unknown,
+): string[] {
+  const where = `@tabdock/${name}'s README`;
+  const problems = new Set<string>();
+  for (const match of readme.matchAll(SUBPATH_MENTION)) {
+    const target = match[1] as PackageName;
+    const subpath = match[2] ?? '';
+    if (!exported(exportsOf(target), `./${subpath}`)) {
+      problems.add(
+        `${where} names @tabdock/${target}/${subpath}, which the packed @tabdock/${target} does not export`,
+      );
+    }
+  }
+  for (const match of readme.matchAll(ROOT_IMPORT)) {
+    const target = match[1] as PackageName;
+    if (!exported(exportsOf(target), '.')) {
+      problems.add(
+        `${where} imports @tabdock/${target}, which the packed @tabdock/${target} does not export`,
+      );
+    }
+  }
+  return [...problems];
 }
 
 function checkManifest(
@@ -308,7 +392,46 @@ function checkManifest(
   return problems;
 }
 
-function checkRelay(manifest: Record<string, Json>, version: string, tarball: Tarball): string[] {
+/**
+ * Every dependency the shrinkwrap's tree leaves without a package, as npm
+ * resolves one: from the dependent's own node_modules up through each
+ * enclosing one to the root's. The root's dependencies count, so a relay
+ * whose shrinkwrap lacks one of them, @tabdock/protocol as it once did, is
+ * refused here rather than by a person's npx.
+ */
+export function missingFromShrinkwrap(packages: Record<string, Json>): string[] {
+  const problems: string[] = [];
+  for (const [path, value] of Object.entries(packages)) {
+    const dependencies = object(object(value).dependencies);
+    for (const dependency of Object.keys(dependencies)) {
+      let base = path;
+      let found = false;
+      for (;;) {
+        const candidate = `${base === '' ? '' : `${base}/`}node_modules/${dependency}`;
+        if (packages[candidate] !== undefined) {
+          found = true;
+          break;
+        }
+        if (base === '') break;
+        const cut = base.lastIndexOf('/node_modules/');
+        base = cut === -1 ? '' : base.slice(0, cut);
+      }
+      if (!found) {
+        problems.push(
+          `npm-shrinkwrap.json leaves out ${dependency}, which ${path === '' ? '@tabdock/relay' : path} depends on, so npm would never install it`,
+        );
+      }
+    }
+  }
+  return problems;
+}
+
+function checkRelay(
+  manifest: Record<string, Json>,
+  version: string,
+  tarball: Tarball,
+  siblings: ReadonlyMap<string, string>,
+): string[] {
   const problems: string[] = [];
   const bin = object(manifest.bin);
   if (Object.keys(bin).length !== 1 || bin['tabdock-relay'] !== './dist/cli.js') {
@@ -343,11 +466,35 @@ function checkRelay(manifest: Record<string, Json>, version: string, tarball: Ta
   if (sorted(rootEntry.dependencies) !== sorted(manifest.dependencies)) {
     problems.push("npm-shrinkwrap.json's dependencies are not package.json's");
   }
+  // npm installs a shrinkwrapped package's dependencies from the file alone,
+  // so whatever the tree needs and the file leaves out is never installed.
+  problems.push(...missingFromShrinkwrap(packages));
   for (const [path, value] of Object.entries(packages)) {
     if (path === '') continue;
     const entry = object(value);
-    if (path.includes('@tabdock/'))
-      problems.push(`npm-shrinkwrap.json pins ${path}, which npm resolves with the release`);
+    const name = path.slice(path.lastIndexOf('node_modules/') + 'node_modules/'.length);
+    if (name.startsWith('@tabdock/')) {
+      // A sibling of this release: exactly the tarball beside the relay, at the URL npm will give it.
+      const sibling = siblings.get(name);
+      if (path !== `node_modules/${name}` || entry.version !== version) {
+        problems.push(
+          `npm-shrinkwrap.json pins ${path} at ${JSON.stringify(entry.version)}, not ${name}@${version} beside the relay`,
+        );
+      }
+      if (entry.resolved !== registryTarballUrl(name, version)) {
+        problems.push(
+          `npm-shrinkwrap.json takes ${path} from ${JSON.stringify(entry.resolved)}, not ${registryTarballUrl(name, version)}`,
+        );
+      }
+      if (sibling === undefined) {
+        problems.push(`npm-shrinkwrap.json pins ${path}, which this release does not pack`);
+      } else if (entry.integrity !== sibling) {
+        problems.push(
+          `npm-shrinkwrap.json pins ${path} with an integrity other than the packed ${name}'s`,
+        );
+      }
+      continue;
+    }
     const resolved = entry.resolved;
     if (typeof resolved !== 'string' || !resolved.startsWith('https://registry.npmjs.org/')) {
       problems.push(
