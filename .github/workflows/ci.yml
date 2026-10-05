@@ -31,6 +31,11 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
+      # A5.2 (ADR 0027): the official conformance suite's 2025-11-25 and
+      # 2026-07-28 requirement sets against a relay of its own, behind a
+      # loopback proxy that adds a token drawn for the run and logs nothing,
+      # each set held to its checked-in baseline in tests/e2e/conformance.
+      - run: pnpm conformance
       - name: Install Chromium for Playwright
         run: pnpm --filter @tabdock/e2e exec playwright install --with-deps chromium
       # The Pages site from its own lockfile (ADR 0029): its checks and tests, then the

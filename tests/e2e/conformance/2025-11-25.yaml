@@ -1,0 +1,36 @@
+# What the relay fails of the 2025-11-25 requirement set by design, for
+# @modelcontextprotocol/conformance 0.2.0-alpha.12 (ADR 0027). Every entry is
+# a scenario that calls the referee's own fixture tools, prompts, resources or
+# capabilities, named with its reason in reviewed.json beside this file; the
+# relay serves only its own tools. Scenarios that pass have no entry, and the
+# suite fails the run on an entry whose scenario now passes, so this list can
+# never outlive what it excuses. server-initialize, ping, tools-list,
+# server-sse-multiple-streams, server-session-lifecycle and
+# dns-rebinding-protection must pass with no entry; test/conformance-baselines.test.ts
+# holds this file to reviewed.json. One entry per line, `- <scenario>`, nothing else.
+server:
+  - logging-set-level
+  - completion-complete
+  - tools-call-simple-text
+  - tools-call-image
+  - tools-call-audio
+  - tools-call-embedded-resource
+  - tools-call-mixed-content
+  - tools-call-with-logging
+  - tools-call-error
+  - tools-call-with-progress
+  - tools-call-sampling
+  - tools-call-elicitation
+  - elicitation-sep1034-defaults
+  - elicitation-sep1330-enums
+  - resources-list
+  - resources-read-text
+  - resources-read-binary
+  - resources-templates-read
+  - resources-subscribe
+  - resources-unsubscribe
+  - prompts-list
+  - prompts-get-simple
+  - prompts-get-with-args
+  - prompts-get-embedded-resource
+  - prompts-get-with-image
