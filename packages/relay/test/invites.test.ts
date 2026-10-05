@@ -353,6 +353,34 @@ describe('S14: an invite closes at its expiry', () => {
     await mintOk(page);
     expect((await mint(page)).answer.refused?.reason).toBe('limit');
   });
+
+  it('closes on approval once its end has passed on the relay clock, its timer not yet run, granting nothing (ADR 0030)', async () => {
+    const { relay, page } = await sharedPage();
+    const { inviteId, link } = await mintOk(page, {
+      role: 'driver',
+      expiresAt: Date.now() + MIN_INVITE_REMAINING_MS + 1000,
+    });
+    const guest = await relay.claude(GUEST, GUEST_EMAIL);
+    const waiting = call(guest, 'pair_page', { invite: link });
+    const request = await page.next('attach_request');
+    // The operator allows after the invite's end, while its timer, a real
+    // minute away, has not run.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + MIN_INVITE_REMAINING_MS + 2000);
+    page.send({ t: 'attach_decision', requestId: request.requestId, allow: true, role: 'driver' });
+    expect((await waiting).text).toBe('pairing_expired: this invite is no longer live');
+    expect(relay.store.attachments.get(page.pageId, request.user.userId)).toBeUndefined();
+    expect(relay.store.invites.get(page.pageId, inviteId)).toBeUndefined();
+    expect((await latest(page, 'invites')).invites).toEqual([]);
+    const events = relay.relay.audit.events();
+    expect(
+      events.filter((event) => event.type === 'invite_closed' && event.inviteId === inviteId),
+    ).toEqual([expect.objectContaining({ reason: 'expired' })]);
+    expect(events.filter((event) => event.type === 'invite_redeemed')).toEqual([]);
+    expect(
+      events.filter((event) => event.type === 'attach' && event.userId === request.user.userId),
+    ).toEqual([]);
+  });
 });
 
 describe('S14: watch invites approve observers in advance', () => {

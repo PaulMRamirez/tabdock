@@ -361,10 +361,29 @@ export function polyfillTools(): RuntimeTool[] {
   ];
 }
 
+/**
+ * Timers that take a delay as Chromium 141 did: converted to a 32-bit
+ * integer, so 2^31 ms runs at once and 2^32 + 5000 ms after 5 s, and run at
+ * once when that is negative. Each delay asked for is kept in `delays`.
+ */
+function browserTimers(clock: ManualClock, delays: number[]): Timers {
+  return {
+    setTimeout: (callback, ms) => {
+      delays.push(ms);
+      return clock.timers.setTimeout(callback, Math.max(0, ms | 0));
+    },
+    clearTimeout: (handle) => {
+      clock.timers.clearTimeout(handle);
+    },
+  };
+}
+
 export interface Harness {
   readonly core: AdapterCore;
   readonly dock: Dock;
   readonly clock: ManualClock;
+  /** Every delay the core asked its timers for, kept only with browserTimers. */
+  readonly delays: number[];
   readonly context: TestContext;
   readonly storage: MapStorage;
   readonly sockets: FakeSocket[];
@@ -382,9 +401,12 @@ export function setup(
     storage?: MapStorage;
     /** Mark the runtime as the MCP-B polyfill 5.1, whose handlers never see the call's signal. */
     polyfill?: boolean;
+    /** Timers that run a delay past the maximum as Chromium does (browserTimers). */
+    browserTimers?: boolean;
   } = {},
 ): Harness {
   const clock = new ManualClock();
+  const delays: number[] = [];
   const context = new TestContext(options.tools ?? chromeTools(), options.polyfill);
   const storage = options.storage ?? new MapStorage();
   const sockets: FakeSocket[] = [];
@@ -408,7 +430,7 @@ export function setup(
       error: (message) => logs.push(`error ${message}`),
     },
     clock: clock.clock,
-    timers: clock.timers,
+    timers: options.browserTimers === true ? browserTimers(clock, delays) : clock.timers,
     random: () => 0.5,
     ...options.core,
   });
@@ -416,6 +438,7 @@ export function setup(
     core,
     dock: core.dock,
     clock,
+    delays,
     context,
     storage,
     sockets,

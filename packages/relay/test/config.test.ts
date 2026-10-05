@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage } from 'node:http';
-import { DEFAULT_CALL_DEADLINE_MS } from '@tabdock/protocol';
+import { DEFAULT_CALL_DEADLINE_MS, MAX_TIMER_MS } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
-import { isLoopbackHost, MAX_TIMER_MS, parseHostHeader, resolveConfig } from '../src/config.ts';
+import { isLoopbackHost, parseHostHeader, resolveConfig } from '../src/config.ts';
 import {
   createDevTokenAuth,
   createRelay,

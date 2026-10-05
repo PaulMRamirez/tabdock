@@ -27,6 +27,7 @@ import {
   DEFAULT_CALL_DEADLINE_MS,
   IDLE_TIMEOUT_MS,
   MAX_FRAME_BYTES,
+  MAX_TIMER_MS,
   MEMBER_RESERVED_SEATS,
   PAIR_WAIT_MS,
   PAIRING_TTL_MS,
@@ -152,8 +153,9 @@ export interface RelayRateLimits {
   /**
    * Requests one member may make to /mcp per window, every tool counted,
    * checked right after sign-in and before the access check, so refusals
-   * count too (ADR 0018), and every 2026-07-28 subscriptions/listen and
-   * every 2026-07-28 request the SDK refuses before a tool runs (A4.3).
+   * count too (ADR 0018), every 2026-07-28 subscriptions/listen (A4.3), and
+   * every other 2026-07-28 request once, as it arrives, tools/list and
+   * server/discover included (ADR 0030).
    */
   requestsPerUser: number;
   /** The same for an invitee, smaller since anyone can become one (ADR 0018). */
@@ -238,16 +240,19 @@ export interface RelayLimits {
   /**
    * Heap the /mcp requests that may wait on a page (call_page_tool, and
    * pair_page while the operator decides) may hold together, each charged
-   * an upper bound on what its body and its parsed copy hold
-   * (request-heap.ts) until it is answered; past it a call is refused
-   * page_busy and a pairing rate_limited (S9, ADR 0018's notes). At least
+   * what its body and its parsed copy are measured to hold (request-heap.ts,
+   * set above what every shape in call-shapes.ts was measured to hold on
+   * both legs) until it is answered; past it a call is refused page_busy and
+   * a pairing rate_limited (S9, ADR 0018's notes). Invitees' requests
+   * together may hold a quarter of it, or MIN_REQUEST_BYTES where a quarter
+   * is less, and are refused the same way past that (ADR 0030). At least
    * MIN_REQUEST_BYTES.
    */
   requestBytes: number;
   /**
    * The same for one user's requests, past which they are refused
    * rate_limited, so one account cannot spend the whole of requestBytes.
-   * At least MIN_REQUEST_BYTES.
+   * At least MIN_REQUEST_BYTES and at most requestBytes (ADR 0030).
    */
   requestBytesPerUser: number;
 }
@@ -396,12 +401,6 @@ export const SSE_KEEP_ALIVE_MS = 15_000;
 export const ARGUMENT_CHECK_MS = 50;
 /** Long enough to sign in and scan a few codes, short enough that a forgotten phone is soon signed out. */
 export const PAIR_SESSION_MS = 15 * 60_000;
-/**
- * The longest delay setTimeout honours. Node runs a longer one after 1 ms
- * instead, which would expire every attachment at once.
- */
-export const MAX_TIMER_MS = 2_147_483_647;
-
 export const DEFAULT_TIMINGS: RelayTimings = {
   pairingTtlMs: PAIRING_TTL_MS,
   attachRequestTtlMs: ATTACH_REQUEST_TTL_MS,
@@ -459,10 +458,11 @@ export const DEFAULT_LIMITS: RelayLimits = {
   // page slot filled up to it leaves the relay well inside that heap
   // (tool-heap.test.ts).
   toolBytes: 64 * 1024 * 1024,
-  // Sized with the same heap (ADR 0018's notes): charged an upper bound on
-  // what a waiting request holds, the whole of it filled beside a full tool
-  // budget leaves the image's relay serving (call-heap.test.ts), and one
-  // member's share holds seven calls of 1 MB string arguments.
+  // Sized with the same heap (ADR 0018's notes): charged what a waiting
+  // request is measured to hold, set above every shape measured on both legs
+  // (ADR 0030), the whole of it filled beside a full tool budget leaves the
+  // image's relay serving (call-heap.test.ts), and one member's share holds
+  // seven calls of 1 MB string arguments.
   requestBytes: 64 * 1024 * 1024,
   requestBytesPerUser: 24 * 1024 * 1024,
 };
@@ -893,6 +893,14 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
         `${name} (${setting}) must be at least ${String(MIN_REQUEST_BYTES)}, so one call of the largest arguments fits (ADR 0018)`,
       );
     }
+  }
+  // relay.ts answers 413 unparsed only past the share, so a share above the
+  // total would let a body charged between the two be parsed, only for the
+  // hub to refuse it page_busy.
+  if (limits.requestBytesPerUser > limits.requestBytes) {
+    throw new Error(
+      "requestBytesPerUser (TABDOCK_MAX_REQUEST_BYTES_PER_USER) must be at most requestBytes (TABDOCK_MAX_REQUEST_BYTES): one user's share of what waiting requests hold cannot pass the relay's total, so lower the share with the total (ADR 0030)",
+    );
   }
   // Only true turns invites on, so a stray value from JavaScript leaves them off.
   const invites = options.invites === true;

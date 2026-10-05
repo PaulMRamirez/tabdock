@@ -43,6 +43,14 @@ export const PAIR_WAIT_MS = 50_000;
 /** Default time a page gets to answer one call. */
 export const DEFAULT_CALL_DEADLINE_MS = 45_000;
 
+/**
+ * The longest delay setTimeout honours, in browsers and Node alike. A longer
+ * one fires early: Chromium ran a 2^31 ms timer at once and wrapped 2^32 +
+ * 5000 ms to 5 s, and Node runs it after 1 ms. So the relay refuses timings
+ * past it and the adapter caps a relay's deadline under it (ADR 0030).
+ */
+export const MAX_TIMER_MS = 2_147_483_647;
+
 /** The adapter re-reads the tool list this often in case toolchange never fires. */
 export const TOOL_POLL_MS = 2000;
 

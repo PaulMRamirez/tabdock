@@ -64,6 +64,17 @@ export const CALL_SHAPES = {
   }),
   /** Keys no other object shares in the request's _meta, which the SDK's schema copies. */
   metaKeys: (): CallShape => ({ args: '{"text":"x"}', meta: uniqueKeys(170_000), spaces: 0 }),
+  /**
+   * Keys of digits alone in the request's _meta, after one as high as an
+   * index goes, so V8 keeps them all as a dictionary of elements: 1.12 of
+   * its charge on the 2026-07-28 leg before the surcharge for such keys
+   * (request-heap.ts, ADR 0030).
+   */
+  metaIndexKeys: (): CallShape => ({
+    args: '{"text":"x"}',
+    meta: `"4294967294":0,${Array.from({ length: 190_000 }, (_, n) => `"${String(n)}":0`).join(',')}`,
+    spaces: 0,
+  }),
   /** Next to nothing: what every waiting call holds besides its body. */
   tiny: (): CallShape => ({ args: '{"text":"x"}', meta: null, spaces: 0 }),
   /** Spaces to the cap, which only the body holds. */

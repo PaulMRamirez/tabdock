@@ -33,6 +33,7 @@ import {
   MAX_INVITE_USES,
   MAX_LIVE_INVITES_PER_PAGE,
   MAX_RESULT_CHARS,
+  MAX_TIMER_MS,
   type PageErrorCode,
   type PageFrameInput,
   PageFrameSchema,
@@ -505,6 +506,15 @@ export const MAX_WAITING_WRITES = 32;
  * running call the same grace.
  */
 export const UNWATCHED_HANDLER_GRACE_MS = 2000;
+
+/**
+ * The longest deadline the page takes from a relay. The schema takes any
+ * positive safe integer, since refusing the frame would close the link over
+ * one odd deadline; but a timer past MAX_TIMER_MS fires at once, ending the
+ * call early, and holdUnwatched adds its grace on top. Tabdock's own relay
+ * never sends more; this is for one the adapter does not trust (ADR 0030).
+ */
+export const MAX_DEADLINE_MS = MAX_TIMER_MS - UNWATCHED_HANDLER_GRACE_MS;
 
 /** Results are cut this far under the cap so the truncation marker fits under it too. */
 const MARKER_ROOM = 100;
@@ -1823,6 +1833,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       return;
     }
     const now = clock();
+    const deadlineMs = Math.min(frame.deadlineMs, MAX_DEADLINE_MS);
     const { userId, displayName, client } = frame.caller;
     const entry: ActivityEntry = Object.freeze({
       callId: frame.callId,
@@ -1837,7 +1848,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     const call: CallRecord = {
       frame,
       seq: nextSeq++,
-      deadlineAt: now + frame.deadlineMs,
+      deadlineAt: now + deadlineMs,
       controller: new AbortController(),
       entry,
       stage: 'admitting',
@@ -1850,7 +1861,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     setState({ activity: [entry, ...state.activity].slice(0, ACTIVITY_LIMIT) });
     call.deadline = timers.setTimeout(() => {
       onDeadline(call);
-    }, frame.deadlineMs);
+    }, deadlineMs);
     if (state.paused) {
       finish(call, PAUSED);
       return;

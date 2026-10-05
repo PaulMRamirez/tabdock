@@ -28,7 +28,9 @@
 // path or query, so no secret a URL carries reaches a log, and a line a
 // signed-in client can cause at will on /mcp is written once per kind a window,
 // the rest counted (repeated-lines.ts, A4.3), as is each /page upgrade refused,
-// within its address's budget (hub.ts). The client address
+// within its address's budget (hub.ts). Every 2026-07-28 request spends the
+// caller's request budget once, and an /mcp response its client leaves unread
+// is cut off once it stops moving (response-stalls.ts, ADR 0030). The client address
 // that /page and /pair count by, and that /mcp's refusal line names, comes
 // from one place (client-address.ts), which answers 400 on a route that counts
 // by address when a host edge names no client (ADR 0018). With an audit
@@ -48,8 +50,10 @@ import { type NodeIncomingMessageLike, toNodeHandler } from '@modelcontextprotoc
 import {
   type AuthInfo,
   createMcpHandler,
+  isJSONRPCRequest,
   isJsonContentType,
   isLegacyRequest,
+  isSpecType,
   type McpHandlerRequestOptions,
   readRequestBody,
 } from '@modelcontextprotocol/server';
@@ -96,6 +100,7 @@ import {
 import { createPairFlow, PAIR_ROUTES, type PairFlow } from './pair.ts';
 import { createRepeatedLog, errorKind } from './repeated-lines.ts';
 import { requestHeapBytes } from './request-heap.ts';
+import { ResponseStalls } from './response-stalls.ts';
 import { type InviteeSessionOptions, McpSessions } from './sessions.ts';
 import { createSignInGate } from './sign-in-gate.ts';
 import { Spike, type SpikeControl } from './spike.ts';
@@ -244,6 +249,27 @@ async function readModernBody(request: Request): Promise<ModernBody> {
     };
   }
 }
+
+/**
+ * A 2026-07-28 message that spends a request of its caller's budget as it
+ * arrives, before the SDK sees it (S9, ADR 0030): one JSON-RPC request,
+ * tools/list, server/discover, ping and initialize included, but for two
+ * that spend elsewhere: a subscriptions/listen, in listen-streams.ts, and a
+ * tools/call that the SDK's own tools/call schema takes, which goes on to the
+ * tool it names. A tools/call the SDK would refuse before any tool runs,
+ * one with no name for instance, spends here like any other request. A
+ * notification carries no request, and a batch, a response or anything else
+ * that is not one request spends only if the SDK refuses it (refusedBySdk).
+ */
+function spendsOnArrival(message: unknown): { id: string | number } | null {
+  if (!isJSONRPCRequest(message)) return null;
+  if (message.method === 'subscriptions/listen') return null;
+  if (isSpecType.CallToolRequest(message)) return null;
+  return { id: message.id };
+}
+
+/** The SDK's server-error code, for a request the relay will not serve now. */
+const BUDGET_CODE = -32000;
 
 /** A subscriptions/listen request's JSON-RPC id, or null for any other message. */
 function listenOf(message: unknown): { id: unknown } | null {
@@ -443,6 +469,8 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   const budget = createRequestBudget(config);
   // Lines a signed-in client can cause at will on /mcp: one per kind a window, the rest counted (A4.3).
   const mcpLines = createRepeatedLog(log, config.rateLimits.windowMs);
+  // Responses a client leaves unread are cut off once they stop moving (ADR 0030).
+  const stalls = new ResponseStalls({ lines: mcpLines });
   // What each /mcp request's body holds on the heap, measured before either
   // leg reads it, so a call or pairing that waits on a page is charged it
   // (request-heap.ts, ADR 0018's notes). Keyed by the request's own auth
@@ -503,9 +531,15 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
    * handed the parsed value, so no copy of a body stays queued in the
    * request for as long as a stream it opened lives. A listen over its own
    * cap is refused before it costs anything, and every other listen passes
-   * the relay's bounds (listen-streams.ts). A request the SDK refuses reached
-   * no tool, which would have spent the caller's budget itself, so it spends
-   * one here: refusals cost like calls, and a flood of them runs dry.
+   * the relay's bounds (listen-streams.ts). Every other request spends one
+   * request of its caller's budget as it arrives, unless it is a tools/call
+   * bound for a tool that spends itself (spendsOnArrival): each builds a
+   * server of its own (createMcpFactory), so 50 tools/list on a budget of 3
+   * all answered in M4. Past the budget it is answered 429 in the budget's
+   * own words, with no audit record, since it asks nothing of a page, as a
+   * refused listen is. A request that spent nothing so far and that the SDK
+   * refuses reached no tool either, so it spends one then: refusals cost
+   * like calls, and a flood of them runs dry. Each request counts once.
    */
   const modern = async (
     request: Request,
@@ -517,6 +551,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     const caller = { userId: extra.data.userId, kind: extra.data.kind };
     const body = await readModernBody(request);
     let response: Response;
+    let spent = false;
     if (body.kind === 'unread') {
       response = await mcp.fetch(request, options);
     } else if (body.kind === 'answered') {
@@ -524,6 +559,16 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     } else {
       const listen = listenOf(body.message);
       const parsed = { ...options, parsedBody: body.message };
+      const arrival = listen === null ? spendsOnArrival(body.message) : null;
+      if (arrival !== null) {
+        spent = true;
+        if (!budget.spend(caller.userId, caller.kind)) {
+          mcpLines.write('warn', 'mcp request refused: past the request budget', {
+            userId: caller.userId,
+          });
+          return jsonRpcError(429, BUDGET_CODE, budget.refusal(caller.kind), arrival.id);
+        }
+      }
       if (listen === null) {
         response = await mcp.fetch(request, parsed);
       } else if (body.bytes > MAX_LISTEN_BODY_BYTES) {
@@ -532,7 +577,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         return listens.open(caller, listen.id, request.signal, () => mcp.fetch(request, parsed));
       }
     }
-    if (refusedBySdk(response)) budget.spend(caller.userId, caller.kind);
+    if (!spent && refusedBySdk(response)) budget.spend(caller.userId, caller.kind);
     return response;
   };
   const legs = {
@@ -708,6 +753,8 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     // under exactOptionalPropertyTypes (method is string | undefined there).
     const withAuth = request as IncomingMessage & { auth?: AuthInfo };
     withAuth.auth = authInfo;
+    // Until it finishes or closes: one the client leaves unread is cut off (ADR 0030).
+    stalls.track(response, outcome.user.userId);
     await mcpNode(withAuth as NodeIncomingMessageLike, response);
   }
 
@@ -879,6 +926,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     await closeAudit(store.audit);
     await mcp.close();
     await sessions.closeAll();
+    stalls.close();
     mcpLines.close();
     auth.stop?.();
     throw error;
@@ -932,6 +980,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         });
         await mcp.close();
         await sessions.closeAll();
+        stalls.close();
         auth.stop?.();
         // The counts of repeated refusals still held go out before the last line.
         refusals.close();
