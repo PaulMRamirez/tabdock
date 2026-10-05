@@ -7,6 +7,15 @@
 // since a readable file may already be copied and rewriting a bad one would
 // hide tampering. Every refusal names the path and the fix, never the contents.
 //
+// ADR 0028 adds three things. A token directory inside any repository's work
+// tree is refused, in a checkout and in the package alike, since the token
+// could be committed from there. On POSIX systems each start keeps
+// `claude-headers` beside the token, a fixed script Claude Code runs to read
+// the token at each connection, so Claude Code's configuration never holds
+// it; the script is checked as the token is and holds no token. And
+// `--new-token` draws a token without reading the old file, and puts it in
+// place in one rename when its caller says so.
+//
 // The environment, platform, uid, home directory and stat calls are injected,
 // so tests can play another platform or account without touching the real
 // home; the file system itself is always the real one.
@@ -15,6 +24,7 @@ import { randomBytes } from 'node:crypto';
 import {
   closeSync,
   constants,
+  fchmodSync,
   fstatSync,
   fsyncSync,
   linkSync,
@@ -23,12 +33,15 @@ import {
   openSync,
   readSync,
   realpathSync,
+  renameSync,
   type Stats,
   unlinkSync,
   writeSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { quotePosix } from './shell-quote.ts';
+import { PACKAGED } from './packaged.ts';
 
 export const OWNER_TOKEN_FILE = 'owner-token';
 const TOKEN_PREFIX = 'tabdock_';
@@ -39,11 +52,18 @@ const MAX_FILE_BYTES = 64;
 const TOKEN_FILE_PATTERN = /^tabdock_[A-Za-z0-9_-]{43}\n?$/;
 const TOKEN_LENGTH = TOKEN_PREFIX.length + 43;
 
+/** The script Claude Code runs to read the token, kept beside it on POSIX systems (ADR 0028). */
+export const HEADERS_HELPER_FILE = 'claude-headers';
+
 /** The one user local mode knows: whoever holds the owner token. */
 export const LOCAL_USER = { userId: 'you', displayName: 'You' } as const;
 
-/** The checkout this code runs from; the token must never land inside it. */
-const CHECKOUT = resolve(import.meta.dirname, '../../..');
+/**
+ * The checkout this code runs from; the token must never land inside it. The
+ * package has none: from the bundle this path would name a directory under
+ * node_modules, so there the work tree rule stands alone (ADR 0028).
+ */
+const CHECKOUT: string | null = PACKAGED ? null : resolve(import.meta.dirname, '../../..');
 
 /** What the checks read from a stat call; node's Stats has all of it. */
 export type FileFacts = Pick<
@@ -57,10 +77,18 @@ export interface LocalTokenSystem {
   uid: number | undefined;
   /** os.homedir(), used only when the environment names no home of its own. */
   homedir: string;
-  /** The checkout the relay runs from, compared by realpath. */
-  checkout: string;
+  /** The checkout the relay runs from, compared by realpath; null in the package, which has none. */
+  checkout: string | null;
   lstat(path: string): FileFacts;
   fstat(fd: number): FileFacts;
+  /**
+   * Set only for `--new-token` (ADR 0028): loadOwnerToken then never reads the
+   * old file but draws a new token, and hands this a function that renames it
+   * over owner-token. The caller runs that function only once its start holds
+   * the audit directory's lock, so a start beside a running relay that shares
+   * the directory refuses before anything changes.
+   */
+  replaceToken?: ((commit: () => void) => void) | undefined;
 }
 
 /** Where the variables come from: process.env, or a test's own object. */
@@ -168,6 +196,11 @@ export function ownerTokenPath(env: TokenEnv, overrides: Partial<LocalTokenSyste
   return join(ownerTokenDirectory(env, overrides), OWNER_TOKEN_FILE);
 }
 
+/** The helper script beside a token file, whose path the banner prints. */
+export function headersHelperPath(tokenPath: string): string {
+  return join(dirname(tokenPath), HEADERS_HELPER_FILE);
+}
+
 /**
  * The real path of `path`, or of its nearest existing ancestor with the rest
  * appended, so a directory can be placed before it is made: nothing is
@@ -202,17 +235,60 @@ function isWithin(child: string, parent: string, platform: NodeJS.Platform): boo
 }
 
 /**
- * Where the directory may lie: never inside the checkout, where the token
- * could be committed, and on Windows only under the profile, whose default
- * access list admits only the user, SYSTEM and Administrators, since Node
- * reports no owner or mode there to check instead.
+ * The work tree of a repository that `real` lies in: the nearest of it and
+ * its ancestors, up to the file system's root, that holds a `.git` entry of
+ * any kind, a directory or a file (a linked worktree's or a submodule's), or
+ * null when none does. A `.git` the relay cannot even look for is refused
+ * rather than guessed absent.
+ */
+function workTreeAround(real: string, system: LocalTokenSystem): string | null {
+  let current = real;
+  for (;;) {
+    const entry = join(current, '.git');
+    try {
+      system.lstat(entry);
+      return current;
+    } catch (error) {
+      const code = errorCode(error);
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+        throw new OwnerTokenError(
+          `local mode cannot tell whether ${current} is a repository's work tree (${code ?? 'error'} on ${entry}), so it will not keep its owner token below it; set TABDOCK_HOME to an absolute path outside any repository (ADR 0028)`,
+        );
+      }
+    }
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+/**
+ * Where the directory may lie: never inside the checkout or any repository's
+ * work tree, where the token could be committed, and on Windows only under
+ * the profile, whose default access list admits only the user, SYSTEM and
+ * Administrators, since Node reports no owner or mode there to check instead.
+ * The checkout comparison still guards a checkout with no `.git`, such as an
+ * unpacked source archive; the work tree rule covers every repository the
+ * token could be committed from, whoever started the relay from wherever.
  */
 function checkPlace(dir: string, env: TokenEnv, system: LocalTokenSystem): void {
   const real = realpathNearest(dir);
-  const checkout = realpathNearest(system.checkout);
-  if (isWithin(real, checkout, system.platform)) {
+  if (system.checkout !== null) {
+    const checkout = realpathNearest(system.checkout);
+    if (isWithin(real, checkout, system.platform)) {
+      throw new OwnerTokenError(
+        `local mode refuses ${dir} for its owner token: it lies inside the checkout ${checkout}, where the token could be committed; set TABDOCK_HOME to an absolute path outside it, or unset it (ADR 0022)`,
+      );
+    }
+  }
+  const tree = workTreeAround(real, system);
+  if (tree !== null) {
+    const fix =
+      setting(env, 'TABDOCK_HOME') === undefined
+        ? 'set TABDOCK_HOME to an absolute path outside every repository'
+        : 'set TABDOCK_HOME to an absolute path outside every repository, or unset it';
     throw new OwnerTokenError(
-      `local mode refuses ${dir} for its owner token: it lies inside the checkout ${checkout}, where the token could be committed; set TABDOCK_HOME to an absolute path outside it, or unset it (ADR 0022)`,
+      `local mode refuses ${dir} for its owner token: it lies inside the git work tree ${tree}, where the token could be committed; ${fix} (ADR 0028)`,
     );
   }
   if (system.platform !== 'win32') return;
@@ -352,8 +428,8 @@ function readTokenFile(file: string, system: LocalTokenSystem): string | null {
   }
 }
 
-function writeAll(fd: number, text: string): void {
-  const bytes = Buffer.from(text, 'latin1');
+function writeAll(fd: number, text: string, encoding: 'latin1' | 'utf8' = 'latin1'): void {
+  const bytes = Buffer.from(text, encoding);
   let written = 0;
   while (written < bytes.length) {
     written += writeSync(fd, bytes, written, bytes.length - written);
@@ -375,6 +451,59 @@ function syncDirectory(dir: string): void {
   }
 }
 
+function freshToken(): string {
+  return `${TOKEN_PREFIX}${randomBytes(TOKEN_BYTES).toString('base64url')}`;
+}
+
+/**
+ * A synced temporary file of its own in `dir` (O_CREAT | O_EXCL, never
+ * through a link) holding `text` with exactly `mode`, whatever the umask;
+ * the caller links or renames it into place and removes the name after.
+ */
+function writeTemporary(
+  dir: string,
+  name: string,
+  text: string,
+  mode: number,
+  system: LocalTokenSystem,
+  encoding: 'latin1' | 'utf8' = 'latin1',
+): string {
+  const temp = join(dir, `.${name}.${randomBytes(8).toString('hex')}.tmp`);
+  const windows = system.platform === 'win32';
+  const flags =
+    constants.O_CREAT |
+    constants.O_EXCL |
+    constants.O_WRONLY |
+    (windows ? 0 : constants.O_NOFOLLOW);
+  let fd: number;
+  try {
+    fd = openSync(temp, flags, mode);
+  } catch (error) {
+    throw new OwnerTokenError(
+      `local mode cannot write its ${name} in ${dir} (${errorCode(error) ?? 'error'}); set TABDOCK_HOME to an absolute path you can write, outside the checkout (ADR 0022)`,
+    );
+  }
+  try {
+    if (!windows) fchmodSync(fd, mode);
+    writeAll(fd, text, encoding);
+    fsyncSync(fd);
+  } catch (error) {
+    closeSync(fd);
+    removeQuietly(temp);
+    throw error;
+  }
+  closeSync(fd);
+  return temp;
+}
+
+function removeQuietly(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch {
+    // Already gone; nothing to tidy.
+  }
+}
+
 /**
  * Draws a token into a temporary 0600 file of its own (O_CREAT | O_EXCL),
  * syncs it, and hard-links it to `owner-token`, which fails if that name
@@ -385,27 +514,8 @@ function syncDirectory(dir: string): void {
 export function drawOwnerToken(dir: string, overrides: Partial<LocalTokenSystem> = {}): boolean {
   const system = systemOf(overrides);
   const file = join(dir, OWNER_TOKEN_FILE);
-  const temp = join(dir, `.${OWNER_TOKEN_FILE}.${randomBytes(8).toString('hex')}.tmp`);
-  const flags =
-    constants.O_CREAT |
-    constants.O_EXCL |
-    constants.O_WRONLY |
-    (system.platform === 'win32' ? 0 : constants.O_NOFOLLOW);
-  let fd: number;
+  const temp = writeTemporary(dir, OWNER_TOKEN_FILE, `${freshToken()}\n`, 0o600, system);
   try {
-    fd = openSync(temp, flags, 0o600);
-  } catch (error) {
-    throw new OwnerTokenError(
-      `local mode cannot write its owner token in ${dir} (${errorCode(error) ?? 'error'}); set TABDOCK_HOME to an absolute path you can write, outside the checkout (ADR 0022)`,
-    );
-  }
-  try {
-    try {
-      writeAll(fd, `${TOKEN_PREFIX}${randomBytes(TOKEN_BYTES).toString('base64url')}\n`);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
     try {
       linkSync(temp, file);
     } catch (error) {
@@ -417,11 +527,186 @@ export function drawOwnerToken(dir: string, overrides: Partial<LocalTokenSystem>
     if (system.platform !== 'win32') syncDirectory(dir);
     return true;
   } finally {
-    try {
-      unlinkSync(temp);
-    } catch {
-      // Already gone; nothing to tidy.
+    removeQuietly(temp);
+  }
+}
+
+/**
+ * Puts `token` in place as owner-token in one rename, for `--new-token`. A
+ * rename, not a link, since a link cannot replace a name: a reader sees the
+ * old token or the new one, never part of either. The directory is checked
+ * again first, since time has passed since the start checked it, and the file
+ * is read back through the usual checks afterwards.
+ */
+function replaceOwnerToken(dir: string, token: string, system: LocalTokenSystem): void {
+  checkDirectory(dir, system);
+  const file = join(dir, OWNER_TOKEN_FILE);
+  const temp = writeTemporary(dir, OWNER_TOKEN_FILE, `${token}\n`, 0o600, system);
+  try {
+    renameSync(temp, file);
+  } catch (error) {
+    removeQuietly(temp);
+    throw new OwnerTokenError(
+      `local mode cannot put a new owner token in place at ${file} (${errorCode(error) ?? 'error'}); delete it and start again (ADR 0028)`,
+    );
+  }
+  if (system.platform !== 'win32') syncDirectory(dir);
+  if (readTokenFile(file, system) !== token) {
+    throw new OwnerTokenError(
+      `local mode put a new owner token at ${file} but read back another; something else writes there: stop it, delete the file and start again (ADR 0028)`,
+    );
+  }
+}
+
+/**
+ * The helper's text for a token at `tokenPath`: a POSIX shell script that
+ * reads the token's first line by its absolute path, checks its shape so
+ * nothing but a token can reach the JSON, and prints Claude Code's header
+ * object. It uses only shell builtins, so no PATH can change what it runs, and
+ * it holds no token. A start that finds a file holding exactly an earlier
+ * release's text replaces it, so EARLIER_HELPER_TEXTS keeps each text this
+ * function returned in a published release, oldest first.
+ */
+export function headersHelperText(tokenPath: string): string {
+  const quotedPath = quotePosix(tokenPath);
+  return `#!/bin/sh
+# Claude Code's headersHelper for the local Tabdock relay (ADR 0028): it reads
+# the owner token from the file named below at each connection and prints the
+# Authorization header as JSON, so Claude Code's settings never hold the token,
+# and neither does this file. The relay writes it and refuses a changed copy
+# at its next start; to change anything, delete it and start the relay again.
+token=
+IFS= read -r token < ${quotedPath} || [ -n "$token" ] || {
+  echo 'tabdock: cannot read the owner token; start the Tabdock relay to make one' >&2
+  exit 1
+}
+case $token in
+  tabdock_*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-]*) ;;
+  tabdock_???????????????????????????????????????????)
+    printf '{"Authorization":"Bearer %s"}\\n' "$token"
+    exit 0
+    ;;
+esac
+echo 'tabdock: the owner token file is not well formed; start the Tabdock relay with --new-token' >&2
+exit 1
+`;
+}
+
+/** Texts of the helper in earlier published releases, for a token path; none yet. */
+export const EARLIER_HELPER_TEXTS: readonly ((tokenPath: string) => string)[] = [];
+
+/** What the start found beside the token, after ensureHeadersHelper. */
+export type HelperOutcome = 'kept' | 'written' | 'replaced';
+
+/**
+ * Makes sure `claude-headers` beside the token is this release's helper, as
+ * every local start on a POSIX system does (ADR 0028). Missing, it is written
+ * as the token is, a synced temporary file linked into place, mode 0700. Found,
+ * it must be a regular file, opened without following a link, owned by this
+ * account, granting nothing to group or others, executable by its owner, and
+ * holding exactly this release's text; one holding an earlier release's exact
+ * text is replaced in one rename, and anything else is refused, never
+ * repaired, naming the path and the fix.
+ */
+export function ensureHeadersHelper(
+  tokenPath: string,
+  overrides: Partial<LocalTokenSystem> = {},
+  earlier: readonly ((tokenPath: string) => string)[] = EARLIER_HELPER_TEXTS,
+): HelperOutcome {
+  const system = systemOf(overrides);
+  const dir = dirname(tokenPath);
+  const file = join(dir, HEADERS_HELPER_FILE);
+  const text = headersHelperText(tokenPath);
+  const older = earlier.map((make) => make(tokenPath)).filter((old) => old !== text);
+  // Two rounds: a racing start may link its copy between this one's look and its link.
+  for (let round = 0; round < 2; round += 1) {
+    const found = readHelper(file, system, [text, ...older]);
+    if (found === text) return 'kept';
+    if (found !== null) {
+      const temp = writeTemporary(dir, HEADERS_HELPER_FILE, text, 0o700, system, 'utf8');
+      try {
+        renameSync(temp, file);
+      } catch (error) {
+        removeQuietly(temp);
+        throw new OwnerTokenError(
+          `local mode cannot replace ${file}, which an earlier release wrote (${errorCode(error) ?? 'error'}); delete it and start again (ADR 0028)`,
+        );
+      }
+      syncDirectory(dir);
+      return 'replaced';
     }
+    const temp = writeTemporary(dir, HEADERS_HELPER_FILE, text, 0o700, system, 'utf8');
+    try {
+      linkSync(temp, file);
+      syncDirectory(dir);
+      return 'written';
+    } catch (error) {
+      if (errorCode(error) !== 'EEXIST') {
+        throw new OwnerTokenError(
+          `local mode cannot put ${file} in place (${errorCode(error) ?? 'error'}); set TABDOCK_HOME to a directory on a local disk (ADR 0028)`,
+        );
+      }
+    } finally {
+      removeQuietly(temp);
+    }
+  }
+  throw new OwnerTokenError(
+    `local mode could not keep ${file} in place: something keeps changing it; stop whatever does and start again (ADR 0028)`,
+  );
+}
+
+/**
+ * The helper's text when it is one of `allowed`, or null when there is no
+ * file; anything else is refused. Read through the descriptor it was checked
+ * through, never following a link.
+ */
+function readHelper(
+  file: string,
+  system: LocalTokenSystem,
+  allowed: readonly string[],
+): string | null {
+  const refuse = (why: string, fix = 'delete it and start again'): OwnerTokenError =>
+    new OwnerTokenError(`local mode refuses ${file}: ${why}; ${fix} (ADR 0028)`);
+  let fd: number;
+  try {
+    fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (error) {
+    const code = errorCode(error);
+    if (code === 'ENOENT') return null;
+    if (code === 'ELOOP' || code === 'EMLINK') {
+      throw refuse('it is a symbolic link, not the header helper itself');
+    }
+    throw refuse(`it cannot be opened (${code ?? 'error'})`);
+  }
+  try {
+    const facts = system.fstat(fd);
+    if (!facts.isFile()) throw refuse('it is not a regular file');
+    if (facts.uid !== system.uid) throw refuse('another account owns it, so it cannot be trusted');
+    if ((facts.mode & 0o077) !== 0) {
+      throw refuse(`other accounts may read or change it (mode ${octal(facts.mode)})`);
+    }
+    if ((facts.mode & 0o100) === 0) {
+      throw refuse(
+        `Claude Code could not run it (mode ${octal(facts.mode)})`,
+        'run chmod 700 on it, or delete it and start again',
+      );
+    }
+    const limit = Math.max(...allowed.map((text) => Buffer.byteLength(text, 'utf8')));
+    if (facts.size > limit) throw refuse('it is not the header helper this release writes');
+    const buffer = Buffer.alloc(limit + 1);
+    let length = 0;
+    for (;;) {
+      const read = readSync(fd, buffer, length, buffer.length - length, null);
+      if (read === 0) break;
+      length += read;
+      if (length === buffer.length) break;
+    }
+    const text = buffer.toString('utf8', 0, length);
+    const match = allowed.find((candidate) => candidate === text);
+    if (match === undefined) throw refuse('it is not the header helper this release writes');
+    return match;
+  } finally {
+    closeSync(fd);
   }
 }
 
@@ -450,9 +735,12 @@ function preparedDirectory(
 }
 
 /**
- * Local mode's start: the owner token, drawn on the first start. Throws an
- * OwnerTokenError naming the path and the fix when anything is not as it
- * should be.
+ * Local mode's start: the owner token, drawn on the first start, with the
+ * header helper beside it on POSIX systems. With `replaceToken` set
+ * (`--new-token`) the old file is never read, so one refused for its mode or
+ * contents can be replaced this way; the new token goes into place only when
+ * the caller runs the commit it is handed. Throws an OwnerTokenError naming
+ * the path and the fix when anything is not as it should be.
  */
 export function loadOwnerToken(
   env: TokenEnv,
@@ -462,6 +750,31 @@ export function loadOwnerToken(
   const dir = preparedDirectory(env, system, true);
   if (dir === null) throw new OwnerTokenError('local mode could not prepare its token directory');
   const file = join(dir, OWNER_TOKEN_FILE);
+  const owner = system.replaceToken
+    ? newOwnerToken(dir, file, system, system.replaceToken)
+    : existingOrDrawn(dir, file, system);
+  // Windows gets no helper until a Windows run shows which shell runs one there (ADR 0028).
+  if (system.platform !== 'win32') ensureHeadersHelper(file, system);
+  return owner;
+}
+
+function newOwnerToken(
+  dir: string,
+  file: string,
+  system: LocalTokenSystem,
+  replaceToken: (commit: () => void) => void,
+): OwnerToken {
+  const token = freshToken();
+  let committed = false;
+  replaceToken(() => {
+    if (committed) return;
+    committed = true;
+    replaceOwnerToken(dir, token, system);
+  });
+  return { path: file, token, created: true };
+}
+
+function existingOrDrawn(dir: string, file: string, system: LocalTokenSystem): OwnerToken {
   // A file deleted between the failed link and the read, by hand or by a
   // racing start's loser, sends the loop round again; three rounds is plenty.
   for (let round = 0; round < 3; round += 1) {
@@ -480,7 +793,8 @@ export function loadOwnerToken(
 /**
  * The owner token when there is one, for tools that talk to a running local
  * relay, such as pnpm spike:latency; null when none exists yet. It never
- * creates the directory or the file, and refuses as loadOwnerToken does.
+ * creates the directory, the file or the helper, and refuses as
+ * loadOwnerToken does.
  */
 export function readOwnerToken(
   env: TokenEnv,

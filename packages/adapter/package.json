@@ -1,17 +1,28 @@
 {
   "name": "@tabdock/adapter",
   "version": "0.0.0",
-  "private": true,
   "description": "Tabdock page adapter: links a page's WebMCP tools to a Tabdock relay.",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PaulMRamirez/tabdock.git",
+    "directory": "packages/adapter"
+  },
+  "homepage": "https://github.com/PaulMRamirez/tabdock#readme",
+  "bugs": "https://github.com/PaulMRamirez/tabdock/issues",
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
     "./core": "./src/core.ts",
     "./qr": "./src/qr.ts"
   },
+  "files": [
+    "dist",
+    "NOTICE"
+  ],
   "scripts": {
-    "build": "node scripts/build.ts",
+    "build": "pnpm --filter @tabdock/protocol build && tsc -p tsconfig.build.json && node scripts/build.ts",
+    "build:script-tag": "node scripts/build.ts",
     "typecheck": "tsc -p tsconfig.json && tsc -p scripts/tsconfig.json"
   },
   "dependencies": {
@@ -21,5 +32,15 @@
   },
   "devDependencies": {
     "esbuild": "0.28.2"
+  },
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    },
+    "types": "./dist/index.d.ts"
   }
 }

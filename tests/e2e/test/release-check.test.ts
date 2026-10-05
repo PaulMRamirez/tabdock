@@ -1,0 +1,331 @@
+// The release check (ADR 0028, scripts/release-check.ts) on tarballs made
+// here: three well-formed ones pass at 0.0.0, and each rule refuses the one
+// thing it is there to catch, so a pack that slips a test, a .env, a token, a
+// source file, an install script, a second bin or a stray dependency into a
+// package never reaches the stage job. The real tarballs are checked in CI by
+// the pack-install job.
+
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import {
+  checkRelease,
+  type PackageName,
+  REPOSITORY_URL,
+  ROOT,
+  tarballName,
+} from '../../../scripts/release-check.ts';
+
+type Json = Record<string, unknown>;
+
+interface Fixture {
+  files: Record<string, string | Buffer>;
+  manifest: Json;
+}
+
+const scratches: string[] = [];
+afterEach(() => {
+  for (const dir of scratches.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+const LICENSE = readFileSync(join(ROOT, 'LICENSE'));
+const NOTICE = readFileSync(join(ROOT, 'NOTICE'));
+
+function common(name: PackageName, version: string): Json {
+  return {
+    name: `@tabdock/${name}`,
+    version,
+    license: 'Apache-2.0',
+    repository: { type: 'git', url: REPOSITORY_URL, directory: `packages/${name}` },
+    type: 'module',
+    publishConfig: { access: 'public' },
+  };
+}
+
+function library(name: 'protocol' | 'adapter', version: string): Json {
+  return {
+    ...common(name, version),
+    exports: { '.': { types: './dist/index.d.ts', default: './dist/index.js' } },
+    types: './dist/index.d.ts',
+    dependencies:
+      name === 'adapter'
+        ? { '@tabdock/protocol': version, 'qrcode-generator': '2.0.4', zod: '4.6.5' }
+        : { zod: '4.6.5' },
+  };
+}
+
+/** Three packages as release-pack.ts makes them, small enough to build in a test. */
+function wellFormed(version = '0.0.0'): Record<PackageName, Fixture> {
+  const base = { 'README.md': '# readme\n', LICENSE, NOTICE };
+  const relayDependencies = { '@tabdock/protocol': version, ws: '8.22.0', zod: '4.6.5' };
+  return {
+    protocol: {
+      manifest: library('protocol', version),
+      files: {
+        ...base,
+        'dist/index.js': 'export {};\n',
+        'dist/index.d.ts': 'export {};\n',
+        'dist/zod-config.js': 'export {};\n',
+      },
+    },
+    adapter: {
+      manifest: library('adapter', version),
+      files: {
+        ...base,
+        'dist/index.js': 'export {};\n',
+        'dist/index.d.ts': 'export {};\n',
+        'dist/tabdock-adapter.js': '(()=>{})();\n',
+        'dist/tabdock-adapter.js.map': '{}\n',
+      },
+    },
+    relay: {
+      manifest: {
+        ...common('relay', version),
+        engines: { node: '>=22.18' },
+        exports: { './package.json': './package.json' },
+        bin: { 'tabdock-relay': './dist/cli.js' },
+        dependencies: relayDependencies,
+        scripts: { start: 'node src/main.ts' },
+      },
+      files: {
+        ...base,
+        'dist/cli.js': '#!/usr/bin/env node\nconsole.log(1);\n',
+        'dist/argument-worker.js': 'export {};\n',
+        'dist/pair-page/pair.html': '<!doctype html>\n',
+        'dist/pair-page/invite.html': '<!doctype html>\n',
+        'npm-shrinkwrap.json': JSON.stringify({
+          name: '@tabdock/relay',
+          version,
+          lockfileVersion: 3,
+          packages: {
+            '': { name: '@tabdock/relay', version, dependencies: relayDependencies },
+            'node_modules/ws': {
+              version: '8.22.0',
+              resolved: 'https://registry.npmjs.org/ws/-/ws-8.22.0.tgz',
+              integrity: 'sha512-abc',
+            },
+          },
+        }),
+      },
+    },
+  };
+}
+
+/** Writes each fixture as a tarball, package/ and all, as npm and pnpm pack them. */
+function pack(fixtures: Record<PackageName, Fixture>): string {
+  const out = mkdtempSync(join(tmpdir(), 'tabdock-release-check-'));
+  scratches.push(out);
+  for (const [name, fixture] of Object.entries(fixtures) as [PackageName, Fixture][]) {
+    const stage = join(out, `stage-${name}`);
+    const files = { ...fixture.files, 'package.json': JSON.stringify(fixture.manifest, null, 2) };
+    for (const [path, contents] of Object.entries(files)) {
+      const file = join(stage, 'package', path);
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, contents);
+    }
+    const version = typeof fixture.manifest.version === 'string' ? fixture.manifest.version : '';
+    const made = spawnSync('tar', [
+      '-czf',
+      join(out, tarballName(name, version)),
+      '-C',
+      stage,
+      'package',
+    ]);
+    expect(made.status).toBe(0);
+    rmSync(stage, { recursive: true, force: true });
+  }
+  return out;
+}
+
+function problemsWith(
+  change: (fixtures: Record<PackageName, Fixture>) => void,
+  tag?: string,
+): string[] {
+  const fixtures = wellFormed();
+  change(fixtures);
+  return checkRelease(pack(fixtures), { tag });
+}
+
+describe('the release check', () => {
+  it('passes three well-formed packages at 0.0.0, and with their tag', () => {
+    expect(checkRelease(pack(wellFormed()))).toEqual([]);
+    expect(checkRelease(pack(wellFormed('0.1.0')), { tag: 'v0.1.0' })).toEqual([]);
+  });
+
+  const cases: [string, (f: Record<PackageName, Fixture>) => void, RegExp, string?][] = [
+    [
+      'a version that differs between packages',
+      (f) => {
+        f.relay.manifest.version = '0.0.1';
+        f.relay.manifest.name = '@tabdock/relay';
+      },
+      /package\.json says "0\.0\.1"/,
+    ],
+    [
+      'a tag that is not the version',
+      () => undefined,
+      /the tag v0\.1\.0 is not v0\.0\.0/,
+      'v0.1.0',
+    ],
+    [
+      'a test file',
+      (f) => {
+        f.protocol.files['dist/page-link.test.js'] = 'x';
+      },
+      /holds dist\/page-link\.test\.js, a test file/,
+    ],
+    [
+      'a test directory',
+      (f) => {
+        f.adapter.files['test/core.js'] = 'x';
+      },
+      /holds test\/core\.js, a test directory/,
+    ],
+    [
+      'a .env file',
+      (f) => {
+        f.relay.files['.env'] = 'TABDOCK_DEV_TOKENS=x';
+      },
+      /holds \.env, a \.env file/,
+    ],
+    [
+      'an owner token',
+      (f) => {
+        f.relay.files['owner-token'] = 'tabdock_x';
+      },
+      /holds owner-token, an owner token/,
+    ],
+    [
+      'a header helper',
+      (f) => {
+        f.relay.files['dist/claude-headers'] = '#!/bin/sh';
+      },
+      /holds dist\/claude-headers, a header helper/,
+    ],
+    [
+      'TypeScript source',
+      (f) => {
+        f.relay.files['src/cli.ts'] = 'x';
+      },
+      /holds src\/cli\.ts, TypeScript source/,
+    ],
+    [
+      'a file the allowlist does not name',
+      (f) => {
+        f.relay.files['dist/extra.js'] = 'x';
+      },
+      /holds dist\/extra\.js, which its allowlist does not name/,
+    ],
+    [
+      'a missing NOTICE',
+      (f) => {
+        delete f.adapter.files.NOTICE;
+      },
+      /@tabdock\/adapter lacks NOTICE/,
+    ],
+    [
+      'a NOTICE that is not the repository’s',
+      (f) => {
+        f.protocol.files.NOTICE = 'Someone else\n';
+      },
+      /@tabdock\/protocol's NOTICE is not the repository's/,
+    ],
+    [
+      'another repository URL',
+      (f) => {
+        f.relay.manifest.repository = { type: 'git', url: 'https://github.com/someone/tabdock' };
+      },
+      /@tabdock\/relay's repository\.url is "https:\/\/github\.com\/someone\/tabdock"/,
+    ],
+    [
+      'a workspace: specifier left behind',
+      (f) => {
+        f.adapter.manifest.dependencies = { '@tabdock/protocol': 'workspace:*' };
+      },
+      /still holds a workspace: specifier/,
+    ],
+    [
+      'a range instead of an exact pin',
+      (f) => {
+        f.protocol.manifest.dependencies = { zod: '^4.6.5' };
+      },
+      /depends on zod "\^4\.6\.5", not an exact version/,
+    ],
+    [
+      'a script npm runs on install',
+      (f) => {
+        f.relay.manifest.scripts = { postinstall: 'node x.js' };
+      },
+      /has a postinstall script/,
+    ],
+    [
+      'a private package',
+      (f) => {
+        f.protocol.manifest.private = true;
+      },
+      /@tabdock\/protocol is marked private/,
+    ],
+    [
+      'a second bin',
+      (f) => {
+        f.relay.manifest.bin = { 'tabdock-relay': './dist/cli.js', tabdock: './dist/cli.js' };
+      },
+      /exactly one bin, tabdock-relay/,
+    ],
+    [
+      'a library entry point in the relay',
+      (f) => {
+        f.relay.manifest.exports = { '.': './dist/cli.js', './package.json': './package.json' };
+      },
+      /exports a library entry point/,
+    ],
+    [
+      'a shrinkwrap that takes a package from elsewhere',
+      (f) => {
+        const shrinkwrap = JSON.parse(String(f.relay.files['npm-shrinkwrap.json'])) as {
+          packages: Record<string, Record<string, string>>;
+        };
+        shrinkwrap.packages['node_modules/ws'] = {
+          version: '8.22.0',
+          resolved: 'file:../ws.tgz',
+          integrity: 'sha512-x',
+        };
+        f.relay.files['npm-shrinkwrap.json'] = JSON.stringify(shrinkwrap);
+      },
+      /takes node_modules\/ws from "file:\.\.\/ws\.tgz", not the npm registry/,
+    ],
+    [
+      'a script-tag build at the ceiling',
+      (f) => {
+        f.adapter.files['dist/tabdock-adapter.js'] = Buffer.alloc(150_000, 0x20);
+      },
+      /dist\/tabdock-adapter\.js is 150000 bytes, not under 150000/,
+    ],
+    [
+      'a sideEffects false that would drop zod-config.ts',
+      (f) => {
+        f.protocol.manifest.sideEffects = false;
+      },
+      /declares sideEffects false/,
+    ],
+    [
+      'an export that points at nothing',
+      (f) => {
+        delete f.protocol.files['dist/index.d.ts'];
+      },
+      /@tabdock\/protocol points at \.\/dist\/index\.d\.ts, which it does not hold/,
+    ],
+  ];
+
+  for (const [what, change, expected, tag] of cases) {
+    it(`refuses ${what}`, () => {
+      const problems = problemsWith(change, tag);
+      expect(
+        problems.some((problem) => expected.test(problem)),
+        problems.join('\n'),
+      ).toBe(true);
+    });
+  }
+});

@@ -1,18 +1,20 @@
 // A4.4 from the command line (ADR 0022): `pnpm relay` and `pnpm dev`, run as
 // children the way the owner runs them, with no settings but a throwaway
 // TABDOCK_HOME. The first start draws the token into a private file and the
-// next keeps it byte for byte; the printed `claude mcp add` line reads that
-// file; only the owner token gets in, and only from this machine; and nothing
-// either command prints, on stdout or stderr (where the relay's log lines go),
-// holds the token, its digest or any 8-character run of its random part.
+// next keeps it byte for byte; the printed `claude mcp add-json` line hands
+// Claude Code the header helper beside the token (ADR 0028), which prints the
+// header a client then connects with; only the owner token gets in, and only
+// from this machine; and nothing either command prints, on stdout or stderr
+// (where the relay's log lines go), holds the token, its digest or any
+// 8-character run of its random part.
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
-import { claudeAddCommand, createRelay, loadConfigFromEnv } from '@tabdock/relay';
+import { createRelay, loadConfigFromEnv, quotePosix } from '@tabdock/relay';
 import { leakIn } from '@tabdock/relay/test/secrecy';
 import { rawRequest } from '@tabdock/relay/test/tunnel';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -54,6 +56,30 @@ function start(args: string[], home: string): Run {
   });
   runs.push(run);
   return run;
+}
+
+/**
+ * The add-json line a POSIX banner prints for this relay and token directory
+ * (ADR 0028): the helper's path in double quotes, since every home here holds
+ * a space.
+ */
+function addJsonLine(mcpUrl: string, home: string): string {
+  const json = JSON.stringify({
+    type: 'http',
+    url: mcpUrl,
+    headersHelper: `"${join(home, 'claude-headers')}"`,
+  });
+  return `claude mcp add-json --scope user tabdock-local ${quotePosix(json)}`;
+}
+
+/** The Authorization header the printed line's helper gives, run through sh as Claude Code runs it. */
+function helperHeader(command: string): string {
+  const quoted = /'(.*)'$/s.exec(command)?.[1] ?? '';
+  const config = JSON.parse(quoted.replaceAll(`'\\''`, "'")) as { headersHelper: string };
+  const ran = spawnSync('sh', ['-c', config.headersHelper], { env: {}, encoding: 'utf8' });
+  expect(ran.status, ran.stderr).toBe(0);
+  const headers = JSON.parse(ran.stdout) as { Authorization?: string };
+  return headers.Authorization ?? '';
 }
 
 async function stopAndScan(run: Run, token: string): Promise<void> {
@@ -102,12 +128,17 @@ describe.skipIf(process.platform === 'win32')('local mode from a clean checkout'
     expect(banner.created).toBe(true);
     expect(banner.tokenPath).toBe(join(home, 'owner-token'));
     expect(banner.mcpUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/);
-    expect(banner.command).toBe(claudeAddCommand('posix', banner.mcpUrl, banner.tokenPath));
+    expect(banner.command).toBe(addJsonLine(banner.mcpUrl, home));
     expect(lstatSync(home).mode & 0o777).toBe(0o700);
     expect(lstatSync(banner.tokenPath).mode & 0o777).toBe(0o600);
     const bytes = readFileSync(banner.tokenPath);
     const token = bytes.toString('latin1').trim();
     expect(/^tabdock_[A-Za-z0-9_-]{43}$/.test(token)).toBe(true);
+    // The helper holds no token, and what it prints is the header that gets in.
+    const helper = join(home, 'claude-headers');
+    expect(lstatSync(helper).mode & 0o777).toBe(0o700);
+    expect(leakIn(readFileSync(helper, 'utf8'), token)).toBeNull();
+    expect(helperHeader(banner.command) === `Bearer ${token}`).toBe(true);
 
     expect(await mcpStatus(banner.mcpUrl, {})).toBe(401);
     expect(
@@ -140,7 +171,22 @@ describe.skipIf(process.platform === 'win32')('local mode from a clean checkout'
     expect(readFileSync(again.tokenPath).equals(bytes)).toBe(true);
     expect(await toolNames(again.mcpUrl, token)).toHaveLength(5);
     await stopAndScan(second, token);
-  }, 60_000);
+
+    // pnpm relay --new-token (ADR 0028): the same command and helper, a new token.
+    const third = start(['relay', '--new-token'], home);
+    await third.waitFor('claude mcp list');
+    const replaced = readBanner(third.stdout());
+    expect(replaced.created).toBe(true);
+    expect(replaced.command).toBe(addJsonLine(replaced.mcpUrl, home));
+    expect(third.stdout()).toContain("Claude Code's entry needs no change");
+    const newToken = readFileSync(replaced.tokenPath, 'latin1').trim();
+    expect(newToken === token).toBe(false);
+    expect(helperHeader(replaced.command) === `Bearer ${newToken}`).toBe(true);
+    expect(await mcpStatus(replaced.mcpUrl, { Authorization: `Bearer ${token}` })).toBe(401);
+    expect(await toolNames(replaced.mcpUrl, newToken)).toHaveLength(5);
+    await stopAndScan(third, newToken);
+    expect(leakIn(third.stdout() + third.stderr(), token)).toBeNull();
+  }, 90_000);
 
   it('a first start that cannot listen keeps the token it drew, and the next says how to replace an older entry', async () => {
     const home = freshHome();
@@ -188,11 +234,12 @@ describe.skipIf(process.platform === 'win32')('local mode from a clean checkout'
     const printed = run.stdout();
     const banner = readBanner(printed);
     expect(banner.created).toBe(true);
-    expect(banner.command).toBe(claudeAddCommand('posix', banner.mcpUrl, banner.tokenPath));
+    expect(banner.command).toBe(addJsonLine(banner.mcpUrl, home));
     const demoLink = /Demo board linked to the relay: (\S+)/.exec(printed)?.[1] ?? '';
     expect(new URL(demoLink).searchParams.get('relay')).toBe(banner.pageUrl);
     expect((await fetch(demoLink)).status).toBe(200);
     const token = readFileSync(banner.tokenPath, 'latin1').trim();
+    expect(helperHeader(banner.command) === `Bearer ${token}`).toBe(true);
     expect(await toolNames(banner.mcpUrl, token)).toHaveLength(5);
     expect(
       await mcpStatus(banner.mcpUrl, {

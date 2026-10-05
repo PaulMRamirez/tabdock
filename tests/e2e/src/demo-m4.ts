@@ -242,9 +242,17 @@ try {
     check((tokenDir.mode & 0o777) === 0o700, 'the token directory should be 0700');
   }
   check(banner.created, 'a first start should create the token');
-  say('   For Claude Code it printed this line, which reads the file when it runs:');
+  say(
+    '   For Claude Code it printed this line, whose header helper reads the file at each connection (ADR 0028):',
+  );
   say(`   ${banner.command}`);
-  check(banner.command.includes('$(cat '), 'the printed line should read the token file');
+  check(
+    process.platform === 'win32'
+      ? banner.command.includes('Get-Content')
+      : banner.command.startsWith('claude mcp add-json ') &&
+          banner.command.includes('claude-headers'),
+    'the printed line should hand Claude Code the helper that reads the token file',
+  );
 
   say(
     '\n2. An MCP client does what that line does: it reads the token from the file and sends it.',

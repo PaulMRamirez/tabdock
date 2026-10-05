@@ -14,6 +14,7 @@ import { Worker } from 'node:worker_threads';
 import type { JsonObject } from '@tabdock/protocol';
 import { type CheckRequest, type CheckResult, WorkerMessageSchema } from './check-messages.ts';
 import type { Logger } from './log.ts';
+import { PACKAGED } from './packaged.ts';
 import { prepareSchema } from './validate.ts';
 
 /** A tool's schema as the worker compiles it, named by a hash of its text. */
@@ -48,7 +49,16 @@ export interface ArgumentCheckerOptions {
   entry?: URL;
 }
 
-const WORKER_ENTRY = new URL('./argument-worker.ts', import.meta.url);
+/**
+ * The worker module beside this code: the source in a checkout, and in the
+ * package the bundle's own worker file, which scripts/build.ts writes next to
+ * cli.js, the file this code is bundled into (ADR 0028).
+ */
+export function workerEntry(packaged: boolean, base: string = import.meta.url): URL {
+  return new URL(packaged ? './argument-worker.js' : './argument-worker.ts', base);
+}
+
+const WORKER_ENTRY = workerEntry(PACKAGED);
 /** A worker that has not said it is ready by then is treated as one that failed to start. */
 const START_LIMIT_MS = 10_000;
 /** Restarts after the second failure in a row wait this long, doubling up to RESTART_MAX_MS. */

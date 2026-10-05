@@ -6,13 +6,16 @@
 //
 // `pnpm relay` starts here as the owner starts it, with no settings but a
 // throwaway TABDOCK_HOME whose path holds a space and a quote. The `claude mcp
-// add` line it prints runs through sh -c exactly as printed, in a throwaway
-// HOME so the owner's own Claude Code configuration is never read or changed,
-// until `claude mcp list` shows the relay connected. Then the rotation the
-// docs describe: stop the relay, delete the token file, start again, see the
-// old entry refused, replace it with the newly printed line, and see it
-// connect. Every line the relay and Claude Code print is checked against both
-// tokens, which this script reads only to compare and never prints.
+// add-json` line it prints (ADR 0028) runs through sh -c exactly as printed,
+// in a throwaway HOME so the owner's own Claude Code configuration is never
+// read or changed, until `claude mcp list` shows the relay connected through
+// the header helper; Claude Code's configuration must then hold the helper
+// and no token, and `claude mcp get`, safe now, must print none. Then the
+// rotation the docs describe: stop the relay, start it with --new-token, and
+// see the same entry connect with the new token, the old one refused. Every
+// line the relay and Claude Code print, and the configuration file, is checked
+// against both tokens, which this script reads only to compare and never
+// prints.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, stat } from 'node:fs/promises';
@@ -120,25 +123,43 @@ try {
   show('   | ', first.stdout().slice(first.stdout().indexOf('Local mode')));
 
   say('\n2. The printed line, through sh -c, then claude mcp list:');
+  const usesHelper = banner.command.startsWith('claude mcp add-json ');
+  say(
+    `   the line is ${usesHelper ? 'claude mcp add-json with the header helper' : 'NOT add-json'}`,
+  );
   const added = await run('sh', ['-c', banner.command], work, claudeEnv);
   show('   add: ', `exit ${String(added.code)}; ${added.output}`);
   const line = await listUntil(claudeEnv, listsConnected);
   say(`   list: ${line}`);
-  const config = JSON.parse(await readFile(join(home, '.claude.json'), 'utf8')) as {
-    mcpServers?: Record<string, { type?: string; url?: string; headers?: Record<string, string> }>;
+  const configText = await readFile(join(home, '.claude.json'), 'utf8');
+  printed.push(configText);
+  const config = JSON.parse(configText) as {
+    mcpServers?: Record<
+      string,
+      { type?: string; url?: string; headers?: Record<string, string>; headersHelper?: string }
+    >;
   };
   const entry = config.mcpServers?.[SERVER];
-  const stored = entry?.headers?.Authorization === `Bearer ${token}`;
+  const helper = join(tabdockHome, 'claude-headers');
+  const throughHelper = entry?.headersHelper === `"${helper}"` && entry.headers === undefined;
   const mode = (await stat(join(home, '.claude.json'))).mode & 0o777;
   say(
-    `   ~/.claude.json (mode ${mode.toString(8)}): user scope ${entry ? 'holds' : 'lacks'} ${SERVER} at ${entry?.url ?? '(none)'}, its header ${stored ? 'the token from the file' : 'NOT the token from the file'} (not shown)`,
+    `   ~/.claude.json (mode ${mode.toString(8)}): user scope ${entry ? 'holds' : 'lacks'} ${SERVER} at ${entry?.url ?? '(none)'}, ${throughHelper ? 'with the header helper and no stored header' : 'WITHOUT the helper, or with a stored header'}`,
   );
-  const firstOk = added.code === 0 && listsConnected(line) && stored && entry.url === banner.mcpUrl;
+  // With no stored header, claude mcp get has nothing secret to print.
+  const got = await run('claude', ['mcp', 'get', SERVER], work, claudeEnv);
+  show('   get: ', `exit ${String(got.code)}; ${got.output}`);
+  const firstOk =
+    usesHelper &&
+    added.code === 0 &&
+    listsConnected(line) &&
+    throughHelper &&
+    entry.url === banner.mcpUrl &&
+    got.code === 0;
 
-  say('\n3. Rotation: stop the relay, delete the token file, start again on the same port:');
+  say('\n3. Rotation: stop the relay and start it with --new-token on the same port:');
   await first.stop();
-  await rm(banner.tokenPath);
-  const second = runPnpm(['relay'], relayEnv);
+  const second = runPnpm(['relay', '--new-token'], relayEnv);
   relays.push(second);
   await second.waitFor('claude mcp list');
   const rotated = readBanner(second.stdout());
@@ -147,27 +168,25 @@ try {
   say(
     `   the relay says the token was ${rotated.created ? 'created just now' : 'KEPT, which is wrong'}`,
   );
-  const stale = await listUntil(claudeEnv, (l) => !listsConnected(l));
-  say(`   list with the old entry: ${stale}`);
-  const removed = await run(
-    'claude',
-    ['mcp', 'remove', '--scope', 'user', SERVER],
-    work,
-    claudeEnv,
-  );
-  show('   remove: ', `exit ${String(removed.code)}; ${removed.output}`);
-  const readded = await run('sh', ['-c', rotated.command], work, claudeEnv);
-  show('   add: ', `exit ${String(readded.code)}; ${readded.output}`);
+  // The same entry, untouched, now sends the new token through the helper.
   const fresh = await listUntil(claudeEnv, listsConnected);
-  say(`   list: ${fresh}`);
+  say(`   list with the same entry: ${fresh}`);
+  const oldRefused =
+    (
+      await fetch(rotated.mcpUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+      })
+    ).status === 401;
+  say(`   the old token ${oldRefused ? 'gets 401' : 'is NOT refused'}`);
+  printed.push(await readFile(join(home, '.claude.json'), 'utf8'));
   await second.stop();
-  const rotationOk =
-    rotated.created &&
-    newToken !== token &&
-    !listsConnected(stale) &&
-    removed.code === 0 &&
-    readded.code === 0 &&
-    listsConnected(fresh);
+  const rotationOk = rotated.created && newToken !== token && listsConnected(fresh) && oldRefused;
 
   const everything = [...relays.flatMap((r) => [r.stdout(), r.stderr()]), ...printed].join('\n');
   const leaks = tokens
@@ -175,13 +194,13 @@ try {
     .filter((leak): leak is string => leak !== null);
   say(
     leaks.length === 0
-      ? '\nNo line the relay or Claude Code printed holds either token, its digest or any 8 characters of it.'
-      : `\nA printed line held ${leaks.join(', ')}.`,
+      ? "\nNo line the relay or Claude Code printed, and nothing in Claude Code's configuration, holds either token, its digest or any 8 characters of it."
+      : `\nA printed line or Claude Code's configuration held ${leaks.join(', ')}.`,
   );
   passed = firstOk && rotationOk && leaks.length === 0;
   say(
     passed
-      ? '\nA4.4 Claude Code PASS: the line pnpm relay printed added the local relay, claude mcp list showed it connected, and rotation worked as documented.'
+      ? "\nA4.4 Claude Code PASS: the add-json line pnpm relay printed added the local relay through its header helper, claude mcp list showed it connected, Claude Code's configuration holds no token, and --new-token rotated it with the entry unchanged."
       : '\nA4.4 Claude Code FAIL: the output above says where it stopped.',
   );
 } catch (error) {
