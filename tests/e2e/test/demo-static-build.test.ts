@@ -37,12 +37,25 @@ function hasE2eBypass(bundle: string): boolean {
   return bundle.includes('__tabdockDock') || /\.has\(\s*["']e2e["']\s*\)/.test(bundle);
 }
 
+/** main.ts's ?mcpb loader: the embed's path, or the test of its query parameter. */
+function hasMcpbLoader(bundle: string): boolean {
+  return bundle.includes('webmcp-local-relay') || /\.has\(\s*["']mcpb["']\s*\)/.test(bundle);
+}
+
 describe("the demo's static build (ADR 0029)", () => {
   it('holds no ?e2e bypass of the Connect click, where the dev and test bundle does', () => {
     expect(hasE2eBypass(devBundle), 'the yardstick: the dev bundle has the hook').toBe(true);
     expect(hasE2eBypass(staticBundle)).toBe(false);
     // The click itself is in both.
     for (const bundle of [staticBundle, devBundle]) expect(bundle).toContain('isTrusted');
+  });
+
+  it("holds no ?mcpb loader for MCP-B's embed, where the dev and test bundle does", () => {
+    // The loader names a path at the origin's root, which under a
+    // <user>.github.io/<repository>/ fallback is another site's, and script-src
+    // 'self' would run whatever that site serves there.
+    expect(hasMcpbLoader(devBundle), 'the yardstick: the dev bundle has the loader').toBe(true);
+    expect(hasMcpbLoader(staticBundle)).toBe(false);
   });
 
   it('carries the meta policy, with the hash of its one inline style, before anything it governs', () => {

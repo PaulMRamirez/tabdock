@@ -60,7 +60,7 @@ const buildOptions = {
   outfile: join(distDir, 'main.js'),
   sourcemap: true,
   logLevel: 'warning',
-  define: { __TABDOCK_E2E_HOOK__: 'false' },
+  define: { __TABDOCK_E2E_HOOK__: 'false', __TABDOCK_MCPB_EMBED__: 'false' },
 } satisfies esbuild.BuildOptions;
 
 /**
@@ -75,8 +75,8 @@ const buildOptions = {
 export async function buildDemo(options: { outDir?: string } = {}): Promise<void> {
   const outDir = options.outDir ?? distDir;
   await rm(outDir, { recursive: true, force: true });
-  // minifySyntax drops the code behind the false ?e2e hook outright, so not
-  // even dead code for it reaches a published copy (ADR 0029).
+  // minifySyntax drops the code behind the false ?e2e hook and ?mcpb loader
+  // outright, so not even dead code for them reaches a published copy (ADR 0029).
   await esbuild.build({ ...buildOptions, minifySyntax: true, outfile: join(outDir, 'main.js') });
   const html = await readFile(join(appDir, 'index.html'), 'utf8');
   await writeFile(join(outDir, 'index.html'), staticIndexHtml(html));
@@ -158,8 +158,9 @@ export async function startDemoServer(
   let bundle = new Map<string, Uint8Array>();
   const ctx = await esbuild.context({
     ...buildOptions,
-    // Only the local dev and test server may offer the ?e2e hook; see src/main.ts.
-    define: { __TABDOCK_E2E_HOOK__: 'true' },
+    // Only the local dev and test server may offer the ?e2e hook, or load the
+    // MCP-B embed it serves from /vendor for ?mcpb; see src/main.ts.
+    define: { __TABDOCK_E2E_HOOK__: 'true', __TABDOCK_MCPB_EMBED__: 'true' },
     write: false,
     plugins: [
       {

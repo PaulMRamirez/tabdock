@@ -3,7 +3,7 @@ import { attach, type Dock } from '@tabdock/adapter';
 import { Board } from './board.ts';
 import { busyFromQuery, startBusy } from './busy.ts';
 import { mountConnectBar, mountConnectForm, tabStore, wasChosen } from './connect.ts';
-import { policyFromQuery } from './policy.ts';
+import { linkPolicyFromQuery, policyInput, policyNotes, policyTag } from './policy.ts';
 import { relayFromQuery } from './relay.ts';
 import { type BoardUi, mountBoard } from './render.ts';
 import { createTools } from './tools.ts';
@@ -13,6 +13,15 @@ import { createTools } from './tools.ts';
  * the static build, so the ?e2e test hook below cannot exist on a hosted copy.
  */
 declare const __TABDOCK_E2E_HOOK__: boolean;
+
+/**
+ * Set by esbuild: true in the dev and test bundle, false in the static build,
+ * which leaves MCP-B's embed out (ADR 0029). The loader below names a path at
+ * the origin's root, which under a <user>.github.io/<repository>/ fallback
+ * belongs to another site, and script-src 'self' would run whatever that site
+ * serves there, so a published copy holds no loader at all.
+ */
+declare const __TABDOCK_MCPB_EMBED__: boolean;
 
 declare global {
   interface Window {
@@ -54,7 +63,7 @@ if (context) {
   ui.setStatus(registered);
   document.documentElement.dataset.tools = 'ready';
   const params = new URLSearchParams(window.location.search);
-  loadMcpbRelayEmbed(params);
+  if (__TABDOCK_MCPB_EMBED__) loadMcpbRelayEmbed(params);
   attachToRelay(params, ui, registered);
 } else {
   ui.setStatus('WebMCP is unavailable in this browser, so no tools are registered');
@@ -64,7 +73,8 @@ if (context) {
 /**
  * The M0 baseline: `?mcpb` loads MCP-B's local relay embed so that relay can
  * reach this page; `?mcpb=9444` also picks its port. It stays for demo:m0 and
- * the M0 specs; Tabdock's own path is ?relay below.
+ * the M0 specs, in the dev and test bundle only, where the server serves the
+ * embed; Tabdock's own path is ?relay below.
  */
 function loadMcpbRelayEmbed(params: URLSearchParams): void {
   if (!params.has('mcpb')) return;
@@ -83,7 +93,9 @@ function loadMcpbRelayEmbed(params: URLSearchParams): void {
  * registered above from document.modelContext, so it needs no handle on them.
  * The policy comes from the query too (policy.ts): clear_board always prompts,
  * `?invites=all` offers Can control invites, and `?confirm=client` lets a
- * member driver confirm clear_board in their own client (ADR 0026).
+ * member driver confirm clear_board in their own client (ADR 0026). Whoever
+ * wrote the link wrote those as well, so the bar names them, the status area
+ * keeps naming them once linked, and the remembered choice covers them.
  */
 function attachToRelay(params: URLSearchParams, ui: BoardUi, registered: string): void {
   const status = requiredElement('[data-role="status"]');
@@ -110,13 +122,15 @@ function attachToRelay(params: URLSearchParams, ui: BoardUi, registered: string)
     document.documentElement.dataset.link = 'refused';
     return;
   }
+  const policy = linkPolicyFromQuery(params);
   const link = (): void => {
-    const dock = attach({ relay: relay.url, policy: policyFromQuery(params) });
+    const dock = attach({ relay: relay.url, policy: policyInput(policy) });
     // The status line names the relay, so the person at the tab can see where it dials.
     dock.on('state', (state) => {
       ui.setStatus(`${registered}; Tabdock relay ${relay.host}: ${state.link}`);
     });
     ui.setStatus(`${registered}; Tabdock relay ${relay.host}: ${dock.state.link}`);
+    showPolicy(status, policyNotes(policy));
     document.documentElement.dataset.link = 'chosen';
     // Test hook for the Playwright specs and the demo scripts, nothing else:
     // ?e2e puts the control handle on window so a script can read the pairing
@@ -127,13 +141,30 @@ function attachToRelay(params: URLSearchParams, ui: BoardUi, registered: string)
   // Only the dev and test bundle's ?e2e skips the click: the static build
   // defines the hook false, so esbuild drops this test and a published copy
   // always waits for its visitor (tests/e2e/test/demo-static-build.test.ts).
-  if ((__TABDOCK_E2E_HOOK__ && params.has('e2e')) || wasChosen(store, relay.url)) {
+  if (
+    (__TABDOCK_E2E_HOOK__ && params.has('e2e')) ||
+    wasChosen(store, relay.url, policyTag(policy))
+  ) {
     link();
     return;
   }
   ui.setStatus(`${registered}; Tabdock relay ${relay.host}: waiting for you to connect`);
   document.documentElement.dataset.link = 'waiting';
-  mountConnectBar(status, relay, store, link);
+  mountConnectBar(status, relay, policy, store, link);
+}
+
+/**
+ * Names, under the status line, each way this board's policy departs from
+ * the defaults, for as long as it is linked: a reload under a remembered
+ * choice shows no bar, and the operator should still see what the link set.
+ */
+function showPolicy(status: Element, notes: string): void {
+  if (notes === '') return;
+  const line = document.createElement('p');
+  line.className = 'meta';
+  line.dataset.role = 'policy';
+  line.textContent = `This board's policy, from its link: ${notes}`;
+  status.after(line);
 }
 
 function requiredElement(selector: string): HTMLElement {
