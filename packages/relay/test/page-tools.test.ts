@@ -497,10 +497,11 @@ describe("a member's first-class list", () => {
     expect(write).not.toHaveBeenCalled();
   });
 
-  it('charges each entry against the tool budget beside its tool', async () => {
-    const charged = async (firstClassTools: boolean): Promise<number> => {
+  it('charges each entry against the tool budget beside its tool, its text included', async () => {
+    /** What the page's tools were charged, with this description on every tool. */
+    const charged = async (firstClassTools: boolean, description: string): Promise<number> => {
       await relayWith(firstClassTools);
-      await pageWith(TOOLS);
+      await pageWith(TOOLS.map((each) => ({ ...each, description })));
       const line = current?.lines
         .map((each) => JSON.parse(each) as Record<string, unknown>)
         .find((each) => each.msg === 'page tools updated');
@@ -509,13 +510,20 @@ describe("a member's first-class list", () => {
       for (const page of pages.splice(0)) page.ws.terminate();
       return Number(line?.heldBytes);
     };
-    const off = await charged(false);
-    const on = await charged(true);
-    // At least two bytes for each character of every entry's name, title and description.
-    const strings = TOOLS.reduce((sum, each) => {
-      const entry = firstClassEntry('pg_0123456789', PAGE_ORIGIN, each)?.entry;
-      return sum + (entry ? entry.name.length + entry.title.length + entry.description.length : 0);
+    const short = 'Short.';
+    const long = 'L'.repeat(1000);
+    // What entries add, beside the tools themselves, for each description.
+    const addsShort = (await charged(true, short)) - (await charged(false, short));
+    const addsLong = (await charged(true, long)) - (await charged(false, long));
+    expect(addsShort).toBeGreaterThan(0);
+    // Two bytes for each character more that the entries' descriptions hold.
+    const more = TOOLS.reduce((sum, each) => {
+      const of = (text: string): number =>
+        firstClassEntry('pg_0123456789', PAGE_ORIGIN, { ...each, description: text })?.entry
+          .description.length ?? 0;
+      return sum + of(long) - of(short);
     }, 0);
-    expect(on - off).toBeGreaterThanOrEqual(2 * strings);
+    expect(more).toBeGreaterThan(500);
+    expect(addsLong - addsShort).toBeGreaterThanOrEqual(2 * more);
   });
 });

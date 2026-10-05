@@ -88,6 +88,7 @@ import {
   type ResolvedConfig,
   resolveConfig,
 } from './config.ts';
+import { parseFirstClassName } from './first-class.ts';
 import { EMPTY_FIRST_CLASS, PageHub } from './hub.ts';
 import { ListenStreams } from './listen-streams.ts';
 import { createLogger, type Logger } from './log.ts';
@@ -265,27 +266,33 @@ async function readModernBody(request: Request): Promise<ModernBody> {
  * params the SDK refuses before any tool runs, a requestState that is not a
  * string for one, make a request free, whatever checks the SDK makes there.
  * `toolAnswers` says whether one past the budget still goes on, to be
- * refused by the fixed tool it names in that tool's own words and with its
- * audit record, as in M4: a tools/call the SDK's own schema takes, naming one
- * of the five, whose requestState the SDK will not refuse first. relay.ts
- * answers any other request past the budget itself. A notification carries
- * no request, and a batch, a response or anything else that is not one
- * request spends only if the SDK refuses it (refusedBySdk).
+ * refused in the dispatcher with its audit record: a tools/call the SDK's
+ * own schema takes, whose requestState the SDK will not refuse first, naming
+ * one of the five fixed tools, refused in that tool's own words as in M4,
+ * or, while first-class tools are on, a first-class name, refused as
+ * call_page_tool is, so both routes answer and record a call past the budget
+ * alike (SPEC section 7, ADR 0025's notes). relay.ts answers any other
+ * request past the budget itself. A notification carries no request, and a
+ * batch, a response or anything else that is not one request spends only if
+ * the SDK refuses it (refusedBySdk).
  */
-function arrivalOf(message: unknown): { id: string | number; toolAnswers: boolean } | null {
+function arrivalOf(
+  message: unknown,
+  firstClassTools: boolean,
+): { id: string | number; toolAnswers: boolean } | null {
   if (!isJSONRPCRequest(message)) return null;
   if (message.method === 'subscriptions/listen') return null;
-  return { id: message.id, toolAnswers: answeredInTool(message) };
+  return { id: message.id, toolAnswers: answeredInTool(message, firstClassTools) };
 }
 
-/** Whether the SDK hands this request to one of the five fixed tools. */
-function answeredInTool(message: unknown): boolean {
+/** Whether the SDK hands this request to the dispatcher for a fixed tool or a first-class name. */
+function answeredInTool(message: unknown, firstClassTools: boolean): boolean {
   if (!isSpecType.CallToolRequest(message)) return false;
   // The SDK refuses a present requestState that is not a string before any handler runs.
   const state: unknown = (message.params as { requestState?: unknown }).requestState;
-  return (
-    FIXED_TOOL_NAMES.has(message.params.name) && (state === undefined || typeof state === 'string')
-  );
+  if (state !== undefined && typeof state !== 'string') return false;
+  const { name } = message.params;
+  return FIXED_TOOL_NAMES.has(name) || (firstClassTools && parseFirstClassName(name) !== null);
 }
 
 /** A subscriptions/listen request's JSON-RPC id, or null for any other message. */
@@ -684,7 +691,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       }
       const listen = listenOf(body.message);
       const parsed = { ...options, parsedBody: body.message };
-      const arrival = listen === null ? arrivalOf(body.message) : null;
+      const arrival = listen === null ? arrivalOf(body.message, config.firstClassTools) : null;
       if (arrival !== null) {
         spent = true;
         const paid = budget.spend(caller.userId, caller.kind);

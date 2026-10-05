@@ -289,19 +289,37 @@ describe('a first-class call and call_page_tool', () => {
     expect((await callTool(alice, 'list_pages')).text).toMatch(/^rate_limited: /);
   });
 
-  it('is answered 429 past the budget on 2026-07-28, where every request spends as it arrives (ADR 0032)', async () => {
+  it('past the budget on 2026-07-28 too, refuses as call_page_tool does, with its record', async () => {
     const relay = await setup({ rateLimits: { requestsPerUser: 2 } });
     const opened = await page();
     const name = `${opened.pageId}__get_view`;
-    const statuses: number[] = [];
+    const answers = [];
     for (let index = 0; index < 3; index += 1) {
-      const answer = await modernExchange(relay.relay, ALICE, 'tools/call', {
-        name,
-        arguments: {},
-      });
-      statuses.push(answer.status);
+      answers.push(await modernExchange(relay.relay, ALICE, 'tools/call', { name, arguments: {} }));
     }
-    expect(statuses).toEqual([200, 200, 429]);
+    // Every request spent as it arrived; the third, past the budget, still reaches the dispatcher.
+    expect(answers.map((answer) => answer.status)).toEqual([200, 200, 200]);
+    const texts = answers.map(
+      (answer) =>
+        (answer.message?.result as { content?: { text?: string }[] } | undefined)?.content?.[0]
+          ?.text,
+    );
+    expect(texts[0]).toMatch(/^not_attached: /);
+    expect(texts[2]).toMatch(/^rate_limited: more than 2 requests/);
+    expect(lastRecord()).toMatchObject({
+      userId: 'alice',
+      pageId: opened.pageId,
+      tool: 'get_view',
+      outcome: 'rate_limited',
+    });
+    // call_page_tool past the budget answers in the same words.
+    const fixed = await modernExchange(relay.relay, ALICE, 'tools/call', {
+      name: 'call_page_tool',
+      arguments: { page: opened.pageId, tool: 'get_view' },
+    });
+    expect(
+      (fixed.message?.result as { content?: { text?: string }[] } | undefined)?.content?.[0]?.text,
+    ).toBe(texts[2]);
   });
 });
 

@@ -34,8 +34,10 @@ export interface PageToolNotifierOptions {
 interface UserState {
   /** The digest of the list the user was last told of (or started with). */
   sentDigest: string;
-  /** When the user was last told; null before the first time. */
-  sentAt: number | null;
+  /**
+   * A look pending: at the end of the turn for a first change, or, after
+   * the user was told, at the end of the interval since.
+   */
   timer: NodeJS.Timeout | null;
 }
 
@@ -62,15 +64,15 @@ export class PageToolNotifier {
     if (this.#closed || this.#looking === userId) return;
     let state = this.#users.get(userId);
     if (state === undefined) {
-      state = { sentDigest: this.#options.emptyDigest, sentAt: null, timer: null };
+      state = { sentDigest: this.#options.emptyDigest, timer: null };
       this.#users.set(userId, state);
     }
+    // Within the interval after a notification its timer is still pending,
+    // and that look takes this change; otherwise this one goes at once.
     if (state.timer !== null) return;
-    const now = Date.now();
-    const wait = state.sentAt === null ? 0 : Math.max(0, state.sentAt + this.#intervalMs - now);
     state.timer = setTimeout(() => {
       this.#flush(userId);
-    }, wait);
+    }, 0);
     state.timer.unref();
   }
 
@@ -93,10 +95,8 @@ export class PageToolNotifier {
     } finally {
       this.#looking = null;
     }
-    const now = Date.now();
     if (digest !== state.sentDigest) {
       state.sentDigest = digest;
-      state.sentAt = now;
       this.#options.send(userId);
       state.timer = setTimeout(() => {
         this.#flush(userId);
@@ -105,8 +105,7 @@ export class PageToolNotifier {
       return;
     }
     // Nothing left to remember once the user's clients last heard of an
-    // empty list: every look runs at or after the interval's end (changed
-    // waits for it), so a later change may go at once.
+    // empty list: no notification is pending, so a later change may go at once.
     if (state.sentDigest === this.#options.emptyDigest) this.#users.delete(userId);
   }
 
