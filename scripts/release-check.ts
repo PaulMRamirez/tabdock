@@ -15,7 +15,8 @@
 // package npm would run a script for on install, that leaves out a package its
 // tree needs, or that pins a sibling other than the very tarball packed beside
 // it; and a README, which npm shows as the package's page, that names an
-// import the packed manifests would refuse with ERR_PACKAGE_PATH_NOT_EXPORTED.
+// import the packed manifests would refuse with ERR_PACKAGE_PATH_NOT_EXPORTED,
+// or links or names a repository path npm cannot open.
 // CI runs it on every pack (the pack-install job) and publish.yml before
 // staging.
 
@@ -332,11 +333,34 @@ const ROOT_IMPORT = new RegExp(
   'g',
 );
 
+/** Fenced code blocks blanked: examples, whose paths are a page's own, not links. */
+function withoutFences(text: string): string {
+  return text.replace(/^(\s*)(`{3,}|~{3,})[^\n]*\n[\s\S]*?^\s*\2[`~]*\s*$/gm, '');
+}
+
+/** A Markdown link or image whose target is not absolute, an in-page anchor aside. */
+const RELATIVE_LINK = /!?\[[^\]]*\]\((?![a-z][a-z0-9+.-]*:|#|\/\/)([^)\s]+)[^)]*\)/gi;
+/** An HTML href or src in prose that is not absolute. */
+const RELATIVE_HTML = /\b(?:href|src)\s*=\s*["'](?![a-z][a-z0-9+.-]*:|#|\/\/)([^"']+)["']/gi;
+/** A link whose target is absolute: its text may name a path, since the link opens it. */
+const ABSOLUTE_LINK = /!?\[[^\]]*\]\([a-z][a-z0-9+.-]*:[^)]*\)/gi;
+/**
+ * A path into the repository rather than the package: docs/..., the spec or
+ * the owner's files at the root, or an ADR's file, none of which the tarball
+ * holds or npm can open.
+ */
+const REPOSITORY_PATH =
+  /(?<![\w./:@-])(?:docs\/[\w./-]*[\w-]|SPEC\.md|CLAUDE\.md|CHANGELOG\.md|\d{4}-[a-z0-9-]+\.md)(?![\w/-])/g;
+
 /**
  * What a packed README tells its reader to import that the packed manifests
  * do not export: npm shows the README as the package's page, and a reader who
  * follows it would meet ERR_PACKAGE_PATH_NOT_EXPORTED. A CDN path such as
  * `@tabdock/adapter@0.1.0/dist/...` names a version, not an import, and passes.
+ * The same page must not send its reader anywhere npm cannot follow: a
+ * relative link resolves against npmjs.com, and a bare repository path, such
+ * as docs/guide/... or an ADR's file, names nothing an npm reader has. Both
+ * belong as absolute GitHub URLs (ADR 0035).
  */
 export function readmeProblems(
   name: PackageName,
@@ -361,6 +385,21 @@ export function readmeProblems(
         `${where} imports @tabdock/${target}, which the packed @tabdock/${target} does not export`,
       );
     }
+  }
+  const prose = withoutFences(readme);
+  const outsideSpans = prose.replace(/(`+)[^`]*?\1/g, '');
+  for (const match of [
+    ...outsideSpans.matchAll(RELATIVE_LINK),
+    ...outsideSpans.matchAll(RELATIVE_HTML),
+  ]) {
+    problems.add(
+      `${where} links to ${match[1] ?? ''}, a relative path npm cannot follow; use an absolute GitHub URL`,
+    );
+  }
+  for (const match of prose.replace(ABSOLUTE_LINK, '').matchAll(REPOSITORY_PATH)) {
+    problems.add(
+      `${where} names ${match[0]}, a repository path an npm reader cannot open; link it with an absolute GitHub URL`,
+    );
   }
   return [...problems];
 }

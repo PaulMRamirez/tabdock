@@ -67,3 +67,5 @@ A member is an entry `sub=userId:Display Name` in `TABDOCK_OAUTH_USERS`, where `
 ## The activity log and the audit log
 
 The widget's activity list keeps the page's last 50 calls: time, person, client, tool, outcome and duration, never arguments or results. The relay's audit log keeps every attach, call, detach and invite redemption as hash-chained JSON lines, 30 days or 64 MiB by default, in `audit/` beside the owner token in local mode and in `TABDOCK_AUDIT_DIR` on a host, where production requires it. Read it with `pnpm audit:log` (with filters such as `--user`, `--page` and `--since`) and check the chain with `--verify`; once 0.1.0 is on npm, `npx @tabdock/relay audit` does the same. [Security](10-security.md) covers what the log proves.
+
+Next: [Run a relay](07-run-a-relay.md).

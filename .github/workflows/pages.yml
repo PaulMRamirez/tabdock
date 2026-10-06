@@ -1,7 +1,7 @@
-# Publishes the GitHub Pages site (ADR 0029): the demo board's static build at
-# / and the docs/tour explainers at /tour/, built whole by `pnpm site:build`,
-# since each deploy replaces the whole site. It runs only when dispatched on
-# main. Its build job reads the repository and nothing else, so mermaid's
+# Publishes the GitHub Pages site (ADRs 0029 and 0035): the demo board's
+# static build at /, the docs/tour explainers at /tour/ and the docs/guide
+# pages at /guide/, built whole by `pnpm site:build`, since each deploy
+# replaces the whole site. It runs only when dispatched on main. Its build job reads the repository and nothing else, so mermaid's
 # packages and Playwright's Chromium run with no token that can publish; its
 # deploy job holds the Pages and OIDC permissions, names the github-pages
 # environment, whose deployment branch rule admits only main, and runs no npm

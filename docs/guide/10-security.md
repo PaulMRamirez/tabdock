@@ -33,7 +33,7 @@ The operator at the tab is the root of trust. Nobody attaches without the operat
 
 **Never return what the agent should not see.** A result goes through the relay in plain text into a model's context and a client's history. Leave out tokens, cookies, API keys and other people's data, even when the page can read them.
 
-**Treat both directions as untrusted.** Results carry a `[tabdock: untrusted content ...]` label because page text may hold instructions aimed at the model, such as an item name another user wrote; keep that text as data in your results. Arguments arrive from agents that read untrusted text elsewhere, so handle them as you would any client's input, and never render them as HTML.
+**Treat both directions as untrusted.** Results carry a `[tabdock: untrusted content from <origin>, tool <name>]` label because page text may hold instructions aimed at the model, such as an item name another user wrote; keep that text as data in your results. Arguments arrive from agents that read untrusted text elsewhere, so handle them as you would any client's input, and never render them as HTML.
 
 **List exact origins.** `TABDOCK_ALLOWED_ORIGINS` names each page origin that may attach, scheme, host and port as the browser sends them. Every origin you list can bring pages to your relay, and anything outside a browser can claim one, so list only your own.
 

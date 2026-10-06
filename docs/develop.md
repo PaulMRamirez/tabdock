@@ -28,7 +28,7 @@ pnpm demo:m3       # sign-in, pairing by code and by the widget's QR code from a
 pnpm demo:m4       # local mode, then a page shared by watch and control invites, and the audit log
 pnpm demo:m5       # first-class page tools on both MCP revisions, and a call confirmed in the client
 
-pnpm site:build    # the Pages site into apps/site/dist: the demo at / and docs/tour at /tour/
+pnpm site:build    # the Pages site into apps/site/dist: the demo at /, docs/tour at /tour/, docs/guide at /guide/
 
 pnpm release:pack  # build and pack the three npm packages into dist/packages, publishing nothing
 pnpm release:check # check those tarballs file by file (add --tag v0.1.0 to match a tag)
@@ -49,7 +49,7 @@ The board dials only a relay its visitor chose (ADR 0029): `pnpm dev` prints a l
 
 ## The site
 
-`pnpm site:build` installs `apps/site` from its own lockfile (`pnpm install --frozen-lockfile --ignore-workspace` there), typechecks it, runs its tests with `node --test`, and builds: the demo's static build at the root, with its meta policy, and each `docs/tour/*.md` rendered by `marked` as a page under `/tour/`, each Mermaid block drawn to an SVG in Playwright's Chromium with the network blocked. It needs the workspace installed (for the demo's build) and that Chromium, which `pnpm --filter @tabdock/e2e exec playwright install chromium` fetches; `CHROMIUM_EXECUTABLE` points it at another build of Chromium. The build stops if a tour page holds a script or an event handler attribute or lacks its policy, or if a diagram holds a script or names anything outside the site. Serve `apps/site/dist` with any static server to read it as Pages will. Root lint, typecheck and unit tests leave `apps/site` out, since a clean clone cannot resolve its packages; CI runs `pnpm site:build` after it installs Chromium, and `.github/workflows/pages.yml` publishes the result (`docs/deploy.md`, "The workflows").
+`pnpm site:build` installs `apps/site` from its own lockfile (`pnpm install --frozen-lockfile --ignore-workspace` there), typechecks it, runs its tests with `node --test`, and builds: the demo's static build at the root, with its meta policy, each `docs/tour/*.md` rendered by `marked` as a page under `/tour/`, and each `docs/guide/*.md` as a page under `/guide/` (its `README.md` as the guide's index), each Mermaid block drawn to an SVG in Playwright's Chromium with the network blocked. It needs the workspace installed (for the demo's build) and that Chromium, which `pnpm --filter @tabdock/e2e exec playwright install chromium` fetches; `CHROMIUM_EXECUTABLE` points it at another build of Chromium. The build stops if a tour or guide page holds a script or an event handler attribute or lacks its policy, if a link names a tour or guide page that does not exist, or if a diagram holds a script or names anything outside the site. Serve `apps/site/dist` with any static server to read it as Pages will. Root lint, typecheck and unit tests leave `apps/site` out, since a clean clone cannot resolve its packages; CI runs `pnpm site:build` after it installs Chromium, and `.github/workflows/pages.yml` publishes the result (`docs/deploy.md`, "The workflows").
 
 ## Conventions
 

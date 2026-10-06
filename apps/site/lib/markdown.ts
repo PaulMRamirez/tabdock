@@ -1,8 +1,10 @@
-// One tour page from Markdown to the body of its HTML page, with marked.
-// Mermaid fences become <img> elements naming the SVG the build draws for
-// them; links and images are rewritten by links.ts; raw HTML in the Markdown
-// is shown as text, never passed through, so the page's markup is marked's
-// own and the checks in checks.ts have only that to vouch for.
+// One page of the tour or the guide from Markdown to the body of its HTML
+// page, with marked. Mermaid fences become <img> elements naming the SVG the
+// build draws for them; links and images are rewritten by links.ts; raw HTML
+// in the Markdown is shown as text, never passed through, so the page's
+// markup is marked's own and the checks in checks.ts have only that to vouch
+// for. An HTML comment alone, such as the guide's <!-- fragment --> marker
+// for the doc tests, is dropped: it was never meant to show.
 
 import { Marked, type Token, type Tokens } from 'marked';
 import { type LinkContext, rewriteImage, rewriteLink } from './links.ts';
@@ -51,11 +53,14 @@ export function slug(text: string): string {
     .replace(/\s/g, '-');
 }
 
+/** An HTML token that is one comment and nothing else. */
+const COMMENT_ONLY = /^\s*<!--(?:(?!-->)[\s\S])*-->\s*$/;
+
 /**
- * Renders one page. `stem` names it (00-baseline) and its diagrams'
- * files (00-1.svg, 00-2.svg) by the page's number.
+ * Renders one page of `links.collection`. `stem` names it (00-baseline) and
+ * its diagrams' files (00-1.svg, 00-2.svg) by the page's number.
  */
-export function renderTourPage(markdown: string, stem: string, links: LinkContext): RenderedPage {
+export function renderPage(markdown: string, stem: string, links: LinkContext): RenderedPage {
   const prefix = /^(\d+)-/.exec(stem)?.[1] ?? stem;
   const diagrams: Diagram[] = [];
   const diagramOf = new Map<Tokens.Code, Diagram>();
@@ -84,7 +89,7 @@ export function renderTourPage(markdown: string, stem: string, links: LinkContex
         link.href = rewriteLink(link.href, links);
       } else if (token.type === 'image') {
         const image = token as Tokens.Image;
-        image.href = rewriteImage(image.href);
+        image.href = rewriteImage(image.href, links.collection);
       }
     },
     renderer: {
@@ -95,6 +100,7 @@ export function renderTourPage(markdown: string, stem: string, links: LinkContex
         return `<figure class="diagram"><img src="img/${escapeHtml(diagram.file)}" alt="${escapeHtml(diagram.alt)}"></figure>\n`;
       },
       html(token) {
+        if (COMMENT_ONLY.test(token.text)) return '';
         return escapeHtml(token.text);
       },
       heading(token) {
@@ -109,13 +115,13 @@ export function renderTourPage(markdown: string, stem: string, links: LinkContex
   });
 
   const body = marked.parse(markdown, { async: false });
-  if (title === '') throw new Error(`docs/tour/${stem}.md has no # title`);
+  if (title === '') throw new Error(`${links.collection.dir}/${stem}.md has no # title`);
   return { title, body, diagrams };
 }
 
 /**
  * The Mermaid sources in a Markdown file the site does not publish, such as
- * the README, in order, so the build can draw them as it draws the tour's
+ * the README, in order, so the build can draw them as it draws the site's
  * and stop on one GitHub would show as an error (A5.5).
  */
 export function mermaidSources(markdown: string): string[] {

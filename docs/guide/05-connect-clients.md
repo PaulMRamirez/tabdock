@@ -78,3 +78,5 @@ On a page with `confirmVia: 'client'`, a member attached as a driver, not by inv
 ## What the operator sees about you
 
 The operator sees your display name (an invitee's verified email, or "unverified account", with a short id and an invited badge), your client's declared name and version, your role and your attachment's time left. The activity list shows each call's time, person, client, tool, outcome and duration, never arguments or results, and the relay's audit log keeps the same. The relay sees calls and results in plain text, so choose whose relay you use.
+
+Next: [Sharing](06-sharing.md).

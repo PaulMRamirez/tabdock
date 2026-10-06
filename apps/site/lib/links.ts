@@ -1,9 +1,14 @@
-// Links in the tour, rewritten for the site (ADR 0029). A link to another
-// tour page becomes its .html page; a link into docs/tour/img stays beside the
-// page, since the build copies those files; any other repository path becomes
-// a GitHub link at the commit built, so a reader on a phone lands on the code
-// the page describes. Anything else that is not http, https or mailto fails
-// the build rather than reach a page that shares the demo's origin.
+// Links in the site's Markdown pages, rewritten for the site (ADRs 0029 and
+// 0035). The site publishes collections of pages, the tour and the guide,
+// each from its own docs/ directory into its own directory on the site. A
+// link to a page of either collection becomes that page's .html page, beside
+// the page or in the other collection's directory, and a link to a page that
+// does not exist stops the build rather than ship a dead link; a link into a
+// collection's img/ stays on the site, since the build copies those files;
+// any other repository path becomes a GitHub link at the commit built, so a
+// reader on a phone lands on the code the page describes. Anything else that
+// is not http, https or mailto fails the build rather than reach a page that
+// shares the demo's origin.
 
 import { posix } from 'node:path';
 
@@ -15,15 +20,30 @@ export interface Repository {
   commit: string;
 }
 
+/** One set of Markdown pages the site publishes. */
+export interface Collection {
+  /** Where its sources live in the repository, such as docs/tour. */
+  dir: string;
+  /** Its directory on the site, such as tour. */
+  out: string;
+  /** The stem of the source that is its index page, such as README, if it has one. */
+  indexStem?: string | undefined;
+  /** Its pages by stem, such as 00-baseline, the index aside. */
+  pages: ReadonlySet<string>;
+}
+
 export interface LinkContext {
   repository: Repository;
-  /** The tour pages built beside this one, by stem, such as 00-baseline. */
-  tourPages: ReadonlySet<string>;
+  /** The collection the page being rendered belongs to. */
+  collection: Collection;
+  /** Every collection the site builds, the page's own among them. */
+  collections: readonly Collection[];
 }
 
 /** Where the tour's sources live in the repository. */
 export const TOUR_DIR = 'docs/tour';
-const IMAGE_DIR = `${TOUR_DIR}/img/`;
+/** Where the guide's sources live (ADR 0035). */
+export const GUIDE_DIR = 'docs/guide';
 
 /** A link or image the site will not carry; the build stops on it. */
 export class LinkError extends Error {}
@@ -32,11 +52,14 @@ const SCHEME = /^([a-z][a-z0-9+.-]*):/i;
 const ALLOWED_SCHEMES = new Set(['http', 'https', 'mailto']);
 
 /** The repository path a relative or root-relative href names, with its query or fragment apart. */
-function repositoryPath(href: string): { path: string; suffix: string; directory: boolean } {
+function repositoryPath(
+  href: string,
+  base: string,
+): { path: string; suffix: string; directory: boolean } {
   const cut = href.search(/[?#]/);
   const raw = cut === -1 ? href : href.slice(0, cut);
   const suffix = cut === -1 ? '' : href.slice(cut);
-  const joined = raw.startsWith('/') ? raw.slice(1) : posix.join(TOUR_DIR, raw);
+  const joined = raw.startsWith('/') ? raw.slice(1) : posix.join(base, raw);
   const normal = posix.normalize(joined === '' ? '.' : joined);
   if (normal === '..' || normal.startsWith('../')) {
     throw new LinkError(`${href} leaves the repository`);
@@ -44,6 +67,11 @@ function repositoryPath(href: string): { path: string; suffix: string; directory
   const directory = raw === '' || raw.endsWith('/') || normal === '.' || normal === './';
   const path = normal.replace(/\/$/, '').replace(/^\.$/, '');
   return { path, suffix, directory };
+}
+
+/** Where a collection's files are reached from a page of `from`: beside it, or in its own directory. */
+function prefixFor(collection: Collection, from: Collection): string {
+  return collection.dir === from.dir ? '' : `../${collection.out}/`;
 }
 
 export function rewriteLink(href: string, context: LinkContext): string {
@@ -58,31 +86,39 @@ export function rewriteLink(href: string, context: LinkContext): string {
   if (trimmed.startsWith('//') || trimmed.startsWith('\\')) {
     throw new LinkError(`${trimmed} names another host without a scheme`);
   }
-  const { path, suffix, directory } = repositoryPath(trimmed);
-  if (path === TOUR_DIR) return `index.html${suffix}`;
-  if (posix.dirname(path) === TOUR_DIR && path.endsWith('.md')) {
-    const stem = posix.basename(path, '.md');
-    if (context.tourPages.has(stem)) return `${stem}.html${suffix}`;
+  const { path, suffix, directory } = repositoryPath(trimmed, context.collection.dir);
+  for (const collection of context.collections) {
+    const prefix = prefixFor(collection, context.collection);
+    if (path === collection.dir) return `${prefix}index.html${suffix}`;
+    if (posix.dirname(path) === collection.dir && path.endsWith('.md')) {
+      const stem = posix.basename(path, '.md');
+      if (stem === collection.indexStem) return `${prefix}index.html${suffix}`;
+      if (collection.pages.has(stem)) return `${prefix}${stem}.html${suffix}`;
+      throw new LinkError(`${path} is no page of ${collection.dir}`);
+    }
+    if (path.startsWith(`${collection.dir}/img/`)) {
+      return `${prefix}${path.slice(collection.dir.length + 1)}${suffix}`;
+    }
   }
-  if (path.startsWith(IMAGE_DIR)) return `${path.slice(TOUR_DIR.length + 1)}${suffix}`;
   const { web, commit } = context.repository;
   if (path === '') return `${web}/tree/${commit}${suffix}`;
   return `${web}/${directory ? 'tree' : 'blob'}/${commit}/${path}${suffix}`;
 }
 
 /**
- * An image must be one of the tour's own, copied beside the pages: tour
- * pages allow images from the site alone (img-src 'self').
+ * An image must be one of its collection's own, copied beside the pages:
+ * site pages allow images from the site alone (img-src 'self').
  */
-export function rewriteImage(href: string): string {
+export function rewriteImage(href: string, collection: Collection): string {
   const trimmed = href.trim();
+  const images = `${collection.dir}/img/`;
   if (SCHEME.test(trimmed) || trimmed.startsWith('//') || trimmed.startsWith('\\')) {
-    throw new LinkError(`the image ${trimmed} is not one of the tour's own`);
+    throw new LinkError(`the image ${trimmed} is not one of ${collection.dir}'s own`);
   }
   if (/[?#]/.test(trimmed)) throw new LinkError(`the image ${trimmed} carries a query or fragment`);
-  const { path } = repositoryPath(trimmed);
-  if (!path.startsWith(IMAGE_DIR)) {
-    throw new LinkError(`the image ${trimmed} is outside ${IMAGE_DIR}`);
+  const { path } = repositoryPath(trimmed, collection.dir);
+  if (!path.startsWith(images)) {
+    throw new LinkError(`the image ${trimmed} is outside ${images}`);
   }
-  return path.slice(TOUR_DIR.length + 1);
+  return path.slice(collection.dir.length + 1);
 }
