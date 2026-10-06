@@ -961,6 +961,35 @@ test('the script tag refuses a data-relay that is not ws: or wss: in one console
   expect(await widgetText(page, 'roster')).toBeNull();
 });
 
+test("local mode's one user, You, reads You want in the attach and consequential prompts", async ({
+  page,
+}) => {
+  const relay = await openWithFakeRelay(page);
+  // The relay names local mode's user you, shown as You (LOCAL_USER).
+  relay.send(attachRequest('req-you', 'you'));
+  await waitForDock(page, (state) => state.pendingRequests.length === 1);
+  await expect
+    .poll(() => widgetBoxText(page, { requestId: 'req-you' }))
+    .toContain('You want to attach via code');
+  expect(await widgetBoxText(page, { requestId: 'req-you' })).not.toContain('You wants');
+  await clickInWidget(page, { action: 'approve-driver', requestId: 'req-you' });
+  await expect.poll(() => decisions(relay).map((frame) => frame.allow)).toEqual([true]);
+  relay.send({ t: 'roster', attachments: [attachment('you', 'You')] });
+  relay.send({
+    ...invokeFrame('call-1', 'clear_board'),
+    caller: { userId: 'you', displayName: 'You', client: null, role: 'driver' },
+  } as RelayFrame);
+  await waitForDock(page, (state) => state.pendingConfirms.length === 1);
+  await expect
+    .poll(() => widgetBoxText(page, { callId: 'call-1' }))
+    .toContain('You want to run clear_board');
+  // Anyone else keeps the verb's -s.
+  relay.send(attachRequest('req-bob', 'bob'));
+  await expect
+    .poll(() => widgetBoxText(page, { requestId: 'req-bob' }))
+    .toContain('Bob wants to attach via code');
+});
+
 test('pause answers calls with page_busy, shows on the badge, and holds across a reload', async ({
   page,
 }) => {

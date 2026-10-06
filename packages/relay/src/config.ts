@@ -1099,11 +1099,14 @@ function positiveIntegers<T extends { [K in keyof T]: number }>(
   return out;
 }
 
+/**
+ * Surrounding spaces are trimmed as for every other setting, so a flag of
+ * spaces alone is blank and counts as unset, which leaves it off.
+ */
 function parseFlag(name: string, value: string | undefined): boolean {
-  if (value === undefined || value === '' || value === '0' || value.toLowerCase() === 'false') {
-    return false;
-  }
-  if (value === '1' || value.toLowerCase() === 'true') return true;
+  const text = value?.trim().toLowerCase() ?? '';
+  if (text === '' || text === '0' || text === 'false') return false;
+  if (text === '1' || text === 'true') return true;
   throw new Error(`${name} must be 1, true, 0 or false`);
 }
 

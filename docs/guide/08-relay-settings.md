@@ -8,7 +8,7 @@ The relay reads its settings from the process environment once, at start, so any
 
 ## Value rules
 
-Flags take `1` or `true` to turn on, and `0`, `false` or empty to stay off, in any case; anything else, such as `yes` or spaces alone, stops the relay at start, though any other setting holding only spaces counts as unset. Counts are whole numbers from 1 to 999999999, with no sign or separator; settings in minutes may be at most 35791, the longest timer Node keeps. Byte settings are in bytes, so `TABDOCK_MAX_TOOL_BYTES=64` is refused rather than read as 64 MiB.
+Flags take `1` or `true` to turn on, and `0`, `false` or empty to stay off, in any case; anything else, such as `yes`, stops the relay at start. Every setting ignores surrounding spaces, so one holding only spaces counts as unset. Counts are whole numbers from 1 to 999999999, with no sign or separator; settings in minutes may be at most 35791, the longest timer Node keeps. Byte settings are in bytes, so `TABDOCK_MAX_TOOL_BYTES=64` is refused rather than read as 64 MiB.
 
 A refusal names the variable and the rule broken, never the value, since a token may sit in the wrong variable: a list entry by its place (`TABDOCK_ALLOWED_ORIGINS) entry 2`), and a directory `TABDOCK_HOME` or `TABDOCK_AUDIT_DIR` gives, or anything in or above it, by its setting (`the path TABDOCK_HOME gives`), as a token starting with `/` passes as a path. A default your platform chose is named in full.
 

@@ -371,6 +371,37 @@ describe('loadConfigFromEnv', () => {
     expect(options.port).toBe(DEFAULT_CLI_PORT);
   });
 
+  it('trims a flag as it trims every setting, so spaces alone read as unset and leave it off', () => {
+    const flags = (value: string) =>
+      loadConfigFromEnv({
+        TABDOCK_DEV_TOKENS: tokens,
+        TABDOCK_DEV_ALLOW_NO_ORIGIN: value,
+        TABDOCK_INVITES: value,
+        TABDOCK_FIRST_CLASS_TOOLS: value,
+        TABDOCK_SPIKE: value,
+      });
+    for (const on of [' 1 ', '\ttrue', 'TRUE  ']) {
+      expect(flags(on), JSON.stringify(on)).toMatchObject({
+        allowMissingOrigin: true,
+        invites: true,
+        firstClassTools: true,
+        spike: true,
+      });
+    }
+    // Blank, as a blank count or URL is: the setting is unset, so the flag stays off.
+    for (const off of ['   ', ' 0 ', ' false', '\t']) {
+      expect(flags(off), JSON.stringify(off)).toMatchObject({
+        allowMissingOrigin: false,
+        invites: false,
+        firstClassTools: false,
+        spike: false,
+      });
+    }
+    for (const bad of [' yes ', '1 1', 'on']) {
+      expect(() => flags(bad), JSON.stringify(bad)).toThrow(/must be 1, true, 0 or false/);
+    }
+  });
+
   it('names the bad variable and never echoes a token', () => {
     expect(() => loadConfigFromEnv({ TABDOCK_DEV_TOKENS: tokens, TABDOCK_PORT: 'x' })).toThrow(
       /TABDOCK_PORT/,

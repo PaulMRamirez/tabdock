@@ -52,7 +52,7 @@ sequenceDiagram
 
 Ask Claude Code to pair with the Tabdock page using the code. Claude Code first asks its own permission to use each `tabdock-local` tool; allow it (a headless `claude -p` run needs `--allowedTools 'mcp__tabdock-local__*'`, or it calls nothing). That question is Claude Code's, not the page's.
 
-The widget then asks "You wants to attach via code" with Allow as driver, Allow as observer and Deny; you have 60 seconds, and silence denies. Click Allow as driver. Then ask Claude to list the page's tools, add an item labelled Hello, and clear the board. `clear_board` is consequential, so the widget asks again ("You wants to run clear_board"). Click Deny once, and Claude reports `denied_by_operator`; ask again and click Allow. Each call appears in the widget's activity list, and every result Claude reads starts with a line such as `[tabdock: untrusted content from http://127.0.0.1:5173, tool add_item]`.
+The widget then asks "You want to attach via code" with Allow as driver, Allow as observer and Deny; you have 60 seconds, and silence denies. Click Allow as driver. Then ask Claude to list the page's tools, add an item labelled Hello, and clear the board. `clear_board` is consequential, so the widget asks again ("You want to run clear_board"). Click Deny once, and Claude reports `denied_by_operator`; ask again and click Allow. Each call appears in the widget's activity list, and every result Claude reads starts with a line such as `[tabdock: untrusted content from http://127.0.0.1:5173, tool add_item]`.
 
 ## A page of your own
 

@@ -380,6 +380,15 @@ function personText(user: { userId: string; displayName: string }, account?: Acc
   return `${name} (${id})`;
 }
 
+/**
+ * "<who> wants", or "You want" for local mode's one user, whom the relay
+ * names You (LOCAL_USER in local-token.ts); any name that reads You takes
+ * the verb as you would.
+ */
+function wants(who: string): string {
+  return who === 'You' ? `${who} want` : `${who} wants`;
+}
+
 /** Whether a roster entry came in by invite, or is an invitee: either way it carries the "invited" badge. */
 function invited(attachment: AttachmentView): boolean {
   return attachment.inviteId !== null || attachment.kind === 'invitee';
@@ -884,10 +893,10 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const line = element('p');
     if (request.invite !== null) {
       // The account beside the label the operator gave the invite, which is this page's own text.
-      dom.append(line, `${who} wants to join by your invite "${request.invite.label}"`);
+      dom.append(line, `${wants(who)} to join by your invite "${request.invite.label}"`);
     } else {
       const via = request.via === 'qr' ? 'QR code' : 'code';
-      dom.append(line, `${who} wants to attach via ${via}`);
+      dom.append(line, `${wants(who)} to attach via ${via}`);
     }
     dom.append(line, badge(request.invite !== null || request.account.kind === 'invitee'));
     dom.append(box, line);
@@ -939,7 +948,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const box = element('div', 'prompt');
     dom.attr(box, 'data-call-id', confirm.callId);
     const line = element('p');
-    dom.append(line, `${personText(confirm.caller)} wants to run ${confirm.tool}`);
+    dom.append(line, `${wants(personText(confirm.caller))} to run ${confirm.tool}`);
     dom.append(line, badge(shortId(confirm.caller.userId) !== null));
     dom.append(box, line);
     const view = newPrompt(box, confirm.expiresAt);
