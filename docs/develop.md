@@ -12,6 +12,7 @@ pnpm format        # prettier --write
 pnpm typecheck     # tsc over the root scripts and every workspace package
 pnpm build         # each package's build, where it has one
 pnpm test:e2e      # browser tests (Playwright; fetches Chromium on first run)
+pnpm conformance   # the official MCP conformance suite's 2025-11-25 and 2026-07-28 sets against a local relay
 
 pnpm relay         # the relay alone; local mode with no settings, printing the command for Claude Code
 pnpm relay --new-token  # the same, after replacing local mode's owner token in one rename
@@ -36,11 +37,11 @@ pnpm spike:latency # the M3 spike's call timings against a running relay
 pnpm spike:soak    # the M3 spike's long run with a busy page
 ```
 
-The three release commands are what CI's `pack-install` job and `publish.yml` run; `docs/release.md` says how a release is made. `pnpm --filter @tabdock/e2e <script>` runs the end-to-end package's own scripts: `baseline` re-measures the M0 baseline, and the `check:claude-code` scripts drive a real Claude Code against a relay in the sandbox. One Playwright spec runs alone with `pnpm --filter @tabdock/e2e exec playwright test specs/<name>.spec.ts`; specs take free ports, so several can run at once.
+`pnpm conformance` is what CI runs after the tests: it starts a relay of its own behind a loopback proxy that adds a token drawn for the run, and holds each requirement set to its checked-in baseline in `tests/e2e/conformance`. The three release commands are what CI's `pack-install` job and `publish.yml` run; `docs/release.md` says how a release is made. `pnpm --filter @tabdock/e2e <script>` runs the end-to-end package's own scripts: `baseline` re-measures the M0 baseline, and the `check:claude-code` scripts drive a real Claude Code against a relay in the sandbox. One Playwright spec runs alone with `pnpm --filter @tabdock/e2e exec playwright test specs/<name>.spec.ts`; specs take free ports, so several can run at once.
 
 ## Settings
 
-Every setting is optional and comes from a `.env` at the root, which git ignores; `.env.example` describes each one. With no `.env`, `pnpm relay` and `pnpm dev` run local mode (ADR 0022): loopback only, one user, `you`, and an owner token drawn into a private file outside the repository (`TABDOCK_HOME`, or the platform's config directory). The relay prints a command for Claude Code that reads the token from that file, so the token never reaches the screen; check the result with `claude mcp list`, never `claude mcp get`. Settings in `.env` win over local mode. `DEMO_PORT` moves the demo board.
+Every setting is optional and comes from the process environment or a `.env` at the root, which git ignores; a variable already set in the environment wins over `.env`, so `TABDOCK_FIRST_CLASS_TOOLS=1 pnpm dev` works whatever `.env` says. `.env.example` describes each setting, and `docs/guide/08-relay-settings.md` lists them as tables with their modes, defaults and bounds. With neither, `pnpm relay` and `pnpm dev` run local mode (ADR 0022): loopback only, one user, `you`, and an owner token drawn into a private file outside the repository (`TABDOCK_HOME`, or the platform's config directory). The relay prints a command for Claude Code that reads the token from that file, so the token never reaches the screen; check the result with `claude mcp list`, never `claude mcp get`. Settings in `.env` win over local mode. `DEMO_PORT` moves the demo board.
 
 ## The demo board
 

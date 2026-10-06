@@ -37,3 +37,7 @@ Every claim about MCP-B was checked on 5 October 2026 against the 6.0 beta, `6.0
 ## What follows
 
 The shapes rhyme: hello, full tool-list replacement, invoke and result, ping. The gaps are Tabdock's security work: an `Origin` the page cannot claim, an explicit allowlist, authenticated clients, an approval on the page, roles and cancellation. MCP-B's defaults suit one machine, where the user's own processes are the boundary, and would break S1, S2 and S4 on a public relay. So the proposal starts with the gap that hurts local users today, a `cancel` frame older widgets ignore, and offers a remote profile only on a subprotocol of its own that keeps those rules.
+
+## Which to use when
+
+MCP-B's local relay fits one person on one machine with a stdio client such as Claude Code: no accounts or approvals, the client starts the relay itself, each open page's tools appear as MCP tools under their own names, and nothing leaves the machine. Tabdock fits when several people or clients share one page, when the client is Claude on the web, desktop or phone and so needs a public URL with sign-in, or when the person at the tab must approve who attaches, choose who may only read, and confirm consequential calls; it costs a relay and a pairing step for each person. Its local mode serves the one-machine case too, over HTTP with an owner token and with the same approvals. The guide's [Concepts](guide/01-concepts.md) and [Use cases](guide/09-use-cases.md) say more about what Tabdock is for.

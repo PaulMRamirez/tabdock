@@ -1,10 +1,10 @@
 # 04: Local and hosted
 
-On a clean clone with no `.env`, `pnpm relay` now starts in local mode (ADR 0022): loopback only, one user called `you`, and a banner with a `claude mcp add` line for Claude Code. With settings, the same relay runs at a stable public URL on a host, where Claude on the web and the phone signs in, and an operator can share a page by invite with someone outside the user list.
+On a clean clone with no `.env`, `pnpm relay` now starts in local mode (ADR 0022): loopback only, one user called `you`, and a banner with a line that adds the relay to Claude Code. With settings, the same relay runs at a stable public URL on a host, where Claude on the web and the phone signs in, and an operator can share a page by invite with someone outside the user list.
 
 ## What exists now
 
-`config.ts` picks local mode when no auth setting is set outside production. `loadOwnerToken` in `local-token.ts` draws a 256-bit token into a 0600 `owner-token` file outside the repo, and refuses, never repairs, a file another account owns or can read. The dev-token plugin holding it is marked `loopbackOnly`, `madeLocally` in `relay.ts` turns away proxied requests, and `local-banner.ts` prints a line that reads the file, so the token never reaches the screen. Hosted mode adds `client-address.ts` and per-address limits (ADR 0018); `audit-file.ts` keeps a hash-chained log on disk in either mode (ADR 0019); `docs/deploy.md` describes one reference deployment and `docs/threat-model.md` its risks. Invites (ADR 0017) need a public URL and `TABDOCK_INVITES`.
+[config.ts](../../packages/relay/src/config.ts) picks local mode when no auth setting is set outside production. `loadOwnerToken` in [local-token.ts](../../packages/relay/src/local-token.ts) draws a 256-bit token into a 0600 `owner-token` file outside the repo, and refuses, never repairs, a file another account owns or can read. The dev-token plugin holding it is marked `loopbackOnly`, `madeLocally` in `relay.ts` turns away proxied requests, and [local-banner.ts](../../packages/relay/src/local-banner.ts) printed a line that reads the file, so the token never reached the screen (since M5, on macOS and Linux, a `claude mcp add-json` line whose `claude-headers` helper Claude Code runs at each connection, which keeps the token out of its settings too; ADR 0028). Hosted mode adds `client-address.ts` and per-address limits (ADR 0018); [audit-file.ts](../../packages/relay/src/audit-file.ts) keeps a hash-chained log on disk in either mode (ADR 0019); `docs/deploy.md` describes one reference deployment and `docs/threat-model.md` its risks. Invites (ADR 0017) need a public URL and `TABDOCK_INVITES`.
 
 ## One watch invite, traced
 
@@ -39,6 +39,6 @@ Bob's Claude, signed in as the same account, calls `call_page_tool` with `get_vi
 
 ## Try it by hand
 
-1. On a clean clone with no `.env`, run `pnpm relay`, paste the line it prints, and check with `claude mcp list` that `tabdock-local` is connected. Never use `claude mcp get`, which prints the token.
+1. On a clean clone with no `.env`, run `pnpm relay`, paste the line it prints, and check with `claude mcp list` that `tabdock-local` is connected. Never use `claude mcp get`, which prints a stored header in full (the token itself, for an entry made with the `--header` line).
 2. Run `pnpm demo:m4`: local mode, then a watch invite, a control invite on `?invites=all`, Revoke all and `pnpm audit:log --verify`, every printed line checked for secrets.
-3. Stop the relay, delete `owner-token` and start again: `claude mcp list` shows the old entry failing with 401. Run `claude mcp remove --scope user tabdock-local` and paste the new line. `pnpm audit:log` then reads local mode's log beside the token.
+3. Stop the relay and run `pnpm relay --new-token`: the banner says Claude Code's entry needs no change, since the helper reads the new token at its next connection, and `claude mcp list` still shows `tabdock-local` connected while the old token gets 401. Only an entry from the PowerShell `--header` line must be removed and pasted again. `pnpm audit:log` then reads local mode's log beside the token.
