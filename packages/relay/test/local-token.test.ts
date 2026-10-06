@@ -27,12 +27,13 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   drawOwnerToken,
   type FileFacts,
+  GIVEN_HOME,
   HEADERS_HELPER_FILE,
   loadOwnerToken,
   type LocalTokenSystem,
@@ -73,6 +74,16 @@ function refusal(run: () => unknown): string {
   throw new Error('expected a refusal');
 }
 
+/**
+ * A refusal about a directory TABDOCK_HOME gave, or something in or above it:
+ * named from the setting and never spelled out, since a token may sit in the
+ * wrong variable (PathNames in local-token.ts).
+ */
+function fromHome(message: string, path: string, named = GIVEN_HOME): void {
+  expect(message).toContain(named);
+  expect(message).not.toContain(path);
+}
+
 /** The same facts with another owner, as another account's file would show. */
 function ownedBy(facts: FileFacts, uid: number): FileFacts {
   return {
@@ -92,6 +103,12 @@ function plant(home: string, contents: string, mode = 0o600): string {
   writeFileSync(file, contents, { mode });
   chmodSync(file, mode);
   return file;
+}
+
+/** A directory the repository rule counts as a git work tree: one holding a `.git` directory. */
+function workTreeAt(path: string): string {
+  mkdirSync(join(path, '.git'), { recursive: true });
+  return path;
 }
 
 const SAMPLE = `tabdock_${'Q'.repeat(20)}Zx9-_${'w'.repeat(18)}`;
@@ -268,7 +285,7 @@ describe('the first start and the next', () => {
   });
 });
 
-describe('refusals: each names the path and the fix, never the contents', () => {
+describe('refusals: each names the path, from TABDOCK_HOME when it gave it, and the fix, never the contents', () => {
   it('a directory inside the checkout, compared by realpath, and nothing is created there', () => {
     const inside = join(CHECKOUT, `.tabdock-token-test-${String(process.pid)}`);
     const docsHome = join(CHECKOUT, 'docs', 'tabdock');
@@ -286,7 +303,9 @@ describe('refusals: each names the path and the fix, never the contents', () => 
     try {
       for (const load of [loadOwnerToken, readOwnerToken]) {
         const message = refusal(() => load({ TABDOCK_HOME: inside }));
-        expect(message).toContain(inside);
+        fromHome(message, inside);
+        // The checkout is the relay's own place, so it is named in full.
+        expect(message).toContain(`inside the checkout ${realpathSync(CHECKOUT)},`);
         expect(message).toMatch(
           /inside the checkout.*set TABDOCK_HOME to an absolute path outside it/,
         );
@@ -338,7 +357,7 @@ describe('refusals: each names the path and the fix, never the contents', () => 
       path === home ? ownedBy(lstatSync(path), (process.getuid?.() ?? 0) + 4242) : lstatSync(path);
     for (const load of [loadOwnerToken, readOwnerToken]) {
       const message = refusal(() => load({ TABDOCK_HOME: home }, { lstat }));
-      expect(message).toContain(home);
+      fromHome(message, home);
       expect(message).toMatch(/another account owns it.*delete it and start again/);
     }
     // The same seen from the other side: the relay running as another account,
@@ -347,7 +366,8 @@ describe('refusals: each names the path and the fix, never the contents', () => 
     const above = (path: string): FileFacts =>
       path === home ? lstatSync(path) : ownedBy(lstatSync(path), 0);
     const seen = refusal(() => loadOwnerToken({ TABDOCK_HOME: home }, { uid, lstat: above }));
-    expect(seen).toContain(`${home}: another account owns it`);
+    expect(seen).toContain(`${GIVEN_HOME}: another account owns it`);
+    expect(seen).not.toContain(home);
   });
 
   it.skipIf(!POSIX)('a directory that grants its group or others any permission', () => {
@@ -356,7 +376,7 @@ describe('refusals: each names the path and the fix, never the contents', () => 
       mkdirSync(home);
       chmodSync(home, mode);
       const message = refusal(() => loadOwnerToken({ TABDOCK_HOME: home }));
-      expect(message).toContain(home);
+      fromHome(message, home);
       expect(message).toMatch(new RegExp(`mode ${mode.toString(8)}\\); run chmod 700 on it`));
       // Refused, not repaired, and no token drawn into it.
       expect(statSync(home).mode & 0o777).toBe(mode);
@@ -368,7 +388,7 @@ describe('refusals: each names the path and the fix, never the contents', () => 
     const file = join(scratch(), 'not-a-directory');
     writeFileSync(file, 'x');
     const message = refusal(() => loadOwnerToken({ TABDOCK_HOME: file }));
-    expect(message).toContain(file);
+    fromHome(message, file);
     expect(message).toMatch(/not a directory; delete it and start again/);
   });
 
@@ -379,7 +399,7 @@ describe('refusals: each names the path and the fix, never the contents', () => 
       ownedBy(fstatSync(fd), (process.getuid?.() ?? 0) + 4242);
     for (const load of [loadOwnerToken, readOwnerToken]) {
       const message = refusal(() => load({ TABDOCK_HOME: home }, { fstat }));
-      expect(message).toContain(owner.path);
+      fromHome(message, home, `${OWNER_TOKEN_FILE} in ${GIVEN_HOME}`);
       expect(message).toMatch(/another account owns it.*delete it and start again/);
       expect(leakIn(message, owner.token)).toBeNull();
     }
@@ -413,7 +433,7 @@ describe('refusals: each names the path and the fix, never the contents', () => 
       const home = join(scratch(), 'tabdock');
       const file = plant(home, `${SAMPLE}\n`, mode);
       const message = refusal(() => loadOwnerToken({ TABDOCK_HOME: home }));
-      expect(message).toContain(file);
+      fromHome(message, file, `${OWNER_TOKEN_FILE} in ${GIVEN_HOME}`);
       expect(message).toMatch(
         /chmod 600 on it if nobody else could have read it.*delete it and start again/,
       );
@@ -432,7 +452,7 @@ describe('refusals: each names the path and the fix, never the contents', () => 
     symlinkSync(real, join(home, OWNER_TOKEN_FILE));
     for (const load of [loadOwnerToken, readOwnerToken]) {
       const message = refusal(() => load({ TABDOCK_HOME: home }));
-      expect(message).toContain(join(home, OWNER_TOKEN_FILE));
+      fromHome(message, home, `${OWNER_TOKEN_FILE} in ${GIVEN_HOME}`);
       expect(message).toMatch(/symbolic link.*delete it and start again/);
       expect(leakIn(message, SAMPLE)).toBeNull();
     }
@@ -485,13 +505,83 @@ describe('refusals: each names the path and the fix, never the contents', () => 
         expect(message, JSON.stringify(contents.slice(0, 20))).toMatch(
           /not a well-formed owner token; delete it and start again/,
         );
-        expect(message).toContain(file);
+        fromHome(message, file, `${OWNER_TOKEN_FILE} in ${GIVEN_HOME}`);
         expect(message).not.toContain('SeCrEt');
       }
       // Refused, never rewritten.
       expect(readFileSync(file, 'latin1')).toBe(contents);
     }
   });
+
+  it.skipIf(!POSIX)(
+    'spells out no path TABDOCK_HOME gave, nor one in or above it, whatever the refusal',
+    () => {
+      // A dev token or client secret may start with '/', so one pasted into
+      // TABDOCK_HOME passes as an absolute path; the mark stands in for it.
+      const MARK = 'Zq7Home9Wq';
+      const base = join(scratch(), MARK);
+      mkdirSync(base, { mode: 0o700 });
+      // readOwnerToken never looks at the helper, so that case is loadOwnerToken's alone.
+      type Load = (env: TokenEnv) => unknown;
+      const homes: [label: string, make: () => string, loads?: Load[]][] = [
+        // Node's own realpath errors quote the path: a loop of links, and a name past the limit.
+        [
+          'a loop of links',
+          () => {
+            symlinkSync(join(base, 'loop'), join(base, 'loop'));
+            return join(base, 'loop', 'tabdock');
+          },
+        ],
+        ['a name too long', () => join(base, MARK.repeat(30))],
+        ['a work tree', () => join(workTreeAt(join(base, 'repo')), 'tabdock')],
+        [
+          'a directory others may write above it',
+          () => {
+            mkdirSync(join(base, 'open'));
+            chmodSync(join(base, 'open'), 0o777);
+            return join(base, 'open', 'tabdock');
+          },
+        ],
+        [
+          'a directory others may enter',
+          () => {
+            mkdirSync(join(base, 'wide'));
+            chmodSync(join(base, 'wide'), 0o755);
+            return join(base, 'wide');
+          },
+        ],
+        [
+          'a file where the directory should be',
+          () => {
+            writeFileSync(join(base, 'file'), 'x');
+            return join(base, 'file');
+          },
+        ],
+        ['a token file others may read', () => dirname(plant(join(base, 'read'), '', 0o644))],
+        ['a malformed token', () => dirname(plant(join(base, 'bad'), 'tabdock_short\n'))],
+        [
+          'a helper that is a link',
+          () => {
+            const home = join(base, 'helper');
+            loadOwnerToken({ TABDOCK_HOME: home });
+            rmSync(join(home, HEADERS_HELPER_FILE));
+            symlinkSync(join(base, 'elsewhere'), join(home, HEADERS_HELPER_FILE));
+            return home;
+          },
+          [loadOwnerToken],
+        ],
+      ];
+      for (const [label, make, loads = [loadOwnerToken, readOwnerToken] as Load[]] of homes) {
+        const home = make();
+        for (const load of loads) {
+          // refusal() also holds every one to OwnerTokenError, never node's own error.
+          const message = refusal(() => load({ TABDOCK_HOME: home }));
+          expect(message, label).toContain(GIVEN_HOME);
+          expect(message, label).not.toContain(MARK);
+        }
+      }
+    },
+  );
 });
 
 describe.skipIf(!POSIX)('the directories above it (ADR 0028)', () => {
@@ -506,7 +596,7 @@ describe.skipIf(!POSIX)('the directories above it (ADR 0028)', () => {
     for (const load of [loadOwnerToken, readOwnerToken]) {
       const message = refusal(() => load({ TABDOCK_HOME: home }));
       expect(message).toBe(
-        `local mode refuses ${home} for its owner token: ${shared} above it can be written by other accounts (mode 1777), so another account could make the directory again once it is gone and have Claude Code run a header helper of its own; set TABDOCK_HOME to an absolute path under your home directory (ADR 0028)`,
+        `local mode refuses ${GIVEN_HOME} for its owner token: the directory just above it can be written by other accounts (mode 1777), so another account could make the directory again once it is gone and have Claude Code run a header helper of its own; set TABDOCK_HOME to an absolute path under your home directory (ADR 0028)`,
       );
     }
     expect(existsSync(home)).toBe(false);
@@ -517,7 +607,7 @@ describe.skipIf(!POSIX)('the directories above it (ADR 0028)', () => {
     if ((statSync(tmp).mode & 0o1022) !== 0o1022) return;
     const home = join(tmp, `tabdock-review-${String(process.pid)}`, 'tabdock');
     expect(refusal(() => loadOwnerToken({ TABDOCK_HOME: home }))).toContain(
-      `: ${tmp} above it can be written by other accounts (mode 1777)`,
+      ': the directory 2 levels above it can be written by other accounts (mode 1777)',
     );
     expect(existsSync(join(tmp, `tabdock-review-${String(process.pid)}`))).toBe(false);
   });
@@ -530,7 +620,7 @@ describe.skipIf(!POSIX)('the directories above it (ADR 0028)', () => {
       const home = join(parent, 'deeper', 'tabdock');
       const message = refusal(() => loadOwnerToken({ TABDOCK_HOME: home }));
       expect(message).toContain(
-        `: ${parent} above it can be written by other accounts (mode ${mode.toString(8)}), so another account could make the directory again`,
+        `: the directory 2 levels above it can be written by other accounts (mode ${mode.toString(8)}), so another account could make the directory again`,
       );
       expect(message).toContain(
         'run chmod go-w on it, or set TABDOCK_HOME to an absolute path under your home directory (ADR 0028)',
@@ -548,7 +638,7 @@ describe.skipIf(!POSIX)('the directories above it (ADR 0028)', () => {
       path === theirs ? ownedBy(lstatSync(path), other) : lstatSync(path);
     const home = join(theirs, 'tabdock');
     expect(refusal(() => loadOwnerToken({ TABDOCK_HOME: home }, { lstat }))).toContain(
-      `: ${theirs} above it belongs to another account (uid ${String(other)}), so another account could make the directory again once it is gone and have Claude Code run a header helper of its own; set TABDOCK_HOME to an absolute path under your home directory (ADR 0028)`,
+      `: the directory just above it belongs to another account (uid ${String(other)}), so another account could make the directory again once it is gone and have Claude Code run a header helper of its own; set TABDOCK_HOME to an absolute path under your home directory (ADR 0028)`,
     );
     const env = { HOME: theirs };
     expect(refusal(() => loadOwnerToken(env, { lstat, platform: 'linux' }))).toContain(
@@ -586,7 +676,7 @@ describe('on Windows, where Node reports no owner and lacks O_NOFOLLOW', () => {
     const outside = join(base, 'elsewhere');
     for (const load of [loadOwnerToken, readOwnerToken]) {
       const message = refusal(() => load({ ...env, TABDOCK_HOME: outside }, system));
-      expect(message).toContain(outside);
+      fromHome(message, outside);
       expect(message).toMatch(
         /must lie under %LOCALAPPDATA% or %USERPROFILE%.*set TABDOCK_HOME to a directory there/,
       );
@@ -659,9 +749,9 @@ describe('the repository rule (ADR 0028), in a checkout and in the package alike
           const message = from(repo, () =>
             refusal(() => load({ TABDOCK_HOME: home }, systemFor(base))),
           );
-          expect(message).toContain(home);
+          fromHome(message, repo);
           expect(message).toContain(
-            `inside the git work tree ${repo}, where the token could be committed; set TABDOCK_HOME to an absolute path outside every repository, or unset it (ADR 0028)`,
+            'inside a git work tree whose top is the directory just above it, where the token could be committed; set TABDOCK_HOME to an absolute path outside every repository, or unset it (ADR 0028)',
           );
           expect(existsSync(home)).toBe(false);
         }
@@ -672,7 +762,7 @@ describe('the repository rule (ADR 0028), in a checkout and in the package alike
         const repo = workTree(join(base, 'linked'), 'file');
         const home = join(repo, 'deep', 'er', 'tabdock');
         expect(refusal(() => loadOwnerToken({ TABDOCK_HOME: home }, systemFor(base)))).toContain(
-          `inside the git work tree ${repo}`,
+          'inside a git work tree whose top is the directory 3 levels above it',
         );
         expect(existsSync(join(repo, 'deep'))).toBe(false);
       });
@@ -685,11 +775,13 @@ describe('the repository rule (ADR 0028), in a checkout and in the package alike
         const message = from(submodule, () =>
           refusal(() => loadOwnerToken({ TABDOCK_HOME: home }, systemFor(base))),
         );
-        expect(message).toContain(`inside the git work tree ${outer},`);
-        // A token directory inside the submodule names the nearer tree.
+        expect(message).toContain(
+          'inside a git work tree whose top is the directory just above it,',
+        );
+        // A token directory inside the submodule names the nearer tree, not the outer 4 levels up.
         const inner = join(submodule, '.tabdock');
         expect(refusal(() => loadOwnerToken({ TABDOCK_HOME: inner }, systemFor(base)))).toContain(
-          `inside the git work tree ${submodule},`,
+          'inside a git work tree whose top is the directory just above it,',
         );
       });
 
@@ -701,7 +793,9 @@ describe('the repository rule (ADR 0028), in a checkout and in the package alike
         const message = from(outside, () =>
           refusal(() => loadOwnerToken({ TABDOCK_HOME: join(repo, 'tokens') }, systemFor(base))),
         );
-        expect(message).toContain(`inside the git work tree ${repo},`);
+        expect(message).toContain(
+          'inside a git work tree whose top is the directory just above it,',
+        );
       });
 
       it('refuses a project that installed the package, run from elsewhere with TABDOCK_HOME inside it', () => {
@@ -717,7 +811,9 @@ describe('the repository rule (ADR 0028), in a checkout and in the package alike
             ),
           ),
         );
-        expect(message).toContain(`inside the git work tree ${project},`);
+        expect(message).toContain(
+          'inside a git work tree whose top is the directory 2 levels above it,',
+        );
       });
 
       it('refuses the default directory when ~/.config, or the home itself, is a work tree, naming TABDOCK_HOME as the fix', () => {
@@ -753,7 +849,7 @@ describe('the repository rule (ADR 0028), in a checkout and in the package alike
         symlinkSync(join(repo, 'docs'), link);
         expect(
           refusal(() => loadOwnerToken({ TABDOCK_HOME: join(link, 'tabdock') }, systemFor(base))),
-        ).toContain(`inside the git work tree ${repo},`);
+        ).toContain('inside a git work tree whose top is the directory 2 levels above it,');
         expect(existsSync(join(repo, 'docs', 'tabdock'))).toBe(false);
       });
 
@@ -775,7 +871,7 @@ describe('the repository rule (ADR 0028), in a checkout and in the package alike
           for (const load of [loadOwnerToken, readOwnerToken]) {
             const message = refusal(() => load({ TABDOCK_HOME: home }, systemFor(base)));
             expect(message, marker).toContain(
-              `inside the ${tool} work tree ${repo}, where the token could be committed;`,
+              `inside a ${tool} work tree whose top is the directory just above it, where the token could be committed;`,
             );
           }
           expect(existsSync(home), marker).toBe(false);
@@ -787,7 +883,7 @@ describe('the repository rule (ADR 0028), in a checkout and in the package alike
         mkdirSync(join(both, '.git'));
         expect(
           refusal(() => loadOwnerToken({ TABDOCK_HOME: join(both, 't') }, systemFor(base))),
-        ).toContain(`inside the git work tree ${both},`);
+        ).toContain('inside a git work tree whose top is the directory just above it,');
       });
 
       it('takes a directory under no work tree at all', () => {
@@ -810,7 +906,7 @@ describe('the repository rule (ADR 0028), in a checkout and in the package alike
       return lstatSync(path);
     };
     expect(refusal(() => loadOwnerToken({ TABDOCK_HOME: home }, { lstat }))).toContain(
-      `cannot tell whether ${base} is a repository's work tree (EACCES`,
+      `cannot tell whether the directory just above ${GIVEN_HOME} is a repository's work tree (EACCES on its .git)`,
     );
     expect(existsSync(home)).toBe(false);
   });
@@ -932,11 +1028,11 @@ describe('--new-token (ADR 0028)', () => {
     const home = join(base, 'repo', 'tabdock');
     expect(
       refusal(() => loadOwnerToken({ TABDOCK_HOME: home }, { replaceToken: () => undefined })),
-    ).toMatch(/inside the git work tree/);
+    ).toMatch(/inside a git work tree whose top is/);
     expect(existsSync(home)).toBe(false);
   });
 
-  it('names the path when something that is not a file holds the name', () => {
+  it('names the file, from TABDOCK_HOME, when something that is not a file holds the name', () => {
     const home = join(scratch(), 'tabdock');
     mkdirSync(join(home, OWNER_TOKEN_FILE, 'inside'), { recursive: true, mode: 0o700 });
     chmodSync(home, 0o700);
@@ -944,7 +1040,7 @@ describe('--new-token (ADR 0028)', () => {
     const message = refusal(() => {
       next.commit();
     });
-    expect(message).toContain(join(home, OWNER_TOKEN_FILE));
+    fromHome(message, home, `${OWNER_TOKEN_FILE} in ${GIVEN_HOME}`);
     expect(message).toMatch(/cannot put a new owner token in place.*delete it and start again/);
     expect(leakIn(message, next.token)).toBeNull();
     expect(readdirSync(home).filter((name) => name.endsWith('.tmp'))).toEqual([]);

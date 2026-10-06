@@ -5,7 +5,8 @@
 // a file or directory that another account owns, that grants anyone else any
 // permission, or that is not what it should be is refused, never repaired,
 // since a readable file may already be copied and rewriting a bad one would
-// hide tampering. Every refusal names the path and the fix, never the contents.
+// hide tampering. Every refusal names the path and the fix, never the contents,
+// and with TABDOCK_HOME set names the path only from that setting (PathNames).
 //
 // ADR 0028 adds three things. A token directory inside any repository's work
 // tree is refused, in a checkout and in the package alike, since the token
@@ -94,6 +95,42 @@ export interface LocalTokenSystem {
 
 /** Where the variables come from: process.env, or a test's own object. */
 export type TokenEnv = Readonly<Record<string, string | undefined>>;
+
+/**
+ * How refusals name the token directory and the paths around it. With
+ * TABDOCK_HOME set the directory is that setting's value, and a value pasted
+ * into the wrong variable passes as a directory once it is absolute: a dev
+ * token or the /pair client secret may be any printable characters, '/'
+ * among them (auth.ts, config.ts). So the directory, anything in it and
+ * anything above it are then named from the variable, never spelled out, as
+ * the audit reader names a path it was given (ADR 0028); the checkout, which
+ * the relay knows without it, is still named in full. Without TABDOCK_HOME the
+ * directory comes from the platform's own variables and is named in full, as
+ * the banner names it.
+ */
+export interface PathNames {
+  /** Whether paths are named from TABDOCK_HOME rather than spelled out. */
+  readonly fromSetting: boolean;
+  /** A path at, in or above the token directory, as a refusal names it. */
+  of(path: string): string;
+  /** How many levels `path` lies above the token directory (0 at it), or null when it does not. */
+  levelsAbove(path: string): number | null;
+}
+
+/** How a path given by TABDOCK_HOME is named, as the audit reader names --dir's. */
+export const GIVEN_HOME = 'the path TABDOCK_HOME gives';
+
+/** Paths spelled out: the per-user default, and tools that chose the directory themselves. */
+export const SHOWN_PATHS: PathNames = {
+  fromSetting: false,
+  of: (path) => path,
+  levelsAbove: () => null,
+};
+
+/** The platform's facts, and how this start's refusals name paths. */
+interface TokenContext extends LocalTokenSystem {
+  readonly names: PathNames;
+}
 
 export interface OwnerToken {
   /** The file's real path, which the banner prints and the printed command reads. */
@@ -235,6 +272,61 @@ function isWithin(child: string, parent: string, platform: NodeJS.Platform): boo
   return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
+/** A directory some levels above another, before the other's name: "the directory just above". */
+function aboveText(levels: number): string {
+  return levels === 1 ? 'the directory just above' : `the directory ${String(levels)} levels above`;
+}
+
+/**
+ * PathNames for this environment: from TABDOCK_HOME when it is set and
+ * absolute (a relative one is refused without naming it), else spelled out.
+ * The directory is known both as given and as its real path, since a check
+ * may name either; resolving the real path may itself fail, and then the
+ * given one alone anchors the names.
+ */
+export function pathNames(env: TokenEnv, overrides: Partial<LocalTokenSystem> = {}): PathNames {
+  const given = setting(env, 'TABDOCK_HOME');
+  if (given === undefined || !isAbsolute(given)) return SHOWN_PATHS;
+  const { platform } = systemOf(overrides);
+  const resolved = resolve(given);
+  const anchors = [resolved];
+  try {
+    anchors.push(realpathNearest(resolved));
+  } catch {
+    // Named from the path as given.
+  }
+  const fold = (path: string): string => (caseless(platform) ? path.toLowerCase() : path);
+  const levelsAbove = (path: string): number | null => {
+    for (const anchor of anchors) {
+      if (!isWithin(anchor, path, platform)) continue;
+      let levels = 0;
+      for (let current = anchor; fold(current) !== fold(path); current = dirname(current)) {
+        if (dirname(current) === current) return null;
+        levels += 1;
+      }
+      return levels;
+    }
+    return null;
+  };
+  return {
+    fromSetting: true,
+    of(path) {
+      const levels = levelsAbove(path);
+      if (levels === 0) return GIVEN_HOME;
+      if (levels !== null) return `${aboveText(levels)} ${GIVEN_HOME}`;
+      const inside = anchors.find((anchor) => isWithin(path, anchor, platform));
+      if (inside !== undefined) return `${relative(inside, path)} in ${GIVEN_HOME}`;
+      // Nothing a check names lies elsewhere, but if something did it could hold the value.
+      return `a path ${GIVEN_HOME} leads to`;
+    },
+    levelsAbove,
+  };
+}
+
+function contextOf(names: PathNames, overrides: Partial<LocalTokenSystem>): TokenContext {
+  return { ...systemOf(overrides), names };
+}
+
 /**
  * What marks the top of a work tree, for each version control tool that could
  * commit a file left inside one, git first so a colocated Jujutsu repository
@@ -258,10 +350,7 @@ const WORK_TREE_MARKERS: readonly (readonly [entry: string, tool: string])[] = [
  * does. An entry the relay cannot even look for is refused rather than
  * guessed absent.
  */
-function workTreeAround(
-  real: string,
-  system: LocalTokenSystem,
-): { path: string; tool: string } | null {
+function workTreeAround(real: string, system: TokenContext): { path: string; tool: string } | null {
   let current = real;
   for (;;) {
     for (const [marker, tool] of WORK_TREE_MARKERS) {
@@ -273,7 +362,7 @@ function workTreeAround(
         const code = errorCode(error);
         if (code !== 'ENOENT' && code !== 'ENOTDIR') {
           throw new OwnerTokenError(
-            `local mode cannot tell whether ${current} is a repository's work tree (${code ?? 'error'} on ${entry}), so it will not keep its owner token below it; set TABDOCK_HOME to an absolute path outside any repository (ADR 0028)`,
+            `local mode cannot tell whether ${system.names.of(current)} is a repository's work tree (${code ?? 'error'} on its ${marker}), so it will not keep its owner token below it; set TABDOCK_HOME to an absolute path outside any repository (ADR 0028)`,
           );
         }
       }
@@ -359,13 +448,33 @@ export function sharedAncestor(
  * unpacked source archive; the work tree rule covers every repository the
  * token could be committed from, whoever started the relay from wherever.
  */
-function checkPlace(dir: string, env: TokenEnv, system: LocalTokenSystem): void {
+function checkPlace(dir: string, env: TokenEnv, system: TokenContext): void {
+  try {
+    checkPlaceOf(dir, env, system);
+  } catch (error) {
+    if (error instanceof OwnerTokenError) throw error;
+    // A realpath or stat that failed past ENOENT: node's own message would quote the path.
+    throw new OwnerTokenError(
+      `local mode cannot examine ${system.names.of(dir)} for its owner token (${errorCode(error) ?? 'error'}); set TABDOCK_HOME to an absolute path you can reach, outside every repository (ADR 0022)`,
+    );
+  }
+}
+
+/** A directory above the token directory, after a clause whose subject is the token directory. */
+function aboveIt(path: string, system: TokenContext): string {
+  const levels = system.names.levelsAbove(path);
+  return levels === null ? `${system.names.of(path)} above it` : `${aboveText(levels)} it`;
+}
+
+function checkPlaceOf(dir: string, env: TokenEnv, system: TokenContext): void {
+  const named = system.names.of(dir);
   const real = realpathNearest(dir);
   if (system.checkout !== null) {
     const checkout = realpathNearest(system.checkout);
     if (isWithin(real, checkout, system.platform)) {
+      // The checkout is the relay's own place, known without TABDOCK_HOME, so it is named.
       throw new OwnerTokenError(
-        `local mode refuses ${dir} for its owner token: it lies inside the checkout ${checkout}, where the token could be committed; set TABDOCK_HOME to an absolute path outside it, or unset it (ADR 0022)`,
+        `local mode refuses ${named} for its owner token: it lies inside the checkout ${checkout}, where the token could be committed; set TABDOCK_HOME to an absolute path outside it, or unset it (ADR 0022)`,
       );
     }
   }
@@ -375,8 +484,13 @@ function checkPlace(dir: string, env: TokenEnv, system: LocalTokenSystem): void 
       setting(env, 'TABDOCK_HOME') === undefined
         ? 'set TABDOCK_HOME to an absolute path outside every repository'
         : 'set TABDOCK_HOME to an absolute path outside every repository, or unset it';
+    const levels = system.names.levelsAbove(tree.path);
+    const where =
+      levels === null
+        ? `the ${tree.tool} work tree ${tree.path}`
+        : `a ${tree.tool} work tree whose top is ${levels === 0 ? 'that directory itself' : `${aboveText(levels)} it`}`;
     throw new OwnerTokenError(
-      `local mode refuses ${dir} for its owner token: it lies inside the ${tree.tool} work tree ${tree.path}, where the token could be committed; ${fix} (ADR 0028)`,
+      `local mode refuses ${named} for its owner token: it lies inside ${where}, where the token could be committed; ${fix} (ADR 0028)`,
     );
   }
   if (system.platform !== 'win32') {
@@ -386,7 +500,7 @@ function checkPlace(dir: string, env: TokenEnv, system: LocalTokenSystem): void 
       const elsewhere = 'set TABDOCK_HOME to an absolute path under your home directory';
       const fix = shared.fixable ? `run chmod go-w on it, or ${elsewhere}` : elsewhere;
       throw new OwnerTokenError(
-        `local mode refuses ${dir} for its owner token: ${shared.path} above it ${shared.why}, so another account could make the directory again once it is gone and have Claude Code run a header helper of its own; ${fix} (ADR 0028)`,
+        `local mode refuses ${named} for its owner token: ${aboveIt(shared.path, system)} ${shared.why}, so another account could make the directory again once it is gone and have Claude Code run a header helper of its own; ${fix} (ADR 0028)`,
       );
     }
     return;
@@ -397,7 +511,7 @@ function checkPlace(dir: string, env: TokenEnv, system: LocalTokenSystem): void 
   ].filter((anchor): anchor is string => anchor !== undefined && isAbsolute(anchor));
   if (!anchors.some((anchor) => isWithin(real, realpathNearest(anchor), system.platform))) {
     throw new OwnerTokenError(
-      `local mode refuses ${dir} for its owner token: on Windows it must lie under %LOCALAPPDATA% or %USERPROFILE%, whose default access list admits only you, SYSTEM and Administrators; set TABDOCK_HOME to a directory there, or unset it (ADR 0022)`,
+      `local mode refuses ${named} for its owner token: on Windows it must lie under %LOCALAPPDATA% or %USERPROFILE%, whose default access list admits only you, SYSTEM and Administrators; set TABDOCK_HOME to a directory there, or unset it (ADR 0022)`,
     );
   }
 }
@@ -412,7 +526,8 @@ export function placeRefusal(
   overrides: Partial<LocalTokenSystem> = {},
 ): string | null {
   try {
-    checkPlace(resolve(dir), { TABDOCK_HOME: dir }, systemOf(overrides));
+    // The caller chose the directory itself, so the refusal may spell it out.
+    checkPlace(resolve(dir), { TABDOCK_HOME: dir }, contextOf(SHOWN_PATHS, overrides));
     return null;
   } catch (error) {
     if (error instanceof OwnerTokenError) return error.message;
@@ -420,7 +535,7 @@ export function placeRefusal(
   }
 }
 
-function makeDirectory(dir: string): void {
+function makeDirectory(dir: string, system: TokenContext): void {
   try {
     // Parents made here get 0700 too, which suits a per-user configuration directory.
     mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -428,18 +543,18 @@ function makeDirectory(dir: string): void {
     // Something already there that is not a directory is named by checkDirectory.
     if (errorCode(error) === 'EEXIST') return;
     throw new OwnerTokenError(
-      `local mode cannot create ${dir} for its owner token (${errorCode(error) ?? 'error'}); set TABDOCK_HOME to an absolute path you can write, outside the checkout (ADR 0022)`,
+      `local mode cannot create ${system.names.of(dir)} for its owner token (${errorCode(error) ?? 'error'}); set TABDOCK_HOME to an absolute path you can write, outside the checkout (ADR 0022)`,
     );
   }
 }
 
-function realDirectory(dir: string): string | null {
+function realDirectory(dir: string, system: TokenContext): string | null {
   try {
     return realpathSync.native(dir);
   } catch (error) {
     if (errorCode(error) === 'ENOENT') return null;
     throw new OwnerTokenError(
-      `local mode cannot open ${dir}, which holds its owner token (${errorCode(error) ?? 'error'}); delete it and start again, or set TABDOCK_HOME (ADR 0022)`,
+      `local mode cannot open ${system.names.of(dir)}, which holds its owner token (${errorCode(error) ?? 'error'}); delete it and start again, or set TABDOCK_HOME (ADR 0022)`,
     );
   }
 }
@@ -448,29 +563,30 @@ function octal(mode: number): string {
   return (mode & 0o777).toString(8).padStart(3, '0');
 }
 
-function checkDirectory(dir: string, system: LocalTokenSystem): void {
+function checkDirectory(dir: string, system: TokenContext): void {
+  const named = system.names.of(dir);
   const facts = system.lstat(dir);
   if (!facts.isDirectory()) {
     throw new OwnerTokenError(
-      `local mode refuses ${dir}: it should be the directory holding the owner token but is not a directory; delete it and start again (ADR 0022)`,
+      `local mode refuses ${named}: it should be the directory holding the owner token but is not a directory; delete it and start again (ADR 0022)`,
     );
   }
   if (system.platform === 'win32') return;
   if (facts.uid !== system.uid) {
     throw new OwnerTokenError(
-      `local mode refuses ${dir}: another account owns it, so the owner token inside cannot be trusted; delete it and start again, or set TABDOCK_HOME to a directory of your own (ADR 0022)`,
+      `local mode refuses ${named}: another account owns it, so the owner token inside cannot be trusted; delete it and start again, or set TABDOCK_HOME to a directory of your own (ADR 0022)`,
     );
   }
   if ((facts.mode & 0o077) !== 0) {
     throw new OwnerTokenError(
-      `local mode refuses ${dir}: it lets other accounts in (mode ${octal(facts.mode)}); run chmod 700 on it and start again (ADR 0022)`,
+      `local mode refuses ${named}: it lets other accounts in (mode ${octal(facts.mode)}); run chmod 700 on it and start again (ADR 0022)`,
     );
   }
 }
 
-function malformed(file: string): OwnerTokenError {
+function malformed(file: string, system: TokenContext): OwnerTokenError {
   return new OwnerTokenError(
-    `local mode refuses ${file}: it is not a well-formed owner token; delete it and start again for a new one (ADR 0022)`,
+    `local mode refuses ${system.names.of(file)}: it is not a well-formed owner token; delete it and start again for a new one (ADR 0022)`,
   );
 }
 
@@ -479,15 +595,16 @@ function malformed(file: string): OwnerTokenError {
  * following a symlink (O_NONBLOCK keeps a FIFO from stalling the open) and
  * checked through the descriptor, so what is checked is what is read.
  */
-function readTokenFile(file: string, system: LocalTokenSystem): string | null {
+function readTokenFile(file: string, system: TokenContext): string | null {
   const windows = system.platform === 'win32';
+  const named = system.names.of(file);
   let fd: number;
   try {
     if (windows) {
       // Node has no O_NOFOLLOW on Windows, so lstat stands in for it.
       if (!system.lstat(file).isFile()) {
         throw new OwnerTokenError(
-          `local mode refuses ${file}: it is not a regular file; delete it and start again (ADR 0022)`,
+          `local mode refuses ${named}: it is not a regular file; delete it and start again (ADR 0022)`,
         );
       }
       fd = openSync(file, constants.O_RDONLY);
@@ -500,33 +617,33 @@ function readTokenFile(file: string, system: LocalTokenSystem): string | null {
     if (code === 'ENOENT') return null;
     if (code === 'ELOOP' || code === 'EMLINK') {
       throw new OwnerTokenError(
-        `local mode refuses ${file}: it is a symbolic link, not the owner token itself; delete it and start again (ADR 0022)`,
+        `local mode refuses ${named}: it is a symbolic link, not the owner token itself; delete it and start again (ADR 0022)`,
       );
     }
     throw new OwnerTokenError(
-      `local mode cannot open ${file} (${code ?? 'error'}); it should belong to you with mode 600: delete it and start again (ADR 0022)`,
+      `local mode cannot open ${named} (${code ?? 'error'}); it should belong to you with mode 600: delete it and start again (ADR 0022)`,
     );
   }
   try {
     const facts = system.fstat(fd);
     if (!facts.isFile()) {
       throw new OwnerTokenError(
-        `local mode refuses ${file}: it is not a regular file; delete it and start again (ADR 0022)`,
+        `local mode refuses ${named}: it is not a regular file; delete it and start again (ADR 0022)`,
       );
     }
     if (!windows) {
       if (facts.uid !== system.uid) {
         throw new OwnerTokenError(
-          `local mode refuses ${file}: another account owns it, so it cannot be trusted; delete it and start again (ADR 0022)`,
+          `local mode refuses ${named}: another account owns it, so it cannot be trusted; delete it and start again (ADR 0022)`,
         );
       }
       if ((facts.mode & 0o077) !== 0) {
         throw new OwnerTokenError(
-          `local mode refuses ${file}: other accounts may read or write it (mode ${octal(facts.mode)}); run chmod 600 on it if nobody else could have read it, or else delete it and start again for a new token (ADR 0022)`,
+          `local mode refuses ${named}: other accounts may read or write it (mode ${octal(facts.mode)}); run chmod 600 on it if nobody else could have read it, or else delete it and start again for a new token (ADR 0022)`,
         );
       }
     }
-    if (facts.size > MAX_FILE_BYTES) throw malformed(file);
+    if (facts.size > MAX_FILE_BYTES) throw malformed(file, system);
     const buffer = Buffer.alloc(MAX_FILE_BYTES + 1);
     let length = 0;
     for (;;) {
@@ -538,7 +655,7 @@ function readTokenFile(file: string, system: LocalTokenSystem): string | null {
     // latin1 maps each byte to one character, so no decoding can turn junk into a match.
     const text = buffer.toString('latin1', 0, length);
     buffer.fill(0);
-    if (length > MAX_FILE_BYTES || !TOKEN_FILE_PATTERN.test(text)) throw malformed(file);
+    if (length > MAX_FILE_BYTES || !TOKEN_FILE_PATTERN.test(text)) throw malformed(file, system);
     return text.slice(0, TOKEN_LENGTH);
   } finally {
     closeSync(fd);
@@ -582,7 +699,7 @@ function writeTemporary(
   name: string,
   text: string,
   mode: number,
-  system: LocalTokenSystem,
+  system: TokenContext,
   encoding: 'latin1' | 'utf8' = 'latin1',
 ): string {
   const temp = join(dir, `.${name}.${randomBytes(8).toString('hex')}.tmp`);
@@ -597,7 +714,7 @@ function writeTemporary(
     fd = openSync(temp, flags, mode);
   } catch (error) {
     throw new OwnerTokenError(
-      `local mode cannot write its ${name} in ${dir} (${errorCode(error) ?? 'error'}); set TABDOCK_HOME to an absolute path you can write, outside the checkout (ADR 0022)`,
+      `local mode cannot write its ${name} in ${system.names.of(dir)} (${errorCode(error) ?? 'error'}); set TABDOCK_HOME to an absolute path you can write, outside the checkout (ADR 0022)`,
     );
   }
   try {
@@ -629,7 +746,10 @@ function removeQuietly(path: string): void {
  * got there first, and its token is the one to read.
  */
 export function drawOwnerToken(dir: string, overrides: Partial<LocalTokenSystem> = {}): boolean {
-  const system = systemOf(overrides);
+  return drawInto(dir, contextOf(SHOWN_PATHS, overrides));
+}
+
+function drawInto(dir: string, system: TokenContext): boolean {
   const file = join(dir, OWNER_TOKEN_FILE);
   const temp = writeTemporary(dir, OWNER_TOKEN_FILE, `${freshToken()}\n`, 0o600, system);
   try {
@@ -638,7 +758,7 @@ export function drawOwnerToken(dir: string, overrides: Partial<LocalTokenSystem>
     } catch (error) {
       if (errorCode(error) === 'EEXIST') return false;
       throw new OwnerTokenError(
-        `local mode cannot put its owner token in place in ${dir} (${errorCode(error) ?? 'error'}), which needs a file system with hard links; set TABDOCK_HOME to a directory on a local disk (ADR 0022)`,
+        `local mode cannot put its owner token in place in ${system.names.of(dir)} (${errorCode(error) ?? 'error'}), which needs a file system with hard links; set TABDOCK_HOME to a directory on a local disk (ADR 0022)`,
       );
     }
     if (system.platform !== 'win32') syncDirectory(dir);
@@ -655,7 +775,7 @@ export function drawOwnerToken(dir: string, overrides: Partial<LocalTokenSystem>
  * again first, since time has passed since the start checked it, and the file
  * is read back through the usual checks afterwards.
  */
-function replaceOwnerToken(dir: string, token: string, system: LocalTokenSystem): void {
+function replaceOwnerToken(dir: string, token: string, system: TokenContext): void {
   checkDirectory(dir, system);
   const file = join(dir, OWNER_TOKEN_FILE);
   const temp = writeTemporary(dir, OWNER_TOKEN_FILE, `${token}\n`, 0o600, system);
@@ -664,13 +784,13 @@ function replaceOwnerToken(dir: string, token: string, system: LocalTokenSystem)
   } catch (error) {
     removeQuietly(temp);
     throw new OwnerTokenError(
-      `local mode cannot put a new owner token in place at ${file} (${errorCode(error) ?? 'error'}); delete it and start again (ADR 0028)`,
+      `local mode cannot put a new owner token in place at ${system.names.of(file)} (${errorCode(error) ?? 'error'}); delete it and start again (ADR 0028)`,
     );
   }
   if (system.platform !== 'win32') syncDirectory(dir);
   if (readTokenFile(file, system) !== token) {
     throw new OwnerTokenError(
-      `local mode put a new owner token at ${file} but read back another; something else writes there: stop it, delete the file and start again (ADR 0028)`,
+      `local mode put a new owner token at ${system.names.of(file)} but read back another; something else writes there: stop it, delete the file and start again (ADR 0028)`,
     );
   }
 }
@@ -730,7 +850,14 @@ export function ensureHeadersHelper(
   overrides: Partial<LocalTokenSystem> = {},
   earlier: readonly ((tokenPath: string) => string)[] = EARLIER_HELPER_TEXTS,
 ): HelperOutcome {
-  const system = systemOf(overrides);
+  return ensureHelper(tokenPath, contextOf(SHOWN_PATHS, overrides), earlier);
+}
+
+function ensureHelper(
+  tokenPath: string,
+  system: TokenContext,
+  earlier: readonly ((tokenPath: string) => string)[] = EARLIER_HELPER_TEXTS,
+): HelperOutcome {
   const dir = dirname(tokenPath);
   const file = join(dir, HEADERS_HELPER_FILE);
   const text = headersHelperText(tokenPath);
@@ -746,7 +873,7 @@ export function ensureHeadersHelper(
       } catch (error) {
         removeQuietly(temp);
         throw new OwnerTokenError(
-          `local mode cannot replace ${file}, which an earlier release wrote (${errorCode(error) ?? 'error'}); delete it and start again (ADR 0028)`,
+          `local mode cannot replace ${system.names.of(file)}, which an earlier release wrote (${errorCode(error) ?? 'error'}); delete it and start again (ADR 0028)`,
         );
       }
       syncDirectory(dir);
@@ -760,7 +887,7 @@ export function ensureHeadersHelper(
     } catch (error) {
       if (errorCode(error) !== 'EEXIST') {
         throw new OwnerTokenError(
-          `local mode cannot put ${file} in place (${errorCode(error) ?? 'error'}); set TABDOCK_HOME to a directory on a local disk (ADR 0028)`,
+          `local mode cannot put ${system.names.of(file)} in place (${errorCode(error) ?? 'error'}); set TABDOCK_HOME to a directory on a local disk (ADR 0028)`,
         );
       }
     } finally {
@@ -768,7 +895,7 @@ export function ensureHeadersHelper(
     }
   }
   throw new OwnerTokenError(
-    `local mode could not keep ${file} in place: something keeps changing it; stop whatever does and start again (ADR 0028)`,
+    `local mode could not keep ${system.names.of(file)} in place: something keeps changing it; stop whatever does and start again (ADR 0028)`,
   );
 }
 
@@ -777,13 +904,9 @@ export function ensureHeadersHelper(
  * file; anything else is refused. Read through the descriptor it was checked
  * through, never following a link.
  */
-function readHelper(
-  file: string,
-  system: LocalTokenSystem,
-  allowed: readonly string[],
-): string | null {
+function readHelper(file: string, system: TokenContext, allowed: readonly string[]): string | null {
   const refuse = (why: string, fix = 'delete it and start again'): OwnerTokenError =>
-    new OwnerTokenError(`local mode refuses ${file}: ${why}; ${fix} (ADR 0028)`);
+    new OwnerTokenError(`local mode refuses ${system.names.of(file)}: ${why}; ${fix} (ADR 0028)`);
   let fd: number;
   try {
     fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -828,19 +951,15 @@ function readHelper(
 }
 
 /** The directory, checked; null when it does not exist and `create` is false. */
-function preparedDirectory(
-  env: TokenEnv,
-  system: LocalTokenSystem,
-  create: boolean,
-): string | null {
+function preparedDirectory(env: TokenEnv, system: TokenContext, create: boolean): string | null {
   const dir = ownerTokenDirectory(env, system);
   checkPlace(dir, env, system);
-  if (create) makeDirectory(dir);
-  const real = realDirectory(dir);
+  if (create) makeDirectory(dir, system);
+  const real = realDirectory(dir, system);
   if (real === null) {
     if (create) {
       throw new OwnerTokenError(
-        `local mode cannot create ${dir} for its owner token; set TABDOCK_HOME to an absolute path you can write, outside the checkout (ADR 0022)`,
+        `local mode cannot create ${system.names.of(dir)} for its owner token; set TABDOCK_HOME to an absolute path you can write, outside the checkout (ADR 0022)`,
       );
     }
     return null;
@@ -863,7 +982,7 @@ export function loadOwnerToken(
   env: TokenEnv,
   overrides: Partial<LocalTokenSystem> = {},
 ): OwnerToken {
-  const system = systemOf(overrides);
+  const system = contextOf(pathNames(env, overrides), overrides);
   const dir = preparedDirectory(env, system, true);
   if (dir === null) throw new OwnerTokenError('local mode could not prepare its token directory');
   const file = join(dir, OWNER_TOKEN_FILE);
@@ -871,14 +990,14 @@ export function loadOwnerToken(
     ? newOwnerToken(dir, file, system, system.replaceToken)
     : existingOrDrawn(dir, file, system);
   // Windows gets no helper until a Windows run shows which shell runs one there (ADR 0028).
-  if (system.platform !== 'win32') ensureHeadersHelper(file, system);
+  if (system.platform !== 'win32') ensureHelper(file, system);
   return owner;
 }
 
 function newOwnerToken(
   dir: string,
   file: string,
-  system: LocalTokenSystem,
+  system: TokenContext,
   replaceToken: (commit: () => void) => void,
 ): OwnerToken {
   const token = freshToken();
@@ -891,19 +1010,19 @@ function newOwnerToken(
   return { path: file, token, created: true };
 }
 
-function existingOrDrawn(dir: string, file: string, system: LocalTokenSystem): OwnerToken {
+function existingOrDrawn(dir: string, file: string, system: TokenContext): OwnerToken {
   // A file deleted between the failed link and the read, by hand or by a
   // racing start's loser, sends the loop round again; three rounds is plenty.
   for (let round = 0; round < 3; round += 1) {
     const found = readTokenFile(file, system);
     if (found !== null) return { path: file, token: found, created: false };
-    if (drawOwnerToken(dir, system)) {
+    if (drawInto(dir, system)) {
       const drawn = readTokenFile(file, system);
       if (drawn !== null) return { path: file, token: drawn, created: true };
     }
   }
   throw new OwnerTokenError(
-    `local mode could not keep its owner token at ${file}: something keeps removing it; stop whatever does and start again (ADR 0022)`,
+    `local mode could not keep its owner token at ${system.names.of(file)}: something keeps removing it; stop whatever does and start again (ADR 0022)`,
   );
 }
 
@@ -917,7 +1036,7 @@ export function readOwnerToken(
   env: TokenEnv,
   overrides: Partial<LocalTokenSystem> = {},
 ): OwnerToken | null {
-  const system = systemOf(overrides);
+  const system = contextOf(pathNames(env, overrides), overrides);
   const dir = preparedDirectory(env, system, false);
   if (dir === null) return null;
   const file = join(dir, OWNER_TOKEN_FILE);

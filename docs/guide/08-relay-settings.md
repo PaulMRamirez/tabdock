@@ -4,13 +4,13 @@ Every relay setting is an environment variable starting `TABDOCK_`, and every on
 
 ## How the relay reads them
 
-The relay reads its settings once, at start, so any change needs a restart. They come from the process environment. In a clone, `pnpm relay` and `pnpm audit:log` also load the checkout's root `.env`, where a variable already set in the environment wins, and `pnpm dev` runs the same relay. The container image holds no `.env`, and `tabdock-relay`, the command `npx @tabdock/relay` runs once 0.1.0 is on npm, reads none. An empty value counts as unset. [`.env.example`](../../.env.example) at the repository's root holds the same list as a commented template to copy to `.env`.
+The relay reads its settings from the process environment once, at start, so any change needs a restart. In a clone, `pnpm relay` and `pnpm audit:log` also load the checkout's root `.env`, where a variable already set in the environment wins, and `pnpm dev` runs the same relay. The container image holds no `.env`, and `tabdock-relay`, the command `npx @tabdock/relay` runs once 0.1.0 is on npm, reads none. An empty value counts as unset. [`.env.example`](../../.env.example) holds the same list as a commented template for `.env`.
 
 ## Value rules
 
 Flags take `1` or `true` to turn on, and `0`, `false` or empty to stay off, in any case; anything else, such as `yes` or spaces alone, stops the relay at start, though any other setting holding only spaces counts as unset. Counts are whole numbers from 1 to 999999999, with no sign or separator; settings in minutes may be at most 35791, the longest timer Node keeps. Byte settings are in bytes, so `TABDOCK_MAX_TOOL_BYTES=64` is refused rather than read as 64 MiB.
 
-A refusal names the variable and the rule broken but not the value, since a token may sit in the wrong variable; only a `TABDOCK_HOME` path, a `TABDOCK_HOST` off loopback and a `TABDOCK_ALLOWED_ORIGINS` entry are quoted back, the last as `allowed origin "<entry>"` without the variable's name.
+A refusal names the variable and the rule broken, never the value, since a token may sit in the wrong variable: a list entry by its place (`TABDOCK_ALLOWED_ORIGINS) entry 2`), and a directory `TABDOCK_HOME` or `TABDOCK_AUDIT_DIR` gives, or anything in or above it, by its setting (`the path TABDOCK_HOME gives`), as a token starting with `/` passes as a path. A default your platform chose is named in full.
 
 ## Mode and sign-in
 
@@ -81,14 +81,14 @@ The image's 192 MiB heap holds the default byte budgets; raise it with them ([Ru
 | `TABDOCK_AUDIT_RETENTION_DAYS` | with a directory, local mode's included | 30                                                                                                 | 1 to 3650 days                           | Deletes files older than this, never the current one                                                                          |
 | `TABDOCK_AUDIT_MAX_MB`         | with a directory, local mode's included | 64                                                                                                 | 8 to 1048576 MiB                         | Deletes the oldest files once all pass this                                                                                   |
 
-Each start begins a new file, and a file rotates at 8 MiB or at midnight UTC. Beside the files, `audit.gap` is padding reserved at start: a relay that stops while writes are failing keeps the count of lost records there, and the next start writes it as an `audit_gap` record.
+Each start begins a new file, which rotates at 8 MiB or midnight UTC. Beside them, `audit.gap` is padding reserved at start, where a relay stopping while writes fail keeps the count of lost records for the next start to write as an `audit_gap` record.
 
 ## Settings each mode refuses
 
-The relay refuses to start, naming the setting, rather than ignore one that would mean nothing where it is set: the OAuth and `/pair` settings, `TABDOCK_OAUTH_MAX_TOKEN_AGE` and `TABDOCK_OAUTH_CLIENT_IDS` included, without `TABDOCK_PUBLIC_URL`; `TABDOCK_CLIENT_ADDRESS_HEADER` unless `TABDOCK_ENV=production` with a public URL; and `TABDOCK_TRUSTED_PROXY_CIDR` without that header.
+The relay refuses to start, naming the setting, rather than ignore one meaningless where it is set: the OAuth and `/pair` settings, `TABDOCK_OAUTH_MAX_TOKEN_AGE` and `TABDOCK_OAUTH_CLIENT_IDS` included, without `TABDOCK_PUBLIC_URL`; `TABDOCK_CLIENT_ADDRESS_HEADER` unless `TABDOCK_ENV=production` with a public URL; and `TABDOCK_TRUSTED_PROXY_CIDR` without that header.
 
 It also refuses `TABDOCK_INVITES` in local mode; `TABDOCK_MAX_REQUESTS_PER_INVITEE` without invites; the two audit bounds with no directory; `TABDOCK_DEV_ALLOW_NO_ORIGIN` in production or with a public URL; `TABDOCK_SPIKE` in production; any listening address but loopback, or `0.0.0.0` in hosted mode; and production with no sign-in settings at all.
 
-The one exception is `TABDOCK_DEV_TOKENS` beside a public URL, which the relay ignores and says so in its banner, since a public relay takes only the provider's tokens.
+The one exception is `TABDOCK_DEV_TOKENS` beside a public URL, which the relay ignores, saying so in its banner, since a public relay takes only the provider's tokens.
 
 Next: [Use cases](09-use-cases.md).

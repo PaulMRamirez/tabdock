@@ -141,7 +141,7 @@ function judge(text: string, boot: string, ns: string): Verdict {
 }
 
 /** Puts `text` in place at `path` whole or not at all, through a file of this process's own linked there; false when a lock is there. */
-function place(dir: string, path: string, text: string): boolean {
+function place(dir: string, path: string, text: string, named: string): boolean {
   const own = join(dir, `.${TOKEN_LOCK_FILE}.${randomBytes(8).toString('hex')}.tmp`);
   try {
     const fd = openSync(
@@ -159,7 +159,7 @@ function place(dir: string, path: string, text: string): boolean {
   } catch (error) {
     if (errorCode(error) === 'EEXIST') return false;
     throw new TokenLockError(
-      `local mode cannot lock its token directory ${dir} (${errorCode(error)}); the relay must be able to create ${TOKEN_LOCK_FILE} there (ADR 0028)`,
+      `local mode cannot lock its token directory ${named} (${errorCode(error)}); the relay must be able to create ${TOKEN_LOCK_FILE} there (ADR 0028)`,
     );
   } finally {
     try {
@@ -201,14 +201,27 @@ function remove(path: string, expected: string): boolean {
 /**
  * Takes the token directory's lock for a local-mode relay, or throws a
  * TokenLockError naming the lock and the fix. `dir` is the token directory,
- * already checked by loadOwnerToken.
+ * already checked by loadOwnerToken; `name` is how its refusals name a path,
+ * from TABDOCK_HOME when that setting gave the directory (PathNames in
+ * local-token.ts), so a value pasted into the wrong variable is never repeated.
  */
-export function lockTokenDirectory(dir: string): TokenLock {
-  const real = realpathSync.native(dir);
+export function lockTokenDirectory(
+  dir: string,
+  name: (path: string) => string = (path) => path,
+): TokenLock {
+  let real: string;
+  try {
+    real = realpathSync.native(dir);
+  } catch (error) {
+    // Node's own message would quote the path.
+    throw new TokenLockError(
+      `local mode cannot open its token directory ${name(dir)} (${errorCode(error)}); start the relay again (ADR 0028)`,
+    );
+  }
   const path = join(real, TOKEN_LOCK_FILE);
   if (heldHere.has(real)) {
     throw new TokenLockError(
-      `local mode's token directory ${real} is already in use by a relay in this process; one relay serves one owner token (ADR 0028)`,
+      `local mode's token directory, ${name(real)}, is already in use by a relay in this process; one relay serves one owner token (ADR 0028)`,
     );
   }
   const boot = bootId();
@@ -216,10 +229,10 @@ export function lockTokenDirectory(dir: string): TokenLock {
   const text = `${String(process.pid)} ${boot} ${ns} ${randomBytes(16).toString('hex')}\n`;
   const inUse = (by: string): TokenLockError =>
     new TokenLockError(
-      `local mode's token directory ${real} is in use by another relay, ${by}; stop that relay first (and with it the old owner token), or, if none is running, delete ${path} and start again (ADR 0028)`,
+      `local mode's token directory, ${name(real)}, is in use by another relay, ${by}; stop that relay first (and with it the old owner token), or, if none is running, delete ${name(path)} and start again (ADR 0028)`,
     );
   for (let attempt = 0; attempt < ATTEMPTS; attempt += 1) {
-    if (place(real, path, text)) {
+    if (place(real, path, text, name(real))) {
       heldHere.add(real);
       let held = true;
       return {
@@ -236,15 +249,17 @@ export function lockTokenDirectory(dir: string): TokenLock {
     // Released between the link and the look: try again.
     if (seen === null) continue;
     const verdict = judge(seen, boot, ns);
-    if (verdict.kind === 'live') throw inUse(`pid ${String(verdict.pid)}, which holds ${path}`);
+    if (verdict.kind === 'live') {
+      throw inUse(`pid ${String(verdict.pid)}, which holds ${name(path)}`);
+    }
     if (verdict.kind === 'unknown') {
-      throw inUse(`perhaps in another container, whose lock ${path} this relay cannot judge`);
+      throw inUse(`perhaps in another container, whose lock ${name(path)} this relay cannot judge`);
     }
     // 'here' with nothing held here is a lock an earlier process with this pid left, as is 'gone'.
     remove(path, seen);
   }
   throw new TokenLockError(
-    `local mode cannot lock its token directory ${real}: another relay keeps taking ${path} (ADR 0028)`,
+    `local mode cannot lock its token directory ${name(real)}: another relay keeps taking ${name(path)} (ADR 0028)`,
   );
 }
 
@@ -253,12 +268,16 @@ export function lockTokenDirectory(dir: string): TokenLock {
  * which createRelay runs before it listens, to its stop, which it runs when
  * the relay closes or fails to start.
  */
-export function holdingTokenLock(auth: AuthPlugin, dir: string): AuthPlugin {
+export function holdingTokenLock(
+  auth: AuthPlugin,
+  dir: string,
+  name?: (path: string) => string,
+): AuthPlugin {
   let lock: TokenLock | null = null;
   return {
     ...auth,
     async start(context) {
-      lock = lockTokenDirectory(dir);
+      lock = lockTokenDirectory(dir, name);
       await auth.start?.(context);
     },
     stop() {

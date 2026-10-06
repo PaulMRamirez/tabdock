@@ -21,7 +21,7 @@
 // (ADR 0027).
 
 import { BlockList, isIP, isIPv6 } from 'node:net';
-import { dirname, isAbsolute, join } from 'node:path';
+import { basename, dirname, isAbsolute, join } from 'node:path';
 import {
   ATTACH_REQUEST_TTL_MS,
   DEFAULT_CALL_DEADLINE_MS,
@@ -35,9 +35,17 @@ import {
   type RelayMode,
   RESUME_WINDOW_MS,
 } from '@tabdock/protocol';
+import type { AuditDirNames } from './audit-file.ts';
 import { type AuthPlugin, createDevTokenAuth, parseDevTokens } from './auth.ts';
 import { CONFIRMATION_TTL_MS } from './confirm.ts';
-import { LOCAL_USER, type LocalTokenSystem, loadOwnerToken } from './local-token.ts';
+import {
+  GIVEN_HOME,
+  LOCAL_USER,
+  type LocalTokenSystem,
+  loadOwnerToken,
+  type PathNames,
+  pathNames,
+} from './local-token.ts';
 import type { LogLevel, LogSink } from './log.ts';
 import { createOAuthAuth, parseOAuthClientIds, parseOAuthUsers } from './oauth.ts';
 import type { RelayStore } from './store.ts';
@@ -274,6 +282,8 @@ export interface RelayLimits {
  */
 export interface ResolvedAudit {
   dir: string | null;
+  /** How refusals name the directory and its files; its path with TABDOCK_AUDIT_DIR when null. */
+  names: AuditDirNames | null;
   /** Files older than this many days are deleted, never the current one. */
   retentionDays: number;
   /** The oldest files go once all of them pass this many bytes, never the current one. */
@@ -388,6 +398,8 @@ export interface RelayOptions {
         dir?: string | undefined;
         retentionDays?: number | undefined;
         maxMb?: number | undefined;
+        /** How refusals name the directory and its files; its path with TABDOCK_AUDIT_DIR unless given. */
+        names?: AuditDirNames | undefined;
       }
     | undefined;
 }
@@ -742,7 +754,9 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
       );
     }
     if (!isLoopbackHost(host)) {
-      throw new Error(`${name} and refuses to bind ${host}; it listens only on loopback`);
+      throw new Error(
+        `${name} and refuses to bind a host (TABDOCK_HOST) off loopback, the only place it listens`,
+      );
     }
     if (options.invites === true) {
       throw new Error(
@@ -799,11 +813,13 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
       throw new Error('allowedOrigins is empty; list at least one page origin (SPEC S2)');
     }
     const allowed = new Set<string>();
-    for (const entry of options.allowedOrigins) {
+    // A bad entry is named by its place, never echoed, as for /mcp's list:
+    // a token may sit in the wrong variable.
+    for (const [index, entry] of options.allowedOrigins.entries()) {
       const parsed = parseOrigin(entry.trim());
       if (parsed === null) {
         throw new Error(
-          `allowed origin "${entry}" is not an origin such as https://app.example or http://localhost:5173`,
+          `allowedOrigins (TABDOCK_ALLOWED_ORIGINS) entry ${String(index + 1)} is not an origin such as https://app.example or http://localhost:5173`,
         );
       }
       allowed.add(parsed);
@@ -869,12 +885,13 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     : [];
   // S12: a plaintext listener off loopback is safe only behind an edge that
   // terminates TLS and names the client, so hosted mode alone may bind the
-  // IPv4 wildcard, and nothing may bind any other address (ADR 0018).
+  // IPv4 wildcard, and nothing may bind any other address (ADR 0018). The
+  // host is not repeated: a token may sit in the wrong variable.
   if (!isLoopbackHost(host) && !(hosted && host === HOSTED_WILDCARD_HOST)) {
     throw new Error(
       hosted
-        ? `refusing to bind ${host}: hosted mode binds loopback or ${HOSTED_WILDCARD_HOST} (TABDOCK_HOST), never another address; :: would also listen on a platform's private network (SPEC S12, ADR 0018)`
-        : `refusing to bind ${host}: the relay listens only on loopback (127.0.0.1, ::1 or localhost) unless it runs in hosted mode, production behind a host edge that terminates TLS and names the client in TABDOCK_CLIENT_ADDRESS_HEADER (SPEC S12, ADR 0018)`,
+        ? `refusing to bind host (TABDOCK_HOST): hosted mode binds loopback or ${HOSTED_WILDCARD_HOST}, never another address; :: would also listen on a platform's private network (SPEC S12, ADR 0018)`
+        : `refusing to bind host (TABDOCK_HOST): the relay listens only on loopback (127.0.0.1, ::1 or localhost) unless it runs in hosted mode, production behind a host edge that terminates TLS and names the client in TABDOCK_CLIENT_ADDRESS_HEADER (SPEC S12, ADR 0018)`,
     );
   }
 
@@ -1057,6 +1074,7 @@ function resolveAudit(audit: RelayOptions['audit']): ResolvedAudit {
   }
   return {
     dir: dir ?? null,
+    names: audit?.names ?? null,
     retentionDays: retentionDays ?? AUDIT_RETENTION_DAYS,
     maxBytes: (maxMb ?? AUDIT_MAX_MB) * 1024 * 1024,
   };
@@ -1127,6 +1145,8 @@ export const AUTH_SETTINGS: readonly string[] = [
 export interface LocalModeInfo {
   /** The owner token's file, which the printed command reads. */
   tokenPath: string;
+  /** How refusals name the token directory and what lies in or above it (PathNames). */
+  names: PathNames;
   /** Whether this start drew the token. */
   created: boolean;
 }
@@ -1223,10 +1243,12 @@ function authFromEnv(
   // Refused here as resolveConfig would, but before a token is drawn for a relay that cannot start.
   if (host !== undefined && !isLoopbackHost(host)) {
     throw new Error(
-      `local mode listens only on loopback and refuses TABDOCK_HOST ${host}; leave TABDOCK_HOST unset or use 127.0.0.1, ::1 or localhost (ADR 0022)`,
+      'local mode listens only on loopback and refuses a TABDOCK_HOST off it; leave TABDOCK_HOST unset or use 127.0.0.1, ::1 or localhost (ADR 0022)',
     );
   }
   const owner = loadOwnerToken(env, system);
+  // Lock and audit refusals name the directory as the owner token's did.
+  const names = pathNames(env, system);
   return {
     // The token directory stays locked while the relay runs, whatever its
     // audit directory, so no second relay serves this token beside it and no
@@ -1234,8 +1256,9 @@ function authFromEnv(
     auth: holdingTokenLock(
       createDevTokenAuth([{ ...LOCAL_USER, token: owner.token }], { loopbackOnly: true }),
       dirname(owner.path),
+      (path) => names.of(path),
     ),
-    localMode: { tokenPath: owner.path, created: owner.created },
+    localMode: { tokenPath: owner.path, names, created: owner.created },
   };
 }
 
@@ -1288,6 +1311,33 @@ function refuseSettingsOutOfMode(
       );
     }
   }
+}
+
+/**
+ * How refusals name the audit directory when the environment gave it: a
+ * TABDOCK_AUDIT_DIR value, an absolute path that may still be a token pasted
+ * into the wrong variable, by the variable alone, as the audit reader names
+ * it (ADR 0028); local mode's directory beside its owner token as the token
+ * directory is named, from TABDOCK_HOME when that setting gave it (PathNames).
+ * Each phrase follows "the audit directory".
+ */
+function auditDirNames(
+  besideToken: string | undefined,
+  localMode: LocalModeInfo | undefined,
+): AuditDirNames {
+  const withCode = (named: string, code: string | undefined): string =>
+    code === undefined ? named : `${named} (${code})`;
+  if (besideToken === undefined || localMode === undefined) {
+    return {
+      dir: (code) => withCode('TABDOCK_AUDIT_DIR gives', code),
+      file: (path) => `${basename(path)} in the audit directory TABDOCK_AUDIT_DIR gives`,
+    };
+  }
+  const { names } = localMode;
+  return {
+    dir: (code) => withCode(names.fromSetting ? `in ${GIVEN_HOME}` : besideToken, code),
+    file: (path) => names.of(path),
+  };
 }
 
 /**
@@ -1414,12 +1464,17 @@ export function loadConfigFromEnv(
     system,
   );
   // Local mode keeps its audit files beside its owner token unless told otherwise (ADR 0019).
-  const auditDir =
-    auditDirText !== ''
-      ? auditDirText
-      : localMode === undefined
-        ? undefined
-        : join(dirname(localMode.tokenPath), LOCAL_AUDIT_DIR);
+  const besideToken =
+    auditDirText === '' && localMode !== undefined
+      ? join(dirname(localMode.tokenPath), LOCAL_AUDIT_DIR)
+      : undefined;
+  const auditDir = auditDirText !== '' ? auditDirText : besideToken;
+  const audit = {
+    dir: auditDir,
+    retentionDays,
+    maxMb,
+    names: auditDirNames(besideToken, localMode),
+  };
   return {
     auth,
     publicUrl,
@@ -1445,6 +1500,6 @@ export function loadConfigFromEnv(
             .split(',')
             .map((entry) => entry.trim())
             .filter((entry) => entry.length > 0),
-    audit: { dir: auditDir, retentionDays, maxMb },
+    audit,
   };
 }

@@ -326,9 +326,11 @@ describe('--new-token (ADR 0028)', () => {
             TABDOCK_PORT: port === 'running' ? String(runningPort) : port,
           });
           expect(await runCommand(argv, ran)).toBe(1);
+          // Named from TABDOCK_HOME, which gave the directory, never spelled out.
           expect(ran.errors.join('\n')).toMatch(
-            /token directory .* is in use by another relay, pid \d+, which holds .*owner-token\.lock; stop that relay first/,
+            /token directory, the path TABDOCK_HOME gives, is in use by another relay, pid \d+, which holds owner-token\.lock in the path TABDOCK_HOME gives; stop that relay first/,
           );
+          expect(ran.errors.join('\n')).not.toContain(home);
           expect(readFileSync(tokenPath).equals(before)).toBe(true);
           expect(ran.printed).toEqual([]);
         }

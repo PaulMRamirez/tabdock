@@ -91,9 +91,33 @@ export type AuditFs = Pick<
   | 'writeSync'
 >;
 
+/**
+ * How refusals name the audit directory and the files in it. By default its
+ * path with TABDOCK_AUDIT_DIR, a directory the operator set for the relay to
+ * create (ADR 0028's notes). Local mode's directory beside an owner token
+ * that TABDOCK_HOME placed is named from that setting instead (PathNames in
+ * local-token.ts), since a value pasted into the wrong variable may be a token.
+ */
+export interface AuditDirNames {
+  /** The directory, with `code`, an error's code, beside it when given. */
+  readonly dir: (code?: string) => string;
+  /** A file in the directory. */
+  readonly file: (path: string) => string;
+}
+
+/** The default AuditDirNames: the path itself, with TABDOCK_AUDIT_DIR. */
+export function auditDirByPath(dir: string): AuditDirNames {
+  return {
+    dir: (code) => `${dir} (TABDOCK_AUDIT_DIR${code === undefined ? '' : `, ${code}`})`,
+    file: (path) => path,
+  };
+}
+
 export interface FileAuditLogOptions {
   /** An absolute directory; made 0700 if missing. */
   dir: string;
+  /** How refusals name it and its files; auditDirByPath(dir) unless given. */
+  names?: AuditDirNames | undefined;
   /** Files whose UTC day ended longer ago than this are deleted. */
   retentionDays: number;
   /** Past this many bytes in all, the oldest files are deleted. */
@@ -536,13 +560,20 @@ export class FileAuditLog implements AuditLog {
    */
   static open(options: FileAuditLogOptions): FileAuditLog {
     const fs = options.fs ?? nodeFs;
-    prepareDir(options.dir, fs);
+    const names = options.names ?? auditDirByPath(options.dir);
+    prepareDir(options.dir, fs, names);
     // Before anything is read or written, so a second relay changes nothing.
-    const lock = takeLock(options.dir, fs, options.log, options.lockStaleMs ?? AUDIT_LOCK_STALE_MS);
+    const lock = takeLock(
+      options.dir,
+      fs,
+      options.log,
+      options.lockStaleMs ?? AUDIT_LOCK_STALE_MS,
+      names,
+    );
     let recovered: Recovered;
     let owed: Gap | null;
     try {
-      recovered = recover(options.dir, fs, options.log);
+      recovered = recover(options.dir, fs, options.log, names);
       owed = owedGap(options.dir, fs, options.log, recovered);
     } catch (error) {
       releaseLock(lock, fs);
@@ -1324,19 +1355,23 @@ function judge(seen: SeenLock, view: LockView): Verdict {
 }
 
 /** The lock at path as it is now, text and stat from one descriptor so both describe one file; null when there is none. */
-function look(path: string, fs: AuditFs): SeenLock | null {
+function look(
+  path: string,
+  fs: AuditFs,
+  name: (path: string) => string = (shown) => shown,
+): SeenLock | null {
   let fd: number;
   try {
     fd = fs.openSync(path, nodeFs.constants.O_RDONLY | noFollow());
   } catch (error) {
     if (codeOf(error) === 'ENOENT') return null;
-    throw new AuditDirError(`cannot read the audit lock ${path} (${codeOf(error)})`);
+    throw new AuditDirError(`cannot read the audit lock ${name(path)} (${codeOf(error)})`);
   }
   try {
     const stat = fs.fstatSync(fd);
     return { text: fs.readFileSync(fd, 'utf8'), ino: stat.ino, mtimeMs: stat.mtimeMs };
   } catch (error) {
-    throw new AuditDirError(`cannot read the audit lock ${path} (${codeOf(error)})`);
+    throw new AuditDirError(`cannot read the audit lock ${name(path)} (${codeOf(error)})`);
   } finally {
     fs.closeSync(fd);
   }
@@ -1444,6 +1479,7 @@ function waitOut(
   staleMs: number,
   fs: AuditFs,
   log: Logger,
+  names: AuditDirNames,
 ): 'released' | 'refreshed' | 'stale' {
   const watch = Math.min(staleMs, LOCK_WATCH_REFRESHES * lockRefreshMs(staleMs));
   const since = performance.now();
@@ -1461,7 +1497,7 @@ function waitOut(
     const left = remaining();
     if (left <= 0) return 'stale';
     pause(Math.max(1, Math.min(poll, Math.ceil(left))));
-    const now = look(path, fs);
+    const now = look(path, fs, names.file);
     if (now === null) return 'released';
     if (!sameLock(now, seen)) return 'refreshed';
   }
@@ -1473,11 +1509,23 @@ function waitOut(
  * restarted) is broken in one step and replaced; one whose relay this
  * process cannot see is watched until it shows itself live or stale.
  */
-function takeLock(dir: string, fs: AuditFs, log: Logger, staleMs: number): AuditLock {
-  const real = nodeFs.realpathSync(dir);
+function takeLock(
+  dir: string,
+  fs: AuditFs,
+  log: Logger,
+  staleMs: number,
+  names: AuditDirNames,
+): AuditLock {
+  let real: string;
+  try {
+    real = nodeFs.realpathSync(dir);
+  } catch (error) {
+    // Node's own message would quote the path.
+    throw new AuditDirError(`cannot read the audit directory ${names.dir(codeOf(error))}`);
+  }
   if (heldHere.has(real)) {
     throw new AuditDirError(
-      `the audit directory ${dir} (TABDOCK_AUDIT_DIR) is already open in this process; one relay writes one audit log (ADR 0019)`,
+      `the audit directory ${names.dir()} is already open in this process; one relay writes one audit log (ADR 0019)`,
     );
   }
   const path = join(dir, AUDIT_LOCK_NAME);
@@ -1485,7 +1533,7 @@ function takeLock(dir: string, fs: AuditFs, log: Logger, staleMs: number): Audit
   const text = `${String(process.pid)} ${view.boot} ${view.ns} ${randomBytes(16).toString('hex')}\n`;
   const inUse = (by: string): AuditDirError =>
     new AuditDirError(
-      `the audit directory ${dir} (TABDOCK_AUDIT_DIR) is in use by another relay, ${by}; two relays writing one audit log would break its chain (ADR 0019). Stop that relay first or, if none is running, delete ${path}`,
+      `the audit directory ${names.dir()} is in use by another relay, ${by}; two relays writing one audit log would break its chain (ADR 0019). Stop that relay first or, if none is running, delete ${names.file(path)}`,
     );
   for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt += 1) {
     let placed: boolean;
@@ -1493,24 +1541,26 @@ function takeLock(dir: string, fs: AuditFs, log: Logger, staleMs: number): Audit
       placed = linkLock(dir, path, text, fs);
     } catch (error) {
       throw new AuditDirError(
-        `cannot lock the audit directory ${dir} (TABDOCK_AUDIT_DIR, ${codeOf(error)}); the relay must be able to create ${AUDIT_LOCK_NAME} there`,
+        `cannot lock the audit directory ${names.dir(codeOf(error))}; the relay must be able to create ${AUDIT_LOCK_NAME} there`,
       );
     }
     if (placed) {
       heldHere.add(real);
       return { path, text, dir: real };
     }
-    const seen = look(path, fs);
+    const seen = look(path, fs, names.file);
     // Released between the link and the look: try again.
     if (seen === null) continue;
     const verdict = judge(seen, view);
-    if (verdict.kind === 'live') throw inUse(`pid ${String(verdict.pid)}, which holds ${path}`);
+    if (verdict.kind === 'live') {
+      throw inUse(`pid ${String(verdict.pid)}, which holds ${names.file(path)}`);
+    }
     if (verdict.kind === 'unseen') {
-      const waited = waitOut(path, seen, staleMs, fs, log);
+      const waited = waitOut(path, seen, staleMs, fs, log, names);
       if (waited === 'released') continue;
       if (waited === 'refreshed') {
         throw inUse(
-          `perhaps in another container on the same volume, which refreshed or replaced ${path} while this one waited`,
+          `perhaps in another container on the same volume, which refreshed or replaced ${names.file(path)} while this one waited`,
         );
       }
     }
@@ -1522,7 +1572,7 @@ function takeLock(dir: string, fs: AuditFs, log: Logger, staleMs: number): Audit
     }
   }
   throw new AuditDirError(
-    `cannot lock the audit directory ${dir} (TABDOCK_AUDIT_DIR): another relay keeps taking ${path}`,
+    `cannot lock the audit directory ${names.dir()}: another relay keeps taking ${names.file(path)}`,
   );
 }
 
@@ -1796,31 +1846,29 @@ function lastByte(fs: AuditFs, path: string, size: number): number {
  * may read is narrowed rather than refused: unlike the owner token, the files
  * in it were written 0600, so nothing in it was exposed by the wider mode.
  */
-function prepareDir(dir: string, fs: AuditFs): void {
+function prepareDir(dir: string, fs: AuditFs, names: AuditDirNames): void {
   try {
     fs.mkdirSync(dir, { recursive: true, mode: DIR_MODE });
   } catch (error) {
     throw new AuditDirError(
-      `cannot create the audit directory ${dir} (TABDOCK_AUDIT_DIR, ${codeOf(error)}); its parent must be writable by the account the relay runs as. On a host volume, see "Volume ownership fallback" in docs/deploy.md`,
+      `cannot create the audit directory ${names.dir(codeOf(error))}; its parent must be writable by the account the relay runs as. On a host volume, see "Volume ownership fallback" in docs/deploy.md`,
     );
   }
   let stat: nodeFs.Stats;
   try {
     stat = fs.lstatSync(dir);
   } catch (error) {
-    throw new AuditDirError(
-      `cannot read the audit directory ${dir} (TABDOCK_AUDIT_DIR, ${codeOf(error)})`,
-    );
+    throw new AuditDirError(`cannot read the audit directory ${names.dir(codeOf(error))}`);
   }
   if (!stat.isDirectory()) {
     throw new AuditDirError(
-      `the audit directory ${dir} (TABDOCK_AUDIT_DIR) is not a directory, or is a symlink; give the real directory`,
+      `the audit directory ${names.dir()} is not a directory, or is a symlink; give the real directory`,
     );
   }
   const uid = process.getuid?.();
   if (uid !== undefined && process.platform !== 'win32' && stat.uid !== uid) {
     throw new AuditDirError(
-      `the audit directory ${dir} (TABDOCK_AUDIT_DIR) belongs to another account; chown it to the account the relay runs as (uid ${String(uid)}). On a host volume, see "Volume ownership fallback" in docs/deploy.md`,
+      `the audit directory ${names.dir()} belongs to another account; chown it to the account the relay runs as (uid ${String(uid)}). On a host volume, see "Volume ownership fallback" in docs/deploy.md`,
     );
   }
   if (process.platform !== 'win32' && (stat.mode & 0o077) !== 0) {
@@ -1828,7 +1876,7 @@ function prepareDir(dir: string, fs: AuditFs): void {
       fs.chmodSync(dir, DIR_MODE);
     } catch (error) {
       throw new AuditDirError(
-        `cannot narrow the audit directory ${dir} (TABDOCK_AUDIT_DIR) to mode 700 (${codeOf(error)}); run chmod 700 on it`,
+        `cannot narrow the audit directory ${names.dir()} to mode 700 (${codeOf(error)}); run chmod 700 on it`,
       );
     }
   }
@@ -1844,14 +1892,12 @@ function prepareDir(dir: string, fs: AuditFs): void {
  * disk while no relay ran may have changed them, and docs/deploy.md says
  * what then shows it.
  */
-function recover(dir: string, fs: AuditFs, log: Logger): Recovered {
+function recover(dir: string, fs: AuditFs, log: Logger, names: AuditDirNames): Recovered {
   let files: AuditFileInfo[];
   try {
     files = listAuditFiles(dir, fs);
   } catch (error) {
-    throw new AuditDirError(
-      `cannot list the audit directory ${dir} (TABDOCK_AUDIT_DIR, ${codeOf(error)})`,
-    );
+    throw new AuditDirError(`cannot list the audit directory ${names.dir(codeOf(error))}`);
   }
   for (const [index, file] of [...files].reverse().entries()) {
     const path = join(dir, file.name);
@@ -1859,10 +1905,10 @@ function recover(dir: string, fs: AuditFs, log: Logger): Recovered {
     try {
       content = fs.readFileSync(path, 'utf8');
     } catch (error) {
-      throw new AuditDirError(`cannot read the audit file ${path} (${codeOf(error)})`);
+      throw new AuditDirError(`cannot read the audit file ${names.file(path)} (${codeOf(error)})`);
     }
     if (index === 0 && content.length > 0 && !content.endsWith('\n')) {
-      closeTornLine(path, fs);
+      closeTornLine(path, fs, names);
       log.warn('closed a torn last line in the audit log, left by a crash or a failed write', {
         file: file.name,
       });
@@ -1873,7 +1919,7 @@ function recover(dir: string, fs: AuditFs, log: Logger): Recovered {
       if (text === '') continue;
       const record = readLine(file.name, at + 1, text).record;
       if (record !== null) {
-        const found = sizesNow(dir, fs, files);
+        const found = sizesNow(dir, fs, files, names);
         return {
           nextSeq: record.seq + 1,
           head: lineHash(text),
@@ -1883,7 +1929,7 @@ function recover(dir: string, fs: AuditFs, log: Logger): Recovered {
       }
     }
   }
-  return { nextSeq: 1, head: null, first: 1, files: sizesNow(dir, fs, files) };
+  return { nextSeq: 1, head: null, first: 1, files: sizesNow(dir, fs, files, names) };
 }
 
 /**
@@ -1891,26 +1937,31 @@ function recover(dir: string, fs: AuditFs, log: Logger): Recovered {
  * the bytes size retention counts each of them by for the rest of the run.
  * A file gone since the listing is left out, as if never found.
  */
-function sizesNow(dir: string, fs: AuditFs, files: readonly AuditFileInfo[]): ListedFile[] {
+function sizesNow(
+  dir: string,
+  fs: AuditFs,
+  files: readonly AuditFileInfo[],
+  names: AuditDirNames,
+): ListedFile[] {
   return files.flatMap((file) => {
     const path = join(dir, file.name);
     try {
       return [{ ...file, size: fs.statSync(path).size }];
     } catch (error) {
       if (codeOf(error) === 'ENOENT') return [];
-      throw new AuditDirError(`cannot read the audit file ${path} (${codeOf(error)})`);
+      throw new AuditDirError(`cannot read the audit file ${names.file(path)} (${codeOf(error)})`);
     }
   });
 }
 
-function closeTornLine(path: string, fs: AuditFs): void {
+function closeTornLine(path: string, fs: AuditFs, names: AuditDirNames): void {
   const fd = fs.openSync(path, nodeFs.constants.O_WRONLY | nodeFs.constants.O_APPEND | noFollow());
   try {
     fs.writeSync(fd, Buffer.from('\n'));
     fs.fdatasyncSync(fd);
   } catch (error) {
     throw new AuditDirError(
-      `cannot close a torn line in the audit file ${path} (${codeOf(error)})`,
+      `cannot close a torn line in the audit file ${names.file(path)} (${codeOf(error)})`,
     );
   } finally {
     fs.closeSync(fd);

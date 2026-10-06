@@ -34,6 +34,7 @@ import {
   lineHash,
   listAuditFiles,
   loadConfigFromEnv,
+  ownerTokenDirectory,
   readAuditLines,
   utcDay,
   verifyAuditLines,
@@ -125,6 +126,55 @@ describe('a relay with an audit directory (ADR 0019)', () => {
     await expect(createRelay({ ...base, audit: { dir }, logSink: quiet })).rejects.toThrow(
       /could not write and sync its relay_start record/,
     );
+  });
+
+  it('names an audit or token directory the environment gave by its setting when a start cannot use it', async () => {
+    // A token pasted into TABDOCK_AUDIT_DIR or TABDOCK_HOME passes as a path
+    // once it starts with '/'; here it is the last segment of one.
+    const token = `tabdock_${'SECRETsecret'.repeat(3)}SECRET1`;
+    const quietEnv = { TABDOCK_PORT: '0' };
+    const said = async (env: NodeJS.ProcessEnv): Promise<string> => {
+      try {
+        const relay = await createRelay({ ...loadConfigFromEnv(env), logSink: quiet });
+        await relay.close();
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+      }
+      throw new Error('expected the start to be refused');
+    };
+    // A file where TABDOCK_AUDIT_DIR's parent should be.
+    const blocked = join(scratch(), token);
+    writeFileSync(blocked, 'x');
+    const audit = await said({
+      ...quietEnv,
+      TABDOCK_DEV_TOKENS: `alice=${ALICE.token}`,
+      TABDOCK_AUDIT_DIR: join(blocked, 'audit'),
+    });
+    expect(audit).toMatch(/^cannot create the audit directory TABDOCK_AUDIT_DIR gives \(ENOTDIR\)/);
+    expect(leakIn(audit, token)).toBeNull();
+    // Local mode keeps its audit files beside a token directory TABDOCK_HOME gave.
+    const home = join(scratch(), token, 'tabdock');
+    const running = await createRelay({
+      ...loadConfigFromEnv({ ...quietEnv, TABDOCK_HOME: home }),
+      logSink: quiet,
+    });
+    try {
+      const beside = await said({ ...quietEnv, TABDOCK_HOME: home });
+      // In this process; another's holder is named the same way (cli.test.ts, for the token lock).
+      expect(beside).toMatch(
+        /^the audit directory in the path TABDOCK_HOME gives is already open in this process;/,
+      );
+      expect(leakIn(beside, token)).toBeNull();
+    } finally {
+      await running.close();
+    }
+    rmSync(join(home, 'audit'), { recursive: true });
+    writeFileSync(join(home, 'audit'), 'x');
+    const unusable = await said({ ...quietEnv, TABDOCK_HOME: home });
+    expect(unusable).toMatch(
+      /^cannot create the audit directory in the path TABDOCK_HOME gives \(/,
+    );
+    expect(leakIn(unusable, token)).toBeNull();
   });
 
   it('brackets a run with relay_start and relay_stop, and syncs the calls the shutdown fails before closing', async () => {
@@ -611,7 +661,7 @@ describe('pnpm audit:log', () => {
     }
   });
 
-  it('never repeats a directory --dir or TABDOCK_AUDIT_DIR gives, which could be a token, and shows the default it derived (ADR 0028)', () => {
+  it('never repeats a directory --dir, TABDOCK_AUDIT_DIR or TABDOCK_HOME gives, which could be a token, and shows a default the platform gave (ADR 0028)', () => {
     const token = `tabdock_${'SECRETsecret'.repeat(3)}SECRET1`;
     const base = scratch();
     // A file where the directory should be: it exists, and reading it fails.
@@ -648,12 +698,20 @@ describe('pnpm audit:log', () => {
       expect(leakIn([...ran.out, ...ran.err].join('\n'), token), reason).toBeNull();
       expect(ran.err, reason).toEqual([reason]);
     }
-    // The default comes from the token directory, never from a value given for the directory.
-    const home = scratch();
-    const derived = run([], { TABDOCK_HOME: home });
+    // The default comes from the token directory, named as the relay names it:
+    // from TABDOCK_HOME when that setting gave it, since a token pasted there
+    // passes as a path once it starts with '/', and in full when the
+    // platform's own variables did.
+    const derived = run([], { TABDOCK_HOME: join(scratch(), token) });
     expect(derived.code).toBe(2);
+    expect(leakIn(derived.err.join('\n'), token)).toBeNull();
     expect(derived.err).toEqual([
-      `no audit directory at ${join(home, 'audit')}; give --dir or TABDOCK_AUDIT_DIR`,
+      'no audit directory at audit in the path TABDOCK_HOME gives; give --dir or TABDOCK_AUDIT_DIR',
+    ]);
+    const platformHome = scratch();
+    const platformEnv = { HOME: platformHome, XDG_CONFIG_HOME: platformHome };
+    expect(run([], platformEnv).err).toEqual([
+      `no audit directory at ${join(ownerTokenDirectory(platformEnv), 'audit')}; give --dir or TABDOCK_AUDIT_DIR`,
     ]);
   });
 });

@@ -8,7 +8,17 @@
 // Each setting's place in the relay README and .env.example stays with
 // readme-settings.test.ts.
 
-import { readdirSync, readFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseEnv } from 'node:util';
 import { MAX_FRAME_BYTES } from '@tabdock/protocol';
@@ -352,37 +362,70 @@ describe('.env.example', () => {
   });
 });
 
-describe('refusals that quote the value', () => {
-  // The page promises a refusal leaves the value out, since a token may sit in
-  // the wrong variable, and names the few that quote it; this finds them by
-  // refusing a marked value in every setting the relay reads.
+describe('refusals and the values they refuse', () => {
+  // The page promises a refusal never repeats the value, since a token may sit
+  // in the wrong variable; this holds the code to it by refusing a marked
+  // value in every setting the relay reads, as a bare word, inside a URL, and
+  // for TABDOCK_HOME as absolute paths, which a token starting with '/' would
+  // pass as: inside the checkout, inside a work tree, on a file, and through
+  // a loop of links, whose realpath error node words with the path.
   const MARK = 'Zq7Mark9Wq';
   const devTokens = { TABDOCK_DEV_TOKENS: `alice=${'k'.repeat(MIN_DEV_TOKEN_LENGTH)}` };
 
-  function quoting(): string[] {
-    const found = new Set<string>();
+  function homes(scratch: string): string[] {
+    const base = join(scratch, MARK);
+    mkdirSync(join(base, 'repo', '.git'), { recursive: true, mode: 0o700 });
+    writeFileSync(join(base, 'file'), 'x');
+    symlinkSync(join(base, 'loop'), join(base, 'loop'));
+    return [
+      join(ROOT, MARK),
+      join(base, 'repo', 'tabdock'),
+      join(base, 'file'),
+      join(base, 'loop', 'tabdock'),
+    ];
+  }
+
+  function quoting(scratch: string): { quoted: string[]; refused: Set<string> } {
+    const quoted = new Set<string>();
+    const refused = new Set<string>();
     for (const name of relaySettings()) {
       const envs: NodeJS.ProcessEnv[] = [MARK, `https://${MARK}.example/x`].map((value) => ({
         ...devTokens,
         [name]: value,
       }));
-      // Local mode refuses a token directory inside the checkout before making it.
-      if (name === 'TABDOCK_HOME') envs.push({ [name]: join(ROOT, MARK) });
+      if (name === 'TABDOCK_HOME') envs.push(...homes(scratch).map((home) => ({ [name]: home })));
       for (const env of envs) {
         try {
           resolveConfig(loadConfigFromEnv(env));
         } catch (error) {
-          if (error instanceof Error && error.message.includes(MARK)) found.add(name);
+          refused.add(name);
+          if (error instanceof Error && error.message.includes(MARK)) quoted.add(name);
         }
       }
     }
-    return [...found].sort();
+    return { quoted: [...quoted].sort(), refused };
   }
 
-  it('are the ones the settings page names, and only those', () => {
-    const sentence = /only (a `TABDOCK_[^;.]+) are quoted back/.exec(read(PAGE))?.[1] ?? '';
-    const named = [...namesIn(sentence)].sort();
-    expect(named.length).toBeGreaterThan(0);
-    expect(quoting()).toEqual(named);
+  it('never repeat it, as the settings page says, naming a list entry by its place', () => {
+    const page = read(PAGE);
+    expect(page).toContain('A refusal names the variable and the rule broken, never the value');
+    const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'tabdock-settings-')));
+    let found: ReturnType<typeof quoting>;
+    try {
+      found = quoting(scratch);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+    const { quoted, refused } = found;
+    // The probe reaches the settings whose refusals once quoted their value.
+    for (const name of ['TABDOCK_ALLOWED_ORIGINS', 'TABDOCK_HOME', 'TABDOCK_HOST']) {
+      expect(refused.has(name), name).toBe(true);
+    }
+    expect(quoted).toEqual([]);
+    expect(() =>
+      resolveConfig(
+        loadConfigFromEnv({ ...devTokens, TABDOCK_ALLOWED_ORIGINS: `https://a.example,${MARK}` }),
+      ),
+    ).toThrow(/^allowedOrigins \(TABDOCK_ALLOWED_ORIGINS\) entry 2 is not an origin/);
   });
 });
