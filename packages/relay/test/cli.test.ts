@@ -23,6 +23,7 @@ import {
   type CommandContext,
   packageVersion,
   parseCommand,
+  refusalText,
   relayUsage,
   runCommand,
   startRelay,
@@ -157,6 +158,30 @@ describe('the arguments', () => {
     expect(ran.errors[1]).toBe(relayUsage(true));
     expect(ran.printed).toEqual([]);
     expect(existsSync(home)).toBe(false);
+  });
+});
+
+describe('what a refused start prints', () => {
+  it("prints a node file error's call and code alone, since its message quotes a path a setting may have given", () => {
+    const token = `tabdock_${'s3cr3t'.repeat(7)}x`;
+    const path = `/${token}/audit/audit-2026-10-06-000000000001.jsonl`;
+    const node = Object.assign(new Error(`EPERM: operation not permitted, open '${path}'`), {
+      code: 'EPERM',
+      syscall: 'open',
+      path,
+    });
+    expect(refusalText(node)).toBe('open failed on a path the relay was given (EPERM)');
+    const renamed = Object.assign(new Error(`EXDEV: cross-device link, rename 'a' -> '${path}'`), {
+      code: 'EXDEV',
+      syscall: 'rename',
+      dest: path,
+    });
+    expect(refusalText(renamed)).toBe('rename failed on a path the relay was given (EXDEV)');
+    // The relay's own refusals, which name settings and never their values, print as they are.
+    expect(refusalText(new Error('TABDOCK_PORT must be a whole number'))).toBe(
+      'TABDOCK_PORT must be a whole number',
+    );
+    expect(refusalText(token)).not.toContain(token);
   });
 });
 
@@ -326,9 +351,11 @@ describe('--new-token (ADR 0028)', () => {
             TABDOCK_PORT: port === 'running' ? String(runningPort) : port,
           });
           expect(await runCommand(argv, ran)).toBe(1);
+          // Named from TABDOCK_HOME, which gave the directory, never spelled out.
           expect(ran.errors.join('\n')).toMatch(
-            /token directory .* is in use by another relay, pid \d+, which holds .*owner-token\.lock; stop that relay first/,
+            /token directory, the path TABDOCK_HOME gives, is in use by another relay, pid \d+, which holds owner-token\.lock in the path TABDOCK_HOME gives; stop that relay first/,
           );
+          expect(ran.errors.join('\n')).not.toContain(home);
           expect(readFileSync(tokenPath).equals(before)).toBe(true);
           expect(ran.printed).toEqual([]);
         }

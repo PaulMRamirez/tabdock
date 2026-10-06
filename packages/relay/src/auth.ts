@@ -341,7 +341,9 @@ export interface DevTokenOptions {
 
 /**
  * Error messages name the user, never the token, because they end up on a
- * terminal and in CI logs. Only each token's digest is kept.
+ * terminal and in CI logs: these users were given in code. TABDOCK_DEV_TOKENS
+ * reaches here only through parseDevTokens, which has already refused, by
+ * entry number, everything this would. Only each token's digest is kept.
  */
 export function createDevTokenAuth(
   users: readonly DevTokenUser[],
@@ -445,6 +447,12 @@ function bearerToken(header: string | undefined): string | null {
  * An entry whose id is an invitee's, g_ and 32 lower-case hex characters, is
  * an invitee (ADR 0017); any other id starting g_ is refused, since only an
  * invitee's may.
+ *
+ * Every check createDevTokenAuth makes on a token is made here first, naming
+ * the entry by its place among the entries that are not empty: an entry
+ * written token first (`<token>=alice`) puts the token where the user id
+ * goes, and a local owner token or a hex token passes as a user id, so a
+ * refusal that named the user would print it.
  */
 export function parseDevTokens(envValue: string): DevTokenUser[] {
   const users: DevTokenUser[] = [];
@@ -453,18 +461,23 @@ export function parseDevTokens(envValue: string): DevTokenUser[] {
     .map((part) => part.trim())
     .filter((part) => part.length > 0);
   parts.forEach((part, index) => {
+    const entry = `TABDOCK_DEV_TOKENS entry ${String(index + 1)}`;
     const split = part.indexOf('=');
     const userId = split > 0 ? part.slice(0, split).trim() : '';
     const token = split > 0 ? part.slice(split + 1).trim() : '';
     if (userId.length === 0 || token.length === 0) {
-      throw new Error(
-        `TABDOCK_DEV_TOKENS entry ${String(index + 1)} is not of the form user=token`,
-      );
+      throw new Error(`${entry} is not of the form user=token`);
     }
     if (!IdSchema.safeParse(userId).success) {
+      throw new Error(`${entry} has a user id that is not 1 to 64 letters, digits, '_' or '-'`);
+    }
+    if (token.length < MIN_DEV_TOKEN_LENGTH) {
       throw new Error(
-        `TABDOCK_DEV_TOKENS entry ${String(index + 1)} has a user id that is not 1 to 64 letters, digits, '_' or '-'`,
+        `${entry} has a token shorter than ${String(MIN_DEV_TOKEN_LENGTH)} characters`,
       );
+    }
+    if (!TOKEN_CHARS.test(token)) {
+      throw new Error(`${entry} has a token that is not printable ASCII without spaces`);
     }
     if (InviteeIdSchema.safeParse(userId).success) {
       users.push({ userId, displayName: UNVERIFIED_ACCOUNT_NAME, token, kind: 'invitee' });
@@ -472,11 +485,21 @@ export function parseDevTokens(envValue: string): DevTokenUser[] {
     }
     if (isInviteePrefixed(userId)) {
       throw new Error(
-        `TABDOCK_DEV_TOKENS entry ${String(index + 1)} has a user id starting g_, which only an invitee's may: g_ and 32 lower-case hex characters (ADR 0017)`,
+        `${entry} has a user id starting g_, which only an invitee's may: g_ and 32 lower-case hex characters (ADR 0017)`,
       );
     }
     users.push({ userId, displayName: userId, token });
   });
   if (users.length === 0) throw new Error('TABDOCK_DEV_TOKENS lists no users');
+  for (let i = 0; i < users.length; i += 1) {
+    for (let j = i + 1; j < users.length; j += 1) {
+      const pair = `TABDOCK_DEV_TOKENS entries ${String(i + 1)} and ${String(j + 1)}`;
+      if (users[i]?.userId === users[j]?.userId) {
+        throw new Error(`${pair} name the same user id`);
+      }
+      // Compared as written, once at start; createDevTokenAuth compares digests at sign-in.
+      if (users[i]?.token === users[j]?.token) throw new Error(`${pair} share a token`);
+    }
+  }
   return users;
 }

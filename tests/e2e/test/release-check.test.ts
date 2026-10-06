@@ -7,8 +7,10 @@
 // job (ADR 0028's notes). Since the A5.6 review it also refuses a dependency
 // the allowlist does not name, an optional, peer or bundled one, a bin on a
 // library, and a shrinkwrap entry not fetched from its own registry URL with
-// a whole sha512, or that runs a script on install. The real tarballs are
-// checked in CI by the pack-install job.
+// a whole sha512, or that runs a script on install, and since the user guide
+// (ADR 0035) a README that links relatively or names a repository path an
+// npm reader cannot open. The real tarballs are checked in CI by the
+// pack-install job.
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -587,6 +589,36 @@ describe('the release check', () => {
       "```ts\nimport { createRelay } from '@tabdock/relay';\n```",
       /@tabdock\/protocol's README imports @tabdock\/relay, which the packed @tabdock\/relay does not export/,
     ],
+    [
+      'a README with a relative link, which npm resolves against its own site',
+      'adapter',
+      'The [adapter reference](../../docs/guide/04-adapter-reference.md) has every option.',
+      /@tabdock\/adapter's README links to \.\.\/\.\.\/docs\/guide\/04-adapter-reference\.md, a relative path npm cannot follow/,
+    ],
+    [
+      'a README with a relative image or HTML link',
+      'relay',
+      '<a href="docs/deploy.md">Deploying</a>',
+      /@tabdock\/relay's README links to docs\/deploy\.md, a relative path npm cannot follow/,
+    ],
+    [
+      'a README naming a docs/ path an npm reader cannot open',
+      'relay',
+      'Operators read `docs/guide/08-relay-settings.md` for every setting.',
+      /@tabdock\/relay's README names docs\/guide\/08-relay-settings\.md, a repository path an npm reader cannot open/,
+    ],
+    [
+      'a README naming the spec by its file',
+      'protocol',
+      'The frames follow SPEC.md section 6.',
+      /@tabdock\/protocol's README names SPEC\.md, a repository path/,
+    ],
+    [
+      "a README naming an ADR's file",
+      'adapter',
+      'The policy is explained in 0034-an-empty-consequential-list.md.',
+      /@tabdock\/adapter's README names 0034-an-empty-consequential-list\.md, a repository path/,
+    ],
   ];
   for (const [what, name, text, expected] of readmeCases) {
     it(`refuses ${what}`, () => {
@@ -600,13 +632,20 @@ describe('the release check', () => {
     });
   }
 
-  it('passes a README naming only what the packages export, a CDN path and the package.json', () => {
+  it('passes a README naming only what the packages export, a CDN path, the package.json and absolute links', () => {
     const fixtures = wellFormed();
     fixtures.adapter.files['README.md'] = [
       "import { attach } from '@tabdock/adapter';",
       'https://cdn.jsdelivr.net/npm/@tabdock/adapter@0.1.0/dist/tabdock-adapter.js',
       "const p = await import('@tabdock/protocol');",
       '`@tabdock/relay/package.json`, then `npx @tabdock/relay`.',
+      // Absolute links may name repository paths, an in-page anchor is fine,
+      // and a code block's paths are the example page's own.
+      '[docs/release.md](https://github.com/PaulMRamirez/tabdock/blob/main/docs/release.md)',
+      'https://github.com/PaulMRamirez/tabdock/blob/main/SPEC.md and [the top](#readme).',
+      '```html',
+      '<script src="/vendor/tabdock-adapter.js" data-relay="ws://127.0.0.1:8787/page"></script>',
+      '```',
       '',
     ].join('\n');
     expect(checkRelease(pack(fixtures))).toEqual([]);

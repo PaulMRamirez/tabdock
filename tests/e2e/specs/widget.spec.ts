@@ -911,9 +911,11 @@ test('on the MCP-B polyfill 5.1, the script tag with an empty data-consequential
       .map((tool) => tool.name)
       .sort(),
   ).toEqual(['add_item', 'clear_board', 'highlight_item', 'move_view']);
+  // On a script tag the notice names the attribute the page wrote, not attach()'s option.
   await expect
     .poll(() => widgetEvaluate(page, 'activity', NOTICE_TEXT))
-    .toMatch(/consequentialTools/);
+    .toMatch(/in the script tag's data-consequential-tools attribute to fix this/);
+  expect(await widgetEvaluate(page, 'activity', NOTICE_TEXT)).not.toMatch(/policy\./);
 
   relay.send(attachRequest('req-alice', 'alice'));
   await clickInWidget(page, { action: 'approve-driver', requestId: 'req-alice' });
@@ -925,6 +927,67 @@ test('on the MCP-B polyfill 5.1, the script tag with an empty data-consequential
     .poll(() => framesOf(relay, 'result').map((frame) => [frame.callId, frame.error?.code ?? 'ok']))
     .toEqual([['call-1', 'denied_by_operator']]);
   await expect(page.locator('[data-role="view"]')).toHaveText(/3 items/);
+});
+
+test('the script tag refuses a data-relay that is not ws: or wss: in one console line, and attaches nothing', async ({
+  page,
+}) => {
+  const relay = await routeFakeRelay(page);
+  const adapter = Buffer.from(await scriptTagFile());
+  await page.route(`${demo.url}tabdock-adapter.js`, (route) =>
+    route.fulfill({ contentType: 'text/javascript', body: adapter }),
+  );
+  const said: string[] = [];
+  page.on('console', (message) => said.push(`${message.type()} ${message.text()}`));
+  await page.goto(demo.url);
+  await page.waitForSelector('html[data-tools="ready"]');
+  const LINE =
+    '[tabdock] data-relay must be a ws: or wss: URL, for example ws://127.0.0.1:8787/page';
+  expectedErrors.push(LINE);
+  await page.evaluate(() => {
+    const script = document.createElement('script');
+    script.src = '/tabdock-adapter.js';
+    script.dataset.relay = 'https://relay.example/page?token=SeCrEt9';
+    document.head.append(script);
+  });
+  await expect
+    .poll(() => said.filter((line) => line.startsWith('error ')))
+    .toEqual([`error ${LINE}`]);
+  // One line, with no stack, no value and no uncaught TypeError (pageErrors is checked after).
+  expect(said.join('\n')).not.toContain('SeCrEt9');
+  expect(said.join('\n')).not.toContain('TypeError');
+  // Nothing dialled, and no widget mounted: its roster list would be there, shown or not.
+  expect(relay.connections).toBe(0);
+  expect(await widgetText(page, 'roster')).toBeNull();
+});
+
+test("local mode's one user, You, reads You want in the attach and consequential prompts", async ({
+  page,
+}) => {
+  const relay = await openWithFakeRelay(page);
+  // The relay names local mode's user you, shown as You (LOCAL_USER).
+  relay.send(attachRequest('req-you', 'you'));
+  await waitForDock(page, (state) => state.pendingRequests.length === 1);
+  await expect
+    .poll(() => widgetBoxText(page, { requestId: 'req-you' }))
+    .toContain('You want to attach via code');
+  expect(await widgetBoxText(page, { requestId: 'req-you' })).not.toContain('You wants');
+  await clickInWidget(page, { action: 'approve-driver', requestId: 'req-you' });
+  await expect.poll(() => decisions(relay).map((frame) => frame.allow)).toEqual([true]);
+  relay.send({ t: 'roster', attachments: [attachment('you', 'You')] });
+  relay.send({
+    ...invokeFrame('call-1', 'clear_board'),
+    caller: { userId: 'you', displayName: 'You', client: null, role: 'driver' },
+  } as RelayFrame);
+  await waitForDock(page, (state) => state.pendingConfirms.length === 1);
+  await expect
+    .poll(() => widgetBoxText(page, { callId: 'call-1' }))
+    .toContain('You want to run clear_board');
+  // Anyone else keeps the verb's -s.
+  relay.send(attachRequest('req-bob', 'bob'));
+  await expect
+    .poll(() => widgetBoxText(page, { requestId: 'req-bob' }))
+    .toContain('Bob wants to attach via code');
 });
 
 test('pause answers calls with page_busy, shows on the badge, and holds across a reload', async ({

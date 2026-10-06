@@ -10,7 +10,10 @@
 // supportedVersions now naming every revision /mcp serves, ADR 0027's Step 3
 // review notes), a name the relay does not serve keeps M4's JSON-RPC error,
 // and a handler that throws still answers an isError result in the thrown
-// message, as McpServer did.
+// message, as McpServer did. One wording change since is deliberate and
+// recorded in the fixture's _comment: detach_page's description names a new
+// invite link beside a new code, since an invitee who offers a code gets
+// invite_required.
 
 import { readFileSync } from 'node:fs';
 import { type AuthInfo, createMcpHandler } from '@modelcontextprotocol/server';

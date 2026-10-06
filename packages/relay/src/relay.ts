@@ -69,7 +69,7 @@ import {
   SUBPROTOCOL,
 } from '@tabdock/protocol';
 import { WebSocketServer } from 'ws';
-import { FileAuditLog } from './audit-file.ts';
+import { auditDirByPath, FileAuditLog } from './audit-file.ts';
 import { createAuthRefusalLog } from './auth-log.ts';
 import {
   type AuthOutcome,
@@ -489,7 +489,7 @@ function openAudit(
   options: RelayOptions,
   log: Logger,
 ): FileAuditLog | null {
-  const { dir, retentionDays, maxBytes } = config.audit;
+  const { dir, names, retentionDays, maxBytes } = config.audit;
   if (dir !== null && options.store !== undefined) {
     throw new Error(
       'give the relay an audit directory (TABDOCK_AUDIT_DIR) or a store of its own, not both',
@@ -503,7 +503,7 @@ function openAudit(
     }
     return null;
   }
-  return FileAuditLog.open({ dir, retentionDays, maxBytes, log });
+  return FileAuditLog.open({ dir, names: names ?? undefined, retentionDays, maxBytes, log });
 }
 
 export async function createRelay(options: RelayOptions): Promise<Relay> {
@@ -543,7 +543,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       await fileAudit.close();
       auth.stop?.();
       throw new Error(
-        `production could not write and sync its relay_start record in the audit directory ${fileAudit.dir} (TABDOCK_AUDIT_DIR); refusing to start unrecorded (ADR 0019)`,
+        `production could not write and sync its relay_start record in the audit directory ${(config.audit.names ?? auditDirByPath(fileAudit.dir)).dir()}; refusing to start unrecorded (ADR 0019)`,
       );
     }
   }

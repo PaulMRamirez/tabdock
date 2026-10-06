@@ -30,6 +30,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   ensureHeadersHelper,
   type FileFacts,
+  GIVEN_HOME,
   HEADERS_HELPER_FILE,
   headersHelperPath,
   headersHelperText,
@@ -165,7 +166,9 @@ describe.skipIf(!POSIX)('the header helper beside the owner token', () => {
     rmSync(helper);
     symlinkSync(elsewhere, helper);
     const message = refusal(() => loadOwnerToken({ TABDOCK_HOME: home }));
-    expect(message).toContain(helper);
+    // Named from TABDOCK_HOME, which gave its directory, never spelled out.
+    expect(message).toContain(`${HEADERS_HELPER_FILE} in ${GIVEN_HOME}`);
+    expect(message).not.toContain(home);
     expect(message).toMatch(/symbolic link.*delete it and start again/);
     expect(lstatSync(helper).isSymbolicLink()).toBe(true);
     // A dangling one too.
@@ -188,7 +191,8 @@ describe.skipIf(!POSIX)('the header helper beside the owner token', () => {
     for (const changed of changes) {
       writeFileSync(helper, changed, { mode: 0o700 });
       const message = refusal(() => loadOwnerToken({ TABDOCK_HOME: home }));
-      expect(message).toContain(helper);
+      expect(message).toContain(`${HEADERS_HELPER_FILE} in ${GIVEN_HOME}`);
+      expect(message).not.toContain(home);
       expect(message).toMatch(
         /not the header helper this release writes; delete it and start again/,
       );

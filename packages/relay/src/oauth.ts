@@ -261,37 +261,63 @@ function secureUrl(value: string): URL | null {
   return null;
 }
 
+/** One place Claude looks for the provider's metadata, with how a refusal names it. */
+interface DiscoveryUrl {
+  readonly url: string;
+  /** Fixed words, never the URL, which holds TABDOCK_OAUTH_ISSUER's value. */
+  readonly where: string;
+}
+
+/** What every refusal about the provider calls the issuer: its setting, never its value. */
+const ISSUER = 'the issuer TABDOCK_OAUTH_ISSUER gives';
+
 /**
  * Where Claude looks for the provider's metadata, in its order: RFC 8414 with
  * the issuer's path inserted, then OpenID Connect discovery, which for an
  * issuer with a path has two forms (MCP authorization, discovery section).
  */
-function discoveryUrls(issuer: URL): string[] {
+function discoveryUrls(issuer: URL): DiscoveryUrl[] {
   const path = issuer.pathname.replace(/\/$/, '');
+  const rfc8414 = '/.well-known/oauth-authorization-server';
+  const oidc = '/.well-known/openid-configuration';
   if (path === '') {
     return [
-      `${issuer.origin}/.well-known/oauth-authorization-server`,
-      `${issuer.origin}/.well-known/openid-configuration`,
+      { url: `${issuer.origin}${rfc8414}`, where: `${rfc8414} at ${ISSUER}` },
+      { url: `${issuer.origin}${oidc}`, where: `${oidc} at ${ISSUER}` },
     ];
   }
   return [
-    `${issuer.origin}/.well-known/oauth-authorization-server${path}`,
-    `${issuer.origin}/.well-known/openid-configuration${path}`,
-    `${issuer.origin}${path}/.well-known/openid-configuration`,
+    {
+      url: `${issuer.origin}${rfc8414}${path}`,
+      where: `${rfc8414} inserted before the path of ${ISSUER}`,
+    },
+    {
+      url: `${issuer.origin}${oidc}${path}`,
+      where: `${oidc} inserted before the path of ${ISSUER}`,
+    },
+    { url: `${issuer.origin}${path}${oidc}`, where: `${oidc} after the path of ${ISSUER}` },
   ];
 }
 
-function errorText(error: unknown): string {
-  if (!(error instanceof Error)) return String(error);
-  const cause = error.cause instanceof Error ? `: ${error.cause.message}` : '';
-  return `${error.message}${cause}`;
+/**
+ * Why a fetch failed, as a code or fixed words: fetch's own messages and
+ * their causes' quote the host or the address, which TABDOCK_OAUTH_ISSUER
+ * gave, and a refusal never repeats a setting's value.
+ */
+function fetchFailure(error: unknown): string {
+  if (error instanceof Error && error.name === 'TimeoutError') {
+    return `no answer within ${String(DISCOVERY_TIMEOUT_MS)} ms`;
+  }
+  const cause = error instanceof Error ? error.cause : undefined;
+  const code = cause instanceof Error && 'code' in cause ? cause.code : undefined;
+  return typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? code : 'fetch failed';
 }
 
 /** The first metadata document the provider serves, checked against what Claude needs. */
 async function discover(issuer: string): Promise<ProviderMetadata> {
   const issuerUrl = new URL(issuer);
   const tried: string[] = [];
-  for (const url of discoveryUrls(issuerUrl)) {
+  for (const { url, where } of discoveryUrls(issuerUrl)) {
     let response: Response;
     try {
       response = await fetch(url, {
@@ -303,13 +329,13 @@ async function discover(issuer: string): Promise<ProviderMetadata> {
     } catch (error) {
       throw new ProviderMetadataError(
         'unreachable',
-        `oauth: cannot reach the identity provider at ${url} (${errorText(error)})`,
+        `oauth: cannot reach the identity provider at ${where} (${fetchFailure(error)})`,
         { cause: error },
       );
     }
     if (response.status !== 200) {
       await response.body?.cancel();
-      tried.push(`${url} answered ${String(response.status)}`);
+      tried.push(`${where} answered ${String(response.status)}`);
       continue;
     }
     let body: unknown;
@@ -318,7 +344,7 @@ async function discover(issuer: string): Promise<ProviderMetadata> {
     } catch {
       throw new ProviderMetadataError(
         'malformed',
-        `oauth: the identity provider's metadata at ${url} is not JSON`,
+        `oauth: the identity provider's metadata at ${where} is not JSON`,
       );
     }
     const parsed = ProviderMetadataSchema.safeParse(body);
@@ -326,26 +352,27 @@ async function discover(issuer: string): Promise<ProviderMetadata> {
       const fields = [...new Set(parsed.error.issues.map((issue) => issue.path.join('.')))];
       throw new ProviderMetadataError(
         'malformed',
-        `oauth: the identity provider's metadata at ${url} lacks or misstates ${fields.join(', ')}`,
+        `oauth: the identity provider's metadata at ${where} lacks or misstates ${fields.join(', ')}`,
       );
     }
-    checkMetadata(parsed.data, issuer, url);
+    checkMetadata(parsed.data, issuer, where);
     return parsed.data;
   }
   throw new ProviderMetadataError(
     'missing',
-    `oauth: the identity provider publishes no metadata for issuer ${issuer} (${tried.join('; ')})`,
+    `oauth: the identity provider publishes no metadata for ${ISSUER} (${tried.join('; ')})`,
   );
 }
 
 /** Refuses a provider Claude could not sign in with, or whose tokens could not be checked. */
-function checkMetadata(metadata: ProviderMetadata, issuer: string, url: string): void {
+function checkMetadata(metadata: ProviderMetadata, issuer: string, where: string): void {
   // RFC 8414 section 3.3 and the MCP authorization spec: the document must name
-  // exactly the issuer it was fetched for, or it may be someone else's.
+  // exactly the issuer it was fetched for, or it may be someone else's. The
+  // provider's own issuer is quoted, being its text and the fix, not a setting.
   if (metadata.issuer !== issuer) {
     throw new ProviderMetadataError(
       'issuer',
-      `oauth: the metadata at ${url} names issuer ${JSON.stringify(metadata.issuer.slice(0, 200))}, not ${JSON.stringify(issuer)}; set TABDOCK_OAUTH_ISSUER to the provider's issuer exactly`,
+      `oauth: the metadata at ${where} names issuer ${JSON.stringify(metadata.issuer.slice(0, 200))}, not the one TABDOCK_OAUTH_ISSUER gives; set TABDOCK_OAUTH_ISSUER to the provider's issuer exactly`,
     );
   }
   if (!metadata.code_challenge_methods_supported?.includes('S256')) {
@@ -463,6 +490,18 @@ export function parseOAuthUsers(envValue: string): OAuthUser[] {
     users.push({ sub, userId, displayName });
   });
   if (users.length === 0) throw new Error('TABDOCK_OAUTH_USERS lists no users');
+  // createOAuthAuth refuses these too, naming the user, as fits users given in
+  // code; from the environment the entries are numbered, as above, since a
+  // secret pasted into the list could sit where a user id goes.
+  for (let i = 0; i < users.length; i += 1) {
+    for (let j = i + 1; j < users.length; j += 1) {
+      const pair = `TABDOCK_OAUTH_USERS entries ${String(i + 1)} and ${String(j + 1)}`;
+      if (users[i]?.sub === users[j]?.sub) throw new Error(`${pair} share a sub`);
+      if (users[i]?.userId === users[j]?.userId) {
+        throw new Error(`${pair} name the same user id`);
+      }
+    }
+  }
   return users;
 }
 

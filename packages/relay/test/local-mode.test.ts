@@ -82,7 +82,12 @@ describe('which mode the environment gives', () => {
     const options = loadConfigFromEnv({ TABDOCK_HOME: home });
     expect(options.auth.name).toBe('dev-token');
     expect(options.auth.loopbackOnly).toBe(true);
-    expect(options.localMode).toEqual({ tokenPath: join(home, OWNER_TOKEN_FILE), created: true });
+    expect(options.localMode).toMatchObject({
+      tokenPath: join(home, OWNER_TOKEN_FILE),
+      created: true,
+    });
+    // Refusals about the directory name it from TABDOCK_HOME, which gave it.
+    expect(options.localMode?.names.of(home)).toBe('the path TABDOCK_HOME gives');
     expect(options).toMatchObject({ port: 8787, env: 'development', host: undefined });
     expect(options.publicUrl).toBeUndefined();
     const config = resolveConfig(options);
@@ -211,7 +216,7 @@ describe('a plugin marked loopbackOnly, whatever its name', () => {
         resolveConfig({ auth: plugin, env: 'production', allowedOrigins: [PAGE_ORIGIN] }),
       ).toThrow(/marked loopbackOnly.*refuses production/);
       expect(() => resolveConfig({ auth: plugin, host: '0.0.0.0' })).toThrow(
-        /marked loopbackOnly.*refuses to bind 0\.0\.0\.0/,
+        /marked loopbackOnly.*refuses to bind a host \(TABDOCK_HOST\) off loopback/,
       );
       await expect(
         createRelay({ auth: plugin, env: 'production', allowedOrigins: [PAGE_ORIGIN] }),

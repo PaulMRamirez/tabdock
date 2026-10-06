@@ -1,6 +1,6 @@
 # Draft: feature request for `@mcp-b/webmcp-local-relay`
 
-> **For the owner.** This is a draft (M5 decision D4, ADR 0031). The owner posts it, if he chooses, from his personal GitHub account through MCP-B's Feature Request form at github.com/WebMCP-org/npm-packages (blank issues are off); the build posts nothing, and nothing here has been posted. Every MCP-B fact was checked on 5 October 2026 against `6.0.0-beta.20261001010549` (still npm's `beta`; `latest` is 5.1.0) and is cited in `docs/mcp-b-comparison.md`; recheck against the current beta or release before posting, and fill in the repository link. The sections below follow the form's fields in order.
+> **For the owner.** This is a draft (M5 decision D4, ADR 0031). The owner posts it, if he chooses, from his personal GitHub account through MCP-B's Feature Request form at github.com/WebMCP-org/npm-packages (blank issues are off); the build posts nothing, and nothing here has been posted. Every MCP-B fact was checked on 5 October 2026 against `6.0.0-beta.20261001010549` (still npm's `beta`; `latest` is 5.1.0) and is cited in `docs/mcp-b-comparison.md`; the dist-tags were rechecked on 6 October 2026 and had not moved. Recheck against the current beta or release before posting; the repository link below is filled in, since the repository is public. The sections below follow the form's fields in order.
 
 **Title:** `[webmcp-local-relay] Cancel in-flight invocations, then an opt-in remote profile`
 
@@ -37,7 +37,7 @@ A remote mode with the local defaults would let any web page publish tools and a
 
 ## Alternatives Considered
 
-Page-side timeouts: the page cannot know when the MCP side gave up, and a client's cancel never reaches it. Closing the page's socket on timeout: it drops every tool and every other call of that tab. A `--remote` flag on `webmcp.v1`: a page could not tell which trust model it is talking to; a separate subprotocol makes page and relay agree explicitly. A separate project: Tabdock (Apache-2.0, <link to the Tabdock repository>) already links pages to a public relay with origin checks, an allowlist, signed-in users, approval on the page and cancellation, on its own `tabdock.v1`. We would rather converge than compete, and either side could adopt the other's frames.
+Page-side timeouts: the page cannot know when the MCP side gave up, and a client's cancel never reaches it. Closing the page's socket on timeout: it drops every tool and every other call of that tab. A `--remote` flag on `webmcp.v1`: a page could not tell which trust model it is talking to; a separate subprotocol makes page and relay agree explicitly. A separate project: Tabdock (Apache-2.0, https://github.com/PaulMRamirez/tabdock) already links pages to a public relay with origin checks, an allowlist, signed-in users, approval on the page and cancellation, on its own `tabdock.v1`. We would rather converge than compete, and either side could adopt the other's frames.
 
 ## Example API / Usage
 

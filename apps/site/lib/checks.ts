@@ -3,7 +3,9 @@
 // the adapter's records in sessionStorage, so a tour page must hold no script
 // of any kind and run under its policy, and every diagram must be a plain
 // picture that names nothing outside the site. These checks read the files as
-// written to dist, so what they pass is what Pages serves.
+// written to dist, so what they pass is what Pages serves. Guide pages share
+// the same origin and get the same checks, word for word (ADR 0035): the
+// names say tour because the tour came first, and every rule holds site-wide.
 
 import { readdir, readFile } from 'node:fs/promises';
 import { extname, join, relative } from 'node:path';

@@ -380,6 +380,15 @@ function personText(user: { userId: string; displayName: string }, account?: Acc
   return `${name} (${id})`;
 }
 
+/**
+ * "<who> wants", or "You want" for local mode's one user, whom the relay
+ * names You (LOCAL_USER in local-token.ts); any name that reads You takes
+ * the verb as you would.
+ */
+function wants(who: string): string {
+  return who === 'You' ? `${who} want` : `${who} wants`;
+}
+
 /** Whether a roster entry came in by invite, or is an invitee: either way it carries the "invited" badge. */
 function invited(attachment: AttachmentView): boolean {
   return attachment.inviteId !== null || attachment.kind === 'invitee';
@@ -884,10 +893,10 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const line = element('p');
     if (request.invite !== null) {
       // The account beside the label the operator gave the invite, which is this page's own text.
-      dom.append(line, `${who} wants to join by your invite "${request.invite.label}"`);
+      dom.append(line, `${wants(who)} to join by your invite "${request.invite.label}"`);
     } else {
       const via = request.via === 'qr' ? 'QR code' : 'code';
-      dom.append(line, `${who} wants to attach via ${via}`);
+      dom.append(line, `${wants(who)} to attach via ${via}`);
     }
     dom.append(line, badge(request.invite !== null || request.account.kind === 'invitee'));
     dom.append(box, line);
@@ -939,7 +948,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const box = element('div', 'prompt');
     dom.attr(box, 'data-call-id', confirm.callId);
     const line = element('p');
-    dom.append(line, `${personText(confirm.caller)} wants to run ${confirm.tool}`);
+    dom.append(line, `${wants(personText(confirm.caller))} to run ${confirm.tool}`);
     dom.append(line, badge(shortId(confirm.caller.userId) !== null));
     dom.append(box, line);
     const view = newPrompt(box, confirm.expiresAt);
@@ -1173,6 +1182,69 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       added = true;
     }
     return added;
+  }
+
+  /** The seq of the newest observer seat already dealt with; null before the first render. */
+  let lastSeat: number | null = null;
+  /** Each seat notice on screen, by its seat's seq, with the user it names. */
+  const seatLines = new Map<number, { userId: string; line: JoinLine }>();
+
+  /**
+   * Says so when the driver limit seated someone as an observer after the
+   * operator chose driver, which nothing else on the panel would: the row
+   * just reads observer (DockState.observerSeats). The words are the
+   * operator's own; the line ages and goes as a join notice does. Returns
+   * whether a notice was added, which opens the panel.
+   */
+  function noticeSeats(state: DockState): boolean {
+    withdrawSeats(state);
+    const newest = state.observerSeats[0]?.seq ?? 0;
+    // Seats recorded before the widget mounted are not news.
+    if (lastSeat === null) {
+      lastSeat = newest;
+      return false;
+    }
+    const fresh = state.observerSeats.filter((seat) => seat.seq > (lastSeat ?? 0));
+    lastSeat = Math.max(lastSeat, newest);
+    for (const seat of [...fresh].reverse()) {
+      const who = personText(seat.user, seat.account ?? undefined);
+      const line = element(
+        'p',
+        'join',
+        `The page already has its maximum drivers, so ${who} ${seat.asked === 'allow' ? 'joined as observer' : 'is still an observer'}.`,
+      );
+      // Not data-user-id, which names roster rows.
+      dom.attr(line, 'data-seated', seat.user.userId);
+      dom.prepend(joins, line);
+      const shown: JoinLine = { element: line, shownMs: 0, since: null, seen: false };
+      joinLines.push(shown);
+      seatLines.set(seat.seq, { userId: seat.user.userId, line: shown });
+    }
+    return fresh.length > 0;
+  }
+
+  /**
+   * Takes a seat notice down once the roster lists its person as a driver
+   * after all, as when a roster sent before the relay read the click came
+   * first: the notice would now say the opposite of the row beside it.
+   */
+  function withdrawSeats(state: DockState): void {
+    for (const [seq, { userId, line }] of [...seatLines]) {
+      const at = joinLines.indexOf(line);
+      if (at === -1) {
+        // Aged away already.
+        seatLines.delete(seq);
+        continue;
+      }
+      if (state.observerSeats.some((seat) => seat.seq === seq)) continue;
+      const driving = state.roster.some(
+        (entry) => entry.userId === userId && entry.role === 'driver',
+      );
+      if (!driving) continue;
+      dom.remove(line.element);
+      joinLines.splice(at, 1);
+      seatLines.delete(seq);
+    }
   }
 
   /**
@@ -1498,6 +1570,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     syncInvites(state);
     syncRows(state);
     const joined = noticeJoins(state);
+    const seated = noticeSeats(state);
     updateForm(state);
     renderActivity(state.activity);
     updatePause(state.paused);
@@ -1515,8 +1588,9 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       confirmView,
     );
     // A new prompt opens the panel, as the operator has a deadline to meet, and
-    // so does a join notice, as nobody was asked about that join.
-    if (newRequest || newConfirm || joined) setOpen(true);
+    // so does a join notice, as nobody was asked about that join, and a seat
+    // notice, as the operator was answered with less than they chose.
+    if (newRequest || newConfirm || joined || seated) setOpen(true);
     // The code is how anyone attaches, so show it without a click while nobody has.
     // Only once on the way in, so the badge can still close the panel: a link that
     // drops and resumes with nobody attached leaves the panel as the operator left it.

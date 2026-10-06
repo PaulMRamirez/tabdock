@@ -170,10 +170,15 @@ export interface UiPort {
   ): boolean | undefined | Promise<boolean | undefined>;
 }
 
+/** Where a page's policy was written: attach()'s options, or the script-tag build's data attributes. */
+export type PolicyFrom = 'attach' | 'script-tag';
+
 export interface CoreOptions {
   /** The relay's page endpoint, for example ws://127.0.0.1:8787/page. */
   relayUrl: string;
   policy?: PolicyInput | undefined;
+  /** Where the policy was written, so advice names that setting; 'attach' unless set. */
+  policyFrom?: PolicyFrom | undefined;
   /** document.modelContext; without it the core logs how to add a polyfill and stays idle. */
   modelContext?: ModelContextLike | undefined;
   socketFactory: SocketFactory;
@@ -383,6 +388,44 @@ export interface InviteJoin {
   readonly time: number;
 }
 
+/**
+ * Someone the operator asked to make a driver, by Allow as driver or Make
+ * driver, whom the relay seated as an observer because the page already had
+ * policy.maxDrivers drivers. The page records it when the relay's roster
+ * comes back, never from its own guess, so the widget can say so in the
+ * operator's own words.
+ */
+export interface ObserverSeat {
+  /** Counts up from 1 with every such seat this core records, so a notice is given once. */
+  readonly seq: number;
+  readonly user: User;
+  /** From the request Allow as driver answered; null for Make driver, which has none. */
+  readonly account: Account | null;
+  /** 'allow' for Allow as driver, 'promote' for Make driver. */
+  readonly asked: 'allow' | 'promote';
+  /** Local epoch milliseconds of the roster that showed it. */
+  readonly time: number;
+}
+
+/** A set_role the page sent, until a roster that could answer it has come. */
+interface SentRole {
+  readonly userId: string;
+}
+
+/** A driver the operator asked for, until the relay's roster settles the seat. */
+interface DriverAsk {
+  readonly user: User;
+  readonly account: Account | null;
+  readonly asked: 'allow' | 'promote';
+  /**
+   * For Make driver, its set_role while a roster may yet answer it; null for
+   * Allow as driver, which the first roster that lists them answers.
+   */
+  readonly sent: SentRole | null;
+  /** Logged as an observer; watched still, in case the relay's answer comes after all. */
+  saidObserver: boolean;
+}
+
 export interface DockState {
   readonly link: LinkState;
   readonly pageId: string | null;
@@ -423,6 +466,11 @@ export interface DockState {
    * What the page runs their calls under now is pageRoles' to say.
    */
   readonly joins: readonly InviteJoin[];
+  /**
+   * Who the driver limit seated as an observer after the operator chose
+   * driver, newest first, while the roster still lists them as one.
+   */
+  readonly observerSeats: readonly ObserverSeat[];
   /**
    * The page's policy as attach() was given it, defaults filled in: what
    * policy.invites lets the operator offer, and maxDrivers, for a prompt to
@@ -597,9 +645,19 @@ const POLYFILL_HINT =
   "(for example @mcp-b/webmcp-polyfill's installWebMCP() on 6.x, or initializeWebMCPPolyfill() on 5.x) " +
   'or use a browser with WebMCP enabled.';
 
-const HINT_NOTICE =
-  "This browser's WebMCP does not report consequentialHint, so every tool that is not read-only " +
-  'is treated as consequential. List the consequential tools in policy.consequentialTools to fix this.';
+/**
+ * The hint fallback's advice (ADR 0002), naming the setting the page author
+ * wrote: the policy option for attach(), the attribute on a script tag.
+ */
+const HINT_NOTICES: Readonly<Record<PolicyFrom, string>> = {
+  attach:
+    "This browser's WebMCP does not report consequentialHint, so every tool that is not read-only " +
+    'is treated as consequential. List the consequential tools in policy.consequentialTools to fix this.',
+  'script-tag':
+    "This browser's WebMCP does not report consequentialHint, so every tool that is not read-only " +
+    "is treated as consequential. List the consequential tools in the script tag's " +
+    'data-consequential-tools attribute to fix this.',
+};
 
 /**
  * The standard close code for a malformed frame. Browsers refuse it from page
@@ -1109,6 +1167,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     invites: [],
     invitesOffered: null,
     joins: [],
+    observerSeats: [],
     policy: { ...policy, consequentialTools: [...policy.consequentialTools] },
   });
   const listeners = new Set<(state: DockState) => void>();
@@ -1197,6 +1256,24 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   let grantEndTimer: unknown = null;
   /** The seq of the last join this core honoured; see InviteJoin. */
   let joinSeq = 0;
+  /**
+   * Users the operator asked to make drivers whose seat the relay has not
+   * settled: the relay decides it (it holds a new driver at maxDrivers), so
+   * what the operator got is said only once its roster shows it.
+   */
+  const askedDriver = new Map<string, DriverAsk>();
+  /**
+   * set_role frames sent whose roster may not have come back, oldest first.
+   * The relay answers each with exactly one roster, in order, and sends
+   * rosters for other events too, so each roster takes the oldest off: a
+   * promotion's answer can be no earlier than the roster that takes its
+   * frame off, and may be later. The relay answers a set_role for someone no
+   * longer attached with nothing, so a roster that leaves its user out takes
+   * it off too.
+   */
+  const rolesUnanswered: SentRole[] = [];
+  /** The seq of the last ObserverSeat recorded. */
+  let seatSeq = 0;
 
   function setState(patch: Partial<DockState>): void {
     const next = { ...state, ...patch };
@@ -1693,7 +1770,83 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     );
     // The relay has applied a revoke once it stops listing the user.
     forgetRevokes([...revoked].filter((userId) => !listed.has(userId)));
-    setState({ roster: attachments });
+    rolesUnanswered.shift();
+    for (let at = rolesUnanswered.length - 1; at >= 0; at -= 1) {
+      if (!listed.has(rolesUnanswered[at]?.userId ?? '')) rolesUnanswered.splice(at, 1);
+    }
+    const seats = seatsAnswered(attachments);
+    // A seat notice lasts while its user is still an observer, and a newer seat replaces it.
+    const observers = new Set(
+      attachments.filter((entry) => entry.role === 'observer').map((entry) => entry.userId),
+    );
+    const fresh = new Set(seats.map((seat) => seat.user.userId));
+    const kept = state.observerSeats.filter(
+      (seat) => observers.has(seat.user.userId) && !fresh.has(seat.user.userId),
+    );
+    setState({ roster: attachments, observerSeats: [...seats, ...kept] });
+  }
+
+  /**
+   * What the relay made of each driver the operator asked for, once its
+   * roster can say: logged as it is, never as asked, and an ObserverSeat for
+   * each the driver limit held back. The roster carries no reason, so the
+   * limit is named only when the other drivers it lists fill maxDrivers; a
+   * promotion the relay refused for another reason, such as too many
+   * promotions this window, is logged as kept. A promotion is judged only by
+   * a roster that can be its answer; one that arrives earlier was sent before
+   * the relay read the click. Rosters sent for other events can still come
+   * first, so someone said to be an observer stays watched, and should the
+   * relay's answer then seat them as a driver, the log says that too and the
+   * seat, with its notice, goes.
+   */
+  function seatsAnswered(attachments: readonly AttachmentView[]): ObserverSeat[] {
+    const seats: ObserverSeat[] = [];
+    for (const [userId, asked] of [...askedDriver]) {
+      const entry = attachments.find((attachment) => attachment.userId === userId);
+      if (!entry) {
+        // Not attached yet, for Allow as driver; detached, for Make driver.
+        if (asked.asked === 'promote') askedDriver.delete(userId);
+        continue;
+      }
+      const who = logName(entry);
+      if (entry.role === 'driver') {
+        askedDriver.delete(userId);
+        log.info(asked.asked === 'allow' ? `${who} joined as driver` : `set ${who} to driver`);
+        continue;
+      }
+      if (asked.saidObserver) continue;
+      if (asked.sent !== null && rolesUnanswered.includes(asked.sent)) continue;
+      const drivers = attachments.filter(
+        (other) => other.role === 'driver' && other.userId !== userId,
+      ).length;
+      if (drivers < policy.maxDrivers) {
+        if (asked.asked === 'allow') {
+          // The first roster that lists someone new is the relay's answer.
+          askedDriver.delete(userId);
+          log.info(`${who} joined as observer`);
+        } else {
+          asked.saidObserver = true;
+          log.info(`the relay kept ${who} an observer`);
+        }
+        continue;
+      }
+      log.info(
+        `${who} ${asked.asked === 'allow' ? 'joined as observer' : 'is still an observer'}: the page already has its maximum drivers (${String(policy.maxDrivers)})`,
+      );
+      if (asked.asked === 'allow') askedDriver.delete(userId);
+      else asked.saidObserver = true;
+      seatSeq += 1;
+      seats.push(
+        Object.freeze({
+          seq: seatSeq,
+          user: Object.freeze({ ...asked.user }),
+          account: asked.account === null ? null : Object.freeze({ ...asked.account }),
+          asked: asked.asked,
+          time: clock(),
+        }),
+      );
+    }
+    return seats;
   }
 
   function onClose(code: number, reason: string): void {
@@ -1752,6 +1905,10 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       record.port.abort();
     }
     requests.clear();
+    // A decision sent before the drop may never have been applied; the next
+    // welcome's roster shows each seat as it is, with nothing to announce.
+    askedDriver.clear();
+    rolesUnanswered.length = 0;
     // A mint the relay has not answered may or may not have reached it. The
     // page forgets it, so nothing honours its link, and should a resumed
     // relay list it, the page closes it as one it holds no record of.
@@ -1855,7 +2012,9 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       lastProblemsKey = problemsKey;
       for (const problem of snapshot.problems) log.warn(problem);
     }
-    const notice = needsHintNotice(snapshot.hintSupport, policy) ? HINT_NOTICE : null;
+    const notice = needsHintNotice(snapshot.hintSupport, policy)
+      ? HINT_NOTICES[options.policyFrom ?? 'attach']
+      : null;
     if (notice !== state.notice) setState({ notice });
     return snapshot;
   }
@@ -2650,6 +2809,10 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     // so the operator's latest decision stands.
     const { userId } = request.user;
     const listed = state.roster.some((attachment) => attachment.userId === userId);
+    // A revoke the relay has yet to apply ends that attachment before this decision makes another.
+    const keptAttachment = revoked.has(userId)
+      ? undefined
+      : state.roster.find((attachment) => attachment.userId === userId);
     if (allow && granted !== undefined && invite && inviteId !== undefined) {
       // An invite-made grant ends 24 hours after redemption and names the
       // invite's role as its cap (ADR 0017); its use is spent here, on the
@@ -2684,7 +2847,28 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       updateInvite({ ...invite, refusals: Math.min(INVITE_BURN_REFUSALS, invite.refusals + 1) });
     }
     const who = logName(request.user);
-    log.info(allow ? `allowed ${who} as ${String(granted)}` : `denied ${who}`);
+    askedDriver.delete(userId);
+    if (!allow) {
+      log.info(`denied ${who}`);
+    } else if (keptAttachment) {
+      // The relay keeps an attachment's role, whatever this approval named.
+      log.info(
+        `allowed ${who}, who is already attached as ${keptAttachment.role}; the relay keeps that role`,
+      );
+    } else if (granted === 'driver') {
+      // The relay seats a new driver only while a driver seat is free, so
+      // what they joined as is logged when its roster lists them.
+      askedDriver.set(userId, {
+        user: request.user,
+        account: request.account,
+        asked: 'allow',
+        sent: null,
+        saidObserver: false,
+      });
+      log.info(`allowed ${who}, asking the relay for a driver seat`);
+    } else {
+      log.info(`allowed ${who} as ${String(granted)}`);
+    }
     // The relay ends every request a revoke names as it applies the revoke
     // frame, which went first; a decision would only reach a request already
     // gone there, and count against the page's budget for frames that change
@@ -2886,8 +3070,26 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     if (grant?.endsAt !== undefined && clock() >= grant.endsAt) return false;
     // A role change keeps whatever else the grant names, such as the invite that made it.
     setGrant(userId, { ...grant, role });
-    log.info(`set ${logName(attachment)} to ${role}`);
-    return send({ t: 'set_role', userId, role });
+    askedDriver.delete(userId);
+    if (!send({ t: 'set_role', userId, role })) return false;
+    // The relay answers every set_role with a roster, even when nothing changed.
+    const sent: SentRole = { userId };
+    rolesUnanswered.push(sent);
+    if (role === 'driver' && attachment.role !== 'driver') {
+      // The relay may hold them at maxDrivers, so the log waits for its roster.
+      const user = { userId: attachment.userId, displayName: attachment.displayName };
+      askedDriver.set(userId, {
+        user,
+        account: null,
+        asked: 'promote',
+        sent,
+        saidObserver: false,
+      });
+      log.info(`asked the relay to make ${logName(attachment)} a driver`);
+    } else {
+      log.info(`set ${logName(attachment)} to ${role}`);
+    }
+    return true;
   }
 
   /**
@@ -2927,6 +3129,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     if (!everyone) bar(target, theirs);
     for (const userId of listed) revoked.add(userId);
     for (const userId of granted) grants.delete(userId);
+    // Whatever they were asked for, nothing is announced for someone revoked.
+    for (const userId of [...askedDriver.keys()].filter(hits)) askedDriver.delete(userId);
     saveGrants();
     log.info(everyone ? 'the operator revoked everyone' : `the operator revoked ${target}`);
     // While the link is down, the next welcome sends it for anyone still listed.

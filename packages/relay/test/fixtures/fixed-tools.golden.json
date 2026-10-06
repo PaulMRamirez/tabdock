@@ -1,5 +1,5 @@
 {
-  "_comment": "The fixed tools as M4 served them, captured from the relay at 616c30f (M5 Step 1, whose fixed tools are M4's): a 2025-era initialize and tools/list on a session, a 2026-07-28 server/discover and tools/list, and the answer to a tools/call naming no tool. <RELAY_VERSION> stands for RELAY_VERSION. The golden test holds the relay to it on both eras with first-class tools off and on.",
+  "_comment": "The fixed tools as M4 served them, captured from the relay at 616c30f (M5 Step 1, whose fixed tools are M4's): a 2025-era initialize and tools/list on a session, a 2026-07-28 server/discover and tools/list, and the answer to a tools/call naming no tool. <RELAY_VERSION> stands for RELAY_VERSION. The golden test holds the relay to it on both eras with first-class tools off and on. One change since, made on purpose on 6 October 2026: detach_page's description names a new invite link beside a new code, since an invitee who offers a code gets invite_required.",
   "legacy": {
     "initialize": {
       "result": {
@@ -130,7 +130,7 @@
           {
             "name": "detach_page",
             "title": "Detach from a page",
-            "description": "Remove your own attachment to a page. Other people's attachments to it are not affected. To use the page again, pair with a new code.",
+            "description": "Remove your own attachment to a page. Other people's attachments to it are not affected. To use the page again, pair with a new code, or, if your account joins pages by invite, with a new invite link from the page's operator.",
             "inputSchema": {
               "type": "object",
               "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -297,7 +297,7 @@
           {
             "name": "detach_page",
             "title": "Detach from a page",
-            "description": "Remove your own attachment to a page. Other people's attachments to it are not affected. To use the page again, pair with a new code.",
+            "description": "Remove your own attachment to a page. Other people's attachments to it are not affected. To use the page again, pair with a new code, or, if your account joins pages by invite, with a new invite link from the page's operator.",
             "inputSchema": {
               "type": "object",
               "$schema": "https://json-schema.org/draft/2020-12/schema",

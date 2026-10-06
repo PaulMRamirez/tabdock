@@ -371,6 +371,37 @@ describe('loadConfigFromEnv', () => {
     expect(options.port).toBe(DEFAULT_CLI_PORT);
   });
 
+  it('trims a flag as it trims every setting, so spaces alone read as unset and leave it off', () => {
+    const flags = (value: string) =>
+      loadConfigFromEnv({
+        TABDOCK_DEV_TOKENS: tokens,
+        TABDOCK_DEV_ALLOW_NO_ORIGIN: value,
+        TABDOCK_INVITES: value,
+        TABDOCK_FIRST_CLASS_TOOLS: value,
+        TABDOCK_SPIKE: value,
+      });
+    for (const on of [' 1 ', '\ttrue', 'TRUE  ']) {
+      expect(flags(on), JSON.stringify(on)).toMatchObject({
+        allowMissingOrigin: true,
+        invites: true,
+        firstClassTools: true,
+        spike: true,
+      });
+    }
+    // Blank, as a blank count or URL is: the setting is unset, so the flag stays off.
+    for (const off of ['   ', ' 0 ', ' false', '\t']) {
+      expect(flags(off), JSON.stringify(off)).toMatchObject({
+        allowMissingOrigin: false,
+        invites: false,
+        firstClassTools: false,
+        spike: false,
+      });
+    }
+    for (const bad of [' yes ', '1 1', 'on']) {
+      expect(() => flags(bad), JSON.stringify(bad)).toThrow(/must be 1, true, 0 or false/);
+    }
+  });
+
   it('names the bad variable and never echoes a token', () => {
     expect(() => loadConfigFromEnv({ TABDOCK_DEV_TOKENS: tokens, TABDOCK_PORT: 'x' })).toThrow(
       /TABDOCK_PORT/,
@@ -391,7 +422,7 @@ describe('loadConfigFromEnv', () => {
     } catch (error) {
       message = error instanceof Error ? error.message : String(error);
     }
-    expect(message).toMatch(/alice.*shorter than 24/);
+    expect(message).toMatch(/^TABDOCK_DEV_TOKENS entry 1 has a token shorter than 24/);
     expect(message).not.toContain(short);
   });
 
@@ -405,10 +436,38 @@ describe('loadConfigFromEnv', () => {
 
 describe('parseDevTokens', () => {
   it('parses user=token pairs, splitting on the first = only', () => {
-    expect(parseDevTokens(' alice=abc== , bob=x=y ,')).toEqual([
-      { userId: 'alice', displayName: 'alice', token: 'abc==' },
-      { userId: 'bob', displayName: 'bob', token: 'x=y' },
+    expect(parseDevTokens(` alice=${TOKEN}== , bob=x=${TOKEN} ,`)).toEqual([
+      { userId: 'alice', displayName: 'alice', token: `${TOKEN}==` },
+      { userId: 'bob', displayName: 'bob', token: `x=${TOKEN}` },
     ]);
+  });
+
+  it('refuses a token check by entry number, so a token written where the user id goes is never printed', () => {
+    // Local mode's owner token and a hex token both pass as user ids.
+    const owner = `tabdock_${'Zq7Mark9Wq'.repeat(4)}abc`;
+    const hex = 'ab'.repeat(32);
+    const other = 'j'.repeat(MIN_DEV_TOKEN_LENGTH);
+    const refusals: [string, RegExp][] = [
+      [`${owner}=you`, /^TABDOCK_DEV_TOKENS entry 1 has a token shorter than 24 characters$/],
+      [`alice=${TOKEN},${hex}=alice`, /^TABDOCK_DEV_TOKENS entry 2 has a token shorter than 24/],
+      [`${owner}=${TOKEN} x`, /^TABDOCK_DEV_TOKENS entry 1 has a token that is not printable/],
+      [
+        `${owner}=${TOKEN},${owner}=${other}`,
+        /^TABDOCK_DEV_TOKENS entries 1 and 2 name the same user id$/,
+      ],
+      [`${owner}=${TOKEN},${hex}=${TOKEN}`, /^TABDOCK_DEV_TOKENS entries 1 and 2 share a token$/],
+    ];
+    for (const [value, refusal] of refusals) {
+      let message = '';
+      try {
+        parseDevTokens(value);
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message, value).toMatch(refusal);
+      expect(message, value).not.toContain('Zq7Mark9Wq');
+      expect(message, value).not.toContain(hex);
+    }
   });
 
   it.each(['', ',', 'alice', 'alice=', '=token', 'al ice=token', 'alice=a,bob'])(

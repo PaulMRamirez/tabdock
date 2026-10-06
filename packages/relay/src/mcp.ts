@@ -471,7 +471,7 @@ function fixedEntries(config: ResolvedConfig): ListedTool[] {
       name: 'detach_page',
       title: 'Detach from a page',
       description:
-        "Remove your own attachment to a page. Other people's attachments to it are not affected. To use the page again, pair with a new code.",
+        "Remove your own attachment to a page. Other people's attachments to it are not affected. To use the page again, pair with a new code, or, if your account joins pages by invite, with a new invite link from the page's operator.",
       inputSchema: listedInputSchema(PAGE_INPUT),
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
@@ -784,7 +784,7 @@ export function createMcpFactory(
         return {
           content: [
             text(
-              'You are not attached to any page. Ask the page operator for the pairing code on their page and call pair_page.',
+              'You are not attached to any page. Ask the page operator for the pairing code on their page, or, if your account joins pages by invite, for an invite link minted for one use, and call pair_page with it.',
             ),
           ],
           structuredContent: { pages },

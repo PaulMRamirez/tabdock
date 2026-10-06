@@ -26,7 +26,7 @@ import {
   verifyAuditLines,
 } from './audit-file.ts';
 import { LOCAL_AUDIT_DIR } from './config.ts';
-import { ownerTokenDirectory } from './local-token.ts';
+import { ownerTokenDirectory, pathNames } from './local-token.ts';
 import { PACKAGED } from './packaged.ts';
 
 /** How a checkout runs the reader; the published command is `tabdock-relay audit`. */
@@ -164,8 +164,10 @@ interface AuditDir {
  * beside its token. A path the person gave is named only by where it came
  * from, never repeated: the value after --dir or in the variable may be a
  * token pasted in the wrong place, and stderr may reach a supervisor's or
- * CI's log (ADR 0028). The default is shown, since the reader derived it
- * from the token directory, which TABDOCK_HOME may name only absolutely.
+ * CI's log (ADR 0028). The default beside the token is named as the relay
+ * names it: from TABDOCK_HOME when that setting gave the token directory, an
+ * absolute path that may still be a token pasted there, and shown in full
+ * when the platform's own variables did (PathNames).
  */
 function auditDir(given: string | undefined, env: NodeJS.ProcessEnv): AuditDir {
   if (given !== undefined) {
@@ -180,7 +182,7 @@ function auditDir(given: string | undefined, env: NodeJS.ProcessEnv): AuditDir {
     };
   }
   const path = join(ownerTokenDirectory(env), LOCAL_AUDIT_DIR);
-  return { path, named: path, hint: 'give --dir or TABDOCK_AUDIT_DIR' };
+  return { path, named: pathNames(env).of(path), hint: 'give --dir or TABDOCK_AUDIT_DIR' };
 }
 
 const AUDIT_OPTIONS = {

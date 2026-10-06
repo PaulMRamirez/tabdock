@@ -413,7 +413,10 @@ try {
   const insideCode = await insideRun.exited;
   check(
     insideCode === 1 &&
-      insideRun.stderr().includes(`inside the git work tree ${work},`) &&
+      insideRun.stderr().includes('refuses the path TABDOCK_HOME gives') &&
+      insideRun.stderr().includes('lies inside a git work tree') &&
+      // A refusal never repeats the setting's value, which could be a token.
+      !insideRun.stderr().includes(work) &&
       !existsSync(inside),
     'a TABDOCK_HOME inside the work tree is refused, and nothing is made there',
   );
@@ -437,7 +440,9 @@ try {
     relays.push(sharedRun);
     check(
       (await sharedRun.exited) === 1 &&
-        sharedRun.stderr().includes(`${shared} above it can be written by other accounts`) &&
+        sharedRun.stderr().includes('refuses the path TABDOCK_HOME gives') &&
+        sharedRun.stderr().includes('above it can be written by other accounts') &&
+        !sharedRun.stderr().includes(sharedHome) &&
         !existsSync(join(shared, `tabdock-pack-install-${String(process.pid)}`)),
       `a TABDOCK_HOME under ${shared} is refused, and nothing is made there`,
     );
