@@ -1175,6 +1175,40 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     return added;
   }
 
+  /** The seq of the newest observer seat already dealt with; null before the first render. */
+  let lastSeat: number | null = null;
+
+  /**
+   * Says so when the driver limit seated someone as an observer after the
+   * operator chose driver, which nothing else on the panel would: the row
+   * just reads observer (DockState.observerSeats). The words are the
+   * operator's own; the line ages and goes as a join notice does. Returns
+   * whether a notice was added, which opens the panel.
+   */
+  function noticeSeats(state: DockState): boolean {
+    const newest = state.observerSeats[0]?.seq ?? 0;
+    // Seats recorded before the widget mounted are not news.
+    if (lastSeat === null) {
+      lastSeat = newest;
+      return false;
+    }
+    const fresh = state.observerSeats.filter((seat) => seat.seq > (lastSeat ?? 0));
+    lastSeat = Math.max(lastSeat, newest);
+    for (const seat of [...fresh].reverse()) {
+      const who = personText(seat.user, seat.account ?? undefined);
+      const line = element(
+        'p',
+        'join',
+        `The page already has its maximum drivers, so ${who} ${seat.asked === 'allow' ? 'joined as observer' : 'is still an observer'}.`,
+      );
+      // Not data-user-id, which names roster rows.
+      dom.attr(line, 'data-seated', seat.user.userId);
+      dom.prepend(joins, line);
+      joinLines.push({ element: line, shownMs: 0, since: null, seen: false });
+    }
+    return fresh.length > 0;
+  }
+
   /**
    * Counts the time each join notice has been on screen, the panel open on a
    * visible tab, and removes those shown for JOIN_NOTICE_MS. Called on every
@@ -1498,6 +1532,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     syncInvites(state);
     syncRows(state);
     const joined = noticeJoins(state);
+    const seated = noticeSeats(state);
     updateForm(state);
     renderActivity(state.activity);
     updatePause(state.paused);
@@ -1515,8 +1550,9 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       confirmView,
     );
     // A new prompt opens the panel, as the operator has a deadline to meet, and
-    // so does a join notice, as nobody was asked about that join.
-    if (newRequest || newConfirm || joined) setOpen(true);
+    // so does a join notice, as nobody was asked about that join, and a seat
+    // notice, as the operator was answered with less than they chose.
+    if (newRequest || newConfirm || joined || seated) setOpen(true);
     // The code is how anyone attaches, so show it without a click while nobody has.
     // Only once on the way in, so the badge can still close the panel: a link that
     // drops and resumes with nobody attached leaves the panel as the operator left it.

@@ -94,6 +94,7 @@ The promise resolves once, with `{ ok: true, inviteId, link, expiresAt }`, the l
 | `invites`         | live invites                                                         | Those this page minted and its own record still holds                                                     |
 | `invitesOffered`  | `{ linkBase }` or null                                               | Null until a relay with invites on says so                                                                |
 | `joins`           | people let in by invite                                              | Newest first, while their grant lasts                                                                     |
+| `observerSeats`   | people the driver limit held back                                    | Newest first: each `user`, `account` and `asked` (`'allow'` or `'promote'`), while they stay observers    |
 | `policy`          | `Policy`                                                             | The policy `attach()` was given, with defaults filled in; a copy                                          |
 
 ## Your own operator UI

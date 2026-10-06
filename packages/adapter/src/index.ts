@@ -33,6 +33,7 @@ export type {
   InviteView,
   LinkState,
   ModelContextLike,
+  ObserverSeat,
   PageRole,
   PendingConfirm,
   PendingRequest,

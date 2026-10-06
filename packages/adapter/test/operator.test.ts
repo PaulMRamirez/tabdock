@@ -609,6 +609,91 @@ describe("the operator's role switch", () => {
     expect(outcomes(socket)).toEqual({ 'call-1': 'role_denied' });
   });
 
+  it('says the driver limit seated someone allowed as driver as an observer, and never that they drive', async () => {
+    const h = setup();
+    const socket = await link(h, {}, { alice: 'driver' });
+    socket.deliver({
+      ...attachRequest(h.clock, 'bob-asks'),
+      user: { userId: 'bob', displayName: 'Bob' },
+    });
+    expect(h.dock.approve('bob-asks', 'driver')).toBe(true);
+    expect(h.dock.state.observerSeats).toEqual([]);
+    // maxDrivers is 1 and Alice drives, so the relay seats Bob as an observer.
+    socket.deliver({
+      t: 'roster',
+      attachments: [attachment('alice', 'driver'), attachment('bob', 'observer')],
+    });
+    await flush();
+    expect(h.dock.state.observerSeats).toMatchObject([
+      { seq: 1, user: { userId: 'bob', displayName: 'Bob' }, asked: 'allow' },
+    ]);
+    expect(h.dock.state.observerSeats[0]?.account).toEqual({ kind: 'member', verified: true });
+    const said = h.logs.filter((line) => line.includes('Bob'));
+    expect(said).toContain(
+      'info Bob joined as observer: the page already has its maximum drivers (1)',
+    );
+    expect(said.filter((line) => /as driver|to driver/.test(line))).toEqual([]);
+    // A later roster says nothing new, and the record lasts only while Bob observes.
+    socket.deliver({
+      t: 'roster',
+      attachments: [attachment('alice', 'observer'), attachment('bob', 'observer')],
+    });
+    await flush();
+    expect(h.dock.state.observerSeats).toHaveLength(1);
+    socket.deliver({
+      t: 'roster',
+      attachments: [attachment('alice', 'observer'), attachment('bob', 'driver')],
+    });
+    await flush();
+    expect(h.dock.state.observerSeats).toEqual([]);
+  });
+
+  it('says Make driver at the limit left them an observer, and records a seat the limit did not hold as it is', async () => {
+    const h = setup();
+    const socket = await link(h, {}, { alice: 'driver', bob: 'observer' });
+    expect(h.dock.setRole('bob', 'driver')).toBe(true);
+    socket.deliver({
+      t: 'roster',
+      attachments: [attachment('alice', 'driver'), attachment('bob', 'observer')],
+    });
+    await flush();
+    expect(h.dock.state.observerSeats).toMatchObject([
+      { user: { userId: 'bob' }, account: null, asked: 'promote' },
+    ]);
+    expect(h.logs).toContain(
+      'info Bob is still an observer: the page already has its maximum drivers (1)',
+    );
+    expect(h.logs.filter((line) => line.includes('set Bob to driver'))).toEqual([]);
+    // With the seat free, the same click makes a driver, and that is what the log says.
+    expect(h.dock.setRole('alice', 'observer')).toBe(true);
+    expect(h.dock.setRole('bob', 'driver')).toBe(true);
+    socket.deliver({
+      t: 'roster',
+      attachments: [attachment('alice', 'observer'), attachment('bob', 'driver')],
+    });
+    await flush();
+    expect(h.logs).toContain('info set Bob to driver');
+    expect(h.dock.state.observerSeats).toEqual([]);
+    // Someone allowed as driver into a free seat joins as one, with no seat notice.
+    socket.deliver({
+      ...attachRequest(h.clock, 'carol-asks'),
+      user: { userId: 'carol', displayName: 'Carol' },
+    });
+    expect(h.dock.setRole('bob', 'observer')).toBe(true);
+    expect(h.dock.approve('carol-asks', 'driver')).toBe(true);
+    socket.deliver({
+      t: 'roster',
+      attachments: [
+        attachment('alice', 'observer'),
+        attachment('bob', 'observer'),
+        attachment('carol', 'driver'),
+      ],
+    });
+    await flush();
+    expect(h.logs).toContain('info Carol joined as driver');
+    expect(h.dock.state.observerSeats).toEqual([]);
+  });
+
   it('promotes someone autoApprove attached, which is how they ever get to write', async () => {
     const h = setup({ core: { policy: { autoApprove: 'observer' } } });
     const socket = await link(h, { roster: [attachment('carol', 'observer')] }, {});

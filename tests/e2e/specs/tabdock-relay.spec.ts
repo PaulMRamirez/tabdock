@@ -761,7 +761,7 @@ test.describe('M2: many clients, many users', () => {
     const fromBob = await addItem(bob, pageId, 'From Bob');
     expect(fromBob.isError, fromBob.text).toBe(false);
 
-    // maxDrivers is 1, so while Bob drives the relay keeps Alice an observer.
+    // maxDrivers is 1, so while Bob drives the relay keeps Alice an observer, and the widget says so.
     await clickInWidget(page, { action: 'make-driver', userId: 'alice' });
     await expect
       .poll(() =>
@@ -772,6 +772,9 @@ test.describe('M2: many clients, many users', () => {
       ['alice', 'observer'],
       ['bob', 'driver'],
     ]);
+    await expect
+      .poll(() => widgetText(page, 'joins'))
+      .toContain('The page already has its maximum drivers, so Alice is still an observer.');
     const stillRefused = await addItem(client, pageId, 'Still refused');
     expect(errorCode(stillRefused), stillRefused.text).toBe('role_denied');
 
@@ -793,6 +796,44 @@ test.describe('M2: many clients, many users', () => {
     const restored = await addItem(client, pageId, 'Restored');
     expect(restored.isError, restored.text).toBe(false);
     await expect(page.locator('[data-role="view"]')).toHaveText(/5 items/);
+  });
+
+  test('Allow as driver past maxDrivers seats an observer, and the widget and console say so, never that they drive', async ({
+    page,
+  }) => {
+    const said: string[] = [];
+    page.on('console', (message) => said.push(message.text()));
+    const { pageId } = await openDemo(page);
+    expect(await pairAs(page, client, 'alice', 'driver')).toBe(pageId);
+    const bob = await extraClient(tabdock.users.bob, BOB_CLIENT);
+    const code = await waitForDock(page, (s) =>
+      s.link === 'linked' && s.pairing !== null && !codesUsed.has(s.pairing.code)
+        ? s.pairing.code
+        : null,
+    );
+    codesUsed.add(code);
+    codesSeen.add(code);
+    const pending = callTool(bob, 'pair_page', { code });
+    const requestId = await waitForDock(
+      page,
+      (s) => s.pendingRequests.find((r) => r.user.userId === 'bob')?.requestId,
+    );
+    await clickInWidget(page, { action: 'approve-driver', requestId });
+    const paired = await pending;
+    expect(paired.isError, paired.text).toBe(false);
+    // maxDrivers is 1 and Alice drives: the relay seats Bob as an observer.
+    expect(paired.structured).toMatchObject({ role: 'observer' });
+    await expect
+      .poll(() => widgetText(page, 'joins'))
+      .toContain('The page already has its maximum drivers, so Bob joined as observer.');
+    await expect
+      .poll(() => said)
+      .toContain('[tabdock] Bob joined as observer: the page already has its maximum drivers (1)');
+    expect(said.filter((line) => /Bob.*(as driver|to driver)/.test(line))).toEqual([]);
+    expect(await rolesOf(page)).toEqual([
+      ['alice', 'driver'],
+      ['bob', 'observer'],
+    ]);
   });
 
   test('the activity list shows each call with its user, client, tool and outcome', async ({
