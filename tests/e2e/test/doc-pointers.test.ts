@@ -284,7 +284,18 @@ describe('pointers the docs give', () => {
 });
 
 function existsInTree(path: string): boolean {
-  return TREE.includes(path) || DIRECTORIES.has(path) || existsSync(join(ROOT, path));
+  if (TREE.includes(path) || DIRECTORIES.has(path)) return true;
+  // A build output such as apps/site/dist is ignored by git, so it exists only
+  // after a build; whether it is on disk must not decide the test, or it passes
+  // after a local build and fails in CI. It counts when the package it is
+  // built into is tracked.
+  const segments = path.split('/');
+  const dist = segments.indexOf('dist');
+  if (dist > 0) {
+    const owner = segments.slice(0, dist).join('/');
+    return DIRECTORIES.has(owner);
+  }
+  return false;
 }
 
 /**
