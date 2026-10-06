@@ -1,10 +1,10 @@
 # Add Tabdock to your app
 
-From "my app has functions" to "Claude can call them safely": a WebMCP runtime, marked tools, the adapter and a relay URL, with words as [Concepts](01-concepts.md) defines them. Tabdock 0.1.0 is not yet on npm, so today the adapter comes from a clone; `npm install @tabdock/adapter` and the CDN tag work once 0.1.0 is on npm.
+From "my app has functions" to "Claude can call them safely": a WebMCP runtime, marked tools, the adapter and a relay URL, with words as [Concepts](01-concepts.md) defines them. A page's Content-Security-Policy and framing are covered in [Security](10-security.md#csp-trusted-types-and-frames).
 
 ## A WebMCP runtime
 
-Tools live on `document.modelContext`, only in a secure context (https, or http on `localhost` and `127.0.0.1`). Chrome's own WebMCP is an origin trial, off by default even on localhost (`--enable-features=WebMCPTesting` turns it on for testing), so most pages load MCP-B's polyfill, which installs `document.modelContext` only where the browser has none. With a bundler, `npm install @mcp-b/webmcp-polyfill@5.1.0` and run it first:
+Tools live on `document.modelContext`, only in a secure context (https, or http on `localhost` and `127.0.0.1`). Chrome's own WebMCP is an origin trial, off by default even on localhost (`--enable-features=WebMCPTesting` turns it on for testing), so most pages load MCP-B's polyfill, which installs `document.modelContext` only where the browser has none. With a bundler, install it pinned (`npm install --save-exact @mcp-b/webmcp-polyfill@5.1.0`, since this guide relies on 5.1.0's behaviour) and run it first:
 
 <!-- fragment -->
 
@@ -14,7 +14,29 @@ import { initializeWebMCPPolyfill } from '@mcp-b/webmcp-polyfill';
 initializeWebMCPPolyfill(); // the 6.0 beta exports installWebMCP() instead
 ```
 
-Without a bundler, load the package's `dist/index.iife.js` in a classic script tag before the adapter; it installs itself. The adapter looks for `document.modelContext` once, at `attach()`; if it is missing, the adapter logs how to add a polyfill, puts that text in `state.error` and stays idle. For TypeScript, declare the slice you use, as [`apps/demo/src/webmcp.ts`](../../apps/demo/src/webmcp.ts) does; MCP-B's own types for 5.1.0 have no `consequentialHint`.
+Without a bundler, load the package's `dist/index.iife.js` in a classic script tag before the adapter; it installs itself. The adapter looks for `document.modelContext` once, at `attach()`; if it is missing, the adapter logs how to add a polyfill, puts that text in `state.error` and stays idle.
+
+TypeScript knows no `document.modelContext`, and MCP-B's own types for 5.1.0 have no `consequentialHint`, so save the slice this guide uses as `src/webmcp.d.ts`:
+
+```ts
+declare global {
+  interface WebMcpTool {
+    name: string;
+    title?: string;
+    description: string;
+    inputSchema: object;
+    annotations?: { readOnlyHint?: boolean; consequentialHint?: boolean };
+    execute: (input: unknown, options?: { signal?: AbortSignal }) => Promise<unknown>;
+  }
+  interface WebMcpContext extends EventTarget {
+    registerTool(tool: WebMcpTool, options?: { signal?: AbortSignal }): Promise<void>;
+  }
+  interface Document {
+    readonly modelContext?: WebMcpContext;
+  }
+}
+export {};
+```
 
 ## Register tools
 
@@ -98,13 +120,27 @@ attach({
 | anything else, a write                                           | drivers               | one at a time per page, in arrival order | none                                                                                         |
 | also `consequentialHint: true`, or named in `consequentialTools` | as above              | as above, once confirmed                 | the operator, under `consequential: 'confirm'`; refused under `'deny'`; none under `'allow'` |
 
-Only the page's own `readOnlyHint: true` makes a tool read-only. Set `consequentialHint` and also name the tool in `policy.consequentialTools`: MCP-B 5.x and Chrome 153 drop the hint, and there, when tools carry annotations but the list names none, every tool that is not read-only prompts and the widget says how to fix it (ADRs 0002 and 0034). Tools with no annotations at all get no such fallback. `untrustedContentHint` changes nothing, as every result is labelled anyway. Under `confirmVia: 'client'` a member driver confirms in their own client ([Sharing](06-sharing.md)). Clients see `call_page_tool` and first-class page tools as not read-only and open-world, so a client that asks before such tools asks before every page call.
+Only the page's own `readOnlyHint: true` makes a tool read-only. Set `consequentialHint` and also name the tool in `policy.consequentialTools` (`data-consequential-tools` on a script tag): MCP-B 5.x and Chrome 153 drop the hint, and there, on a page whose tools carry annotations but whose list names none, every tool that is not read-only prompts, and the widget's notice says to list them in `policy.consequentialTools` (ADRs 0002 and 0034). A page whose tools carry no annotations at all gets no such fallback, since the adapter cannot tell a hint was dropped. `untrustedContentHint` changes nothing, as every result is labelled anyway. Under `confirmVia: 'client'` a member driver confirms in their own client ([Sharing](06-sharing.md)).
 
 ## Add the adapter
 
-Today, build it in a clone: `pnpm --filter @tabdock/adapter build` writes the script-tag file, `dist/tabdock-adapter.js` in `packages/adapter`, to serve from your own origin. For a bundler, `pnpm release:pack` writes `dist/packages/tabdock-protocol-0.1.0.tgz` and `dist/packages/tabdock-adapter-0.1.0.tgz`; install both in one `npm install`, as the adapter needs that exact protocol. Once 0.1.0 is on npm, `npm install @tabdock/adapter` replaces both.
+Today it comes from a clone. For a page with no build step, `pnpm --filter @tabdock/adapter build` writes the script-tag file, `dist/tabdock-adapter.js` in `packages/adapter`, to serve from your own origin ([the script tag](#the-script-tag)). For a bundler, `pnpm release:pack` in the clone writes the protocol and adapter tarballs to `dist/packages`. In your app's folder, install both in one command, since the adapter needs that exact protocol, with `<clone>` standing for the clone's path:
 
-Call `attach()` once per page load, in browser code only (a client-only module in a server-rendered framework), and keep the handle it returns inside your own code: it approves attachments and answers prompts. It throws a `TypeError` for a relay URL that is not `ws:` or `wss:` and for a bad policy value, naming the fields; a misspelled key is silently dropped, which TypeScript catches and plain JavaScript does not.
+```sh
+npm install --save-exact @mcp-b/webmcp-polyfill@5.1.0 \
+  <clone>/dist/packages/tabdock-protocol-0.1.0.tgz <clone>/dist/packages/tabdock-adapter-0.1.0.tgz
+```
+
+Once 0.1.0 is on npm, `npm install @tabdock/adapter` replaces both tarballs. To try the example above, put the polyfill lines and then the example in `src/main.ts`, load the bundle from an `index.html` with `<script type="module" src="main.js"></script>`, and with `pnpm dev` running in the clone, build and serve it:
+
+```sh
+npx --yes esbuild@0.28.2 src/main.ts --bundle --format=esm --outfile=main.js
+npx --yes http-server@14 . -a 127.0.0.1 -p 5500 -c-1
+```
+
+Open `http://127.0.0.1:5500/`, pair from Claude Code with the widget's code as in the [Quick start](02-quick-start.md#connect-pair-and-call), and ask it to submit order A-1; [Connect clients](05-connect-clients.md) covers other clients.
+
+Call `attach()` once per page load, in browser code only (a client-only module in a server-rendered framework), and keep the handle it returns inside your own code: it approves attachments and answers prompts. It throws a `TypeError` for a bad relay URL or policy value and silently drops a misspelled key, which TypeScript catches ([Adapter reference](04-adapter-reference.md#attachoptions)).
 
 In React, call `attach()` at module scope, not in an effect: StrictMode runs effects twice in development, and a cleanup calling `dock.close()` detaches for good and forgets the resume token. Components follow `dock.on('state', ...)`, whose return value is the cleanup:
 
@@ -140,7 +176,7 @@ A page with no build step loads the polyfill, then the adapter's script-tag file
 ></script>
 ```
 
-It reads `data-relay` and the policy attributes the [adapter reference](04-adapter-reference.md#the-script-tag) lists, and attaches once the document has parsed, so a polyfill loaded as a module script is ready first. It gives no handle: the widget is the only control, with no `ui: false` or `modelContext`. A bad attribute logs `[tabdock] invalid data attributes for <fields>` and nothing attaches. Once 0.1.0 is on npm, jsDelivr serves the file pinned to a version, with the digest from the release asset `tabdock-adapter.integrity.txt`, which also holds a ready tag:
+It reads `data-relay` and the policy attributes the [adapter reference](04-adapter-reference.md#the-script-tag) lists, and attaches once the document has parsed, so a polyfill loaded as a module script is ready first. It gives no handle: the widget is the only control, with no `ui: false` or `modelContext`. A bad value logs `[tabdock] invalid data attributes for <fields>`, naming policy fields (`maxDrivers` for `data-max-drivers`), and nothing attaches; a misspelled attribute is ignored without a word. Once 0.1.0 is on npm, jsDelivr serves the file pinned to a version, with the digest from the release asset `tabdock-adapter.integrity.txt`, which also holds a ready tag:
 
 ```html
 <!-- once 0.1.0 is on npm -->
@@ -162,15 +198,13 @@ It reads `data-relay` and the policy attributes the [adapter reference](04-adapt
 
 `TABDOCK_ALLOWED_ORIGINS` takes exact origins as the browser sends them (scheme, host and any port; no path or wildcard) and replaces the localhost default. Outside hosted mode, `/page` takes only sockets made on the relay's machine (a loopback `Host`, no forwarding headers), so a tunnel never carries pages, and a public https page dialing a loopback relay meets Chrome's Local Network Access prompt. A refused origin just keeps reconnecting, as browsers hide why a WebSocket failed; the relay logs `page socket refused: origin not allowed`. [Run a relay](07-run-a-relay.md) sets up each mode.
 
-## CSP, Trusted Types and frames
-
-A Content-Security-Policy must allow the adapter's script in `script-src` and the relay in `connect-src` (`ws://127.0.0.1:8787` or `wss://relay.example`), and in current browsers nothing more, since the widget adopts a constructed stylesheet (which no `style-src` governs), draws its QR code as SVG nodes and runs zod without `eval`: no `'unsafe-inline'`, `'unsafe-eval'` or `data:` images, and it works under `require-trusted-types-for 'script'`. The adapter shares only its own window's tools, not those of same-origin frames, which Chrome also lists. Refuse framing by other sites (`frame-ancestors`): a framing page could dress up the widget to steer the operator's click.
-
 ## Writing handlers
 
-Always return a value (`undefined` fails on MCP-B 6). It reaches the client as text, an object as JSON and a string as it is, though MCP-B 6 quotes strings, under a `[tabdock: untrusted content from <origin>, tool <name>]` line, cut at 120,000 characters with a marker, never as structured content. A thrown error becomes an error result under the same label, but native WebMCP and MCP-B 6 replace its message with `Tool execution failed`, so return errors the agent should read, as `{ error: 'no such order' }` does above.
+Always return a value. It reaches the client as text, an object as JSON and a string as it is, though MCP-B 6 quotes strings, under a `[tabdock: untrusted content from <origin>, tool <name>]` line, cut at 120,000 characters with a marker, never as structured content. On MCP-B 5.1, `undefined` arrives as the text `undefined`; on MCP-B 6 it fails.
 
-Check your own input: the relay checks arguments against `inputSchema` but leaves out `pattern`, `format` and `uniqueItems`, and lets a call through when its check takes over 50 ms (ADRs 0008 and 0010). A call has about 45 s from when the relay receives it, its wait in the write queue and the operator's prompt included; an unanswered prompt is `denied_by_operator`. The handler's `signal` fires on a cancel, a revoke or the deadline on native WebMCP and MCP-B 6; MCP-B 5.1 never tells the handler, and a write holds the page until its handler returns (ADR 0001).
+A thrown error becomes an error result under the same label. On 5.1 its text is `Tool was executed but the invocation failed. For example, the script function threw an error: ` and then your message; native WebMCP and MCP-B 6 replace the message with `Tool execution failed`. So return errors the agent should read, as `{ error: 'no such order' }` does above.
+
+Check your own input: the relay checks arguments against `inputSchema` but leaves out `pattern`, `format` and `uniqueItems`, and a check that cannot start within 50 ms, or runs past 50 ms, lets the call through unchecked, so the check holds a call about 100 ms at most (ADRs 0008 and 0010). A call has about 45 s from when the relay receives it, its wait in the write queue and the operator's prompt included; an unanswered prompt is `denied_by_operator`. The handler's `signal` fires on a cancel, a revoke or the deadline on native WebMCP and MCP-B 6; MCP-B 5.1 never tells the handler, and a write holds the page until its handler returns (ADR 0001).
 
 Limits: 128 tools per page, names matching `^[A-Za-z0-9_.-]{1,128}$`, descriptions cut to 1,000 characters, and input schemas over 8,192 characters or 64 levels deep replaced by a stub. First-class names, `<page id>__<tool>`, stop at 64 characters, which leaves 49 for yours (`.` becomes `_`); a longer one is reachable only through `call_page_tool`.
 

@@ -1,6 +1,7 @@
 // What an MCP client meets, as the guide and the spec describe it (ADR
-// 0035): every error code the relay returns has a row in the guide's
-// troubleshooting table, and no row names a code nothing sends; SPEC.md
+// 0035): every error code the relay returns has a heading of its own on the
+// guide's troubleshooting page, so a reader can link to it, and no heading
+// there names a code nothing sends; SPEC.md
 // section 7 lists the same codes; the guide's table of fixed tools names
 // each tool the relay serves with each of its inputs, as the golden capture
 // of the relay's tools/list holds them; and the untrusted label the guide
@@ -8,7 +9,7 @@
 
 import { ERROR_CODES, PAGE_ERROR_CODES, untrustedHeader } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
-import { markdownIn, readRepo, type Table, tables } from '../src/doc-files.ts';
+import { markdownIn, readRepo, type Table, tables, withoutCodeBlocks } from '../src/doc-files.ts';
 
 const TROUBLESHOOTING = 'docs/guide/11-troubleshooting.md';
 const CLIENTS = 'docs/guide/05-connect-clients.md';
@@ -22,6 +23,17 @@ function tableHeaded(path: string, first: string): Table {
 /** A first cell holding one backticked word: `not_attached` gives not_attached. */
 function codeOf(cell: string): string | null {
   return /^`([a-z_]+)`$/.exec(cell.trim())?.[1] ?? null;
+}
+
+/** The headings under a page's `## Error codes`, each as its code, or null when it names none. */
+function codeHeadings(path: string): (string | null)[] {
+  const text = withoutCodeBlocks(readRepo(path));
+  const start = text.indexOf('\n## Error codes\n');
+  if (start < 0) throw new Error(`${path} has no Error codes section`);
+  const rest = text.slice(start + 1);
+  const end = rest.indexOf('\n## ', 1);
+  const section = end < 0 ? rest : rest.slice(0, end);
+  return [...section.matchAll(/^### (.+)$/gm)].map((match) => codeOf(match[1] ?? ''));
 }
 
 interface GoldenTool {
@@ -46,13 +58,14 @@ function goldenTools(): Map<string, string[]> {
 }
 
 describe('error codes', () => {
-  const rows = tableHeaded(TROUBLESHOOTING, 'Code').rows.map((row) => codeOf(row.values[0] ?? ''));
+  const rows = codeHeadings(TROUBLESHOOTING);
 
-  it('each have a row in the troubleshooting table', () => {
+  it('each have a heading on the troubleshooting page', () => {
+    expect(rows.length).toBeGreaterThan(0);
     expect(ERROR_CODES.filter((code) => !rows.includes(code))).toEqual([]);
   });
 
-  it('are the only codes the table names, besides the page codes', () => {
+  it('are the only codes its headings name, besides the page codes', () => {
     const known = new Set<string>([...ERROR_CODES, ...PAGE_ERROR_CODES]);
     expect(rows.filter((code) => code === null || !known.has(code))).toEqual([]);
   });

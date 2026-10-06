@@ -119,6 +119,8 @@ const BARE_NAMES_IN_CONTEXT = new Set([
   'settings.json',
   'owner-token',
   'claude-headers',
+  // Made by the reader in a folder of their own, as the guide shows.
+  'list-pages.ts',
 ]);
 
 /** GitHub's anchor for a heading. */

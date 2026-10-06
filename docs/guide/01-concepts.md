@@ -11,7 +11,7 @@ flowchart TB
   adapter["Adapter and widget, loaded by the page"]
   tools["The page's tools on document.modelContext"]
   operator["Operator at the tab"]
-  people -->|"client opens MCP over HTTPS to /mcp"| relay
+  people -->|"MCP over Streamable HTTP to /mcp, https when public"| relay
   adapter -->|"page dials out a WebSocket to /page"| relay
   adapter -->|"lists and runs"| tools
   operator -->|"approves, switches roles, answers prompts"| adapter
@@ -27,7 +27,7 @@ The **adapter** (`@tabdock/adapter`) is a script the page loads. It reads the to
 
 The **relay** (`@tabdock/relay`) is one Node process with two doors: `/mcp`, the Streamable HTTP URL clients add, and `/page`, the socket pages dial. It signs clients in, holds pages, attachments, codes and invites in memory, checks and routes calls, queues writes, labels results and keeps the audit log. It never runs a tool, but it sees calls and results in plain text, as does any tunnel or host edge that terminates TLS in front of it, so you run your own.
 
-The **clients** are Claude Code, Claude on the web, desktop and phone, or any MCP client. Identity is the signed-in account, so one person's clients share that person's attachments. A **member** is an account the relay knows (local mode's user `you`, a dev token's user, or an entry in `TABDOCK_OAUTH_USERS`); an **invitee** is any other signed-in account, which reaches a page only through an invite.
+The **clients** are Claude Code, Claude on the web, desktop and phone, or any MCP client. Identity is the signed-in account, so one person's clients share that person's attachments. A **member** is an account the relay knows (local mode's user `you`, a dev token's user, or an entry in `TABDOCK_OAUTH_USERS`). With invites on (`TABDOCK_INVITES=1`), any other signed-in account is an **invitee**, which reaches a page only through an invite; with them off, the relay refuses it.
 
 ## Four flows
 
@@ -63,7 +63,7 @@ sequenceDiagram
   R-->>C: untrusted content label, then the result as text
 ```
 
-Writes run one at a time per page in arrival order, reads alongside, and the adapter runs each call under the least of its own grant, the relay's roster and the claimed role. The result reaches the client as text under a `[tabdock: untrusted content from <origin>, tool <name>]` line, so the model treats it as data, within 45 s of arrival. Each call lands in the widget's activity log and the relay's **audit log**: hash-chained JSON Lines on disk in local mode or wherever `TABDOCK_AUDIT_DIR` points, otherwise only the relay's log output.
+Writes run one at a time per page in arrival order, reads alongside, and the adapter runs each call under the least of its own grant, the relay's roster and the claimed role. The result reaches the client within 45 s of arrival, as text under a `[tabdock: untrusted content from <origin>, tool <name>]` line so the model treats it as data. Each call lands in the widget's activity log and the relay's **audit log**: hash-chained JSON Lines on disk in local mode or wherever `TABDOCK_AUDIT_DIR` points, otherwise only the relay's log output.
 
 **Lifecycle.**
 
@@ -77,13 +77,15 @@ stateDiagram-v2
   gone --> [*]
 ```
 
-When the socket drops (a reload, a closed tab, a lost network) the page is asleep, and its attachments wait 10 minutes for the same page in the same tab to resume under the same id. The resume token and grants live in the tab's `sessionStorage`, keyed by relay URL, origin and path, so a fresh tab or another path is a new page needing its own approval. Attachments end after 8 hours unused, invite-made ones within 24 hours or with the page session. A relay restart forgets every page, attachment, code and invite (only the audit log on disk and local mode's token survive), and pages pair again under new ids.
+When the socket drops (a reload, a closed tab, a lost network) the page is asleep, and its attachments wait 10 minutes for it to resume in the same tab under the same id. The resume token and grants live in the tab's `sessionStorage`, keyed by relay URL, origin and path, so a fresh tab or another path is a new page needing its own approval. Attachments end after 8 hours unused, invite-made ones within 24 hours or with the page session. A relay restart forgets every page, attachment, code and invite (only the audit log on disk and local mode's token survive), and pages pair again under new ids.
 
 ## Three dials
 
 **Roles.** An **observer** may call only tools whose `readOnlyHint` is true; every other tool is a write. A **driver** may call every tool. The operator picks the role at approval and can switch it later. `maxDrivers` (default 1) counts people, not clients, and a driver approved past it is seated as an observer. A page holds up to 10 people by default.
 
-**Consequence.** A tool is **consequential** when its `consequentialHint` is true or the page names it in `policy.consequentialTools`. Name it in both: MCP-B 5.x and Chrome 153 drop the hint, and there a page whose list names no tool treats every write as consequential (tools with no annotations at all get no such fallback). The page's `consequential` policy then decides: `'confirm'` (the default) prompts the operator, `'allow'` runs the call, `'deny'` refuses it. Under `'confirm'`, `confirmVia: 'client'` turns on **confirmation in the client**: a member driver whose attachment no invite made confirms in their own MCP client, where it declares form elicitation. A client's yes proves only that the account's client answered, perhaps with no person present.
+**Consequence.** A tool is **consequential** when its `consequentialHint` is true or the page names it in `policy.consequentialTools`. Name it in both: MCP-B 5.x and Chrome 153 drop the hint, and there a page whose list names no tool treats every write as consequential (a page whose tools carry no annotations at all gets no such fallback). The page's `consequential` policy then decides: `'confirm'` (the default) prompts the operator, `'allow'` runs the call, `'deny'` refuses it.
+
+Under `'confirm'`, `confirmVia: 'client'` turns on **confirmation in the client**: a member driver whose attachment no invite made confirms in their own MCP client, where it declares form elicitation. A client's yes proves only that the account's client answered, perhaps with no person present.
 
 | Caller                                                        | Read-only tool | Write                     | Consequential write                                        |
 | ------------------------------------------------------------- | -------------- | ------------------------- | ---------------------------------------------------------- |
@@ -93,9 +95,9 @@ When the socket drops (a reload, a closed tab, a lost network) the page is aslee
 | Driver, `'allow'`                                             | Runs           | Runs, one write at a time | Runs with no prompt                                        |
 | Driver, `'deny'`                                              | Runs           | Runs, one write at a time | `denied_by_operator`                                       |
 
-While the operator has paused the page, every new call answers `page_busy`.
+While the operator has paused the page, every call that has not started, queued ones and those at a prompt included, answers `page_busy`; running ones finish.
 
-**Reach.** **Local mode**, what the relay runs with no auth settings outside production, is loopback only, with one user holding an owner token kept outside the checkout; dev tokens (`TABDOCK_DEV_TOKENS`) replace that user with several named ones on the same machine, for testing. **Public URL mode** (`TABDOCK_PUBLIC_URL` with an OAuth provider) puts the relay behind a tunnel with sign-in, so Claude on the web, desktop and phone, the QR code and invites work, while pages still attach only from the relay's machine. **Hosted mode** (`TABDOCK_ENV=production` with a public URL, behind a host edge that names the client in `TABDOCK_CLIENT_ADDRESS_HEADER`) also takes pages from anywhere on the origins `TABDOCK_ALLOWED_ORIGINS` lists. [Run a relay](07-run-a-relay.md) compares them.
+**Reach.** **Local mode**, what the relay runs with no auth settings outside production, is loopback only, with one user holding an owner token kept outside the checkout; dev tokens (`TABDOCK_DEV_TOKENS`) replace that user with several named ones on the same machine, for testing. **Public URL mode** (`TABDOCK_PUBLIC_URL` with an OAuth provider) puts the relay behind a tunnel with sign-in, so Claude on the web, desktop and phone and the QR code work, and invites with `TABDOCK_INVITES=1`, while pages still attach only from the relay's machine. **Hosted mode** (`TABDOCK_ENV=production` with a public URL, behind a host edge that names the client in `TABDOCK_CLIENT_ADDRESS_HEADER`) also takes pages from anywhere on the origins `TABDOCK_ALLOWED_ORIGINS` lists. [Run a relay](07-run-a-relay.md) compares them.
 
 ## What makes it unusual
 

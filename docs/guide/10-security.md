@@ -4,7 +4,9 @@ What Tabdock protects, and what it relies on you for, whether you write the page
 
 ## The trust model
 
-The operator at the tab is the root of trust. Nobody attaches without the operator's approval, except as an observer under the page's own `autoApprove: 'observer'` or through a Can watch invite minted on that page. Every call is checked twice, by the relay and again by the adapter, which runs it only under the least of the operator's grant, the relay's roster and the role the call claims, so even a relay that lies cannot run a write for an observer or skip a prompt the page owns. Prompts default to deny: silence for 60 s on an attach request, or until the call's deadline on a consequential prompt, is a no. The page's origin comes only from the browser's `Origin` header. The relay never runs a tool, but it sees every call, argument and result in plain text, as does any tunnel or edge that ends TLS in front of it, so you run your own.
+The operator at the tab is the root of trust. Nobody attaches without the operator's approval, except as an observer under the page's own `autoApprove: 'observer'` or through a Can watch invite minted on that page. Every call is checked twice, by the relay and again by the adapter, which runs it only under the least of the operator's grant, the relay's roster and the role the call claims, so even a relay that lies cannot run a write for an observer or skip a prompt the page owns. Prompts default to deny: silence for 60 s on an attach request, or until the call's deadline on a consequential prompt, is a no.
+
+The page's origin comes only from the browser's `Origin` header. The relay never runs a tool, but it sees every call, argument and result in plain text, as does any tunnel or edge that ends TLS in front of it, so you run your own.
 
 ## What Tabdock guarantees
 
@@ -39,9 +41,13 @@ The operator at the tab is the root of trust. Nobody attaches without the operat
 
 **Keep tokens and codes out of logs.** Never log or send on the pairing code, `state.pairing.url` (its fragment is a single-use nonce), invite links or the resume token in `sessionStorage`. In local mode the owner token lives in a private file outside the checkout, and on macOS and Linux Claude Code reads it through the header helper the relay writes, so its settings hold no token; avoid `claude mcp get`, which prints a stored header in full ([Quick start](02-quick-start.md)).
 
-**Look after your page.** Allow only the relay in `connect-src`, keep the handle `attach()` returns inside your own code, and refuse framing by other sites. Load the adapter before scripts you trust less: it takes the WebSocket, crypto and DOM built-ins it relies on when it loads and when `attach()` runs, so a script that runs later cannot sit inside the page link or predict a secret. Such a script can still read some frames and invite secrets through the page's other built-ins, and do anything your page can do, so Tabdock assumes the page is trusted (the threat model's row B5; [Add to your app](03-add-to-your-app.md#csp-trusted-types-and-frames)).
+**Look after your page.** Allow only the relay in `connect-src`, keep the handle `attach()` returns inside your own code, and refuse framing by other sites. Load the adapter before scripts you trust less: it takes the WebSocket, crypto and DOM built-ins it relies on when it loads and when `attach()` runs, so a script that runs later cannot sit inside the page link or predict a secret. Such a script can still read some frames and invite secrets through the page's other built-ins, and do anything your page can do, so Tabdock assumes the page is trusted (the threat model's row B5; [below](#csp-trusted-types-and-frames)).
 
 **Operate the relay with care.** In hosted mode name the client address in one header, `TABDOCK_CLIENT_ADDRESS_HEADER`, believed only from `TABDOCK_TRUSTED_PROXY_CIDR`. Keep the audit log, which chains every line to the one before, and check it with `pnpm audit:log --verify`. A restart forgets every page, attachment, code and invite, so everyone pairs again; only the audit log and local mode's token survive. [Run a relay](07-run-a-relay.md) and [Relay settings](08-relay-settings.md) cover the rest.
+
+## CSP, Trusted Types and frames
+
+A Content-Security-Policy must allow the adapter's script in `script-src` and the relay in `connect-src` (`ws://127.0.0.1:8787` or `wss://relay.example`), and in current browsers nothing more, since the widget adopts a constructed stylesheet (which no `style-src` governs), draws its QR code as SVG nodes and runs zod without `eval`: no `'unsafe-inline'`, `'unsafe-eval'` or `data:` images, and it works under `require-trusted-types-for 'script'`. The adapter shares only its own window's tools, not those of same-origin frames, which Chrome also lists. Refuse framing by other sites (`frame-ancestors`): a framing page could dress up the widget to steer the operator's click.
 
 ## What is out of scope
 

@@ -4,7 +4,9 @@ Tabdock lets MCP clients use the tools of a live web page. The page registers to
 
 ## Why it is different
 
-A page's tools run inside the tab, with the user's own signed-in session and live state, so an agent can work an app that has no API, and your back end gains no endpoint or credential. The tab dials out to one relay URL, so the browser opens no port and the connector never changes as pages come and go. Several people and their clients share a page with roles: observers call only read-only tools, drivers call the rest, and writes run one at a time. Consequential calls wait for a human, on the page or, where the page allows it, in the calling member's own client. [Use cases](docs/guide/09-use-cases.md) shows what that makes possible; [the comparison with MCP-B's local relay](docs/mcp-b-comparison.md) shows where a simpler tool fits better.
+A page's tools run inside the tab, with the user's own signed-in session and live state, so an agent can work an app that has no API, and your back end gains no endpoint or credential.
+
+The tab dials out to one relay URL, so the browser opens no port and the connector never changes as pages come and go. Several people and their clients share a page with roles: observers call only read-only tools, drivers call the rest, and writes run one at a time. Consequential calls wait for a human, on the page or, where the page allows it, in the calling member's own client. [Use cases](docs/guide/09-use-cases.md) shows what that makes possible; [the comparison with MCP-B's local relay](docs/mcp-b-comparison.md) shows where a simpler tool fits better.
 
 ## How it works
 
@@ -15,7 +17,7 @@ flowchart TB
   adapter["Adapter and widget, loaded by the page; checks every call again"]
   tools["The page's own tools on document.modelContext"]
   operator["Operator: the person at the tab"]
-  clients -->|"open MCP over HTTPS to /mcp"| relay
+  clients -->|"MCP over Streamable HTTP to /mcp, https when public"| relay
   adapter -->|"dials out a WebSocket to /page"| relay
   adapter -->|"lists and runs"| tools
   operator -->|"approves people, answers prompts"| adapter
@@ -27,13 +29,13 @@ The relay never runs a tool: it signs clients in and checks and routes each call
 
 Version 0.1.0 is prepared but not yet on npm, so today Tabdock runs from a clone; `npx @tabdock/relay` and `npm install @tabdock/adapter` work once 0.1.0 is on npm. Every security requirement in `SPEC.md` section 9 has automated tests. What has been checked, and where:
 
-| Path                                                | Checked in the sandbox                                                                                      | Waiting for the owner's own devices                                           |
-| --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| Claude Code in local mode                           | Claude Code 2.1.289 headless, on MCP 2026-07-28 and 2025-11-25, first-class tools included                  | The header helper on macOS and Windows; the confirmation dialog with a person |
-| Other MCP clients                                   | The SDK client matrix and the official conformance suite in CI; confirmation in the client with SDK clients | Nothing                                                                       |
-| The adapter in a browser                            | Headless Chromium with the MCP-B polyfill 5.1.0 and the 6.0 beta                                            | An hour in a background tab, Energy Saver and laptop sleep                    |
-| Claude on web, desktop and phone; QR scans; invites | Public URL mode against a stand-in identity provider, in a phone-sized browser                              | All of it: none has run live yet                                              |
-| The container image                                 | Built and smoke-tested                                                                                      | A real host                                                                   |
+| Path                                                | Checked in the sandbox                                                                                      | Waiting for the owner's own devices                                                                                                                        |
+| --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claude Code in local mode                           | Claude Code 2.1.289 headless, on MCP 2026-07-28 and 2025-11-25, first-class tools included                  | The header helper on macOS; on Windows, which shell would run one (the PowerShell `--header` line serves meanwhile); the confirmation dialog with a person |
+| Other MCP clients                                   | The SDK client matrix and the official conformance suite in CI; confirmation in the client with SDK clients | Nothing                                                                                                                                                    |
+| The adapter in a browser                            | Headless Chromium with the MCP-B polyfill 5.1.0 and the 6.0 beta                                            | An hour in a background tab, Energy Saver and laptop sleep                                                                                                 |
+| Claude on web, desktop and phone; QR scans; invites | Public URL mode against a stand-in identity provider, in a phone-sized browser                              | All of it: none has run live yet                                                                                                                           |
+| The container image                                 | Built and smoke-tested                                                                                      | A real host                                                                                                                                                |
 
 The open steps are in `docs/checklists/` (M3, M4 and M5). WebMCP is an early draft in a Chrome origin trial, so the demo board uses the MCP-B polyfill.
 
@@ -86,7 +88,9 @@ const dock = attach({
 });
 ```
 
-That URL serves a page on the relay's own machine, and by default the relay admits http and https pages on `localhost`, `127.0.0.1` and `[::1]`; only hosted mode takes `wss://<host>/page` from pages elsewhere, on origins it lists. A tool prompts the operator when its `consequentialHint` is true or `policy.consequentialTools` names it. Set both: MCP-B 5.x and Chrome 153 drop the hint, and there a page whose list names no tool has every tool that is not read-only prompt (ADRs 0002 and 0034). A page that wants no prompts says `consequential: 'allow'`. Until 0.1.0 is on npm, take the adapter from a clone: `pnpm release:pack` packs installable tarballs into `dist/packages`, and `pnpm --filter @tabdock/adapter build` writes the script-tag file. [Add to your app](docs/guide/03-add-to-your-app.md) has the rest.
+That URL serves a page on the relay's own machine, and by default the relay admits http and https pages on `localhost`, `127.0.0.1` and `[::1]`; only hosted mode takes `wss://<host>/page` from pages elsewhere, on origins it lists. TypeScript knows no `document.modelContext`, so the snippet needs the short declaration in [Add to your app](docs/guide/03-add-to-your-app.md#a-webmcp-runtime).
+
+A tool prompts the operator when its `consequentialHint` is true or `policy.consequentialTools` names it. Set both: MCP-B 5.x and Chrome 153 drop the hint, and there, on a page whose tools carry annotations, a list that names no tool makes every tool that is not read-only prompt (ADRs 0002 and 0034). A page that wants no prompts says `consequential: 'allow'`. Until 0.1.0 is on npm, take the adapter from a clone: `pnpm release:pack` packs installable tarballs into `dist/packages`, and `pnpm --filter @tabdock/adapter build` writes the script-tag file. [Add to your app](docs/guide/03-add-to-your-app.md) has the rest.
 
 ## Claude on the web, desktop and phone
 
@@ -105,7 +109,7 @@ Hosted Claude reaches a connector from the cloud, so a relay on loopback cannot 
 | Share a page you run               | [Sharing](docs/guide/06-sharing.md)                                                                                                                 |
 | Run a relay                        | [Run a relay](docs/guide/07-run-a-relay.md), [Relay settings](docs/guide/08-relay-settings.md)                                                      |
 
-For contributors: `docs/develop.md` (every command), `SPEC.md` (the source of truth), `docs/adr/` (the decisions), `docs/threat-model.md` (each boundary and its tests), `docs/mcp-b-comparison.md`, `docs/tour/` (the build's history, a milestone a page), `docs/deploy.md` (the reference deployment), `docs/release.md`, `CHANGELOG.md`, `.env.example` (every setting), and the READMEs of `packages/adapter`, `packages/relay`, `packages/protocol` and `apps/demo`. `pnpm site:build` builds the demo board and the tour into a static site for GitHub Pages, not yet published; until it is, run the board with `pnpm dev`.
+For contributors: `docs/develop.md` (every command), `SPEC.md` (the source of truth), `docs/adr/` (the decisions), `docs/threat-model.md` (each boundary and its tests), `docs/mcp-b-comparison.md`, `docs/tour/` (the build's history, a milestone a page), `docs/deploy.md` (the reference deployment), `docs/release.md`, `CHANGELOG.md`, `.env.example` (every setting), and the READMEs of `packages/adapter`, `packages/relay`, `packages/protocol` and `apps/demo`. `pnpm site:build` builds the demo board, the tour and the guide into a static site for GitHub Pages, not yet published; until it is, run the board with `pnpm dev`.
 
 ## Licence
 

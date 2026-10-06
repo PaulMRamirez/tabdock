@@ -50,7 +50,9 @@ sequenceDiagram
   R-->>C: labelled text
 ```
 
-Ask Claude Code to pair with the Tabdock page using the code. The widget asks "You wants to attach via code" with Allow as driver, Allow as observer and Deny; you have 60 seconds, and silence denies. Click Allow as driver. Then ask Claude to list the page's tools, add an item labelled Hello, and clear the board. `clear_board` is consequential, so the widget asks again ("You wants to run clear_board"). Click Deny once, and Claude reports `denied_by_operator`; ask again and click Allow. Each call appears in the widget's activity list, and every result Claude reads starts with a line such as `[tabdock: untrusted content from http://127.0.0.1:5173, tool add_item]`.
+Ask Claude Code to pair with the Tabdock page using the code. Claude Code first asks its own permission to use each `tabdock-local` tool; allow it (a headless `claude -p` run needs `--allowedTools 'mcp__tabdock-local__*'`, or it calls nothing). That question is Claude Code's, not the page's.
+
+The widget then asks "You wants to attach via code" with Allow as driver, Allow as observer and Deny; you have 60 seconds, and silence denies. Click Allow as driver. Then ask Claude to list the page's tools, add an item labelled Hello, and clear the board. `clear_board` is consequential, so the widget asks again ("You wants to run clear_board"). Click Deny once, and Claude reports `denied_by_operator`; ask again and click Allow. Each call appears in the widget's activity list, and every result Claude reads starts with a line such as `[tabdock: untrusted content from http://127.0.0.1:5173, tool add_item]`.
 
 ## A page of your own
 
@@ -98,14 +100,14 @@ Save this as `~/counter/index.html`:
 </html>
 ```
 
-Keep `pnpm dev` running, serve the folder on localhost with any static server, for example `npx --yes http-server@14 ~/counter -a 127.0.0.1 -p 5500`, and open `http://127.0.0.1:5500/`. The polyfill puts `document.modelContext` in place, the page registers three tools, and the adapter attaches once the document has parsed; a script-tag page has no Connect bar. Pair from Claude with the new widget's code and ask it to increment the counter.
+Keep `pnpm dev` running, serve the folder on localhost with any static server, for example `npx --yes http-server@14 ~/counter -a 127.0.0.1 -p 5500 -c-1` (`-c-1` turns off caching, so a reload picks up a rebuilt adapter), and open `http://127.0.0.1:5500/`. The polyfill puts `document.modelContext` in place, the page registers three tools, and the adapter attaches once the document has parsed; a script-tag page has no Connect bar. Pair from Claude with the new widget's code and ask it to increment the counter.
 
 `get_count` is read-only, so an observer may call it too. `increment` is a write, which only drivers may call and which runs one at a time. `reset` is named in `data-consequential-tools`, so it prompts. Name your consequential tools there even when they set `consequentialHint`: the 5.1 polyfill drops that hint, and on such a runtime a page that names none gets a prompt for every write. The relay accepts this page because, with `TABDOCK_ALLOWED_ORIGINS` unset, it allows http and https pages on `localhost`, `127.0.0.1` and `[::1]` at any port. Once 0.1.0 is on npm, `npm install @tabdock/adapter` replaces the build step. [Add Tabdock to your app](03-add-to-your-app.md) covers `attach()`, bundlers, other origins and tool design.
 
 ## Stopping and rotating the token
 
-The relay keeps pages, codes and attachments in memory, so after a restart each page shows a new code and clients pair again; only the audit log survives. To replace the owner token, stop `pnpm dev` and run `pnpm relay --new-token`, which draws a new token and starts the relay without the board. Its banner says Claude Code's entry needs no change, and `claude mcp list` stays connected, since the helper reads the new token at the next connection; a PowerShell `--header` entry must be removed and added again. Stop it and run `pnpm dev` to get the board back.
+The relay keeps pages, codes and attachments in memory, so after a restart each page shows a new code and clients pair again; only the audit log and the owner token survive. To replace the owner token, stop `pnpm dev` and run `pnpm relay --new-token`, which draws a new token and starts the relay without the board. Its banner says Claude Code's entry needs no change, and `claude mcp list` stays connected, since the helper reads the new token at the next connection; a PowerShell `--header` entry must be removed and added again. Stop it and run `pnpm dev` to get the board back.
 
 ## Where next
 
-[Add Tabdock to your app](03-add-to-your-app.md) and the [adapter reference](04-adapter-reference.md) for your own pages; [Sharing](06-sharing.md) for roles, invites and confirmation in the client; [Run a relay](07-run-a-relay.md) for a tunnel or a host; [Troubleshooting](11-troubleshooting.md) when a step above does not behave as described. The [guide's index](README.md) lists every page.
+[Add Tabdock to your app](03-add-to-your-app.md) and the [adapter reference](04-adapter-reference.md) for your own pages; [Sharing](06-sharing.md) for roles, invites and confirmation in the client; [Run a relay](07-run-a-relay.md) for a tunnel or a host; [Setup problems](12-setup-and-limits.md) when a step above does not behave as described. The [guide's index](README.md) lists every page.

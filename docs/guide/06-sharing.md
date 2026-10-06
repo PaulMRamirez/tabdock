@@ -17,11 +17,21 @@ The person at the tab, the operator, decides who may use a page and what each pe
 
 When someone pairs by code or QR, the widget names them and their client and offers Allow as driver, Allow as observer and Deny. You have 60 seconds, and silence denies; a person's second device joins the request already shown. An observer may call only tools the page marks `readOnlyHint`, and a driver every tool. Writes run one at a time in arrival order, and reads run alongside.
 
-`maxDrivers` in the page's policy (`data-max-drivers` on the script tag), from 1, the default, to 100, caps how many people may drive. It counts people, so one person's phone and laptop take one seat, and past it Allow as driver seats the person as an observer, which their client is told. A page holds at most 10 people (`TABDOCK_MAX_USERS_PER_PAGE`), and a full page refuses pairings with `page_busy` before asking you. With `autoApprove: 'observer'`, members who pair attach as observers with no prompt; invitees never do, and driving still takes your Make driver. That suits an unattended screen whose tools are all read-only.
+`maxDrivers` in the page's policy (`data-max-drivers` on the script tag), from 1, the default, to 100, caps how many people may drive. It counts people, so one person's phone and laptop take one seat. Past it, Allow as driver seats the person as an observer: their client hears only the role (`... as observer.`), and the widget gives no message, just an observer row. To seat another driver, make the current one an observer first, or raise `maxDrivers`.
+
+A page holds at most 10 people (`TABDOCK_MAX_USERS_PER_PAGE`), and a full page refuses pairings with `page_busy` before asking you. With `autoApprove: 'observer'`, members who pair attach as observers with no prompt; invitees never do, and driving still takes your Make driver. That suits an unattended screen whose tools are all read-only.
 
 ## Change your mind
 
-Each roster row shows the person, their clients, their role and their time left. Make driver and Make observer switch roles within `maxDrivers`. Revoke ends an attachment at once, cancelling calls in flight and dropping queued ones, and the person must pair again like anyone new; Revoke all does that for everyone and closes every live invite. Pause answers every new call with `page_busy` while running calls finish, and holds across a reload until Resume. New code replaces a code that, say, was read off a shared screen. A reload in the same tab within 10 minutes keeps the page and its attachments; a closed tab leaves it asleep, then gone after 10 minutes, and a new tab is a new page needing new approvals.
+Each roster row shows the person, their clients, their role and their time left. Make driver and Make observer switch roles; Make driver at `maxDrivers` leaves the person an observer, again with no message, though the page's console logs `set <name> to driver`.
+
+Revoke ends an attachment at once, cancelling calls in flight and dropping queued ones, and the person must pair again like anyone new; Revoke all does that for everyone and closes every live invite. Pause answers `page_busy` to every call that has not started, queued ones and those waiting at your prompt included, while running calls finish, and holds across a reload until Resume. New code replaces a code that, say, was read off a shared screen. A reload in the same tab within 10 minutes keeps the page and its attachments; a closed tab leaves it asleep, then gone after 10 minutes, and a new tab is a new page needing new approvals.
+
+## Try sharing on one computer
+
+Dev tokens let you play two people on one machine. Make two tokens with the command in [Run a relay](07-run-a-relay.md#dev-tokens), put `TABDOCK_DEV_TOKENS=alice=<token>,bob=<token>` in the clone's `.env` and restart `pnpm dev`. That turns local mode off, so the `tabdock-local` entry answers 401 meanwhile. Give each person a client of their own: Claude Code in a folder per person, each running the `claude mcp add --transport http tabdock http://127.0.0.1:8787/mcp --header "Authorization: Bearer <token>"` line `pnpm dev` prints, filled in with that person's token, or the program in [Connect clients](05-connect-clients.md#any-mcp-client) with a token file per person.
+
+Connect the board, pair alice with one code and bob with the next, and Allow alice as driver and bob as observer; a write from bob's client gets `role_denied`. Try Make driver on bob's row while alice drives, then Revoke. Remove the `.env` line and restart to go back to local mode.
 
 ## Invites
 
@@ -54,7 +64,9 @@ sequenceDiagram
   C->>R: list_pages, then call_page_tool
 ```
 
-At `/i` the guest sees who shared the page, its address and title, your label and what the invite allows, signs in with any account at the relay's provider and chooses Join; the page then tells them to add the connector with that account and ask Claude to list their pages. A one-use link also works in `pair_page`, but a multi-use one only at `/i`. A guest's attachment ends within 24 hours, never gets first-class tools or confirmation in its client, and shows an invited badge, the verified email (or "unverified account") and a short id. Revoking a guest bars their account from that invite, and the "and close this link" box, ticked by default while a multi-use link has uses left, closes the link too. Cancel closes a link but keeps whoever it let in. Invites run with a stand-in provider in `pnpm demo:m4`, not yet with a real one ([the M5 checklist](../checklists/M5.md)).
+At `/i` the guest sees who shared the page, its address and title, your label and what the invite allows, signs in with any account at the relay's provider and chooses Join; the page then tells them to add the connector with that account and ask Claude to list their pages. A one-use link also works in `pair_page`, but a multi-use one only at `/i`.
+
+A guest's attachment ends within 24 hours, never gets first-class tools or confirmation in its client, and shows an invited badge, the verified email (or "unverified account") and a short id. Revoking a guest bars their account from that invite, and the "and close this link" box, ticked by default while a multi-use link has uses left, closes the link too. Cancel closes a link but keeps whoever it let in. Invites run with a stand-in provider in `pnpm demo:m4`, not yet with a real one ([the M5 checklist](../checklists/M5.md)).
 
 ## Confirmation in a member's own client
 

@@ -4,6 +4,10 @@
 // on a host the project means to send readers to, or a placeholder, so
 // neither a personal domain nor an employer's host gets in; and each guide
 // page short enough to read on a phone, with one H1 and a link onward.
+// Short enough counts tables too, since a wide table fills a phone screen as
+// prose does (a troubleshooting page once held 1,300 words of table cells
+// beside its prose), and holds each paragraph and table cell to what a
+// phone shows at once.
 
 import { execFileSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
@@ -37,6 +41,12 @@ const HOSTS = new Set([
   '[::1]',
 ]);
 const WORD_LIMIT = 1300;
+/** Words outside code blocks, tables included. */
+const PAGE_LIMIT = 1600;
+/** Words in one paragraph or list item of the guide or the README. */
+const PARAGRAPH_LIMIT = 120;
+/** Words in one table cell. */
+const CELL_LIMIT = 45;
 const URL = /\b(?:https?|wss?):\/\/([^\s/)>`"',;]+)/g;
 
 function tracked(patterns: readonly string[]): string[] {
@@ -61,15 +71,64 @@ function allowedHost(host: string): boolean {
   return HOSTS.has(name);
 }
 
-/** The words a page's prose holds, its code blocks, tables and comments left out. */
-function proseWords(text: string): number {
+function wordCount(text: string): number {
+  return text.split(/\s+/).filter((word) => /[A-Za-z0-9]/.test(word)).length;
+}
+
+/** A page's lines outside code blocks and comments. */
+function textLines(text: string): string[] {
   return withoutCodeBlocks(text)
     .replace(/<!--[\s\S]*?-->/g, '')
-    .split('\n')
-    .filter((line) => !line.trim().startsWith('|'))
-    .join(' ')
-    .split(/\s+/)
-    .filter((word) => /[A-Za-z0-9]/.test(word)).length;
+    .split('\n');
+}
+
+/** The words a page's prose holds, its code blocks, tables and comments left out. */
+function proseWords(text: string): number {
+  return wordCount(
+    textLines(text)
+      .filter((line) => !line.trim().startsWith('|'))
+      .join(' '),
+  );
+}
+
+/** The words outside code blocks and comments, table cells included. */
+function pageWords(text: string): number {
+  return wordCount(textLines(text).join(' '));
+}
+
+/** Each paragraph and list item outside code blocks and tables, with its word count. */
+function paragraphs(text: string): { start: string; words: number }[] {
+  const found: { start: string; words: number }[] = [];
+  let current: string[] = [];
+  const close = (): void => {
+    const joined = current.join(' ').trim();
+    if (joined !== '') found.push({ start: joined.slice(0, 60), words: wordCount(joined) });
+    current = [];
+  };
+  for (const line of textLines(text)) {
+    const trimmed = line.trim();
+    if (trimmed === '' || trimmed.startsWith('|') || trimmed.startsWith('#')) {
+      close();
+      continue;
+    }
+    if (/^(?:[-*+]|\d+\.)\s/.test(trimmed)) close();
+    current.push(trimmed);
+  }
+  close();
+  return found;
+}
+
+/** Each table cell outside code blocks, with its word count. */
+function cells(text: string): { start: string; words: number }[] {
+  return textLines(text)
+    .filter((line) => line.trim().startsWith('|'))
+    .flatMap((line) =>
+      line
+        .trim()
+        .replace(/^\||\|$/g, '')
+        .split(/(?<!\\)\|/),
+    )
+    .map((cell) => ({ start: cell.trim().slice(0, 60), words: wordCount(cell) }));
 }
 
 describe('en and em dashes', () => {
@@ -123,6 +182,41 @@ describe('the guide pages', () => {
       .map((path) => ({ path, words: proseWords(readRepo(path)) }))
       .filter(({ words }) => words > WORD_LIMIT);
     expect(long).toEqual([]);
+  });
+
+  it(`each hold at most ${String(PAGE_LIMIT)} words outside code blocks, tables included`, () => {
+    const long = all
+      .map((path) => ({ path, words: pageWords(readRepo(path)) }))
+      .filter(({ words }) => words > PAGE_LIMIT);
+    expect(long).toEqual([]);
+  });
+
+  it(`hold no paragraph over ${String(PARAGRAPH_LIMIT)} words, nor a table cell over ${String(CELL_LIMIT)}, and nor does the README`, () => {
+    const long = [...all, 'README.md'].flatMap((path) => {
+      const text = readRepo(path);
+      return [
+        ...paragraphs(text)
+          .filter(({ words }) => words > PARAGRAPH_LIMIT)
+          .map(({ start, words }) => `${path}: a paragraph of ${String(words)} words, "${start}"`),
+        ...cells(text)
+          .filter(({ words }) => words > CELL_LIMIT)
+          .map(({ start, words }) => `${path}: a cell of ${String(words)} words, "${start}"`),
+      ];
+    });
+    expect(long).toEqual([]);
+  });
+
+  it('would count a long table cell and a long paragraph', () => {
+    const cell = Array.from({ length: CELL_LIMIT + 1 }, () => 'word').join(' ');
+    const table = `| A | B |\n| - | - |\n| x | ${cell} |\n`;
+    expect(cells(table).some(({ words }) => words > CELL_LIMIT)).toBe(true);
+    expect(pageWords(table)).toBeGreaterThan(proseWords(table));
+    const prose = Array.from({ length: PARAGRAPH_LIMIT + 1 }, () => 'word').join(' ');
+    expect(paragraphs(`${prose}\n\n1. short item\n2. another`).map(({ words }) => words)).toEqual([
+      PARAGRAPH_LIMIT + 1,
+      3,
+      2,
+    ]);
   });
 
   it('each end by linking to the next page, and the last back to the index', () => {

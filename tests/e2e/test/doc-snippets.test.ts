@@ -2,8 +2,11 @@
 // against the packages as they are now (ADR 0035): every ts and js block in
 // docs/guide, the root README and the adapter's README is typechecked as its
 // own module under the workspace's strict settings, with the DOM and Node
-// types and the demo's declaration of document.modelContext, so a renamed
-// option or method fails here rather than in a reader's editor. A block that
+// types, so a renamed option or method fails here rather than in a reader's
+// editor. TypeScript knows no document.modelContext, so the blocks compile
+// only with the declaration the guide itself gives readers, never with one
+// from the repository a reader would not have (the guide once sent readers
+// to the demo's source for it). A block that
 // is a piece of a larger program (a React hook, a polyfill import) carries
 // <!-- fragment --> just before it and is skipped. Every script tag in an
 // html block that sets data-* attributes must name only those the
@@ -25,8 +28,8 @@ import {
 
 const DOCS = [...markdownIn('docs/guide'), 'README.md', 'packages/adapter/README.md'];
 const SCRIPT_LANGS = new Set(['ts', 'typescript', 'js', 'javascript', 'mjs']);
-/** The demo's declaration of the WebMCP slice a page uses, as the guide tells readers to copy. */
-const AMBIENT = join(ROOT, 'apps/demo/src/webmcp.ts');
+/** A block that declares document.modelContext for TypeScript. */
+const DECLARES_MODEL_CONTEXT = /interface Document\s*\{[^}]*\bmodelContext\b/;
 
 // Under tests/e2e, so @tabdock/adapter, @tabdock/protocol and the MCP SDK
 // resolve through the workspace, and in its ignored test-results, so no
@@ -79,7 +82,7 @@ function compilerOptions(): ts.CompilerOptions {
 
 function diagnosticsFor(snippets: readonly Snippet[]): string[] {
   const program = ts.createProgram({
-    rootNames: [AMBIENT, ...snippets.map((snippet) => snippet.file)],
+    rootNames: snippets.map((snippet) => snippet.file),
     options: compilerOptions(),
   });
   const where = new Map(snippets.map((snippet) => [snippet.file, snippet.where]));
@@ -114,8 +117,26 @@ describe('code in the guide and READMEs', () => {
     );
   });
 
+  it('include a declaration of document.modelContext in the guide', () => {
+    const declaring = markdownIn('docs/guide').filter((doc) =>
+      codeBlocks(readRepo(doc)).some(
+        (block) =>
+          !block.fragment &&
+          SCRIPT_LANGS.has(block.lang) &&
+          DECLARES_MODEL_CONTEXT.test(block.body),
+      ),
+    );
+    expect(declaring).not.toEqual([]);
+  });
+
   it('typechecks against the workspace packages under strict settings', () => {
     expect(diagnosticsFor(snippets)).toEqual([]);
+  }, 120_000);
+
+  it('would fail a block that uses document.modelContext with no declaration beside it', () => {
+    const file = join(scratch, 'undeclared.ts');
+    writeFileSync(file, 'void document.modelContext;\nexport {};\n');
+    expect(diagnosticsFor([{ where: 'undeclared', file }])).not.toEqual([]);
   }, 120_000);
 
   it('would fail a block that names an option attach() lacks', () => {

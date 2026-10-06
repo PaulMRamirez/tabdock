@@ -1,4 +1,4 @@
-// The guide's limits table (docs/guide/11-troubleshooting.md, ADR 0035)
+// The guide's limits table (docs/guide/12-setup-and-limits.md, ADR 0035)
 // names the constant behind each number it states and the file that holds
 // it, so this holds each stated value and unit to the constant itself: a
 // timer or a cap changed in code fails here until the page says the new
@@ -14,7 +14,7 @@ import * as config from '../../../packages/relay/src/config.ts';
 import * as confirm from '../../../packages/relay/src/confirm.ts';
 import { readRepo, type TableRow, tables } from '../src/doc-files.ts';
 
-const PAGE = 'docs/guide/11-troubleshooting.md';
+const PAGE = 'docs/guide/12-setup-and-limits.md';
 /** The constants the plan for the guide requires the table to state, at least. */
 const REQUIRED = [
   'PAIRING_TTL_MS',
@@ -132,7 +132,7 @@ function rowProblems(row: TableRow, file: string | null): string[] {
   ];
 }
 
-describe("the troubleshooting page's limits table", () => {
+describe("the setup and limits page's limits table", () => {
   const table = tables(readRepo(PAGE)).find((candidate) => candidate.header[0] === 'Limit');
   const rows = table?.rows ?? [];
 

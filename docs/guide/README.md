@@ -14,7 +14,7 @@ Tabdock 0.1.0 is prepared but not yet on npm, so every page leads with the path 
 | Use a page from Claude or another MCP client   | [Connect clients](05-connect-clients.md), [Troubleshooting](11-troubleshooting.md)                                 |
 | Let other people use a page you operate        | [Sharing](06-sharing.md)                                                                                           |
 | Run a relay for yourself or a team             | [Run a relay](07-run-a-relay.md), [Relay settings](08-relay-settings.md), [Security](10-security.md)               |
-| Find out why something failed                  | [Troubleshooting](11-troubleshooting.md)                                                                           |
+| Find out why something failed                  | [Troubleshooting](11-troubleshooting.md) for a call, [Setup problems and limits](12-setup-and-limits.md) for setup |
 
 Whatever your role, read [Concepts](01-concepts.md) first: every other page uses its words (operator, member, invitee, driver, observer, consequential) in exactly its sense.
 
@@ -30,7 +30,8 @@ Whatever your role, read [Concepts](01-concepts.md) first: every other page uses
 8. [Relay settings](08-relay-settings.md): every `TABDOCK_*` setting with its mode, default and bounds.
 9. [Use cases](09-use-cases.md): what you can build, with an honest status on each.
 10. [Security](10-security.md): what Tabdock protects, and what it relies on you for.
-11. [Troubleshooting](11-troubleshooting.md): error codes, setup failures and the limits.
+11. [Troubleshooting](11-troubleshooting.md): each error code a client sees, and failures without one.
+12. [Setup problems and limits](12-setup-and-limits.md): a relay, page or client that misbehaves before any call, and the fixed limits.
 
 For the design itself, `SPEC.md` is the source of truth, `docs/adr/` holds the decisions and `docs/threat-model.md` maps each boundary to its tests. `docs/develop.md` is for contributors.
 

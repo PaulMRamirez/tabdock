@@ -1,105 +1,79 @@
 # Troubleshooting
 
-What to do when a call fails or a setup step misbehaves, in the words [Concepts](01-concepts.md) defines. Three places say what happened: the tool error in your client, which starts with a code; the widget, whose roster, activity list and notice line show what the adapter decided; and the relay's log, JSON lines that name each refusal but never a token, code or argument.
+What a failed call means and what to do, in the words [Concepts](01-concepts.md) defines. Three places say what happened: the tool error in your client, which starts with a code; the widget, whose roster, activity list and notice line show what the adapter decided; and the relay's log, JSON lines that name each refusal but never a token, code or argument. This page covers what a client sees; [Setup problems and limits](12-setup-and-limits.md) covers a relay or page that misbehaves before any call, and the fixed limits.
 
 ## Error codes
 
-A refusal reaches the client as a tool error whose text is `<code>: <reason>`, the reason in the relay's own words, so match on the code ([errors.ts](../../packages/protocol/src/errors.ts)). The adapter refuses calls with page codes of its own ([page-link.ts](../../packages/protocol/src/page-link.ts)), which the relay maps onto these (`PAGE_ERRORS` in [hub.ts](../../packages/relay/src/hub.ts)); the last two rows are page codes a client never sees by name.
+A refusal reaches the client as a tool error whose text is `<code>: <reason>`, the reason in the relay's own words, so match on the code ([errors.ts](../../packages/protocol/src/errors.ts)). The adapter refuses calls with page codes of its own ([page-link.ts](../../packages/protocol/src/page-link.ts)), which the relay maps onto these (`PAGE_ERRORS` in [hub.ts](../../packages/relay/src/hub.ts)); the last two are page codes a client never sees by name.
 
-| Code                 | What it means                                                                                                                                                                                                                                                                                                          | What to do                                                                                                                                                                           |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `not_attached`       | You hold no attachment to that page: you never paired, the operator revoked you, it went unused for 8 hours, an invite-made attachment reached its end, or the page id is wrong. A stranger and an unknown page get the same answer (S13).                                                                             | Run `list_pages`. Pair again with the code the page shows now or, if your account joins by invite, ask the operator for a new invite link.                                           |
-| `role_denied`        | You are an observer and the tool is not marked `readOnlyHint: true`, by the relay's check or the page's own. The page also answers it for a caller its operator never approved.                                                                                                                                        | Ask the operator to make you a driver in the widget. A page author whose read tool is refused marks it `readOnlyHint: true`.                                                         |
-| `tool_not_found`     | The page lists no tool by that name now, or you used a first-class name on an attachment an invite made.                                                                                                                                                                                                               | Run `list_page_tools` again, since tools come and go with the page; use `call_page_tool` with the tool's own name.                                                                   |
-| `page_asleep`        | The tab disconnected (reload, close, freeze, network) or is reconnecting and has not listed its tools yet, a pairing waiting on it ended, or the relay is shutting down. Attachments are kept for 10 minutes.                                                                                                          | Retry in a moment. The operator brings the tab back within 10 minutes; a pairing that was waiting starts again with the code the page shows when it is back.                         |
-| `page_gone`          | The page stayed away past 10 minutes, or detached while your call ran. It shows as gone in `list_pages` for 10 more minutes.                                                                                                                                                                                           | Its attachments are over: pair with the page again by its new code.                                                                                                                  |
-| `denied_by_operator` | The operator denied your attach request or a consequential call, a consequential prompt went unanswered until the deadline, the page's policy denies consequential tools, or the operator revoked you, closed the invite you used or its sponsoring member left while you waited.                                      | Ask the operator. Nothing retries on its own.                                                                                                                                        |
-| `timeout`            | The page did not answer within 45 seconds, the call waited 45 seconds behind other writes and never ran, the call was cancelled by your client or the page, `pair_page` stopped waiting after 50 seconds, or an attach request went unanswered for 60 seconds and was denied.                                          | Retry a call. After a `pair_page` timeout the request stays open on the page until its 60 seconds end, and an approval shows up in `list_pages`, so look there before pairing again. |
-| `page_busy`          | The operator paused the page, 32 writes already wait at the relay or on the page, the page holds its 10 users already, the seats invites may use are full, another redemption of the same invite is waiting, or the relay holds all the waiting requests it allows.                                                    | Retry shortly. The operator can resume, or revoke someone to make room.                                                                                                              |
-| `pairing_expired`    | The code is wrong, used or older than 120 seconds (the page shows a new one after every pairing); the same for a QR link; or the invite link is unknown, used up, cancelled, expired, or minted for several uses, which `pair_page` never takes.                                                                       | Copy the code the widget shows now and pair within two minutes. Open a multi-use invite link in a browser at `/i` instead, or ask for a new link.                                    |
-| `rate_limited`       | Past a budget: requests to the relay (240 a minute for a member, 60 for an invitee), 120 calls a minute to one page, 10 pairing attempts a minute per account or 30 per page, 30 redemptions of one invite a minute, four confirmations already waiting in your clients, or the memory your waiting requests may hold. | Wait a minute and retry. A relay's operator can raise some of these ([Relay settings](08-relay-settings.md)).                                                                        |
-| `invalid_arguments`  | The arguments failed the tool's `inputSchema` at the relay, would not fit one 1 MiB page link frame, or a fixed tool's own input was wrong, such as `pair_page` with both or neither of `code` and `invite`.                                                                                                           | Read the schema with `list_page_tools` and call again.                                                                                                                               |
-| `invite_required`    | Your account is an invitee, signed in at the provider without being on the relay's member list, and it offered a pairing code or QR link, which only members use (ADR 0017).                                                                                                                                           | Ask the operator for an invite link: a single-use one for `pair_page`, or any live one opened in a browser.                                                                          |
-| `not_confirmed`      | On a page with `confirmVia: 'client'`, your client did not confirm the call: declined, dismissed, expired after 120 seconds, already used, given for other arguments, another tool or page, or held from before a relay restart. The page never heard of the call (ADR 0026).                                          | Call again and accept the question your client shows. A client with no person at it, such as headless `claude -p`, may decline at once.                                              |
-| `tool_error`         | Page code: the page's handler threw. The client gets the page's error text under the untrusted label, flagged `isError`, with no code.                                                                                                                                                                                 | Read it as page data; the fix is in the page or the arguments.                                                                                                                       |
-| `cancelled`          | Page code: the page ended a call it had started, or a client's cancellation reached it. The client sees `timeout`.                                                                                                                                                                                                     | As for `timeout`.                                                                                                                                                                    |
+### `not_attached`
 
-The relay's argument check is advisory (ADR 0010): one that has not finished within about 100 ms lets the call through unchecked, and only a check that finishes and fails answers `invalid_arguments`.
+You hold no attachment to that page: you never paired, the operator revoked you, it went unused for 8 hours, an invite-made attachment reached its end, or the page id is wrong or stale, as in a first-class name from before a new tab, a gone page or a relay restart. A stranger and an unknown page get the same answer (S13). **What to do:** run `list_pages`, and list tools again rather than reuse a first-class name. Pair again with the code the page shows now or, if your account joins by invite, ask the operator for a new invite link.
+
+### `role_denied`
+
+You are an observer and the tool is not marked `readOnlyHint: true`, by the relay's check or the page's own. The page also answers it for a caller its operator never approved. **What to do:** ask the operator to make you a driver in the widget. A page author whose read tool is refused marks it `readOnlyHint: true`.
+
+### `tool_not_found`
+
+The page lists no tool by that name now, or you used a first-class name on an attachment an invite made. **What to do:** run `list_page_tools` again, since tools come and go with the page, and use `call_page_tool` with the tool's own name.
+
+### `page_asleep`
+
+The tab disconnected (reload, close, freeze, network) or is reconnecting and has not listed its tools yet, a pairing waiting on it ended, or the relay is shutting down. Attachments are kept for 10 minutes. **What to do:** retry in a moment. The operator brings the tab back within 10 minutes; a pairing that was waiting starts again with the code the page shows when it is back.
+
+### `page_gone`
+
+The page stayed away past 10 minutes, or detached while your call ran. It shows as gone in `list_pages` for 10 more minutes. **What to do:** its attachments are over, so pair with the page again by its new code.
+
+### `denied_by_operator`
+
+The operator denied your attach request or a consequential call, a consequential prompt went unanswered until the deadline, the page's policy denies consequential tools, or the operator revoked you, closed the invite you used or its sponsoring member left while you waited. **What to do:** ask the operator; nothing retries on its own.
+
+### `timeout`
+
+The page did not answer within 45 seconds, the call waited 45 seconds behind other writes and never ran, your client or the page cancelled it, `pair_page` stopped waiting after 50 seconds, or an attach request went unanswered for 60 seconds and was denied. **What to do:** retry a call. After a `pair_page` timeout the request stays open on the page until its 60 seconds end, and an approval shows up in `list_pages`, so look there before pairing again.
+
+### `page_busy`
+
+The operator paused the page, 32 writes already wait at the relay or on the page, the page holds its 10 users already, the seats invites may use are full, another redemption of the same invite is waiting, or the relay holds all the waiting requests it allows. **What to do:** retry shortly. The operator can resume, or revoke someone to make room.
+
+### `pairing_expired`
+
+The code is wrong, used or older than 120 seconds (the page shows a new one after every pairing); the same for a QR link; or the invite link is unknown, used up, cancelled, expired, or minted for several uses, which `pair_page` never takes. **What to do:** copy the code the widget shows now and pair within two minutes. Open a multi-use invite link in a browser at `/i` instead, or ask for a new link.
+
+### `rate_limited`
+
+Past a budget: requests to the relay (240 a minute for a member, 60 for an invitee), 120 calls a minute to one page, 10 pairing attempts a minute per account or 30 per page, 30 redemptions of one invite a minute, four confirmations already waiting in your clients, or the memory your waiting requests may hold. **What to do:** wait a minute and retry. A relay's operator can raise some of these ([Relay settings](08-relay-settings.md)).
+
+### `invalid_arguments`
+
+The arguments failed the tool's `inputSchema` at the relay, would not fit one 1 MiB page link frame, or a fixed tool's own input was wrong, such as `pair_page` with both or neither of `code` and `invite`. The schema check is advisory (ADR 0010): one that cannot start within 50 ms, or runs past 50 ms, lets the call through unchecked, so only a check that finishes and fails answers this. **What to do:** read the schema with `list_page_tools` and call again.
+
+### `invite_required`
+
+Your account is an invitee, signed in at the provider without being on the relay's member list, and it offered a pairing code or QR link, which only members use (ADR 0017). **What to do:** ask the operator for an invite link: a single-use one for `pair_page`, or any live one opened in a browser.
+
+### `not_confirmed`
+
+On a page with `confirmVia: 'client'`, your client did not confirm the call: declined, dismissed, expired after 120 seconds, already used, given for other arguments, another tool or page, or held from before a relay restart. The page never heard of the call (ADR 0026). **What to do:** call again and accept the question your client shows. A client with no person at it, such as headless `claude -p`, may decline at once.
+
+### `tool_error`
+
+A page code: the page's handler threw. The client gets the page's error text under the untrusted label, flagged `isError`, with no code; [Writing handlers](03-add-to-your-app.md#writing-handlers) shows the text each runtime gives. **What to do:** read it as page data; the fix is in the page or the arguments.
+
+### `cancelled`
+
+A page code: the page ended a call it had started, or a client's cancellation reached it. The client sees `timeout`. **What to do:** as for `timeout`.
 
 ## Failures without a code
 
-| Answer                                                                         | What it means, and what to do                                                                                                                                                         |
-| ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| JSON-RPC error -32602, `Tool <name> not found`                                 | The relay serves no such name: a first-class name whose page id changed (a new tab, a gone page, a relay restart), or any while `TABDOCK_FIRST_CLASS_TOOLS` is off. List tools again. |
-| JSON-RPC error -32000, `more than 240 requests to this relay in 1 minute; ...` | Past the request budget on a request no tool answers, such as `tools/list`; on 2026-07-28 it comes with HTTP 429. Wait a minute.                                                      |
-| HTTP 401 with `WWW-Authenticate`                                               | No token or a wrong one. Sign in again; for local mode, see the next section.                                                                                                         |
-| HTTP 404, `Session not found`                                                  | A 2025-era session idle for 30 minutes, or another user's. The client opens a new one.                                                                                                |
-| HTTP 413                                                                       | One request would hold more of the relay's memory than one user's requests may. Send less.                                                                                            |
+| Answer                                                                         | What it means, and what to do                                                                                                                                                                                                                |
+| ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| JSON-RPC error -32602, `Tool <name> not found`                                 | The relay serves no such name: neither a fixed tool nor shaped `<page id>__<tool>`, or any first-class name while `TABDOCK_FIRST_CLASS_TOOLS` is off. A stale first-class name gets `not_attached`, or `page_gone` just after its page went. |
+| JSON-RPC error -32000, `more than 240 requests to this relay in 1 minute; ...` | Past the request budget on a request no tool answers, such as `tools/list`; on 2026-07-28 it comes with HTTP 429. Wait a minute.                                                                                                             |
+| HTTP 401 with `WWW-Authenticate`                                               | No token or a wrong one. Sign in again; for local mode, see [Setup problems](12-setup-and-limits.md#setup-problems).                                                                                                                         |
+| HTTP 404, `Session not found`                                                  | A 2025-era session idle for 30 minutes, or another user's. The client opens a new one.                                                                                                                                                       |
+| HTTP 413                                                                       | One request would hold more of the relay's memory than one user's requests may. Send less.                                                                                                                                                   |
 
-## Setup problems
-
-**The board sits at "Connect to 127.0.0.1:8787".** By design: the demo board dials only a relay its visitor chose (ADR 0029), so click that bar and the widget and its code appear. A reload in the same tab reconnects without a click; a link that changes `?confirm` or `?invites` asks again. Your own page dials as soon as it calls `attach()`.
-
-**Claude Code says `tabdock-local` already exists.** It never replaces an entry: run `claude mcp remove --scope user tabdock-local`, paste the line the banner printed, and check with `claude mcp list`, never `claude mcp get`, which prints a stored header in full. After `pnpm relay --new-token`, an entry from the `claude mcp add-json` line needs no change, since its `claude-headers` helper reads the new token at each connection; only an entry from the `--header` line (PowerShell, or a token directory whose path holds a quote, backslash, `$` or backtick) answers 401 until you replace it.
-
-**The relay stops before it starts.** It names the problem, never a value. For the owner token, whose directory defaults to `~/.config/tabdock` (or `$XDG_CONFIG_HOME/tabdock`) on Linux, `~/Library/Application Support/Tabdock` on macOS and `%LOCALAPPDATA%\Tabdock` on Windows, the line reads `local mode refuses <path> ...` and names its fix:
-
-| Refused because                                                           | Fix                                                                                   |
-| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| it lies inside the checkout or any git work tree                          | Set `TABDOCK_HOME` to an absolute path outside every repository                       |
-| a directory above it, such as `/tmp`, can be written by other accounts    | Set `TABDOCK_HOME` under your home directory, or `chmod go-w` a directory of your own |
-| the directory lets other accounts in                                      | `chmod 700` it                                                                        |
-| other accounts may read or write the token file                           | `chmod 600` it if nobody else could have read it; otherwise delete it for a new token |
-| another account owns it, or it is not the token or helper the relay wrote | Delete it and start again                                                             |
-
-Other refusals name a setting: one outside its mode (`TABDOCK_INVITES does not apply to local mode, ...`), a byte setting not written as whole bytes (`TABDOCK_MAX_TOOL_BYTES must be a positive whole number`, at least 1048576), a dev token under 24 characters, an origin with a path or trailing slash. An unknown flag prints `the option <flag> is not one this command takes` and the usage, and exits 2. [Relay settings](08-relay-settings.md) lists every rule.
-
-**403 `Pages attach only from the relay machine itself`.** Outside hosted mode, `/page` takes only sockets made on the relay's computer: a `Host` of localhost, 127.0.0.1 or [::1], and no `Forwarded` or `X-Forwarded-*` header, so a page reached through a tunnel or proxy is refused (logged as `page socket refused: not made on this machine`). Open the page on the relay's computer and dial `ws://127.0.0.1:8787/page`, or run hosted mode for pages elsewhere ([Run a relay](07-run-a-relay.md)). In hosted mode, `Pages attach through the public URL only` means the socket did not name the public host.
-
-**The widget keeps reconnecting.** Browsers hide why a WebSocket failed; look for `page socket refused: origin not allowed` in the relay's log, a 403 `Origin not allowed`. With no `TABDOCK_ALLOWED_ORIGINS` the relay takes http and https pages on localhost, 127.0.0.1 and [::1] only. List your page's exact origin (scheme, host, any port; no path or trailing slash); the list replaces that default, and public URL mode and production require one.
-
-**403 `Invalid Origin` on `/mcp`.** A browser-based client sent an `Origin` the relay does not take: loopback ones in local and dev-token mode, the public URL's own in public and hosted mode. The log says `mcp request refused: origin not allowed`; add the origin, in that exact form, to `TABDOCK_MCP_ALLOWED_ORIGINS`. Claude Code sends no `Origin`.
-
-**403 `Invalid Host`, or `This relay serves only clients on its own machine`.** The relay answers only the loopback names, plus the public URL's host in public and hosted mode, each exactly as written. A tunnel to a local-mode relay that keeps the public `Host` gets the first; one that rewrites it to loopback gets the second (logged as `mcp request refused: not made on this machine`), since local and dev-token mode serve this computer only. Claude on the web, desktop and phone connects from the cloud and needs public URL mode ([Run a relay](07-run-a-relay.md)). In hosted mode the platform's own name for the app gets `Invalid Host` everywhere but `/healthz`.
-
-**An https page and a relay on 127.0.0.1.** From Chrome 147, Local Network Access asks before a public https page opens a WebSocket to a loopback address (the `loopback-network` permission); until the person allows it, the socket fails and the adapter keeps retrying. `ws://127.0.0.1` from an https page is not mixed content, but `ws:` to any other host is refused. Allow the prompt, serve the page from localhost while you build it, or give a public page a public relay over `wss:`.
-
-**The page fell asleep in a background tab.** A frozen or discarded tab closes its socket; a thaw or reload within 10 minutes resumes the same page and attachments, and after that it is gone. The adapter holds a Web Lock while linked, which Chromium counts as a reason not to freeze a tab, but Memory Saver can still discard one that is not pinned ([verified.md](../notes/verified.md)), so pin a long-lived operator tab. Runs on a real laptop and phone are still open ([spike.md](../notes/spike.md)).
-
-**A consequential tool runs with no prompt.** MCP-B 5.1.0 and Chrome 153 drop `consequentialHint`. While the page names no tool in `policy.consequentialTools` (no list, or an empty one), every tool not marked read-only prompts there, and the widget's notice says why; once the list names a tool, only listed and hinted tools prompt. If no tool carries annotations at all, the adapter cannot tell the hint was dropped, and only the list decides. Name every consequential tool in `consequentialTools` or `data-consequential-tools` whatever the runtime, and keep `consequential` at `'confirm'` ([Adapter reference](04-adapter-reference.md), ADRs 0002 and 0034).
-
-**First-class names do not appear.** They need `TABDOCK_FIRST_CLASS_TOOLS=1` (off by default), a member account and an attachment no invite made; an observer sees only read-only tools. A name over 64 characters, two that collide, a schema some client would refuse, or tools past a user's 64 tools or 100,000 characters stay off the list but work through `call_page_tool`. Clients hear of changes at most every 10 seconds, and may show new tools only in a new conversation.
-
-**`document.modelContext is missing, so Tabdock stays idle`.** The page has no WebMCP runtime: load a polyfill before the adapter (MCP-B's `installWebMCP()` on 6.x, `initializeWebMCPPolyfill()` on 5.x) or use a browser with WebMCP on. The widget shows the same line.
-
-**`[tabdock] invalid data attributes for <fields>`.** The script tag's attributes failed the policy schema, such as `data-max-drivers` outside 1 to 100 or `data-confirm-via` other than `page` or `client`, and the adapter does not attach; `[tabdock] data-relay is required` means it names no relay. `attach()` throws a `TypeError` naming the fields instead.
-
-## Limits
-
-Fixed numbers, each from the named constant. Rate limits, users per page, queue depth and the byte budgets are settings, with their defaults in [Relay settings](08-relay-settings.md).
-
-| Limit                                                          | Value                        | Constant                                                           | In                                                       |
-| -------------------------------------------------------------- | ---------------------------- | ------------------------------------------------------------------ | -------------------------------------------------------- |
-| A pairing code lives, and works once                           | 120 s                        | `PAIRING_TTL_MS`                                                   | [constants.ts](../../packages/protocol/src/constants.ts) |
-| An attach request waits for the operator; silence denies       | 60 s                         | `ATTACH_REQUEST_TTL_MS`                                            | constants.ts                                             |
-| How long `pair_page` waits                                     | 50 s                         | `PAIR_WAIT_MS`                                                     | constants.ts                                             |
-| A page answers one call                                        | 45 s                         | `DEFAULT_CALL_DEADLINE_MS`                                         | constants.ts                                             |
-| An asleep page keeps its attachments                           | 10 min                       | `RESUME_WINDOW_MS`                                                 | constants.ts                                             |
-| A gone page stays in `list_pages`                              | 10 min                       | `GONE_TOMBSTONE_MS`                                                | [config.ts](../../packages/relay/src/config.ts)          |
-| An unused attachment ends (`TABDOCK_ATTACHMENT_IDLE_MINUTES`)  | 8 h                          | `ATTACHMENT_IDLE_MS`                                               | config.ts                                                |
-| An idle 2025-era session ends (`TABDOCK_SESSION_IDLE_MINUTES`) | 30 min                       | `SESSION_IDLE_MS`                                                  | config.ts                                                |
-| Result text before a marked cut                                | 120,000 characters           | `MAX_RESULT_CHARS`                                                 | constants.ts                                             |
-| A page's tool description                                      | 1,000 characters             | `MAX_DESCRIPTION_CHARS`                                            | constants.ts                                             |
-| Tools one page publishes                                       | 128 tools                    | `MAX_TOOLS_PER_PAGE`                                               | constants.ts                                             |
-| One page link frame                                            | 1,048,576 bytes              | `MAX_FRAME_BYTES`                                                  | constants.ts                                             |
-| Most uses of a Can watch invite (Can control: 1)               | 20 uses                      | `MAX_INVITE_USES`                                                  | constants.ts                                             |
-| Live invites per page                                          | 10 invites                   | `MAX_LIVE_INVITES_PER_PAGE`                                        | constants.ts                                             |
-| An invite, and the attachment it makes, lasts at most          | 24 h                         | `MAX_INVITE_LIFETIME_MS`                                           | constants.ts                                             |
-| A first-class name                                             | 64 characters                | `MAX_FIRST_CLASS_NAME_CHARS`                                       | constants.ts                                             |
-| First-class tools per user                                     | 64 tools, 100,000 characters | `MAX_FIRST_CLASS_TOOLS_PER_USER`, `MAX_FIRST_CLASS_CHARS_PER_USER` | constants.ts                                             |
-| A question in your client waits                                | 120 s, four at once per user | `CONFIRMATION_TTL_MS`, `MAX_PENDING_CONFIRMATIONS`                 | [confirm.ts](../../packages/relay/src/confirm.ts)        |
-| Writes waiting on the page                                     | 32 writes                    | `MAX_WAITING_WRITES`                                               | [core.ts](../../packages/adapter/src/core.ts)            |
-| The widget's activity list                                     | 50 calls                     | `ACTIVITY_LIMIT`                                                   | core.ts                                                  |
-| A dev token                                                    | at least 24 characters       | `MIN_DEV_TOKEN_LENGTH`                                             | [auth.ts](../../packages/relay/src/auth.ts)              |
-
-Back to [the guide's index](README.md), or start again at [Concepts](01-concepts.md).
+Next: [Setup problems and limits](12-setup-and-limits.md).

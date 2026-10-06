@@ -56,7 +56,7 @@ With `TABDOCK_FIRST_CLASS_TOOLS=1`, Claude Code lists a page's tools by name, su
 
 An issue tracker, a docs page and a design tool each load the adapter and are approved separately. Claude finds them with `list_pages` and moves information between them under one connector; each operator sees only their own roster and activity.
 
-**Works today**, with each origin on the relay's allowlist.
+**Works today** for tabs on the relay's machine, with each origin on the allowlist; tabs on other people's machines **need settings** (hosted mode).
 
 ## When MCP-B's local relay fits better
 

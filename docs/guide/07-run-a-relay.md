@@ -1,33 +1,35 @@
 # Run a relay
 
-The relay is one Node process with two doors: `/mcp`, the URL clients add, and `/page`, the socket pages dial. It never runs a tool, but it sees every call and result in plain text, as does anything that terminates TLS in front of it, so run your own. This page helps you pick a mode and run it; [Relay settings](08-relay-settings.md) lists every setting, and [the reference deployment](../deploy.md) is a worked example on a real host.
+The relay is one Node process with two doors: `/mcp`, the URL clients add, and `/page`, the socket pages dial. It never runs a tool, but it sees every call and result in plain text, as does anything that terminates TLS in front of it, so run your own. This page helps you pick a mode and run it; [Relay settings](08-relay-settings.md) lists every setting, and [the reference deployment](../deploy.md) takes hosted mode from accounts to rollback on Fly.io with WorkOS AuthKit and GitHub Actions.
 
-The commands below run in a clone (`git clone`, then `pnpm install`), since 0.1.0 is prepared but not yet on npm. Once 0.1.0 is on npm, `npx @tabdock/relay` runs the same command, `tabdock-relay`, on Node 22.18 or later, reading settings from the environment alone, never a `.env` file.
+The commands below run in a clone (`git clone`, then `pnpm install`) until 0.1.0 is on npm. Once 0.1.0 is on npm, `npx @tabdock/relay` runs the same command, `tabdock-relay`, on Node 22.18 or later, reading settings from the environment alone, never a `.env` file.
 
 ## Choose a mode
 
-The relay picks its mode from its settings at start.
+The relay picks its mode from its settings at start:
 
-| Mode       | Selected by                                                                                 | Clients from        | Pages from                  | Sign-in        | QR and invites | Audit log on disk             |
-| ---------- | ------------------------------------------------------------------------------------------- | ------------------- | --------------------------- | -------------- | -------------- | ----------------------------- |
-| Local      | no sign-in setting, `TABDOCK_ENV` not `production`                                          | this computer       | this computer               | an owner token | no             | yes, beside the token         |
-| Dev tokens | `TABDOCK_DEV_TOKENS`                                                                        | this computer       | this computer               | named tokens   | no             | only with `TABDOCK_AUDIT_DIR` |
-| Public URL | `TABDOCK_PUBLIC_URL` with an identity provider                                              | anywhere, by tunnel | the relay's computer only   | the provider's | yes            | only with `TABDOCK_AUDIT_DIR` |
-| Hosted     | public URL, `TABDOCK_ENV=production` and `TABDOCK_CLIENT_ADDRESS_HEADER`, behind a TLS edge | anywhere            | anywhere, on listed origins | the provider's | yes            | required                      |
+| Mode       | Selected by                                                                                 | Clients from        | Pages from                  | Sign-in        | QR and invites                       | Audit log on disk             |
+| ---------- | ------------------------------------------------------------------------------------------- | ------------------- | --------------------------- | -------------- | ------------------------------------ | ----------------------------- |
+| Local      | no sign-in setting, `TABDOCK_ENV` not `production`                                          | this computer       | this computer               | an owner token | no                                   | yes, beside the token         |
+| Dev tokens | `TABDOCK_DEV_TOKENS`                                                                        | this computer       | this computer               | named tokens   | no                                   | only with `TABDOCK_AUDIT_DIR` |
+| Public URL | `TABDOCK_PUBLIC_URL` with an identity provider                                              | anywhere, by tunnel | the relay's computer only   | the provider's | QR; invites with `TABDOCK_INVITES=1` | only with `TABDOCK_AUDIT_DIR` |
+| Hosted     | public URL, `TABDOCK_ENV=production` and `TABDOCK_CLIENT_ADDRESS_HEADER`, behind a TLS edge | anywhere            | anywhere, on listed origins | the provider's | QR; invites with `TABDOCK_INVITES=1` | required                      |
 
 Clients on your own computer, such as Claude Code, need only local mode. Claude on the web, desktop and phone connects from Anthropic's cloud, so it needs a public https URL: a tunnel for a session at your desk, a host for something that stays up. Pages on other people's computers need hosted mode.
 
 ## Local mode
 
-`pnpm relay` starts it on `127.0.0.1:8787` (`pnpm dev` adds the demo board) and prints a line for Claude Code, as the [Quick start](02-quick-start.md) shows. Its one credential is an owner token in a private directory: `TABDOCK_HOME` when set (an absolute path), otherwise `~/.config/tabdock` on Linux, `~/Library/Application Support/Tabdock` on macOS or `%LOCALAPPDATA%\Tabdock` on Windows. The relay refuses rather than repairs a directory that lies in a work tree of git, Jujutsu, Mercurial, Sapling, Subversion or Bazaar, or, on macOS and Linux, below any directory another account owns or can write (so never under `/tmp`); on Windows it must lie under `%LOCALAPPDATA%` or `%USERPROFILE%`. If your home directory is itself a dotfiles repository, set `TABDOCK_HOME` outside it.
+`pnpm relay` starts it on `127.0.0.1:8787` (`pnpm dev` adds the demo board) and prints a line for Claude Code, as the [Quick start](02-quick-start.md) shows. Its one credential is an owner token in a private directory: `TABDOCK_HOME` when set (an absolute path), otherwise `~/.config/tabdock` on Linux, `~/Library/Application Support/Tabdock` on macOS or `%LOCALAPPDATA%\Tabdock` on Windows.
+
+The relay refuses rather than repairs a directory that lies in a work tree of git, Jujutsu, Mercurial, Sapling, Subversion or Bazaar, or, on macOS and Linux, below any directory that an account other than yours or root owns, or that other accounts can write (so never under `/tmp`); on Windows it must lie under `%LOCALAPPDATA%` or `%USERPROFILE%`. If your home directory is itself a dotfiles repository, set `TABDOCK_HOME` outside it.
 
 Local mode trusts every account on the computer, since nothing proves the relay to its clients; on a machine shared with people you do not trust, use a host with sign-in. One relay holds a token directory at a time, so `pnpm relay` beside a running `pnpm dev` refuses, naming the lock.
 
-To rotate the token, stop the relay and run `pnpm relay --new-token`. The old token gets 401 at once. A Claude Code entry made with the `claude-headers` helper (macOS and Linux) needs no change; one made in PowerShell, which holds the token, must be removed and added again from the new banner.
+To rotate the token, stop the relay and run `pnpm relay --new-token`. The old token gets 401 at once; an entry made with the `claude-headers` helper needs no change, while a PowerShell one, which holds the token, must be added again from the new banner.
 
 ## Dev tokens
 
-For several named people on one computer, as in testing, set `TABDOCK_DEV_TOKENS=alice=<token>,bob=<token>`, each token 24 or more printable characters without spaces, for example from `node -e "console.log(require('node:crypto').randomBytes(24).toString('base64url'))"`. Clients send `Authorization: Bearer <token>`, and the relay stays on loopback.
+For several named people on one computer, as in testing, set `TABDOCK_DEV_TOKENS=alice=<token>,bob=<token>`, each token 24 or more printable characters without spaces, for example from `node -e "console.log(require('node:crypto').randomBytes(24).toString('base64url'))"`. Clients send `Authorization: Bearer <token>`, and the relay stays on loopback. With the tokens in the clone's `.env`, `pnpm dev` prints a Claude Code line to fill in with one of them; `pnpm relay` prints only the MCP URL. Dev tokens turn local mode off, so the Quick start's `tabdock-local` entry answers 401 until you return to it; remove it with `claude mcp remove --scope user tabdock-local`, or leave it unused. [Sharing](06-sharing.md#try-sharing-on-one-computer) walks two people through one page.
 
 ## Public URL through a tunnel
 
@@ -70,7 +72,7 @@ flowchart LR
   relay -->|"keys and metadata"| idp["Identity provider"]
 ```
 
-The project checked it in its sandbox with Docker 29.6.2, nginx 1.28 and Caddy 2.11.7, using test certificates on other ports and a stand-in provider: health, sign-in, the tool list and a page socket all passed through each proxy, and a forged `X-Real-IP` was overwritten.
+The project checked it in its sandbox on 6 October with Docker 29.6.2, nginx 1.28 and Caddy 2.11.7, using test certificates on other ports and a stand-in provider: health, sign-in, the tool list and a page socket all passed through each proxy, and a forged `X-Real-IP` was overwritten ([verified.md](../notes/verified.md)).
 
 ```sh
 # /etc/tabdock/relay.env, mode 600: the six settings above, then
@@ -120,7 +122,7 @@ relay.example {
 }
 ```
 
-Without containers, a systemd unit can run a clone at `/opt/tabdock` after `pnpm install --prod --frozen-lockfile --filter '@tabdock/relay...'` there; keep no `.env` in it, since a checkout reads one for any variable the unit leaves unset. `systemd-analyze verify` accepts this unit, but the project has not run it under systemd.
+Without containers, a systemd unit can run a clone at `/opt/tabdock` after `pnpm install --prod --frozen-lockfile --filter '@tabdock/relay...'` there; keep no `.env` in it, since a checkout reads one for any variable the unit leaves unset. Put the absolute path `which node` prints (Node 22.18 or later) in `ExecStart`, where the unit assumes `/usr/bin/node`; with it, `systemd-analyze verify` accepts the unit, though the project has not run it under systemd.
 
 ```ini
 [Unit]
@@ -160,10 +162,6 @@ To upgrade, read the [changelog](../../CHANGELOG.md) (while versions start with 
 
 `pnpm audit:log` prints the audit log, filtered with `--user`, `--page`, `--type`, `--outcome`, `--since` and `--until`, and `--verify` checks its hash chain. In the container above, run `docker exec tabdock /nodejs/bin/node packages/relay/src/audit-cli.ts --dir /data/audit --since 24h`. [Reading the audit log](../deploy.md#reading-the-audit-log) explains the chain and its checkpoints.
 
-If a client you trust is refused with 403 and the log shows `mcp request refused: origin not allowed`, add that origin to `TABDOCK_MCP_ALLOWED_ORIGINS`. [Troubleshooting](11-troubleshooting.md) covers other refusals, and [Security](10-security.md) what the relay can and cannot see.
-
-## The reference deployment
-
-[docs/deploy.md](../deploy.md) takes hosted mode from accounts to rollback on Fly.io, with WorkOS AuthKit and GitHub Actions.
+[Setup problems](12-setup-and-limits.md) covers refusals, and [Security](10-security.md) what the relay can and cannot see.
 
 Next: [Relay settings](08-relay-settings.md).

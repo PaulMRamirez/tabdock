@@ -351,3 +351,38 @@ describe('.env.example', () => {
     expect(() => resolveConfig(options)).not.toThrow();
   });
 });
+
+describe('refusals that quote the value', () => {
+  // The page promises a refusal leaves the value out, since a token may sit in
+  // the wrong variable, and names the few that quote it; this finds them by
+  // refusing a marked value in every setting the relay reads.
+  const MARK = 'Zq7Mark9Wq';
+  const devTokens = { TABDOCK_DEV_TOKENS: `alice=${'k'.repeat(MIN_DEV_TOKEN_LENGTH)}` };
+
+  function quoting(): string[] {
+    const found = new Set<string>();
+    for (const name of relaySettings()) {
+      const envs: NodeJS.ProcessEnv[] = [MARK, `https://${MARK}.example/x`].map((value) => ({
+        ...devTokens,
+        [name]: value,
+      }));
+      // Local mode refuses a token directory inside the checkout before making it.
+      if (name === 'TABDOCK_HOME') envs.push({ [name]: join(ROOT, MARK) });
+      for (const env of envs) {
+        try {
+          resolveConfig(loadConfigFromEnv(env));
+        } catch (error) {
+          if (error instanceof Error && error.message.includes(MARK)) found.add(name);
+        }
+      }
+    }
+    return [...found].sort();
+  }
+
+  it('are the ones the settings page names, and only those', () => {
+    const sentence = /only (a `TABDOCK_[^;.]+) are quoted back/.exec(read(PAGE))?.[1] ?? '';
+    const named = [...namesIn(sentence)].sort();
+    expect(named.length).toBeGreaterThan(0);
+    expect(quoting()).toEqual(named);
+  });
+});
