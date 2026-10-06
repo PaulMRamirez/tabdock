@@ -5,7 +5,7 @@
 // loaded as a module script is in place first. The handle stays inside: the
 // widget is this build's only control surface.
 
-import { attach } from './index.ts';
+import { attachPage } from './page.ts';
 import { readScriptOptions } from './script-options.ts';
 
 const script = document.currentScript;
@@ -17,7 +17,16 @@ if (!(script instanceof HTMLScriptElement)) {
     console.error(`[tabdock] ${options.error}`);
   } else {
     const start = (): void => {
-      attach({ relay: options.relay, policy: options.policy });
+      try {
+        // Advice such as the hint notice names data attributes, not attach()'s options.
+        attachPage({ relay: options.relay, policy: options.policy }, 'script-tag');
+      } catch (error) {
+        // One line, never a stack: attach()'s TypeErrors name what is wrong, never a value
+        // (ADR 0032), and anything else is not this tag's to describe.
+        console.error(
+          `[tabdock] ${error instanceof TypeError ? error.message : 'the adapter could not attach'}`,
+        );
+      }
     };
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', start, { once: true });

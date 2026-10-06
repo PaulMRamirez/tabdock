@@ -20,6 +20,7 @@ import {
   createAdapterCore,
   type LocksLike,
   MAX_DEADLINE_MS,
+  type PolicyFrom,
   REMEMBERED_PROMPT_IDS,
   type RuntimeTool,
   type UiPort,
@@ -1039,7 +1040,9 @@ describe('roles and consequential tools', () => {
     it('treats every tool that is not read-only as consequential and says how to fix it', async () => {
       const h = setup({ tools: polyfillTools() });
       const socket = await link(h);
-      expect(h.dock.state.notice).toMatch(/consequentialTools/);
+      expect(h.dock.state.notice).toMatch(
+        /List the consequential tools in policy\.consequentialTools/,
+      );
       socket.deliver(invoke('set_value'));
       socket.deliver(invoke('get_value', { callId: 'call-2' }));
       await flush();
@@ -1063,17 +1066,32 @@ describe('roles and consequential tools', () => {
 
     // README and SPEC section 8 once showed consequentialTools: [] in their
     // example, so a page that copied either must still fail safe (ADR 0034).
-    it.each<[string, PolicyInput]>([
-      ['attach() given consequentialTools: []', { consequentialTools: [] }],
-      ['the script tag given data-consequential-tools=""', scriptTagPolicy('')],
-      ['the script tag given data-consequential-tools=" , "', scriptTagPolicy(' , ')],
+    // The notice names the setting the page wrote: the option, or on a script tag the attribute.
+    const OPTION = /in policy\.consequentialTools to fix this/;
+    const ATTRIBUTE = /in the script tag's data-consequential-tools attribute to fix this/;
+    it.each<[string, PolicyInput, PolicyFrom | undefined, RegExp]>([
+      ['attach() given consequentialTools: []', { consequentialTools: [] }, undefined, OPTION],
+      [
+        'the script tag given data-consequential-tools=""',
+        scriptTagPolicy(''),
+        'script-tag',
+        ATTRIBUTE,
+      ],
+      [
+        'the script tag given data-consequential-tools=" , "',
+        scriptTagPolicy(' , '),
+        'script-tag',
+        ATTRIBUTE,
+      ],
     ])(
       'counts an empty list as naming none, for %s: every write is marked, prompts, and the notice shows',
-      async (_how, policy) => {
+      async (_how, policy, policyFrom, names) => {
         expect(policy.consequentialTools).toEqual([]);
-        const h = setup({ tools: polyfillTools(), core: { policy } });
+        const h = setup({ tools: polyfillTools(), core: { policy, policyFrom } });
         const socket = await link(h);
-        expect(h.dock.state.notice).toMatch(/consequentialTools/);
+        expect(h.dock.state.notice).toMatch(names);
+        // Never the other setting's name, which the page author did not write.
+        expect(h.dock.state.notice).not.toMatch(names === OPTION ? ATTRIBUTE : OPTION);
         expect(
           socket
             .framesOf('tools')[0]

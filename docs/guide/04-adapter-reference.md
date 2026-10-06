@@ -40,7 +40,7 @@ The script-tag build, `dist/tabdock-adapter.js`, reads these attributes from its
 | `data-invites`             | `off`, `watch` or `all`                                   |
 | `data-confirm-via`         | `page` or `client`                                        |
 
-An absent attribute keeps the default, and so does a misspelled one, which is ignored without a word. A bad value logs `[tabdock] invalid data attributes for <fields>`, naming policy fields (`maxDrivers` for `data-max-drivers`); a missing `data-relay` logs `[tabdock] data-relay is required, for example ws://127.0.0.1:8787/page`; a file loaded as a module logs `[tabdock] load the adapter build with a classic <script> tag`; and in each case nothing attaches. A `data-relay` that is not a `ws:` or `wss:` URL throws `TypeError: the relay URL must be a ws: or wss: URL`, uncaught, once the document has parsed.
+An absent attribute keeps the default, and so does a misspelled one, which is ignored without a word. A bad value logs `[tabdock] invalid data attributes for <fields>`, naming policy fields (`maxDrivers` for `data-max-drivers`); a missing `data-relay` logs `[tabdock] data-relay is required, for example ws://127.0.0.1:8787/page`, and one that is not a `ws:` or `wss:` URL `[tabdock] data-relay must be a ws: or wss: URL, for example ws://127.0.0.1:8787/page`, never repeating it; a file loaded as a module logs `[tabdock] load the adapter build with a classic <script> tag`; and in each case nothing attaches. The widget's hint notice names `data-consequential-tools` rather than `policy.consequentialTools`.
 
 ## The handle
 

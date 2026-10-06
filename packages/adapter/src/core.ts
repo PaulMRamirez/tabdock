@@ -170,10 +170,15 @@ export interface UiPort {
   ): boolean | undefined | Promise<boolean | undefined>;
 }
 
+/** Where a page's policy was written: attach()'s options, or the script-tag build's data attributes. */
+export type PolicyFrom = 'attach' | 'script-tag';
+
 export interface CoreOptions {
   /** The relay's page endpoint, for example ws://127.0.0.1:8787/page. */
   relayUrl: string;
   policy?: PolicyInput | undefined;
+  /** Where the policy was written, so advice names that setting; 'attach' unless set. */
+  policyFrom?: PolicyFrom | undefined;
   /** document.modelContext; without it the core logs how to add a polyfill and stays idle. */
   modelContext?: ModelContextLike | undefined;
   socketFactory: SocketFactory;
@@ -621,9 +626,19 @@ const POLYFILL_HINT =
   "(for example @mcp-b/webmcp-polyfill's installWebMCP() on 6.x, or initializeWebMCPPolyfill() on 5.x) " +
   'or use a browser with WebMCP enabled.';
 
-const HINT_NOTICE =
-  "This browser's WebMCP does not report consequentialHint, so every tool that is not read-only " +
-  'is treated as consequential. List the consequential tools in policy.consequentialTools to fix this.';
+/**
+ * The hint fallback's advice (ADR 0002), naming the setting the page author
+ * wrote: the policy option for attach(), the attribute on a script tag.
+ */
+const HINT_NOTICES: Readonly<Record<PolicyFrom, string>> = {
+  attach:
+    "This browser's WebMCP does not report consequentialHint, so every tool that is not read-only " +
+    'is treated as consequential. List the consequential tools in policy.consequentialTools to fix this.',
+  'script-tag':
+    "This browser's WebMCP does not report consequentialHint, so every tool that is not read-only " +
+    "is treated as consequential. List the consequential tools in the script tag's " +
+    'data-consequential-tools attribute to fix this.',
+};
 
 /**
  * The standard close code for a malformed frame. Browsers refuse it from page
@@ -1946,7 +1961,9 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       lastProblemsKey = problemsKey;
       for (const problem of snapshot.problems) log.warn(problem);
     }
-    const notice = needsHintNotice(snapshot.hintSupport, policy) ? HINT_NOTICE : null;
+    const notice = needsHintNotice(snapshot.hintSupport, policy)
+      ? HINT_NOTICES[options.policyFrom ?? 'attach']
+      : null;
     if (notice !== state.notice) setState({ notice });
     return snapshot;
   }

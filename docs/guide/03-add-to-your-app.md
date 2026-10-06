@@ -120,7 +120,7 @@ attach({
 | anything else, a write                                           | drivers               | one at a time per page, in arrival order | none                                                                                         |
 | also `consequentialHint: true`, or named in `consequentialTools` | as above              | as above, once confirmed                 | the operator, under `consequential: 'confirm'`; refused under `'deny'`; none under `'allow'` |
 
-Only the page's own `readOnlyHint: true` makes a tool read-only. Set `consequentialHint` and also name the tool in `policy.consequentialTools` (`data-consequential-tools` on a script tag): MCP-B 5.x and Chrome 153 drop the hint, and there, on a page whose tools carry annotations but whose list names none, every tool that is not read-only prompts, and the widget's notice says to list them in `policy.consequentialTools` (ADRs 0002 and 0034). A page whose tools carry no annotations at all gets no such fallback, since the adapter cannot tell a hint was dropped. `untrustedContentHint` changes nothing, as every result is labelled anyway. Under `confirmVia: 'client'` a member driver confirms in their own client ([Sharing](06-sharing.md)).
+Only the page's own `readOnlyHint: true` makes a tool read-only. Set `consequentialHint` and also name the tool in `policy.consequentialTools` (`data-consequential-tools` on a script tag): MCP-B 5.x and Chrome 153 drop the hint, and there, on a page whose tools carry annotations but whose list names none, every tool that is not read-only prompts, and the widget's notice says to list them there (ADRs 0002 and 0034). A page whose tools carry no annotations at all gets no such fallback, since the adapter cannot tell a hint was dropped. `untrustedContentHint` changes nothing, as every result is labelled anyway. Under `confirmVia: 'client'` a member driver confirms in their own client ([Sharing](06-sharing.md)).
 
 ## Add the adapter
 
@@ -176,7 +176,7 @@ A page with no build step loads the polyfill, then the adapter's script-tag file
 ></script>
 ```
 
-It reads `data-relay` and the policy attributes the [adapter reference](04-adapter-reference.md#the-script-tag) lists, and attaches once the document has parsed, so a polyfill loaded as a module script is ready first. It gives no handle: the widget is the only control, with no `ui: false` or `modelContext`. A bad value logs `[tabdock] invalid data attributes for <fields>`, naming policy fields (`maxDrivers` for `data-max-drivers`), and nothing attaches; a misspelled attribute is ignored without a word. Once 0.1.0 is on npm, jsDelivr serves the file pinned to a version, with the digest from the release asset `tabdock-adapter.integrity.txt`, which also holds a ready tag:
+It reads `data-relay` and the policy attributes the [adapter reference](04-adapter-reference.md#the-script-tag) lists, and attaches once the document has parsed, so a polyfill loaded as a module script is ready first. It gives no handle: the widget is the only control, with no `ui: false` or `modelContext`. A bad value logs `[tabdock] invalid data attributes for <fields>`, naming policy fields (`maxDrivers` for `data-max-drivers`), a `data-relay` other than `ws:` or `wss:` logs `[tabdock] data-relay must be a ws: or wss: URL ...`, and nothing attaches; a misspelled attribute is silently ignored. Once 0.1.0 is on npm, jsDelivr serves the file pinned to a version, with the digest from the release asset `tabdock-adapter.integrity.txt`, which also holds a ready tag:
 
 ```html
 <!-- once 0.1.0 is on npm -->

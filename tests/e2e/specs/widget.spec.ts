@@ -911,9 +911,11 @@ test('on the MCP-B polyfill 5.1, the script tag with an empty data-consequential
       .map((tool) => tool.name)
       .sort(),
   ).toEqual(['add_item', 'clear_board', 'highlight_item', 'move_view']);
+  // On a script tag the notice names the attribute the page wrote, not attach()'s option.
   await expect
     .poll(() => widgetEvaluate(page, 'activity', NOTICE_TEXT))
-    .toMatch(/consequentialTools/);
+    .toMatch(/in the script tag's data-consequential-tools attribute to fix this/);
+  expect(await widgetEvaluate(page, 'activity', NOTICE_TEXT)).not.toMatch(/policy\./);
 
   relay.send(attachRequest('req-alice', 'alice'));
   await clickInWidget(page, { action: 'approve-driver', requestId: 'req-alice' });
@@ -925,6 +927,38 @@ test('on the MCP-B polyfill 5.1, the script tag with an empty data-consequential
     .poll(() => framesOf(relay, 'result').map((frame) => [frame.callId, frame.error?.code ?? 'ok']))
     .toEqual([['call-1', 'denied_by_operator']]);
   await expect(page.locator('[data-role="view"]')).toHaveText(/3 items/);
+});
+
+test('the script tag refuses a data-relay that is not ws: or wss: in one console line, and attaches nothing', async ({
+  page,
+}) => {
+  const relay = await routeFakeRelay(page);
+  const adapter = Buffer.from(await scriptTagFile());
+  await page.route(`${demo.url}tabdock-adapter.js`, (route) =>
+    route.fulfill({ contentType: 'text/javascript', body: adapter }),
+  );
+  const said: string[] = [];
+  page.on('console', (message) => said.push(`${message.type()} ${message.text()}`));
+  await page.goto(demo.url);
+  await page.waitForSelector('html[data-tools="ready"]');
+  const LINE =
+    '[tabdock] data-relay must be a ws: or wss: URL, for example ws://127.0.0.1:8787/page';
+  expectedErrors.push(LINE);
+  await page.evaluate(() => {
+    const script = document.createElement('script');
+    script.src = '/tabdock-adapter.js';
+    script.dataset.relay = 'https://relay.example/page?token=SeCrEt9';
+    document.head.append(script);
+  });
+  await expect
+    .poll(() => said.filter((line) => line.startsWith('error ')))
+    .toEqual([`error ${LINE}`]);
+  // One line, with no stack, no value and no uncaught TypeError (pageErrors is checked after).
+  expect(said.join('\n')).not.toContain('SeCrEt9');
+  expect(said.join('\n')).not.toContain('TypeError');
+  // Nothing dialled, and no widget mounted: its roster list would be there, shown or not.
+  expect(relay.connections).toBe(0);
+  expect(await widgetText(page, 'roster')).toBeNull();
 });
 
 test('pause answers calls with page_busy, shows on the badge, and holds across a reload', async ({

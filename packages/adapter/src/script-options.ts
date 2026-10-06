@@ -23,6 +23,20 @@ export function readScriptOptions(
   if (relay === '') {
     return { ok: false, error: 'data-relay is required, for example ws://127.0.0.1:8787/page' };
   }
+  // Checked here, as attach() would, so a bad URL is one console line rather
+  // than an uncaught TypeError, and never quoted, since a URL's query can carry a secret.
+  let protocol = '';
+  try {
+    protocol = new URL(relay).protocol;
+  } catch {
+    // Refused below; URL.parse is newer than some browsers a polyfill serves.
+  }
+  if (protocol !== 'ws:' && protocol !== 'wss:') {
+    return {
+      ok: false,
+      error: 'data-relay must be a ws: or wss: URL, for example ws://127.0.0.1:8787/page',
+    };
+  }
   const policy: Record<string, unknown> = {};
   if (data.autoApprove !== undefined) policy.autoApprove = data.autoApprove.trim();
   if (data.maxDrivers !== undefined) policy.maxDrivers = Number(data.maxDrivers.trim() || NaN);

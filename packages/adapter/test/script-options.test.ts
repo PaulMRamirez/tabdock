@@ -9,6 +9,25 @@ describe('readScriptOptions', () => {
     expect(readScriptOptions({ relay: '  ' })).toMatchObject({ ok: false });
   });
 
+  it('refuses a data-relay that is not a ws: or wss: URL, without repeating it', () => {
+    const refused = {
+      ok: false,
+      error: 'data-relay must be a ws: or wss: URL, for example ws://127.0.0.1:8787/page',
+    };
+    for (const relay of [
+      'http://127.0.0.1:8787/page',
+      'https://relay.example/page?token=SeCrEt9',
+      'relay.example/page',
+      '/page',
+      'ws//127.0.0.1:8787/page',
+    ]) {
+      const read = readScriptOptions({ relay });
+      expect(read, relay).toEqual(refused);
+      expect(JSON.stringify(read)).not.toContain('SeCrEt9');
+    }
+    expect(readScriptOptions({ relay: 'WSS://Relay.Example/page' })).toMatchObject({ ok: true });
+  });
+
   it('reads every policy attribute', () => {
     expect(
       readScriptOptions({
