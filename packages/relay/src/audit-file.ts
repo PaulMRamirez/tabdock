@@ -1955,14 +1955,22 @@ function sizesNow(
 }
 
 function closeTornLine(path: string, fs: AuditFs, names: AuditDirNames): void {
-  const fd = fs.openSync(path, nodeFs.constants.O_WRONLY | nodeFs.constants.O_APPEND | noFollow());
+  // Node's own messages quote the path, which TABDOCK_HOME or TABDOCK_AUDIT_DIR may have given.
+  const refusal = (error: unknown): AuditDirError =>
+    new AuditDirError(
+      `cannot close a torn line in the audit file ${names.file(path)} (${codeOf(error)})`,
+    );
+  let fd: number;
+  try {
+    fd = fs.openSync(path, nodeFs.constants.O_WRONLY | nodeFs.constants.O_APPEND | noFollow());
+  } catch (error) {
+    throw refusal(error);
+  }
   try {
     fs.writeSync(fd, Buffer.from('\n'));
     fs.fdatasyncSync(fd);
   } catch (error) {
-    throw new AuditDirError(
-      `cannot close a torn line in the audit file ${names.file(path)} (${codeOf(error)})`,
-    );
+    throw refusal(error);
   } finally {
     fs.closeSync(fd);
   }

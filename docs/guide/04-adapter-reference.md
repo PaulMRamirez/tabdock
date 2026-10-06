@@ -78,24 +78,24 @@ The promise resolves once, with `{ ok: true, inviteId, link, expiresAt }`, the l
 
 ## The state
 
-| `DockState` field | Type                                                                 | What it holds                                                                                             |
-| ----------------- | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `link`            | `'idle'`, `'connecting'`, `'linked'`, `'reconnecting'` or `'closed'` | The page link                                                                                             |
-| `pageId`          | string or null                                                       | The relay's id for this page session, such as `pg_0123456789`                                             |
-| `pairing`         | `{ code, url?, expiresAt }` or null                                  | The current code, and the QR link when the relay has a public URL                                         |
-| `roster`          | attachments                                                          | Everyone attached, as the relay lists them: user, kind, role, clients, times, and the invite that made it |
-| `pageRoles`       | one per roster entry                                                 | The role the page itself runs that user's calls under (null for none), and whether a revoke is pending    |
-| `pendingRequests` | attach requests                                                      | `requestId`, `user`, `account`, `via` (`code`, `qr` or `invite`), `invite`, `client`, `expiresAt`         |
-| `pendingConfirms` | consequential prompts                                                | `callId`, `tool`, `caller`, and `expiresAt`, the call's deadline                                          |
-| `notice`          | string or null                                                       | Advice for the page author, such as the `consequentialHint` fallback                                      |
-| `error`           | string or null                                                       | Why the link is not working, such as a missing `document.modelContext`                                    |
-| `paused`          | boolean                                                              | The pause switch                                                                                          |
-| `activity`        | the last 50 calls, newest first                                      | user, client, tool, outcome, `confirmedBy`, duration; never arguments or results                          |
-| `invites`         | live invites                                                         | Those this page minted and its own record still holds                                                     |
-| `invitesOffered`  | `{ linkBase }` or null                                               | Null until a relay with invites on says so                                                                |
-| `joins`           | people let in by invite                                              | Newest first, while their grant lasts                                                                     |
-| `observerSeats`   | people the driver limit held back                                    | Newest first: each `user`, `account` and `asked` (`'allow'` or `'promote'`), while they stay observers    |
-| `policy`          | `Policy`                                                             | The policy `attach()` was given, with defaults filled in; a copy                                          |
+| `DockState` field | Type                                                                 | What it holds                                                                                                         |
+| ----------------- | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `link`            | `'idle'`, `'connecting'`, `'linked'`, `'reconnecting'` or `'closed'` | The page link                                                                                                         |
+| `pageId`          | string or null                                                       | The relay's id for this page session, such as `pg_0123456789`                                                         |
+| `pairing`         | `{ code, url?, expiresAt }` or null                                  | The current code, and the QR link when the relay has a public URL                                                     |
+| `roster`          | attachments                                                          | Everyone attached, as the relay lists them: user, kind, role, clients, times, and the invite that made it             |
+| `pageRoles`       | one per roster entry                                                 | The role the page itself runs that user's calls under (null for none), and whether a revoke is pending                |
+| `pendingRequests` | attach requests                                                      | `requestId`, `user`, `account`, `via` (`code`, `qr` or `invite`), `invite`, `client`, `expiresAt`                     |
+| `pendingConfirms` | consequential prompts                                                | `callId`, `tool`, `caller`, and `expiresAt`, the call's deadline                                                      |
+| `notice`          | string or null                                                       | Advice for the page author, such as the `consequentialHint` fallback                                                  |
+| `error`           | string or null                                                       | Why the link is not working, such as a missing `document.modelContext`                                                |
+| `paused`          | boolean                                                              | The pause switch                                                                                                      |
+| `activity`        | the last 50 calls, newest first                                      | user, client, tool, outcome, `confirmedBy`, duration; never arguments or results                                      |
+| `invites`         | live invites                                                         | Those this page minted and its own record still holds                                                                 |
+| `invitesOffered`  | `{ linkBase }` or null                                               | Null until a relay with invites on says so                                                                            |
+| `joins`           | people let in by invite                                              | Newest first, while their grant lasts                                                                                 |
+| `observerSeats`   | people the driver limit held back                                    | Newest first: each `seq`, `user`, `account`, `asked` (`'allow'` or `'promote'`) and `time`, while they stay observers |
+| `policy`          | `Policy`                                                             | The policy `attach()` was given, with defaults filled in; a copy                                                      |
 
 ## Your own operator UI
 

@@ -1186,6 +1186,8 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
 
   /** The seq of the newest observer seat already dealt with; null before the first render. */
   let lastSeat: number | null = null;
+  /** Each seat notice on screen, by its seat's seq, with the user it names. */
+  const seatLines = new Map<number, { userId: string; line: JoinLine }>();
 
   /**
    * Says so when the driver limit seated someone as an observer after the
@@ -1195,6 +1197,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
    * whether a notice was added, which opens the panel.
    */
   function noticeSeats(state: DockState): boolean {
+    withdrawSeats(state);
     const newest = state.observerSeats[0]?.seq ?? 0;
     // Seats recorded before the widget mounted are not news.
     if (lastSeat === null) {
@@ -1213,9 +1216,35 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       // Not data-user-id, which names roster rows.
       dom.attr(line, 'data-seated', seat.user.userId);
       dom.prepend(joins, line);
-      joinLines.push({ element: line, shownMs: 0, since: null, seen: false });
+      const shown: JoinLine = { element: line, shownMs: 0, since: null, seen: false };
+      joinLines.push(shown);
+      seatLines.set(seat.seq, { userId: seat.user.userId, line: shown });
     }
     return fresh.length > 0;
+  }
+
+  /**
+   * Takes a seat notice down once the roster lists its person as a driver
+   * after all, as when a roster sent before the relay read the click came
+   * first: the notice would now say the opposite of the row beside it.
+   */
+  function withdrawSeats(state: DockState): void {
+    for (const [seq, { userId, line }] of [...seatLines]) {
+      const at = joinLines.indexOf(line);
+      if (at === -1) {
+        // Aged away already.
+        seatLines.delete(seq);
+        continue;
+      }
+      if (state.observerSeats.some((seat) => seat.seq === seq)) continue;
+      const driving = state.roster.some(
+        (entry) => entry.userId === userId && entry.role === 'driver',
+      );
+      if (!driving) continue;
+      dom.remove(line.element);
+      joinLines.splice(at, 1);
+      seatLines.delete(seq);
+    }
   }
 
   /**

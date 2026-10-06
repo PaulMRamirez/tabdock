@@ -40,6 +40,7 @@ import {
   OWNER_TOKEN_FILE,
   OwnerTokenError,
   ownerTokenDirectory,
+  pathNames,
   readOwnerToken,
   type TokenEnv,
 } from '../src/local-token.ts';
@@ -647,6 +648,30 @@ describe.skipIf(!POSIX)('the directories above it (ADR 0028)', () => {
     expect(existsSync(join(theirs, '.config'))).toBe(false);
     // Directories root owns, and ours that only we may write, are trusted.
     expect(loadOwnerToken({ TABDOCK_HOME: join(base, 'mine', 'tabdock') }).created).toBe(true);
+  });
+});
+
+describe('names for paths TABDOCK_HOME gave, on a platform that folds case', () => {
+  it('names a path whose case differs from the setting by what lies below it, never by climbing out', () => {
+    const names = pathNames(
+      { TABDOCK_HOME: '/nonexistent-tabdock/Users/me/TabDockZq7Mark9Wq' },
+      { platform: 'darwin' },
+    );
+    expect(names.of('/nonexistent-tabdock/Users/me/tabdockzq7mark9wq/owner-token')).toBe(
+      `owner-token in ${GIVEN_HOME}`,
+    );
+    expect(names.of('/nonexistent-tabdock/Users/me/TABDOCKZQ7MARK9WQ/audit/audit.lock')).toBe(
+      `audit/audit.lock in ${GIVEN_HOME}`,
+    );
+    expect(names.of('/nonexistent-tabdock/users/ME/tabdockzq7mark9wq')).toBe(GIVEN_HOME);
+    // Where case counts, a path in another case is another directory.
+    const strict = pathNames(
+      { TABDOCK_HOME: '/nonexistent-tabdock/Users/me/TabDockZq7Mark9Wq' },
+      { platform: 'linux' },
+    );
+    expect(strict.of('/nonexistent-tabdock/Users/me/tabdockzq7mark9wq/owner-token')).not.toMatch(
+      /mark9wq/i,
+    );
   });
 });
 

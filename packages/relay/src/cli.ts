@@ -221,8 +221,8 @@ export async function startRelay(
 /**
  * Runs the command; resolves with an exit code, or null once a relay is
  * serving, which a signal then closes. Errors from the configuration and the
- * owner token name variables and paths, never their secrets, so they are
- * printed as they are.
+ * owner token name variables, never their values, so they are printed as
+ * they are, through refusalText.
  */
 export async function runCommand(
   argv: readonly string[],
@@ -268,9 +268,24 @@ export async function runCommand(
     }
     return null;
   } catch (error) {
-    context.err(`tabdock relay: ${error instanceof Error ? error.message : String(error)}`);
+    context.err(`tabdock relay: ${refusalText(error)}`);
     return 1;
   }
+}
+
+/**
+ * What a start's refusal prints. The relay's own refusals never repeat a
+ * setting's value; Node's file errors quote the path they failed on, which
+ * TABDOCK_HOME or TABDOCK_AUDIT_DIR may have given, and a token pasted there
+ * passes as a path. One that reaches here unwrapped prints its call and code.
+ */
+export function refusalText(error: unknown): string {
+  if (!(error instanceof Error)) return 'the relay could not start';
+  const { code, syscall, path, dest } = error as NodeJS.ErrnoException & { dest?: unknown };
+  if (typeof code === 'string' && (typeof path === 'string' || typeof dest === 'string')) {
+    return `${typeof syscall === 'string' ? syscall : 'a file operation'} failed on a path the relay was given (${code})`;
+  }
+  return error.message;
 }
 
 /** The process's own context: its environment, platform and terminal. */

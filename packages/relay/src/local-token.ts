@@ -315,7 +315,14 @@ export function pathNames(env: TokenEnv, overrides: Partial<LocalTokenSystem> = 
       if (levels === 0) return GIVEN_HOME;
       if (levels !== null) return `${aboveText(levels)} ${GIVEN_HOME}`;
       const inside = anchors.find((anchor) => isWithin(path, anchor, platform));
-      if (inside !== undefined) return `${relative(inside, path)} in ${GIVEN_HOME}`;
+      if (inside !== undefined) {
+        // Measured as isWithin compared them, case folded where the platform
+        // folds case, then spelled as the path spells it, so a path whose case
+        // differs from the setting never climbs out through '..' and names
+        // the directory the setting gave.
+        const depth = relative(fold(inside), fold(path)).split(sep).length;
+        return `${resolve(path).split(sep).slice(-depth).join(sep)} in ${GIVEN_HOME}`;
+      }
       // Nothing a check names lies elsewhere, but if something did it could hold the value.
       return `a path ${GIVEN_HOME} leads to`;
     },

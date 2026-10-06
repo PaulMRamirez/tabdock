@@ -26,7 +26,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import {
   AUDIT_VERSION,
   type AuditEvent,
@@ -196,6 +196,49 @@ describe('the audit files (ADR 0019)', () => {
     expect(report.torn).toEqual([{ file: file?.name, lineNumber: 3 }]);
     expect(report.problems).toEqual([]);
     expect(report.lastSeq).toBe(3);
+  });
+
+  it('refuses a start that cannot open a torn file to close it by the names it was given, never the path', async () => {
+    const dir = scratch();
+    const first = open(dir);
+    first.audit.append(call(T0));
+    await first.audit.close();
+    const [file] = listAuditFiles(dir);
+    const path = join(dir, file?.name ?? '');
+    writeFileSync(path, `${readFileSync(path, 'utf8')}{"v":1,"seq":2,"type":"ca`);
+    // As node words it: an immutable file, or one the relay's account cannot write.
+    const fs: AuditFs = {
+      ...nodeFs,
+      openSync: (...args: Parameters<typeof nodeFs.openSync>) => {
+        const [target, flags] = args;
+        if (target === path && typeof flags === 'number' && flags & nodeFs.constants.O_APPEND) {
+          throw Object.assign(new Error(`EPERM: operation not permitted, open '${path}'`), {
+            code: 'EPERM',
+            syscall: 'open',
+            path,
+          });
+        }
+        return nodeFs.openSync(...args);
+      },
+    };
+    const names = {
+      dir: (code?: string) => `the audit directory a setting gives${code ? ` (${code})` : ''}`,
+      file: (at: string) => `${basename(at)} in the audit directory a setting gives`,
+    };
+    let refused: unknown = null;
+    try {
+      open(dir, { fs, names });
+    } catch (error) {
+      refused = error;
+    }
+    expect(refused).toBeInstanceOf(AuditDirError);
+    expect((refused as Error).message).toBe(
+      `cannot close a torn line in the audit file ${file?.name ?? ''} in the audit directory a setting gives (EPERM)`,
+    );
+    // The lock went with the refusal, so the next start finds the file as it was and closes it.
+    const second = open(dir);
+    expect(second.lines.join('\n')).toContain('closed a torn last line');
+    await second.audit.close();
   });
 
   it('rotates at the size limit and at UTC midnight, chaining across files and checkpointing each time', async () => {

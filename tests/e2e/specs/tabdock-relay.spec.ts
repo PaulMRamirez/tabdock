@@ -793,6 +793,10 @@ test.describe('M2: many clients, many users', () => {
         ['alice', 'driver'],
         ['bob', 'observer'],
       ]);
+    // The notice that she is still an observer goes with it, not when it ages.
+    await expect
+      .poll(() => widgetText(page, 'joins'), { timeout: 2_000 })
+      .not.toContain('so Alice is still an observer');
     const restored = await addItem(client, pageId, 'Restored');
     expect(restored.isError, restored.text).toBe(false);
     await expect(page.locator('[data-role="view"]')).toHaveText(/5 items/);

@@ -23,6 +23,7 @@ import {
   type CommandContext,
   packageVersion,
   parseCommand,
+  refusalText,
   relayUsage,
   runCommand,
   startRelay,
@@ -157,6 +158,30 @@ describe('the arguments', () => {
     expect(ran.errors[1]).toBe(relayUsage(true));
     expect(ran.printed).toEqual([]);
     expect(existsSync(home)).toBe(false);
+  });
+});
+
+describe('what a refused start prints', () => {
+  it("prints a node file error's call and code alone, since its message quotes a path a setting may have given", () => {
+    const token = `tabdock_${'s3cr3t'.repeat(7)}x`;
+    const path = `/${token}/audit/audit-2026-10-06-000000000001.jsonl`;
+    const node = Object.assign(new Error(`EPERM: operation not permitted, open '${path}'`), {
+      code: 'EPERM',
+      syscall: 'open',
+      path,
+    });
+    expect(refusalText(node)).toBe('open failed on a path the relay was given (EPERM)');
+    const renamed = Object.assign(new Error(`EXDEV: cross-device link, rename 'a' -> '${path}'`), {
+      code: 'EXDEV',
+      syscall: 'rename',
+      dest: path,
+    });
+    expect(refusalText(renamed)).toBe('rename failed on a path the relay was given (EXDEV)');
+    // The relay's own refusals, which name settings and never their values, print as they are.
+    expect(refusalText(new Error('TABDOCK_PORT must be a whole number'))).toBe(
+      'TABDOCK_PORT must be a whole number',
+    );
+    expect(refusalText(token)).not.toContain(token);
   });
 });
 

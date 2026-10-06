@@ -18,6 +18,8 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { createServer, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseEnv } from 'node:util';
@@ -42,6 +44,7 @@ import {
   resolveConfig,
 } from '../src/config.ts';
 import { MIN_DEV_TOKEN_LENGTH } from '../src/auth.ts';
+import { createRelay } from '../src/relay.ts';
 import { DEFAULT_MAX_TOKEN_AGE_MINUTES } from '../src/oauth.ts';
 
 const ROOT = new URL('../../../', import.meta.url).pathname;
@@ -365,12 +368,39 @@ describe('.env.example', () => {
 describe('refusals and the values they refuse', () => {
   // The page promises a refusal never repeats the value, since a token may sit
   // in the wrong variable; this holds the code to it by refusing a marked
-  // value in every setting the relay reads, as a bare word, inside a URL, and
-  // for TABDOCK_HOME as absolute paths, which a token starting with '/' would
-  // pass as: inside the checkout, inside a work tree, on a file, and through
-  // a loop of links, whose realpath error node words with the path.
+  // value in every setting the relay reads, in dev-token, public and local
+  // mode, as a bare word and inside a URL; for TABDOCK_HOME as absolute paths,
+  // which a token starting with '/' would pass as: inside the checkout, inside
+  // a work tree, on a file, and through a loop of links, whose realpath error
+  // node words with the path; and for the user lists as entries written token
+  // first or listed twice, where a token lands in the user id's place.
   const MARK = 'Zq7Mark9Wq';
-  const devTokens = { TABDOCK_DEV_TOKENS: `alice=${'k'.repeat(MIN_DEV_TOKEN_LENGTH)}` };
+  const long = 'k'.repeat(MIN_DEV_TOKEN_LENGTH);
+  const devTokens = { TABDOCK_DEV_TOKENS: `alice=${long}` };
+  const PUBLIC = {
+    TABDOCK_PUBLIC_URL: 'https://relay.example',
+    TABDOCK_OAUTH_ISSUER: 'https://idp.example',
+    TABDOCK_OAUTH_USERS: 'user_01=alice:Alice',
+    TABDOCK_PAIR_CLIENT_ID: 'tabdock-pair',
+    TABDOCK_PAIR_CLIENT_SECRET: 'pair-secret-0123456789abcdef',
+    TABDOCK_ALLOWED_ORIGINS: 'https://app.example',
+  };
+  /** Shaped as local mode's owner token, which passes as a user id. */
+  const markedToken = `tabdock_${MARK}${'A'.repeat(33)}`;
+  /** Each of these refuses, by entry number, with the mark where a user id goes. */
+  const LISTS: Readonly<Record<string, readonly NodeJS.ProcessEnv[]>> = {
+    TABDOCK_DEV_TOKENS: [
+      `${markedToken}=you`,
+      `alice=${long},${'ab'.repeat(27)}${MARK}=alice`,
+      `${MARK}=${long},${MARK}=${long}x`,
+      `alice=${long},${MARK}=${long}`,
+      `${MARK}=${long} x`,
+    ].map((value) => ({ TABDOCK_DEV_TOKENS: value })),
+    TABDOCK_OAUTH_USERS: [`s1=${MARK}:A,s2=${MARK}:B`, `s=alice:A,s=${MARK}:B`].map((value) => ({
+      ...PUBLIC,
+      TABDOCK_OAUTH_USERS: value,
+    })),
+  };
 
   function homes(scratch: string): string[] {
     const base = join(scratch, MARK);
@@ -388,12 +418,13 @@ describe('refusals and the values they refuse', () => {
   function quoting(scratch: string): { quoted: string[]; refused: Set<string> } {
     const quoted = new Set<string>();
     const refused = new Set<string>();
+    const local = { TABDOCK_HOME: join(scratch, 'home') };
     for (const name of relaySettings()) {
-      const envs: NodeJS.ProcessEnv[] = [MARK, `https://${MARK}.example/x`].map((value) => ({
-        ...devTokens,
-        [name]: value,
-      }));
+      const envs: NodeJS.ProcessEnv[] = [devTokens, PUBLIC, local].flatMap((base) =>
+        [MARK, `https://${MARK}.example/x`].map((value) => ({ ...base, [name]: value })),
+      );
       if (name === 'TABDOCK_HOME') envs.push(...homes(scratch).map((home) => ({ [name]: home })));
+      envs.push(...(LISTS[name] ?? []));
       for (const env of envs) {
         try {
           resolveConfig(loadConfigFromEnv(env));
@@ -418,14 +449,109 @@ describe('refusals and the values they refuse', () => {
     }
     const { quoted, refused } = found;
     // The probe reaches the settings whose refusals once quoted their value.
-    for (const name of ['TABDOCK_ALLOWED_ORIGINS', 'TABDOCK_HOME', 'TABDOCK_HOST']) {
+    for (const name of [
+      'TABDOCK_ALLOWED_ORIGINS',
+      'TABDOCK_HOME',
+      'TABDOCK_HOST',
+      'TABDOCK_DEV_TOKENS',
+      'TABDOCK_OAUTH_USERS',
+    ]) {
       expect(refused.has(name), name).toBe(true);
     }
     expect(quoted).toEqual([]);
-    expect(() =>
-      resolveConfig(
-        loadConfigFromEnv({ ...devTokens, TABDOCK_ALLOWED_ORIGINS: `https://a.example,${MARK}` }),
-      ),
-    ).toThrow(/^allowedOrigins \(TABDOCK_ALLOWED_ORIGINS\) entry 2 is not an origin/);
+    const refusal = (env: NodeJS.ProcessEnv): string => {
+      try {
+        resolveConfig(loadConfigFromEnv(env));
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+      }
+      return 'not refused';
+    };
+    expect(refusal({ ...devTokens, TABDOCK_ALLOWED_ORIGINS: `https://a.example,${MARK}` })).toMatch(
+      /^allowedOrigins \(TABDOCK_ALLOWED_ORIGINS\) entry 2 is not an origin/,
+    );
+    // Each list value reaches the check it was written for, not an earlier one.
+    expect(Object.values(LISTS).flat().map(refusal)).toEqual([
+      'TABDOCK_DEV_TOKENS entry 1 has a token shorter than 24 characters',
+      'TABDOCK_DEV_TOKENS entry 2 has a token shorter than 24 characters',
+      'TABDOCK_DEV_TOKENS entries 1 and 2 name the same user id',
+      'TABDOCK_DEV_TOKENS entries 1 and 2 share a token',
+      'TABDOCK_DEV_TOKENS entry 1 has a token that is not printable ASCII without spaces',
+      'TABDOCK_OAUTH_USERS entries 1 and 2 name the same user id',
+      'TABDOCK_OAUTH_USERS entries 1 and 2 share a sub',
+    ]);
+  });
+
+  it('never repeat a marked issuer when the relay cannot use its provider at start', async () => {
+    // start() fetches the provider's metadata, so its refusals are probed with
+    // a relay that starts: against a server that answers each way a provider
+    // can fail, a closed port and a port fetch refuses outright.
+    let answer: (response: ServerResponse) => void = () => undefined;
+    const provider = createServer((_request, response) => {
+      answer(response);
+    });
+    await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve));
+    const closed = createServer();
+    await new Promise<void>((resolve) => closed.listen(0, '127.0.0.1', resolve));
+    const closedPort = (closed.address() as AddressInfo).port;
+    await new Promise<void>((resolve) =>
+      closed.close(() => {
+        resolve();
+      }),
+    );
+    const port = (provider.address() as AddressInfo).port;
+    const issuer = `http://127.0.0.1:${String(port)}/${MARK}`;
+    const send =
+      (status: number, body: string) =>
+      (response: ServerResponse): void => {
+        response.writeHead(status, { 'Content-Type': 'application/json' });
+        response.end(body);
+      };
+    const other = 'https://idp.example';
+    const usable = {
+      issuer: other,
+      authorization_endpoint: `${other}/authorize`,
+      token_endpoint: `${other}/token`,
+      jwks_uri: `${other}/jwks`,
+      response_types_supported: ['code'],
+      code_challenge_methods_supported: ['S256'],
+      token_endpoint_auth_methods_supported: ['none'],
+      client_id_metadata_document_supported: true,
+    };
+    const cases: [string, (response: ServerResponse) => void, RegExp][] = [
+      [issuer, send(404, '{}'), /publishes no metadata for the issuer TABDOCK_OAUTH_ISSUER gives/],
+      [issuer, send(200, 'not json'), /is not JSON/],
+      [issuer, send(200, JSON.stringify({ issuer })), /lacks or misstates/],
+      [issuer, send(200, JSON.stringify(usable)), /not the one TABDOCK_OAUTH_ISSUER gives/],
+      [`http://127.0.0.1:${String(closedPort)}/${MARK}`, send(404, ''), /\(ECONNREFUSED\)$/],
+      [`http://127.0.0.1:1/${MARK}`, send(404, ''), /cannot reach the identity provider/],
+    ];
+    try {
+      for (const [given, respond, refusal] of cases) {
+        answer = respond;
+        const lines: string[] = [];
+        const options = loadConfigFromEnv({
+          ...PUBLIC,
+          TABDOCK_OAUTH_ISSUER: given,
+          TABDOCK_PORT: '0',
+        });
+        let message = 'not refused';
+        try {
+          const relay = await createRelay({ ...options, logSink: (line) => lines.push(line) });
+          await relay.close();
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message, given).toMatch(refusal);
+        expect(message, given).not.toContain(MARK);
+        expect(lines.join('\n'), given).not.toContain(MARK);
+      }
+    } finally {
+      await new Promise<void>((resolve) =>
+        provider.close(() => {
+          resolve();
+        }),
+      );
+    }
   });
 });

@@ -694,6 +694,97 @@ describe("the operator's role switch", () => {
     expect(h.dock.state.observerSeats).toEqual([]);
   });
 
+  it('judges Make driver only by a roster that can be its answer, so an earlier one never says the relay kept them', async () => {
+    const h = setup();
+    const socket = await link(h, {}, { alice: 'driver', bob: 'observer' });
+    const from = h.logs.length;
+    // A page's own "hand over": Alice steps back, then Bob drives.
+    expect(h.dock.setRole('alice', 'observer')).toBe(true);
+    expect(h.dock.setRole('bob', 'driver')).toBe(true);
+    // The relay's answer to Alice's set_role, sent before it read Bob's.
+    socket.deliver({
+      t: 'roster',
+      attachments: [attachment('alice', 'observer'), attachment('bob', 'observer')],
+    });
+    await flush();
+    const aboutBob = (): string[] => h.logs.slice(from).filter((line) => line.includes('Bob'));
+    expect(aboutBob()).toEqual(['info asked the relay to make Bob a driver']);
+    expect(h.dock.state.observerSeats).toEqual([]);
+    socket.deliver({
+      t: 'roster',
+      attachments: [attachment('alice', 'observer'), attachment('bob', 'driver')],
+    });
+    await flush();
+    expect(aboutBob()).toEqual([
+      'info asked the relay to make Bob a driver',
+      'info set Bob to driver',
+    ]);
+  });
+
+  it('corrects itself when a roster sent for another event crossed Make driver and the relay then seats a driver', async () => {
+    const h = setup();
+    const socket = await link(h, {}, { alice: 'driver', bob: 'observer' });
+    const from = h.logs.length;
+    expect(h.dock.setRole('bob', 'driver')).toBe(true);
+    // Sent before the relay read the click; nothing on the page can tell it from the answer.
+    socket.deliver({
+      t: 'roster',
+      attachments: [attachment('alice', 'driver'), attachment('bob', 'observer')],
+    });
+    await flush();
+    expect(h.dock.state.observerSeats).toMatchObject([{ user: { userId: 'bob' } }]);
+    // Alice left meanwhile, and the relay's answer seats Bob as a driver after all.
+    socket.deliver({ t: 'roster', attachments: [attachment('bob', 'driver')] });
+    await flush();
+    expect(h.logs.slice(from).filter((line) => line.includes('Bob'))).toEqual([
+      'info asked the relay to make Bob a driver',
+      'info Bob is still an observer: the page already has its maximum drivers (1)',
+      'info set Bob to driver',
+    ]);
+    // The seat goes, and with it the widget's notice (tabdock-relay.spec.ts).
+    expect(h.dock.state.observerSeats).toEqual([]);
+  });
+
+  it('says the relay kept someone an observer with a seat free only once its answer can have come', async () => {
+    const h = setup();
+    const socket = await link(h, {}, { alice: 'driver', bob: 'observer', carol: 'observer' });
+    const from = h.logs.length;
+    expect(h.dock.setRole('alice', 'observer')).toBe(true);
+    expect(h.dock.setRole('carol', 'driver')).toBe(true);
+    // Carol left before the relay read her set_role, which it then answers with nothing.
+    socket.deliver({
+      t: 'roster',
+      attachments: [attachment('alice', 'observer'), attachment('bob', 'observer')],
+    });
+    await flush();
+    expect(h.dock.setRole('bob', 'driver')).toBe(true);
+    // A seat is free, yet the relay held Bob back, as it does past its promotions per window.
+    socket.deliver({
+      t: 'roster',
+      attachments: [attachment('alice', 'observer'), attachment('bob', 'observer')],
+    });
+    await flush();
+    expect(h.logs).toContain('info the relay kept Bob an observer');
+    expect(h.dock.state.observerSeats).toEqual([]);
+    expect(h.logs.slice(from).filter((line) => line.includes('Carol'))).toEqual([
+      'info asked the relay to make Carol a driver',
+    ]);
+  });
+
+  it('logs an approval for someone already attached with the role the relay keeps, never the one chosen', async () => {
+    const h = setup();
+    const socket = await link(h, {}, { alice: 'driver', bob: 'observer' });
+    const before = h.logs.length;
+    socket.deliver({ ...attachRequest(h.clock, 'bob-again') });
+    expect(h.dock.approve('bob-again', 'driver')).toBe(true);
+    const said = h.logs.slice(before).filter((line) => line.includes('Bob'));
+    expect(said).toEqual([
+      'info attach request from Bob via code',
+      'info allowed Bob, who is already attached as observer; the relay keeps that role',
+    ]);
+    expect(said.filter((line) => /as driver|to driver/.test(line))).toEqual([]);
+  });
+
   it('promotes someone autoApprove attached, which is how they ever get to write', async () => {
     const h = setup({ core: { policy: { autoApprove: 'observer' } } });
     const socket = await link(h, { roster: [attachment('carol', 'observer')] }, {});

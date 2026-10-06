@@ -244,6 +244,24 @@ describe('parseOAuthUsers', () => {
       expect(() => parseOAuthUsers(value)).toThrow(/TABDOCK_OAUTH_USERS/);
     },
   );
+
+  it('refuses a sub or user id listed twice by entry number, never by the user id', () => {
+    const mark = 'Zq7Mark9Wq';
+    for (const [value, refusal] of [
+      [`s1=${mark}:A,s2=${mark}:B`, /^TABDOCK_OAUTH_USERS entries 1 and 2 name the same user id$/],
+      [`s=alice:A,s=${mark}:B`, /^TABDOCK_OAUTH_USERS entries 1 and 2 share a sub$/],
+      [`s=alice,t=bob,s=${mark}`, /^TABDOCK_OAUTH_USERS entries 1 and 3 share a sub$/],
+    ] as const) {
+      let message = '';
+      try {
+        parseOAuthUsers(value);
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message, value).toMatch(refusal);
+      expect(message, value).not.toContain(mark);
+    }
+  });
 });
 
 describe('a relay with a public URL (ADR 0014)', () => {
