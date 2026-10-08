@@ -1,0 +1,5 @@
+# The Pages site is its own pnpm project (ADR 0029): this file makes pnpm,
+# and Dependabot, treat apps/site as a workspace root with its own lockfile,
+# without needing --ignore-workspace.
+packages:
+  - .
