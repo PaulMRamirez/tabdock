@@ -4,7 +4,8 @@
 // attach request, reads every invoke, keeps none and answers none, so each
 // call waits. It prints the relay's /mcp URL, the page's id and its pairing
 // code, space apart, as its first line, then answers each IPC message with
-// its heap after collecting garbage and the invokes its page has received, so
+// its heap after collecting garbage, the invokes its page had received before
+// the first collection and the calls the relay had ended by the last reading, so
 // call-heap.test.ts can measure what waiting calls hold from another
 // process, whose own copies of the bodies it sends are not counted.
 
@@ -96,5 +97,13 @@ async function settledHeap(): Promise<number> {
 }
 
 process.on('message', () => {
-  void settledHeap().then((heapUsed) => send({ heapUsed, invokes }));
+  // Counted before the first collection, not after the last reading: a call
+  // that reaches the page while the heap is measured was not held at the
+  // earlier readings, and the least of them leaves it out, so a measure begun
+  // as calls arrive can count none of them. Calls ended are counted after the
+  // last reading, so none was released before any of them.
+  const invoked = invokes;
+  void settledHeap().then((heapUsed) =>
+    send({ heapUsed, invokes: invoked, ended: relay.audit.records().length }),
+  );
 });

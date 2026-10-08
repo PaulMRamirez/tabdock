@@ -1,6 +1,6 @@
 // Confirmation in the caller's client, the relay's half (ADR 0026, A5.3), on
 // both revisions, against a stand-in page whose every frame a test can read:
-// the SDK client 2.3.0 with its own elicitation handler, which on 2026-07-28
+// the SDK client 2.3.1 with its own elicitation handler, which on 2026-07-28
 // answers input_required and retries by itself and on a 2025-era session
 // answers the relay's elicitation inside the request; and raw requests where
 // a test must hold, forge or replay a requestState. The relay asks only a
@@ -162,7 +162,7 @@ interface AskingOptions {
 }
 
 /**
- * The SDK client 2.3.0, declaring form elicitation unless `capable` is false,
+ * The SDK client 2.3.1, declaring form elicitation unless `capable` is false,
  * whose elicitation handler answers each question with `answer`. On
  * 2026-07-28 the client fulfils input_required with that handler and retries
  * by itself; on a 2025-era session the relay asks inside the request.

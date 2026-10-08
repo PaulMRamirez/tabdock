@@ -1,6 +1,6 @@
 // A5.3 against the sim page, on both revisions (ADR 0026): the real adapter
 // core on a page that chose confirmVia 'client', the real relay, and the SDK
-// client 2.3.0 with its own elicitation handler. A member driver whose client
+// client 2.3.1 with its own elicitation handler. A member driver whose client
 // declares form elicitation confirms a consequential call there and the page
 // raises no prompt; a declined, dismissed, expired, replayed, forged or
 // mismatched confirmation, or one from another account or OAuth client,
@@ -147,7 +147,7 @@ async function page(
 }
 
 /**
- * The SDK client 2.3.0, declaring form elicitation unless `capable` is
+ * The SDK client 2.3.1, declaring form elicitation unless `capable` is
  * false, its handler answering every question with `answer`.
  */
 async function asking(

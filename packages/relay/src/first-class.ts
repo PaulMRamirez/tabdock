@@ -298,7 +298,7 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 /**
  * Whether every client era the relay serves takes this root, since each
  * rejects a whole tools/list, the fixed tools included, over one entry it
- * does not: the SDK's 2025-era clients (2.3.0 in legacy mode, and v1) want
+ * does not: the SDK's 2025-era clients (2.3.1 in legacy mode, and v1) want
  * `properties` an object, each property's schema an object (v1 from 1.24),
  * and `required` an array of strings; its 2026-07-28 client wants
  * `$schema` a string. Checked by hand at the root alone, where those rules

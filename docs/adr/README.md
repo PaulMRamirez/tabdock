@@ -40,3 +40,4 @@ Short records of decisions that change or refine `SPEC.md`, or that a future con
 | [0034](0034-an-empty-consequential-list.md)      | An empty consequential list                                     | Accepted |
 | [0035](0035-user-guide-on-pages.md)              | A user guide in docs/guide, published at /guide/                | Accepted |
 | [0036](0036-refresh-spec-after-0-1-0.md)         | Refresh SPEC sections 4 to 8 and 11 after 0.1.0                 | Accepted |
+| [0037](0037-sdk-pins-together.md)                | Move the MCP SDK pins to 2.3.1, and keep them together          | Accepted |

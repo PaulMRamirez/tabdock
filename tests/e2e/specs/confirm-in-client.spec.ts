@@ -21,7 +21,7 @@ import {
 
 // Confirmation in the caller's client on the demo board, in a real browser
 // (ADR 0026, A5.3): the board opened with ?confirm=client lets its member
-// driver confirm clear_board in their own MCP client. The SDK client 2.3.0
+// driver confirm clear_board in their own MCP client. The SDK client 2.3.1
 // answers the relay's question with its elicitation handler, on both
 // revisions; the board raises no prompt, clears, and its widget's activity
 // log draws the page's own badge on that line, naming the client and the

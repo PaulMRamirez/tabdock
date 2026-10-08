@@ -5,7 +5,7 @@
 // a sim page offers one plain tool beside one tool for each root shape some
 // client refuses, and every client of the matrix lists the five fixed tools
 // and the plain tool alone: the v1 SDK at the four versions the matrix pins,
-// and 2.3.0 on a 2025-era session and on 2026-07-28. A later client that
+// and 2.3.1 on a 2025-era session and on 2026-07-28. A later client that
 // adds a rule fails here on upgrade.
 
 import type { FakeToolDefinition } from '@tabdock/sim-page';
@@ -106,11 +106,11 @@ describe('first-class entries (ADR 0025)', () => {
     const expected = [...FIXED, `${pageId}__plain`];
 
     for (const modern of [false, true]) {
-      const client = await world.client(world.alice, 'matrix-2.3.0', { modern });
+      const client = await world.client(world.alice, 'matrix-2.3.1', { modern });
       const { tools: listed } = await client.listTools();
       expect(
         listed.map((tool) => tool.name),
-        `2.3.0 ${modern ? '2026-07-28' : 'legacy'}`,
+        `2.3.1 ${modern ? '2026-07-28' : 'legacy'}`,
       ).toEqual(expected);
     }
 

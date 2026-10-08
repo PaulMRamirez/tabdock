@@ -59,7 +59,10 @@ afterEach(async () => {
 
 interface ProbeReport {
   heapUsed: number;
+  /** Invokes the page had received before the first collection. */
   invokes: number;
+  /** Calls the relay had ended by the last reading of the heap. */
+  ended: number;
 }
 
 /** One run of the probe relay: the heap each waiting call of a shape holds, and what the relay charged it. */
@@ -107,7 +110,11 @@ async function probe(
   clients.push(client);
   const paired = await client.callTool({ name: 'pair_page', arguments: { code } });
   expect(paired.isError ?? false).toBe(false);
-  /** Sends calls that wait for good, and returns once the page has received `total` invokes. */
+  /**
+   * Sends calls that wait for good, and returns the first measure begun once
+   * the page had received `total` invokes, so that every reading in it found
+   * all of them waiting.
+   */
   const waitingCalls = async (count: number, total: number): Promise<ProbeReport> => {
     for (let n = 0; n < count; n += 1) {
       void client
@@ -119,7 +126,10 @@ async function probe(
     }
     for (;;) {
       const now = await report();
-      if (now.invokes >= total) return now;
+      if (now.invokes >= total) {
+        expect(now.ended, 'a call stopped waiting while its heap was measured').toBe(0);
+        return now;
+      }
       await new Promise((resolveTick) => setTimeout(resolveTick, 50));
     }
   };

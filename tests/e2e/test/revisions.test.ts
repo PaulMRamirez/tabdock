@@ -3,7 +3,7 @@
 // page with first-class tools on (ADR 0025). Four v1 SDKs, installed as exact
 // npm aliases, open a session at the revision each one speaks (1.10.2 at
 // 2024-11-05, best effort; 1.12.3 at 2025-03-26; 1.24.0 at 2025-06-18; 1.32.0
-// at 2025-11-25), and client 2.3.0 speaks 2025-11-25 on a session in legacy
+// at 2025-11-25), and client 2.3.1 speaks 2025-11-25 on a session in legacy
 // mode and 2026-07-28 with none in auto and pinned mode. Each one pairs with
 // the page, lists its tools through list_page_tools and tools/list, calls one
 // through call_page_tool and another by its first-class name, and hears its
@@ -217,7 +217,7 @@ const ROWS: Row[] = [
     discovers: false,
   })),
   {
-    label: '@modelcontextprotocol/client 2.3.0, legacy',
+    label: '@modelcontextprotocol/client 2.3.1, legacy',
     name: 'matrix-client-legacy',
     connect: (url, token, name) => connectV2('legacy', url, token, name),
     asks: '2025-11-25',
@@ -226,7 +226,7 @@ const ROWS: Row[] = [
     discovers: false,
   },
   {
-    label: '@modelcontextprotocol/client 2.3.0, auto',
+    label: '@modelcontextprotocol/client 2.3.1, auto',
     name: 'matrix-client-auto',
     connect: (url, token, name) => connectV2('auto', url, token, name),
     asks: null,
@@ -235,7 +235,7 @@ const ROWS: Row[] = [
     discovers: true,
   },
   {
-    label: '@modelcontextprotocol/client 2.3.0, pinned to 2026-07-28',
+    label: '@modelcontextprotocol/client 2.3.1, pinned to 2026-07-28',
     name: 'matrix-client-pinned',
     connect: (url, token, name) => connectV2('pinned', url, token, name),
     asks: null,

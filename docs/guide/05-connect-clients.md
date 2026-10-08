@@ -25,12 +25,12 @@ In Claude, open Customize, Connectors, +, Add custom connector; enter `https://r
 
 ## Any MCP client
 
-Any client that speaks MCP over streamable HTTP works, sending its token as a bearer token: the owner token in local mode, or a dev token. This program uses the official TypeScript SDK's client package, `@modelcontextprotocol/client`, at 2.3.0, the version the project tests. Set up a folder for it:
+Any client that speaks MCP over streamable HTTP works, sending its token as a bearer token: the owner token in local mode, or a dev token. This program uses the official TypeScript SDK's client package, `@modelcontextprotocol/client`, at 2.3.1, the version the project tests. Set up a folder for it:
 
 ```sh
 mkdir my-client && cd my-client
 npm init -y && npm pkg set type=module
-npm install --save-exact @modelcontextprotocol/client@2.3.0
+npm install --save-exact @modelcontextprotocol/client@2.3.1
 ```
 
 Save this there as `list-pages.ts` and run it as `TOKEN_FILE=<path> node list-pages.ts ABCDE-12345` with the code the widget shows, since Node 22.18 runs TypeScript directly. `TOKEN_FILE` names a file holding the token: the owner token file the banner names, or for a dev token a file of your own, readable only by you.
