@@ -74,4 +74,47 @@ describe('apps/site (ADR 0029)', () => {
     expect(existsSync(join(ROOT, 'apps/site/test'))).toBe(false);
     expect(table(site.scripts).test).toMatch(/^node --test /);
   });
+
+  it('is a pnpm project of its own, so a tool that cannot pass --ignore-workspace updates its lockfile', () => {
+    // Dependabot changed apps/site/package.json without its lockfile while
+    // pnpm took the site for part of the parent workspace; its own
+    // pnpm-workspace.yaml makes pnpm stop the search there.
+    expect(read('apps/site/pnpm-workspace.yaml')).toMatch(/^packages:\n {2}- \.$/m);
+  });
+});
+
+describe('Dependabot leaves to a person what one pull request cannot move (docs/develop.md)', () => {
+  /** Each `updates:` entry of .github/dependabot.yml, as text. */
+  const entries = read('.github/dependabot.yml')
+    .split(/^ {2}- package-ecosystem: /m)
+    .slice(1);
+  const entry = (ecosystem: string, directory: string): string => {
+    const found = entries.find(
+      (text) =>
+        text.startsWith(`${ecosystem}\n`) && text.includes(`\n    directory: ${directory}\n`),
+    );
+    if (found === undefined) throw new Error(`no ${ecosystem} entry for ${directory}`);
+    return found;
+  };
+  const ignores = (text: string, name: string): boolean =>
+    new RegExp(`^ {6}- dependency-name: '?${name.replace(/[/@-]/g, '\\$&')}'?$`, 'm').test(text);
+
+  it('keeps the tools the workspace and the site share out of both npm entries', () => {
+    const workspace = entry('npm', '/');
+    const site = entry('npm', '/apps/site');
+    for (const name of ['typescript', '@types/node', 'playwright-core']) {
+      expect(ignores(workspace, name), `workspace ${name}`).toBe(true);
+      expect(ignores(site, name), `site ${name}`).toBe(true);
+    }
+    expect(ignores(workspace, '@playwright/test'), 'workspace @playwright/test').toBe(true);
+    // The site's own packages still move on their own.
+    expect(ignores(site, 'marked')).toBe(false);
+    expect(ignores(site, 'mermaid')).toBe(false);
+  });
+
+  it('proposes no new major of Node for the image, whose runtime moves by a recorded decision', () => {
+    expect(entry('docker', '/')).toMatch(
+      /^ {6}- dependency-name: node\n {8}update-types: \['version-update:semver-major'\]$/m,
+    );
+  });
 });
