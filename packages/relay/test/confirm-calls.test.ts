@@ -999,11 +999,15 @@ describe('a 2026-07-28 retry', () => {
       p: { id: string };
     };
     payload.p.id = 'A'.repeat(22);
+    // The MAC's first character changed, so it is always another MAC. Its last
+    // characters would not do: base64url decoding drops the last one's two low
+    // bits, and one MAC in 1,024 already ends in AA.
+    const otherMac = `${(mac ?? '').startsWith('A') ? 'B' : 'A'}${(mac ?? '').slice(1)}`;
     const forged = [
       'v1.e30.AAAA',
       'not a state at all',
       `${version ?? ''}.${Buffer.from(JSON.stringify(payload)).toString('base64url')}.${mac ?? ''}`,
-      `${version ?? ''}.${body ?? ''}.${(mac ?? '').slice(0, -2)}AA`,
+      `${version ?? ''}.${body ?? ''}.${otherMac}`,
     ];
     for (const requestState of forged) {
       const answer = await retry(target, wipeParams(page.pageId), requestState);
@@ -1056,9 +1060,11 @@ describe('a 2026-07-28 retry', () => {
   it('answers a retry not_confirmed past its expiry, and writes the sweep line for a question never retried', async () => {
     await relay({ timings: { confirmationTtlMs: 1000 } });
     const { page, invokes, target } = await attachedDriver();
+    // Taken before either question, as asking writes no line: a second first
+    // round slower than the first question's TTL would else hide its sweep line.
+    const before = callRecords().length;
     const { state } = await firstRound(target, wipeParams(page.pageId, { n: 1 }));
     await firstRound(target, wipeParams(page.pageId, { n: 2 }));
-    const before = callRecords().length;
     await delay(1300);
     const late = await retry(target, wipeParams(page.pageId, { n: 1 }), state);
     expect(rawCode(late)).toBe('not_confirmed');
@@ -1069,7 +1075,14 @@ describe('a 2026-07-28 retry', () => {
     expect(lines.every((line) => line.outcome === 'not_confirmed' && line.tool === 'wipe')).toBe(
       true,
     );
-    expect(lines.filter((line) => line.durationMs >= 1000)).toHaveLength(2);
+    // A sweep line runs from its question's Date.now() to the sweep's. Node
+    // counts the sweep's setTimeout from the whole millisecond of its
+    // monotonic loop clock it was armed in, so the line can fall short of the
+    // TTL by under 1 ms for that, under 1 ms for truncating its two Date.now()
+    // readings and under 0.5 ms for NTP's slew of the wall clock (at most 500
+    // ppm over this second): it never reads below 998. A check for the whole
+    // 1000 failed about one run in eight.
+    expect(lines.filter((line) => line.durationMs >= 1000 - 2)).toHaveLength(2);
     expect(lines.at(-1)?.durationMs).toBeLessThan(1000);
   });
 
