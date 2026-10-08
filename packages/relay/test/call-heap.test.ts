@@ -126,10 +126,10 @@ async function probe(
     }
     for (;;) {
       const now = await report();
-      if (now.invokes >= total) {
-        expect(now.ended, 'a call stopped waiting while its heap was measured').toBe(0);
-        return now;
-      }
+      // Read on every pass: a call refused or ended before it reached the
+      // page would otherwise leave invokes short of total until the timeout.
+      expect(now.ended, 'a call stopped waiting before its heap was measured').toBe(0);
+      if (now.invokes >= total) return now;
       await new Promise((resolveTick) => setTimeout(resolveTick, 50));
     }
   };

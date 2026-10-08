@@ -59,7 +59,8 @@ updates:
       # with. Dependabot puts a dependency in the first group it matches, so
       # this group comes before runtime and tooling, which would otherwise take
       # server (production) and client (development) apart. Names, not
-      # '@modelcontextprotocol/*', which would also take the conformance alpha.
+      # '@modelcontextprotocol/*', which would also pull the conformance alpha
+      # into this group; it moves in tooling.
       mcp-sdk:
         patterns:
           - '@modelcontextprotocol/server'

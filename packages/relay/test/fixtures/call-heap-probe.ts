@@ -100,8 +100,8 @@ process.on('message', () => {
   // Counted before the first collection, not after the last reading: a call
   // that reaches the page while the heap is measured was not held at the
   // earlier readings, and the least of them leaves it out, so a measure begun
-  // as calls arrive can count none of them. Calls ended are counted after the
-  // last reading, so none was released before any of them.
+  // as calls arrive can count none of them. Calls ended are read after the
+  // last reading, so a call released before or during any reading counts.
   const invoked = invokes;
   void settledHeap().then((heapUsed) =>
     send({ heapUsed, invokes: invoked, ended: relay.audit.records().length }),

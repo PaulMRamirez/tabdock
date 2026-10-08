@@ -141,7 +141,11 @@ describe('Dependabot keeps together what must move together, and leaves to a per
     expect(site.has('mermaid')).toBe(false);
   });
 
-  /** An entry's `groups:` in the order written, the order Dependabot matches them in. */
+  /**
+   * An entry's `groups:` in the order written, the order Dependabot matches
+   * them in. Reads block-style lists of single-quoted names with no blank
+   * lines; any other spelling fails here, never passes.
+   */
   const groups = (text: string): { name: string; keys: string[]; patterns: string[] }[] => {
     const block = /^ {4}groups:\n((?: {6}.*\n)*)/m.exec(text)?.[1] ?? '';
     const found: { name: string; keys: string[]; patterns: string[] }[] = [];
@@ -171,8 +175,10 @@ describe('Dependabot keeps together what must move together, and leaves to a per
     // Patterns alone: a dependency-type would leave server or client out.
     expect(sdk?.keys).toEqual(['patterns']);
     // Each package by name, core too though it comes only through server's
-    // and client's exact pins; a wildcard would also take the conformance alpha.
-    expect(sdk?.patterns.toSorted()).toEqual([...pinned, '@modelcontextprotocol/core'].toSorted());
+    // and client's exact pins; a wildcard would also pull in the conformance alpha.
+    expect(sdk?.patterns.toSorted()).toEqual(
+      [...new Set([...pinned, '@modelcontextprotocol/core'])].toSorted(),
+    );
     expect(rest.map((group) => group.name)).toEqual(['runtime', 'tooling']);
   });
 
