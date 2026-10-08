@@ -14,6 +14,11 @@ const read = (path: string): string => readFileSync(join(ROOT, path), 'utf8');
 const json = (path: string): Record<string, unknown> =>
   JSON.parse(read(path)) as Record<string, unknown>;
 const table = (value: unknown): Record<string, string> => (value ?? {}) as Record<string, string>;
+/** A pnpm-workspace.yaml's `packages:` entries, as written. */
+const workspaceGlobs = (text: string): string[] => {
+  const block = /^packages:\n((?:(?: {2}.*)?\n)*)/m.exec(text)?.[1] ?? '';
+  return [...block.matchAll(/^ {2}- (.+)$/gm)].map((match) => match[1] ?? '');
+};
 
 describe('apps/site (ADR 0029)', () => {
   const site = json('apps/site/package.json');
@@ -27,9 +32,9 @@ describe('apps/site (ADR 0029)', () => {
     }
   });
 
-  it('pins marked and mermaid exactly, and the tools at the workspace versions', () => {
-    expect(dev.marked).toBe('18.0.14');
-    expect(dev.mermaid).toBe('12.1.0');
+  it('pins every package exactly, and the tools at the workspace versions', () => {
+    for (const [name, version] of Object.entries(dev))
+      expect(version, name).toMatch(/^\d+\.\d+\.\d+$/);
     expect(dev['playwright-core']).toBe(
       table(json('tests/e2e/package.json').devDependencies)['@playwright/test'],
     );
@@ -50,7 +55,13 @@ describe('apps/site (ADR 0029)', () => {
     for (const [name, version] of Object.entries(dev)) {
       expect(lock, name).toContain(`${name}@${version}`);
     }
-    expect(read('pnpm-workspace.yaml')).toMatch(/^ {2}- '!apps\/site'$/m);
+    // The workspace names the demo alone under apps/: Dependabot expands these
+    // globs without pnpm's '!' negation, so `apps/*` would hand it the site too.
+    expect(workspaceGlobs(read('pnpm-workspace.yaml'))).toEqual([
+      'packages/*',
+      'apps/demo',
+      'tests/*',
+    ]);
     // The workspace's own lockfile knows nothing of it, so a clean clone's install never fetches mermaid.
     const workspaceLock = read('pnpm-lock.yaml');
     expect(workspaceLock).not.toMatch(/^ {2}apps\/site:/m);
@@ -79,7 +90,10 @@ describe('apps/site (ADR 0029)', () => {
     // Dependabot changed apps/site/package.json without its lockfile while
     // pnpm took the site for part of the parent workspace; its own
     // pnpm-workspace.yaml makes pnpm stop the search there.
-    expect(read('apps/site/pnpm-workspace.yaml')).toMatch(/^packages:\n {2}- \.$/m);
+    const lines = read('apps/site/pnpm-workspace.yaml')
+      .split('\n')
+      .filter((line) => line !== '' && !line.startsWith('#'));
+    expect(lines).toEqual(['packages:', '  - .']);
   });
 });
 
@@ -96,25 +110,40 @@ describe('Dependabot leaves to a person what one pull request cannot move (docs/
     if (found === undefined) throw new Error(`no ${ecosystem} entry for ${directory}`);
     return found;
   };
-  const ignores = (text: string, name: string): boolean =>
-    new RegExp(`^ {6}- dependency-name: '?${name.replace(/[/@-]/g, '\\$&')}'?$`, 'm').test(text);
-
-  it('keeps the tools the workspace and the site share out of both npm entries', () => {
-    const workspace = entry('npm', '/');
-    const site = entry('npm', '/apps/site');
-    for (const name of ['typescript', '@types/node', 'playwright-core']) {
-      expect(ignores(workspace, name), `workspace ${name}`).toBe(true);
-      expect(ignores(site, name), `site ${name}`).toBe(true);
+  /** An entry's `ignore:` rules: each dependency name, with the condition lines under it. */
+  const ignoreRules = (text: string): Map<string, string[]> => {
+    const block = /^ {4}ignore:\n((?: {6}.*\n)*)/m.exec(text)?.[1] ?? '';
+    const rules = new Map<string, string[]>();
+    let conditions: string[] | undefined;
+    for (const line of block.split('\n')) {
+      const rule = /^ {6}- dependency-name: '?([^']+)'?$/.exec(line);
+      if (rule !== null) {
+        conditions = [];
+        rules.set(rule[1] ?? '', conditions);
+      } else if (/^ {8}\S/.test(line)) {
+        conditions?.push(line.trim());
+      }
     }
-    expect(ignores(workspace, '@playwright/test'), 'workspace @playwright/test').toBe(true);
+    return rules;
+  };
+
+  it('keeps the tools the workspace and the site share out of both npm entries, every version', () => {
+    const workspace = ignoreRules(entry('npm', '/'));
+    const site = ignoreRules(entry('npm', '/apps/site'));
+    // A rule with no versions or update-types under it ignores every version.
+    for (const name of ['typescript', '@types/node', 'playwright-core']) {
+      expect(workspace.get(name), `workspace ${name}`).toEqual([]);
+      expect(site.get(name), `site ${name}`).toEqual([]);
+    }
+    expect(workspace.get('@playwright/test'), 'workspace @playwright/test').toEqual([]);
     // The site's own packages still move on their own.
-    expect(ignores(site, 'marked')).toBe(false);
-    expect(ignores(site, 'mermaid')).toBe(false);
+    expect(site.has('marked')).toBe(false);
+    expect(site.has('mermaid')).toBe(false);
   });
 
   it('proposes no new major of Node for the image, whose runtime moves by a recorded decision', () => {
-    expect(entry('docker', '/')).toMatch(
-      /^ {6}- dependency-name: node\n {8}update-types: \['version-update:semver-major'\]$/m,
-    );
+    expect(ignoreRules(entry('docker', '/')).get('node')).toEqual([
+      "update-types: ['version-update:semver-major']",
+    ]);
   });
 });

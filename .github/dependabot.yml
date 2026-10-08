@@ -16,12 +16,13 @@
 # Three kinds of update are left to a person on purpose (docs/develop.md,
 # "Dependency updates"). Node's major version is a decision, not a bump: the
 # runtime stays on 22 until a recorded move to 24 before 30 April 2027
-# (docs/plans/backlog.md), so the image takes digest and patch updates only.
+# (docs/plans/backlog.md), so the image takes new digests of the 22 tag only.
 # TypeScript, @types/node and Playwright are shared by the workspace and the
-# Pages site, which must hold the same versions (site-files.test.ts), and no
-# single Dependabot pull request can move both lockfiles, so both entries
-# leave them alone and a person bumps them in both places in one change.
-# @types/node also follows the runtime's major, never a newer one.
+# Pages site, which must hold the same versions (site-files.test.ts), and
+# Dependabot proposes each directory's updates in a pull request of its own,
+# so it cannot keep the two in step: both entries ignore every version of
+# them, and a person bumps them in both places in one change, a security fix
+# included. @types/node also follows the runtime's major, never a newer one.
 
 version: 2
 updates:
