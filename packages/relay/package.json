@@ -34,7 +34,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/node": "2.1.1",
-    "@modelcontextprotocol/server": "2.3.0",
+    "@modelcontextprotocol/server": "2.3.1",
     "@tabdock/protocol": "workspace:*",
     "jose": "6.2.12",
     "openid-client": "6.8.8",
@@ -42,7 +42,7 @@
     "zod": "4.6.5"
   },
   "devDependencies": {
-    "@modelcontextprotocol/client": "2.3.0",
+    "@modelcontextprotocol/client": "2.3.1",
     "@types/ws": "8.18.2",
     "esbuild": "0.28.2",
     "oauth2-mock-server": "9.2.0"

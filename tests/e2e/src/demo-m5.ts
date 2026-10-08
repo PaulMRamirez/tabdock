@@ -97,7 +97,7 @@ interface DemoClient {
 }
 
 /**
- * An SDK client 2.3.0 with the owner token, as the printed line hands it to
+ * An SDK client 2.3.1 with the owner token, as the printed line hands it to
  * Claude Code: pinned to 2026-07-28 when `modern`, else on the SDK's default
  * 2025-11-25 session; declaring form elicitation, and accepting every
  * question, when `confirming`.
@@ -304,7 +304,7 @@ try {
   clients.push(modern);
   const legacy = await demoClient(banner.mcpUrl, ownerToken, 'demo-2025-11-25', false, true);
   clients.push(legacy);
-  say('\n3. Two MCP clients (the SDK, 2.3.0) connect with the owner token:');
+  say('\n3. Two MCP clients (the SDK, 2.3.1) connect with the owner token:');
   for (const each of [modern, legacy]) {
     const revision = each.client.getNegotiatedProtocolVersion() ?? 'unknown';
     say(

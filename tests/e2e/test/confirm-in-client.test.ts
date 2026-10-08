@@ -1,6 +1,6 @@
 // A5.3 against the sim page, on both revisions (ADR 0026): the real adapter
 // core on a page that chose confirmVia 'client', the real relay, and the SDK
-// client 2.3.0 with its own elicitation handler. A member driver whose client
+// client 2.3.1 with its own elicitation handler. A member driver whose client
 // declares form elicitation confirms a consequential call there and the page
 // raises no prompt; a declined, dismissed, expired, replayed, forged or
 // mismatched confirmation, or one from another account or OAuth client,
@@ -147,7 +147,7 @@ async function page(
 }
 
 /**
- * The SDK client 2.3.0, declaring form elicitation unless `capable` is
+ * The SDK client 2.3.1, declaring form elicitation unless `capable` is
  * false, its handler answering every question with `answer`.
  */
 async function asking(
@@ -277,6 +277,17 @@ function retry(
   answer: ElicitResult = ACCEPT,
 ): Promise<RawAnswer> {
   return rawCall(reach, { ...params, requestState, inputResponses: { confirm: answer } });
+}
+
+/**
+ * The state with its MAC's first character changed, so it always carries
+ * another MAC. Changing the last characters may not: base64url decoding
+ * drops the last one's two low bits, and one MAC in 1,024 already ends in AA.
+ */
+function tampered(state: string): string {
+  const dot = state.lastIndexOf('.');
+  const mac = state.slice(dot + 1);
+  return `${state.slice(0, dot + 1)}${mac.startsWith('A') ? 'B' : 'A'}${mac.slice(1)}`;
 }
 
 describe.each(ERAS)('A5.3 against the sim page (%s)', (_label, modern) => {
@@ -459,7 +470,7 @@ describe('A5.3: a 2026-07-28 retry against the sim page', () => {
     expect(rawCode(await retry(reach, payParams(pageId, 1), confirmed))).toBe('not_confirmed');
 
     const state = await firstRound(reach, payParams(pageId, 2));
-    expect(rawCode(await retry(reach, payParams(pageId, 2), `${state.slice(0, -2)}AA`))).toBe(
+    expect(rawCode(await retry(reach, payParams(pageId, 2), tampered(state)))).toBe(
       'not_confirmed',
     );
     expect(rawCode(await retry(reach, payParams(pageId, 2), 7))).toBe('not_confirmed');

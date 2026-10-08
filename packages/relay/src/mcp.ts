@@ -142,7 +142,7 @@ export type ListedTool = ListToolsResult['tools'][number];
 
 /**
  * The SDK's low-level server, which the relay builds for every request and
- * session. Its 2.3.0 typings mark it deprecated for ordinary use; the relay's
+ * session. Its 2.3.1 typings mark it deprecated for ordinary use; the relay's
  * tool set, computed per user from the hub, is the advanced case the SDK's
  * docs name it for (ADR 0025), and the golden test catches a change on
  * upgrade.

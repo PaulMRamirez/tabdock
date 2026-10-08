@@ -97,7 +97,7 @@ describe('apps/site (ADR 0029)', () => {
   });
 });
 
-describe('Dependabot leaves to a person what one pull request cannot move (docs/develop.md)', () => {
+describe('Dependabot keeps together what must move together, and leaves to a person what one pull request cannot move (docs/develop.md)', () => {
   /** Each `updates:` entry of .github/dependabot.yml, as text. */
   const entries = read('.github/dependabot.yml')
     .split(/^ {2}- package-ecosystem: /m)
@@ -139,6 +139,47 @@ describe('Dependabot leaves to a person what one pull request cannot move (docs/
     // The site's own packages still move on their own.
     expect(site.has('marked')).toBe(false);
     expect(site.has('mermaid')).toBe(false);
+  });
+
+  /**
+   * An entry's `groups:` in the order written, the order Dependabot matches
+   * them in. Reads block-style lists of single-quoted names with no blank
+   * lines; any other spelling fails here, never passes.
+   */
+  const groups = (text: string): { name: string; keys: string[]; patterns: string[] }[] => {
+    const block = /^ {4}groups:\n((?: {6}.*\n)*)/m.exec(text)?.[1] ?? '';
+    const found: { name: string; keys: string[]; patterns: string[] }[] = [];
+    for (const line of block.split('\n')) {
+      const group = /^ {6}([\w-]+):$/.exec(line);
+      const key = /^ {8}([\w-]+):/.exec(line);
+      const pattern = /^ {10}- '([^']+)'$/.exec(line);
+      if (group !== null) found.push({ name: group[1] ?? '', keys: [], patterns: [] });
+      else if (key !== null) found.at(-1)?.keys.push(key[1] ?? '');
+      else if (pattern !== null) found.at(-1)?.patterns.push(pattern[1] ?? '');
+    }
+    return found;
+  };
+
+  it('moves the MCP SDK the relay pins in one pull request, matched before runtime and tooling (ADR 0037)', () => {
+    // Dependabot puts a dependency in the first group it matches. After
+    // runtime, server would go there and client, a development dependency,
+    // to tooling, as pull requests #13 and #14 split them, each leaving two
+    // cores in the tree.
+    const relay = json('packages/relay/package.json');
+    const pinned = Object.keys({
+      ...table(relay.dependencies),
+      ...table(relay.devDependencies),
+    }).filter((name) => name.startsWith('@modelcontextprotocol/'));
+    const [sdk, ...rest] = groups(entry('npm', '/'));
+    expect(sdk?.name).toBe('mcp-sdk');
+    // Patterns alone: a dependency-type would leave server or client out.
+    expect(sdk?.keys).toEqual(['patterns']);
+    // Each package by name, core too though it comes only through server's
+    // and client's exact pins; a wildcard would also pull in the conformance alpha.
+    expect(sdk?.patterns.toSorted()).toEqual(
+      [...new Set([...pinned, '@modelcontextprotocol/core'])].toSorted(),
+    );
+    expect(rest.map((group) => group.name)).toEqual(['runtime', 'tooling']);
   });
 
   it('proposes no new major of Node for the image, whose runtime moves by a recorded decision', () => {

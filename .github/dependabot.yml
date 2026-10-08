@@ -52,6 +52,21 @@ updates:
     schedule:
       interval: weekly
     groups:
+      # The MCP SDK the relay pins moves as one (ADR 0037): server and client
+      # each pin core exactly, so a pull request that moved one alone would
+      # leave two cores in the tree, and the client matrix, the probes and the
+      # conformance suite would test the relay through a core it does not ship
+      # with. Dependabot puts a dependency in the first group it matches, so
+      # this group comes before runtime and tooling, which would otherwise take
+      # server (production) and client (development) apart. Names, not
+      # '@modelcontextprotocol/*', which would also pull the conformance alpha
+      # into this group; it moves in tooling.
+      mcp-sdk:
+        patterns:
+          - '@modelcontextprotocol/server'
+          - '@modelcontextprotocol/client'
+          - '@modelcontextprotocol/core'
+          - '@modelcontextprotocol/node'
       runtime:
         dependency-type: production
       tooling:
