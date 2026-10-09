@@ -21,10 +21,17 @@
 // toward closing it.
 
 import { type ChildProcess, fork } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { connect, createServer, type Server, type Socket } from 'node:net';
 import { resolve } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
-import { encodeFrame, type PageFrameInput, type PageTool, SUBPROTOCOL } from '@tabdock/protocol';
+import {
+  encodeFrame,
+  IDLE_TIMEOUT_MS,
+  type PageFrameInput,
+  type PageTool,
+  SUBPROTOCOL,
+} from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
 import { MAX_UNREAD_BYTES } from '../src/hub.ts';
@@ -34,8 +41,21 @@ import { pairAndApprove } from './helpers/relay.ts';
 
 const RELAY = resolve(import.meta.dirname, 'fixtures/page-flood-relay.ts');
 const MIB = 1024 * 1024;
-/** Frames each flood sends at most; the page stops sooner if it sees the relay cut it off. */
-const FLOOD = 1_000_000;
+/**
+ * How long a page floods before it stops waiting for the relay to close it.
+ * The kernel's socket buffers take a page's unread answers before any reach
+ * the relay's own queue, and Linux packs small segments together, so they
+ * take more answers than their nominal size: a ping flood here was closed
+ * once the relay had sent 316,000 to 681,000 pongs, as tcp_rmem's ceiling
+ * and the timing allowed, and a host tuned for bulk transfer holds more.
+ * Capped at a million frames, a ping flood ended in up to 7 runs of 25 here
+ * with about half a million pings still in kernel buffers on their way in,
+ * before the relay had answered enough to fill the way out, and the case
+ * saw no close.
+ * The relay closes within seconds of the buffers filling, so this bounds
+ * only a relay that never closes, the failure this file is for.
+ */
+const FLOOD_MS = 60_000;
 /**
  * Frames a flood sends before it lets this process's event loop turn. The
  * relay's close reaches the flood only as events (the fixture's IPC line,
@@ -43,19 +63,37 @@ const FLOOD = 1_000_000;
  * bufferedAmount stays under MIB for as long as the relay reads as fast as
  * the page writes: always once it has closed the socket, since it then
  * discards what follows, and whenever load gives it more of the CPU than
- * this process. Such a run went on to FLOOD. Each ws.send corks and uncorks
- * the socket and so schedules a callback of its own, about 1.2 KiB held
- * until the run yields, and once the relay cuts the socket off every send
- * fails into the same queue without ever filling bufferedAmount. Beside two
- * full suites a flood of invite_cancel sent all its million frames in one
- * run of 45 s, the relay having closed after 93,000, and on a busier
- * machine one took 138 s and failed on the 120 s timeout; the relay closes
- * after 32,000 to 340,000 frames, within 4 s. Yielding every BATCH frames,
- * a flood sees the close within a batch of its arrival and holds about a
- * megabyte at a time: against a reader that reset the socket it sent under
- * 300 frames past the reset, where one run sent 930,000 and held 1.1 GiB.
+ * this process. Such a run went on to the million frames a flood was then
+ * capped at. Each ws.send corks and uncorks the socket and so schedules a
+ * callback of its own, about 1.2 KiB held until the run yields, and once
+ * the relay cuts the socket off every send fails into the same queue
+ * without ever filling bufferedAmount. Beside two full suites a flood of
+ * invite_cancel sent all its million frames in one run of 45 s, the relay
+ * having closed after 93,000, and on a busier machine one took 138 s and
+ * failed on the 120 s timeout. Yielding every BATCH frames, a flood sees
+ * the close within a batch of its arrival and holds about a megabyte at a
+ * time: against a reader that reset the socket it sent under 300 frames
+ * past the reset, where one run sent 930,000 and held 1.1 GiB.
  */
 const BATCH = 1000;
+/**
+ * How long a flood waits with its queue full and no close before it fails.
+ * A relay that runs either reads what the page sends, which drains
+ * bufferedAmount and lets the flood go on, or reads nothing and so closes
+ * the page as silent IDLE_TIMEOUT_MS after the last frame it read. A flood
+ * stuck past that and a margin for load means the fixture relay's process
+ * stopped running its loop. Once on CI a case waited out its whole 120 s
+ * timeout and said nothing more, as one does here whose fixture is stopped
+ * with SIGSTOP mid-flood; one whose fixture is killed also fails on its
+ * closed IPC channel.
+ */
+const STALL_MS = IDLE_TIMEOUT_MS + 15_000;
+/**
+ * How long the fixture relay may take to print its URLs or answer a report,
+ * about a second together beside a full suite, before the case fails saying
+ * what its process was doing.
+ */
+const ANSWER_MS = 45_000;
 
 interface Report {
   heapUsed: number;
@@ -89,6 +127,29 @@ interface Fixture {
   report: () => Promise<Report>;
   /** Whether it has closed a page socket yet. */
   closed: () => boolean;
+  /** How its process ended, or null while it runs. */
+  ended: () => string | null;
+  /** Its process's scheduler state and CPU time so far (processState). */
+  state: () => string;
+}
+
+/**
+ * A process's scheduler state (R running, S sleeping, D waiting on a device,
+ * T stopped, Z gone) and the CPU ticks it has used, from /proc where there is
+ * one: two a second apart tell a relay spinning on its main thread from one
+ * blocked or stopped.
+ */
+function processState(pid: number | undefined): string {
+  if (pid === undefined) return 'no pid';
+  try {
+    const stat = readFileSync(`/proc/${String(pid)}/stat`, 'utf8');
+    // The command name may hold spaces, so fields count from its closing parenthesis:
+    // state first, then utime and stime twelfth and thirteenth.
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    return `state ${fields[0] ?? '?'}, ${String(Number(fields[11]) + Number(fields[12]))} CPU ticks`;
+  } catch {
+    return 'no /proc entry';
+  }
 }
 
 /** The fixture relay in its own process, with these timings and limits. */
@@ -102,25 +163,70 @@ async function startRelay(
   });
   child = started;
   let closed = false;
-  let waiting: ((report: Report) => void) | null = null;
+  let ended: string | null = null;
+  let waiting: { resolve: (report: Report) => void; reject: (error: Error) => void } | null = null;
   started.on('message', (message: Report | { closing: string }) => {
-    if ('closing' in message) closed = true;
-    else waiting?.(message);
+    if ('closing' in message) {
+      closed = true;
+      return;
+    }
+    const answered = waiting;
+    waiting = null;
+    answered?.resolve(message);
   });
-  const [url = '', mcpUrl = ''] = await new Promise<string[]>((resolveUrls, reject) => {
-    started.stdout?.once('data', (chunk: Buffer) => {
-      resolveUrls(chunk.toString('utf8').trim().split(' '));
-    });
-    started.once('exit', (code) => {
-      reject(new Error(`the fixture relay exited with ${String(code)}`));
-    });
+  // A report asked of a relay that has gone would otherwise wait out the case's timeout.
+  started.once('exit', (code, signal) => {
+    ended = signal === null ? `exited with ${String(code)}` : `was killed by ${signal}`;
+    waiting?.reject(new Error(`the fixture relay ${ended} before it answered`));
+    waiting = null;
   });
+  /** The fixture's answer, or a failure naming its process's state once ANSWER_MS has passed. */
+  const within = <T>(answer: Promise<T>, what: string): Promise<T> => {
+    let timer: NodeJS.Timeout | undefined;
+    const late = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(
+          new Error(
+            `the fixture relay did not ${what} within ${String(ANSWER_MS)} ms: ${processState(started.pid)}`,
+          ),
+        );
+      }, ANSWER_MS);
+    });
+    return Promise.race([answer, late]).finally(() => {
+      clearTimeout(timer);
+    });
+  };
+  const [url = '', mcpUrl = ''] = await within(
+    new Promise<string[]>((resolveUrls, reject) => {
+      started.stdout?.once('data', (chunk: Buffer) => {
+        resolveUrls(chunk.toString('utf8').trim().split(' '));
+      });
+      started.once('exit', (code) => {
+        reject(new Error(`the fixture relay exited with ${String(code)}`));
+      });
+    }),
+    'print its URLs',
+  );
   const report = (): Promise<Report> =>
-    new Promise((resolveReport) => {
-      waiting = resolveReport;
-      started.send('measure');
-    });
-  return { url, mcpUrl, report, closed: () => closed };
+    within(
+      new Promise<Report>((resolveReport, reject) => {
+        if (ended !== null) {
+          reject(new Error(`the fixture relay ${ended}`));
+          return;
+        }
+        waiting = { resolve: resolveReport, reject };
+        started.send('measure');
+      }),
+      'answer a report',
+    );
+  return {
+    url,
+    mcpUrl,
+    report,
+    closed: () => closed,
+    ended: () => ended,
+    state: () => processState(started.pid),
+  };
 }
 
 /** A page that says hello and takes its welcome, then, if deaf, stops reading anything the relay sends. */
@@ -138,6 +244,8 @@ async function openPage(
   ws.on('error', () => {
     // A write after the relay cut the socket off; the close follows.
   });
+  // A socket that cannot connect, or that the relay closes before its welcome,
+  // only closes; without these the case would wait out its timeout.
   await new Promise<void>((resolveOpen, reject) => {
     ws.once('open', () => {
       resolveOpen();
@@ -145,10 +253,16 @@ async function openPage(
     ws.once('unexpected-response', () => {
       reject(new Error('upgrade refused'));
     });
+    void closed.then((code) => {
+      reject(new Error(`the page socket closed with ${String(code)} before it opened`));
+    });
   });
-  const welcomed = new Promise<void>((resolveWelcome) => {
+  const welcomed = new Promise<void>((resolveWelcome, reject) => {
     ws.once('message', () => {
       resolveWelcome();
+    });
+    void closed.then((code) => {
+      reject(new Error(`the relay closed the page socket with ${String(code)} before its welcome`));
     });
   });
   ws.send(
@@ -167,21 +281,46 @@ async function openPage(
 }
 
 /**
- * Sends a frame up to FLOOD times, never holding more than a little of it in
- * this process, and stops once the relay has closed the socket; how many
- * went out. A page that went on would only be cut off a moment later.
+ * Sends a frame until the relay has closed the socket or FLOOD_MS has
+ * passed, never holding more than a little of it in this process; how many
+ * went out. A page that went on would only be cut off a moment later. One
+ * that can send nothing for STALL_MS and sees no close fails, saying what
+ * the page and the relay's process were doing.
  */
 async function flood(ws: WebSocket, sendOne: () => void, relay: Fixture): Promise<number> {
   let sent = 0;
-  const going = (): boolean => sent < FLOOD && ws.readyState === WebSocket.OPEN && !relay.closed();
+  const started = performance.now();
+  let lastSent = started;
+  const going = (): boolean => ws.readyState === WebSocket.OPEN && !relay.closed();
   while (going()) {
+    const now = performance.now();
+    if (now - lastSent > STALL_MS) throw new Error(await stalled(ws, relay, sent));
+    if (now - started > FLOOD_MS) break;
+    const before = sent;
     for (let batch = 0; batch < BATCH && ws.bufferedAmount < MIB && going(); batch += 1) {
       sendOne();
       sent += 1;
     }
+    if (sent > before) lastSent = performance.now();
     await new Promise((resolveTick) => setImmediate(resolveTick));
   }
   return sent;
+}
+
+/** Why a flood stopped going anywhere, as far as this process can see. */
+async function stalled(ws: WebSocket, relay: Fixture, sent: number): Promise<string> {
+  const first = relay.state();
+  await new Promise((resolveTick) => setTimeout(resolveTick, 1000));
+  return `the flood could send nothing for ${String(STALL_MS)} ms and saw no close: ${JSON.stringify(
+    {
+      sent,
+      bufferedAmount: ws.bufferedAmount,
+      readyState: ws.readyState,
+      relay: relay.ended() ?? 'running',
+      // A second apart.
+      relayProcess: [first, relay.state()],
+    },
+  )}`;
 }
 
 const PING_PAYLOAD = Buffer.alloc(125, 0x61);
