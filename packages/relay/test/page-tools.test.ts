@@ -19,7 +19,7 @@ import {
   MAX_FIRST_CLASS_TITLE_CHARS,
   MAX_FIRST_CLASS_TOOLS_PER_USER,
 } from '@tabdock/protocol';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import {
   defusedLine,
   firstClassDescription,
@@ -38,6 +38,7 @@ import {
   TOOLS,
 } from './helpers/page-client.ts';
 import { openSession } from './helpers/raw-mcp.ts';
+import { leastTimes, leastTimesAsync, ROUNDS } from './helpers/timing.ts';
 import {
   ALICE,
   BOB,
@@ -144,64 +145,6 @@ function tool(name: string, extra: Partial<PageTool> = {}): PageTool {
 const GROWTH = 20;
 /** Past the most linear work measured, and well short of the least either quadratic one did. */
 const MAX_GROWTH = 3;
-/**
- * Rounds of each pair of measures. Load only ever lengthens a measure, so a
- * work's least measure is its own cost unless all of them were stalled: to
- * put linear work past MAX_GROWTH, a stall of twice the work would have to
- * land on every measure of the one piece while some measure of the pieces
- * escaped. That is unlikely only while stalls land on rounds independently,
- * and rounds taken back to back in a fixed order are not independent: on a
- * core shared fairly with busy processes, rounds of one length fall in step
- * with the scheduler's slices and the same measure is cut off in every
- * round. Taken so, linear work read 3.05 once beside two full suites, and
- * past 3 in 4 checks of 300, up to 10, pinned to one core beside four or
- * seven busy loops. So each round takes the two in a random order, each
- * after a random wait.
- */
-const ROUNDS = 15;
-/**
- * The longest wait before a measure: about a scheduler slice on a busy core,
- * a few milliseconds, so that each measure starts at a random point of one.
- */
-const STAGGER_MS = 3;
-/**
- * No round starts once the rounds have taken this long, so quadratic work
- * fails in seconds rather than minutes. Linear work takes each measure's
- * ROUNDS in under 0.3 s idle, so it takes fewer only on a machine slowed
- * about sevenfold. The two tests allow 30 s: on a machine that slow, three
- * measures and their untimed checks could pass vitest's default 5 s and fail
- * a test whose measures compare as they should.
- */
-const ROUNDS_MS = 2000;
-
-/** Waits busily for a random time up to STAGGER_MS. */
-function stagger(): void {
-  const until = performance.now() + Math.random() * STAGGER_MS;
-  while (performance.now() < until) continue;
-}
-
-/** The least time each of two works took, over rounds that take both in a random order. */
-function leastTimes(first: () => unknown, second: () => unknown): [number, number] {
-  const least: [number, number] = [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY];
-  const measure = (slot: 0 | 1, work: () => unknown): void => {
-    stagger();
-    const before = performance.now();
-    work();
-    least[slot] = Math.min(least[slot], performance.now() - before);
-  };
-  const started = performance.now();
-  for (let round = 0; round < ROUNDS; round += 1) {
-    if (round > 0 && performance.now() - started > ROUNDS_MS) break;
-    if (Math.random() < 0.5) {
-      measure(0, first);
-      measure(1, second);
-    } else {
-      measure(1, second);
-      measure(0, first);
-    }
-  }
-  return least;
-}
 
 /** How many times as long defusing `make(size)` takes as defusing `make(size / GROWTH)` GROWTH times. */
 function growthOf(make: (size: number) => string, size: number): number {
@@ -847,45 +790,91 @@ describe("a member's first-class list", () => {
 
   it('builds the entries of a frame of brackets in about the time the frame takes with the flag off (S9)', async () => {
     /**
-     * The median time the relay took over frames of 128 new tools, each a
-     * title and texts of brackets before the word: the costliest text for
-     * defusing, which with one bracket removed a pass took 80 times as long.
+     * With the flag on a frame costs the relay about what three cost with it
+     * off (3.2 to 3.4 times one, idle), the entries' defusing being the rest.
+     * So a measure with the flag off sends OFF_FRAMES frames and one with it
+     * on sends one: works of about one length, which load stretches alike.
+     * On a core shared with busy processes a work waits out their slices
+     * each time its own runs out, so the least times of a long work and a
+     * short one drift apart: a frame each read 3.3 apart idle, up to 6.8
+     * pinned to one core beside four busy loops and 7.5 inside a full suite
+     * beside another.
      */
-    const median = async (firstClassTools: boolean): Promise<number> => {
-      const started = await relayWith(firstClassTools);
-      const page = await connectPage(started.relay.pageUrl);
-      pages.push(page);
-      const times: number[] = [];
-      // Within the default budget of 10 tools frames per socket.
-      for (let frame = 0; frame < 9; frame += 1) {
-        const tools = Array.from({ length: 128 }, (_, index) =>
-          tool(`f${String(frame)}_${String(index)}`, {
-            title: `${'['.repeat(190)}tabdock`,
-            description: `${'['.repeat(980)}tabdock`,
-            inputSchema: {
-              type: 'object',
-              properties: { a: { type: 'string', description: `${'['.repeat(980)}tabdock` } },
-            },
-          }),
-        );
-        const sent = performance.now();
-        page.send({ t: 'tools', tools });
-        await page.sync();
-        times.push(performance.now() - sent);
-      }
-      expect(started.lines.filter((line) => line.includes('page tools updated'))).toHaveLength(9);
-      for (const opened of pages.splice(0)) opened.ws.terminate();
-      await started.close();
-      current = undefined;
-      times.sort((a, b) => a - b);
-      return times[4] ?? Number.POSITIVE_INFINITY;
-    };
-    const off = await median(false);
-    const on = await median(true);
-    process.stderr.write(
-      `frame of brackets: ${off.toFixed(1)} ms with the flag off, ${on.toFixed(1)} ms with it on\n`,
+    const OFF_FRAMES = 3;
+    /**
+     * Linear entries read 0.8 to 2.4 times the frames with the flag off, the
+     * most inside a full suite beside another, and 1.05 to 1.17 pinned to one
+     * core beside four busy loops. Removing one bracket a pass read 7.4 to
+     * 31 times: 20 to 45 against frames it leaves alone, less where the
+     * garbage of its own measures slows the frames timed after them.
+     */
+    const MAX_FLAG_COST = 4;
+    const title = `${'['.repeat(190)}tabdock`;
+    const text = `${'['.repeat(980)}tabdock`;
+    // Each a list of 128 new tools, each tool a title and texts of brackets
+    // before the word, the costliest text for defusing; built before any is
+    // timed, and named anew in each, so none is a list the page sent before.
+    // Enough for a round untimed and for every timed one (helpers/timing.ts).
+    const frames = Array.from({ length: (ROUNDS + 1) * OFF_FRAMES }, (_, frame) =>
+      Array.from({ length: 128 }, (_, index) =>
+        tool(`f${String(frame)}_${String(index)}`, {
+          title,
+          description: text,
+          inputSchema: { type: 'object', properties: { a: { type: 'string', description: text } } },
+        }),
+      ),
     );
-    expect(on).toBeLessThan(off * 4 + 50);
+    // Both relays run at once and take their frames in turns, in a random
+    // order after a random wait, so load falls on both alike. Nine frames on
+    // one relay and then nine on another let load that rose between the two
+    // windows read as the flag's cost (132.2 ms against a bound of 124.97
+    // from 18.7 ms with the flag off, beside two full suites), and that
+    // bound's 50 ms allowance would let the 80-fold build pass on a machine
+    // ten times as fast as this one. The budget of tools frames is no part of
+    // what is timed, and the rounds need more than its default 10 a socket.
+    const rateLimits = {
+      toolsFramesPerSocket: frames.length,
+      toolsFramesPerAddress: frames.length,
+    };
+    const off = await startRelay({ firstClassTools: false, rateLimits });
+    onTestFinished(() => off.close());
+    const on = await relayWith(true, { rateLimits });
+    /** A work that sends a page on the relay its next `count` frames and ends once the relay has handled them. */
+    const framesTo = async (relay: TestRelay, count: number) => {
+      const page = await connectPage(relay.relay.pageUrl);
+      pages.push(page);
+      let sent = 0;
+      return {
+        send: async () => {
+          for (let index = 0; index < count; index += 1) {
+            page.send({ t: 'tools', tools: frames[sent] ?? [] });
+            sent += 1;
+          }
+          await page.sync();
+        },
+        sent: () => sent,
+      };
+    };
+    const offFrames = await framesTo(off, OFF_FRAMES);
+    const onFrames = await framesTo(on, 1);
+    // A round untimed first, so that neither least time can be a first run
+    // that compiles the code it runs, which is all there is when costly
+    // rounds stop early.
+    await offFrames.send();
+    await onFrames.send();
+    const [offMs, onMs] = await leastTimesAsync(offFrames.send, onFrames.send);
+    process.stderr.write(
+      `frame of brackets: ${offMs.toFixed(1)} ms for ${String(OFF_FRAMES)} with the flag off, ${onMs.toFixed(1)} ms for one with it on\n`,
+    );
+    expect(offFrames.sent()).toBe(onFrames.sent() * OFF_FRAMES);
+    for (const [relay, sender] of [
+      [off, offFrames],
+      [on, onFrames],
+    ] as const) {
+      const updated = relay.lines.filter((line) => line.includes('page tools updated'));
+      expect(updated).toHaveLength(sender.sent());
+    }
+    expect(onMs / offMs).toBeLessThan(MAX_FLAG_COST);
   }, 30_000);
 
   it('holds at most 64 page tools, in attachment then page order', async () => {

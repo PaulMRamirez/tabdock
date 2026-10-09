@@ -89,9 +89,20 @@ describe('attachment idle expiry', () => {
     const moved = opened.all('roster').at(-1)?.attachments[0];
     expect(moved?.lastUsedAt).toBeGreaterThan(granted?.grantedAt ?? 0);
     expect(moved?.expiresAt).toBe((moved?.lastUsedAt ?? 0) + 2000);
-    // Right after, another call moves the expiry without another roster.
+    // Within the step, another call moves the expiry without another roster.
+    // The step runs on the relay's clock from the roster it last sent, which
+    // went out as the first call arrived, and between the two arrivals lie
+    // the first call's round trip to the page and back and a sync: beside two
+    // full suites that has passed 200 ms, and the relay then rightly sent a
+    // roster for the second call too. So the relay reads the last millisecond
+    // of the step as the second call arrives, however late it really is,
+    // where a relay that ended the step any earlier would send one.
+    const step = 2000 / 10;
+    const lastOfStep = (moved?.lastUsedAt ?? 0) + step - 1;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(lastOfStep);
     expect((await getView(alice, opened.pageId)).isError).toBe(false);
     await opened.sync();
+    clock.mockRestore();
     expect(opened.all('roster').length).toBe(before + 1);
   });
 

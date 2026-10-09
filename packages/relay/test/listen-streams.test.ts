@@ -70,10 +70,37 @@ async function listen(user: DevTokenUser, options: ListenOptions = {}): Promise<
   return opened;
 }
 
-/** Whether the stream ended within a short wait; an open one keeps sending keep-alives only. */
+/**
+ * How long a stream that must stay open is watched for an end; an open one
+ * keeps sending keep-alives only.
+ */
+const OPEN_WAIT_MS = 300;
+
+/** Whether the stream ended within a short wait. */
 async function ended(opened: OpenListen | undefined): Promise<boolean> {
-  if (!opened) throw new Error('no stream');
-  return Promise.race([opened.ended.then(() => true), delay(300).then(() => false)]);
+  const [one] = await endedEach([opened]);
+  return one ?? false;
+}
+
+/**
+ * Whether each stream ended within one short wait, watched side by side.
+ * The relay ends a stream that gives way before it answers the listen it
+ * gives way to, so an end it made shows at once and only the streams that
+ * stay open use up the wait. Watched one after another, a test that checks
+ * seven of them spent 2.1 s of vitest's 5 s waiting alone, beside a relay
+ * start and a dozen requests that slow with the machine's load; streams
+ * checked at the same point now share one wait, each still watched for all
+ * of it.
+ */
+async function endedEach(streams: readonly (OpenListen | undefined)[]): Promise<boolean[]> {
+  const seen = streams.map(() => false);
+  const ends = streams.map(async (opened, index) => {
+    if (!opened) throw new Error('no stream');
+    await opened.ended;
+    seen[index] = true;
+  });
+  await Promise.race([Promise.all(ends), delay(OPEN_WAIT_MS)]);
+  return [...seen];
 }
 
 function refusalOf(opened: OpenListen): {
@@ -114,8 +141,7 @@ describe('listen streams on the 2026-07-28 leg (A4.3)', () => {
     const opened: OpenListen[] = [];
     for (let i = 0; i < 6; i += 1) opened.push(await listen(G1));
     expect(opened.map((stream) => stream.streaming)).toEqual(Array(6).fill(true));
-    for (const stream of opened.slice(0, 5)) expect(await ended(stream)).toBe(true);
-    expect(await ended(opened[5])).toBe(false);
+    expect(await endedEach(opened)).toEqual([true, true, true, true, true, false]);
     // The member's stream fits beside the stranger's one.
     const alice = await listen(ALICE);
     expect(alice.streaming).toBe(true);
@@ -127,13 +153,10 @@ describe('listen streams on the 2026-07-28 leg (A4.3)', () => {
     await setup({ store, limits: { sessionsPerUser: 3, sessionsPerInvitee: 2 } });
     heldBy(store, G1);
     const guests = [await listen(G1), await listen(G1), await listen(G1)];
-    expect(await ended(guests[0])).toBe(true);
-    expect(await ended(guests[1])).toBe(false);
-    expect(await ended(guests[2])).toBe(false);
+    expect(await endedEach(guests)).toEqual([true, false, false]);
     const members = [await listen(ALICE), await listen(ALICE), await listen(ALICE)];
     members.push(await listen(ALICE));
-    expect(await ended(members[0])).toBe(true);
-    for (const stream of members.slice(1)) expect(await ended(stream)).toBe(false);
+    expect(await endedEach(members)).toEqual([true, false, false, false]);
   });
 
   it('keeps strangers to their pool, past which a stranger is refused while a guest and a member still listen', async () => {
@@ -147,9 +170,7 @@ describe('listen streams on the 2026-07-28 leg (A4.3)', () => {
     // A guest takes the place of the stranger who opened first.
     heldBy(store, G4);
     expect((await listen(G4)).streaming).toBe(true);
-    expect(await ended(strangers[0])).toBe(true);
-    expect(await ended(strangers[1])).toBe(false);
-    expect(await ended(strangers[2])).toBe(false);
+    expect(await endedEach(strangers)).toEqual([true, false, false]);
     // Members are not in the pool at all.
     expect((await listen(ALICE)).streaming).toBe(true);
   });
@@ -168,7 +189,7 @@ describe('listen streams on the 2026-07-28 leg (A4.3)', () => {
     heldBy(store, G3);
     expect(refusalOf(await listen(G3))).toMatchObject({ error: FULL });
     expect(refusalOf(await listen(CAROL))).toMatchObject({ error: FULL });
-    for (const stream of alice) expect(await ended(stream)).toBe(false);
+    expect(await endedEach(alice)).toEqual([false, false]);
   });
 
   it('counts each listen against the request budget, refused past it before any room is made', async () => {
@@ -186,8 +207,7 @@ describe('listen streams on the 2026-07-28 leg (A4.3)', () => {
         message: 'more than 3 requests to this relay in 1 minute; wait and try again',
       },
     });
-    expect(await ended(first)).toBe(false);
-    expect(await ended(second)).toBe(false);
+    expect(await endedEach([first, second])).toEqual([false, false]);
     // A stranger's second listen is refused by the budget, so its first is not replaced.
     const stranger = await listen(G1);
     expect(refusalOf(await listen(G1)).error?.message).toBe(
@@ -239,14 +259,13 @@ describe('listen streams on the 2026-07-28 leg (A4.3)', () => {
     expect((await listen(G4, { params: {} })).status).toBe(400);
     expect((await listen(G4, { id: false })).status).toBe(202);
     expect((await listen(G4, { params: { notifications: 'x' } })).status).toBe(400);
-    for (const stream of strangers) expect(await ended(stream)).toBe(false);
+    expect(await endedEach(strangers)).toEqual([false, false, false]);
     // A member at its own cap of one, and another at the relay total, the same.
     const alice = await listen(ALICE);
     expect(alice.streaming).toBe(true);
     expect((await listen(ALICE, { params: {} })).status).toBe(400);
     expect((await listen(BOB, { headers: { 'Content-Type': 'text/plain' } })).status).toBe(415);
-    expect(await ended(alice)).toBe(false);
-    for (const stream of strangers) expect(await ended(stream)).toBe(false);
+    expect(await endedEach([alice, ...strangers])).toEqual([false, false, false, false]);
     // A listen the SDK serves still makes room as before.
     expect((await listen(G4)).streaming).toBe(true);
     expect(await ended(strangers[0])).toBe(true);

@@ -39,7 +39,7 @@ import {
   utcDay,
   verifyAuditLines,
 } from '../src/index.ts';
-import { startMain } from './helpers/main-process.ts';
+import { type MainProcess, startMain } from './helpers/main-process.ts';
 import { connectPage, PAGE_ORIGIN, type TestPage, TOOLS } from './helpers/page-client.ts';
 import {
   ALICE,
@@ -56,8 +56,15 @@ const scratches: string[] = [];
 const relays: TestRelay[] = [];
 const pages: TestPage[] = [];
 const clients: Client[] = [];
+/**
+ * main.ts children, killed once their test ends however it ended: one that
+ * a timed-out run of the test below left behind was still serving, orphaned,
+ * 40 minutes later, its directory deleted under it.
+ */
+const mains: MainProcess[] = [];
 
 afterEach(async () => {
+  for (const main of mains.splice(0)) main.child.kill('SIGKILL');
   for (const client of clients.splice(0)) await client.close();
   for (const page of pages.splice(0)) page.ws.terminate();
   for (const relay of relays.splice(0)) await relay.close();
@@ -306,6 +313,14 @@ describe('a relay with an audit directory (ADR 0019)', () => {
   });
 
   it('refuses a second relay on the same audit directory before it writes a line, in this process or another', async () => {
+    // The time this takes is real work that grows with the machine's load:
+    // main.ts started as the image starts it (node, type stripping and the
+    // whole relay), which startMain allows 20 s to listen, its exit on
+    // SIGTERM, which hosted-main.test.ts holds to 5 s, and four relays of
+    // this process. Beside two full suites the child alone took 2.3 s to
+    // listen and the whole test 4.9 to 7.3 s, past vitest's default 5 s,
+    // which also cut short startMain's own report of a slow start. 30 s
+    // covers both allowances, as for the other tests that start main.ts.
     const home = join(scratch(), 'tabdock');
     const dir = join(home, 'audit');
     const options = loadConfigFromEnv({ TABDOCK_HOME: home, TABDOCK_PORT: '0' });
@@ -321,10 +336,13 @@ describe('a relay with an audit directory (ADR 0019)', () => {
     expect(records(dir).map((record) => record.type)).toEqual(['relay_start', 'relay_stop']);
 
     // pnpm relay while pnpm dev already runs: the other process holds the lock.
+    // The audit directory's own, not the token directory's (ADR 0028), whose
+    // refusal says the same words after it and would hide a broken one.
     const other = startMain({ TABDOCK_HOME: home });
+    mains.push(other);
     await other.port;
     await expect(createRelay({ ...options, logSink: quiet })).rejects.toThrow(
-      new RegExp(`in use by another relay, pid ${String(other.child.pid)}`),
+      new RegExp(`audit directory .* is in use by another relay, pid ${String(other.child.pid)}`),
     );
     other.child.kill('SIGTERM');
     expect(await other.exited, other.output()).toEqual({ code: 0, signal: null });
@@ -340,7 +358,7 @@ describe('a relay with an audit directory (ADR 0019)', () => {
     const next = await createRelay({ ...options, logSink: quiet });
     await next.close();
     expect(verifyAuditLines(readAuditLines(dir)).problems).toEqual([]);
-  });
+  }, 30_000);
 
   it('never writes a token, code, resume token, argument or client address to a file or a log line (S11)', async () => {
     const dir = join(scratch(), 'audit');

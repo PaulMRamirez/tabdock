@@ -270,6 +270,18 @@ async function firstRound(reach: Reach, params: Record<string, unknown>): Promis
   return answer.result?.requestState ?? '';
 }
 
+/**
+ * The first Date.now() at which the SDK's codec refuses a state as expired.
+ * The codec signs and does not encrypt, so the body is readable: its exp is
+ * in whole Unix seconds, and verify refuses once the current second is past it.
+ */
+function codecRefusesFrom(state: string): number {
+  const body = JSON.parse(Buffer.from(state.split('.')[1] ?? '', 'base64url').toString()) as {
+    exp: number;
+  };
+  return (body.exp + 1) * 1000;
+}
+
 function retry(
   reach: Reach,
   params: Record<string, unknown>,
@@ -331,7 +343,17 @@ describe.each(ERAS)('A5.3 against the sim page (%s)', (_label, modern) => {
   );
 
   it('answers a question nobody answers in time not_confirmed', async () => {
-    const bench = await devRelay({ timings: { confirmationTtlMs: 1000 } });
+    // On the 2026-07-28 leg what this proves is the record's own expiry, so
+    // the late retry must carry a state the SDK codec still accepts: the
+    // codec would otherwise refuse it first, with the same not_confirmed,
+    // and a relay that kept expired records would pass. The codec counts
+    // whole seconds from the second a state was minted in, its TTL the
+    // record's rounded up, so it accepts a state for more than
+    // ceil(ttl / 1000) * 1000 ms. A TTL just past a whole second leaves the
+    // most room between the two: 1001 ms for the record, more than 2000 ms
+    // for its state. The 2025-era question waits the same TTL either way.
+    const ttlMs = 1001;
+    const bench = await devRelay({ timings: { confirmationTtlMs: ttlMs } });
     const paid: { amount: number }[] = [];
     const sim = await page(bench.relay, OPTED_IN, paid);
     const held = deferred<ElicitResult>();
@@ -341,8 +363,20 @@ describe.each(ERAS)('A5.3 against the sim page (%s)', (_label, modern) => {
     if (modern) {
       const reach = bench.reach(alice);
       const state = await firstRound(reach, payParams(pageId, 5));
-      await delay(1300);
-      outcome = rawCode(await retry(reach, payParams(pageId, 5), state));
+      // Past the record's TTL counted from after the record was made, which
+      // the first round's answer follows.
+      await delay(ttlMs + 10);
+      const late = await retry(reach, payParams(pageId, 5), state);
+      // The bound this relies on: from the state's minting, the first round's
+      // answer, the wait's lateness and the whole retry have more than
+      // 2000 - 1011 = 989 ms to come back before the codec would refuse the
+      // state. Past that this run could not tell the two expiries apart, so
+      // it fails rather than pass on the codec's refusal.
+      expect(
+        Date.now(),
+        'the retry must come back before the codec expires its state',
+      ).toBeLessThan(codecRefusesFrom(state));
+      outcome = rawCode(late);
     } else {
       outcome = errorCode(await pay(you.client, pageId, 5));
     }

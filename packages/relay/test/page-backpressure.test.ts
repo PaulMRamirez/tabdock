@@ -36,6 +36,26 @@ const RELAY = resolve(import.meta.dirname, 'fixtures/page-flood-relay.ts');
 const MIB = 1024 * 1024;
 /** Frames each flood sends at most; the page stops sooner if it sees the relay cut it off. */
 const FLOOD = 1_000_000;
+/**
+ * Frames a flood sends before it lets this process's event loop turn. The
+ * relay's close reaches the flood only as events (the fixture's IPC line,
+ * the socket's close or error), which a run of sends never lets in, and
+ * bufferedAmount stays under MIB for as long as the relay reads as fast as
+ * the page writes: always once it has closed the socket, since it then
+ * discards what follows, and whenever load gives it more of the CPU than
+ * this process. Such a run went on to FLOOD. Each ws.send corks and uncorks
+ * the socket and so schedules a callback of its own, about 1.2 KiB held
+ * until the run yields, and once the relay cuts the socket off every send
+ * fails into the same queue without ever filling bufferedAmount. Beside two
+ * full suites a flood of invite_cancel sent all its million frames in one
+ * run of 45 s, the relay having closed after 93,000, and on a busier
+ * machine one took 138 s and failed on the 120 s timeout; the relay closes
+ * after 32,000 to 340,000 frames, within 4 s. Yielding every BATCH frames,
+ * a flood sees the close within a batch of its arrival and holds about a
+ * megabyte at a time: against a reader that reset the socket it sent under
+ * 300 frames past the reset, where one run sent 930,000 and held 1.1 GiB.
+ */
+const BATCH = 1000;
 
 interface Report {
   heapUsed: number;
@@ -155,7 +175,7 @@ async function flood(ws: WebSocket, sendOne: () => void, relay: Fixture): Promis
   let sent = 0;
   const going = (): boolean => sent < FLOOD && ws.readyState === WebSocket.OPEN && !relay.closed();
   while (going()) {
-    while (ws.bufferedAmount < MIB && going()) {
+    for (let batch = 0; batch < BATCH && ws.bufferedAmount < MIB && going(); batch += 1) {
       sendOne();
       sent += 1;
     }

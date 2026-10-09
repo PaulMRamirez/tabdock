@@ -6,13 +6,53 @@ import { CfWorkerJsonSchemaValidator } from '@modelcontextprotocol/server/valida
 import type { JsonObject } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
 import { compileArgumentCheck } from '../src/cfworker.ts';
-import { describeFailure, MAX_CHECKED_SCHEMA_DEPTH, prepareSchema } from '../src/validate.ts';
+import {
+  type CheckArguments,
+  describeFailure,
+  MAX_CHECKED_SCHEMA_DEPTH,
+  prepareSchema,
+} from '../src/validate.ts';
+import { leastTimes } from './helpers/timing.ts';
+
+function compiled(schema: JsonObject): CheckArguments {
+  const checkArguments = compileArgumentCheck('tool_x', schema);
+  if (!checkArguments) throw new Error('did not compile');
+  return checkArguments;
+}
 
 function check(schema: JsonObject, args: JsonObject) {
-  const compiled = compileArgumentCheck('tool_x', schema);
-  if (!compiled) throw new Error('did not compile');
-  return compiled(args);
+  return compiled(schema)(args);
 }
+
+/**
+ * The two checks below, that a call runs no page regex and compares no pairs
+ * of an array, time two measures taken in the same run against each other
+ * (helpers/timing.ts), never one against a ceiling in milliseconds: load that
+ * stalls the test process crosses a ceiling (500 ms here before, around work
+ * of microseconds), and on a fast enough machine a rule the relay kept would
+ * come in under it. Each times calls of a check compiled once, as the worker
+ * keeps it, so that a measure is the calls alone.
+ *
+ * CALLS is how many calls a measure of one argument makes: a check that runs
+ * no page regex takes a few microseconds a call, where the timer's grain and
+ * the state of the caches decide a ratio (single calls doing the same work
+ * read 0.36 to 3.28 apart in 200 runs beside other suites), and a hundred
+ * take a tenth of a millisecond (0.76 to 1.56 apart).
+ */
+const CALLS = 100;
+/** Past the most that the same work read apart, and far short of a regex that backtracks. */
+const MAX_SAME_WORK = 3;
+/**
+ * An array is checked whole and in GROWTH pieces, each a GROWTH-th as long.
+ * A check that compares no pairs takes about a GROWTH-th as long whole,
+ * having one call to make rather than GROWTH (0.05 to 0.39 in 200 runs beside
+ * other suites; both measures are far shorter than a scheduler's slice, so
+ * load only stalls one now and then, and the least time sets that aside),
+ * and one that compares every pair up to GROWTH times as long.
+ */
+const GROWTH = 20;
+/** Past the most a check without the rule read, and well short of one with it. */
+const MAX_GROWTH = 3;
 
 describe('prepareSchema', () => {
   it('removes every regex and every annotation, and keeps names and data as written', () => {
@@ -369,22 +409,56 @@ describe('compileArgumentCheck', () => {
         u: { type: 'string', format: 'url' },
       },
     };
-    const started = performance.now();
-    expect(
-      check(redos, { s: `${'a'.repeat(100_000)}!`, u: `http://${'a'.repeat(100_000)}!` }),
-    ).toEqual({ kind: 'valid' });
-    expect(performance.now() - started).toBeLessThan(500);
+    const checkArguments = compiled(redos);
+    // Each regex refuses these, having tried every way to split the letters.
+    const refused = (letters: number): JsonObject => ({
+      s: `${'a'.repeat(letters)}!`,
+      u: `http://${'a'.repeat(letters)}!com`,
+    });
+    // At 20 letters either regex refuses within a fraction of a second, so a
+    // check that ran one fails here, where at 100,000 it would never end.
+    expect(checkArguments(refused(20))).toEqual({ kind: 'valid' });
+    const hostile = refused(100_000);
+    expect(checkArguments(hostile)).toEqual({ kind: 'valid' });
+    // As long, and each regex matches it without trying the ways to split
+    // the letters: a check that runs no page regex does the same work on
+    // either, and one that ran a regex would backtrack on the first alone.
+    const matched: JsonObject = {
+      s: `${'a'.repeat(100_000)}a`,
+      u: `http://${'a'.repeat(100_000)}.com`,
+    };
+    expect(checkArguments(matched)).toEqual({ kind: 'valid' });
+    const [backtracking, matching] = leastTimes(
+      () => {
+        for (let call = 0; call < CALLS; call += 1) checkArguments(hostile);
+      },
+      () => {
+        for (let call = 0; call < CALLS; call += 1) checkArguments(matched);
+      },
+    );
+    expect(backtracking / matching).toBeLessThan(MAX_SAME_WORK);
   });
 
   it('checks a uniqueItems array near 1 MB in linear time, as the relay drops the rule (ADR 0010)', () => {
-    const schema: JsonObject = {
+    const checkArguments = compiled({
       type: 'object',
       properties: { tags: { type: 'array', uniqueItems: true } },
-    };
-    const tags = Array.from({ length: 150_000 }, (_, index) => index);
-    const started = performance.now();
-    expect(check(schema, { tags })).toEqual({ kind: 'valid' });
-    expect(performance.now() - started).toBeLessThan(500);
+    });
+    // 10,000 first: comparing every pair of them takes about 0.25 s a check,
+    // so a relay that kept the rule fails in seconds, where 150,000 would
+    // take it some 40 s a check.
+    for (const length of [10_000, 150_000]) {
+      const whole = { tags: Array.from({ length }, (_, index) => index) };
+      const piece = { tags: whole.tags.slice(0, length / GROWTH) };
+      const [one, pieces] = leastTimes(
+        () => checkArguments(whole),
+        () => {
+          for (let index = 0; index < GROWTH; index += 1) checkArguments(piece);
+        },
+      );
+      expect(one / pieces, `${String(length)} items`).toBeLessThan(MAX_GROWTH);
+      expect(checkArguments(whole)).toEqual({ kind: 'valid' });
+    }
   });
 
   it('gives up on schemas CfWorker refuses, and on checks that throw', () => {
