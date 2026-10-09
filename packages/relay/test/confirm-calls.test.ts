@@ -321,6 +321,18 @@ async function firstRound(
   return { state, message };
 }
 
+/**
+ * The first Date.now() at which the SDK's codec refuses a state as expired.
+ * The codec signs and does not encrypt, so the body is readable: its exp is
+ * in whole Unix seconds, and verify refuses once the current second is past it.
+ */
+function codecRefusesFrom(state: string): number {
+  const body = JSON.parse(Buffer.from(state.split('.')[1] ?? '', 'base64url').toString()) as {
+    exp: number;
+  };
+  return (body.exp + 1) * 1000;
+}
+
 function retry(
   target: RawTarget,
   params: Record<string, unknown>,
@@ -1058,15 +1070,37 @@ describe('a 2026-07-28 retry', () => {
   });
 
   it('answers a retry not_confirmed past its expiry, and writes the sweep line for a question never retried', async () => {
-    await relay({ timings: { confirmationTtlMs: 1000 } });
+    // What this proves is the record's own expiry, so the late retry must
+    // carry a state the SDK codec still accepts: the codec would otherwise
+    // refuse it first, with the same not_confirmed, and a relay that kept
+    // expired records would pass. The codec counts whole seconds from the
+    // second a state was minted in, its TTL the record's rounded up, so it
+    // accepts a state for more than ceil(ttl / 1000) * 1000 ms. A TTL just
+    // past a whole second leaves the most room between the two: 1001 ms for
+    // the record, more than 2000 ms for its state.
+    const ttlMs = 1001;
+    await relay({ timings: { confirmationTtlMs: ttlMs } });
     const { page, invokes, target } = await attachedDriver();
     // Taken before either question, as asking writes no line: a second first
     // round slower than the first question's TTL would else hide its sweep line.
     const before = callRecords().length;
-    const { state } = await firstRound(target, wipeParams(page.pageId, { n: 1 }));
+    // The question never retried goes first, so nothing but the wait stands
+    // between the retried question's state and its retry.
     await firstRound(target, wipeParams(page.pageId, { n: 2 }));
-    await delay(1300);
+    const { state } = await firstRound(target, wipeParams(page.pageId, { n: 1 }));
+    // Past the record's TTL counted from after the record was made, and
+    // armed after its sweep with a later deadline, which Node fires first:
+    // the sweep has taken the record and written its line when the retry goes.
+    await delay(ttlMs + 10);
     const late = await retry(target, wipeParams(page.pageId, { n: 1 }), state);
+    // The bound this relies on: from the state's minting, the first round's
+    // answer, the wait's lateness and the whole retry have more than
+    // 2000 - 1011 = 989 ms to come back before the codec would refuse the
+    // state. Past that this run could not tell the two expiries apart, so it
+    // fails rather than pass on the codec's refusal.
+    expect(Date.now(), 'the retry must come back before the codec expires its state').toBeLessThan(
+      codecRefusesFrom(state),
+    );
     expect(rawCode(late)).toBe('not_confirmed');
     expect(invokes).toEqual([]);
     // The sweep's line for each question, retried late or never, then the late retry's own.
@@ -1080,10 +1114,10 @@ describe('a 2026-07-28 retry', () => {
     // monotonic loop clock it was armed in, so the line can fall short of the
     // TTL by under 1 ms for that, under 1 ms for truncating its two Date.now()
     // readings and under 0.5 ms for NTP's slew of the wall clock (at most 500
-    // ppm over this second): it never reads below 998. A check for the whole
-    // 1000 failed about one run in eight.
-    expect(lines.filter((line) => line.durationMs >= 1000 - 2)).toHaveLength(2);
-    expect(lines.at(-1)?.durationMs).toBeLessThan(1000);
+    // ppm over this second): it never reads more than 2 ms short. A check
+    // for the whole TTL failed about one run in eight.
+    expect(lines.filter((line) => line.durationMs >= ttlMs - 2)).toHaveLength(2);
+    expect(lines.at(-1)?.durationMs).toBeLessThan(ttlMs);
   });
 
   it("leaves a question's record to its own retry, or to the sweep and its line, when its state rides on a call to no page tool", async () => {

@@ -156,6 +156,16 @@ function events(): Record<string, unknown>[] {
   return lines.map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
+/**
+ * The nonce one particular frame carried, as a phone reads it from the
+ * fragment. Unlike opened.nonce, which follows the newest frame, it stays
+ * the nonce of that frame however many rotations arrive after it.
+ */
+function nonceIn(url: string | undefined): string {
+  if (url === undefined) throw new Error('the relay sent no pairing URL');
+  return new URL(url).hash.slice(1);
+}
+
 /** Claims and reads back the claim id, failing the test with the body when refused. */
 async function claimOk(browser: Phone, nonce: string): Promise<string> {
   const claimed = await browser.claim(nonce);
@@ -551,15 +561,29 @@ describe('the nonce (S3, S11)', () => {
   });
 
   it('dies with its code when the code expires, and the page gets a new pair', async () => {
+    // A 300 ms life, so the rotation timer fires within the test, and only
+    // one WebSocket frame and one HTTP exchange on loopback have to fit in
+    // each nonce's life before its 200: the page's welcome (with its tools
+    // and their ping) and a preview, then the rotation frame and a preview.
+    // With two full suites running beside it (load above 20 on four cores)
+    // that took at most 41 ms. The sign-in, a dozen exchanges with the
+    // provider that took up to 177 ms there and more on a busier machine, is
+    // done before the page exists: inside the life it could outlast it, the
+    // timer would rotate the pair first, and opened.nonce would then name
+    // the replacement, which reads 200 where the expired one must read 404.
     await start({ timings: { pairingTtlMs: 300 } });
-    const opened = await page();
     const browser = await signedIn();
-    const old = opened.nonce;
+    const opened = await page();
+    const old = nonceIn(opened.welcome?.pairing.url);
     expect((await browser.preview(old)).status).toBe(200);
-    await opened.next('pairing', 2000);
+    // The first rotation is the one that retired the welcome's pair.
+    const rotated = await opened.next('pairing', 2000);
+    const fresh = nonceIn(rotated.url);
+    expect(fresh).not.toBe(old);
+    expect((await browser.preview(fresh)).status).toBe(200);
+    // A retired nonce never comes back, so these hold however late they run.
     expect(await browser.preview(old)).toMatchObject({ status: 404, data: EXPIRED });
     expect(await browser.claim(old)).toMatchObject({ status: 404, data: EXPIRED });
-    expect((await browser.preview(opened.nonce)).status).toBe(200);
   });
 
   it('is refused past its own expiry even before the rotation timer fires', async () => {

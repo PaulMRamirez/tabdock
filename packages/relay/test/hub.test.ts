@@ -290,11 +290,21 @@ describe('calls on a page whose queue is full (ADR 0024 notes)', () => {
     expect(await pairing).toMatchObject({ kind: 'attached' });
   }
 
+  /** The ids of the calls the hub held for want of room, in the order they began to wait. */
+  function heldOrder(lines: string[]): string[] {
+    return lines.flatMap((line) => {
+      const entry = JSON.parse(line) as { msg?: unknown; callId?: unknown };
+      return entry.msg === 'call waits for room on the page link' &&
+        typeof entry.callId === 'string'
+        ? [entry.callId]
+        : [];
+    });
+  }
+
   /** Waits until the hub has held `count` calls for want of room, as its debug lines say. */
   async function heldCalls(lines: string[], count: number): Promise<void> {
     const deadline = Date.now() + 5000;
-    const held = (): number =>
-      lines.filter((line) => line.includes('call waits for room on the page link')).length;
+    const held = (): number => heldOrder(lines).length;
     while (held() < count && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
@@ -335,6 +345,9 @@ describe('calls on a page whose queue is full (ADR 0024 notes)', () => {
     const { hub, page, served, lines } = await bench({ tools: [SEARCH] });
     await attach(hub, page);
     page.onInvoke = (frame) => ({ ok: true, content: String(String(frame.arguments.text).length) });
+    // As relay.ts waits before it listens, so the burst's arguments are checked
+    // as on a live relay rather than all going unchecked while the worker starts.
+    await hub.ready();
     const queue = stall(served);
     const sizes = Array.from({ length: 12 }, (_, n) => 300_000 + n);
     const calls = sizes.map((size) => search(hub, page, size));
@@ -345,6 +358,13 @@ describe('calls on a page whose queue is full (ADR 0024 notes)', () => {
     expect(page.all('invoke')).toHaveLength(3);
     expect(queue.bytes).toBeLessThanOrEqual(INVOKE_ROOM);
     expect(page.ws.readyState).toBe(page.ws.OPEN);
+    // Read-only calls are checked side by side, one at a time in the worker,
+    // and a check that cannot start within its budget goes unchecked at once
+    // (ADR 0010), so a later call of the burst may reach the socket before an
+    // earlier one whose check still runs; read-only calls keep no arrival
+    // order (SPEC section 5). ADR 0024 keeps the order from the socket on:
+    // the calls that found room, then the rest in the order they began to wait.
+    const reachedSocket = [...page.all('invoke').map((frame) => frame.callId), ...heldOrder(lines)];
     // The page reads a frame at a time, as on a slow link, and each frame it takes makes room.
     while (queue.frames > 0) {
       queue.drain(1);
@@ -355,8 +375,7 @@ describe('calls on a page whose queue is full (ADR 0024 notes)', () => {
     expect(outcomes.map((outcome) => (outcome.kind === 'ok' ? outcome.content : outcome))).toEqual(
       sizes.map(String),
     );
-    // In arrival order.
-    expect(page.all('invoke').map((frame) => String(frame.arguments.text).length)).toEqual(sizes);
+    expect(page.all('invoke').map((frame) => frame.callId)).toEqual(reachedSocket);
     expect(page.ws.readyState).toBe(page.ws.OPEN);
   });
 
