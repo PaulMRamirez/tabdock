@@ -124,6 +124,98 @@ function tool(name: string, extra: Partial<PageTool> = {}): PageTool {
   return { name, description: `The ${name} tool.`, inputSchema: SCHEMA, ...extra };
 }
 
+/**
+ * The S9 checks that defusing is linear compare two measures taken in the
+ * same run, never one measure against a ceiling in milliseconds, since load
+ * from other test files and processes slows both measures alike but leaves
+ * a ceiling where it is: beside two full suites on 4 cores, the linear pass
+ * over the marks below took 104 and 147 ms against a ceiling of 100, and on
+ * a fast enough machine a quadratic pass would come in under it. So the same
+ * text is defused in one piece and in GROWTH pieces, each a GROWTH-th as
+ * long. Linear work takes about as long either way: 0.7 to 1.1 times idle,
+ * at most 1.4 times beside two full suites, and at most 2.1 times in 480
+ * checks pinned to one core beside four or seven busy loops. Quadratic
+ * work takes up to GROWTH times as long in one piece, each piece costing a
+ * GROWTH-squared part of the whole: removing one bracket a pass measured 7.3
+ * to 7.7 times (each pass also has a fixed cost, linear in all, so it falls
+ * short of GROWTH), and taking a run from each of its positions 16 to 20
+ * times.
+ */
+const GROWTH = 20;
+/** Past the most linear work measured, and well short of the least either quadratic one did. */
+const MAX_GROWTH = 3;
+/**
+ * Rounds of each pair of measures. Load only ever lengthens a measure, so a
+ * work's least measure is its own cost unless all of them were stalled: to
+ * put linear work past MAX_GROWTH, a stall of twice the work would have to
+ * land on every measure of the one piece while some measure of the pieces
+ * escaped. That is unlikely only while stalls land on rounds independently,
+ * and rounds taken back to back in a fixed order are not independent: on a
+ * core shared fairly with busy processes, rounds of one length fall in step
+ * with the scheduler's slices and the same measure is cut off in every
+ * round. Taken so, linear work read 3.05 once beside two full suites, and
+ * past 3 in 4 checks of 300, up to 10, pinned to one core beside four or
+ * seven busy loops. So each round takes the two in a random order, each
+ * after a random wait.
+ */
+const ROUNDS = 15;
+/**
+ * The longest wait before a measure: about a scheduler slice on a busy core,
+ * a few milliseconds, so that each measure starts at a random point of one.
+ */
+const STAGGER_MS = 3;
+/**
+ * No round starts once the rounds have taken this long, so quadratic work
+ * fails in seconds rather than minutes. Linear work takes each measure's
+ * ROUNDS in under 0.3 s idle, so it takes fewer only on a machine slowed
+ * about sevenfold. The two tests allow 30 s: on a machine that slow, three
+ * measures and their untimed checks could pass vitest's default 5 s and fail
+ * a test whose measures compare as they should.
+ */
+const ROUNDS_MS = 2000;
+
+/** Waits busily for a random time up to STAGGER_MS. */
+function stagger(): void {
+  const until = performance.now() + Math.random() * STAGGER_MS;
+  while (performance.now() < until) continue;
+}
+
+/** The least time each of two works took, over rounds that take both in a random order. */
+function leastTimes(first: () => unknown, second: () => unknown): [number, number] {
+  const least: [number, number] = [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY];
+  const measure = (slot: 0 | 1, work: () => unknown): void => {
+    stagger();
+    const before = performance.now();
+    work();
+    least[slot] = Math.min(least[slot], performance.now() - before);
+  };
+  const started = performance.now();
+  for (let round = 0; round < ROUNDS; round += 1) {
+    if (round > 0 && performance.now() - started > ROUNDS_MS) break;
+    if (Math.random() < 0.5) {
+      measure(0, first);
+      measure(1, second);
+    } else {
+      measure(1, second);
+      measure(0, first);
+    }
+  }
+  return least;
+}
+
+/** How many times as long defusing `make(size)` takes as defusing `make(size / GROWTH)` GROWTH times. */
+function growthOf(make: (size: number) => string, size: number): number {
+  const whole = make(size);
+  const piece = make(size / GROWTH);
+  const [one, pieces] = leastTimes(
+    () => defusedLine(whole),
+    () => {
+      for (let index = 0; index < GROWTH; index += 1) defusedLine(piece);
+    },
+  );
+  return one / pieces;
+}
+
 describe('first-class names and entries, as built', () => {
   const pageId = 'pg_0123456789';
 
@@ -263,23 +355,33 @@ describe('first-class names and entries, as built', () => {
 
   it('defuse a long run of brackets in one pass, linear in the text (S9)', () => {
     // One bracket a pass made this quadratic: 20,000 brackets took seconds.
-    const run = `${'['.repeat(20_000)}tabdock`;
-    const started = performance.now();
-    expect(defusedLine(run)).toBe('tabdock');
+    expect(defusedLine(`${'['.repeat(20_000)}tabdock`)).toBe('tabdock');
     expect(defusedLine(`${'[ '.repeat(10_000)}x`)).toBe(`${'[ '.repeat(10_000)}x`);
-    expect(performance.now() - started).toBeLessThan(50);
-    // As the hub meets it: a description of 1,000 and a title of 200, nearly all brackets.
+    expect(growthOf((size) => `${'['.repeat(size)}tabdock`, 20_000)).toBeLessThan(MAX_GROWTH);
+    expect(growthOf((size) => `${'[ '.repeat(size / 2)}x`, 20_000)).toBeLessThan(MAX_GROWTH);
+    // As the hub meets it: a frame of 128 tools, each a description of 1,000 and a title
+    // of 200, nearly all brackets, costs about what one of ordinary text of those lengths
+    // does. Linear work measured 0.8 to 0.9 times the ordinary frame; one bracket a pass,
+    // 37 times.
     const worst = tool('t', {
       title: `${'['.repeat(190)}tabdock`,
       description: `${'['.repeat(990)}tabdock`,
     });
-    const timed = performance.now();
-    for (let index = 0; index < 128; index += 1) {
-      firstClassDescription(pageId, PAGE_ORIGIN, worst);
-      firstClassTitle(PAGE_ORIGIN, worst);
-    }
-    expect(performance.now() - timed).toBeLessThan(100);
-  });
+    const ordinary = tool('t', {
+      title: 'Add a card to a column of the board '.repeat(6).slice(0, 197),
+      description: 'Adds a card with the given text to the named column of the board. '
+        .repeat(15)
+        .slice(0, 997),
+    });
+    const frame = (entry: PageTool) => () => {
+      for (let index = 0; index < 128; index += 1) {
+        firstClassDescription(pageId, PAGE_ORIGIN, entry);
+        firstClassTitle(PAGE_ORIGIN, entry);
+      }
+    };
+    const [brackets, prose] = leastTimes(frame(worst), frame(ordinary));
+    expect(brackets / prose).toBeLessThan(MAX_GROWTH);
+  }, 30_000);
 
   it('remove what a client draws as nothing, so nothing hides a forged prefix or text a person never sees', () => {
     const unseen = ['\u200b', '\u00ad', '\u2060', '\ufeff', '\u200d', '\u180e', '\u{e0020}'];
@@ -386,14 +488,22 @@ describe('first-class names and entries, as built', () => {
   });
 
   it('look for the word once from each run, however many marks its letters carry (S9)', () => {
-    const started = performance.now();
     expect(defusedLine(`[t${'\u0301'.repeat(20_000)}abdock`)).toBe(
       `t${'\u0301'.repeat(20_000)}abdock`,
     );
-    defusedLine(`[t${'\u0301'.repeat(1000)}`.repeat(20));
-    defusedLine('(t\u0301a\u0301b\u0301d\u0301o\u0301c\u0301x '.repeat(3000));
-    expect(performance.now() - started).toBeLessThan(100);
-  });
+    const texts: [string, (size: number) => string, number][] = [
+      ['marks on one letter', (marks) => `[t${'\u0301'.repeat(marks)}abdock`, 20_000],
+      ['runs of marks', (runs) => `[t${'\u0301'.repeat(1000)}`.repeat(runs), 20],
+      [
+        'near words',
+        (words) => '(t\u0301a\u0301b\u0301d\u0301o\u0301c\u0301x '.repeat(words),
+        3000,
+      ],
+    ];
+    for (const [label, make, size] of texts) {
+      expect(growthOf(make, size), label).toBeLessThan(MAX_GROWTH);
+    }
+  }, 30_000);
 
   it('leave off a schema whose root some client era rejects the whole list over', () => {
     for (const root of [

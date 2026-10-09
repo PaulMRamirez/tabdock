@@ -224,13 +224,24 @@ describe('hello', () => {
   });
 
   it('closes with 1008 when no hello arrives in time', async () => {
-    const { relay } = await relayWith({ timings: { helloTimeoutMs: 150 } });
-    const ws = await openSocket(relay.pageUrl);
-    const opened = new TestPage(ws);
+    const helloTimeoutMs = 150;
+    const { relay } = await relayWith({ timings: { helloTimeoutMs } });
+    // The relay arms its hello timer as it answers the upgrade (ws calls back
+    // straight after writing the 101), before this side has read that answer.
+    // So the clock starts before the socket is asked for: started after
+    // openSocket resolved, it ran late by however long the 101 took to be
+    // read, which on a loaded machine has been tens of milliseconds.
+    const started = performance.now();
+    const opened = new TestPage(await openSocket(relay.pageUrl));
     pages.push(opened);
-    const started = Date.now();
     expect((await opened.closed).code).toBe(1008);
-    expect(Date.now() - started).toBeGreaterThanOrEqual(140);
+    // Node counts a timer from the whole millisecond of libuv's loop clock,
+    // which libuv reads from CLOCK_MONOTONIC_COARSE where that ticks at 1 ms or
+    // finer. So the relay may close up to 1 ms (the truncation) plus 1 ms (the
+    // coarse clock's lag) short of helloTimeoutMs after the instant it armed;
+    // performance.now() reads CLOCK_MONOTONIC, the same clock, so no wall
+    // clock step or rounding needs any further allowance.
+    expect(performance.now() - started).toBeGreaterThanOrEqual(helloTimeoutMs - 2);
   });
 
   it('closes with 1008 when the first frame is not hello', async () => {
