@@ -5,9 +5,12 @@
 // hands the worker one check at a time. A check gets the budget to start and
 // the budget again to run: one that cannot start in time because another is
 // running goes unchecked at once, and one that runs past its budget goes
-// unchecked while the worker is terminated and replaced. A worker that fails to
-// start or crashes is restarted with backoff, and calls meanwhile go unchecked.
-// Under attack, checks are skipped, never waited on; the check stays advisory.
+// unchecked while the worker is terminated and replaced. Both are judged from
+// an immediate their timer queues, once the loop has read what the worker
+// already sent, so other work holding the main thread cannot make a prompt
+// reply lose to a timer. A worker that fails to start or crashes is restarted
+// with backoff, and calls meanwhile go unchecked. Under attack, checks are
+// skipped, never waited on; the check stays advisory.
 
 import { createHash } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
@@ -94,8 +97,26 @@ interface Job {
   queuedBehind: boolean;
 }
 
+interface Running {
+  job: Job;
+  timer: NodeJS.Timeout;
+}
+
 function unchecked(reason: UncheckedReason): CheckOutcome {
   return { kind: 'unchecked', reason };
+}
+
+/**
+ * Runs a timer's judgement about the worker after the loop next reads it.
+ * When another callback holds the main thread past the budget, Node runs the
+ * timers that fell due before it polls the port, so a reply or ready that
+ * arrived in time would lose to them; an immediate runs after that poll
+ * (ADR 0010's notes, 9 October 2026). Left referenced, because an
+ * unreferenced one lets that poll sleep until other I/O comes, which would
+ * leave the judgement without a bound.
+ */
+function afterReading(judge: () => void): void {
+  setImmediate(judge);
 }
 
 function fromWorker(result: CheckResult): CheckOutcome {
@@ -116,7 +137,7 @@ export class ArgumentChecker {
   #restartTimer: NodeJS.Timeout | null = null;
   /** Checks waiting for the worker, oldest first. */
   readonly #waiting = new Set<Job>();
-  #running: { job: Job; timer: NodeJS.Timeout } | null = null;
+  #running: Running | null = null;
   #nextId = 0;
   /** ready() callers waiting on the current worker's first ready or failure. */
   #readyWaiters: ((ready: boolean) => void)[] = [];
@@ -173,9 +194,12 @@ export class ArgumentChecker {
         queuedBehind: this.#running !== null,
       };
       job.startTimer = setTimeout(() => {
-        if (!this.#waiting.delete(job)) return;
-        // Behind a check that overran, the wait ends while its replacement starts: still busy.
-        job.resolve(unchecked(job.queuedBehind || this.#running ? 'busy' : 'unavailable'));
+        afterReading(() => {
+          // Started once a ready or a reply was read, or settled by a failure or close.
+          if (!this.#waiting.delete(job)) return;
+          // Behind a check that overran, the wait ends while its replacement starts: still busy.
+          job.resolve(unchecked(job.queuedBehind || this.#running ? 'busy' : 'unavailable'));
+        });
       }, this.#budgetMs);
       job.startTimer.unref();
       this.#waiting.add(job);
@@ -266,11 +290,16 @@ export class ArgumentChecker {
     if (!job) return;
     this.#waiting.delete(job);
     if (job.startTimer) clearTimeout(job.startTimer);
-    const timer = setTimeout(() => {
-      this.#overrun(worker);
-    }, this.#budgetMs);
-    timer.unref();
-    this.#running = { job, timer };
+    const running: Running = {
+      job,
+      timer: setTimeout(() => {
+        afterReading(() => {
+          this.#overrun(worker, running);
+        });
+      }, this.#budgetMs),
+    };
+    running.timer.unref();
+    this.#running = running;
     try {
       worker.postMessage(job.request);
     } catch {
@@ -278,11 +307,12 @@ export class ArgumentChecker {
     }
   }
 
-  #overrun(worker: Worker): void {
-    if (worker !== this.#worker || !this.#running) return;
-    const { job } = this.#running;
+  #overrun(worker: Worker, running: Running): void {
+    // Its reply was read first, or a failure or close settled it; the worker
+    // may already be running the next check, which this must not judge.
+    if (worker !== this.#worker || this.#running !== running) return;
     this.#running = null;
-    job.resolve(unchecked('timeout'));
+    running.job.resolve(unchecked('timeout'));
     this.#log.debug('replacing the argument check worker after an overrun');
     this.#replace();
   }

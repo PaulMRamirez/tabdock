@@ -67,8 +67,9 @@ export const CALL_SHAPES = {
   /**
    * Keys of digits alone in the request's _meta, after one as high as an
    * index goes, so V8 keeps them all as a dictionary of elements: 1.12 of
-   * its charge on the 2026-07-28 leg before the surcharge for such keys
-   * (request-heap.ts, ADR 0030).
+   * its charge on the 2026-07-28 leg without the surcharge for such keys
+   * when that was added, and 0.85 since the relay holds one copy fewer of
+   * _meta (request-heap.ts, ADR 0030's notes of 9 October 2026).
    */
   metaIndexKeys: (): CallShape => ({
     args: '{"text":"x"}',

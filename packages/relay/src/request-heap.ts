@@ -32,8 +32,13 @@ export const PROPERTY_HEAP_BYTES = 128;
 /**
  * More for a property whose key is digits alone: V8 keeps such keys as
  * elements, and sparse ones, past an index as high as 4294967294, as a
- * dictionary of their own, which held 1.12 of the charge without this on the
- * 2026-07-28 leg and 0.74 with it (call-heap.test.ts, ADR 0030).
+ * dictionary of their own. call-heap.test.ts's metaIndexKeys shape held 1.12
+ * of its charge without this on the 2026-07-28 leg when ADR 0030 added it;
+ * since ADR 0025's low-level Server keeps one copy fewer of a call's _meta,
+ * it holds 0.85 without this and 0.56 with it on that leg, and 0.58 and 0.38
+ * on the 2025-era leg (ADR 0030's notes of 9 October 2026). It stays: an
+ * overcharge is the safe side of S9's bound, and a copy brought back would
+ * put the shape over its charge again.
  */
 export const INDEX_KEY_HEAP_BYTES = 128;
 

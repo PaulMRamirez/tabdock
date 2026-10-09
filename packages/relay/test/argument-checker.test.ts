@@ -1,15 +1,19 @@
 // The worker that runs argument checks (ADR 0010), on its own: a time budget
 // per check, a busy worker that never makes other checks wait past it, an
 // overrunning or crashing worker replaced (with backoff when it keeps failing),
-// a bounded cache of compiled schemas, and shutdown that stops the thread.
-// Misbehaving workers come from test/fixtures; they load as plain node would
-// load them, with type stripping.
+// a reply that reached the port in time read before any timer judges its
+// check, however long other work held the main thread, a bounded cache of
+// compiled schemas, and shutdown that stops the thread. Misbehaving and
+// counting workers, and a checker alone in a thread, come from test/fixtures;
+// they load as plain node would load them, with type stripping.
 
+import { setEnvironmentData, Worker } from 'node:worker_threads';
 import type { JsonObject } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   ArgumentChecker,
   type ArgumentCheckerOptions,
+  type CheckOutcome,
   prepareForCheck,
   type PreparedSchema,
 } from '../src/argument-checker.ts';
@@ -99,15 +103,22 @@ function watchLoop(): { stop: () => number } {
 
 /**
  * The answer, or 'late' when a timer of twice the budget, set now, fires
- * first: the most a check may take, the budget to start and the budget again
- * to run (ADR 0010's notes). The checker answers a check it gives up on from
- * a timer of its own, set as the check is made. Node runs timers in the
- * order they fall due, however late a loaded machine runs the loop, and
- * settles promises between them, so this bounds such an answer in the
- * loop's own time, which a stall cannot shift.
+ * first and one more turn of the loop passes: the most a check may take, the
+ * budget to start and the budget again to run (ADR 0010's notes). The checker
+ * gives up on a check from a timer of its own, set as the check is made, in
+ * an immediate that timer queues, so a reply already in the port is read
+ * first (the notes of 9 October 2026). Node runs timers in the order they
+ * fall due, however late a loaded machine runs the loop, and immediates in
+ * the order they were queued, so this bounds such an answer in the loop's
+ * own time, which a stall cannot shift.
  */
 function inTime<T>(answer: Promise<T>): Promise<T | 'late'> {
-  return Promise.race([answer, delay(2 * BUDGET_MS).then(() => 'late' as const)]);
+  return Promise.race([
+    answer,
+    delay(2 * BUDGET_MS)
+      .then(() => new Promise((resolve) => setImmediate(resolve)))
+      .then(() => 'late' as const),
+  ]);
 }
 
 /**
@@ -281,6 +292,225 @@ describe('ArgumentChecker', () => {
       reason: 'unavailable',
     });
   });
+});
+
+/** The environment data key posting-worker.ts reads its shared count from. */
+const POSTED_KEY = 'tabdock-test-worker-posted';
+
+/**
+ * A checker on posting-worker.ts, the real worker counting what it posts, and
+ * a reader of that count that works while the main thread is held.
+ */
+function startCounting(): ReturnType<typeof start> & { posted: () => number } {
+  const count = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+  // Each worker reads it as it starts, replacements too, so one count covers them all.
+  setEnvironmentData(POSTED_KEY, count.buffer);
+  cleanups.push(() => {
+    setEnvironmentData(POSTED_KEY, undefined);
+    return Promise.resolve();
+  });
+  return {
+    ...start({ entry: fixture('posting-worker.ts') }),
+    posted: () => Atomics.load(count, 0),
+  };
+}
+
+/**
+ * Runs `work` from a setImmediate callback. After that phase Node runs the
+ * timers that fell due before it next polls for messages, so whatever
+ * reaches the port while `work` holds the thread waits unread behind them,
+ * as it does behind a socket callback that parses a large body. Held in a
+ * timer callback, or after a worker message, the thread would read the port
+ * first (docs/notes/verified.md, 9 October 2026).
+ */
+function fromCheckPhase<T>(work: () => T): Promise<{ value: T }> {
+  return new Promise((resolve, reject) => {
+    setImmediate(() => {
+      try {
+        resolve({ value: work() });
+      } catch (error: unknown) {
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  });
+}
+
+/** Holds the main thread, as a long synchronous callback would, until `done`. */
+function hold(done: () => boolean): void {
+  const giveUp = performance.now() + 10_000;
+  while (!done()) {
+    if (performance.now() > giveUp) throw new Error('held the main thread for 10 s');
+  }
+}
+
+/** Whether `answer` has settled, as seen from a later turn of the loop. */
+function watch(answer: Promise<unknown>): () => boolean {
+  let answered = false;
+  void answer.then(() => {
+    answered = true;
+  });
+  return () => answered;
+}
+
+/**
+ * Resolves once every judgement already queued has run. Made after a timer
+ * of the checker fell due, so after its judgement was queued, this resolves
+ * after that judgement too, since immediates run in the order they were
+ * queued; a test that no overrun was judged must wait for it, or it reads
+ * the log before the judgement could write to it.
+ */
+function afterJudging(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+/** When fixtures/lone-overrun.ts wakes its thread, far past any prompt judgement. */
+const RESCUE_MS = 3000;
+
+/**
+ * One overrun judged by a checker alone in a thread of its own, and how long
+ * it took from the check to its answer.
+ */
+function loneOverrun(): Promise<{ outcome: unknown; took: number }> {
+  return new Promise((resolve, reject) => {
+    const thread = new Worker(fixture('lone-overrun.ts'), {
+      workerData: { budgetMs: BUDGET_MS, rescueMs: RESCUE_MS, slow: FAN_OUT, form: FORM },
+    });
+    cleanups.push(() => thread.terminate().then(() => undefined));
+    thread.once('message', (message: { outcome: unknown; took: number }) => {
+      resolve(message);
+    });
+    thread.once('error', reject);
+    thread.once('exit', () => {
+      reject(new Error('lone-overrun.ts ended before it measured'));
+    });
+  });
+}
+
+const TOO_LONG: CheckOutcome = {
+  kind: 'invalid',
+  message:
+    'the arguments for tool form do not match its inputSchema: arguments/name is too long (rule "maxLength")',
+};
+
+function overruns(lines: string[]): number {
+  return lines.filter((line) =>
+    line.includes('replacing the argument check worker after an overrun'),
+  ).length;
+}
+
+describe('ArgumentChecker reads what the worker sent before a timer judges a check (ADR 0010, 9 October 2026)', () => {
+  it('reads a reply that already waits in the port before it judges an overrun', async () => {
+    const { checker, lines, posted } = startCounting();
+    await settled(checker);
+    const generation = checker.generation;
+    const seen = posted();
+    const { value: answer } = await fromCheckPhase(() => {
+      const since = performance.now();
+      const outcome = checker.check('form', FORM, { name: 'far too long' });
+      // A compiled schema answers in well under a millisecond; the thread stays
+      // held for twice the budget, so the check's timer is due before the loop
+      // can read the reply.
+      hold(() => posted() > seen && performance.now() - since >= 2 * BUDGET_MS);
+      return outcome;
+    });
+    expect(await answer).toEqual(TOO_LONG);
+    await afterJudging();
+    expect(overruns(lines)).toBe(0);
+    expect(checker.generation).toBe(generation);
+  });
+
+  it('reads a ready that already waits in the port before it gives up on a check that could not start', async () => {
+    const { value: started } = await fromCheckPhase(() => {
+      const counting = startCounting();
+      const since = performance.now();
+      const answer = counting.checker.check('form', FORM, { name: 'far too long' });
+      hold(() => counting.posted() > 0 && performance.now() - since >= 2 * BUDGET_MS);
+      return { ...counting, answer };
+    });
+    const { checker, lines, posted, answer } = started;
+    const answered = watch(answer);
+    // Once the ready is read the check starts, and its first compile could
+    // overrun a loaded run's budget; hold again until its reply is in the
+    // port too. A checker that gave up on it already has nothing to wait for.
+    await fromCheckPhase(() => {
+      if (!answered()) hold(() => posted() > 1);
+    });
+    expect(await answer).toEqual(TOO_LONG);
+    await afterJudging();
+    expect(overruns(lines)).toBe(0);
+    expect(checker.generation).toBe(1);
+  });
+
+  it('starts a queued check once a reply that already waits in the port frees the worker', async () => {
+    const { checker, lines, posted } = startCounting();
+    await settled(checker);
+    const generation = checker.generation;
+    const seen = posted();
+    const { value: answers } = await fromCheckPhase(() => {
+      const since = performance.now();
+      const first = checker.check('form', FORM, { name: 'Ada' });
+      const queued = checker.check('form', FORM, { name: 'far too long' });
+      hold(() => posted() > seen && performance.now() - since >= 2 * BUDGET_MS);
+      return { first, queued };
+    });
+    const answered = watch(answers.queued);
+    // As above: the queued check, started late, gets the whole of its own budget.
+    await fromCheckPhase(() => {
+      if (!answered()) hold(() => posted() > seen + 1);
+    });
+    expect(await answers.first).toEqual({ kind: 'valid' });
+    expect(await answers.queued).toEqual(TOO_LONG);
+    await afterJudging();
+    expect(overruns(lines)).toBe(0);
+    expect(checker.generation).toBe(generation);
+  });
+
+  it('still judges a check that overran while the thread was held, at most one turn of the loop later', async () => {
+    const { checker, lines } = startCounting();
+    await settled(checker);
+    const generation = checker.generation;
+    /** Turns of the loop since the hold ended. */
+    let turn = 0;
+    const inTurn = (answer: Promise<CheckOutcome>) => answer.then((outcome) => ({ outcome, turn }));
+    const { value: answers } = await fromCheckPhase(() => {
+      const since = performance.now();
+      const slow = inTurn(checker.check('fan_out', FAN_OUT, {}));
+      const queued = inTurn(checker.check('form', FORM, { name: 'Ada' }));
+      // The fan-out runs for minutes, so no reply comes however long this holds.
+      hold(() => performance.now() - since >= 2 * BUDGET_MS);
+      // Queued now, this runs in the next check phase ahead of anything the
+      // due timers queue on the way there.
+      setImmediate(() => {
+        turn = 1;
+        setImmediate(() => {
+          turn = 2;
+        });
+      });
+      return { slow, queued };
+    });
+    const slow = await answers.slow;
+    const queued = await answers.queued;
+    expect(slow.outcome).toEqual({ kind: 'unchecked', reason: 'timeout' });
+    expect(queued.outcome).toEqual({ kind: 'unchecked', reason: 'busy' });
+    expect(slow.turn).toBeLessThanOrEqual(1);
+    expect(queued.turn).toBeLessThanOrEqual(1);
+    expect(overruns(lines)).toBe(1);
+    expect(checker.generation).toBe(generation + 1);
+  });
+
+  it('judges an overrun promptly when nothing else wakes the loop', async () => {
+    // The fan-out answers nothing for minutes, and in the round's own thread
+    // no other timer or socket is due before RESCUE_MS, so a judgement that
+    // waited for other I/O to end the poll before it would take that long.
+    const took: number[] = [];
+    for (let round = 0; round < 3; round += 1) {
+      const { outcome, took: roundTook } = await loneOverrun();
+      expect(outcome).toEqual({ kind: 'unchecked', reason: 'timeout' });
+      took.push(roundTook);
+    }
+    // Least of three, as for a crash above: a stall can lengthen one round, not every one.
+    expect(Math.min(...took)).toBeLessThan(10 * BUDGET_MS);
+  }, 30_000);
 });
 
 describe('prepareForCheck', () => {
