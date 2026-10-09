@@ -27,7 +27,19 @@ const relay = await createRelay({
   port: 0,
   // Room for every call; what they hold is what is being measured.
   limits: { requestBytes: 2 ** 40, requestBytesPerUser: 2 ** 40 },
-  timings: { callDeadlineMs: 300_000 },
+  // Calls wait for good: neither the call deadline nor the page link's
+  // heartbeat (SPEC section 6: silent for idleTimeoutMs, the page is closed
+  // and its calls end page_asleep) may end one within a case. The heartbeat
+  // runs on this loop, which, with no bound on what waits, may read several
+  // bodies in one poll phase and parse each in turn: beside two other suites,
+  // six or seven bodies of about 2 MB of distinct or digit keys in _meta
+  // took one pass of 30 to 49 s, in which the relay sent no ping and read no
+  // pong, and the overdue idle timer then closed the page before the next
+  // poll. Both outlast the case's own 120 s timeout, so no stall a case can
+  // hold reaches them. What a stall still meets first is Node's own
+  // headersTimeout, 60 s, which answers 408 to a request whose headers wait
+  // unread that long; the test sees that call settle, and fails on it.
+  timings: { callDeadlineMs: 300_000, idleTimeoutMs: 300_000 },
   logSink: () => undefined,
 });
 

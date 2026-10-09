@@ -326,12 +326,23 @@ describe('heartbeat', () => {
   });
 
   it('closes a page that stays silent past the idle timeout', async () => {
-    const { relay } = await relayWith({ timings: { pingIntervalMs: 50, idleTimeoutMs: 200 } });
+    const idleTimeoutMs = 200;
+    const { relay } = await relayWith({ timings: { pingIntervalMs: 50, idleTimeoutMs } });
+    // The relay arms its idle timer as it sends the welcome (hub.ts,
+    // #startHeartbeat), before this side has read that welcome. So the clock
+    // starts before the socket is asked for: started once page() resolved, it
+    // ran late by however long the welcome took to be read, which on a
+    // loaded machine has outrun the 50 ms this test once allowed for it.
+    const started = performance.now();
     const opened = await page(relay.pageUrl, { autoPong: false });
-    const started = Date.now();
     const closed = await opened.closed;
     expect(closed.code).toBe(1001);
-    expect(Date.now() - started).toBeGreaterThanOrEqual(150);
+    // As for the hello timer: Node counts a timer from the whole millisecond
+    // of libuv's loop clock, read from CLOCK_MONOTONIC_COARSE where that ticks
+    // at 1 ms or finer, so the relay may close up to 2 ms short of
+    // idleTimeoutMs after the instant it armed; performance.now() reads the
+    // same monotonic clock, so nothing else needs an allowance.
+    expect(performance.now() - started).toBeGreaterThanOrEqual(idleTimeoutMs - 2);
   });
 
   it('answers a page ping with pong', async () => {

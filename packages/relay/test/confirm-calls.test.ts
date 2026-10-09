@@ -1088,6 +1088,15 @@ describe('a 2026-07-28 retry', () => {
     // between the retried question's state and its retry.
     await firstRound(target, wipeParams(page.pageId, { n: 2 }));
     const { state } = await firstRound(target, wipeParams(page.pageId, { n: 1 }));
+    // The codec's own lock is set from this relay's TTL, which mcp.ts hands
+    // it: minted before the first round answered, the state is refused at
+    // the latest once the TTL in whole seconds has passed from the end of the
+    // second read here. confirm.test.ts holds the codec to its rounding; this
+    // holds mcp.ts to the relay's setting, which every other check here would
+    // also pass with a codec TTL of 120 s or a day.
+    expect(codecRefusesFrom(state)).toBeLessThanOrEqual(
+      (Math.floor(Date.now() / 1000) + Math.ceil(ttlMs / 1000) + 1) * 1000,
+    );
     // Past the record's TTL counted from after the record was made, and
     // armed after its sweep with a later deadline, which Node fires first:
     // the sweep has taken the record and written its line when the retry goes.

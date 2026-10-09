@@ -402,7 +402,7 @@ describe('calls on a page whose queue is full (ADR 0024 notes)', () => {
       code: 'timeout',
       message: expect.stringContaining('never reached it') as unknown,
     });
-    // With the frames the page asked for one short of the cap, a burst of
+    // With the frames the page asked for two short of the cap, a burst of
     // cancels for calls it holds still closes nothing: they are bounded by
     // the invokes that went out, not by what the page reads.
     queue.drain();
@@ -414,13 +414,18 @@ describe('calls on a page whose queue is full (ADR 0024 notes)', () => {
     for (const abort of aborts) abort.abort();
     await Promise.all(sent);
     expect(page.ws.readyState).toBe(page.ws.OPEN);
+    // The relay hands ws each cancel as its call is aborted, before the call
+    // settles, so the pong to a ping sent now follows every cancel on the
+    // socket. Waits of 2 s, for the cancels and then for a close that never
+    // came, stood here instead: with the call deadline's 1.5 s they left
+    // 1.5 s of vitest's 5 s for the work, which load stretches. The pong is
+    // also a frame the page asked for, the 255th queued and one short of the
+    // cap, so a relay that had counted the cancels toward the cap would close
+    // the page, and the close would come in the pong's place.
+    expect(await Promise.race([page.sync().then(() => null), page.closed])).toBeNull();
     // The page sees every cancel, so the relay sent them rather than closing.
-    const deadline = Date.now() + 2000;
-    while (page.all('cancel').length < aborts.length && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
     expect(page.all('cancel')).toHaveLength(aborts.length);
-    expect(await closeOf(page)).toBeNull();
+    expect(page.ws.readyState).toBe(page.ws.OPEN);
   });
 
   it('ends a held call at once when its caller is revoked, and the page never hears of it (S8)', async () => {

@@ -24,6 +24,15 @@ const BUDGET_MS = 50;
  * then go unchecked for want of time instead of giving the answer under test.
  */
 const GENEROUS_MS = 2000;
+/**
+ * Rounds of a timed measure, of which the least counts. Beside two full
+ * suites a lone measure here once ran past its limit by a stall of about
+ * half a second with the checker as it should be; load only ever lengthens a
+ * measure, so a checker that is fine fails only if such a stall lands on the
+ * measure in every round, while one that held the main loop for a check, or
+ * waited on a crashed worker, does so in every round.
+ */
+const ROUNDS = 5;
 const cleanups: (() => Promise<void>)[] = [];
 
 afterEach(async () => {
@@ -88,6 +97,39 @@ function watchLoop(): { stop: () => number } {
   };
 }
 
+/**
+ * The answer, or 'late' when a timer of twice the budget, set now, fires
+ * first: the most a check may take, the budget to start and the budget again
+ * to run (ADR 0010's notes). The checker answers a check it gives up on from
+ * a timer of its own, set as the check is made. Node runs timers in the
+ * order they fall due, however late a loaded machine runs the loop, and
+ * settles promises between them, so this bounds such an answer in the
+ * loop's own time, which a stall cannot shift.
+ */
+function inTime<T>(answer: Promise<T>): Promise<T | 'late'> {
+  return Promise.race([answer, delay(2 * BUDGET_MS).then(() => 'late' as const)]);
+}
+
+/**
+ * Waits for a ready worker that has finished a check, through a replacement
+ * starting and any restart backoff, so that the next overrun replaces it at
+ * once (ADR 0010's notes).
+ */
+async function settled(checker: ArgumentChecker): Promise<void> {
+  const until = performance.now() + 10_000;
+  while (performance.now() < until) {
+    // A first check that runs out of time under load replaces the worker; try again.
+    if (
+      (await checker.ready()) &&
+      (await checker.check('form', FORM, { name: 'Ada' })).kind === 'valid'
+    ) {
+      return;
+    }
+    await delay(10);
+  }
+  throw new Error('no worker finished a check within 10 s');
+}
+
 describe('ArgumentChecker', () => {
   it('checks in the worker and describes a failure in the relay words', async () => {
     const { checker } = start({ budgetMs: GENEROUS_MS });
@@ -102,27 +144,33 @@ describe('ArgumentChecker', () => {
 
   it('gives up on a 2^30 fan-out schema within the budget, and the main loop never waits on it', async () => {
     const { checker } = start();
-    expect(await checker.ready()).toBe(true);
-    const loop = watchLoop();
-    const started = performance.now();
-    expect(await checker.check('fan_out', FAN_OUT, {})).toEqual({
-      kind: 'unchecked',
-      reason: 'timeout',
-    });
-    const elapsed = performance.now() - started;
-    expect(elapsed).toBeGreaterThanOrEqual(BUDGET_MS - 5);
-    expect(elapsed).toBeLessThan(500);
-    expect(loop.stop()).toBeLessThan(100);
-  });
+    const idle: number[] = [];
+    const checking: number[] = [];
+    for (let round = 0; round < ROUNDS; round += 1) {
+      await settled(checker);
+      // The yardstick: how long the loop goes without a turn over an idle wait as long as the budget.
+      let loop = watchLoop();
+      await delay(BUDGET_MS);
+      idle.push(loop.stop());
+      loop = watchLoop();
+      const started = performance.now();
+      expect(await inTime(checker.check('fan_out', FAN_OUT, {}))).toEqual({
+        kind: 'unchecked',
+        reason: 'timeout',
+      });
+      expect(performance.now() - started).toBeGreaterThanOrEqual(BUDGET_MS - 5);
+      checking.push(loop.stop());
+    }
+    // Replacing the worker costs the loop a few milliseconds; holding it for the check costs the budget.
+    expect(Math.min(...checking)).toBeLessThan(Math.min(...idle) + BUDGET_MS);
+  }, 30_000);
 
   it('never makes a check wait behind a slow one for longer than the budget', async () => {
     const { checker } = start();
     expect(await checker.ready()).toBe(true);
     const slow = checker.check('fan_out', FAN_OUT, {});
-    const started = performance.now();
-    const queued = await checker.check('form', FORM, { name: 'Ada' });
+    const queued = await inTime(checker.check('form', FORM, { name: 'Ada' }));
     expect(queued).toEqual({ kind: 'unchecked', reason: 'busy' });
-    expect(performance.now() - started).toBeLessThan(BUDGET_MS + 100);
     expect(await slow).toEqual({ kind: 'unchecked', reason: 'timeout' });
   });
 
@@ -166,11 +214,10 @@ describe('ArgumentChecker', () => {
     // Without backoff a worker that dies while loading is replaced every 50 to 100 ms.
     expect(checker.generation).toBeGreaterThanOrEqual(2);
     expect(checker.generation).toBeLessThanOrEqual(5);
-    const quick = performance.now();
-    expect(await checker.check('form', FORM, { name: 'Ada' })).toMatchObject({
+    // At once while the next restart waits, or within the budget while one starts.
+    expect(await inTime(checker.check('form', FORM, { name: 'Ada' }))).toMatchObject({
       kind: 'unchecked',
     });
-    expect(performance.now() - quick).toBeLessThan(BUDGET_MS + 100);
     const stopped = lines.filter((line) => line.includes('argument check worker stopped'));
     expect(stopped.length).toBeGreaterThanOrEqual(2);
     expect(lines.join('\n')).not.toContain('broken on purpose');
@@ -178,18 +225,24 @@ describe('ArgumentChecker', () => {
 
   it('lets a check through unchecked at once when its worker crashes, and starts another', async () => {
     // With a generous budget, a crash cannot be mistaken for an overrun, and
-    // answering in far less than the budget shows the check did not wait for it.
-    const { checker } = start({ entry: fixture('crash-worker.ts'), budgetMs: GENEROUS_MS });
-    expect(await checker.ready()).toBe(true);
-    const before = checker.generation;
-    const started = performance.now();
-    expect(await checker.check('form', FORM, { name: 'Ada' })).toEqual({
-      kind: 'unchecked',
-      reason: 'failed',
-    });
-    expect(performance.now() - started).toBeLessThan(GENEROUS_MS / 4);
-    expect(checker.generation).toBe(before + 1);
-  });
+    // answering in far less than the budget shows the check did not wait for
+    // it. Beside two full suites a crash was answered in 3 to 5 ms; a lone
+    // answer once took over 500 ms, so the least of a few crashes counts.
+    const took: number[] = [];
+    for (let round = 0; round < 3; round += 1) {
+      const { checker } = start({ entry: fixture('crash-worker.ts'), budgetMs: GENEROUS_MS });
+      expect(await checker.ready()).toBe(true);
+      const before = checker.generation;
+      const started = performance.now();
+      expect(await checker.check('form', FORM, { name: 'Ada' })).toEqual({
+        kind: 'unchecked',
+        reason: 'failed',
+      });
+      took.push(performance.now() - started);
+      expect(checker.generation).toBe(before + 1);
+    }
+    expect(Math.min(...took)).toBeLessThan(GENEROUS_MS / 4);
+  }, 15_000);
 
   it('treats a reply that fails validation as a failed worker', async () => {
     const { checker } = start({ entry: fixture('garbage-worker.ts'), budgetMs: GENEROUS_MS });

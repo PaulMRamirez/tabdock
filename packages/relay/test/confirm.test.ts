@@ -1,18 +1,22 @@
 // The pure half of confirmation in the caller's client (ADR 0026, confirm.ts):
 // when the relay asks, the question it writes, the one answer that confirms,
 // the digest that binds a confirmation to its arguments, the records and
-// waiting questions with their bounds and expiry, and the rewrite of a
-// requestState the SDK would refuse before any handler ran. The call flow on
-// both revisions is held by confirm-calls.test.ts and, against the sim page,
-// by tests/e2e/test/confirm-in-client.test.ts.
+// waiting questions with their bounds and expiry, the request state's own
+// expiry, and the rewrite of a requestState the SDK would refuse before any
+// handler ran. The call flow on both revisions is held by
+// confirm-calls.test.ts and, against the sim page, by
+// tests/e2e/test/confirm-in-client.test.ts.
 
+import type { ServerContext } from '@modelcontextprotocol/server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   argumentsDigest,
   asksClient,
   canonicalJson,
+  CONFIRMATION_TTL_MS,
   type ConfirmationRecord,
   confirmQuestion,
+  createConfirmationCodec,
   confirms,
   FORGED_REQUEST_STATE,
   MAX_PENDING_CONFIRMATIONS,
@@ -307,6 +311,43 @@ describe('the records and the questions waiting', () => {
     // A question already answered frees nothing twice.
     waiting?.done();
     expect(pending.heldBy('alice')).toBe(0);
+  });
+});
+
+describe("the request state's own expiry", () => {
+  // The record's expiry is the first lock on a late confirmation and the
+  // codec's the second: a state the codec still accepted long after its
+  // record had gone would leave the record's own check alone between a late
+  // retry and the page. Every test that drives a question also passes with a
+  // codec that never expires, so this one reads the codec's verdict at the
+  // instants that decide it, on a clock the test sets.
+  it("accepts a state as long as its record lives, and refuses it once the record's TTL in whole seconds has passed", async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    // The binding is the user, the OAuth client and the method, read from a
+    // real request's context in mcp.ts; here one fixed value stands for it.
+    const ctx = {} as ServerContext;
+    for (const ttlMs of [1, 999, 1000, 1001, 1999, CONFIRMATION_TTL_MS]) {
+      const codec = createConfirmationCodec({ ttlMs, bind: () => 'alice' });
+      // Minted at the start, just inside and at the end of a whole second,
+      // since the codec counts from the second a state was minted in.
+      for (const into of [0, 1, 999]) {
+        const mintedAt = Date.UTC(2026, 9, 9, 12, 0, 0, into);
+        vi.setSystemTime(mintedAt);
+        const state = await codec.mint('record', ctx);
+        const label = `a TTL of ${String(ttlMs)} ms, minted ${String(into)} ms into its second`;
+        // The record was made before its state, so it has expired by the
+        // state's minting instant plus the TTL; until then the state opens,
+        // and the codec never refuses a retry the record would let through.
+        vi.setSystemTime(mintedAt + ttlMs - 1);
+        expect(await codec.open(state, ctx), label).toBe('record');
+        // Refused once the TTL rounded up to whole seconds has passed from
+        // the end of the second it was minted in: a state outlives the TTL
+        // from its minting by under two seconds, never more.
+        const wholeSeconds = Math.ceil(ttlMs / 1000);
+        vi.setSystemTime((Math.floor(mintedAt / 1000) + wholeSeconds + 1) * 1000);
+        expect(await codec.open(state, ctx), label).toBeNull();
+      }
+    }
   });
 });
 

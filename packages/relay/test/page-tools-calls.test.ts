@@ -155,7 +155,13 @@ describe('a first-class call and call_page_tool', () => {
   for (const modern of [false, true]) {
     describe(modern ? 'on 2026-07-28' : 'on a 2025-era session', () => {
       it('answer every outcome in the same words and leave the same call line', async () => {
-        await setup();
+        // A generous check budget, so the invalid board.add below is refused
+        // by its check however loaded the test run is. At the default 50 ms,
+        // beside two full suites, a first check (a compile in the worker)
+        // took 20 to over 50 ms, and one that ran out of time let board.add
+        // through unchecked, as ADR 0010 allows. The two routes, not the
+        // budget, are under test.
+        await setup({ timings: { argumentCheckMs: 2000 } });
         const opened = await page({
           tools: [...TOOLS, DOTTED],
           onInvoke: (frame) =>

@@ -110,6 +110,8 @@ async function probe(
   clients.push(client);
   const paired = await client.callTool({ name: 'pair_page', arguments: { code } });
   expect(paired.isError ?? false).toBe(false);
+  /** How each call that settled on this side did; until the client closes, none may. */
+  const settled: string[] = [];
   /**
    * Sends calls that wait for good, and returns the first measure begun once
    * the page had received `total` invokes, so that every reading in it found
@@ -122,12 +124,30 @@ async function probe(
           { name: 'call_page_tool', arguments: { page: pageId, tool: 'search' } },
           { timeout: 600_000 },
         )
-        .catch(() => undefined);
+        .then(
+          (result) => {
+            settled.push(`answered: ${JSON.stringify(result.content).slice(0, 300)}`);
+          },
+          (error: unknown) => {
+            // The SDK's HTTP errors keep the status in their fields, not their message.
+            let fields = '';
+            try {
+              fields = JSON.stringify(error);
+            } catch {
+              // A field that cannot be written leaves the message alone.
+            }
+            settled.push(`rejected: ${String(error)} ${fields}`);
+          },
+        );
     }
     for (;;) {
       const now = await report();
       // Read on every pass: a call refused or ended before it reached the
       // page would otherwise leave invokes short of total until the timeout.
+      // On both sides: the relay records every call it ends, while a request
+      // it never read (one Node's server answers 408 after a long stall)
+      // settles only here.
+      expect(settled, 'a call stopped waiting before its heap was measured').toEqual([]);
       expect(now.ended, 'a call stopped waiting before its heap was measured').toBe(0);
       if (now.invokes >= total) return now;
       await new Promise((resolveTick) => setTimeout(resolveTick, 50));
