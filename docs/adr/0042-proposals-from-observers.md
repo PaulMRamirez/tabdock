@@ -1,6 +1,6 @@
 # 0042: Proposals from observers
 
-Status: Proposed, 9 October 2026. Priority 5 in `docs/plans/backlog.md`, for the target scenario in `docs/plans/map-classroom.md`. Would change SPEC sections 2 (the tool surface), 5 (what an observer may do), 6 (proposal frames), 7 (a fixed tool and an answer), 8 (the widget), 9 (S5, S6, S7 and S9) and 10 (A5.1's "only the five fixed tools").
+Status: Proposed, 9 October 2026. Priority 5 in `docs/plans/backlog.md`, for the target scenario in `docs/plans/map-classroom.md`. Would change SPEC sections 2 (the tool surface), 5 (what an observer may do), 6 (proposal frames), 7 (a fixed tool and an answer), 8 (the widget), 9 (S5, S6, S7 and S9) and 10 (A5.1's "only the five fixed tools"), and ADR 0016's wording on the five fixed tools.
 
 ## Context
 
@@ -16,7 +16,7 @@ C. As B, but drivers may also accept from their own clients. Deferred: an agent 
 
 ## Decision
 
-B, with acceptance on the page only. S5 gains one clause: an observer's write runs only as a proposal the operator accepted on the page, and the adapter runs it only against its own record of that acceptance, never on a relay frame alone. Under `consequential: 'deny'` a proposal for a consequential tool is refused at once; otherwise the acceptance, which arms after 500 ms like every click in the widget, is that call's S6 confirmation. The operator is whoever is at the tab and has no identity in Tabdock, so S7's audit record names the proposer and marks the call accepted on the page (`acceptedOnPage: true`, with the proposal id). `get_proposal` answers only the proposer: a proposal id is a name, never a capability (S13), which is how 2026-07-28's tools page describes such handles.
+B, with acceptance on the page only. S5 gains one clause: an observer's write runs only as a proposal the operator accepted on the page, and the adapter runs it only against its own record of that acceptance, never on a relay frame alone. Under `consequential: 'deny'` a proposal for a consequential tool is refused at once; otherwise the acceptance, which arms after 500 ms like every widget control that grants access (prompts, roster rows, the pause control and the Invite form; SPEC section 8), is that call's S6 confirmation. The operator is whoever is at the tab and has no identity in Tabdock, so S7's audit record names the proposer and marks the call accepted on the page (`acceptedOnPage: true`, with the proposal id). `get_proposal` answers only the proposer: a proposal id is a name, never a capability (S13), which is how 2026-07-28's tools page describes such handles.
 
 A proposal lives at most 10 minutes; a user may hold at most 3 pending per page and a page at most 20, and a proposal past either limit answers `rate_limited`. Proposals are shown to the operator only, never to other attached people. Holding the call open until the operator decides was rejected: calls end at the 45 s deadline, and the relay offers no task-augmented calls (ADR 0027).
 
@@ -24,7 +24,7 @@ Aligned open item: SPEC section 12's per-user fairness rule for the write queue.
 
 ## Consequences
 
-The classroom loop works without driver seats: people suggest, the teacher picks. The fixed tools grow by one beside ADR 0040's two, with the same effects on SPEC section 2, A5.1, first-class listings and the golden test. The widget gains a queue, which on a phone-sized operator screen needs care. Invitees can propose only where the page chose `all`.
+The classroom loop works without driver seats: people suggest, the teacher picks. The fixed tools grow by one beside ADR 0040's two, with the same effects on SPEC section 2, A5.1, ADR 0016's wording, first-class listings, the golden test and the guide. The widget gains a queue, which on a phone-sized operator screen needs care. Invitees can propose only where the page chose `all`.
 
 ## Open questions
 

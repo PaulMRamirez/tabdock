@@ -1,6 +1,6 @@
 # 0044: Larger read-only rooms
 
-Status: Proposed, 9 October 2026. Priority 7 in `docs/plans/backlog.md`, for the target scenario in `docs/plans/map-classroom.md`. Would change SPEC section 9 (S9) and ADR 0017's seat rule, and brings in three backlog rows.
+Status: Proposed, 9 October 2026. Priority 7 in `docs/plans/backlog.md`, for the target scenario in `docs/plans/map-classroom.md`. Would change SPEC section 9 (S9, and S14's "leave members two seats", the seat rule ADR 0017 wrote into it) and ADR 0016's "user limit minus two seats" wording, and brings in three backlog rows.
 
 ## Context
 
@@ -10,7 +10,7 @@ A university class or a seminar is 20 to 35 people; a page holds 10 by default (
 
 A. Raise `TABDOCK_MAX_USERS_PER_PAGE`. Simple, but it raises drivers' and members' room along with observers', and the number was never measured for a class.
 
-B. A separate allowance for observers, provisionally `TABDOCK_MAX_OBSERVERS_PER_PAGE`, counted apart from the people limit and sized by measurement on the reference host, together with the invitee pool and rate. A session (ADR 0043) mints as many watch invites as the allowance needs, each at most 20 uses, within S14's 10 live per page, so S14 is unchanged. Brought in with it: the relay-wide ceiling on responses with bytes waiting (5 October row), so a room of idle clients cannot crowd out members; for the reference deployment only, "Sign in with Google" (3 October row), since a school's own relay picks its own provider; and the no-account agent tokens on `/g/mcp` (3 October row), for a lab computer running Claude Code, never for hosted Claude, whose no-sign-in connector URLs ADR 0016 rejects.
+B. A separate allowance for observers, provisionally `TABDOCK_MAX_OBSERVERS_PER_PAGE`, counted apart from the people limit and sized by measurement on the reference host, together with the invitee pool and rate. A session (ADR 0043) mints as many watch invites as the allowance needs, each at most 20 uses, within S14's 10 live per page and 20 uses each, so S14's invite limits are unchanged. Brought in with it: the relay-wide ceiling on responses with bytes waiting (5 October row), so a room of idle clients cannot crowd out members; for the reference deployment only, "Sign in with Google" (3 October row), since a school's own relay picks its own provider; and the no-account agent tokens on `/g/mcp` (3 October row), for a lab computer running Claude Code, never for hosted Claude, whose no-sign-in connector URLs ADR 0016 rejects.
 
 C. A broadcast mode in which the relay serves page state (ADR 0040) to anyone with a link, without an attachment. Rejected: anonymous means no account, never no identity (ADR 0016).
 

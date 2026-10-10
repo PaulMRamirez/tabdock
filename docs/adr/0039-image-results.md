@@ -18,7 +18,7 @@ C. The adapter captures the page itself. A browser offers no silent capture: scr
 
 B. The image is page content and is treated as page text is: it never travels as structured content, the untrusted label always comes first in the same result, and the audit log records its type, size and SHA-256 digest, never the image. Responses carry no byte charge: ADR 0030 caps how many may wait per user, sized for answers of about 0.72 MB, so that sizing is measured again with image results, and S9's result size limit gains an image cap. A page that wants to show its canvas calls `toDataURL` on it inside the handler; a WebGL canvas must keep its drawing buffer or capture right after a frame renders, which the profile's `capture_view` (ADR 0038) documents.
 
-MCP-B 6 serializes every result as JSON, so a string arrives quoted there, and the adapter unwraps it once before reading the envelope; the backlog row of 5 October says unwrapping changes ADR 0001's rule, which is why this record amends it for declared image tools only. The MCP-B 6 test leg (`tests/mcpb6`) runs the envelope on both runtimes.
+MCP-B 6 serializes every result as JSON, so a string arrives quoted there, and the adapter unwraps it once before reading the envelope; the backlog row of 5 October says unwrapping changes ADR 0001's rule, which is why this record amends it for declared image tools only. The MCP-B 6 leg (the `mcpb6` Playwright project, `tests/e2e/specs/mcpb6.spec.ts`, with the beta held in `tests/mcpb6`) runs the envelope on MCP-B 6, and the `chromium` project runs it on 5.1.0 and native WebMCP.
 
 ## Consequences
 
@@ -26,4 +26,4 @@ MCP-B 6 serializes every result as JSON, so a string arrives quoted there, and t
 
 ## Open questions
 
-What Claude Code and hosted Claude show their model for an image part in a tool result, which is not yet checked and decides the value of this record. Whether hosted Claude's limit of about 150,000 characters per result and Claude Code's 25,000 token cap (SPEC section 3) count image parts, which sets the cap. Whether the adapter should downscale or re-encode, which would strip metadata but costs work on the page.
+Claude Code's half is answered (checked 10 October, `docs/notes/verified.md`): it shows a PNG, JPEG, GIF or WebP image part to its model inline, scaled down or compressed to fit, keeps the original bytes in a file, and counts image data against `MAX_MCP_OUTPUT_TOKENS` (25,000 by default; `anthropic/maxResultSizeChars` raises only the text limit). Still open: what hosted Claude shows its model for an image part, and whether its limit of about 150,000 characters per result (SPEC section 3) counts image parts; with Claude Code's limit, that sets the cap. Whether the adapter should downscale or re-encode, which would strip metadata but costs work on the page.

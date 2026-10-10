@@ -37,11 +37,11 @@ flowchart LR
 
 ## What works today
 
-The teacher alone, with Claude Code in local mode on the classroom computer, can already drive the page through any tools it registers, and a read-only wall screen can take observers on the same machine (`docs/guide/09-use-cases.md`). Everything with other people in it needs a public URL and sign-in today, and with invites on a page takes at most eight invited people (ten less two member seats), which ADR 0044 addresses.
+The teacher alone, with Claude Code in local mode on the classroom computer, can already drive the page through any tools it registers, and a read-only wall screen can take observers on the same machine (`docs/guide/09-use-cases.md`). Everything with other people in it needs a public URL and sign-in today, and with invites on a page takes at most eight invited people by default (`TABDOCK_MAX_USERS_PER_PAGE` defaults to ten, less the two seats kept for members), which ADR 0044 addresses.
 
 ## What does not change
 
-Every attachment is still approved on the page, or comes from a watch invite the operator minted while a member sponsors it (S4, S14). Page text, page state and page images still reach clients only behind the untrusted label (S10). Anonymous still means no account, never no identity (ADR 0016). The relay is still self-hosted, since it sees calls in plain text.
+Every attachment is still approved on the page, approved in advance for observers where the page set `autoApprove: 'observer'`, or made by a watch invite the operator minted while a member sponsors it (S4, S14). Page text, page state and page images still reach clients only behind the untrusted label (S10). Anonymous still means no account, never no identity (ADR 0016). The relay is still self-hosted, since it sees calls in plain text.
 
 ## Order of work
 

@@ -4,7 +4,7 @@ Status: Proposed, 9 October 2026. Priority 3 in `docs/plans/backlog.md`, for the
 
 ## Context
 
-Clients only ask; nothing tells them when a page changes. The one push the relay sends is `list_changed`, for tool lists (ADR 0032), and it declares no resources capability (ADR 0027's notes). In the target scenario a room follows the teacher's tab. Today a client learns the stop, the clock and the photo on screen only by calling page tools, which runs the page's handlers and spends its call budget (120 calls a minute per page, and for an invitee 60 requests a minute in all), and it still never knows when to look.
+Clients only ask; nothing tells them when a page changes. The one push the relay sends is `list_changed`, for tool lists (ADR 0032), and it declares no resources capability (ADR 0027's notes). In the target scenario a room follows the teacher's tab. Today a client learns the stop, the clock and the photo on screen only by calling page tools, which runs the page's handlers and spends its call budget (by default 120 calls a minute per user per page, `TABDOCK_MAX_CALLS_PER_MINUTE`, and for an invitee 60 requests a minute in all), and it still never knows when to look.
 
 ## Options
 
