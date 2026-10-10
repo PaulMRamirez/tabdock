@@ -5,22 +5,36 @@
 // fields it may hold, so nothing else reaches the log by accident: never
 // arguments, results, tokens, codes, nonces, invite secrets or their hashes,
 // resume-token hashes, cookies, the provider's `sub`, client addresses, or
-// text a page wrote (titles, URLs, invite labels). A page is named by its id
-// and the origin from its socket's Origin header (S1). An invitee's email
-// appears only in its attach record, and the logger drops it from stderr.
+// text a page wrote (titles, URLs, invite labels). From M6 also never image
+// data, page state values, session labels, agent labels, agent tokens or
+// their digests, or members' display names. A page is named by its id and
+// the origin from its socket's Origin header (S1). An invitee's email appears
+// only in its attach record, and the logger drops it from stderr. Every M6
+// field and record type is additive within AUDIT_VERSION 1, so lines written
+// before read as they did (ADR 0045's notes: the version moves to 2 only if
+// 0.1.0 publishes first).
 
 // First, before zod builds anything: no eval probe on Trusted Types pages.
 import './zod-config.ts';
 import * as z from 'zod/mini';
-import { AUDIT_VERSION, REFUSED_SUMMARY_BUSIEST } from './constants.ts';
+import {
+  AUDIT_VERSION,
+  MAX_IMAGE_BYTES,
+  MAX_MEMBERS,
+  REFUSED_SUMMARY_BUSIEST,
+} from './constants.ts';
 import { ERROR_CODES } from './errors.ts';
+import { IMAGE_MIME_TYPES, ImageRefusalSchema } from './images.ts';
 import {
   AttachViaSchema,
   ClientInfoSchema,
   EmailSchema,
   EpochMsSchema,
   IdSchema,
+  ProposalPolicySchema,
   RoleSchema,
+  SessionEndReasonSchema,
+  SessionLengthSchema,
   ToolNameSchema,
   UserKindSchema,
 } from './page-link.ts';
@@ -28,13 +42,16 @@ import {
 /**
  * How an attempt ended: 'cancelled' is a call its MCP client abandoned and
  * 'relay_error' one the relay failed on its own (a bug), recorded so no
- * attempt escapes S7. Every error code a client sees is recorded as itself.
+ * attempt escapes S7. 'proposed' (ADR 0042) is an observer's call the page's
+ * policy turned into a proposal: it reached the page as a proposal, never as
+ * an invoke. Every error code a client sees is recorded as itself.
  */
 export const AuditOutcomeSchema = z.enum([
   'ok',
   'tool_error',
   'cancelled',
   'relay_error',
+  'proposed',
   ...ERROR_CODES,
 ]);
 export type AuditOutcome = z.infer<typeof AuditOutcomeSchema>;
@@ -93,8 +110,19 @@ export const AttachRefusalSchema = z.enum([
   'invite_required',
 ]);
 
-/** Why an attachment ended without a revoke or a detach. */
-export const ExpireReasonSchema = z.enum(['idle', 'ends_at', 'page_gone', 'sponsor_gone']);
+/**
+ * Why an attachment ended without a revoke or a detach. membership_changed: a
+ * members reload removed or renumbered the account (ADR 0043); session_ended:
+ * a time-boxed session's end took the invite-made attachments with it.
+ */
+export const ExpireReasonSchema = z.enum([
+  'idle',
+  'ends_at',
+  'page_gone',
+  'sponsor_gone',
+  'membership_changed',
+  'session_ended',
+]);
 
 /** Why an invite stopped being live. */
 export const InviteCloseReasonSchema = z.enum([
@@ -105,6 +133,28 @@ export const InviteCloseReasonSchema = z.enum([
   'revoked',
   'sponsor_gone',
   'page_gone',
+  'session_ended',
+]);
+
+/** Why a proposal ended without being accepted (ADR 0042); an accepted one ends in its run's call line. */
+export const ProposalCloseReasonSchema = z.enum([
+  'dismissed',
+  'refused',
+  'expired',
+  'withdrawn',
+  'cancelled',
+]);
+
+/** Why an agent token stopped being live (ADR 0044); a deny burns it at once, and so does its third timeout. */
+export const AgentCloseReasonSchema = z.enum([
+  'cancelled',
+  'expired',
+  'revoked',
+  'denied',
+  'burned',
+  'sponsor_gone',
+  'page_gone',
+  'session_ended',
 ]);
 
 /** How the relay was started; its auth and address settings decide it (ADRs 0014, 0018 and 0022). */
@@ -133,12 +183,89 @@ const CallShape = shape('call', {
    * decided. Additive within AUDIT_VERSION 1: lines without it read as before.
    */
   confirmedBy: z.optional(z.literal('client')),
+  /**
+   * The invoke's id, present exactly when the call's invoke went out to its
+   * page (ADR 0045), so an exported session record can be matched to this
+   * line; additive within AUDIT_VERSION 1.
+   */
+  callId: z.optional(IdSchema),
+  /**
+   * The image that reached the client (ADR 0039): its type, decoded size and
+   * the SHA-256 of its bytes, never the image. Present only with outcome ok.
+   */
+  image: z.optional(
+    z.strictObject({
+      mimeType: z.enum(IMAGE_MIME_TYPES),
+      bytes: z.number().check(z.int(), z.gte(1), z.lte(MAX_IMAGE_BYTES)),
+      sha256: z.string().check(z.regex(/^[0-9a-f]{64}$/)),
+    }),
+  ),
+  /** Why the relay refused the page's image; present only with outcome tool_error. */
+  imageRefused: z.optional(ImageRefusalSchema),
+  /**
+   * The proposal (ADR 0042) this line made, with outcome 'proposed', or ran,
+   * with acceptedOnPage; userId and client are the proposer's either way.
+   */
+  proposalId: z.optional(IdSchema),
+  /** The run of a proposal the operator accepted on the page, whose Accept was its confirmation. */
+  acceptedOnPage: z.optional(z.literal(true)),
 });
 function callRule(record: { outcome: string; confirmedBy?: string | undefined }): boolean {
   return record.confirmedBy === undefined || record.outcome !== 'not_confirmed';
 }
 const CALL_RULE = {
   message: 'a call refused for its confirmation went out unconfirmed, so no client confirmed it',
+};
+
+/** ADR 0039: an image only beside ok, a refusal only beside tool_error, never both. */
+function imageRule(record: {
+  outcome: string;
+  image?: unknown;
+  imageRefused?: string | undefined;
+}): boolean {
+  return (
+    (record.image === undefined || record.outcome === 'ok') &&
+    (record.imageRefused === undefined || record.outcome === 'tool_error') &&
+    (record.image === undefined || record.imageRefused === undefined)
+  );
+}
+const IMAGE_RULE = {
+  message:
+    'an image reaches a client only in an ok call, a refused one only in a tool_error, and never both',
+};
+
+/**
+ * ADR 0042: a proposal leaves a line with outcome 'proposed' when it is made,
+ * which sent no invoke and so has no callId or image, and, once the operator
+ * accepts it, a line for its run marked acceptedOnPage, whose confirmation was
+ * the Accept on the page and never a client's. Each names the proposal, and
+ * no other line names one.
+ */
+function proposalRule(record: {
+  outcome: string;
+  confirmedBy?: string | undefined;
+  callId?: string | undefined;
+  image?: unknown;
+  proposalId?: string | undefined;
+  acceptedOnPage?: true | undefined;
+}): boolean {
+  if (record.acceptedOnPage !== undefined) {
+    return (
+      record.proposalId !== undefined &&
+      record.confirmedBy === undefined &&
+      record.outcome !== 'proposed'
+    );
+  }
+  if (record.outcome === 'proposed') {
+    return (
+      record.proposalId !== undefined && record.callId === undefined && record.image === undefined
+    );
+  }
+  return record.proposalId === undefined;
+}
+const PROPOSAL_RULE = {
+  message:
+    'a proposal is made by a line with outcome proposed and run by one accepted on the page, each naming it, and no other line names one',
 };
 
 /** An attachment made, by an approval, autoApprove or an invite. */
@@ -162,11 +289,13 @@ function attachRule(record: {
 }): boolean {
   return (
     (record.kind === 'invitee') === (record.email !== undefined) &&
-    (record.via === 'invite') === (record.inviteId !== null)
+    (record.via === 'invite' || record.via === 'agent') === (record.inviteId !== null) &&
+    (record.via !== 'agent' || record.kind === 'invitee')
   );
 }
 const ATTACH_RULE = {
-  message: 'an invitee and only an invitee has an email; an invite and only an invite names one',
+  message:
+    'an invitee and only an invitee has an email; an invite or agent token, and only those, names one, and an agent is an invitee',
 };
 
 /**
@@ -192,8 +321,18 @@ const PAGE_RULE = { message: 'a known page has its origin, and only a known page
  * a request_refused record. call_page_tool past it keeps its call record and
  * pair_page its attach_refused record (outcome rate_limited), so every call
  * attempt stays a call line (S7) and every pairing an attach_refused line.
+ * From M6 the waiting tools also get one for a wait refused by the wait caps
+ * or by the request's byte charge (ADRs 0040 and 0042).
  */
-export const RequestRefusedToolSchema = z.enum(['list_pages', 'list_page_tools', 'detach_page']);
+export const RequestRefusedToolSchema = z.enum([
+  'list_pages',
+  'list_page_tools',
+  'detach_page',
+  'get_page_state',
+  'wait_for_page_state',
+  'get_proposal',
+  'withdraw_proposal',
+]);
 
 /**
  * A request ADR 0018's per-user budget refused before its tool ran, within
@@ -266,12 +405,18 @@ const SponsorGoneShape = shape('sponsor_gone', {
   attachments: COUNT,
 });
 
-/** The relay started; with relay_stop it marks the gap a restart leaves (ADR 0019). */
+/**
+ * The relay started; with relay_stop it marks the gap a restart leaves (ADR
+ * 0019). agentTokens (ADR 0044) and restartSnapshot (ADR 0046) say whether
+ * those were on; lines written before M6 lack both.
+ */
 const RelayStartShape = shape('relay_start', {
   version: z.string().check(z.minLength(1), z.maxLength(50)),
   env: z.enum(['development', 'production']),
   mode: RelayModeSchema,
   invites: z.boolean(),
+  agentTokens: z.optional(z.boolean()),
+  restartSnapshot: z.optional(z.boolean()),
 });
 
 const RelayStopShape = shape('relay_stop', {});
@@ -306,6 +451,93 @@ const RefusedSummaryShape = shape('refused_summary', {
   ]),
 });
 
+/** A proposal that ended without being accepted (ADR 0042); never its arguments. */
+const ProposalClosedShape = shape('proposal_closed', {
+  ...PAGE,
+  proposalId: IdSchema,
+  /** The proposer. */
+  userId: IdSchema,
+  tool: ToolNameSchema,
+  reason: ProposalCloseReasonSchema,
+});
+
+/** A time-boxed session started (ADR 0043); demoted counts the drivers its seats left out. Never its label. */
+const SessionStartShape = shape('session_start', {
+  ...PAGE,
+  sessionId: IdSchema,
+  lengthMs: SessionLengthSchema,
+  maxDrivers: z.number().check(z.int(), z.gte(1), z.lte(100)),
+  proposals: ProposalPolicySchema,
+  demoted: COUNT,
+});
+
+/** The operator lengthened a session; lengthMs is the new total from its start. */
+const SessionExtendShape = shape('session_extend', {
+  ...PAGE,
+  sessionId: IdSchema,
+  lengthMs: SessionLengthSchema,
+});
+
+/** A session ended, with the invite-made attachments, live invites and agent tokens its end closed. */
+const SessionEndShape = shape('session_end', {
+  ...PAGE,
+  sessionId: IdSchema,
+  reason: SessionEndReasonSchema,
+  attachments: COUNT,
+  invites: COUNT,
+  agents: COUNT,
+});
+
+/**
+ * The relay read a changed members list (ADR 0043): how many members it now
+ * has, the user ids added and removed, how many were renamed and the
+ * attachments the change ended. Never a sub or a display name.
+ */
+const MembersReloadedShape = shape('members_reloaded', {
+  members: COUNT,
+  added: z.array(IdSchema).check(z.maxLength(MAX_MEMBERS)),
+  removed: z.array(IdSchema).check(z.maxLength(MAX_MEMBERS)),
+  renamed: COUNT,
+  attachments: COUNT,
+});
+
+/**
+ * A restart snapshot written at a graceful stop (ADR 0046), with the SHA-256
+ * of the file, so a start loads only the snapshot this log says was written.
+ */
+const SnapshotWrittenShape = shape('snapshot_written', {
+  pages: COUNT,
+  attachments: COUNT,
+  invites: COUNT,
+  sessions: COUNT,
+  sha256: z.string().check(z.regex(/^[0-9a-f]{64}$/)),
+});
+
+/** A restart snapshot loaded at start: its age, what it restored and the attachments it dropped. */
+const SnapshotLoadedShape = shape('snapshot_loaded', {
+  ageMs: COUNT,
+  pages: COUNT,
+  attachments: COUNT,
+  invites: COUNT,
+  sessions: COUNT,
+  dropped: COUNT,
+});
+
+/** An agent token minted on a page (ADR 0044); never the token, its digest or its label. */
+const AgentMintedShape = shape('agent_minted', {
+  ...PAGE,
+  tokenId: IdSchema,
+  expiresAt: EpochMsSchema,
+  sponsor: IdSchema,
+});
+
+/** An agent token stopped being live; written once per token. */
+const AgentClosedShape = shape('agent_closed', {
+  ...PAGE,
+  tokenId: IdSchema,
+  reason: AgentCloseReasonSchema,
+});
+
 /** What the persistent log adds to each record: its place in the log and the previous line's digest. */
 const LINE = {
   seq: COUNT,
@@ -315,7 +547,13 @@ const LINE = {
 
 /** What the hub appends (AuditLog.append). */
 export const AuditEventSchema = z.discriminatedUnion('type', [
-  z.strictObject(CallShape).check(z.refine(callRule, CALL_RULE)),
+  z
+    .strictObject(CallShape)
+    .check(
+      z.refine(callRule, CALL_RULE),
+      z.refine(imageRule, IMAGE_RULE),
+      z.refine(proposalRule, PROPOSAL_RULE),
+    ),
   z.strictObject(AttachShape).check(z.refine(attachRule, ATTACH_RULE)),
   z.strictObject(AttachRefusedShape).check(z.refine(attachRefusedRule, PAGE_RULE)),
   z.strictObject(RoleShape),
@@ -331,6 +569,15 @@ export const AuditEventSchema = z.discriminatedUnion('type', [
   z.strictObject(AuditGapShape).check(z.refine(auditGapRule, GAP_RULE)),
   z.strictObject(RefusedSummaryShape),
   z.strictObject(RequestRefusedShape).check(z.refine(requestRefusedRule, REQUEST_RULE)),
+  z.strictObject(ProposalClosedShape),
+  z.strictObject(SessionStartShape),
+  z.strictObject(SessionExtendShape),
+  z.strictObject(SessionEndShape),
+  z.strictObject(MembersReloadedShape),
+  z.strictObject(SnapshotWrittenShape),
+  z.strictObject(SnapshotLoadedShape),
+  z.strictObject(AgentMintedShape),
+  z.strictObject(AgentClosedShape),
 ]);
 export type AuditEvent = z.infer<typeof AuditEventSchema>;
 export type AuditEventType = AuditEvent['type'];
@@ -339,7 +586,13 @@ export type AuditCallEvent = AuditEventOf<'call'>;
 
 /** One line of the persistent log: an event with its sequence number and chain link. */
 export const AuditLineSchema = z.discriminatedUnion('type', [
-  z.strictObject({ ...CallShape, ...LINE }).check(z.refine(callRule, CALL_RULE)),
+  z
+    .strictObject({ ...CallShape, ...LINE })
+    .check(
+      z.refine(callRule, CALL_RULE),
+      z.refine(imageRule, IMAGE_RULE),
+      z.refine(proposalRule, PROPOSAL_RULE),
+    ),
   z.strictObject({ ...AttachShape, ...LINE }).check(z.refine(attachRule, ATTACH_RULE)),
   z.strictObject({ ...AttachRefusedShape, ...LINE }).check(z.refine(attachRefusedRule, PAGE_RULE)),
   z.strictObject({ ...RoleShape, ...LINE }),
@@ -357,10 +610,22 @@ export const AuditLineSchema = z.discriminatedUnion('type', [
   z
     .strictObject({ ...RequestRefusedShape, ...LINE })
     .check(z.refine(requestRefusedRule, REQUEST_RULE)),
+  z.strictObject({ ...ProposalClosedShape, ...LINE }),
+  z.strictObject({ ...SessionStartShape, ...LINE }),
+  z.strictObject({ ...SessionExtendShape, ...LINE }),
+  z.strictObject({ ...SessionEndShape, ...LINE }),
+  z.strictObject({ ...MembersReloadedShape, ...LINE }),
+  z.strictObject({ ...SnapshotWrittenShape, ...LINE }),
+  z.strictObject({ ...SnapshotLoadedShape, ...LINE }),
+  z.strictObject({ ...AgentMintedShape, ...LINE }),
+  z.strictObject({ ...AgentClosedShape, ...LINE }),
 ]);
 export type AuditLine = z.infer<typeof AuditLineSchema>;
 
-/** Every record type, in ADR 0019's order and then request_refused from its notes, for readers that filter by type. */
+/**
+ * Every record type, in ADR 0019's order, then request_refused from its notes,
+ * then M6's in plan order, for readers that filter by type.
+ */
 export const AUDIT_EVENT_TYPES = [
   'call',
   'attach',
@@ -378,4 +643,13 @@ export const AUDIT_EVENT_TYPES = [
   'audit_gap',
   'refused_summary',
   'request_refused',
+  'proposal_closed',
+  'session_start',
+  'session_extend',
+  'session_end',
+  'members_reloaded',
+  'snapshot_written',
+  'snapshot_loaded',
+  'agent_minted',
+  'agent_closed',
 ] as const satisfies readonly AuditEventType[];
