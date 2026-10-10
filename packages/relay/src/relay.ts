@@ -272,7 +272,7 @@ async function readModernBody(request: Request): Promise<ModernBody> {
  * `toolAnswers` says whether one past the budget still goes on, to be
  * refused in the dispatcher with its audit record: a tools/call the SDK's
  * own schema takes, whose requestState the SDK will not refuse first, naming
- * one of the five fixed tools, refused in that tool's own words as in M4,
+ * one of the fixed tools, refused in that tool's own words as in M4,
  * or, while first-class tools are on, a first-class name, refused as
  * call_page_tool is, so both routes answer and record a call past the budget
  * alike (SPEC section 7, ADR 0025's notes). relay.ts answers any other
@@ -582,7 +582,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     }
   }
 
-  // One request budget for the five tools, the listen streams and the
+  // One request budget for the fixed tools, the listen streams and the
   // 2026-07-28 requests the SDK refuses alike (ADR 0018).
   const budget = createRequestBudget(config);
   // Lines a signed-in client can cause at will on /mcp: one per kind a window, the rest counted (A4.3).

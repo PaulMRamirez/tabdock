@@ -101,8 +101,9 @@ describe('ADR 0009 defaults', () => {
     expect(DEFAULT_LIMITS).toEqual({
       sessionsPerUser: 20,
       sessions: 1000,
-      // ADR 0016: the invitee tier's own small pool, one session until an invitee holds a page.
-      inviteeSessions: 50,
+      // ADR 0016: the invitee tier's own pool, one session until an invitee
+      // holds a page; sized for a class from M6 (ADR 0044).
+      inviteeSessions: 100,
       sessionsPerInvitee: 2,
       usersPerPage: 10,
       queueDepth: 32,
@@ -117,6 +118,15 @@ describe('ADR 0009 defaults', () => {
       // ADR 0018's notes: what requests waiting on pages may hold, in all and per user.
       requestBytes: 64 * 1024 * 1024,
       requestBytesPerUser: 24 * 1024 * 1024,
+      // M6: the largest image (ADR 0039), the relay-wide budgets for page
+      // state, proposals and unread answers (ADRs 0040, 0042 and 0044), and
+      // the watching seats and their calls in flight (ADR 0044).
+      imageBytes: 65_536,
+      stateBytes: 4 * 1024 * 1024,
+      proposalBytes: 16 * 1024 * 1024,
+      responseBytes: 96 * 1024 * 1024,
+      observersPerPage: 40,
+      watchingCallsInFlight: 4,
     });
     expect(DEFAULT_RATE_LIMITS.callsPerUserPerPage).toBe(120);
     // Pairing counts per user and per page, never per address (S3, ADR 0016).
