@@ -131,13 +131,19 @@ interface Fixture {
   ended: () => string | null;
   /** Its process's scheduler state and CPU time so far (processState). */
   state: () => string;
+  /** Its last RECENT_LINES log messages, oldest first. */
+  lines: () => readonly string[];
 }
+
+/** Log messages a fixture keeps for a failure to quote. */
+const RECENT_LINES = 20;
 
 /**
  * A process's scheduler state (R running, S sleeping, D waiting on a device,
- * T stopped, Z gone) and the CPU ticks it has used, from /proc where there is
- * one: two a second apart tell a relay spinning on its main thread from one
- * blocked or stopped.
+ * T stopped, Z gone), the kernel function it sleeps in, and the CPU ticks it
+ * has used, from /proc where there is one: two a second apart tell a relay
+ * spinning on its main thread from one blocked in a call (a pipe write, say)
+ * or idle in its event loop (ep_poll), which still runs its timers.
  */
 function processState(pid: number | undefined): string {
   if (pid === undefined) return 'no pid';
@@ -146,10 +152,61 @@ function processState(pid: number | undefined): string {
     // The command name may hold spaces, so fields count from its closing parenthesis:
     // state first, then utime and stime twelfth and thirteenth.
     const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-    return `state ${fields[0] ?? '?'}, ${String(Number(fields[11]) + Number(fields[12]))} CPU ticks`;
+    let wchan = '?';
+    try {
+      wchan = readFileSync(`/proc/${String(pid)}/wchan`, 'utf8') || '0';
+    } catch {
+      // Some kernels hide it; the state and ticks still say a good deal.
+    }
+    return `state ${fields[0] ?? '?'} in ${wchan}, ${String(Number(fields[11]) + Number(fields[12]))} CPU ticks`;
   } catch {
     return 'no /proc entry';
   }
+}
+
+/** /proc/net/tcp's states and timers, by their codes there. */
+const TCP_STATES: Record<string, string> = {
+  '01': 'ESTABLISHED',
+  '04': 'FIN_WAIT1',
+  '05': 'FIN_WAIT2',
+  '06': 'TIME_WAIT',
+  '07': 'CLOSE',
+  '08': 'CLOSE_WAIT',
+  '09': 'LAST_ACK',
+  '0A': 'LISTEN',
+  '0B': 'CLOSING',
+};
+const TCP_TIMERS = ['none', 'retransmit', 'keepalive', 'time-wait', 'zero-window probe'];
+
+/**
+ * The kernel's view of every TCP socket to or from this port, where /proc
+ * shows one: each end's state, what sits unsent and unread in its queues, and
+ * which timer runs. A page whose sends stop while the relay idles reads here
+ * as either a relay that stopped reading (its receive queue full) or a
+ * connection that stopped moving (a zero-window probe timer, both queues
+ * waiting on the other end).
+ */
+function tcpState(port: number): string[] {
+  let table: string;
+  try {
+    table = readFileSync('/proc/net/tcp', 'utf8');
+  } catch {
+    return ['no /proc/net/tcp'];
+  }
+  const portOf = (address: string): number => Number.parseInt(address.split(':')[1] ?? '', 16);
+  return table
+    .split('\n')
+    .slice(1)
+    .map((row) => row.trim().split(/\s+/))
+    .filter(
+      (fields) =>
+        fields.length > 6 && (portOf(fields[1] ?? '') === port || portOf(fields[2] ?? '') === port),
+    )
+    .map((fields) => {
+      const [txQueue = '0', rxQueue = '0'] = (fields[4] ?? '').split(':');
+      const timer = TCP_TIMERS[Number.parseInt((fields[5] ?? '').split(':')[0] ?? '', 16)] ?? '?';
+      return `${String(portOf(fields[1] ?? ''))}>${String(portOf(fields[2] ?? ''))} ${TCP_STATES[fields[3] ?? ''] ?? fields[3] ?? '?'} unsent ${String(Number.parseInt(txQueue, 16))} unread ${String(Number.parseInt(rxQueue, 16))} timer ${timer} retransmits ${String(Number.parseInt(fields[6] ?? '', 16))}`;
+    });
 }
 
 /** The fixture relay in its own process, with these timings and limits. */
@@ -165,7 +222,13 @@ async function startRelay(
   let closed = false;
   let ended: string | null = null;
   let waiting: { resolve: (report: Report) => void; reject: (error: Error) => void } | null = null;
-  started.on('message', (message: Report | { closing: string }) => {
+  const recent: string[] = [];
+  started.on('message', (message: Report | { closing: string } | { line: string }) => {
+    if ('line' in message) {
+      recent.push(message.line);
+      if (recent.length > RECENT_LINES) recent.shift();
+      return;
+    }
     if ('closing' in message) {
       closed = true;
       return;
@@ -226,6 +289,7 @@ async function startRelay(
     closed: () => closed,
     ended: () => ended,
     state: () => processState(started.pid),
+    lines: () => [...recent],
   };
 }
 
@@ -307,7 +371,12 @@ async function flood(ws: WebSocket, sendOne: () => void, relay: Fixture): Promis
   return sent;
 }
 
-/** Why a flood stopped going anywhere, as far as this process can see. */
+/**
+ * Why a flood stopped going anywhere, as far as this process can see: the
+ * page's queue and socket, the relay's process a second apart, the kernel's
+ * view of the connection, and what the relay last logged, which names a close
+ * that is not one for not reading (a silent page's, say).
+ */
 async function stalled(ws: WebSocket, relay: Fixture, sent: number): Promise<string> {
   const first = relay.state();
   await new Promise((resolveTick) => setTimeout(resolveTick, 1000));
@@ -319,6 +388,8 @@ async function stalled(ws: WebSocket, relay: Fixture, sent: number): Promise<str
       relay: relay.ended() ?? 'running',
       // A second apart.
       relayProcess: [first, relay.state()],
+      tcp: tcpState(Number(new URL(relay.url).port)),
+      relayLines: relay.lines(),
     },
   )}`;
 }
