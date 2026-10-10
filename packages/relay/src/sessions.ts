@@ -524,6 +524,18 @@ export class McpSessions {
     return this.#notify((session) => session.userId === userId);
   }
 
+  /**
+   * Ends every session of a user whose account a member list change moved
+   * to another id (ADR 0043, S8): one still opening included, so nothing
+   * served under the old id outlives the change. The next request on one
+   * answers 404, and the client starts again as who it is now.
+   */
+  closeUser(userId: string): number {
+    const own = [...this.#sessions.values()].filter((session) => session.userId === userId);
+    for (const session of own) void this.#close(session, 'membership changed');
+    return own.length;
+  }
+
   /** Tells every open session whose user `whose` names; the spike's marker concerns every member. */
   notifyAll(whose: (userId: string) => boolean): number {
     return this.#notify((session) => whose(session.userId));

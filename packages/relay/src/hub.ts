@@ -38,6 +38,8 @@ import {
   type ImageRefusal,
   INVITE_BURN_REFUSALS,
   INVITE_PATH,
+  INVITEE_ID_PREFIX,
+  INVITEE_SHORT_ID_CHARS,
   type InviteListing,
   type InviteRefusalReason,
   InviteeIdSchema,
@@ -53,6 +55,7 @@ import {
   MAX_FRAME_BYTES,
   MAX_INVITE_LIFETIME_MS,
   MAX_LIVE_INVITES_PER_PAGE,
+  MAX_MEMBERS,
   MAX_RESULT_CHARS,
   MEMBER_RESERVED_SEATS,
   MIN_INVITE_REMAINING_MS,
@@ -102,6 +105,7 @@ import {
 import { AgentTokens } from './agents.ts';
 import { type HeldTally, holdValue } from './held-tally.ts';
 import type { LogFields, Logger, LogLevel } from './log.ts';
+import type { MemberChange } from './members.ts';
 import { PageParts } from './page-parts.ts';
 import { PageStates } from './page-state.ts';
 import { PageProposals } from './proposals.ts';
@@ -3677,6 +3681,107 @@ export class PageHub {
    */
   holds(userId: string): boolean {
     return this.#store.attachments.listForUser(userId).length > 0;
+  }
+
+  /**
+   * The member list changed (ADR 0043). Whatever an account held under a
+   * user id the change took from it ends at once, as a revoke would (S8):
+   * its attachments on every page, in-flight calls cancelled and queued ones
+   * answered not_attached, each with an expire record; the invites it
+   * sponsored and what those let in; its pending attach requests; and its
+   * place among a gone page's former users, so an id handed to someone else
+   * shows them none of its old pages (S13). A member renamed keeps all of it
+   * under the new name, and an invitee whose name now reads as a member's is
+   * shown by its short id instead (ADR 0017). The relay ends the account's
+   * MCP sessions, listen streams and /pair sign-ins beside this.
+   */
+  membershipChanged(change: MemberChange): { attachments: number } {
+    const now = Date.now();
+    const members = new Set(change.memberNames.map(foldName));
+    let ended = 0;
+    for (const page of this.#store.pages.all()) {
+      const { pageId } = page;
+      if (page.state === 'gone') {
+        const former = page.formerAttachments.filter((entry) => !change.ended.has(entry.userId));
+        if (former.length !== page.formerAttachments.length) {
+          page.formerAttachments = former;
+          this.#store.pages.put(page);
+        }
+        continue;
+      }
+      const targets = this.#store.attachments
+        .listForPage(pageId)
+        .filter((attachment) => change.ended.has(attachment.userId));
+      if (targets.length > 0) {
+        this.#endAttachments(
+          pageId,
+          new Set(targets.map((attachment) => attachment.userId)),
+          'revoked',
+          'your membership on this relay changed, so this attachment ended; sign in and pair again',
+        );
+        for (const target of targets) {
+          this.#auditExpire(page, target.userId, 'membership_changed', now);
+        }
+        ended += targets.length;
+      }
+      for (const request of this.#store.requests.listForPage(pageId)) {
+        if (change.ended.has(request.userId)) {
+          this.#endRequest(
+            request.requestId,
+            hubError(
+              'pairing_expired',
+              'your membership on this relay changed while the request waited; sign in and pair again',
+            ),
+          );
+          continue;
+        }
+        const name = this.#renamed(request.userId, request.displayName, change, members);
+        if (name !== null) {
+          request.displayName = name;
+          this.#store.requests.put(request);
+        }
+      }
+      let renamed = false;
+      for (const attachment of this.#store.attachments.listForPage(pageId)) {
+        const name = this.#renamed(attachment.userId, attachment.displayName, change, members);
+        if (name === null) continue;
+        attachment.displayName = name;
+        this.#store.attachments.put(attachment);
+        renamed = true;
+      }
+      // Their invites close and what those let in ends, as when a sponsor detaches (ADR 0017).
+      if (targets.length > 0) this.#loseSponsors(pageId, targets);
+      if (targets.length > 0 || renamed) this.#sendRoster(pageId);
+    }
+    this.#audit({
+      v: AUDIT_VERSION,
+      type: 'members_reloaded',
+      at: now,
+      members: change.total,
+      added: change.added.slice(0, MAX_MEMBERS),
+      removed: change.removed.slice(0, MAX_MEMBERS),
+      renamed: change.renamed.size,
+      attachments: ended,
+    });
+    return { attachments: ended };
+  }
+
+  /**
+   * The name a member list change gives someone the relay holds, or null
+   * when it stays: a renamed member's new name, and for an invitee whose
+   * name now folds to a member's, `invitee <short id>`, as at sign-in.
+   */
+  #renamed(
+    userId: string,
+    displayName: string,
+    change: MemberChange,
+    members: ReadonlySet<string>,
+  ): string | null {
+    const name = change.renamed.get(userId);
+    if (name !== undefined) return name === displayName ? null : name;
+    if (!userId.startsWith(INVITEE_ID_PREFIX) || !members.has(foldName(displayName))) return null;
+    const short = `invitee ${userId.slice(INVITEE_ID_PREFIX.length, INVITEE_ID_PREFIX.length + INVITEE_SHORT_ID_CHARS)}`;
+    return short === displayName ? null : short;
   }
 
   /**

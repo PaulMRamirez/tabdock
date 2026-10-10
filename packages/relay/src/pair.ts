@@ -318,6 +318,12 @@ export interface PairFlow {
     response: ServerResponse,
     address: string,
   ): Promise<void>;
+  /**
+   * Signs out every browser signed in as one of these users (ADR 0043, S8):
+   * a member list change moved their accounts to other ids, so a phone
+   * signed in under an old one signs in again. Returns how many ended.
+   */
+  endSessionsOf(userIds: ReadonlySet<string>): number;
   close(): void;
 }
 
@@ -987,6 +993,15 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
         default:
           serveAsset(path, response);
       }
+    },
+    endSessionsOf(userIds) {
+      let ended = 0;
+      for (const [key, session] of sessions) {
+        if (!userIds.has(session.user.userId)) continue;
+        sessions.delete(key);
+        ended += 1;
+      }
+      return ended;
     },
     close() {
       sessions.clear();

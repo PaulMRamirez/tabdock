@@ -66,6 +66,7 @@ import {
   type AuditEvent,
   InviteeIdSchema,
   MAX_FRAME_BYTES,
+  type MemberEntry,
   SUBPROTOCOL,
 } from '@tabdock/protocol';
 import { WebSocketServer } from 'ws';
@@ -94,6 +95,12 @@ import { parseFirstClassName } from './first-class.ts';
 import { EMPTY_FIRST_CLASS, PageHub } from './hub.ts';
 import { ListenStreams } from './listen-streams.ts';
 import { createLogger, type Logger } from './log.ts';
+import {
+  loadMembersFile,
+  type MembersReload,
+  type MembersWatch,
+  watchMembersFile,
+} from './members.ts';
 import {
   type AuthExtra,
   AuthExtraSchema,
@@ -136,6 +143,13 @@ export interface Relay {
    * from the relay's own process only (main.ts reads it from stdin).
    */
   readonly spike: SpikeControl | null;
+  /**
+   * Reads the members file now, without waiting for the poll to see it
+   * settle, and applies it if its text changed (ADR 0043): 'refused' keeps
+   * the list in force. Without a members file there is nothing to read, and
+   * it answers 'unchanged'.
+   */
+  reloadMembers(): Promise<MembersReload>;
   close(): Promise<void>;
 }
 
@@ -513,6 +527,15 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     ...(options.logLevel ? { level: options.logLevel } : {}),
   });
   const auth = options.auth;
+  // The members file, read before anything starts, so a file the relay cannot
+  // use stops it, naming a line at most, and the list in force from the first
+  // request is the file's (ADR 0043). resolveConfig refused a file beside a
+  // plugin that keeps no member list.
+  const members = config.membersFile === null ? null : (auth.members ?? null);
+  if (config.membersFile !== null && members !== null) {
+    const { entries, digest } = loadMembersFile(config.membersFile, options.membersSystem);
+    if (digest !== members.digest) members.replace(entries, digest);
+  }
   // Before the plugin starts, so a directory the relay cannot use sets nothing going.
   const fileAudit = openAudit(config, options, log);
   // Then, before anything else exists: a plugin that cannot work (an identity
@@ -675,6 +698,35 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     lines: mcpLines,
     createHandler: strictHandler,
   });
+  /**
+   * A new member list from the file (ADR 0043), in force for the next
+   * request at once. Whatever an account held under a user id the change
+   * took from it ends now, every way in (S8): attachments, requests and
+   * invites in the hub, then /pair sign-ins, 2025-era sessions and listen
+   * streams. The line names user ids and counts, never a sub or a name.
+   */
+  const applyMembers = (entries: MemberEntry[], digest: string): void => {
+    if (members === null) return;
+    const change = members.replace(entries, digest);
+    const { attachments } = hub.membershipChanged(change);
+    const signIns = pair?.endSessionsOf(change.ended) ?? 0;
+    let mcpSessions = 0;
+    let streams = 0;
+    for (const userId of change.ended) {
+      mcpSessions += sessions.closeUser(userId);
+      streams += listens.closeUser(userId);
+    }
+    log.info('members reloaded', {
+      members: change.total,
+      added: change.added,
+      removed: change.removed,
+      renamed: change.renamed.size,
+      attachments,
+      signIns,
+      mcpSessions,
+      streams,
+    });
+  };
   // The marker concerns every member, who all list it (spike.ts).
   spike?.setNotifier(() => {
     listens.notifyAll();
@@ -1176,6 +1228,18 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     );
   }
 
+  // Polled from here on; a relay that never listened has nothing to stop.
+  const membersWatch: MembersWatch | null =
+    config.membersFile === null || members === null
+      ? null
+      : watchMembersFile({
+          path: config.membersFile,
+          system: options.membersSystem,
+          intervalMs: config.timings.membersPollMs,
+          applied: members.digest,
+          apply: applyMembers,
+          log,
+        });
   let closing: Promise<void> | null = null;
   return {
     url,
@@ -1188,8 +1252,17 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       events: () => store.audit.records(),
     },
     spike,
+    reloadMembers() {
+      // A throw from the read or the hub rejects, as from an async function.
+      return new Promise<MembersReload>((resolveReload) => {
+        resolveReload(
+          closing !== null || membersWatch === null ? 'unchanged' : membersWatch.reloadNow(),
+        );
+      });
+    },
     close() {
       closing ??= (async () => {
+        membersWatch?.stop();
         pair?.close();
         await hub.shutdown();
         // After the hub, whose shutdown audits the calls it fails (ADR 0019).

@@ -188,3 +188,23 @@ export {
   type TicketStore,
   type TimedSession,
 } from './store.ts';
+export {
+  defaultMembersSystem,
+  inviteeKeyOf,
+  loadMembersFile,
+  type MemberChange,
+  type MemberFileStat,
+  MemberList,
+  MembersError,
+  type MembersProblem,
+  type MembersReload,
+  type MembersSystem,
+  type MembersWatch,
+  type MembersWatchOptions,
+  membersDigest,
+  parseMemberEntry,
+  parseMembersFile,
+  readMembersFile,
+  refuseRepeats,
+  watchMembersFile,
+} from './members.ts';

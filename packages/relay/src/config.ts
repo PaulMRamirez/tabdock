@@ -59,6 +59,7 @@ import {
   pathNames,
 } from './local-token.ts';
 import type { LogLevel, LogSink } from './log.ts';
+import { loadMembersFile, MemberList, type MembersSystem } from './members.ts';
 import { createOAuthAuth, parseOAuthClientIds, parseOAuthUsers } from './oauth.ts';
 import type { RelayStore } from './store.ts';
 import { holdingTokenLock } from './token-lock.ts';
@@ -475,8 +476,7 @@ export interface RelayOptions {
    * What the members file's checks read the platform through, as local
    * mode's place checks do; tests stand in for it. Never from the environment.
    */
-  // M6 seam: not built. Read by nothing until W1-E's members.ts checks the file.
-  membersSystem?: Partial<LocalTokenSystem> | undefined;
+  membersSystem?: Partial<MembersSystem> | undefined;
   /**
    * The restart snapshot (TABDOCK_RESTART_SNAPSHOT, ADR 0046), off unless
    * exactly true: written into the audit directory at a graceful stop and
@@ -543,7 +543,7 @@ export const DEFAULT_TIMINGS: RelayTimings = {
   pairSessionMs: PAIR_SESSION_MS,
   confirmationTtlMs: CONFIRMATION_TTL_MS,
   proposalTtlMs: PROPOSAL_TTL_MS, // M6 seam: not built. W2-A's proposals.ts reads it.
-  membersPollMs: MEMBERS_POLL_MS, // M6 seam: not built. W1-E's poller reads it.
+  membersPollMs: MEMBERS_POLL_MS,
 };
 
 export const DEFAULT_RATE_LIMITS: RelayRateLimits = {
@@ -1144,12 +1144,11 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     );
   }
   const membersFile = resolveMembersFile(options.membersFile, publicUrl);
-  // M6 seam: not built. Until this relay reads the file (W1-E), one given in
-  // code is refused as the environment's is, rather than run on the plugin's
-  // own list while the operator expects the file's.
-  if (membersFile !== null) {
+  // The file replaces a live list the plugin maps subjects through; a plugin
+  // with none would go on with its own while the operator edits the file.
+  if (membersFile !== null && options.auth.members === undefined) {
     throw new Error(
-      "membersFile (TABDOCK_MEMBERS_FILE) is not read by this relay yet; give the members to the OAuth plugin's users (ADR 0043)",
+      'membersFile (TABDOCK_MEMBERS_FILE) replaces the member list of the OAuth plugin, and this auth plugin keeps none (ADR 0043)',
     );
   }
   const audit = resolveAudit(options.audit);
@@ -1499,9 +1498,10 @@ interface EnvAuth {
 
 /**
  * The auth plugin the environment asks for. TABDOCK_PUBLIC_URL means OAuth
- * through TABDOCK_OAUTH_ISSUER for the people in TABDOCK_OAUTH_USERS, and
- * TABDOCK_DEV_TOKENS is then ignored (ADR 0014); without it, dev tokens as in
- * M1. The OAuth settings alone mean nothing, since tokens are issued for the
+ * through TABDOCK_OAUTH_ISSUER for the people in TABDOCK_OAUTH_USERS or in the
+ * file TABDOCK_MEMBERS_FILE names (ADR 0043), and TABDOCK_DEV_TOKENS is then
+ * ignored (ADR 0014); without it, dev tokens as in M1. The OAuth settings
+ * alone mean nothing, since tokens are issued for the
  * public URL, so they are refused rather than silently unused. With none of
  * AUTH_SETTINGS the relay runs in local mode outside production (ADR 0022);
  * production without them refuses to start.
@@ -1520,25 +1520,26 @@ function authFromEnv(
   const pairClientSecret = env.TABDOCK_PAIR_CLIENT_SECRET?.trim() ?? '';
   const membersFile = env.TABDOCK_MEMBERS_FILE?.trim() ?? '';
   if (publicText !== '') {
-    // The members file's rules were checked before this (refuseSettingsOutOfMode).
-    if (membersFile !== '') {
-      // M6 seam: not built. Until this relay reads the file, a start that
-      // names one is refused rather than run with no members (ADR 0043).
+    // The members file's rules were checked before this (refuseSettingsOutOfMode):
+    // never beside TABDOCK_OAUTH_USERS, and an absolute path.
+    if (issuer === '' || (oauthUsers === '' && membersFile === '')) {
       throw new Error(
-        'TABDOCK_MEMBERS_FILE is not read by this relay yet; list the members in TABDOCK_OAUTH_USERS (ADR 0043)',
-      );
-    }
-    if (issuer === '' || oauthUsers === '') {
-      throw new Error(
-        'TABDOCK_PUBLIC_URL needs TABDOCK_OAUTH_ISSUER and TABDOCK_OAUTH_USERS: a relay with a public URL signs people in only through OAuth (ADR 0014)',
+        'TABDOCK_PUBLIC_URL needs TABDOCK_OAUTH_ISSUER and TABDOCK_OAUTH_USERS or TABDOCK_MEMBERS_FILE: a relay with a public URL signs people in only through OAuth (ADR 0014)',
       );
     }
     const publicUrl = parsePublicUrl(publicText);
     const clientIds = env.TABDOCK_OAUTH_CLIENT_IDS?.trim() ?? '';
+    // Read now, so a file the relay cannot use stops it here, naming a line
+    // at most (ADR 0043); the relay reads it again as it starts and whenever
+    // it changes.
+    const listed =
+      membersFile === ''
+        ? { users: parseOAuthUsers(oauthUsers) }
+        : { members: membersFromFile(membersFile, system) };
     const auth = createOAuthAuth({
       issuer,
       resource: publicMcpUrlOf(publicUrl),
-      users: parseOAuthUsers(oauthUsers),
+      ...listed,
       maxTokenAgeMinutes: parseCount(
         'TABDOCK_OAUTH_MAX_TOKEN_AGE',
         env.TABDOCK_OAUTH_MAX_TOKEN_AGE,
@@ -1603,6 +1604,12 @@ function authFromEnv(
     ),
     localMode: { tokenPath: owner.path, names, created: owner.created },
   };
+}
+
+/** The members file's list, read through `system`; its refusals name a line at most, never the path. */
+function membersFromFile(path: string, system: Partial<MembersSystem>): MemberList {
+  const { entries, digest } = loadMembersFile(path, system);
+  return new MemberList(entries, digest);
 }
 
 /**
@@ -1703,8 +1710,7 @@ function refuseSettingsOutOfMode(
  * M6's flags this relay cannot honour yet, each refused once its own mode
  * rules above have passed, and before local mode draws a token: a relay that
  * started anyway would run as if they were off while its operator, its
- * guide page and `.env.example` expect them on. TABDOCK_MEMBERS_FILE is
- * refused in authFromEnv, where the list it replaces is read.
+ * guide page and `.env.example` expect them on.
  */
 function refuseUnbuiltSettings(flags: { agentTokens: boolean; restartSnapshot: boolean }): void {
   // M6 seam: not built. W2-D serves /g/mcp (ADR 0044).
@@ -1922,6 +1928,8 @@ export function loadConfigFromEnv(
     firstClassTools,
     agentTokens,
     membersFile: membersText === '' ? undefined : membersText,
+    // The relay reads the file again as it starts, through what read it here.
+    ...(membersText === '' ? {} : { membersSystem: system }),
     restartSnapshot,
     clientAddressHeader: headerText === '' ? undefined : headerText,
     trustedProxyCidr:

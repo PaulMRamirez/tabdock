@@ -30,6 +30,7 @@ import {
 } from '@tabdock/protocol';
 import { z } from 'zod';
 import type { Logger } from './log.ts';
+import type { MemberList } from './members.ts';
 import { digest, sameDigest } from './secrets.ts';
 
 export interface AuthRefusal {
@@ -248,6 +249,13 @@ export interface AuthPlugin {
   readonly routes?: ReadonlyMap<string, AuthRoute> | undefined;
   /** Present on a plugin that signs people in at a provider; public URL mode needs it for /pair. */
   readonly browserSignIn?: BrowserSignIn | undefined;
+  /**
+   * The live member list a plugin maps subjects through, on the oauth plugin.
+   * A members file (TABDOCK_MEMBERS_FILE) replaces its entries while the
+   * relay runs, so the request after a reload maps as the file now says
+   * (ADR 0043); a plugin without one cannot take a members file.
+   */
+  readonly members?: MemberList | undefined;
   /**
    * Set on a plugin whose credential is good only on this machine, as local
    * mode's owner token is (ADR 0022). resolveConfig refuses a plugin so
