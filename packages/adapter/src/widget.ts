@@ -47,7 +47,8 @@
 // trusted-page rule (SPEC.md section 2) covers all of this, since such a
 // script can run the page's tools itself; docs/threat-model.md (B5) records
 // it.
-// Buttons carry stable data-action attributes for browser tests.
+// Buttons carry stable data-action attributes, and blocks data-role ones, for
+// browser tests and the testing helper; widget-names.ts lists every name.
 
 import {
   type Account,
@@ -522,6 +523,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     return node;
   }
 
+  /** A block placed now and filled later, hidden until then so the panel looks as it did. */
   function hiddenBlock<K extends 'div' | 'p'>(tag: K): HTMLElementTagNameMap[K] {
     const node = element(tag);
     dom.flag(node, 'hidden', true);
