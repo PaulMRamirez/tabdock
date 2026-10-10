@@ -187,6 +187,22 @@ importers:
         specifier: 8.22.0
         version: 8.22.0
 
+  tests/map-page:
+    dependencies:
+      '@mcp-b/webmcp-polyfill':
+        specifier: 5.1.0
+        version: 5.1.0
+      '@tabdock/adapter':
+        specifier: workspace:*
+        version: link:../../packages/adapter
+      '@tabdock/sim-page':
+        specifier: workspace:*
+        version: link:../../packages/sim-page
+    devDependencies:
+      esbuild:
+        specifier: 0.28.2
+        version: 0.28.2
+
   tests/mcpb6:
     dependencies:
       webmcp-local-relay-6-beta:

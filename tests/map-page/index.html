@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tabdock map page</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: system-ui, sans-serif;
+        color: #212529;
+        background: #f8f9fa;
+      }
+      body {
+        margin: 0;
+        padding: 16px;
+      }
+      main {
+        max-width: 960px;
+        margin: 0 auto;
+        display: grid;
+        gap: 8px;
+      }
+      h1 {
+        font-size: 1.2rem;
+        margin: 0;
+      }
+      /* The drawing buffer stays 960 by 540; on screen it takes the column's width. */
+      canvas {
+        width: 100%;
+        height: auto;
+        aspect-ratio: 16 / 9;
+        background: #0b0d12;
+        border-radius: 8px;
+        touch-action: none;
+        cursor: grab;
+      }
+      p {
+        margin: 0;
+        font-size: 0.85rem;
+        color: #495057;
+        overflow-wrap: anywhere;
+      }
+      form {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+        font-size: 0.9rem;
+      }
+      form input {
+        flex: 1 1 14rem;
+        min-width: 0;
+        font: inherit;
+        padding: 4px 8px;
+      }
+      form button {
+        font: inherit;
+        padding: 4px 12px;
+      }
+      ol {
+        margin: 0;
+        padding-left: 1.2rem;
+        font-size: 0.85rem;
+        font-family: ui-monospace, monospace;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Tabdock map page</h1>
+      <form data-role="connect">
+        <label for="relay">Tabdock relay page URL</label>
+        <input
+          id="relay"
+          name="relay"
+          type="text"
+          value="ws://127.0.0.1:8787/page"
+          spellcheck="false"
+          autocomplete="off"
+        />
+        <button type="submit" data-action="connect">Connect</button>
+      </form>
+      <p data-role="status">Loading tools...</p>
+      <canvas id="map" aria-label="Map of the Moon; drag to pan, scroll to zoom"></canvas>
+      <p data-role="view"></p>
+      <p data-role="clock"></p>
+      <ol data-role="calls" aria-live="polite"></ol>
+    </main>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
