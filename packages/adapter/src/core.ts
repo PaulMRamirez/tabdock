@@ -10,6 +10,7 @@ import {
   type AttachmentView,
   type AttachVia,
   type Caller,
+  checkImage,
   type ClientInfo,
   CLOSE_DETACH,
   CLOSE_INVALID_FRAME_PAGE,
@@ -32,6 +33,8 @@ import {
   INVITEE_SHORT_ID_CHARS,
   JsonObjectSchema,
   MAX_FRAME_BYTES,
+  MAX_IMAGE_BYTES,
+  MAX_IMAGE_TEXT_CHARS,
   MAX_INVITE_LIFETIME_MS,
   MAX_INVITE_USES,
   MAX_LIVE_INVITES_PER_PAGE,
@@ -45,6 +48,7 @@ import {
   PageFrameSchema,
   type PageTool,
   type Pairing,
+  parseImageEnvelope,
   parseRelayFrame,
   parseValue,
   type Policy,
@@ -934,7 +938,16 @@ type ProposalEndFrame = Extract<RelayFrame, { t: 'proposal_end' }>;
 type SessionFrame = Extract<RelayFrame, { t: 'session' }>;
 type AgentsFrame = Extract<RelayFrame, { t: 'agents' }>;
 
-type Outcome = { ok: true; content: string } | { ok: false; code: PageErrorCode; message: string };
+/** A declared image tool's checked image (ADR 0039): bare base64, never re-encoded. */
+interface ResultImage {
+  mimeType: ImageMimeType;
+  data: string;
+  bytes: number;
+}
+
+type Outcome =
+  | { ok: true; content: string; image?: ResultImage }
+  | { ok: false; code: PageErrorCode; message: string };
 type Refusal = Extract<Outcome, { ok: false }>;
 
 const PAUSED: Refusal = {
@@ -2510,12 +2523,13 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     setState({ activity });
   }
 
-  /** Replaces the call's running line in the activity log with how it ended. */
-  function settleEntry(call: CallRecord, outcome: ActivityOutcome): void {
+  /** Replaces the call's running line in the activity log with how it ended, and any image's type and size. */
+  function settleEntry(call: CallRecord, outcome: ActivityOutcome, image?: ResultImage): void {
     updateEntry(call, {
       outcome,
       durationMs: Math.max(0, clock() - call.entry.time),
       handlerRunning: call.executing,
+      ...(image && { image: Object.freeze({ mimeType: image.mimeType, bytes: image.bytes }) }),
     });
   }
 
@@ -2557,29 +2571,56 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     timers.clearTimeout(call.deadline);
     settleConfirmPromise(call, false);
     const { callId } = call.frame;
-    logCall(call, outcome.ok ? 'ok' : outcome.code);
-    if (outcome.ok) {
-      send(resultFrame(callId, outcome.content));
-    } else {
+    const frame = outcome.ok ? resultFrame(callId, outcome.content, outcome.image) : null;
+    // An image is never cut, so one that leaves no room on this link is refused whole (ADR 0039).
+    const ended: Outcome =
+      outcome.ok && frame === null
+        ? {
+            ok: false,
+            code: 'tool_error',
+            message: "the image is too large for this relay's page link",
+          }
+        : outcome;
+    const image = ended.ok ? ended.image : undefined;
+    // S7: the type and size, never the data.
+    logCall(
+      call,
+      ended.ok ? (image ? `ok, an ${image.mimeType} of ${image.bytes} bytes` : 'ok') : ended.code,
+    );
+    if (frame) send(frame);
+    else if (!ended.ok) {
       send({
         t: 'result',
         callId,
         ok: false,
-        error: { code: outcome.code, message: outcome.message.slice(0, MAX_ERROR_CHARS) },
+        error: { code: ended.code, message: ended.message.slice(0, MAX_ERROR_CHARS) },
       });
     }
-    settleEntry(call, outcome.ok ? 'ok' : outcome.code);
+    settleEntry(call, ended.ok ? 'ok' : ended.code, image);
     release(call);
+    // A call answered before its handler started gives up the image gate, and
+    // one answered while it waited leaves it, its handler never run (S8).
+    freeImageSlot(call.executing ? null : call);
   }
 
-  /** Cuts the text to the result limit, then further if JSON escaping or UTF-8 still overflow the frame. */
-  function resultFrame(callId: string, content: string): PageFrameInput {
+  /**
+   * Cuts the text to the result limit, then further if JSON escaping or UTF-8
+   * still overflow the frame. An image beside it is never cut: null when the
+   * frame cannot fit it even with the text gone.
+   */
+  function resultFrame(
+    callId: string,
+    content: string,
+    image?: ResultImage,
+  ): PageFrameInput | null {
+    const extra = image && { image: { mimeType: image.mimeType, data: image.data } };
     let max = content.length > resultLimit ? resultLimit - MARKER_ROOM : content.length;
     for (;;) {
       const text = max >= content.length ? content : truncate(content, max).text;
-      const frame = { t: 'result', callId, ok: true, content: text } as const;
+      const frame = { t: 'result', callId, ok: true, content: text, ...extra } as const;
       const size = byteLength(encodeFrame(frame));
-      if (size <= frameLimit || max === 0) return frame;
+      if (size <= frameLimit) return frame;
+      if (max === 0) return extra ? null : frame;
       max = Math.floor(Math.min(max, content.length) * (frameLimit / size) * 0.9);
     }
   }
@@ -2679,6 +2720,11 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     snapshot: ToolSnapshot,
   ): Promise<void> {
     const { frame } = call;
+    // ADR 0039: a tool the page declares an image tool waits for the image
+    // gate first, so nothing below awaits anything between its checks and
+    // the handler but the operator's own prompt, as before.
+    const imageTool = policy.imageTools.includes(tool.page.name);
+    if (imageTool && !(await takeImageSlot(call, snapshot))) return;
     if (isConsequential(tool.page, snapshot.hintSupport, policy)) {
       if (policy.consequential === 'deny') {
         finish(call, {
@@ -2720,11 +2766,15 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     let unwatched = false;
     try {
       const value = await execute(tool.runtime, frame.arguments, call);
-      outcome = { ok: true, content: resultText(value) };
+      outcome = imageTool
+        ? imageOutcome(resultText(value))
+        : { ok: true, content: resultText(value) };
     } catch (error) {
       outcome = { ok: false, code: 'tool_error', message: errorParts(error).message };
       unwatched = await lostSightOfHandler(call, tool, error);
     }
+    // The runtime has settled the call, so the next image call may start.
+    freeImageSlot(call);
     if (unwatched) {
       holdUnwatched(call);
       // The relay still hears the runtime's answer, unless something answered first.
@@ -3652,8 +3702,107 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   const stateFlush = (): void => undefined;
 
   // Image results (ADR 0039)
-  // M6 seam: not built
-  const imageWelcome: (frame: WelcomeFrame) => void = () => undefined;
+
+  /**
+   * What the welcome says the relay takes, held to the protocol's ceiling so
+   * a relay's large number never lets the page send more; absent, as from a
+   * 0.1.0 relay, is none, and an image tool's image is then refused here
+   * rather than sent to be dropped.
+   */
+  const imageWelcome = (frame: WelcomeFrame): void => {
+    setState({ maxImageBytes: Math.min(MAX_IMAGE_BYTES, frame.limits.maxImageBytes ?? 0) });
+  };
+
+  /**
+   * A declared image tool's result: an envelope, checked here as the relay
+   * checks it again (one checkImage for both); anything else stays text as
+   * the runtime gave it (ADR 0001), so the tool can still answer in words.
+   * The page's words beside an image are cut so the marker fits within
+   * MAX_IMAGE_TEXT_CHARS, and the image never is.
+   */
+  function imageOutcome(text: string): Outcome {
+    const envelope = parseImageEnvelope(text);
+    if (envelope.kind === 'text') return { ok: true, content: text };
+    const refused = (message: string): Outcome => ({ ok: false, code: 'tool_error', message });
+    if (envelope.kind === 'invalid') return refused(envelope.message);
+    const limit = state.maxImageBytes ?? 0;
+    if (limit === 0) return refused("this page's relay takes no image results");
+    const checked = checkImage(envelope.image, limit);
+    if (!checked.ok) return refused(checked.message);
+    return {
+      ok: true,
+      content: truncate(envelope.text, MAX_IMAGE_TEXT_CHARS - MARKER_ROOM).text,
+      image: { mimeType: checked.mimeType, data: envelope.image.data, bytes: checked.bytes.length },
+    };
+  }
+
+  // The image gate (ADR 0039): image calls start one at a time on this page,
+  // IMAGE_CALL_SPACING_MS apart, so a room capturing the projected tab cannot
+  // keep it drawing; the page holds it, so no relay can get round it.
+  let imageRunning: CallRecord | null = null;
+  let imageStartedAt = -Infinity;
+  let imageTimer: unknown = null;
+  let imageHold: unknown = null;
+  const imageWaiting: { call: CallRecord; go: () => void }[] = [];
+
+  /**
+   * Waits for the gate, then runs check() again, since the caller's role or
+   * grant may have changed meanwhile; false when the call ended instead, its
+   * handler never run (S8). Past MAX_WAITING_IMAGE_CALLS waiting, a call is
+   * answered page_busy at once.
+   */
+  async function takeImageSlot(call: CallRecord, snapshot: ToolSnapshot): Promise<boolean> {
+    if (imageWaiting.filter((waiter) => !waiter.call.finished).length >= MAX_WAITING_IMAGE_CALLS) {
+      finish(call, { ok: false, code: 'page_busy', message: 'too many image calls are waiting' });
+      return false;
+    }
+    await new Promise<void>((go) => {
+      imageWaiting.push({ call, go });
+      pumpImages();
+    });
+    if (isDone(call)) return false;
+    const again = check(call.frame, snapshot);
+    if (!again.ok) finish(call, again.refusal);
+    return again.ok;
+  }
+
+  /** Drops waiters already answered, then starts the next once the gate is free and the spacing passed. */
+  function pumpImages(): void {
+    for (const waiter of imageWaiting.filter((each) => each.call.finished)) {
+      imageWaiting.splice(imageWaiting.indexOf(waiter), 1);
+      waiter.go();
+    }
+    const next = imageWaiting[0];
+    if (!next || imageRunning !== null || imageTimer !== null) return;
+    const wait = imageStartedAt + IMAGE_CALL_SPACING_MS - clock();
+    if (wait > 0) {
+      imageTimer = timers.setTimeout(() => {
+        imageTimer = null;
+        pumpImages();
+      }, wait);
+      return;
+    }
+    imageWaiting.shift();
+    imageRunning = next.call;
+    imageStartedAt = clock();
+    // A handler the runtime never settles (a polyfill 5.1 read) holds the gate no longer than this.
+    imageHold = timers.setTimeout(
+      () => {
+        freeImageSlot(next.call);
+      },
+      Math.max(next.call.deadlineAt, imageStartedAt) + UNWATCHED_HANDLER_GRACE_MS - imageStartedAt,
+    );
+    next.go();
+  }
+
+  /** Frees the gate if `call` holds it, then lets the next waiter start. */
+  function freeImageSlot(call: CallRecord | null): void {
+    if (call !== null && imageRunning === call) {
+      imageRunning = null;
+      timers.clearTimeout(imageHold);
+    }
+    pumpImages();
+  }
 
   // Proposals (ADR 0042)
   // M6 seam: not built
