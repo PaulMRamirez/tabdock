@@ -597,6 +597,8 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   // Responses a client leaves unread are cut off once they stop moving, and a
   // user's oldest once more of theirs wait than they may, an invitee a
   // quarter as many as a member (responsesWaitingFor, ADR 0030 and its notes).
+  // M6 seam: not built. W1-F gives it config.limits.responseBytes as a
+  // relay-wide ceiling (S9, ADR 0044); until then only those two bounds hold.
   const stalls = new ResponseStalls({ lines: mcpLines });
   // What each /mcp request's body holds on the heap, measured before either
   // leg reads it, so a call or pairing that waits on a page is charged it

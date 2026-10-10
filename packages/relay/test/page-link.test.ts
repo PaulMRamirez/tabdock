@@ -9,7 +9,6 @@ import {
   MAX_DESCRIPTION_CHARS,
   MAX_FRAME_BYTES,
   MAX_RESULT_CHARS,
-  MAX_STATE_BYTES,
   PAIRING_TTL_MS,
   PING_INTERVAL_MS,
   RESUME_WINDOW_MS,
@@ -200,28 +199,27 @@ describe('hello', () => {
       idleTimeoutMs: 10_000,
       resumeWindowMs: 5000,
       attachRequestTtlMs: 5000,
-      // M6: images up to the relay's setting (ADR 0039), page state (ADR
-      // 0040), and the page's people with no watching seats, invites off
-      // (ADR 0044).
-      maxImageBytes: DEFAULT_IMAGE_BYTES,
-      maxStateBytes: MAX_STATE_BYTES,
+      // M6: the page's people with no watching seats, invites off (ADR
+      // 0044). M6 seam: not built. Until W1-B and W1-C pass images and keep
+      // state, the welcome says the relay takes no image (0) and, by leaving
+      // maxStateBytes out, no state, whatever TABDOCK_MAX_IMAGE_BYTES says.
+      maxImageBytes: 0,
       usersPerPage: 10,
       observersPerPage: 0,
     });
   });
 
-  it('tells the page its watching seats and image size as set, with invites on', async () => {
+  it('tells the page its watching seats as set, with invites on', async () => {
     const { relay } = await relayWith({
       invites: true,
-      limits: { observersPerPage: 25, usersPerPage: 6, imageBytes: 0 },
+      limits: { observersPerPage: 25, usersPerPage: 6, imageBytes: DEFAULT_IMAGE_BYTES },
     });
     const opened = await page(relay.pageUrl, { tools: TOOLS });
-    expect(opened.welcome?.limits).toMatchObject({
-      maxImageBytes: 0,
-      maxStateBytes: MAX_STATE_BYTES,
-      usersPerPage: 6,
-      observersPerPage: 25,
-    });
+    expect(opened.welcome?.limits).toMatchObject({ usersPerPage: 6, observersPerPage: 25 });
+    // M6 seam: not built. W1-B sends the image size as set, and W1-C
+    // MAX_STATE_BYTES; until then neither is claimed.
+    expect(opened.welcome?.limits.maxImageBytes).toBe(0);
+    expect(opened.welcome?.limits).not.toHaveProperty('maxStateBytes');
   });
 
   it('advertises the protocol defaults when no timings are overridden', async () => {

@@ -54,9 +54,9 @@ import {
   MAX_INVITE_LIFETIME_MS,
   MAX_LIVE_INVITES_PER_PAGE,
   MAX_RESULT_CHARS,
-  MAX_STATE_BYTES,
   MEMBER_RESERVED_SEATS,
   MIN_INVITE_REMAINING_MS,
+  narrowPolicy,
   type PageErrorCode,
   type PageFrame,
   type PageTool,
@@ -2176,8 +2176,12 @@ export class PageHub {
       page.title = frame.title;
       page.url = frame.url;
       page.adapterVersion = frame.adapterVersion;
-      page.policy = frame.policy;
+      // A reload may send a new ceiling, never a way past a live session
+      // (S5, ADR 0043): the policy in force stays the narrower of the two.
       page.ceiling = frame.policy;
+      // M6 seam: not built. W2-B also narrows the session itself under a
+      // smaller ceiling, demotes drivers past its seats and tells the page.
+      page.policy = narrowPolicy(frame.policy, page.timedSession?.policy ?? null);
     } else {
       const noRoom = this.#makeRoom(conn.address);
       if (noRoom !== null) {
@@ -2199,8 +2203,11 @@ export class PageHub {
         title: frame.title,
         url: frame.url,
         adapterVersion: frame.adapterVersion,
+        // A new page session starts with no time-boxed session, so the policy
+        // in force is its ceiling.
         policy: frame.policy,
         ceiling: frame.policy,
+        // M6 seam: not built. W2-B starts sessions here (#sessionFrame).
         timedSession: null,
         tools: [],
         toolsPending: false,
@@ -2252,7 +2259,8 @@ export class PageHub {
    * for none, ADR 0039), that it takes page state (ADR 0040), and the
    * page's people limit and watching seats, none of which exist with
    * invites off (ADR 0044), so the adapter sends nothing an older relay
-   * would only ignore.
+   * would only ignore. Each says only what this relay does: an adapter that
+   * believed more would send images and state that nothing here passes on.
    */
   #limits(): Limits {
     const { timings, limits, invites } = this.#config;
@@ -2264,8 +2272,12 @@ export class PageHub {
       idleTimeoutMs: timings.idleTimeoutMs,
       resumeWindowMs: timings.resumeWindowMs,
       attachRequestTtlMs: timings.attachRequestTtlMs,
-      maxImageBytes: limits.imageBytes,
-      maxStateBytes: MAX_STATE_BYTES,
+      // M6 seam: not built. W1-B sends limits.imageBytes once #result passes
+      // checked images on; until then this relay takes none.
+      maxImageBytes: 0,
+      // M6 seam: not built. W1-C adds maxStateBytes: MAX_STATE_BYTES once
+      // this relay keeps state; until then it is absent, which tells the
+      // adapter the relay takes none.
       usersPerPage: limits.usersPerPage,
       observersPerPage: invites ? limits.observersPerPage : 0,
     };
@@ -3608,6 +3620,26 @@ export class PageHub {
     }
     if (call.marks) call.marks.resultIn = performance.now();
     const origin = conn.origin;
+    if (frame.ok && frame.image !== undefined) {
+      // M6 seam: not built. W1-B's #checkedImage passes a declared tool's
+      // checked image on. Until then this relay passes none, as its welcome
+      // says, so an image is refused whole rather than dropped while the
+      // call reads as ok: 'undeclared' when the hello named no such image
+      // tool, as ADR 0039 checks first, else 'off'. Relay words only.
+      const declared =
+        this.#store.pages.get(pageId)?.policy.imageTools.includes(call.toolName) ?? false;
+      const imageRefused: ImageRefusal = declared ? 'off' : 'undeclared';
+      call.trace.imageRefused = imageRefused;
+      call.settle({
+        kind: 'tool_error',
+        origin,
+        message: declared
+          ? "tabdock refused this tool's image: this relay passes no images"
+          : "tabdock refused this tool's image: the page did not declare this tool an image tool",
+        imageRefused,
+      });
+      return;
+    }
     if (frame.ok) {
       call.settle({ kind: 'ok', origin, content: frame.content ?? '' });
       return;
