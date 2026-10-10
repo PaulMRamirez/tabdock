@@ -36,7 +36,8 @@ function membersOf(path: string, name: string): string[] {
 /** The table whose first header cell is `first`. */
 function tableHeaded(all: readonly Table[], first: string): Table {
   const table = all.find((candidate) => candidate.header[0] === first);
-  if (table === undefined) throw new Error(`neither ${PAGE} nor ${HANDLE} has a table headed ${first}`);
+  if (table === undefined)
+    throw new Error(`neither ${PAGE} nor ${HANDLE} has a table headed ${first}`);
   return table;
 }
 
