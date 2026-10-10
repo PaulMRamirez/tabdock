@@ -35,3 +35,9 @@ A reviewer found that the invitee pool kept out the people it exists for. A 2025
 ## Notes from ADRs 0025 and 0026 (5 October 2026)
 
 ADR 0025 builds M5's first-class tools and keeps this record's rule. Invitees, and every attachment an invite made (a member's included), get no first-class names, and a call by such a name answers `tool_not_found`. ADR 0026 does the same for confirmation in the caller's client: on a page that opts in, invitees and every invite-made attachment still get the page prompt for a consequential call, and the adapter tells an invite-made grant by the invite it names.
+
+## Notes from M6 (10 October 2026)
+
+The fixed tools are nine from M6: `list_pages`, `pair_page`, `list_page_tools`, `call_page_tool` and `detach_page`, then `get_page_state` and `wait_for_page_state` (ADR 0040) and `get_proposal` and `withdraw_proposal` (ADR 0042). Where this record says invitees stay on "the five fixed tools", read "the fixed tools": invitees and invite-made attachments still get no first-class names. An invitee may read page state as any attached role may, and may propose only on a page whose `policy.proposals` is `'all'`.
+
+"Use at most the page's user limit minus two seats" now holds for the people limit only (ADR 0044): invitees watching by invite sit in the page's watching seats, `TABDOCK_MAX_OBSERVERS_PER_PAGE`, apart from it, and with those at 0 the old rule returns. The no-account agent tokens on `/g/mcp` are built by ADR 0044, behind `TABDOCK_AGENT_TOKENS`, off by default: observer only, one page, 1, 4 or 8 hours, their first request always prompting, a deny or three timeouts burning them, named `agent <short id>` by the relay with the label the widget shows, and never a hosted connector.

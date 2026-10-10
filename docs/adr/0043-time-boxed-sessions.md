@@ -1,6 +1,6 @@
 # 0043: Time-boxed sessions
 
-Status: Proposed, 9 October 2026. Priority 6 in `docs/plans/backlog.md`, for the target scenario in `docs/plans/map-classroom.md`. Would change SPEC sections 5 (an attachment's end), 6 (a policy update frame), 7 (the allowlist), 8 (the widget) and 11 (every setting is an environment variable, which a members file is not).
+Status: Accepted, 10 October 2026, under the owner's standing instruction. Option B, with the relay also holding a session's end on its own clock. Changes SPEC sections 4 (the members file the relay reads), 5 (the session and the attachment's end), 6 (session frames), 7 (the members file in the auth paragraph), 8 (the session form and handle), 9 (S5, S8, S9, S11 and S14), 10 (A6.14 to A6.17) and 11 (the one list that may live in a file), and brings in the restart snapshot as ADR 0046. Priority 6 in `docs/plans/backlog.md`; built in M6.
 
 ## Context
 
@@ -24,6 +24,63 @@ Aligned backlog row: the restart snapshot (3 October), since a deploy in the mid
 
 Starting a lesson is one form and ending it is automatic. Adding a teacher or a reviewer as a member no longer costs everyone their pairing. A session mints its invites only while a member is attached as sponsor (S14), normally the teacher's own Claude; if that attachment ends, every invite-made attachment ends with it, so the widget warns before the sponsor detaches. The members file is a new place a secret could leak; it holds subjects and names only, never tokens, and the threat model gains a row. ADR 0044's larger rooms and ADR 0045's record both hang off a session's start and end.
 
-## Open questions
+## Open questions, as proposed
 
 The members file's format and whether a signal or a file watch reloads it. Whether presets belong in page code (`attach()` naming a few sessions) or only in the widget. Whether a session may extend itself, and by whose approval. Whether a session makes sense in local mode, where nobody else can attach.
+
+## Decisions
+
+Accepted with these settings on 10 October 2026, copied from section 1 of the M6 plan. Every recommendation of the record's design not listed here was accepted as written.
+
+1. **Members file format:** one `sub=userId:Display Name` per line, with # comments, CRLF and BOM accepted. At most 500 entries and 262,144 bytes. Refusals name a line number, never its text.
+2. **Reload mechanism:** stat polling every MEMBERS_POLL_MS (2,000) with one stable poll to settle, plus `relay.reloadMembers()`. No fs.watch and no SIGHUP (conflict C8).
+3. **Windows:** the same polling, with POSIX mode checks skipped.
+4. **Sources:** exactly one of TABDOCK_OAUTH_USERS and TABDOCK_MEMBERS_FILE, in public URL mode only, never with dev tokens.
+5. **A bad file at reload** keeps the last list. At start it refuses to start.
+6. **An account whose user id changes** loses everything held under the old id, including formerAttachments.
+7. **Presets:** the widget form plus `dock.startSession()`. There is no attach() option.
+8. **Extending:** only the operator, in steps of SESSION_EXTEND_MS, up to 4 h from the start, counted against OPERATOR_GRANTS_PER_PAGE.
+9. **Local mode:** a session is a time box only.
+10. **Enforcing the end:** both the relay's clock (a timer plus `#endSessionIfDue`) and the adapter's own end.
+11. **What the end covers:** every invite-made attachment, every live invite and every live agent token on the page (conflict C11).
+12. **Policy fields a session sets:** only maxDrivers and proposals.
+13. **Lowered seats:** drivers beyond the count are demoted, newest grant first, in both layers.
+14. **The QR** is held in memory only, with renewSessionLink after a reload.
+15. **Session invites:** ceil(observers / 20) watch invites, with expiry capped at the session's end, shown one QR at a time (conflict C12).
+16. **Sponsor warnings,** plus detach_page's new description sentence.
+17. **Naming:** "time-boxed session" in prose, and session_start, session_extend, session_end and session on the wire.
+18. **The restart snapshot** becomes ADR 0046: opt-in and bound to the audit chain (conflict C15).
+19. **deploy.yml** takes either the secret or `vars.TABDOCK_MEMBERS_FILE`.
+20. **The session frame** follows every welcome and carries remainingMs. The adapter adopts only its own session ids.
+21. **A smaller ceiling on reload** narrows the session field by field.
+22. **Length:** whole minutes from 30 to 240.
+23. **Fairness** is ADR 0042's.
+24. **SessionEndReason** is 'operator', 'time' or 'page_gone', and the adapter adds 'relay' (conflict C19).
+
+Conflicts between the M6 records, settled by the plan, that touch this one:
+
+- **C8:** the members file is polled with stat, not watched with fs.watch.
+- **C11:** a session's end closes every live agent token on the page, and AgentCloseReason gains 'session_ended'.
+- **C12, the session form's observers field.** It runs from 0 to observersPerPage, or to usersPerPage less 2 when the allowance is 0, and mints ceil(n / 20) watch invites within MAX_LIVE_INVITES_PER_PAGE.
+- **C15:** the restart snapshot is opt-in, not on by default. docs/deploy.md's rotation procedure relies on a restart ending everything (deploy.md:103 and :220).
+- **C19:** the session end reason 'ended' is renamed 'operator'.
+- **C22, the panel order:**
+  1. error line, notice line, joins
+  2. prompts, then the record offer
+  3. proposals, pairing
+  4. roster (People, then Watching by invite), session block
+  5. invites (with the agent kind and list)
+  6. activity, record block, state line, pause box
+- **C26, record scope names.** RecordScopeSchema uses `endsAt` (was plannedEndAt), `maxDrivers` (was drivers), `observers` and `invites`. endedBy is 'operator', 'time', 'page_gone' or 'relay'.
+
+## Notes from the other M6 records (10 October 2026)
+
+**From ADR 0042.** The session form's proposals field offers off, members and all, within the ceiling `attach()` sets; the decision text's "proposals on or off" reads that way.
+
+**From ADR 0044.** A session's end also closes every live agent token on the page, and its observers field is sized by the watching seats (C11, C12).
+
+**From ADR 0045.** A session's record spans page sessions, and at the session's end it is sealed and offered, kept until saved, discarded or replaced.
+
+**From ADR 0046.** The restart snapshot is its own record, off by default and bound to the audit chain (C15), so a deploy during a lesson keeps the room only where the operator chose it.
+
+**Open questions.** Settled under Decisions: the file's format (1) and stat polling (2), presets in the widget and `dock.startSession()` only (7), extension by the operator alone (8), and a time box only in local mode (9).

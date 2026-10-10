@@ -120,6 +120,7 @@ SPEC asks only that the audit log persist. On every host, every restart, includi
   - Emails and page titles sit on disk briefly.
   - A crash still falls back to (A).
 - I would build this in M5 if re-pairing under (A) turns out to be annoying.
+- Taken in M6 as ADR 0046 (10 October 2026), off unless `TABDOCK_RESTART_SNAPSHOT` turns it on, since the credential rotation in `docs/deploy.md` relies on a restart ending everything, and loaded only when the audit log's last records name the snapshot's digest, so a stale or planted file never comes back.
 
 **(C) No volume, platform logs only, $0.**
 
