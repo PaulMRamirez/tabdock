@@ -195,13 +195,16 @@ describe('reading what a page published (ADR 0040)', () => {
     );
   });
 
-  it('takes null as nothing shared, and never logs a value', async () => {
+  it('takes null as nothing shared, sends the page nothing back, and never logs a value', async () => {
     const relay = await setup();
     const opened = await page();
     const alice = await client();
     await pairAndApprove(alice, opened);
     const marker = 'STATE-MARKER-4f1c9a';
+    const heard = opened.received.length;
     await publish(opened, { secretish: marker });
+    // A state frame queues nothing for the page, so ADR 0024's bound is untouched: only the sync's pong.
+    expect(opened.received.slice(heard).map((frame) => frame.t)).toEqual(['pong']);
     expect((await readState(alice, opened.pageId)).body).toMatchObject({ version: 1 });
     await publish(opened, null);
     expect((await readState(alice, opened.pageId)).body).toMatchObject({ version: 2, value: null });

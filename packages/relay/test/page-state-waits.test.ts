@@ -365,6 +365,31 @@ describe('how many may wait, and what each holds (S9, waits.ts)', () => {
   });
 });
 
+describe('past the request budget (ADR 0018, S7)', () => {
+  it.each(LEGS)(
+    'both state tools answer rate_limited in their own words with a request_refused record on the %s leg',
+    async (_, modern) => {
+      const relay = await setup({ rateLimits: { requestsPerUser: 4 } });
+      const opened = await page();
+      const alice = await client(ALICE, { modern });
+      await pairAndApprove(alice, opened);
+      let read = await readState(alice, opened.pageId);
+      for (let n = 0; n < 10 && !read.isError; n += 1) read = await readState(alice, opened.pageId);
+      expect(read.text).toMatch(/^rate_limited: more than 4 requests/);
+      const waited = await waitState(alice, opened.pageId, 0, 2000);
+      expect(waited.text).toMatch(/^rate_limited: more than 4 requests/);
+      const refused = relay.relay.audit
+        .events()
+        .filter((event) => event.type === 'request_refused');
+      for (const tool of ['get_page_state', 'wait_for_page_state']) {
+        expect(refused, tool).toContainEqual(
+          expect.objectContaining({ tool, pageId: opened.pageId, outcome: 'rate_limited' }),
+        );
+      }
+    },
+  );
+});
+
 /** A fetch that pads every wait_for_page_state body with this many spaces, which the SDK never would. */
 function padding(spaces: number, base: FetchLike = fetch): FetchLike {
   return (input, init) => {
