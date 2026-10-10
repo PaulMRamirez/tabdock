@@ -1,9 +1,11 @@
-// The adapter reference (docs/guide/04-adapter-reference.md, ADR 0035) is
-// where a page author looks up an option, a policy field or a handle method,
-// so each of its tables must list exactly what the code declares: the
-// members of AttachOptions, Dock, DockState and InviteOptions as the
-// TypeScript sources declare them, PolicySchema's fields, and the data-*
-// attributes the script-tag build reads. The policy's defaults must be what
+// The adapter reference (docs/guide/04-adapter-reference.md, ADR 0035) and
+// the control handle page it sends readers on to (13-the-control-handle.md,
+// which took the handle's tables when M6 grew them) are where a page author
+// looks up an option, a policy field or a handle method, so each of their
+// tables must list exactly what the code declares: the members of
+// AttachOptions, Dock, DockState and InviteOptions as the TypeScript sources
+// declare them, PolicySchema's fields, and the data-* attributes the
+// script-tag build reads. The policy's defaults must be what
 // PolicySchema fills in, every value the page lists must parse, and the
 // stated range for maxDrivers must be the schema's. The adapter README's
 // at-a-glance paragraph names the same handle members.
@@ -16,6 +18,7 @@ import { readScriptOptions } from '../../../packages/adapter/src/script-options.
 import { datasetKey, readRepo, scriptTagAttributes, type Table, tables } from '../src/doc-files.ts';
 
 const PAGE = 'docs/guide/04-adapter-reference.md';
+const HANDLE = 'docs/guide/13-the-control-handle.md';
 
 /** The member names an interface declares in a source file, in order. */
 function membersOf(path: string, name: string): string[] {
@@ -33,7 +36,7 @@ function membersOf(path: string, name: string): string[] {
 /** The table whose first header cell is `first`. */
 function tableHeaded(all: readonly Table[], first: string): Table {
   const table = all.find((candidate) => candidate.header[0] === first);
-  if (table === undefined) throw new Error(`${PAGE} has no table headed ${first}`);
+  if (table === undefined) throw new Error(`neither ${PAGE} nor ${HANDLE} has a table headed ${first}`);
   return table;
 }
 
@@ -76,7 +79,14 @@ function enumOptions(field: keyof typeof PolicySchema.shape): string[] | null {
 }
 
 describe('the adapter reference', () => {
-  const all = tables(readRepo(PAGE));
+  // Each table is looked for on both pages, so it may move between them, but
+  // never be on neither nor (by its header) on both.
+  const all = [...tables(readRepo(PAGE)), ...tables(readRepo(HANDLE))];
+
+  it('holds each of its tables once across the two pages', () => {
+    const headers = all.map((table) => table.header[0]);
+    expect(headers.filter((header, index) => headers.indexOf(header) !== index)).toEqual([]);
+  });
 
   it('lists every attach() option and no other', () => {
     expect(firstNames(tableHeaded(all, 'Option'))).toEqual(

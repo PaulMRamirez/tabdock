@@ -58,6 +58,10 @@ Your account is an invitee, signed in at the provider without being on the relay
 
 On a page with `confirmVia: 'client'`, your client did not confirm the call: declined, dismissed, expired after 120 seconds, already used, given for other arguments, another tool or page, or held from before a relay restart. The page never heard of the call (ADR 0026). **What to do:** call again and accept the question your client shows. A client with no person at it, such as headless `claude -p`, may decline at once.
 
+### `proposal_not_found`
+
+No proposal of yours has that id on that page: unknown, forgotten 10 minutes after it ended, or someone else's, which reads the same (ADR 0042). **What to do:** use the id `call_page_tool` returned.
+
 ### `tool_error`
 
 A page code: the page's handler threw. The client gets the page's error text under the untrusted label, flagged `isError`, with no code; [Writing handlers](03-add-to-your-app.md#writing-handlers) shows the text each runtime gives. **What to do:** read it as page data; the fix is in the page or the arguments.

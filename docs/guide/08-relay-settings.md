@@ -1,6 +1,6 @@
 # Relay settings
 
-Every relay setting is an environment variable starting `TABDOCK_`, and every one is optional: with none, the relay runs local mode. This page lists each one the relay reads, with the modes it applies to, its default and its bounds, all taken from [`packages/relay/src/config.ts`](../../packages/relay/src/config.ts). [Run a relay](07-run-a-relay.md) explains the modes.
+Every relay setting is an environment variable starting `TABDOCK_`, and every one is optional: with none, the relay runs local mode. This page and [Settings for rooms, images and state](14-settings-for-rooms.md) list each one the relay reads, with the modes it applies to, its default and its bounds, all taken from [`packages/relay/src/config.ts`](../../packages/relay/src/config.ts). [Run a relay](07-run-a-relay.md) explains the modes.
 
 ## How the relay reads them
 
@@ -55,7 +55,6 @@ Each limit applies in every mode. Hosted mode lowers three page limits by defaul
 | --------------------------------------- | -------- | -------------- | ----------------- | -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
 | `TABDOCK_MAX_SESSIONS_PER_USER`         | 20       | 20             | sessions          | 1                                | 2025-era MCP sessions one user holds, and 2026-07-28 listen streams                                                              |
 | `TABDOCK_MAX_SESSIONS`                  | 1000     | 1000           | sessions          | 1                                | The same for the whole relay                                                                                                     |
-| `TABDOCK_MAX_USERS_PER_PAGE`            | 10       | 10             | people            | 1, or 3 with invites             | People attached to one page                                                                                                      |
 | `TABDOCK_MAX_CALLS_PER_MINUTE`          | 120      | 120            | calls a minute    | 1                                | Calls one user makes to one page                                                                                                 |
 | `TABDOCK_MAX_QUEUE_DEPTH`               | 32       | 32             | calls             | 1                                | Writes waiting behind the running one on one page                                                                                |
 | `TABDOCK_MAX_REQUESTS_PER_USER`         | 240      | 240            | requests a minute | 1                                | One member's requests to `/mcp`: every tool call, every 2026-07-28 request and, with first-class tools, every 2025-era tool list |
@@ -73,6 +72,8 @@ Each limit applies in every mode. Hosted mode lowers three page limits by defaul
 
 The image's 192 MiB heap holds the default byte budgets; raise it with them ([Run a relay](07-run-a-relay.md#hosted-on-your-own-host)).
 
+More settings: [Settings for rooms, images and state](14-settings-for-rooms.md).
+
 ## Audit log
 
 | Setting                        | Modes                                   | Default                                                                                            | Bounds                                   | What it does                                                                                                                  |
@@ -88,7 +89,5 @@ Each start begins a new file, which rotates at 8 MiB or midnight UTC. Beside the
 The relay refuses, by name, rather than ignore a setting meaningless where it is set: the OAuth and `/pair` settings, `TABDOCK_OAUTH_MAX_TOKEN_AGE` and `TABDOCK_OAUTH_CLIENT_IDS` included, without `TABDOCK_PUBLIC_URL`; `TABDOCK_CLIENT_ADDRESS_HEADER` unless `TABDOCK_ENV=production` with a public URL; and `TABDOCK_TRUSTED_PROXY_CIDR` without that header.
 
 It also refuses `TABDOCK_INVITES` in local mode; `TABDOCK_MAX_REQUESTS_PER_INVITEE` without invites; the two audit bounds with no directory; `TABDOCK_DEV_ALLOW_NO_ORIGIN` in production or with a public URL; `TABDOCK_SPIKE` in production; any listening address but loopback, or `0.0.0.0` in hosted mode; and production with no sign-in settings at all.
-
-The one exception: the relay ignores `TABDOCK_DEV_TOKENS` beside a public URL, saying so in its banner, since a public relay takes only the provider's tokens.
 
 Next: [Use cases](09-use-cases.md).

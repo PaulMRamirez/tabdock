@@ -42,7 +42,7 @@ Other refusals name a setting: one outside its mode (`TABDOCK_INVITES does not a
 
 ## Limits
 
-Fixed numbers, each from the named constant. Rate limits, users per page, queue depth and the byte budgets are settings, with their defaults in [Relay settings](08-relay-settings.md).
+Fixed numbers, each from the named constant; M6's are on [their own page](15-limits-for-rooms.md). Rate limits, users per page, queue depth and the byte budgets are settings, with their defaults in [Relay settings](08-relay-settings.md).
 
 | Limit                                                          | Value                        | Constant                                                           | In                                                       |
 | -------------------------------------------------------------- | ---------------------------- | ------------------------------------------------------------------ | -------------------------------------------------------- |
@@ -68,4 +68,4 @@ Fixed numbers, each from the named constant. Rate limits, users per page, queue 
 | The widget's activity list                                     | 50 calls                     | `ACTIVITY_LIMIT`                                                   | core.ts                                                  |
 | A dev token                                                    | at least 24 characters       | `MIN_DEV_TOKEN_LENGTH`                                             | [auth.ts](../../packages/relay/src/auth.ts)              |
 
-Back to [the guide's index](README.md), or start again at [Concepts](01-concepts.md).
+Next: [The control handle](13-the-control-handle.md).

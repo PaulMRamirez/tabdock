@@ -55,15 +55,19 @@ await client.close();
 
 A public relay takes only tokens from its provider, which the SDK's OAuth support obtains while a person signs in; no credential yet lets a program use a public relay unattended ([Use cases](09-use-cases.md#not-yet)).
 
-## The five tools
+## The fixed tools
 
-| Tool              | Input                                            | Returns                                                                                                |
-| ----------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------ |
-| `list_pages`      | none                                             | Each page's `page` id, `origin`, `title`, your `role`, `state` (awake, asleep or gone) and `toolCount` |
-| `pair_page`       | `code` like `ABCDE-12345`, or a one-use `invite` | `Attached to page <id> (<origin>) as <role>.`, and as structured content `page`, `origin` and `role`   |
-| `list_page_tools` | `page`                                           | Each tool's name, description, schema, annotations and an `allowed` flag for your role                 |
-| `call_page_tool`  | `page`, `tool`, `arguments`                      | The page's result                                                                                      |
-| `detach_page`     | `page`                                           | `Detached from page <id>.` Only yours ends; pair again with a new code or one-use invite link          |
+| Tool                  | Input                                            | Returns                                                                                                                                       |
+| --------------------- | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list_pages`          | none                                             | Each page's `page` id, `origin`, `title`, your `role`, `state` (awake, asleep or gone) and `toolCount`                                        |
+| `pair_page`           | `code` like `ABCDE-12345`, or a one-use `invite` | `Attached to page <id> (<origin>) as <role>.`, and as structured content `page`, `origin` and `role`                                          |
+| `list_page_tools`     | `page`                                           | Each tool's name, description, schema, annotations and an `allowed` flag for your role                                                        |
+| `call_page_tool`      | `page`, `tool`, `arguments`                      | The page's result                                                                                                                             |
+| `detach_page`         | `page`                                           | `Detached from page <id>.` Only yours ends; pair again with a new code or one-use invite link                                                 |
+| `get_page_state`      | `page`                                           | The page's published state behind its label: `version`, `publishedAt`, `heardAt` and `value`, null while it shares nothing; runs no page tool |
+| `wait_for_page_state` | `page`, `after`, `timeoutMs`                     | The same with `changed`, as soon as the version passes `after`, or at the timeout (25 s unless set, at most 40 s)                             |
+| `get_proposal`        | `page`, `proposal`, `waitMs`                     | A proposal you made: pending, accepted with the page's result behind its label, dismissed, refused, expired, withdrawn or cancelled           |
+| `withdraw_proposal`   | `page`, `proposal`                               | Withdraws your pending proposal, so the operator is no longer asked                                                                           |
 
 You rarely name them: ask Claude to pair with a code, list your pages or do something on a page. A page that went gone stays in `list_pages` for 10 minutes. `pair_page`, `detach_page` and an empty `list_pages` also return structured content, which some clients, Claude Code among them, show in place of the text. Errors are tool errors whose text starts with a code, such as `not_attached: ...`; [Troubleshooting](11-troubleshooting.md) gives each code's remedy.
 
