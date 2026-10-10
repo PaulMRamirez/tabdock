@@ -18,13 +18,23 @@ import { connect, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type NodeIncomingMessageLike, toNodeHandler } from '@modelcontextprotocol/node';
+import type { AuthInfo } from '@modelcontextprotocol/server';
+import { MAX_RESULT_CHARS } from '@tabdock/protocol';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createDevTokenAuth } from '../src/index.ts';
+import { MIN_RESPONSE_BYTES } from '../src/config.ts';
+import {
+  type AttachmentRecord,
+  createDevTokenAuth,
+  createMemoryStore,
+  type DevTokenUser,
+} from '../src/index.ts';
 import { createLogger } from '../src/log.ts';
 import { createRepeatedLog } from '../src/repeated-lines.ts';
 import {
   inSlices,
   RESPONSE_CAP_LINE,
+  RESPONSE_CEILING_LINE,
+  RESPONSE_CEILING_MEMBERS_LINE,
   RESPONSE_CHECK_MS,
   RESPONSE_CUT_LINE,
   RESPONSE_SLICE_BYTES,
@@ -33,8 +43,10 @@ import {
   RESPONSES_WAITING_PER_INVITEE,
   RESPONSES_WAITING_PER_USER,
   responsesWaitingFor,
+  type ResponseStallOptions,
   type WatchedSocket,
 } from '../src/response-stalls.ts';
+import { GUEST, MEMBER, STRANGER, type TierRank } from '../src/sessions.ts';
 import { connectPage, type TestPage, TOOLS } from './helpers/page-client.ts';
 import { openListen, type OpenStream } from './helpers/raw-mcp.ts';
 import {
@@ -95,9 +107,23 @@ class StandIn extends EventEmitter {
 class Connection extends EventEmitter {
   destroyed = false;
 
+  /** Whether 'close' comes a tick after destroy(), as a real socket's does. */
+  readonly closesLater: boolean;
+
+  constructor(closesLater = false) {
+    super();
+    this.closesLater = closesLater;
+  }
+
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    if (this.closesLater) {
+      process.nextTick(() => {
+        this.emit('close');
+      });
+      return;
+    }
     this.emit('close');
   }
 }
@@ -111,6 +137,46 @@ function trackOn(
 ): Connection {
   stalls.track(response, userId, on);
   return on;
+}
+
+/**
+ * An answer's body as the SDK makes one: chunks enqueued as they come,
+ * whether anyone reads them or not, and a cancel that is heard.
+ */
+class FakeBody {
+  readonly cancelled: unknown[] = [];
+  readonly stream: ReadableStream<Uint8Array>;
+  #controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+
+  constructor() {
+    this.stream = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        this.#controller = controller;
+      },
+      cancel: (reason) => {
+        this.cancelled.push(reason);
+      },
+    });
+  }
+
+  push(bytes: number): void {
+    this.#controller?.enqueue(new Uint8Array(bytes));
+  }
+
+  end(): void {
+    this.#controller?.close();
+  }
+
+  fail(error: Error): void {
+    this.#controller?.error(error);
+  }
+}
+
+/** Lets the slicer's reads of what was pushed run. */
+async function settle(): Promise<void> {
+  for (let turn = 0; turn < 3; turn += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
 }
 
 let relay: TestRelay | undefined;
@@ -429,11 +495,194 @@ describe('responses waiting, a few a user (ADR 0030 notes, A5.6)', () => {
   });
 });
 
+/** A megabyte, as the ceiling tests count. */
+const MB = 1_000_000;
+
+/** Where the ceiling tests' users stand: by the start of their names. */
+function rankByName(userId: string): TierRank {
+  if (userId.startsWith('stranger')) return STRANGER;
+  if (userId.startsWith('guest')) return GUEST;
+  return MEMBER;
+}
+
+/** The check with a ceiling of `ceilingBytes` and its lines captured, under fake timers. */
+function watchCeiling(ceilingBytes: number): ReturnType<typeof watch> {
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'] });
+  const lines: Record<string, unknown>[] = [];
+  const log = createLogger({
+    sink: (line) => {
+      lines.push(JSON.parse(line) as Record<string, unknown>);
+    },
+  });
+  const repeated = createRepeatedLog(log, 60_000);
+  const stalls = new ResponseStalls({ lines: repeated, ceilingBytes, rankOf: rankByName });
+  return {
+    stalls,
+    lines,
+    close: () => {
+      stalls.close();
+      repeated.close();
+    },
+  };
+}
+
+/** A response of `userId`'s whose slicer holds `bytes` of its answer, which the test may change. */
+function holding(
+  stalls: ResponseStalls,
+  userId: string,
+  bytes: number,
+  on?: Connection,
+): { response: StandIn; held: { bytes: number } } {
+  const response = new StandIn();
+  const held = { bytes };
+  trackOn(stalls, response, userId, on);
+  stalls.measure(response, () => held.bytes);
+  return { response, held };
+}
+
+/** The users named in the lines with `msg`, in order. */
+function named(lines: Record<string, unknown>[], msg: string): unknown[] {
+  return lines.filter((line) => line.msg === msg).map((line) => line.userId);
+}
+
+describe('the relay-wide ceiling on what responses hold (S9, ADR 0044)', () => {
+  it("cuts a guest's older response once all held passes the ceiling, and never a member's", () => {
+    const { stalls, lines, close } = watchCeiling(10 * MB);
+    const guest = holding(stalls, 'guest-1', 4 * MB);
+    const member = holding(stalls, 'alice', 6 * MB);
+    // At the ceiling, not past it.
+    stalls.answering('alice');
+    expect([guest.response.destroyed, member.response.destroyed]).toEqual([false, false]);
+    const newer = holding(stalls, 'alice', 1 * MB);
+    stalls.answering('alice');
+    expect(guest.response.destroyed).toBe(true);
+    expect([member.response.destroyed, newer.response.destroyed]).toEqual([false, false]);
+    expect(stalls.size).toBe(2);
+    close();
+    expect(lines.filter((line) => line.msg === RESPONSE_CEILING_LINE)).toEqual([
+      expect.objectContaining({ level: 'warn', userId: 'guest-1' }),
+    ]);
+    expect(named(lines, RESPONSE_CEILING_MEMBERS_LINE)).toEqual([]);
+  });
+
+  it("cuts strangers' first, though newer, then guests', each oldest first, and stops once the rest fit", () => {
+    const { stalls, lines, close } = watchCeiling(10 * MB);
+    const olderGuest = holding(stalls, 'guest-1', 3 * MB);
+    const newerGuest = holding(stalls, 'guest-2', 3 * MB);
+    const olderStranger = holding(stalls, 'stranger-1', 2 * MB);
+    const newerStranger = holding(stalls, 'stranger-2', 2 * MB);
+    const member = holding(stalls, 'alice', 3 * MB);
+    stalls.answering('alice');
+    // 13 MB: both strangers go, and at 9 MB the guests fit.
+    expect(
+      [olderGuest, newerGuest, olderStranger, newerStranger, member].map(
+        ({ response }) => response.destroyed,
+      ),
+    ).toEqual([false, false, true, true, false]);
+    holding(stalls, 'bob', 3 * MB);
+    stalls.answering('bob');
+    // 12 MB and no stranger left: the older guest goes, and the newer fits.
+    expect([olderGuest.response.destroyed, newerGuest.response.destroyed]).toEqual([true, false]);
+    close();
+    // One line a window, naming the first user cut; the rest counted.
+    expect(named(lines, RESPONSE_CEILING_LINE)).toEqual(['stranger-1']);
+    expect(lines.filter((line) => line.msg === `${RESPONSE_CEILING_LINE}, repeated`)).toEqual([
+      expect.objectContaining({ repeated: 2 }),
+    ]);
+  });
+
+  it('counts what Node holds of a response unsent beside what its slicer holds', () => {
+    const { stalls, close } = watchCeiling(10 * MB);
+    const guest = holding(stalls, 'guest-1', 0);
+    guest.response.write(6 * MB);
+    holding(stalls, 'alice', 3 * MB);
+    stalls.answering('alice');
+    expect(guest.response.destroyed).toBe(false);
+    guest.held.bytes = 2 * MB;
+    stalls.answering('alice');
+    expect(guest.response.destroyed).toBe(true);
+    close();
+  });
+
+  it("never cuts a member's response, nor an invited account's that holds nothing, and says once a window that members alone pass it", () => {
+    const { stalls, lines, close } = watchCeiling(10 * MB);
+    const idle = holding(stalls, 'guest-1', 0);
+    const members = [holding(stalls, 'alice', 6 * MB), holding(stalls, 'bob', 6 * MB)];
+    for (let n = 0; n < 3; n += 1) stalls.chunkQueued();
+    // A check called, not timed: a faked timer would also end the lines' window early.
+    stalls.check();
+    expect([idle, ...members].some(({ response }) => response.destroyed)).toBe(false);
+    close();
+    // No user named: the line is about the relay, not anyone in it.
+    expect(named(lines, RESPONSE_CEILING_MEMBERS_LINE)).toEqual([undefined]);
+    expect(
+      lines.filter((line) => line.msg === `${RESPONSE_CEILING_MEMBERS_LINE}, repeated`),
+    ).toEqual([expect.objectContaining({ repeated: 3 })]);
+    expect(named(lines, RESPONSE_CEILING_LINE)).toEqual([]);
+  });
+
+  it('holds the ceiling as a slicer queues a chunk and at every check, before any answer is handed over', () => {
+    const { stalls, close } = watchCeiling(10 * MB);
+    const first = holding(stalls, 'guest-1', 5 * MB);
+    holding(stalls, 'alice', 4 * MB);
+    stalls.chunkQueued();
+    expect(first.response.destroyed).toBe(false);
+    // Its answer grows as the SDK hands the slicer more of it.
+    first.held.bytes = 7 * MB;
+    stalls.chunkQueued();
+    expect(first.response.destroyed).toBe(true);
+    const second = holding(stalls, 'guest-2', 5 * MB);
+    second.held.bytes = 7 * MB;
+    expect(second.response.destroyed).toBe(false);
+    vi.advanceTimersByTime(RESPONSE_CHECK_MS);
+    expect(second.response.destroyed).toBe(true);
+    close();
+  });
+
+  it('cuts a response queued behind another with its connection, and counts all queued there as let go', async () => {
+    const { stalls, close } = watchCeiling(10 * MB);
+    // Its 'close' comes a tick later, as a socket's does, so the other
+    // response queued there is still watched when the ceiling counts again.
+    const connection = new Connection(true);
+    // A stream its client reads, with two guests' answers pipelined behind
+    // it, and between them in age a guest's on a connection of its own.
+    holding(stalls, 'alice', 0, connection);
+    const first = holding(stalls, 'guest-1', 4 * MB, connection);
+    const elsewhere = holding(stalls, 'guest-2', 3 * MB);
+    const queued = [first, holding(stalls, 'guest-3', 4 * MB, connection)];
+    for (const { response } of queued) response.connected = false;
+    holding(stalls, 'bob', 5 * MB);
+    stalls.answering('bob');
+    // 16 MB: the oldest guest's goes, taking its connection and the other
+    // queued there, and 8 MB is left, so the guest on its own connection,
+    // older than the one queued, stays.
+    expect(connection.destroyed).toBe(true);
+    expect(elsewhere.response.destroyed).toBe(false);
+    await new Promise((resolve) => {
+      process.nextTick(resolve);
+    });
+    expect(queued.every(({ response }) => response.destroyed)).toBe(true);
+    expect(elsewhere.response.destroyed).toBe(false);
+    close();
+  });
+
+  it('cuts nothing when given no ceiling', () => {
+    const { stalls, close } = watch();
+    const guest = new StandIn();
+    trackOn(stalls, guest, 'guest-1');
+    stalls.measure(guest, () => 500 * MB);
+    stalls.chunkQueued();
+    stalls.answering('guest-1');
+    expect(guest.destroyed).toBe(false);
+    close();
+  });
+});
+
 describe('inSlices', () => {
   it('cuts each chunk into views of at most RESPONSE_SLICE_BYTES, keeping status, headers and every byte', async () => {
     const source = new Uint8Array(3 * RESPONSE_SLICE_BYTES + 5).map((_, n) => n % 251);
     const original = new Response(source, { status: 202, headers: { 'x-kept': 'yes' } });
-    const sliced = inSlices(original);
+    const sliced = inSlices(original).response;
     expect(sliced.status).toBe(202);
     expect(sliced.headers.get('x-kept')).toBe('yes');
     const sizes: number[] = [];
@@ -451,9 +700,82 @@ describe('inSlices', () => {
     expect(received).toEqual([...source]);
   });
 
-  it('leaves a response with no body as it is', () => {
+  it('leaves a response with no body as it is, holding nothing', () => {
     const empty = new Response(null, { status: 202 });
-    expect(inSlices(empty)).toBe(empty);
+    const sliced = inSlices(empty);
+    expect(sliced.response).toBe(empty);
+    expect(sliced.queuedBytes()).toBe(0);
+  });
+
+  it('reads the answer as it comes, before anyone asks, and counts what it holds down as each slice is taken (ADR 0044)', async () => {
+    const source = new FakeBody();
+    let heard = 0;
+    const sliced = inSlices(new Response(source.stream), () => {
+      heard += 1;
+    });
+    source.push(2 * RESPONSE_SLICE_BYTES + 100);
+    source.push(300);
+    await settle();
+    // Nobody has read a byte, and both chunks are held where they can be counted.
+    expect(sliced.queuedBytes()).toBe(2 * RESPONSE_SLICE_BYTES + 400);
+    expect(heard).toBe(2);
+    const reader: ReadableStreamDefaultReader<Uint8Array> | undefined =
+      sliced.response.body?.getReader();
+    if (reader === undefined) throw new Error('no body');
+    const sizes: number[] = [];
+    const left: number[] = [];
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      sizes.push(next.value.byteLength);
+      left.push(sliced.queuedBytes());
+      // The last slice is taken only once the source has ended.
+      if (left.length === 4) source.end();
+    }
+    expect(sizes).toEqual([RESPONSE_SLICE_BYTES, RESPONSE_SLICE_BYTES, 100, 300]);
+    expect(left).toEqual([RESPONSE_SLICE_BYTES + 400, 400, 300, 0]);
+  });
+
+  it('cancels the answer underneath as its client goes, and lets go of what it held', async () => {
+    const source = new FakeBody();
+    const sliced = inSlices(new Response(source.stream));
+    source.push(5 * RESPONSE_SLICE_BYTES);
+    await settle();
+    const reader: ReadableStreamDefaultReader<Uint8Array> | undefined =
+      sliced.response.body?.getReader();
+    if (reader === undefined) throw new Error('no body');
+    expect((await reader.read()).value?.byteLength).toBe(RESPONSE_SLICE_BYTES);
+    await reader.cancel('gone');
+    expect(source.cancelled).toEqual(['gone']);
+    expect(sliced.queuedBytes()).toBe(0);
+  });
+
+  it('fails the body its client reads as the answer underneath fails, holding nothing after', async () => {
+    const source = new FakeBody();
+    const sliced = inSlices(new Response(source.stream));
+    source.push(1000);
+    source.fail(new Error('the SDK went'));
+    await settle();
+    expect(sliced.queuedBytes()).toBe(0);
+    const reader: ReadableStreamDefaultReader<Uint8Array> | undefined =
+      sliced.response.body?.getReader();
+    if (reader === undefined) throw new Error('no body');
+    await expect(reader.read()).rejects.toThrow('the SDK went');
+  });
+
+  it('waits for more of a stream that has not ended, rather than ending it', async () => {
+    const source = new FakeBody();
+    const sliced = inSlices(new Response(source.stream));
+    const reader: ReadableStreamDefaultReader<Uint8Array> | undefined =
+      sliced.response.body?.getReader();
+    if (reader === undefined) throw new Error('no body');
+    const first = reader.read();
+    await settle();
+    source.push(13);
+    expect((await first).value?.byteLength).toBe(13);
+    const second = reader.read();
+    source.end();
+    expect((await second).done).toBe(true);
   });
 });
 
@@ -479,6 +801,8 @@ interface Answering {
   path: string;
   /** How each response the server made ended, in the order the requests came. */
   outcomes: Promise<'finished' | 'closed'>[];
+  /** Answers handed to the adapter so far. */
+  answered: () => number;
   close: () => Promise<void>;
 }
 
@@ -491,16 +815,31 @@ interface Answering {
  * `answerAfterMs` first, as a call waits on its page.
  */
 async function serveAll(stalls: ResponseStalls, answerAfterMs = 0): Promise<Answering> {
+  // As relay.ts keys each request's Node response by its auth object.
+  const answeredOn = new WeakMap<AuthInfo, ServerResponse>();
+  let answered = 0;
   const handler = toNodeHandler({
-    fetch: async () => {
+    fetch: async (_request, options) => {
       if (answerAfterMs > 0) await new Promise((resolve) => setTimeout(resolve, answerAfterMs));
-      stalls.answering('alice');
-      return inSlices(Response.json(RESULT));
+      const auth = options?.authInfo;
+      stalls.answering(auth?.clientId ?? 'alice');
+      const slices = inSlices(Response.json(RESULT), () => {
+        stalls.chunkQueued();
+      });
+      const written = auth === undefined ? undefined : answeredOn.get(auth);
+      if (written !== undefined) stalls.measure(written, slices.queuedBytes);
+      answered += 1;
+      return slices.response;
     },
   });
   const outcomes: Promise<'finished' | 'closed'>[] = [];
   const server = createServer((request: IncomingMessage, response) => {
-    stalls.track(response, 'alice', request.socket);
+    // The user a request names in its query, alice when it names none.
+    const userId = new URL(request.url ?? '/', 'http://relay.invalid').searchParams.get('user');
+    const auth: AuthInfo = { token: '', clientId: userId ?? 'alice', scopes: [] };
+    answeredOn.set(auth, response);
+    (request as IncomingMessage & { auth?: AuthInfo }).auth = auth;
+    stalls.track(response, auth.clientId, request.socket);
     outcomes.push(
       new Promise((resolve) => {
         response.once('finish', () => {
@@ -519,6 +858,7 @@ async function serveAll(stalls: ResponseStalls, answerAfterMs = 0): Promise<Answ
   return {
     path,
     outcomes,
+    answered: () => answered,
     close: async () => {
       server.closeAllConnections();
       await new Promise((resolve) => server.close(resolve));
@@ -528,6 +868,11 @@ async function serveAll(stalls: ResponseStalls, answerAfterMs = 0): Promise<Answ
 
 /** One GET for an answer, the connection closed after it. */
 const ONE_REQUEST = 'GET /mcp HTTP/1.1\r\nHost: relay.invalid\r\nConnection: close\r\n\r\n';
+
+/** ONE_REQUEST, made as `userId`. */
+function requestAs(userId: string): string {
+  return ONE_REQUEST.replace('/mcp', `/mcp?user=${userId}`);
+}
 
 interface Reader {
   ended: Promise<void>;
@@ -613,7 +958,7 @@ async function serveOne(
 describe.skipIf(process.platform === 'win32')(
   'on a real socket, written as relay.ts writes it (ADR 0032)',
   () => {
-    function realStalls(waitingCapOf?: (userId: string) => number): {
+    function realStalls(options: Omit<ResponseStallOptions, 'lines'> = {}): {
       stalls: ResponseStalls;
       lines: Record<string, unknown>[];
     } {
@@ -626,7 +971,7 @@ describe.skipIf(process.platform === 'win32')(
       const stalls = new ResponseStalls({
         lines: createRepeatedLog(log, 60_000),
         checkMs: REAL_CHECK_MS,
-        ...(waitingCapOf === undefined ? {} : { waitingCapOf }),
+        ...options,
       });
       return { stalls, lines };
     }
@@ -668,7 +1013,7 @@ describe.skipIf(process.platform === 'win32')(
       // No cap, so only the stall rule acts: the first answer is cut off and
       // its connection goes. Node closes that one only; the rest, queued
       // behind it with their bodies, stayed held for good.
-      const { stalls, lines } = realStalls(() => Number.POSITIVE_INFINITY);
+      const { stalls, lines } = realStalls({ waitingCapOf: () => Number.POSITIVE_INFINITY });
       // The answers wait, as calls wait on a page, so every request is read before any is written.
       const server = await serveAll(stalls, 100);
       const pipelined = 'GET /mcp HTTP/1.1\r\nHost: relay.invalid\r\n\r\n'.repeat(PIPELINED);
@@ -700,7 +1045,7 @@ describe.skipIf(process.platform === 'win32')(
 
     it('cuts off the oldest of answers a user reads steadily once more wait than they may, and keeps the rest', async () => {
       const cap = 3;
-      const { stalls, lines } = realStalls(() => cap);
+      const { stalls, lines } = realStalls({ waitingCapOf: () => cap });
       const server = await serveAll(stalls);
       // Each read as the reader of the first test reads, never stalling.
       const readers: Reader[] = [];
@@ -721,8 +1066,69 @@ describe.skipIf(process.platform === 'win32')(
         await server.close();
       }
     }, 20_000);
+
+    /**
+     * A guest leaves its 3 MB answer unread, then two members read theirs
+     * steadily, under a ceiling of MIN_RESPONSE_BYTES with the stall rule
+     * held off. The guest's answer, written as relay.ts writes it, is almost
+     * all in its slicer's queue, the kernel holding only its buffer's worth.
+     */
+    async function guestThenMembers(
+      ceilingBytes: number | undefined,
+    ): Promise<{ lines: Record<string, unknown>[]; guest: 'finished' | 'closed' | 'open' }> {
+      const { stalls, lines } = realStalls({
+        checkMs: 60_000,
+        rankOf: (userId) => (userId === GUEST_ID ? GUEST : MEMBER),
+        ...(ceilingBytes === undefined ? {} : { ceilingBytes }),
+      });
+      const server = await serveAll(stalls);
+      const readers: Reader[] = [];
+      try {
+        readers.push(readFrom(server.path, 0, 0, requestAs(GUEST_ID)));
+        await answersHanded(server, 1);
+        for (const [n, member] of ['alice', 'bob'].entries()) {
+          readers.push(
+            readFrom(server.path, 1_500_000, Number.POSITIVE_INFINITY, requestAs(member)),
+          );
+          await answersHanded(server, n + 2);
+        }
+        const [guest, ...members] = server.outcomes;
+        expect(await Promise.all(members)).toEqual(['finished', 'finished']);
+        const open = new Promise<'open'>((resolve) => setImmediate(resolve, 'open'));
+        return { lines, guest: await Promise.race([guest ?? open, open]) };
+      } finally {
+        stalls.close();
+        for (const reader of readers) reader.close();
+        await server.close();
+      }
+    }
+
+    it("cuts an invited account's unread answer once all that waits passes the ceiling, counting what its slicer holds, and never a member's (ADR 0044)", async () => {
+      const { lines, guest } = await guestThenMembers(MIN_RESPONSE_BYTES);
+      expect(guest).toBe('closed');
+      expect(lines.filter((line) => line.msg === RESPONSE_CEILING_LINE)).toEqual([
+        expect.objectContaining({ level: 'warn', userId: GUEST_ID }),
+      ]);
+      // Bob's answer came while Alice still held much of hers: members alone, so only a line.
+      expect(named(lines, RESPONSE_CEILING_MEMBERS_LINE)).toEqual([undefined]);
+      expect(lines.filter((line) => line.msg === RESPONSE_CUT_LINE)).toEqual([]);
+    }, 20_000);
+
+    it("keeps the guest's unread answer whole without a ceiling, as before M6", async () => {
+      const { lines, guest } = await guestThenMembers(undefined);
+      expect(guest).toBe('open');
+      expect(named(lines, RESPONSE_CEILING_LINE)).toEqual([]);
+    }, 20_000);
   },
 );
+
+/** Polls until `server` has handed `count` answers to the adapter, and their slicers have read them. */
+async function answersHanded(server: Answering, count: number): Promise<void> {
+  while (server.answered() < count) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  await settle();
+}
 
 /**
  * Makes the response to every request carrying the stall header report bytes
@@ -899,56 +1305,178 @@ describe('the cut-off on /mcp (ADRs 0030 and 0032)', () => {
     const client = await connectClient(relay.relay, ALICE, { modern: true });
     await pairAndApprove(client, page);
     await client.close();
-    const url = new URL(relay.relay.mcpUrl);
-    const envelope = {
-      'io.modelcontextprotocol/protocolVersion': '2026-07-28',
-      'io.modelcontextprotocol/clientInfo': { name: 'pipelining', version: '1.0.0' },
-      'io.modelcontextprotocol/clientCapabilities': {},
-    };
-    const post = (headers: Record<string, string>, message: unknown): string => {
-      const body = JSON.stringify(message);
-      const lines = Object.entries({
-        Host: url.host,
-        Authorization: `Bearer ${ALICE.token}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json, text/event-stream',
-        'Mcp-Protocol-Version': '2026-07-28',
-        ...headers,
-        'Content-Length': String(Buffer.byteLength(body)),
-      }).map(([name, value]) => `${name}: ${value}\r\n`);
-      return `POST /mcp HTTP/1.1\r\n${lines.join('')}\r\n${body}`;
-    };
-    const listen = post(
-      { 'Mcp-Method': 'subscriptions/listen' },
-      {
-        jsonrpc: '2.0',
-        id: 'listen',
-        method: 'subscriptions/listen',
-        params: { _meta: envelope, notifications: { toolsListChanged: true } },
-      },
-    );
-    const call = post(
-      { 'Mcp-Method': 'tools/call', 'Mcp-Name': 'call_page_tool' },
-      {
-        jsonrpc: '2.0',
-        id: 'call',
-        method: 'tools/call',
-        params: {
-          name: 'call_page_tool',
-          arguments: { page: page.pageId, tool: 'get_view' },
-          _meta: envelope,
-        },
-      },
-    );
-    // One write, so the relay reads both before it answers either: the
-    // call's answer waits behind the stream, which never ends.
-    const socket = connect(Number(url.port), url.hostname);
-    socket.on('error', () => undefined);
-    await new Promise<void>((resolve) => socket.once('connect', resolve));
-    socket.write(listen + call);
+    const socket = await callBehindStream(relay, page);
     const invoke = await page.next('invoke');
     socket.destroy();
     // Long before the call's 20 s deadline.
     expect((await page.next('cancel', 2000)).callId).toBe(invoke.callId);
   });
+
+  it("counts what an answer queued in the relay holds toward TABDOCK_MAX_RESPONSE_BYTES, cutting a stranger's response before an older guest's and never the member's (ADR 0044)", async () => {
+    // No check runs: the cut comes as the member's answer is read into its slicer.
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    heldMarked();
+    const store = createMemoryStore();
+    relay = await startRelay({
+      auth: createDevTokenAuth([ALICE, GUEST_USER, STRANGER_USER]),
+      invites: true,
+      store,
+      limits: { responseBytes: MIN_RESPONSE_BYTES },
+      timings: { callDeadlineMs: 20_000 },
+    });
+    // The largest answer, about 0.72 MB on the wire: JSON writes each character in six bytes.
+    const page = await connectPage(relay.relay.pageUrl, {
+      tools: TOOLS,
+      onInvoke: () => ({ ok: true, content: '\u0001'.repeat(MAX_RESULT_CHARS) }),
+    });
+    pages.push(page);
+    store.attachments.put(guestAttachment(GUEST_USER.userId));
+    // Together 3.8 MB of the 4 MiB ceiling, the stranger's the newer.
+    const guest = await openListen(relay.relay, GUEST_USER, {
+      headers: { 'X-Test-Held': '2000000' },
+    });
+    const stranger = await openListen(relay.relay, STRANGER_USER, {
+      headers: { 'X-Test-Held': '1800000' },
+    });
+    streams.push(guest, stranger);
+    expect([guest.streaming, stranger.streaming]).toEqual([true, true]);
+    const client = await connectClient(relay.relay, ALICE, { modern: true });
+    await pairAndApprove(client, page);
+    await client.close();
+    // The member's answer waits behind her stream, all of it in the relay:
+    // Node takes only its high-water mark of a response that has no socket.
+    const socket = await callBehindStream(relay, page);
+    try {
+      await page.next('invoke');
+      await stranger.ended;
+      const ended = new Set<OpenStream>();
+      void guest.ended.then(() => {
+        ended.add(guest);
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(ended.size).toBe(0);
+      expect(socket.destroyed).toBe(false);
+      const cut = relay.lines
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((line) => line.msg === RESPONSE_CEILING_LINE);
+      expect(cut).toEqual([
+        expect.objectContaining({ level: 'warn', userId: STRANGER_USER.userId }),
+      ]);
+      expect(JSON.stringify(cut)).not.toContain(STRANGER_USER.token);
+    } finally {
+      socket.destroy();
+    }
+  });
 });
+
+/** An invited account holding an attachment, so a guest rather than a stranger (sessions.ts's rankOf). */
+const GUEST_USER: DevTokenUser = {
+  userId: GUEST_ID,
+  displayName: 'ignored',
+  token: 'guest-ceiling-dev-token-3c7a91e2',
+  kind: 'invitee',
+};
+
+/** An invited account holding none. */
+const STRANGER_USER: DevTokenUser = {
+  userId: `g_${'0b'.repeat(16)}`,
+  displayName: 'ignored',
+  token: 'stranger-ceiling-dev-token-8e15f4d0',
+  kind: 'invitee',
+};
+
+/** An attachment as an invite would have made it, to put straight into the store. */
+function guestAttachment(userId: string): AttachmentRecord {
+  return {
+    pageId: 'pg_HELD000000',
+    userId,
+    displayName: 'unverified account',
+    kind: 'invitee',
+    role: 'observer',
+    grantedAt: Date.now(),
+    lastUsedAt: null,
+    expiresAt: null,
+    clients: [],
+    inviteId: 'inv_held',
+    endsAt: Date.now() + 60 * 60_000,
+    inviteRole: 'observer',
+    sponsorId: 'alice',
+    emailHash: null,
+  };
+}
+
+/**
+ * Makes the response to every request carrying the held header report that
+ * many bytes more waiting to be sent than it really has, as one whose client
+ * stopped reading a large answer would.
+ */
+function heldMarked(): void {
+  const real = Object.getOwnPropertyDescriptor(
+    Object.getPrototypeOf(ServerResponse.prototype) as object,
+    'writableLength',
+  );
+  Object.defineProperty(ServerResponse.prototype, 'writableLength', {
+    configurable: true,
+    get(this: ServerResponse): number {
+      const held = Number(this.req.headers['x-test-held'] ?? 0);
+      return held + ((real?.get?.call(this) as number | undefined) ?? 0);
+    },
+  });
+  restore = () => {
+    Reflect.deleteProperty(ServerResponse.prototype, 'writableLength');
+  };
+}
+
+/**
+ * Alice's listen stream and a call to `page` behind it, written to one new
+ * connection in one write, so the relay reads both before it answers either
+ * and the call's answer waits behind the stream, which never ends.
+ */
+async function callBehindStream(test: TestRelay, page: TestPage): Promise<Socket> {
+  const url = new URL(test.relay.mcpUrl);
+  const envelope = {
+    'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+    'io.modelcontextprotocol/clientInfo': { name: 'pipelining', version: '1.0.0' },
+    'io.modelcontextprotocol/clientCapabilities': {},
+  };
+  const post = (headers: Record<string, string>, message: unknown): string => {
+    const body = JSON.stringify(message);
+    const lines = Object.entries({
+      Host: url.host,
+      Authorization: `Bearer ${ALICE.token}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+      'Mcp-Protocol-Version': '2026-07-28',
+      ...headers,
+      'Content-Length': String(Buffer.byteLength(body)),
+    }).map(([name, value]) => `${name}: ${value}\r\n`);
+    return `POST /mcp HTTP/1.1\r\n${lines.join('')}\r\n${body}`;
+  };
+  const listen = post(
+    { 'Mcp-Method': 'subscriptions/listen' },
+    {
+      jsonrpc: '2.0',
+      id: 'listen',
+      method: 'subscriptions/listen',
+      params: { _meta: envelope, notifications: { toolsListChanged: true } },
+    },
+  );
+  const call = post(
+    { 'Mcp-Method': 'tools/call', 'Mcp-Name': 'call_page_tool' },
+    {
+      jsonrpc: '2.0',
+      id: 'call',
+      method: 'tools/call',
+      params: {
+        name: 'call_page_tool',
+        arguments: { page: page.pageId, tool: 'get_view' },
+        _meta: envelope,
+      },
+    },
+  );
+  const socket = connect(Number(url.port), url.hostname);
+  socket.on('error', () => undefined);
+  await new Promise<void>((resolve) => socket.once('connect', resolve));
+  socket.write(listen + call);
+  return socket;
+}

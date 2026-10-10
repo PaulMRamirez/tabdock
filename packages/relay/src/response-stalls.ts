@@ -45,9 +45,23 @@
 // went. So when a watched connection closes, every response still queued on
 // it is destroyed and closed here, as Node closes the one it was writing,
 // and cutting a queued response ends its connection.
+//
+// Those bound each user, not the relay: some 40 members, or 110 invitees
+// holding pages, all leaving answers unread at once would fill what the
+// reference host leaves beside its heap, and image answers (ADR 0039) are
+// larger than the counts assumed. So the relay also caps the bytes every
+// watched response holds together (TABDOCK_MAX_RESPONSE_BYTES, ADR 0044).
+// What a response holds is what inSlices has read of its answer and not yet
+// handed on, plus what Node holds of it unsent; inSlices reads the SDK's
+// body as it comes, so an unread answer's bytes sit in a queue it can count
+// rather than in the SDK's stream, where they sat before uncounted. Past the
+// cap, strangers' responses go first, then guests', each oldest first, as
+// sessions give way (sessions.ts); a member's never does, since members are
+// the owner's own and each is bounded by the count above.
 
 import { InviteeIdSchema } from '@tabdock/protocol';
 import type { RepeatedLog } from './repeated-lines.ts';
+import { GUEST, MEMBER, STRANGER, type TierRank } from './sessions.ts';
 
 /** How often the responses are looked at. */
 export const RESPONSE_CHECK_MS = 10_000;
@@ -88,27 +102,108 @@ export function responsesWaitingFor(userId: string): number {
  */
 export const RESPONSE_SLICE_BYTES = 16_384;
 
+/** The line a cut past the relay-wide ceiling writes, once a window and counted after. */
+export const RESPONSE_CEILING_LINE =
+  'mcp response cut off: responses waiting to be read hold all the relay lets invited accounts hold';
+
+/** The line written, once a window, when members' responses alone pass the ceiling and none is cut. */
+export const RESPONSE_CEILING_MEMBERS_LINE =
+  "mcp responses waiting to be read hold more than the relay's ceiling, all of them members'";
+
+/** An answer handed on in slices, and what it has read and not yet handed on. */
+export interface Slices {
+  readonly response: Response;
+  /** Bytes read from the answer's body that the Node adapter has not yet taken. */
+  readonly queuedBytes: () => number;
+}
+
+const NOTHING_QUEUED = (): number => 0;
+
 /**
- * The same response, its body cut into slices of at most RESPONSE_SLICE_BYTES.
- * The slices are views of the chunk they came from, so nothing is copied, and
- * a client that goes cancels the source through the pipe as before.
+ * The same response, its body cut into slices of at most
+ * RESPONSE_SLICE_BYTES, each handed on only as the Node adapter asks for
+ * one. The body underneath is read as fast as it comes, into a queue whose
+ * size queuedBytes() reports and `queued` hears of each time it grows, so
+ * that what an unread answer holds is counted where it waits (ADR 0044).
+ * Reading ahead holds nothing the SDK did not already hold: its streams
+ * enqueue whatever they are given, read or not. The slices are views of the
+ * chunk they came from, so nothing is copied; a client that goes cancels
+ * the body underneath, and what was queued is let go.
  */
-export function inSlices(response: Response): Response {
-  if (response.body === null) return response;
-  const body = response.body.pipeThrough(
-    new TransformStream<Uint8Array, Uint8Array>({
-      transform(chunk, controller) {
-        if (chunk.byteLength <= RESPONSE_SLICE_BYTES) {
-          controller.enqueue(chunk);
+export function inSlices(response: Response, queued?: () => void): Slices {
+  const source = response.body;
+  if (source === null) return { response, queuedBytes: NOTHING_QUEUED };
+  const reader: ReadableStreamDefaultReader<Uint8Array> = source.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  let ended = false;
+  let stopped = false;
+  let waiting: (() => void) | null = null;
+  const wake = (): void => {
+    const resume = waiting;
+    waiting = null;
+    resume?.();
+  };
+  const body = new ReadableStream<Uint8Array>(
+    {
+      start(controller) {
+        void (async () => {
+          try {
+            for (;;) {
+              const next = await reader.read();
+              if (next.done || stopped) break;
+              chunks.push(next.value);
+              bytes += next.value.byteLength;
+              wake();
+              queued?.();
+            }
+            ended = true;
+          } catch (error) {
+            if (stopped) return;
+            // As the pipe did: the client sees the body fail, and nothing stays queued.
+            stopped = true;
+            chunks.length = 0;
+            bytes = 0;
+            controller.error(error);
+          }
+          wake();
+        })();
+      },
+      async pull(controller) {
+        let head = chunks[0];
+        while (head === undefined) {
+          if (stopped) return;
+          if (ended) {
+            controller.close();
+            return;
+          }
+          await new Promise<void>((resolve) => {
+            waiting = resolve;
+          });
+          head = chunks[0];
+        }
+        if (head.byteLength <= RESPONSE_SLICE_BYTES) {
+          chunks.shift();
+          bytes -= head.byteLength;
+          controller.enqueue(head);
           return;
         }
-        for (let at = 0; at < chunk.byteLength; at += RESPONSE_SLICE_BYTES) {
-          controller.enqueue(chunk.subarray(at, at + RESPONSE_SLICE_BYTES));
-        }
+        chunks[0] = head.subarray(RESPONSE_SLICE_BYTES);
+        bytes -= RESPONSE_SLICE_BYTES;
+        controller.enqueue(head.subarray(0, RESPONSE_SLICE_BYTES));
       },
-    }),
+      async cancel(reason) {
+        stopped = true;
+        chunks.length = 0;
+        bytes = 0;
+        wake();
+        await reader.cancel(reason);
+      },
+    },
+    // Nothing waits on this side: a slice is cut only when the adapter asks.
+    { highWaterMark: 0 },
   );
-  return new Response(body, response);
+  return { response: new Response(body, response), queuedBytes: () => bytes };
 }
 
 /** What the check needs of a response's connection; node's net.Socket has it. */
@@ -148,6 +243,8 @@ interface Watched {
   sent: number | null;
   /** Checks in a row since then that found no more sent. */
   stalls: number;
+  /** What inSlices has read of its answer and not yet handed on (measure()); nothing until then. */
+  queued: () => number;
 }
 
 /** The responses watched on one connection, and the listener that hears it close. */
@@ -162,7 +259,14 @@ export interface ResponseStallOptions {
   checkMs?: number;
   /** Responses with bytes waiting each user may have; left out, responsesWaitingFor. */
   waitingCapOf?: (userId: string) => number;
+  /** Bytes every watched response may hold together (limits.responseBytes); left out, no ceiling. */
+  ceilingBytes?: number;
+  /** Where a user stands when the ceiling is passed (sessions.ts's rankOf); left out, a member. */
+  rankOf?: (userId: string) => TierRank;
 }
+
+/** Who gives way to the ceiling, in order: never a member. */
+const GIVES_WAY: readonly TierRank[] = [STRANGER, GUEST];
 
 /** Bytes whose writes have finished on the socket, or null when it says nothing. */
 function finishedBytes(socket: WatchedSocket | null): number | null {
@@ -174,6 +278,8 @@ export class ResponseStalls {
   readonly #lines: RepeatedLog;
   readonly #checkMs: number;
   readonly #waitingCapOf: (userId: string) => number;
+  readonly #ceilingBytes: number;
+  readonly #rankOf: (userId: string) => TierRank;
   /** Every response watched, oldest first. */
   readonly #watched = new Map<WatchedResponse, Watched>();
   /** The same by user, oldest first, for the cap on responses waiting. */
@@ -185,6 +291,8 @@ export class ResponseStalls {
     this.#lines = options.lines;
     this.#checkMs = options.checkMs ?? RESPONSE_CHECK_MS;
     this.#waitingCapOf = options.waitingCapOf ?? responsesWaitingFor;
+    this.#ceilingBytes = options.ceilingBytes ?? Number.POSITIVE_INFINITY;
+    this.#rankOf = options.rankOf ?? (() => MEMBER);
   }
 
   /** Responses being watched now. */
@@ -203,7 +311,13 @@ export class ResponseStalls {
       if (response.socket === null) this.#release(response);
       return;
     }
-    this.#watched.set(response, { userId, connection, sent: null, stalls: 0 });
+    this.#watched.set(response, {
+      userId,
+      connection,
+      sent: null,
+      stalls: 0,
+      queued: NOTHING_QUEUED,
+    });
     let mine = this.#byUser.get(userId);
     if (mine === undefined) {
       mine = new Set();
@@ -243,6 +357,25 @@ export class ResponseStalls {
    */
   answering(userId: string): void {
     this.#trim(userId);
+    this.#ceiling();
+    this.#idle();
+  }
+
+  /**
+   * Counts what inSlices has read of `response`'s answer and not yet handed
+   * on as part of what it holds, until it is no longer watched.
+   */
+  measure(response: WatchedResponse, queuedBytes: () => number): void {
+    const watched = this.#watched.get(response);
+    if (watched !== undefined) watched.queued = queuedBytes;
+  }
+
+  /**
+   * An answer's slicer queued another chunk: the ceiling is held at once, so
+   * answers read between two checks cannot pile up past it.
+   */
+  chunkQueued(): void {
+    this.#ceiling();
     this.#idle();
   }
 
@@ -251,7 +384,8 @@ export class ResponseStalls {
    * does one whose socket finished more bytes since the last check; one
    * seen waiting for the first time is noted; and one waiting with no more
    * sent counts a stall. At RESPONSE_STALL_CHECKS stalls the response goes.
-   * Then each user's oldest responses waiting past their cap go.
+   * Then each user's oldest responses waiting past their cap go, and then
+   * invited accounts' past the relay-wide ceiling.
    */
   check(): void {
     for (const [response, watched] of this.#watched) {
@@ -274,6 +408,7 @@ export class ResponseStalls {
       this.#cut(response, RESPONSE_CUT_LINE);
     }
     for (const userId of [...this.#byUser.keys()]) this.#trim(userId);
+    this.#ceiling();
     this.#idle();
   }
 
@@ -294,6 +429,47 @@ export class ResponseStalls {
     const over = waiting.length - this.#waitingCapOf(userId);
     if (over <= 0) return;
     for (const response of waiting.slice(0, over)) this.#cut(response, RESPONSE_CAP_LINE);
+  }
+
+  /**
+   * What a response holds: its answer read and not yet handed on, and what
+   * Node holds of it unsent. One already destroyed, or whose connection is,
+   * holds nothing that is not being let go.
+   */
+  #held(response: WatchedResponse, watched: Watched): number {
+    if (response.destroyed || watched.connection.destroyed) return 0;
+    return watched.queued() + Math.max(0, response.writableLength);
+  }
+
+  #heldInAll(): number {
+    let total = 0;
+    for (const [response, watched] of this.#watched) total += this.#held(response, watched);
+    return total;
+  }
+
+  /**
+   * Past the ceiling, cuts strangers' responses holding bytes, oldest first,
+   * then guests', until the rest fit; a member's never. When members'
+   * alone pass it, nothing is cut and a line says so.
+   */
+  #ceiling(): void {
+    if (this.#ceilingBytes === Number.POSITIVE_INFINITY) return;
+    let total = this.#heldInAll();
+    if (total <= this.#ceilingBytes) return;
+    for (const rank of GIVES_WAY) {
+      for (const [response, watched] of [...this.#watched]) {
+        if (total <= this.#ceilingBytes) return;
+        // Gone with an earlier cut's connection.
+        if (!this.#watched.has(response)) continue;
+        const held = this.#held(response, watched);
+        if (held <= 0 || this.#rankOf(watched.userId) !== rank) continue;
+        const queuedBehind = response.socket === null;
+        this.#cut(response, RESPONSE_CEILING_LINE);
+        // A queued one takes its connection, and all queued there, with it.
+        total = queuedBehind ? this.#heldInAll() : total - held;
+      }
+    }
+    if (total > this.#ceilingBytes) this.#lines.write('warn', RESPONSE_CEILING_MEMBERS_LINE);
   }
 
   #cut(response: WatchedResponse, line: string): void {
