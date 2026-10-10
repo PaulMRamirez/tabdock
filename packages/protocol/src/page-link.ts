@@ -132,9 +132,19 @@ export const PolicySchema = z.object({
 export type Policy = z.infer<typeof PolicySchema>;
 export type PolicyInput = z.input<typeof PolicySchema>;
 
-/** Whether a page's proposal policy takes proposals from an account of this kind. */
-export function proposalsAdmit(policy: ProposalPolicy, kind: UserKind): boolean {
-  return policy === 'all' || (policy === 'members' && kind === 'member');
+/**
+ * Whether a page's proposal policy takes proposals from this caller. An agent
+ * token's caller never proposes, whatever the policy (ADR 0044, conflict
+ * C13): it is an invitee by kind and id, so 'all' would admit it, and the
+ * relay's #propose and the adapter's onProposal each ask here, so neither
+ * layer can forget the rule the other keeps.
+ */
+export function proposalsAdmit(
+  policy: ProposalPolicy,
+  proposer: { readonly kind: UserKind; readonly agent: boolean },
+): boolean {
+  if (proposer.agent) return false;
+  return policy === 'all' || (policy === 'members' && proposer.kind === 'member');
 }
 
 // Time-boxed sessions (ADR 0043)

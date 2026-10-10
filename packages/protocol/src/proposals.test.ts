@@ -1,8 +1,8 @@
 // ADR 0042's protocol pieces: the page's proposal policy and who it admits,
-// the canonical JSON that binds an accepted proposal (and a client's
-// confirmation) to its exact arguments, the escaping both the relay and the
-// widget show arguments with, and the argument caps. Each case would pass a
-// cap off by one or a default flipped.
+// never an agent token's caller (C13); the canonical JSON that binds an
+// accepted proposal (and a client's confirmation) to its exact arguments; the
+// escaping both the relay and the widget show arguments with; and the
+// argument caps. Each case would pass a cap off by one or a default flipped.
 
 import { describe, expect, it } from 'vitest';
 import {
@@ -32,13 +32,23 @@ describe('the proposal policy', () => {
     expect(PolicySchema.parse({ proposals: 'members' }).proposals).toBe('members');
   });
 
-  it('admits members under members, everyone under all and nobody under off', () => {
-    expect(proposalsAdmit('off', 'member')).toBe(false);
-    expect(proposalsAdmit('off', 'invitee')).toBe(false);
-    expect(proposalsAdmit('members', 'member')).toBe(true);
-    expect(proposalsAdmit('members', 'invitee')).toBe(false);
-    expect(proposalsAdmit('all', 'member')).toBe(true);
-    expect(proposalsAdmit('all', 'invitee')).toBe(true);
+  it('admits members under members, everyone but agents under all and nobody under off', () => {
+    const member = { kind: 'member', agent: false } as const;
+    const invitee = { kind: 'invitee', agent: false } as const;
+    expect(proposalsAdmit('off', member)).toBe(false);
+    expect(proposalsAdmit('off', invitee)).toBe(false);
+    expect(proposalsAdmit('members', member)).toBe(true);
+    expect(proposalsAdmit('members', invitee)).toBe(false);
+    expect(proposalsAdmit('all', member)).toBe(true);
+    expect(proposalsAdmit('all', invitee)).toBe(true);
+  });
+
+  it('never admits an agent token, though it is an invitee by kind and id (C13)', () => {
+    for (const policy of ['off', 'members', 'all'] as const) {
+      expect(proposalsAdmit(policy, { kind: 'invitee', agent: true }), policy).toBe(false);
+      // Should a layer ever name an agent a member, it is still refused.
+      expect(proposalsAdmit(policy, { kind: 'member', agent: true }), policy).toBe(false);
+    }
   });
 
   // Literal values, so a change to a bound fails here rather than slipping through.
