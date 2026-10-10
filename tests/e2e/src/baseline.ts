@@ -2,10 +2,12 @@
 //   pnpm --filter @tabdock/e2e baseline
 // Writes the raw numbers and shapes to docs/notes/baseline.raw.json.
 //
-// BASELINE_MCPB=6 measures MCP-B's 6.0 beta instead (M5 decision D4): the demo
-// page on the beta polyfill (src/mcpb6-page.ts) and the beta local relay with
-// its own embed, since embed and runtime must share a major. That run writes
-// docs/notes/baseline.raw.mcpb6-beta.json unless BASELINE_LABEL names another.
+// BASELINE_MCPB=6 measures MCP-B 6.0.0 instead (ADR 0047, after M5 decision
+// D4): the demo page on 6.0.0's polyfill (src/mcpb6-page.ts) and 6.0.0's
+// local relay with its own embed, since embed and runtime must share a major.
+// That run writes docs/notes/baseline.raw.mcpb6.json unless BASELINE_LABEL
+// names another; baseline.raw.mcpb6-beta.json keeps the beta's run of
+// 5 October.
 
 import { readFileSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
@@ -14,7 +16,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
-import { MCPB6_LOCAL_RELAY_CLI, MCPB6_POLYFILL_SCRIPT } from '@tabdock/mcpb6';
+import { MCPB6_LOCAL_RELAY_CLI, MCPB6_POLYFILL_MODULE } from '@tabdock/mcpb6';
 import { startDemoServer } from '@tabdock/demo/server';
 import type { Page } from '@playwright/test';
 import {
@@ -37,7 +39,7 @@ if (process.env.BASELINE_MCPB !== undefined && !mcpb6) {
   throw new Error('BASELINE_MCPB takes 6 or nothing');
 }
 // BASELINE_LABEL names a variant run, for example against native WebMCP in a newer Chrome.
-const label = process.env.BASELINE_LABEL ?? (mcpb6 ? 'mcpb6-beta' : undefined);
+const label = process.env.BASELINE_LABEL ?? (mcpb6 ? 'mcpb6' : undefined);
 const outFile = fileURLToPath(
   new URL(`../../../docs/notes/baseline.raw${label ? `.${label}` : ''}.json`, import.meta.url),
 );
@@ -65,7 +67,7 @@ function packageOf(file: string): string {
 function mcpbPackages(): { polyfill: string; localRelay: string } {
   if (mcpb6) {
     return {
-      polyfill: packageOf(MCPB6_POLYFILL_SCRIPT),
+      polyfill: packageOf(MCPB6_POLYFILL_MODULE),
       localRelay: packageOf(MCPB6_LOCAL_RELAY_CLI),
     };
   }
@@ -123,7 +125,7 @@ async function measureInPage() {
 }
 
 /**
- * startBaseline's chain with the 6.0 beta: its local relay, the demo page on
+ * startBaseline's chain with 6.0.0: its local relay, the demo page on
  * its polyfill, and its embed and widget served where the demo serves 5.1.0's,
  * so the page's ?mcpb hook loads them unchanged.
  */
