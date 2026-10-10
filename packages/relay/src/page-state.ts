@@ -21,11 +21,12 @@ import type { HubError } from './hub.ts';
 import type { PagePart } from './page-parts.ts';
 
 /**
- * What one stored value costs beside its text: the entry, its map slot and
- * the bookkeeping, generously, so the charge never falls below the heap it
- * stands for (state-heap.test.ts).
+ * What one stored value costs beside its text: the entry, its map slot, its
+ * set of waiters and the bookkeeping. state-heap.test.ts measured about 1.2
+ * KiB a page beside the text, which ADR 0040's design had put at 1 KiB, so
+ * this is twice that and the charge never falls below the heap it stands for.
  */
-export const STATE_HEAP_BYTES = 1024;
+export const STATE_HEAP_BYTES = 2048;
 
 /** A held text's charge: V8 keeps a string at up to two bytes a UTF-16 unit. */
 export function stateCharge(text: string | null): number {

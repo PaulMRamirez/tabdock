@@ -40,6 +40,7 @@ import {
   TestFence,
   type TestRelay,
 } from './helpers/relay.ts';
+import { stateCharge } from '../src/page-state.ts';
 import { publish, readState } from './helpers/state.ts';
 
 let current: TestRelay | undefined;
@@ -340,14 +341,20 @@ describe('what every page holds (TABDOCK_MAX_STATE_BYTES, S9)', () => {
     });
     const alice = await client();
     const big = (n: number) => ({ n, t: 'b'.repeat(16_000) });
+    // Each is charged STATE_HEAP_BYTES and two bytes a character, so about thirty fit in 1 MiB.
+    let fitting = 0;
+    for (let held = 0; held + stateCharge(JSON.stringify(big(fitting))) <= MAX_FRAME_BYTES;) {
+      held += stateCharge(JSON.stringify(big(fitting)));
+      fitting += 1;
+    }
+    expect(fitting).toBeGreaterThanOrEqual(28);
     const opened: TestPage[] = [];
-    for (let n = 0; n < 32; n += 1) opened.push(await page());
+    for (let n = 0; n <= fitting; n += 1) opened.push(await page());
     const [first] = opened;
     const last = opened.at(-1);
     if (!first || !last) throw new Error('no pages');
     await pairAndApprove(alice, first);
     await pairAndApprove(alice, last);
-    // Each is charged 1024 and two bytes a character: 31 fit in 1 MiB, the 32nd does not.
     for (const [n, each] of opened.entries()) await publish(each, big(n));
     const withheld = await readState(alice, last.pageId);
     expect(withheld.body).toMatchObject({ version: 1, value: null });
@@ -359,10 +366,10 @@ describe('what every page holds (TABDOCK_MAX_STATE_BYTES, S9)', () => {
     ).toEqual([expect.objectContaining({ pageId: last.pageId, version: 1 })]);
     // Room made, the same value is taken.
     await publish(first, null);
-    await publish(last, big(31));
+    await publish(last, big(fitting));
     expect((await readState(alice, last.pageId)).body).toMatchObject({
       version: 2,
-      value: big(31),
+      value: big(fitting),
     });
   });
 });
@@ -401,7 +408,7 @@ describe('state across a page session (ADR 0040)', () => {
     // What the sleep dropped was given back: all pages hold this one value's charge alone.
     expect(linesNamed(relay, 'page state published').at(-1)).toMatchObject({
       version: 3,
-      allPagesStateBytes: 1024 + 2 * JSON.stringify(value).length,
+      allPagesStateBytes: stateCharge(JSON.stringify(value)),
     });
   });
 
