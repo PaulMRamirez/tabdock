@@ -2,11 +2,17 @@
 // throwaway dev tokens, the demo page served beside it and opened with ?relay
 // and ?e2e=<its key>, and MCP clients from the official SDK with a bearer header. The
 // Playwright specs, the milestone demos and the Claude Code checks all use it.
+// Its widget clicks and text reads run the published helper,
+// @tabdock/adapter/testing (ADR 0041), so every spec that clicks the widget
+// exercises the code a CI check copies.
 
 import { randomBytes } from 'node:crypto';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import type { CDPSession, Page } from '@playwright/test';
 import type { Dock, DockState, Role } from '@tabdock/adapter';
+// A namespace, since the wrappers here share the names of the helper's functions they call.
+import * as helper from '@tabdock/adapter/testing';
+import type { WidgetAction, WidgetRole, WidgetTarget } from '@tabdock/adapter/testing';
 import { startDemoServer, type DemoServer } from '@tabdock/demo/server';
 import { type ErrorCode, isErrorCode } from '@tabdock/protocol';
 import {
@@ -117,13 +123,7 @@ export async function connectMcp(
   return client;
 }
 
-/** A pairing code with its second half hidden, for narration that may end up in a CI log (S11). */
-export function maskCode(code: string): string {
-  const split = code.indexOf('-');
-  return split === -1
-    ? '*'.repeat(code.length)
-    : `${code.slice(0, split + 1)}${'*'.repeat(code.length - split - 1)}`;
-}
+export { maskCode, type WidgetTarget } from '@tabdock/adapter/testing';
 
 export interface ToolOutcome {
   isError: boolean;
@@ -200,8 +200,10 @@ export async function approveThroughHandle(
 
 // Clicking inside the widget's closed shadow root. Page script and Playwright
 // selectors cannot reach into it, which is the point; the DevTools protocol
-// can, so a test finds the button there and clicks its centre with a real
-// mouse event, as a person would.
+// can. The clicks and text reads go through @tabdock/adapter/testing, which
+// finds the button there and clicks its centre with trusted input, as a
+// person would, once it is armed and uncovered. The readers below it that
+// only tests need keep their own node search over the whole document.
 
 interface DomNode {
   backendNodeId: number;
@@ -229,99 +231,17 @@ function findNode(node: DomNode, match: (node: DomNode) => boolean): DomNode | n
   return null;
 }
 
-export interface WidgetTarget {
-  /**
-   * A data-action value: approve-driver, approve-observer, deny, confirm-allow,
-   * confirm-deny, rotate, toggle; make-driver, make-observer, revoke and
-   * close-link in a roster row; revoke-all; pause or resume; from M4
-   * invite-open, invite-close, invite-label, invite-role-observer,
-   * invite-role-driver, invite-lifetime-15m, -1h and -open, invite-uses,
-   * invite-create, invite-copy, invite-done, and cancel-invite in a list row.
-   */
-  action: string;
-  /** Narrows to the prompt box for one attach request. */
-  requestId?: string;
-  /** Narrows to the prompt box for one consequential call. */
-  callId?: string;
-  /** Narrows to one user's roster row. */
-  userId?: string;
-  /** Narrows to one invite's row in the live list (M4). */
-  inviteId?: string;
-}
-
+/**
+ * Runs `run` with a DevTools session of its own. Playwright's CDPSession goes
+ * to the helper with no cast: the helper's structural DevToolsSession is what
+ * keeps Playwright out of its dependencies, and this typechecks that it fits.
+ */
 async function withCdp<T>(page: Page, run: (cdp: CDPSession) => Promise<T>): Promise<T> {
   const cdp = await page.context().newCDPSession(page);
   try {
     return await run(cdp);
   } finally {
     await cdp.detach();
-  }
-}
-
-async function findButton(cdp: CDPSession, target: WidgetTarget): Promise<DomNode | null> {
-  const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
-  const scope =
-    target.requestId !== undefined
-      ? findNode(root, (n) => attribute(n, 'data-request-id') === target.requestId)
-      : target.callId !== undefined
-        ? findNode(root, (n) => attribute(n, 'data-call-id') === target.callId)
-        : target.userId !== undefined
-          ? findNode(root, (n) => attribute(n, 'data-user-id') === target.userId)
-          : target.inviteId !== undefined
-            ? findNode(root, (n) => attribute(n, 'data-invite-id') === target.inviteId)
-            : root;
-  return scope && findNode(scope, (n) => attribute(n, 'data-action') === target.action);
-}
-
-/** The centre of a node's box, or null while it has none (a button in a hidden panel). */
-async function boxCentre(
-  cdp: CDPSession,
-  backendNodeId: number,
-): Promise<{ x: number; y: number } | null> {
-  return cdp
-    .send('DOM.scrollIntoViewIfNeeded', { backendNodeId })
-    .then(() => cdp.send('DOM.getBoxModel', { backendNodeId }))
-    .then(({ model }) => {
-      const [x1 = 0, y1 = 0, , , x3 = 0, y3 = 0] = model.content;
-      return { x: (x1 + x3) / 2, y: (y1 + y3) / 2 };
-    })
-    .catch(() => null);
-}
-
-/**
- * Waits until the target button exists, is armed and is what a click on its
- * centre would hit, then returns that centre. A prompt box's buttons ignore
- * clicks until data-armed turns true, half a second after the box appeared or
- * last moved, so a prompt that slides under the pointer cannot take the click.
- */
-async function armedButton(
-  cdp: CDPSession,
-  target: WidgetTarget,
-  timeoutMs: number,
-): Promise<{ backendNodeId: number; x: number; y: number }> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const button = await findButton(cdp, target);
-    if (button && attribute(button, 'data-armed') !== 'false') {
-      const { backendNodeId } = button;
-      const centre = await boxCentre(cdp, backendNodeId);
-      if (centre) {
-        // Hit-test first, so a layout shift can never turn this into a click on another button.
-        const hit = await cdp.send('DOM.getNodeForLocation', {
-          x: Math.round(centre.x),
-          y: Math.round(centre.y),
-          ignorePointerEventsNone: true,
-        });
-        // The hit may be a label inside the button, such as the badge's text.
-        if (findNode(button, (n) => n.backendNodeId === hit.backendNodeId)) {
-          return { backendNodeId, ...centre };
-        }
-      }
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`no clickable ${target.action} button in the Tabdock widget`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
   }
 }
 
@@ -332,7 +252,7 @@ export async function widgetButtonCentre(
   timeoutMs = 5000,
 ): Promise<{ x: number; y: number }> {
   return withCdp(page, async (cdp) => {
-    const { x, y } = await armedButton(cdp, target, timeoutMs);
+    const { x, y } = await helper.widgetButton(cdp, target, { timeoutMs });
     return { x, y };
   });
 }
@@ -340,23 +260,44 @@ export async function widgetButtonCentre(
 /**
  * The target button as it is right now, without waiting: whether it is armed
  * (data-armed is not false) and where its centre is. null while it has no box.
+ * Specs read a button that is not armed yet with this, so it searches on its own.
  */
 export async function widgetButtonNow(
   page: Page,
   target: WidgetTarget,
 ): Promise<{ armed: boolean; x: number; y: number } | null> {
   return withCdp(page, async (cdp) => {
-    const button = await findButton(cdp, target);
-    const centre = button && (await boxCentre(cdp, button.backendNodeId));
-    if (!button || !centre) return null;
+    const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
+    const scope =
+      target.requestId !== undefined
+        ? findNode(root, (n) => attribute(n, 'data-request-id') === target.requestId)
+        : target.callId !== undefined
+          ? findNode(root, (n) => attribute(n, 'data-call-id') === target.callId)
+          : target.userId !== undefined
+            ? findNode(root, (n) => attribute(n, 'data-user-id') === target.userId)
+            : target.inviteId !== undefined
+              ? findNode(root, (n) => attribute(n, 'data-invite-id') === target.inviteId)
+              : root;
+    const button = scope && findNode(scope, (n) => attribute(n, 'data-action') === target.action);
+    if (!button) return null;
+    const { backendNodeId } = button;
+    const centre = await cdp
+      .send('DOM.scrollIntoViewIfNeeded', { backendNodeId })
+      .then(() => cdp.send('DOM.getBoxModel', { backendNodeId }))
+      .then(({ model }) => {
+        const [x1 = 0, y1 = 0, , , x3 = 0, y3 = 0] = model.content;
+        // Whole pixels, as the helper's widgetButton reports and presses them, so the two compare.
+        return { x: Math.round((x1 + x3) / 2), y: Math.round((y1 + y3) / 2) };
+      })
+      .catch(() => null);
+    if (!centre) return null;
     return { armed: attribute(button, 'data-armed') !== 'false', ...centre };
   });
 }
 
-/** A real mouse click on the target button, as the operator would make it. */
+/** A trusted click on the target button, as the operator would make it, through the helper. */
 export async function clickInWidget(page: Page, target: WidgetTarget): Promise<void> {
-  const { x, y } = await widgetButtonCentre(page, target);
-  await page.mouse.click(x, y);
+  await withCdp(page, (cdp) => helper.clickInWidget(cdp, target));
 }
 
 /**
@@ -365,7 +306,7 @@ export async function clickInWidget(page: Page, target: WidgetTarget): Promise<v
  */
 export async function scriptClickInWidget(page: Page, target: WidgetTarget): Promise<void> {
   await withCdp(page, async (cdp) => {
-    const { backendNodeId } = await armedButton(cdp, target, 5000);
+    const { backendNodeId } = await helper.widgetButton(cdp, target);
     const { object } = await cdp.send('DOM.resolveNode', { backendNodeId });
     if (object.objectId === undefined) throw new Error('could not resolve the widget button');
     await cdp.send('Runtime.callFunctionOn', {
@@ -388,24 +329,9 @@ export async function widgetVisible(page: Page, role: string): Promise<boolean> 
   });
 }
 
-/** The text of the widget element with this data-role, read through the DevTools protocol. */
-export async function widgetText(page: Page, role: string): Promise<string | null> {
-  const cdp = await page.context().newCDPSession(page);
-  try {
-    const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
-    const node = findNode(root, (n) => attribute(n, 'data-role') === role);
-    if (!node) return null;
-    const { object } = await cdp.send('DOM.resolveNode', { backendNodeId: node.backendNodeId });
-    if (object.objectId === undefined) return null;
-    const { result } = await cdp.send('Runtime.callFunctionOn', {
-      objectId: object.objectId,
-      functionDeclaration: 'function () { return this.textContent; }',
-      returnByValue: true,
-    });
-    return typeof result.value === 'string' ? result.value : null;
-  } finally {
-    await cdp.detach();
-  }
+/** The text of the widget element with this data-role, read through the helper. */
+export async function widgetText(page: Page, role: WidgetRole): Promise<string | null> {
+  return withCdp(page, (cdp) => helper.widgetText(cdp, role));
 }
 
 /**
@@ -537,7 +463,7 @@ export async function widgetBoxText(
 }
 
 /** Types into a widget input as the operator would: a real click to focus it, then keys. */
-export async function typeInWidget(page: Page, action: string, text: string): Promise<void> {
+export async function typeInWidget(page: Page, action: WidgetAction, text: string): Promise<void> {
   await clickInWidget(page, { action });
   await page.keyboard.press('ControlOrMeta+A');
   await page.keyboard.type(text);

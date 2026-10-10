@@ -214,7 +214,7 @@ test('a roster change from the relay that moves the prompts disarms them until t
   const relay = await openWithFakeRelay(page);
   relay.send({ t: 'roster', attachments: [attachment('carol', 'Carol')] });
   relay.send(attachRequest('req-bob', 'bob'));
-  const target = { action: 'approve-observer', requestId: 'req-bob' };
+  const target = { action: 'approve-observer', requestId: 'req-bob' } as const;
   const before = await widgetButtonCentre(page, target);
 
   await pauseClock(page);
@@ -247,7 +247,7 @@ test('a click on a box that moved with no state change is ignored, and restarts 
 }) => {
   const relay = await openWithFakeRelay(page);
   relay.send(attachRequest('req-bob', 'bob'));
-  const target = { action: 'approve-driver', requestId: 'req-bob' };
+  const target = { action: 'approve-driver', requestId: 'req-bob' } as const;
   const before = await widgetButtonCentre(page, target);
 
   await pauseClock(page);
@@ -271,7 +271,7 @@ test('prompts arriving every 300 ms leave the oldest one armed on its own schedu
 }) => {
   const relay = await openWithFakeRelay(page);
   await pauseClock(page);
-  const oldest = { action: 'approve-observer', requestId: 'req-1' };
+  const oldest = { action: 'approve-observer', requestId: 'req-1' } as const;
   for (let n = 1; n <= 4; n += 1) {
     if (n > 1) await page.clock.runFor(300);
     relay.send(attachRequest(`req-${n}`, `user${n}`));
@@ -313,7 +313,7 @@ test('a prompt that armed while the tab was hidden waits again when the tab is s
   });
   relay.send(attachRequest('req-bg', 'mallory'));
   await waitForDock(page, (state) => state.pendingRequests.length === 1);
-  const target = { action: 'approve-driver', requestId: 'req-bg' };
+  const target = { action: 'approve-driver', requestId: 'req-bg' } as const;
   await page.clock.runFor(ARM_DELAY_MS * 3);
   expect((await widgetButtonNow(page, target))?.armed).toBe(true);
 
@@ -468,7 +468,7 @@ test('a roster row that moves disarms its buttons until it holds still', async (
     t: 'roster',
     attachments: [attachment('bob', 'Bob', 'observer'), attachment('carol', 'Carol')],
   });
-  const target = { action: 'make-driver', userId: 'bob' };
+  const target = { action: 'make-driver', userId: 'bob' } as const;
   const before = await widgetButtonCentre(page, target);
 
   await pauseClock(page);
@@ -534,7 +534,7 @@ test('a client list that keeps changing neither moves a row nor makes its button
     })),
   });
   relay.send({ t: 'roster', attachments: [withClients(1, 0)] });
-  const target = { action: 'revoke', userId: 'alice' };
+  const target = { action: 'revoke', userId: 'alice' } as const;
   const before = await widgetButtonCentre(page, target);
 
   await pauseClock(page);
@@ -562,7 +562,7 @@ test('a row the page never approved says so and offers only Revoke, and every ro
   const rows = await widgetItems(page, 'roster');
   expect(rows[0]?.text).toContain('Mallory (not approved on this page)');
   expect(rows[1]?.text).toContain('Bob (observer)');
-  for (const action of ['make-driver', 'make-observer']) {
+  for (const action of ['make-driver', 'make-observer'] as const) {
     expect(await widgetButtonNow(page, { action, userId: 'mallory' })).toBeNull();
   }
 
