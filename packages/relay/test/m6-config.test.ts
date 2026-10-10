@@ -6,7 +6,10 @@
 // watching seats, the invitee pool and agent tokens, which mean nothing
 // without invites (ADR 0044), the members file in public URL mode (ADR 0043)
 // and the restart snapshot, which needs an audit directory (ADR 0046). Every
-// refusal names its setting and never the value it was given (R1, R2).
+// refusal names its setting and never the value it was given (R1, R2). Until
+// the waves serve them, agent tokens, the members file and the snapshot pass
+// their own rules and are then refused at start, so no relay runs as if one
+// were on while nothing honours it.
 
 import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -440,17 +443,23 @@ describe('TABDOCK_MAX_USERS_PER_PAGE gains a ceiling (ADR 0044)', () => {
 });
 
 describe('TABDOCK_AGENT_TOKENS (ADR 0044)', () => {
-  it('is off unless set, and on with invites in every mode that has them, production included', () => {
+  it('is off unless set, and refused at start when on until this relay serves /g/mcp', () => {
     expect(resolveEnv(DEV_INVITES).agentTokens).toBe(false);
-    for (const value of ['1', 'true', 'TRUE']) {
-      expect(resolveEnv({ ...DEV_INVITES, TABDOCK_AGENT_TOKENS: value }).agentTokens).toBe(true);
-    }
     for (const value of ['0', 'false']) {
       expect(resolveEnv({ ...DEV, TABDOCK_AGENT_TOKENS: value }).agentTokens).toBe(false);
     }
-    expect(
-      resolveEnv({ ...HOSTED, TABDOCK_INVITES: '1', TABDOCK_AGENT_TOKENS: '1' }),
-    ).toMatchObject({ mode: 'hosted', agentTokens: true });
+    // M6 seam: not built. W2-D serves /g/mcp and turns these into relays with tokens on.
+    for (const env of [
+      { ...DEV_INVITES, TABDOCK_AGENT_TOKENS: '1' },
+      { ...DEV_INVITES, TABDOCK_AGENT_TOKENS: 'TRUE' },
+      { ...HOSTED, TABDOCK_INVITES: '1', TABDOCK_AGENT_TOKENS: 'true' },
+    ]) {
+      refusedWith(
+        env,
+        'TRUE',
+        'TABDOCK_AGENT_TOKENS is not served by this relay yet; leave it off (ADR 0044)',
+      );
+    }
   });
 
   it('is refused without invites, and in local mode through them, before a token is drawn', () => {
@@ -472,11 +481,13 @@ describe('TABDOCK_AGENT_TOKENS (ADR 0044)', () => {
     );
   });
 
-  it('takes only true from code, and never without invites', () => {
-    expect(resolveConfig({ auth, invites: true, agentTokens: true }).agentTokens).toBe(true);
+  it('takes only true from code, never without invites, and refuses it until built', () => {
     expect(resolveConfig(stray({ invites: true, agentTokens: 'true' })).agentTokens).toBe(false);
     expect(() => resolveConfig({ auth, agentTokens: true })).toThrow(
       'agentTokens (TABDOCK_AGENT_TOKENS) needs invites (TABDOCK_INVITES): an agent token is minted on a page as an invite is, while a member sponsors it (ADR 0044)',
+    );
+    expect(thrown(() => resolveConfig({ auth, invites: true, agentTokens: true }))).toBe(
+      'agentTokens (TABDOCK_AGENT_TOKENS) is not served by this relay yet; leave it off (ADR 0044)',
     );
   });
 });
@@ -528,10 +539,9 @@ describe('TABDOCK_MEMBERS_FILE (ADR 0043)', () => {
     );
   });
 
-  it('holds options given in code to public URL mode and an absolute path', () => {
+  it('holds options given in code to public URL mode and an absolute path, then refuses it until read', () => {
     const publicOptions = loadConfigFromEnv(OAUTH);
     expect(resolveConfig(publicOptions).membersFile).toBeNull();
-    expect(resolveConfig({ ...publicOptions, membersFile: SECRETISH }).membersFile).toBe(SECRETISH);
     const relative = thrown(() =>
       resolveConfig({ ...publicOptions, membersFile: 'sk_live_secret/members.txt' }),
     );
@@ -541,6 +551,12 @@ describe('TABDOCK_MEMBERS_FILE (ADR 0043)', () => {
       'membersFile (TABDOCK_MEMBERS_FILE) lists the members OAuth signs in, which only public URL mode does (TABDOCK_PUBLIC_URL) (ADR 0043)',
     );
     expect(local).not.toContain(SECRETISH);
+    // M6 seam: not built. W1-E reads the file and turns this into a relay that does.
+    const unread = thrown(() => resolveConfig({ ...publicOptions, membersFile: SECRETISH }));
+    expect(unread).toBe(
+      "membersFile (TABDOCK_MEMBERS_FILE) is not read by this relay yet; give the members to the OAuth plugin's users (ADR 0043)",
+    );
+    expect(unread).not.toContain(SECRETISH);
   });
 });
 
@@ -550,18 +566,25 @@ describe('TABDOCK_RESTART_SNAPSHOT (ADR 0046)', () => {
     expect(resolveEnv({ TABDOCK_HOME: freshHome() }).restartSnapshot).toBe(false);
   });
 
-  it('is on with TABDOCK_AUDIT_DIR, or in local mode beside its token', () => {
+  it('is refused at start when on until this relay writes it, before local mode draws a token', () => {
+    // M6 seam: not built. W3-B writes the snapshot and turns these into relays with it on.
+    const words =
+      'TABDOCK_RESTART_SNAPSHOT is not written by this relay yet; leave it off (ADR 0046)';
+    refusedWith(
+      { ...DEV, TABDOCK_AUDIT_DIR: scratch(), TABDOCK_RESTART_SNAPSHOT: '1' },
+      'xx',
+      words,
+    );
+    refusedWith(
+      { ...HOSTED, TABDOCK_AUDIT_DIR: scratch(), TABDOCK_RESTART_SNAPSHOT: 'TRUE' },
+      'TRUE',
+      words,
+    );
+    const home = freshHome();
     expect(
-      resolveEnv({ ...DEV, TABDOCK_AUDIT_DIR: scratch(), TABDOCK_RESTART_SNAPSHOT: '1' })
-        .restartSnapshot,
-    ).toBe(true);
-    const local = resolveEnv({ TABDOCK_HOME: freshHome(), TABDOCK_RESTART_SNAPSHOT: 'true' });
-    expect(local).toMatchObject({ mode: 'local', restartSnapshot: true });
-    expect(local.audit.dir).not.toBeNull();
-    expect(
-      resolveEnv({ ...HOSTED, TABDOCK_AUDIT_DIR: scratch(), TABDOCK_RESTART_SNAPSHOT: '1' })
-        .restartSnapshot,
-    ).toBe(true);
+      thrown(() => loadConfigFromEnv({ TABDOCK_HOME: home, TABDOCK_RESTART_SNAPSHOT: 'true' })),
+    ).toBe(words);
+    expect(existsSync(home)).toBe(false);
   });
 
   it('is refused without an audit directory, in either layer', () => {
@@ -576,8 +599,8 @@ describe('TABDOCK_RESTART_SNAPSHOT (ADR 0046)', () => {
       'restartSnapshot (TABDOCK_RESTART_SNAPSHOT) keeps its file in the audit directory (TABDOCK_AUDIT_DIR), and without one the relay keeps none (ADR 0046)',
     );
     const dir = scratch();
-    expect(resolveConfig({ auth, restartSnapshot: true, audit: { dir } }).restartSnapshot).toBe(
-      true,
+    expect(thrown(() => resolveConfig({ auth, restartSnapshot: true, audit: { dir } }))).toBe(
+      'restartSnapshot (TABDOCK_RESTART_SNAPSHOT) is not written by this relay yet; leave it off (ADR 0046)',
     );
     expect(resolveConfig(stray({ restartSnapshot: 'true', audit: { dir } })).restartSnapshot).toBe(
       false,

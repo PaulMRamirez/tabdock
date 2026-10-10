@@ -473,6 +473,7 @@ export interface RelayOptions {
    * What the members file's checks read the platform through, as local
    * mode's place checks do; tests stand in for it. Never from the environment.
    */
+  // M6 seam: not built. Read by nothing until W1-E's members.ts checks the file.
   membersSystem?: Partial<LocalTokenSystem> | undefined;
   /**
    * The restart snapshot (TABDOCK_RESTART_SNAPSHOT, ADR 0046), off unless
@@ -1132,7 +1133,23 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
       'agentTokens (TABDOCK_AGENT_TOKENS) needs invites (TABDOCK_INVITES): an agent token is minted on a page as an invite is, while a member sponsors it (ADR 0044)',
     );
   }
+  // M6 seam: not built. Nothing serves /g/mcp until ADR 0044's agent tokens
+  // land (W2-D), so a relay asked for them refuses to start rather than run
+  // as if they were on.
+  if (agentTokens) {
+    throw new Error(
+      'agentTokens (TABDOCK_AGENT_TOKENS) is not served by this relay yet; leave it off (ADR 0044)',
+    );
+  }
   const membersFile = resolveMembersFile(options.membersFile, publicUrl);
+  // M6 seam: not built. Until this relay reads the file (W1-E), one given in
+  // code is refused as the environment's is, rather than run on the plugin's
+  // own list while the operator expects the file's.
+  if (membersFile !== null) {
+    throw new Error(
+      "membersFile (TABDOCK_MEMBERS_FILE) is not read by this relay yet; give the members to the OAuth plugin's users (ADR 0043)",
+    );
+  }
   const audit = resolveAudit(options.audit);
   // Only true turns it on: a snapshot carries attachments over a restart,
   // which deploy.md's rotation relies on a restart to end (ADR 0046).
@@ -1140,6 +1157,14 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
   if (restartSnapshot && audit.dir === null) {
     throw new Error(
       'restartSnapshot (TABDOCK_RESTART_SNAPSHOT) keeps its file in the audit directory (TABDOCK_AUDIT_DIR), and without one the relay keeps none (ADR 0046)',
+    );
+  }
+  // M6 seam: not built. No snapshot is written or loaded until ADR 0046's
+  // lands (W3-B), so a relay asked for one refuses to start rather than stop
+  // with its operator expecting pages to resume.
+  if (restartSnapshot) {
+    throw new Error(
+      'restartSnapshot (TABDOCK_RESTART_SNAPSHOT) is not written by this relay yet; leave it off (ADR 0046)',
     );
   }
   const mode: RelayMode =
@@ -1673,6 +1698,28 @@ function refuseSettingsOutOfMode(
 }
 
 /**
+ * M6's flags this relay cannot honour yet, each refused once its own mode
+ * rules above have passed, and before local mode draws a token: a relay that
+ * started anyway would run as if they were off while its operator, its
+ * guide page and `.env.example` expect them on. TABDOCK_MEMBERS_FILE is
+ * refused in authFromEnv, where the list it replaces is read.
+ */
+function refuseUnbuiltSettings(flags: { agentTokens: boolean; restartSnapshot: boolean }): void {
+  // M6 seam: not built. W2-D serves /g/mcp (ADR 0044).
+  if (flags.agentTokens) {
+    throw new Error(
+      'TABDOCK_AGENT_TOKENS is not served by this relay yet; leave it off (ADR 0044)',
+    );
+  }
+  // M6 seam: not built. W3-B writes and loads the snapshot (ADR 0046).
+  if (flags.restartSnapshot) {
+    throw new Error(
+      'TABDOCK_RESTART_SNAPSHOT is not written by this relay yet; leave it off (ADR 0046)',
+    );
+  }
+}
+
+/**
  * How refusals name the audit directory when the environment gave it: a
  * TABDOCK_AUDIT_DIR value, an absolute path that may still be a token pasted
  * into the wrong variable, by the variable alone, as the audit reader names
@@ -1832,6 +1879,7 @@ export function loadConfigFromEnv(
   );
   const maxMb = parseCount('TABDOCK_AUDIT_MAX_MB', env.TABDOCK_AUDIT_MAX_MB);
   refuseSettingsOutOfMode(env, relayEnv, { invites, agentTokens, restartSnapshot });
+  refuseUnbuiltSettings({ agentTokens, restartSnapshot });
 
   // Last, so a mistake in any other setting is reported before local mode draws a token.
   const { auth, publicUrl, pairClient, localMode } = authFromEnv(

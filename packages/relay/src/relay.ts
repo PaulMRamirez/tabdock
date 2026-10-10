@@ -529,6 +529,9 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   // Only a log that outlives the process marks its starts and stops; a memory
   // ring forgets everything at a restart anyway.
   if (fileAudit !== null) {
+    // M6 seam: not built. relay_start gains agentTokens (W2-D) and
+    // restartSnapshot (W3-B) once each is served; until then config.ts
+    // refuses to start with either on, so the record would say false.
     recordAudit(fileAudit, log, {
       v: AUDIT_VERSION,
       type: 'relay_start',
