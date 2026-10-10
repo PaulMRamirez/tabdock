@@ -15,7 +15,7 @@
 // With --live it runs against the signed-in Claude Code instead and asks the
 // model which digit a 64 KiB PNG shows, which proves the model sees the
 // picture rather than only receiving it. That spends the owner's own usage,
-// so only the owner runs it (docs/checklists/M6.md); a failure there lowers
+// so only the owner runs it, from the M6 checklist; a failure there lowers
 // DEFAULT_IMAGE_BYTES in 8 KiB steps (ADR 0039, decision 2).
 
 import { spawn, spawnSync } from 'node:child_process';
@@ -49,7 +49,7 @@ const say = (text: string): void => {
 const version = spawnSync('claude', ['--version'], { encoding: 'utf8' });
 if (version.error !== undefined || version.status !== 0) {
   say(
-    'check:claude-code:images skipped: no `claude` on the PATH. Claude Code is not a repo dependency, so docs/checklists/M6.md keeps this check for a run by hand.',
+    'check:claude-code:images skipped: no `claude` on the PATH. Claude Code is not a repo dependency, so the M6 checklist keeps this check for a run by hand.',
   );
   process.exit(0);
 }

@@ -263,7 +263,7 @@ describe('what SPEC says ahead of the code (docs/plans/M6.md)', () => {
       .split('\n')
       .slice(-4)
       .join('\n');
-    // W1-B built it: equal, with no seam marker left above it.
+    // Built (ADR 0039): equal, with no seam marker left above it.
     expect(built).toBe(promised);
     expect(before).not.toContain('M6 seam');
   });
