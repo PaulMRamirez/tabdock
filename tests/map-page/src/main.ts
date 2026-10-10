@@ -16,7 +16,7 @@ import {
   type MapToolDefinition,
   type MapViewport,
 } from '@tabdock/sim-page/map';
-import { drawMap } from './render.ts';
+import { drawMap } from './draw.ts';
 import './webmcp.ts';
 
 declare global {

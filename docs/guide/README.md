@@ -6,15 +6,16 @@ Tabdock 0.1.0 is prepared but not yet on npm, so every page leads with the path 
 
 ## Where to start
 
-| You want to                                    | Read, in order                                                                                                                                                         |
-| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Understand what Tabdock is and whether it fits | [Concepts](01-concepts.md), [Use cases](09-use-cases.md)                                                                                                               |
-| See it work in ten minutes                     | [Quick start](02-quick-start.md)                                                                                                                                       |
-| Add it to your own web app                     | [Add to your app](03-add-to-your-app.md), [Adapter reference](04-adapter-reference.md), [The control handle](13-the-control-handle.md), [Security](10-security.md)     |
-| Use a page from Claude or another MCP client   | [Connect clients](05-connect-clients.md), [Troubleshooting](11-troubleshooting.md)                                                                                     |
-| Let other people use a page you operate        | [Sharing](06-sharing.md)                                                                                                                                               |
-| Run a relay for yourself or a team             | [Run a relay](07-run-a-relay.md), [Relay settings](08-relay-settings.md), [Settings for rooms, images and state](14-settings-for-rooms.md), [Security](10-security.md) |
-| Find out why something failed                  | [Troubleshooting](11-troubleshooting.md) for a call, [Setup problems and limits](12-setup-and-limits.md) for setup                                                     |
+| You want to                                         | Read, in order                                                                                                                                                         |
+| --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Understand what Tabdock is and whether it fits      | [Concepts](01-concepts.md), [Use cases](09-use-cases.md)                                                                                                               |
+| See it work in ten minutes                          | [Quick start](02-quick-start.md)                                                                                                                                       |
+| Add it to your own web app                          | [Add to your app](03-add-to-your-app.md), [Adapter reference](04-adapter-reference.md), [The control handle](13-the-control-handle.md), [Security](10-security.md)     |
+| Use a page from Claude or another MCP client        | [Connect clients](05-connect-clients.md), [Troubleshooting](11-troubleshooting.md)                                                                                     |
+| Let other people use a page you operate             | [Sharing](06-sharing.md)                                                                                                                                               |
+| Run a relay for yourself or a team                  | [Run a relay](07-run-a-relay.md), [Relay settings](08-relay-settings.md), [Settings for rooms, images and state](14-settings-for-rooms.md), [Security](10-security.md) |
+| Build a map or globe page every client drives alike | [Map and globe pages](16-map-pages.md)                                                                                                                                 |
+| Find out why something failed                       | [Troubleshooting](11-troubleshooting.md) for a call, [Setup problems and limits](12-setup-and-limits.md) for setup                                                     |
 
 Whatever your role, read [Concepts](01-concepts.md) first: every other page uses its words (operator, member, invitee, driver, observer, consequential) in exactly its sense.
 
@@ -35,6 +36,7 @@ Whatever your role, read [Concepts](01-concepts.md) first: every other page uses
 13. [The control handle](13-the-control-handle.md): every member of the handle `attach()` returns, its state, and the options its minting methods take.
 14. [Settings for rooms, images and state](14-settings-for-rooms.md): the settings for images, page state, proposals, watching seats, the members file, agent tokens and the restart snapshot.
 15. [Limits for rooms, images and state](15-limits-for-rooms.md): the fixed numbers behind those, each with its constant.
+16. [Map and globe pages](16-map-pages.md): the shared tool profile for map and globe pages, its units and shapes, and its worked examples.
 
 For the design itself, `SPEC.md` is the source of truth, `docs/adr/` holds the decisions and `docs/threat-model.md` maps each boundary to its tests. `docs/develop.md` is for contributors.
 

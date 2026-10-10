@@ -4,7 +4,9 @@
 // by the heading. It always draws from straight above and leaves pitch as a
 // number the tools report, since a tilted camera is a 3D engine's work. Its
 // output depends on the world's state alone, so two captures of one view are
-// the same bytes.
+// the same bytes. A 2D canvas keeps its pixels between frames; a WebGL page
+// must read its canvas in the same task as its render, or create the context
+// with preserveDrawingBuffer, or a capture comes back blank.
 
 import { GLOBE, type MapViewport, type MapWorld, projectToScreen } from '@tabdock/sim-page/map';
 

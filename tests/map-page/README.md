@@ -1,6 +1,6 @@
 # @tabdock/map-page
 
-A map and globe page drawn on a plain canvas with no map library, which registers the map profile's sixteen tools (guide page 16, `docs/guide/16-map-pages.md`) through WebMCP and links to a Tabdock relay. It is the browser half of ADR 0038's worked example: the same `MapWorld` and tools that `@tabdock/sim-page/map` runs in Node, drawn by `src/render.ts`, on the MCP-B polyfill at exactly 5.1.0 where the browser has no native WebMCP. It is private and never published.
+A map and globe page drawn on a plain canvas with no map library, which registers the map profile's sixteen tools (guide page 16, `docs/guide/16-map-pages.md`) through WebMCP and links to a Tabdock relay. It is the browser half of ADR 0038's worked example: the same `MapWorld` and tools that `@tabdock/sim-page/map` runs in Node, drawn by `src/draw.ts`, on the MCP-B polyfill at exactly 5.1.0 where the browser has no native WebMCP. It is private and never published.
 
 Try it by hand from a clone, with a relay running (`pnpm relay` in another terminal):
 

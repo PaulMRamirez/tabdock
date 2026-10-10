@@ -37,7 +37,7 @@ describe('the map page package', () => {
 
   it('imports nothing in its page but those and its own files', () => {
     const sources = readdirSync(join(DIR, 'src')).filter((name) => name.endsWith('.ts'));
-    expect(sources).toEqual(expect.arrayContaining(['main.ts', 'render.ts', 'webmcp.ts']));
+    expect(sources).toEqual(expect.arrayContaining(['draw.ts', 'main.ts', 'webmcp.ts']));
     const imported = sources.flatMap((name) =>
       [
         ...readFileSync(join(DIR, 'src', name), 'utf8').matchAll(

@@ -45,4 +45,4 @@ The fixed numbers behind images, page state, proposals, time-boxed sessions, the
 
 Waits share one more bound: a page holds at most as many as its people limit and watching seats together, and invitees on it that number less two. Each wait also holds its request's charge, so the byte budgets on [Relay settings](08-relay-settings.md) bound them too. The widget warns 5 minutes and 1 minute before a session ends, and agent tokens last 1, 4 or 8 hours, as the widget offers them.
 
-Back to [the guide's index](README.md), or start again at [Concepts](01-concepts.md).
+Next: [Map and globe pages](16-map-pages.md).
