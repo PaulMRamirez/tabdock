@@ -41,3 +41,11 @@ Short records of decisions that change or refine `SPEC.md`, or that a future con
 | [0035](0035-user-guide-on-pages.md)              | A user guide in docs/guide, published at /guide/                | Accepted |
 | [0036](0036-refresh-spec-after-0-1-0.md)         | Refresh SPEC sections 4 to 8 and 11 after 0.1.0                 | Accepted |
 | [0037](0037-sdk-pins-together.md)                | Move the MCP SDK pins to 2.3.1, and keep them together          | Accepted |
+| [0038](0038-map-and-globe-tool-set.md)           | A tool set for map and globe pages                              | Proposed |
+| [0039](0039-image-results.md)                    | Image results                                                   | Proposed |
+| [0040](0040-page-state-clients-can-follow.md)    | Page state clients can follow                                   | Proposed |
+| [0041](0041-checking-a-page-from-ci.md)          | Checking a page from CI                                         | Proposed |
+| [0042](0042-proposals-from-observers.md)         | Proposals from observers                                        | Proposed |
+| [0043](0043-time-boxed-sessions.md)              | Time-boxed sessions                                             | Proposed |
+| [0044](0044-larger-read-only-rooms.md)           | Larger read-only rooms                                          | Proposed |
+| [0045](0045-session-record-for-the-operator.md)  | A session record for the operator                               | Proposed |
