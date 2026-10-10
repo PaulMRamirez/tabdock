@@ -21,14 +21,16 @@ import {
   type Tabdock,
 } from '../src/tabdock-harness.ts';
 
-// A5.4: the adapter's call, cancel and consequential specs on MCP-B's 6.0
-// beta polyfill (M5 decision D4, ADR 0031). The demo page and the adapter it
-// bundles run unchanged; src/mcpb6-page.ts installs the beta before the page's
-// own scripts, so its 5.1.0 initializeWebMCPPolyfill() finds a context and
-// steps aside. The playwright.config.ts project "mcpb6" runs this file
-// without the flag that turns native WebMCP on, and every test first proves
-// the context is 6's, so a pass can never be 5.1.0's or Chrome's. On 6 the adapter takes the
-// path it takes on native Chrome (ADR 0001's notes): no __isWebMCPPolyfill
+// A5.4 and A6.26: the adapter's call, cancel and consequential specs on
+// MCP-B's 6.0.0 polyfill (ADR 0047; the beta before it, M5 decision D4 and
+// ADR 0031). The demo page and the adapter it bundles run unchanged;
+// src/mcpb6-page.ts loads 6.0.0's module before the page's own scripts and
+// calls installWebMCP(), since importing it installs nothing, so the page's
+// 5.1.0 initializeWebMCPPolyfill() finds a context and steps aside. The
+// playwright.config.ts project "mcpb6" runs this file without the flag that
+// turns native WebMCP on, and every test first proves the context is 6's, so
+// a pass can never be 5.1.0's or Chrome's. On 6 the adapter takes the path
+// it takes on native Chrome (ADR 0001's notes): no __isWebMCPPolyfill
 // marker, an object input taken the first time, consequentialHint reported,
 // and the caller's signal handed to the handler, so a revoke or a client's
 // cancel aborts it. Results arrive as 6 gives them, a plain string quoted and
@@ -152,15 +154,16 @@ function resultsFromPage(callId: string): string[] {
 }
 
 /**
- * Opens the demo on the beta and proves that is what runs: the polyfill
- * installed over nothing, no 5.1.0 marker or navigator alias, and 6's own
- * refusal of a JSON string.
+ * Opens the demo on 6.0.0 and proves that is what runs: the module loaded
+ * over nothing and installed nothing until installWebMCP() ran, no 5.1.0
+ * marker or navigator alias, and 6's own refusal of a JSON string.
  */
 async function openOnMcpb6(page: Page): Promise<string> {
   await page.goto(tabdock.pageUrl);
   await page.waitForSelector('html[data-tools="ready"]');
   expect(await mcpb6Runtime(page)).toEqual({
     hadContextBefore: false,
+    installedOnImport: false,
     installed: true,
     marker: undefined,
     navigatorAlias: false,
@@ -214,7 +217,7 @@ async function registerTool(
     await context.registerTool({
       name,
       title: name,
-      description: `A tool the 6.0 leg registers: ${name}.`,
+      description: `A tool the 6.0.0 leg registers: ${name}.`,
       inputSchema: { type: 'object', properties: {} },
       annotations,
       execute: () => returns,
@@ -265,7 +268,7 @@ async function registerSlowWrite(page: Page): Promise<void> {
   });
 }
 
-test('call: on the 6.0 beta a driver lists and calls tools, the object input is taken the first time, and results arrive as 6 gives them', async ({
+test('call: on 6.0.0 a driver lists and calls tools, the object input is taken the first time, and results arrive as 6 gives them', async ({
   page,
 }) => {
   const pageId = await openOnMcpb6(page);
@@ -290,10 +293,10 @@ test('call: on the 6.0 beta a driver lists and calls tools, the object input is 
   const added = await callTool(client, 'call_page_tool', {
     page: pageId,
     tool: 'add_item',
-    arguments: { label: 'From the 6.0 leg', x: 120, y: 80, color: 'purple' },
+    arguments: { label: 'From the 6.0.0 leg', x: 120, y: 80, color: 'purple' },
   });
   expect(added.isError, added.text).toBe(false);
-  expect(added.structured).toMatchObject({ item: { id: 'item-4', label: 'From the 6.0 leg' } });
+  expect(added.structured).toMatchObject({ item: { id: 'item-4', label: 'From the 6.0.0 leg' } });
   await expect(page.locator('[data-role="view"]')).toHaveText(/4 items/);
 
   // 6 serializes every result as JSON, so a handler's plain text arrives quoted,

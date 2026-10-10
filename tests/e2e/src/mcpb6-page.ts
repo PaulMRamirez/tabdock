@@ -1,21 +1,27 @@
-// Puts a page on the MCP-B 6.0 beta polyfill (M5 decision D4, ADR 0031) for
-// the Playwright leg in specs/mcpb6.spec.ts and the baseline's 6.0 run. The
-// beta's script-tag build runs as an init script, before any of the page's
-// own scripts, and installs document.modelContext; the demo's 5.1.0
-// initializeWebMCPPolyfill() then finds a context and steps aside, as it does
-// for native WebMCP, so the demo, its tools and the adapter it bundles run on
-// 6 unchanged. The beta is reached through @tabdock/mcpb6's paths alone
-// (ADR 0032), never a bare package name that could resolve to 5.1.0.
+// Puts a page on the MCP-B 6.0.0 polyfill (ADR 0047, after M5 decision D4
+// and ADR 0031) for the Playwright leg in specs/mcpb6.spec.ts and the
+// baseline's 6 run. An init script runs before any of the page's own
+// scripts and does what an npm page does with 6.0.0: it loads the ESM entry,
+// which installs nothing on import, then calls installWebMCP() itself. The
+// demo's 5.1.0 initializeWebMCPPolyfill() then finds a context and steps
+// aside, as it does for native WebMCP, so the demo, its tools and the adapter
+// it bundles run on 6 unchanged. 6.0.0 is reached through @tabdock/mcpb6's
+// paths alone (ADR 0032), never a bare package name that could resolve to
+// 5.1.0.
 
-import { readFileSync } from 'node:fs';
 import type { Page } from '@playwright/test';
-import { MCPB6_POLYFILL_SCRIPT } from '@tabdock/mcpb6';
+import { mcpb6ModuleScript } from '@tabdock/mcpb6';
+
+/** The name the init script binds the polyfill's exports to, inside its own function. */
+export const MCPB6_BINDING = 'mcpb6Polyfill';
 
 /** What the init script saw, read back with page.evaluate(() => window.__mcpb6). */
 export interface Mcpb6Probe {
   /** A context was there before the polyfill ran, so it kept that one and this page is not on 6. */
   hadContextBefore: boolean;
-  /** The polyfill left document.modelContext in place. */
+  /** A context was there once the module loaded and before installWebMCP() ran. */
+  installedOnImport: boolean;
+  /** installWebMCP() left document.modelContext in place. */
   installed: boolean;
   /**
    * Every executeTool call the page's code made, in order: the input's type
@@ -30,7 +36,7 @@ declare global {
   }
 }
 
-const polyfill = readFileSync(MCPB6_POLYFILL_SCRIPT, 'utf8');
+const polyfill = mcpb6ModuleScript(MCPB6_BINDING).script;
 
 /**
  * The init script's text. With recordCalls, executeTool is wrapped on the
@@ -57,23 +63,32 @@ export function mcpb6InitScript(options: { recordCalls: boolean }): string {
     },
   });`;
   return `(() => {
-  const probe = { hadContextBefore: 'modelContext' in document, installed: false, calls: [] };
+  const probe = {
+    hadContextBefore: 'modelContext' in document,
+    installedOnImport: false,
+    installed: false,
+    calls: [],
+  };
   window.__mcpb6 = probe;
 ${polyfill}
+  probe.installedOnImport = 'modelContext' in document;
+  ${MCPB6_BINDING}.installWebMCP();
   const context = document.modelContext;
   probe.installed = Boolean(context);
   if (!context) return;${options.recordCalls ? recorder : ''}
 })();`;
 }
 
-/** Loads the 6.0 beta polyfill into every document this page opens from now on. */
+/** Loads the 6.0.0 polyfill into every document this page opens from now on. */
 export async function useMcpb6(page: Page, options: { recordCalls: boolean }): Promise<void> {
   await page.addInitScript({ content: mcpb6InitScript(options) });
 }
 
-/** What makes a context the 6.0 beta's rather than 5.1.0's or a native one. */
+/** What makes a context 6.0.0's rather than 5.1.0's or a native one. */
 export interface Mcpb6Runtime {
   hadContextBefore: boolean;
+  /** 6.0.0's module installs nothing as it loads; only installWebMCP() does. */
+  installedOnImport: boolean;
   installed: boolean;
   /** 5.1.0 sets __isWebMCPPolyfill on its context; 6 and native Chrome set nothing. */
   marker: unknown;
@@ -110,6 +125,7 @@ export async function mcpb6Runtime(page: Page): Promise<Mcpb6Runtime> {
     const marker: unknown = context ? Reflect.get(context, '__isWebMCPPolyfill') : null;
     return {
       hadContextBefore: probe?.hadContextBefore ?? true,
+      installedOnImport: probe?.installedOnImport ?? true,
       installed: probe?.installed ?? false,
       marker,
       navigatorAlias: 'modelContext' in navigator,
