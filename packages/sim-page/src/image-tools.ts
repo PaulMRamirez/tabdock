@@ -14,6 +14,8 @@ export interface PngOptions {
   height: number;
   /** One colour for every pixel, as [red, green, blue]; mid grey by default. */
   rgb?: readonly [number, number, number];
+  /** Each pixel's colour in place of `rgb`, for a picture with something in it to see. */
+  paint?: (x: number, y: number) => readonly [number, number, number];
   /**
    * The file's exact size in bytes: an ancillary chunk of random bytes, which
    * decoders skip, fills it out. Must leave room for the chunk's 12 bytes.
@@ -41,10 +43,11 @@ function concat(parts: readonly Uint8Array[]): Uint8Array {
   return out;
 }
 
-/** A truecolour PNG of one colour, with valid chunk CRCs and zlib data. */
+/** A truecolour PNG, of one colour unless painted, with valid chunk CRCs and zlib data. */
 export function pngImage(options: PngOptions): Uint8Array {
   const { width, height } = options;
-  const [red, green, blue] = options.rgb ?? [128, 128, 128];
+  const flat = options.rgb ?? [128, 128, 128];
+  const paint = options.paint ?? (() => flat);
   const header = new Uint8Array(13);
   const view = new DataView(header.buffer);
   view.setUint32(0, width);
@@ -54,7 +57,7 @@ export function pngImage(options: PngOptions): Uint8Array {
   const row = 1 + width * 3;
   const pixels = new Uint8Array(row * height);
   for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) pixels.set([red, green, blue], y * row + 1 + x * 3);
+    for (let x = 0; x < width; x += 1) pixels.set(paint(x, y), y * row + 1 + x * 3);
   }
   const parts = [
     new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
