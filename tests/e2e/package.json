@@ -31,6 +31,7 @@
     "@playwright/test": "1.56.1",
     "@tabdock/adapter": "workspace:*",
     "@tabdock/demo": "workspace:*",
+    "@tabdock/map-page": "workspace:*",
     "@tabdock/mcpb6": "workspace:*",
     "@tabdock/protocol": "workspace:*",
     "@tabdock/relay": "workspace:*",

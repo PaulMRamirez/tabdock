@@ -156,6 +156,9 @@ importers:
       '@tabdock/demo':
         specifier: workspace:*
         version: link:../../apps/demo
+      '@tabdock/map-page':
+        specifier: workspace:*
+        version: link:../map-page
       '@tabdock/mcpb6':
         specifier: workspace:*
         version: link:../mcpb6
