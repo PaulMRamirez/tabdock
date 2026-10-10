@@ -940,7 +940,7 @@ describe("a member's first-class list", () => {
     expect(names(await modernList())).toEqual(before);
   });
 
-  it("is empty with the flag off: M4's surface, no firstClass field, and a first-class name unknown", async () => {
+  it('is empty with the flag off: the fixed tools alone, no firstClass field, and a first-class name unknown', async () => {
     await relayWith(false);
     const page = await pageWith(TOOLS);
     const alice = await member();

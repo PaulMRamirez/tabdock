@@ -454,7 +454,9 @@ export interface RelayOptions {
    * First-class page tools (TABDOCK_FIRST_CLASS_TOOLS, ADR 0025), off unless
    * exactly true, in every mode, local mode included, and allowed in
    * production: members' clients list each attached page's tools as
-   * `<page id>__<tool>` beside the fixed tools. Off, the tool surface is M4's.
+   * `<page id>__<tool>` beside the fixed tools. Off, the surface is the fixed
+   * tools alone, M4's five first and unchanged in name, input schema and
+   * annotations (fixed-tools-golden.test.ts).
    */
   firstClassTools?: boolean | undefined;
   /**
