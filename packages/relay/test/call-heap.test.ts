@@ -9,7 +9,9 @@
 // every limit at its default) with every page slot filled to the tool
 // budget, takes members' calls of those shapes on a page that reads every
 // invoke and answers none: it must refuse those past what waiting requests
-// may hold, and go on serving, rather than run out of heap.
+// may hold, and go on serving, rather than run out of heap. A waiting
+// wait_for_page_state holds its request charge too (ADR 0040), so the same
+// shapes carried by waits are held to it as well.
 
 import { type ChildProcess, fork } from 'node:child_process';
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
@@ -177,6 +179,163 @@ describe('what requests waiting on a page hold, and the heap (S9, ADR 0018 notes
       const report = JSON.stringify({ shape, leg, heapPerCall, chargedPerCall });
       expect(heapPerCall, report).toBeGreaterThan(0);
       expect(chargedPerCall, report).toBeGreaterThan(heapPerCall);
+    },
+    120_000,
+  );
+});
+
+const WAIT_PROBE = resolve(import.meta.dirname, 'fixtures/wait-heap-probe.ts');
+/** Waits measured per shape and leg, after one that warms the relay up: one a member. */
+const WAIT_COUNT = 8;
+
+/**
+ * A fetch whose wait_for_page_state requests carry a call shape's arguments
+ * as an extra argument and its _meta as theirs, keeping the request's id, so
+ * a wait holds what the shape makes a call hold (ADR 0040). `sent` receives
+ * each body as it goes.
+ */
+function waitShapedFetch(
+  shape: CallShapeName,
+  page: () => string,
+  sent: (body: string) => void,
+): FetchLike {
+  const made = CALL_SHAPES[shape]();
+  return (input, init) => {
+    const body = init?.body;
+    if (typeof body !== 'string' || !body.includes('"wait_for_page_state"')) {
+      return fetch(input, init);
+    }
+    const message = JSON.parse(body) as {
+      id: unknown;
+      params: { _meta?: Record<string, unknown> };
+    };
+    const meta = JSON.stringify(message.params._meta ?? {});
+    const extra =
+      made.meta === null ? meta : `${meta.slice(0, -1)}${meta === '{}' ? '' : ','}${made.meta}}`;
+    const shaped =
+      `{"jsonrpc":"2.0","id":${JSON.stringify(message.id)},"method":"tools/call","params":` +
+      `{"name":"wait_for_page_state","arguments":{"page":${JSON.stringify(page())},` +
+      `"after":0,"timeoutMs":40000,"pad":${made.args}},"_meta":${extra}}${' '.repeat(made.spaces)}}`;
+    sent(shaped);
+    return fetch(input, { ...init, body: shaped });
+  };
+}
+
+interface WaitReport {
+  heapUsed: number;
+  /** Waits the relay had started before the first collection. */
+  waits: number;
+}
+
+/** One run of the wait probe: the heap each waiting wait of a shape holds, and what the relay charged it. */
+async function probeWaits(
+  shape: CallShapeName,
+  modern: boolean,
+): Promise<{ heapPerWait: number; chargedPerWait: number }> {
+  const child = fork(WAIT_PROBE, [], {
+    execArgv: ['--expose-gc'],
+    stdio: ['ignore', 'pipe', 'inherit', 'ipc'],
+  });
+  children.push(child);
+  const ask = <T>(message: string): Promise<T> =>
+    new Promise((resolveAnswer) => {
+      child.once('message', (answer: T) => {
+        resolveAnswer(answer);
+      });
+      child.send(message);
+    });
+  const [mcpUrl = '', pageId = ''] = await new Promise<string[]>((resolveLine) => {
+    child.stdout?.once('data', (chunk: Buffer) => {
+      resolveLine(chunk.toString('utf8').trim().split(' '));
+    });
+  });
+  let charged = 0;
+  const members: Client[] = [];
+  let used = '';
+  for (let n = 0; n <= WAIT_COUNT; n += 1) {
+    const client = new Client(
+      { name: 'wait-heap', version: '1.0.0' },
+      modern ? { versionNegotiation: { mode: { pin: '2026-07-28' } } } : {},
+    );
+    await client.connect(
+      new StreamableHTTPClientTransport(new URL(mcpUrl), {
+        requestInit: {
+          headers: { Authorization: `Bearer wait-heap-probe-${String(n)}-token-5d1e8b3a7c2f` },
+        },
+        fetch: waitShapedFetch(
+          shape,
+          () => pageId,
+          (body) => {
+            charged = requestHeapBytes(new TextEncoder().encode(body));
+          },
+        ),
+      }),
+    );
+    clients.push(client);
+    members.push(client);
+    // Each pairing spends the code, and the page hears its successor a moment later.
+    let code = used;
+    while (code === used) code = (await ask<{ code: string }>('code')).code;
+    used = code;
+    const paired = await client.callTool({ name: 'pair_page', arguments: { code } });
+    expect(paired.isError ?? false, JSON.stringify(paired.content)).toBe(false);
+  }
+  const settled: string[] = [];
+  const startWait = (client: Client | undefined): void => {
+    void client
+      ?.callTool(
+        { name: 'wait_for_page_state', arguments: { page: pageId, after: 0 } },
+        { timeout: 600_000 },
+      )
+      .then(
+        (result) => {
+          settled.push(`answered: ${JSON.stringify(result.content).slice(0, 300)}`);
+        },
+        (error: unknown) => {
+          settled.push(`rejected: ${String(error)}`);
+        },
+      );
+  };
+  /** The first measure begun once the relay had started `total` waits, so every reading found them all. */
+  const measured = async (total: number): Promise<WaitReport> => {
+    for (;;) {
+      const now = await ask<WaitReport>('measure');
+      expect(settled, 'a wait stopped waiting before its heap was measured').toEqual([]);
+      if (now.waits >= total) return now;
+      await new Promise((resolveTick) => setTimeout(resolveTick, 50));
+    }
+  };
+  // One wait first, so what every wait costs once (code, maps, caches) is in the baseline.
+  startWait(members[0]);
+  const before = await measured(1);
+  for (const client of members.slice(1)) startWait(client);
+  const after = await measured(1 + WAIT_COUNT);
+  for (const client of members) await client.close();
+  child.kill('SIGKILL');
+  return {
+    heapPerWait: Math.round((after.heapUsed - before.heapUsed) / WAIT_COUNT),
+    chargedPerWait: charged,
+  };
+}
+
+describe('what a waiting wait_for_page_state holds, and the heap (S9, ADR 0040)', () => {
+  // The shapes that hold the most per byte in a call's arguments and in _meta, and next to nothing.
+  const shapes: CallShapeName[] = [
+    'tiny',
+    'twoByteText',
+    'emptyObjects',
+    'metaObjects',
+    'metaIndexKeys',
+  ];
+  const cases = shapes.flatMap((shape) => [[shape, 'legacy'] as const, [shape, 'modern'] as const]);
+
+  it.each(cases)(
+    'charges a waiting wait of %s on the %s leg at least the heap it holds',
+    async (shape, leg) => {
+      const { heapPerWait, chargedPerWait } = await probeWaits(shape, leg === 'modern');
+      const report = JSON.stringify({ shape, leg, heapPerWait, chargedPerWait });
+      expect(heapPerWait, report).toBeGreaterThan(0);
+      expect(chargedPerWait, report).toBeGreaterThan(heapPerWait);
     },
     120_000,
   );
