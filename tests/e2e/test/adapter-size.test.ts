@@ -8,6 +8,7 @@
 // here before a release ships it. ADR 0048's per-wave checkpoints are
 // recorded in docs/plans/M6.md at each wave's merge.
 
+import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import { scriptTagBytes } from '../../../packages/adapter/scripts/script-tag-build.ts';
 import { SCRIPT_TAG_LIMIT_BYTES } from '../../../scripts/release-check.ts';
@@ -20,4 +21,14 @@ describe('the adapter script-tag build', () => {
     // A build that lost the adapter would pass the ceiling for the wrong reason.
     expect(bytes).toBeGreaterThan(50_000);
   }, 60_000);
+
+  // Importing any schema must still run zod-config.ts, in the workspace's
+  // sources and in the published dist alike; every other protocol module is
+  // pure, so the build may drop those a page never imports (ADR 0048's notes).
+  it('drops unused protocol modules but never zod-config', async () => {
+    const manifest = JSON.parse(
+      await readFile(new URL('../../../packages/protocol/package.json', import.meta.url), 'utf8'),
+    ) as { sideEffects?: unknown };
+    expect(manifest.sideEffects).toEqual(['./src/zod-config.ts', './dist/zod-config.js']);
+  });
 });
