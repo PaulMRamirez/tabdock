@@ -245,7 +245,7 @@ describe('an image the adapter refuses before sending (A6.4)', () => {
       expect(h.dock.state.maxImageBytes).toBe(0);
       expect(await call(h, socket, () => ENVELOPE)).toMatchObject({
         ok: false,
-        error: { code: 'tool_error', message: "this page's relay takes no image results" },
+        error: { code: 'tool_error', message: 'image results are off here (a cap of 0 bytes)' },
       });
     }
     const { h, socket } = await page({ maxImageBytes: 2 ** 31 });

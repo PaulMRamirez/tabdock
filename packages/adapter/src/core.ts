@@ -3718,16 +3718,15 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    * checks it again (one checkImage for both); anything else stays text as
    * the runtime gave it (ADR 0001), so the tool can still answer in words.
    * The page's words beside an image are cut so the marker fits within
-   * MAX_IMAGE_TEXT_CHARS, and the image never is.
+   * MAX_IMAGE_TEXT_CHARS, and the image never is. A relay that named no cap
+   * takes none, which checkImage refuses as images off.
    */
   function imageOutcome(text: string): Outcome {
     const envelope = parseImageEnvelope(text);
     if (envelope.kind === 'text') return { ok: true, content: text };
     const refused = (message: string): Outcome => ({ ok: false, code: 'tool_error', message });
     if (envelope.kind === 'invalid') return refused(envelope.message);
-    const limit = state.maxImageBytes ?? 0;
-    if (limit === 0) return refused("this page's relay takes no image results");
-    const checked = checkImage(envelope.image, limit);
+    const checked = checkImage(envelope.image, state.maxImageBytes ?? 0);
     if (!checked.ok) return refused(checked.message);
     return {
       ok: true,
