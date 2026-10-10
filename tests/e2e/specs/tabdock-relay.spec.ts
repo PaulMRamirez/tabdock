@@ -644,7 +644,7 @@ test.describe('M2: many clients, many users', () => {
   }) => {
     const { pageId, aliceModern, bob } = await attachTwoUsers(page);
     await registerSlowWrite(page);
-    await waitForToolCount(pageId, 7);
+    await waitForToolCount(pageId, 8);
 
     let runningSettled = false;
     const running = callTool(client, 'call_page_tool', { page: pageId, tool: 'slow_write' });

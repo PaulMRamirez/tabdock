@@ -112,9 +112,9 @@ try {
       [];
     say(`   ${listed.text.split('\n', 1)[0] ?? ''}`);
     for (const tool of tools) say(`   ${tool.name.padEnd(16)} allowed: ${String(tool.allowed)}`);
-    if (tools.length !== 6) {
+    if (tools.length !== 7) {
       unexpected += 1;
-      say(`   UNEXPECTED: ${String(tools.length)} tools, expected 6`);
+      say(`   UNEXPECTED: ${String(tools.length)} tools, expected 7`);
     }
   }
 
