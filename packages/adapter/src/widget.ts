@@ -47,7 +47,8 @@
 // trusted-page rule (SPEC.md section 2) covers all of this, since such a
 // script can run the page's tools itself; docs/threat-model.md (B5) records
 // it.
-// Buttons carry stable data-action attributes for browser tests.
+// Buttons carry stable data-action attributes, and blocks data-role ones, for
+// browser tests and the testing helper; widget-names.ts lists every name.
 
 import {
   type Account,
@@ -78,9 +79,7 @@ import type {
 import { type BoxRect, takeDom } from './dom.ts';
 import { createQrView, inviteQrUrl, QR_SIDE_PX } from './qr.ts';
 import { apply, taken } from './taken.ts';
-
-/** A valid custom element name needs no registration to host a shadow root, so nothing is defined globally. */
-const HOST_TAG = 'tabdock-dock';
+import { HOST_TAG, type WidgetAction, type WidgetRole } from './widget-names.ts';
 
 /**
  * A box's buttons ignore clicks until the box has held still this long since
@@ -136,6 +135,21 @@ const REFUSAL_TEXT: Record<InviteRefusal, string> = {
     'No link came back: the relay did not answer, or this page cannot make one (it needs https).',
   cancelled: 'The invite was closed before the relay answered.',
 };
+
+// The M6 blocks' rules, a labelled section each with its own dark-mode
+// rules, so each workstream edits its own lines alone (plan section 2.6).
+/** The page state line (ADR 0040). */
+const STATE_STYLE = '';
+/** The proposal queue and its badge (ADR 0042). */
+const PROPOSALS_STYLE = '';
+/** The time-boxed session's form, countdown and badge (ADR 0043). */
+const SESSION_STYLE = '';
+/** The roster's Watching section and compact rows (ADR 0044). */
+const ROSTER_STYLE = '';
+/** Agent tokens in the invite form and list (ADR 0044). */
+const AGENTS_STYLE = '';
+/** The session record's block and its offer (ADR 0045). */
+const RECORD_STYLE = '';
 
 const STYLE = `
 :host { all: initial; position: fixed; right: 16px; bottom: 16px; z-index: 2147483647;
@@ -238,7 +252,7 @@ li { padding: 2px 0; }
   .join { color: #93c5fd; }
   .notice, .activity [data-outcome='running'] { color: #fcd34d; }
 }
-`;
+${STATE_STYLE}${PROPOSALS_STYLE}${SESSION_STYLE}${ROSTER_STYLE}${AGENTS_STYLE}${RECORD_STYLE}`;
 
 /** A box whose buttons take a click only once it has held still; see ARM_DELAY_MS. */
 interface ArmedBox {
@@ -509,6 +523,13 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     return node;
   }
 
+  /** A block placed now and filled later, hidden until then so the panel looks as it did. */
+  function hiddenBlock<K extends 'div' | 'p'>(tag: K): HTMLElementTagNameMap[K] {
+    const node = element(tag);
+    dom.flag(node, 'hidden', true);
+    return node;
+  }
+
   /** Every armed box on show: prompts, roster rows, the pause control and the Invite form. */
   const boxes = new Set<ArmedBox>();
   const requestViews = new Map<string, PromptView>();
@@ -516,10 +537,20 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   const rowViews = new Map<string, RowView>();
   const inviteRows = new Map<string, InviteRowView>();
 
-  function button(label: string, action: string, onClick: () => void, primary = false) {
+  /** Every data-action goes through here, so only a name WIDGET_ACTIONS lists can be set. */
+  function setAction(node: Element, action: WidgetAction): void {
+    dom.attr(node, 'data-action', action);
+  }
+
+  /** Every data-role goes through here, so only a name WIDGET_ROLES lists can be set. */
+  function role(node: Element, name: WidgetRole): void {
+    dom.attr(node, 'data-role', name);
+  }
+
+  function button(label: string, action: WidgetAction, onClick: () => void, primary = false) {
     const node = element('button', primary ? 'action primary' : 'action', label);
     dom.attr(node, 'type', 'button');
-    dom.attr(node, 'data-action', action);
+    setAction(node, action);
     dom.listen(node, 'click', (event) => {
       // Page script can dispatch a click, but never a trusted one.
       if (!event.isTrusted) return;
@@ -531,7 +562,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   /** The "invited" badge; empty, and so not shown, for anyone else. */
   function badge(show: boolean): HTMLElement {
     const node = element('span', 'invited', show ? 'invited' : '');
-    dom.attr(node, 'data-role', 'invited');
+    role(node, 'invited');
     return node;
   }
 
@@ -561,7 +592,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     readonly person: string;
   }): HTMLElement {
     const node = element('span', 'confirmed');
-    dom.attr(node, 'data-role', 'confirmed');
+    role(node, 'confirmed');
     if (confirmed.client === null) dom.append(node, 'confirmed in their client');
     else dom.append(node, 'confirmed in ', quotedClient(confirmed.client));
     dom.append(node, ' by ', person(confirmed.person));
@@ -609,7 +640,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   function boxButton(
     box: ArmedBox,
     label: string,
-    action: string,
+    action: WidgetAction,
     onClick: () => void,
     primary = false,
   ) {
@@ -645,14 +676,33 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   const noticeLine = element('p', 'notice');
   // Who just joined by a Can watch invite, with no prompt to say so (ADR 0016).
   const joins = element('div');
-  dom.attr(joins, 'data-role', 'joins');
+  role(joins, 'joins');
   dom.attr(joins, 'aria-live', 'polite');
   const prompts = element('div');
   dom.attr(prompts, 'aria-live', 'polite');
 
+  // The M6 blocks, each hidden until the workstream that owns it fills it,
+  // and placed in the panel in the order plan C22 fixes; see the append below.
+  /** The session record's offer at a session's end (ADR 0045), right under the prompts. */
+  const recordOfferBox = hiddenBlock('div');
+  role(recordOfferBox, 'record-offer');
+  /** Proposals waiting for the operator (ADR 0042). */
+  const proposalsBlock = hiddenBlock('div');
+  role(proposalsBlock, 'proposals');
+  /** The time-boxed session's form, or the running session (ADR 0043). */
+  const sessionBlock = hiddenBlock('div');
+  role(sessionBlock, 'session');
+  /** Agent tokens beside the invites (ADR 0044). */
+  const agentsBlock = hiddenBlock('div');
+  /** The session record: what it holds, and Save (ADR 0045). */
+  const recordBlock = hiddenBlock('div');
+  /** Whether the page's state reaches the relay (ADR 0040). */
+  const stateLine = hiddenBlock('p');
+  role(stateLine, 'state-line');
+
   const pairing = element('div');
   const code = element('div', 'code');
-  dom.attr(code, 'data-role', 'pairing-code');
+  role(code, 'pairing-code');
   const expiry = element('p', 'muted');
   const rotate = button('New code', 'rotate', () => {
     dock.rotatePairing();
@@ -660,7 +710,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   // Shown only when the relay sent a pairing URL the QR module accepts.
   const qr = createQrView(doc);
   const qrBox = element('div', 'qr');
-  dom.attr(qrBox, 'data-role', 'pairing-qr');
+  role(qrBox, 'pairing-qr');
   dom.flag(qrBox, 'hidden', true);
   dom.append(qrBox, qr.element);
   const pairText = element('div', 'pair-text');
@@ -670,7 +720,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   dom.append(pairing, element('div', 'label', 'Pairing code'), pairRow);
 
   const roster = element('ul');
-  dom.attr(roster, 'data-role', 'roster');
+  role(roster, 'roster');
   const nobody = element('p', 'muted', 'Nobody yet');
   // Revoking only takes access away, so it is not held back like the boxes.
   const revokeAll = button('Revoke all', 'revoke-all', () => {
@@ -681,11 +731,11 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
 
   // Invites (ADR 0017): the link shown once, the live list, and the form.
   const invitesBlock = element('div');
-  dom.attr(invitesBlock, 'data-role', 'invites');
+  role(invitesBlock, 'invites');
   dom.flag(invitesBlock, 'hidden', true);
 
   const linkBox = element('div', 'prompt');
-  dom.attr(linkBox, 'data-role', 'invite-link');
+  role(linkBox, 'invite-link');
   dom.flag(linkBox, 'hidden', true);
   const linkHeading = element('p');
   const linkQr = createQrView(doc, {
@@ -693,10 +743,10 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     label: 'Invite QR code: scan it with a phone to join',
   });
   const linkQrBox = element('div', 'qr');
-  dom.attr(linkQrBox, 'data-role', 'invite-qr');
+  role(linkQrBox, 'invite-qr');
   dom.append(linkQrBox, linkQr.element);
   const linkText = element('p', 'link-text');
-  dom.attr(linkText, 'data-role', 'invite-link-text');
+  role(linkText, 'invite-link-text');
   const copyLink = button('Copy link', 'invite-copy', () => {
     copyShownLink();
   });
@@ -710,10 +760,10 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   let shownLink: { readonly inviteId: string; readonly link: string } | null = null;
 
   const inviteList = element('ul');
-  dom.attr(inviteList, 'data-role', 'invite-list');
+  role(inviteList, 'invite-list');
   const noInvites = element('p', 'muted', 'No live invites');
   const inviteError = element('p', 'error');
-  dom.attr(inviteError, 'data-role', 'invite-error');
+  role(inviteError, 'invite-error');
   dom.flag(inviteError, 'hidden', true);
   const inviteToggle = button('Invite someone', 'invite-open', () => {
     // Any hidden attribute, 'until-found' too, means closed.
@@ -722,7 +772,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
 
   // The form is an armed box: Create grants access, as Allow does.
   const formBox = element('div', 'row');
-  dom.attr(formBox, 'data-role', 'invite-form');
+  role(formBox, 'invite-form');
   dom.flag(formBox, 'hidden', true);
   const formView = newBox(formBox);
   boxes.add(formView);
@@ -733,21 +783,21 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   dom.attr(labelInput, 'autocomplete', 'off');
   dom.attr(labelInput, 'spellcheck', 'false');
   dom.attr(labelInput, 'placeholder', 'Who is it for?');
-  dom.attr(labelInput, 'data-action', 'invite-label');
+  setAction(labelInput, 'invite-label');
   dom.append(labelField, labelInput);
 
   function choice(
     group: string,
     value: string,
     text: string,
-    action: string,
+    action: WidgetAction,
   ): { label: HTMLLabelElement; input: HTMLInputElement } {
     const label = element('label');
     const input = element('input');
     dom.attr(input, 'type', 'radio');
     dom.attr(input, 'name', group);
     dom.attr(input, 'value', value);
-    dom.attr(input, 'data-action', action);
+    setAction(input, action);
     dom.append(label, input, text);
     return { label, input };
   }
@@ -782,11 +832,11 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   dom.attr(usesInput, 'max', String(MAX_INVITE_USES));
   dom.attr(usesInput, 'step', '1');
   dom.setValue(usesInput, '1');
-  dom.attr(usesInput, 'data-action', 'invite-uses');
+  setAction(usesInput, 'invite-uses');
   dom.append(usesField, usesInput);
 
   const formReason = element('p', 'muted');
-  dom.attr(formReason, 'data-role', 'invite-reason');
+  role(formReason, 'invite-reason');
   const createButton = boxButton(
     formView,
     'Create link',
@@ -817,6 +867,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     linkBox,
     inviteList,
     noInvites,
+    agentsBlock,
     inviteError,
     formBox,
     inviteToggle,
@@ -824,14 +875,14 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
 
   // A fixed height, so new calls never move the boxes around it.
   const activity = element('ol', 'activity');
-  dom.attr(activity, 'data-role', 'activity');
+  role(activity, 'activity');
   dom.attr(activity, 'aria-label', 'Recent calls, newest first');
   const activityBlock = element('div');
   dom.append(activityBlock, element('div', 'label', 'Activity'), activity);
 
   // Last in the panel, beside the badge, where other changes move it least.
   const pauseBox = element('div', 'pause');
-  dom.attr(pauseBox, 'data-role', 'pause-box');
+  role(pauseBox, 'pause-box');
   const pauseView: PauseView = {
     ...newBox(pauseBox),
     text: element('span'),
@@ -845,30 +896,51 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   dom.append(pauseBox, pauseView.text, pauseView.toggle);
   boxes.add(pauseView);
 
+  // Plan C22's order: what needs the operator now first, the pause control last beside the badge.
   dom.append(
     panel,
     errorLine,
     noticeLine,
     joins,
     prompts,
+    recordOfferBox,
+    proposalsBlock,
     pairing,
     rosterBlock,
+    sessionBlock,
     invitesBlock,
     activityBlock,
+    recordBlock,
+    stateLine,
     pauseBox,
   );
 
   const dot = element('span', 'dot');
   const count = element('span', 'count', '0');
   const pausedTag = element('span', 'tag', 'Paused');
-  dom.attr(pausedTag, 'data-role', 'badge-paused');
+  role(pausedTag, 'badge-paused');
+  // The running session's minutes left (ADR 0043) and the proposals waiting (ADR 0042), shown once built.
+  const sessionTag = element('span', 'tag');
+  role(sessionTag, 'badge-session');
+  dom.flag(sessionTag, 'hidden', true);
+  const proposedTag = element('span', 'tag');
+  role(proposedTag, 'badge-proposals');
+  dom.flag(proposedTag, 'hidden', true);
   const badgeButton = button('', 'toggle', () => {
     // Any hidden attribute, 'until-found' too, means closed.
     setOpen(dom.has(panel, 'hidden'));
   });
   dom.attr(badgeButton, 'class', 'badge');
   dom.attr(badgeButton, 'aria-expanded', 'false');
-  dom.append(badgeButton, dot, element('span', '', 'Tabdock'), count, pausedTag);
+  dom.append(
+    badgeButton,
+    dot,
+    element('span', '', 'Tabdock'),
+    count,
+    pausedTag,
+    sessionTag,
+    proposedTag,
+  );
 
   const wrap = element('div', 'wrap');
   dom.append(wrap, panel, badgeButton);
@@ -1009,7 +1081,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const closeLink = element('label', 'check');
     const closeInput = element('input');
     dom.attr(closeInput, 'type', 'checkbox');
-    dom.attr(closeInput, 'data-action', 'close-link');
+    setAction(closeInput, 'close-link');
     dom.append(closeLink, closeInput, 'and close this link');
     dom.flag(closeLink, 'hidden', true);
     const view: RowView = {
@@ -1090,7 +1162,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     dom.flag(view.roleSwitch, 'hidden', role === null || capped);
     const promote = role !== 'driver';
     dom.setText(view.roleSwitch, promote ? 'Make driver' : 'Make observer');
-    dom.attr(view.roleSwitch, 'data-action', promote ? 'make-driver' : 'make-observer');
+    setAction(view.roleSwitch, promote ? 'make-driver' : 'make-observer');
     // "and close this link" starts checked whenever it appears.
     if (closable && dom.has(view.closeLink, 'hidden')) dom.setChecked(view.closeInput, true);
     dom.flag(view.closeLink, 'hidden', !closable);
@@ -1388,7 +1460,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     );
     const open = !dom.has(formBox, 'hidden');
     dom.setText(inviteToggle, open ? 'Close the form' : 'Invite someone');
-    dom.attr(inviteToggle, 'data-action', open ? 'invite-close' : 'invite-open');
+    setAction(inviteToggle, open ? 'invite-close' : 'invite-open');
   }
 
   function setFormOpen(open: boolean): void {
@@ -1477,7 +1549,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       paused ? 'Paused: every call is refused' : 'Calls run as they come',
     );
     dom.setText(pauseView.toggle, paused ? 'Resume' : 'Pause');
-    dom.attr(pauseView.toggle, 'data-action', paused ? 'resume' : 'pause');
+    setAction(pauseView.toggle, paused ? 'resume' : 'pause');
     // Resume grants access again, so a switch that just flipped waits like a new box.
     if (!isNew) restartArming(pauseView);
   }
@@ -1524,12 +1596,33 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   /** Whether the panel has opened by itself to show the code since anyone was last attached; see render. */
   let codeShown = false;
 
+  // M6 seams (plan section 2.6), each its workstream's own: until one is
+  // filled in, its block stays hidden. core.ts says what the marker is for.
+
+  // M6 seam: not built
+  const syncStateLine: (state: DockState) => void = () => undefined;
+  // M6 seam: not built
+  const syncProposals: (state: DockState) => void = () => undefined;
+  // M6 seam: not built
+  const tickProposals = (): void => undefined;
+  // M6 seam: not built
+  const syncSession: (state: DockState) => void = () => undefined;
+  // M6 seam: not built
+  const tickSession = (): void => undefined;
+  // M6 seam: not built
+  const syncAgents: (state: DockState) => void = () => undefined;
+  // M6 seam: not built
+  /** Returns whether a session's end offers its record, which opens the panel as a join notice does. */
+  const syncRecords: (state: DockState) => boolean = () => false;
+
   function tick(): void {
     for (const view of [...requestViews.values(), ...confirmViews.values()]) {
       dom.setText(view.countdown, `Denied automatically in ${secondsLeft(view.expiresAt)} s`);
     }
     for (const view of rowViews.values()) dom.setText(view.expiry, expiryText(view.expiresAt));
     for (const row of inviteRows.values()) setText(row.detail, inviteDetail(row.view));
+    tickSession();
+    tickProposals();
     ageJoinLines();
     updateAttention();
     const current = dock.state.pairing;
@@ -1574,6 +1667,11 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     updateForm(state);
     renderActivity(state.activity);
     updatePause(state.paused);
+    syncStateLine(state);
+    syncProposals(state);
+    syncSession(state);
+    syncAgents(state);
+    const offered = syncRecords(state);
 
     const newRequest = syncPrompts(
       requestViews,
@@ -1588,9 +1686,10 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       confirmView,
     );
     // A new prompt opens the panel, as the operator has a deadline to meet, and
-    // so does a join notice, as nobody was asked about that join, and a seat
-    // notice, as the operator was answered with less than they chose.
-    if (newRequest || newConfirm || joined || seated) setOpen(true);
+    // so does a join notice, as nobody was asked about that join, a seat
+    // notice, as the operator was answered with less than they chose, and the
+    // offer of a session's record, which the browser saves only on a click.
+    if (newRequest || newConfirm || joined || seated || offered) setOpen(true);
     // The code is how anyone attaches, so show it without a click while nobody has.
     // Only once on the way in, so the badge can still close the panel: a link that
     // drops and resumes with nobody attached leaves the panel as the operator left it.
