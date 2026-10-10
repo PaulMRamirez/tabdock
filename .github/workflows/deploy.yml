@@ -92,11 +92,24 @@ jobs:
           TABDOCK_ALLOWED_ORIGINS: ${{ secrets.TABDOCK_ALLOWED_ORIGINS }}
           TABDOCK_OAUTH_ISSUER: ${{ secrets.TABDOCK_OAUTH_ISSUER }}
           TABDOCK_OAUTH_USERS: ${{ secrets.TABDOCK_OAUTH_USERS }}
+          # The members can live in a file on the volume instead, read again
+          # whenever it changes (ADR 0043): a path, so a variable, not a secret.
+          TABDOCK_MEMBERS_FILE: ${{ vars.TABDOCK_MEMBERS_FILE }}
           TABDOCK_PAIR_CLIENT_ID: ${{ secrets.TABDOCK_PAIR_CLIENT_ID }}
           TABDOCK_PAIR_CLIENT_SECRET: ${{ secrets.TABDOCK_PAIR_CLIENT_SECRET }}
         run: |
           set -euo pipefail
-          names=(TABDOCK_PUBLIC_URL TABDOCK_ALLOWED_ORIGINS TABDOCK_OAUTH_ISSUER TABDOCK_OAUTH_USERS TABDOCK_PAIR_CLIENT_ID TABDOCK_PAIR_CLIENT_SECRET)
+          names=(TABDOCK_PUBLIC_URL TABDOCK_ALLOWED_ORIGINS TABDOCK_OAUTH_ISSUER TABDOCK_PAIR_CLIENT_ID TABDOCK_PAIR_CLIENT_SECRET)
+          # Exactly one place lists the members; the relay refuses to start with both.
+          if [[ -n "$TABDOCK_MEMBERS_FILE" ]]; then
+            if [[ -n "$TABDOCK_OAUTH_USERS" ]]; then
+              echo "::error::the production environment sets both the secret TABDOCK_OAUTH_USERS and the variable TABDOCK_MEMBERS_FILE; keep one"
+              exit 1
+            fi
+            names+=(TABDOCK_MEMBERS_FILE)
+          else
+            names+=(TABDOCK_OAUTH_USERS)
+          fi
           # Checked before anything is staged, so a missing secret stages nothing.
           for name in FLY_API_TOKEN FLY_APP "${names[@]}"; do
             if [[ -z "${!name}" ]]; then

@@ -187,6 +187,12 @@ export async function startRelay(
           `Tabdock relay on ${relay.url}, public URL ${relay.publicUrl ?? ''}`,
           `  Connector URL (OAuth sign-in through TABDOCK_OAUTH_ISSUER): ${relay.publicMcpUrl}`,
           `  QR pairing page, signing phones in with TABDOCK_PAIR_CLIENT_ID: ${relay.publicUrl ?? ''}/pair`,
+          // A count, never the path, which might hold a pasted secret (ADR 0043).
+          ...(options.membersFile === undefined
+            ? []
+            : [
+                `  Members from TABDOCK_MEMBERS_FILE (${String(options.auth.members?.size ?? 0)}), read again when it changes`,
+              ]),
           // Hosted mode takes pages through the edge (ADR 0018); a tunnelled relay only from this machine.
           options.clientAddressHeader === undefined
             ? `  Page socket for the adapter, on this machine only: ${relay.pageUrl}`

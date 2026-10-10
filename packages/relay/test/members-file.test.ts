@@ -31,6 +31,7 @@ import {
   MEMBERS_POLL_MS,
 } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
+import { startRelay as startFromEnv } from '../src/cli.ts';
 import { resolveConfig } from '../src/config.ts';
 import { type DevTokenUser, inviteeKeyOf, loadConfigFromEnv } from '../src/index.ts';
 import {
@@ -47,7 +48,7 @@ import {
 } from './helpers/invites.ts';
 import { PAGE_ORIGIN, type TestPage } from './helpers/page-client.ts';
 import { Phone } from './helpers/phone.ts';
-import { PAIR_CLIENT } from './helpers/provider.ts';
+import { PAIR_CLIENT, startProvider } from './helpers/provider.ts';
 import { openListen } from './helpers/raw-mcp.ts';
 import { eventually } from './helpers/relay.ts';
 import { leakIn } from './helpers/secrecy.ts';
@@ -253,6 +254,34 @@ describe('the members file at start (ADR 0043)', () => {
       expect(loadConfigFromEnv(env(privateLink)).auth.members?.names()).toEqual(['Alice']);
     },
   );
+
+  it('is counted in the banner, never named', async () => {
+    const provider = await startProvider();
+    try {
+      const file = markedFile([ALICE, BOB]);
+      const started = await startFromEnv(
+        {
+          packaged: false,
+          env: { ...env(file), TABDOCK_OAUTH_ISSUER: provider.issuer, TABDOCK_PORT: '0' },
+          platform: process.platform,
+          out: () => undefined,
+          err: () => undefined,
+        },
+        { newToken: false },
+      );
+      try {
+        expect(started.lines).toContain(
+          '  Members from TABDOCK_MEMBERS_FILE (2), read again when it changes',
+        );
+        expect(started.lines.join('\n')).not.toContain(file);
+        expect(leakIn(started.lines.join('\n'), MARK)).toBeNull();
+      } finally {
+        await started.relay.close();
+      }
+    } finally {
+      await provider.stop();
+    }
+  });
 
   it('is read again as the relay starts, so a list given in code yields to the file', async () => {
     const { relay } = await membersRelay([ALICE], { invites: false });

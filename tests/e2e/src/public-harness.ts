@@ -16,7 +16,9 @@
 // the browser still applies its own rules to each: its cookie jar, SameSite
 // on the way back from the provider, and Origin on the page's own requests.
 
+import { mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
+import { join } from 'node:path';
 import type { BrowserContext, Route } from '@playwright/test';
 import { startDemoServer, type DemoServer } from '@tabdock/demo/server';
 import { createOAuthAuth, createRelay, type LogSink, type Relay } from '@tabdock/relay';
@@ -26,6 +28,7 @@ import {
   startProvider,
   type TestProvider,
 } from '@tabdock/relay/test/provider';
+import { privateTempRoot } from '@tabdock/relay/test/private-tmp';
 import { PUBLIC_MCP_URL, PUBLIC_ORIGIN } from '@tabdock/relay/test/tunnel';
 import { demoPageUrl } from './tabdock-harness.ts';
 
@@ -37,7 +40,20 @@ export interface PublicTabdock {
   demo: DemoServer;
   /** The demo page linked to this relay over loopback, with the test hook on. */
   pageUrl: string;
+  /** The members file, with the membersFile option; else null. */
+  membersFile: string | null;
+  /**
+   * Replaces the members file's list, renaming a new file over the old as
+   * the guide says to, so the relay never reads half of it (ADR 0043).
+   */
+  saveMembers(users: readonly PublicMember[]): void;
   close(): Promise<void>;
+}
+
+export interface PublicMember {
+  sub: string;
+  userId: string;
+  displayName: string;
 }
 
 export interface PublicTabdockOptions {
@@ -45,7 +61,13 @@ export interface PublicTabdockOptions {
   /** The M3 spike's measurements (TABDOCK_SPIKE), for the scan-to-first-call milestones. */
   spike?: boolean;
   /** More accounts the provider may sign in, beside Alice. */
-  users?: { sub: string; userId: string; displayName: string }[];
+  users?: PublicMember[];
+  /**
+   * TABDOCK_MEMBERS_FILE in place of TABDOCK_OAUTH_USERS (ADR 0043): the
+   * members, Alice and `users`, go to a 0600 file in a private directory,
+   * which the relay reads at start and again whenever it changes.
+   */
+  membersFile?: boolean;
   /** TABDOCK_INVITES: accounts off the list become invitees, and pages mint invites (ADR 0017). */
   invites?: boolean;
   /** TABDOCK_AUDIT_DIR, an absolute path: the persistent audit log instead of the memory ring (ADR 0019). */
@@ -56,19 +78,32 @@ export interface PublicTabdockOptions {
 export async function startPublicTabdock(
   options: PublicTabdockOptions = {},
 ): Promise<PublicTabdock> {
+  const users: PublicMember[] = [
+    { sub: MOCK_SUBJECT, userId: 'alice', displayName: 'Alice' },
+    ...(options.users ?? []),
+  ];
+  // A private directory: the relay refuses a members file another account could change.
+  const membersDir =
+    options.membersFile === true
+      ? mkdtempSync(join(privateTempRoot(), 'tabdock-public-members-'))
+      : null;
+  const membersFile = membersDir === null ? null : join(membersDir, 'members.txt');
+  const saveMembers = (list: readonly PublicMember[]): void => {
+    if (membersFile === null) throw new Error('this Tabdock has no members file');
+    const next = `${membersFile}.new`;
+    const lines = list.map((user) => `${user.sub}=${user.userId}:${user.displayName}`);
+    writeFileSync(next, `${lines.join('\n')}\n`, { mode: 0o600 });
+    renameSync(next, membersFile);
+  };
+  if (membersFile !== null) saveMembers(users);
   const provider = await startProvider();
   const demo = await startDemoServer({ e2eHook: true });
   let relay: Relay;
   try {
     relay = await createRelay({
-      auth: createOAuthAuth({
-        issuer: provider.issuer,
-        resource: PUBLIC_MCP_URL,
-        users: [
-          { sub: MOCK_SUBJECT, userId: 'alice', displayName: 'Alice' },
-          ...(options.users ?? []),
-        ],
-      }),
+      // With a members file the relay reads its list from there at start.
+      auth: createOAuthAuth({ issuer: provider.issuer, resource: PUBLIC_MCP_URL, users }),
+      ...(membersFile === null ? {} : { membersFile }),
       publicUrl: PUBLIC_ORIGIN,
       pairClient: PAIR_CLIENT,
       allowedOrigins: [new URL(demo.url).origin],
@@ -82,6 +117,7 @@ export async function startPublicTabdock(
   } catch (error) {
     await demo.close();
     await provider.stop();
+    if (membersDir !== null) rmSync(membersDir, { recursive: true, force: true });
     throw error;
   }
   return {
@@ -89,10 +125,13 @@ export async function startPublicTabdock(
     provider,
     demo,
     pageUrl: demoPageUrl(demo, relay.pageUrl),
+    membersFile,
+    saveMembers,
     async close() {
       await relay.close();
       await demo.close();
       await provider.stop();
+      if (membersDir !== null) rmSync(membersDir, { recursive: true, force: true });
     },
   };
 }

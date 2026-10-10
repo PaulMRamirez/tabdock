@@ -5,7 +5,9 @@
 // process, the way the owner runs it, against the stand-in provider.
 
 import { type ChildProcess, spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PAIR_CLIENT, startProvider, type TestProvider } from '@tabdock/relay/test/provider';
 import { rawRequest } from '@tabdock/relay/test/tunnel';
@@ -61,8 +63,10 @@ function run(env: NodeJS.ProcessEnv): Run {
 
 let provider: TestProvider | undefined;
 let running: Run | undefined;
+const scratches: string[] = [];
 
 afterEach(async () => {
+  for (const dir of scratches.splice(0)) rmSync(dir, { recursive: true, force: true });
   if (running && running.child.exitCode === null) {
     running.child.kill('SIGTERM');
     await running.exited;
@@ -165,6 +169,48 @@ describe('pnpm dev:public', () => {
     expect(challenged.headers.get('www-authenticate')).toContain(
       `resource_metadata="${PUBLIC_URL}/.well-known/oauth-protected-resource/mcp"`,
     );
+    started.child.kill('SIGTERM');
+    expect(await started.exited).toBe(0);
+  });
+
+  it('takes a members file in place of TABDOCK_OAUTH_USERS, counting its members and never naming it (ADR 0043)', async () => {
+    const missing = run({
+      ...blankEnv(),
+      TABDOCK_PUBLIC_URL: PUBLIC_URL,
+      TABDOCK_MEMBERS_FILE: '/srv/members.txt',
+    });
+    expect(await missing.exited).toBe(1);
+    expect(missing.stderr()).toContain('TABDOCK_OAUTH_ISSUER');
+    expect(missing.stderr()).not.toMatch(/^\s+TABDOCK_OAUTH_USERS\s/m);
+    provider = await startProvider();
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'tabdock-dev-members-')));
+    scratches.push(dir);
+    const file = join(dir, 'members.txt');
+    writeFileSync(file, `${SUBJECT}=alice:Alice\nuser_02=bob:Bob\n`, { mode: 0o600 });
+    const started = run({
+      ...blankEnv(),
+      TABDOCK_PORT: '0',
+      DEMO_PORT: '0',
+      TABDOCK_PUBLIC_URL: PUBLIC_URL,
+      TABDOCK_OAUTH_ISSUER: provider.issuer,
+      TABDOCK_MEMBERS_FILE: file,
+      TABDOCK_PAIR_CLIENT_ID: PAIR_CLIENT.clientId,
+      TABDOCK_PAIR_CLIENT_SECRET: PAIR_CLIENT.clientSecret,
+      TABDOCK_ALLOWED_ORIGINS: 'http://127.0.0.1:5173',
+    });
+    running = started;
+    const deadline = Date.now() + 30_000;
+    while (!started.stdout().includes('Relay logs follow')) {
+      if (started.child.exitCode !== null || Date.now() > deadline) {
+        throw new Error(`dev:public did not start: ${started.stderr()}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const printed = started.stdout();
+    expect(printed).toContain('Accounts allowed (TABDOCK_MEMBERS_FILE): 2 members');
+    expect(printed).not.toContain(file);
+    expect(printed).not.toContain(SUBJECT);
+    expect(started.stderr()).not.toContain(file);
     started.child.kill('SIGTERM');
     expect(await started.exited).toBe(0);
   });
