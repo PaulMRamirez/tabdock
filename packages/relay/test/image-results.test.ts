@@ -35,6 +35,13 @@ import {
   SVG,
   webpVp8x,
 } from './helpers/images.ts';
+import {
+  attachMember,
+  type InviteRelay,
+  mintOk,
+  redeem,
+  startInviteRelay,
+} from './helpers/invites.ts';
 import { connectPage, PAGE_ORIGIN, READ_TOOL, type TestPage } from './helpers/page-client.ts';
 import {
   ALICE,
@@ -49,8 +56,11 @@ const relays: TestRelay[] = [];
 const pages: TestPage[] = [];
 const clients: Client[] = [];
 const scratches: string[] = [];
+let invites: InviteRelay | undefined;
 
 afterEach(async () => {
+  await invites?.close();
+  invites = undefined;
   for (const client of clients.splice(0)) await client.close().catch(() => undefined);
   for (const page of pages.splice(0)) page.ws.terminate();
   for (const relay of relays.splice(0)) await relay.close();
@@ -387,6 +397,32 @@ describe('what the record and the log keep of an image (A6.5)', () => {
           `${where} at ${String(offset)}`,
         ).toBe(false);
       }
+    }
+  });
+});
+
+describe('an image for an observer and an invitee (A6.3)', () => {
+  it('reaches a member observer and an invitee observer of a read-only image tool alike', async () => {
+    invites = await startInviteRelay();
+    const opened = await invites.page({ tools: [CAPTURE_TOOL, READ_TOOL], policy: DECLARED });
+    const data = base64(PNG);
+    answerWithImage(opened, { mimeType: 'image/png', data });
+    const alice = await invites.claude('sub-alice');
+    await attachMember(alice, opened, 'observer');
+    const link = await mintOk(opened, { role: 'observer' });
+    const guest = await invites.claude('sub-guest', 'guest@example.com');
+    expect((await redeem(guest, opened, link.link)).outcome.isError).toBe(false);
+    for (const client of [alice, guest]) {
+      const result = await client.callTool({
+        name: 'call_page_tool',
+        arguments: { page: opened.pageId, tool: CAPTURE_TOOL.name, arguments: {} },
+      });
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0]).toEqual({
+        type: 'text',
+        text: `${untrustedHeader(PAGE_ORIGIN, CAPTURE_TOOL.name)}\n${imageLine('image/png', PNG.length)}\nthe view as a picture`,
+      });
+      expect(result.content[1]).toEqual({ type: 'image', mimeType: 'image/png', data });
     }
   });
 });
