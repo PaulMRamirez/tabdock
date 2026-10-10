@@ -19,6 +19,9 @@ const entry: ActivityEntry = {
   confirmedBy: 'client',
   durationMs: 12,
   handlerRunning: false,
+  image: null,
+  proposalId: null,
+  acceptedOnPage: false,
 };
 
 describe('confirmedIn', () => {

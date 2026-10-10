@@ -33,8 +33,25 @@ export type {
   StoredGrant,
   StoredInvite,
   StoredInvites,
+  AgentLifetime,
+  AgentsOffered,
+  AgentTokenOptions,
+  AgentTokenResult,
+  AgentView,
+  PendingProposal,
+  ProposalLogEntry,
+  ProposalOutcome,
+  PublishResult,
+  PublishStatus,
+  SeatLimits,
+  SessionEnded,
+  SessionEndedReason,
+  SessionOptions,
+  SessionResult,
+  SessionView,
 } from './core.ts';
-export { INVITE_LIFETIMES } from './core.ts';
+export { INVITE_LIFETIMES, STATE_EVENT } from './core.ts';
+export type { RecordView, RecordWhich, SessionRecord } from './record.ts';
 export type {
   Account,
   AttachmentView,
@@ -47,7 +64,11 @@ export type {
   Role,
   User,
   UserKind,
+  AgentState,
+  ImageMimeType,
+  ProposalPolicy,
 } from '@tabdock/protocol';
+export { DEFAULT_IMAGE_BYTES, MAX_IMAGE_BYTES } from '@tabdock/protocol';
 export { ADAPTER_VERSION };
 
 export interface AttachOptions {
@@ -58,7 +79,9 @@ export interface AttachOptions {
    * 'page') lets member drivers whose attachment no invite made confirm a
    * consequential call in their own MCP client instead of the operator here,
    * under consequential 'confirm' only; everyone else still gets the on-page
-   * prompt (ADR 0026).
+   * prompt (ADR 0026). From M6 imageTools names the tools whose results may
+   * carry an image (ADR 0039), and proposals ('off' unless set) lets
+   * observers propose writes for the operator to accept here (ADR 0042).
    */
   policy?: PolicyInput;
   /** Mount the on-page widget; true unless set to false, in which case the handle answers prompts. */

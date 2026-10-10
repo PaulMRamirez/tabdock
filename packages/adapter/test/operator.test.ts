@@ -497,6 +497,10 @@ describe('the activity log (S7)', () => {
         confirmedBy: null,
         durationMs: null,
         handlerRunning: false,
+        // No image result (ADR 0039), and no proposal it ran (ADR 0042).
+        image: null,
+        proposalId: null,
+        acceptedOnPage: false,
       },
     ]);
     await h.clock.advance(250);

@@ -6,15 +6,26 @@ import { PolicySchema, type PolicyInput } from '@tabdock/protocol';
 export type ScriptOptions =
   { ok: true; relay: string; policy: PolicyInput } | { ok: false; error: string };
 
+/** A comma list of tool names, blanks dropped, so one naming no tool reads as an empty list. */
+function toolList(text: string): string[] {
+  return text
+    .split(',')
+    .map((name) => name.trim())
+    .filter((name) => name !== '');
+}
+
 /**
  * `data` is a script element's dataset: data-relay, data-auto-approve,
  * data-max-drivers, data-consequential, data-consequential-tools (a comma
- * list), data-invites (off, watch or all; ADR 0016) and data-confirm-via
- * (page or client; ADR 0026). Absent attributes stay absent, so the policy
- * defaults apply and an omitted data-confirm-via keeps the operator's prompt.
- * A data-consequential-tools that names no tool, empty or only commas, reads as
- * an empty list, which like an absent one leaves ADR 0002's fallback on where
- * the runtime drops the hint (ADR 0034).
+ * list), data-invites (off, watch or all; ADR 0016), data-confirm-via
+ * (page or client; ADR 0026), data-image-tools (a comma list; ADR 0039) and
+ * data-proposals (off, members or all; ADR 0042). Absent attributes stay
+ * absent, so the policy defaults apply: an omitted data-confirm-via keeps the
+ * operator's prompt, an omitted data-image-tools lets no result carry an
+ * image, and an omitted data-proposals takes none. A data-consequential-tools
+ * that names no tool, empty or only commas, reads as an empty list, which like
+ * an absent one leaves ADR 0002's fallback on where the runtime drops the hint
+ * (ADR 0034); a data-image-tools that names none reads as one too.
  */
 export function readScriptOptions(
   data: Readonly<Record<string, string | undefined>>,
@@ -46,11 +57,12 @@ export function readScriptOptions(
   // with the error below, rather than quietly choosing who confirms.
   if (data.confirmVia !== undefined) policy.confirmVia = data.confirmVia.trim();
   if (data.consequentialTools !== undefined) {
-    policy.consequentialTools = data.consequentialTools
-      .split(',')
-      .map((name) => name.trim())
-      .filter((name) => name !== '');
+    policy.consequentialTools = toolList(data.consequentialTools);
   }
+  if (data.imageTools !== undefined) policy.imageTools = toolList(data.imageTools);
+  // Only 'off', 'members' or 'all' parses: a typo attaches nothing rather
+  // than quietly letting observers propose, or not.
+  if (data.proposals !== undefined) policy.proposals = data.proposals.trim();
   const parsed = PolicySchema.safeParse(policy);
   if (!parsed.success) {
     const fields = parsed.error.issues.map((issue) => issue.path.join('.')).join(', ');

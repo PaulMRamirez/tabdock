@@ -5,6 +5,7 @@
 
 import {
   type Account,
+  type AgentState,
   ATTACH_REQUEST_TTL_MS,
   type AttachmentView,
   type AttachVia,
@@ -19,6 +20,7 @@ import {
   encodeFrame,
   IdSchema,
   IDLE_TIMEOUT_MS,
+  type ImageMimeType,
   INVITE_BURN_REFUSALS,
   INVITE_SECRET_BYTES,
   InviteeIdSchema,
@@ -32,8 +34,10 @@ import {
   MAX_INVITE_LIFETIME_MS,
   MAX_INVITE_USES,
   MAX_LIVE_INVITES_PER_PAGE,
+  MAX_OBSERVERS_PER_PAGE,
   MAX_RESULT_CHARS,
   MAX_TIMER_MS,
+  MAX_USERS_PER_PAGE,
   type PageErrorCode,
   type PageFrameInput,
   PageFrameSchema,
@@ -43,12 +47,16 @@ import {
   type Policy,
   type PolicyInput,
   PolicySchema,
+  type ProposalPolicy,
   PROTOCOL_VERSION,
   RECONNECT_MAX_MS,
   RECONNECT_MIN_MS,
   type RelayFrame,
   type Role,
   RoleSchema,
+  type SessionEndReason,
+  type SessionRecord,
+  type SessionRefusalReason,
   SHORT_INVITE_LIFETIME_MS,
   type StoredGrant,
   StoredGrantSchema,
@@ -60,6 +68,7 @@ import {
   type User,
 } from '@tabdock/protocol';
 import * as z from 'zod/mini';
+import { NOOP_RECORDER, type Recorder, type RecordView, type RecordWhich } from './record.ts';
 import { apply } from './taken.ts';
 import {
   isConsequential,
@@ -211,6 +220,11 @@ export interface CoreOptions {
    * docs/threat-model.md (B5) says what such a script can still read.
    */
   crypto?: CryptoLike | undefined;
+  /**
+   * Keeps the session record (ADR 0045). Internal, for tests: one that
+   * throws shows that a recorder fault stops the record and never changes a call.
+   */
+  recorder?: Recorder | undefined;
 }
 
 // What the page sees.
@@ -324,6 +338,168 @@ export interface PendingConfirm {
   readonly expiresAt: number;
 }
 
+// From M6: page state, proposals, time-boxed sessions and agent tokens.
+
+/** What publishState did with a value (ADR 0040). Never a throw: pages publish from render loops. */
+export type PublishResult =
+  { readonly ok: true } | { readonly ok: false; readonly reason: 'too_large' | 'invalid' };
+
+/**
+ * Whether the page's state reaches the relay (ADR 0040): nothing published
+ * yet, shared, held while paused, refused for its size or its shape, or a
+ * relay that takes no page state. It changes only between these, never with
+ * each value, so a page publishing twice a second re-renders nothing.
+ */
+export type PublishStatus = 'none' | 'shared' | 'paused' | 'too_large' | 'invalid' | 'unsupported';
+
+/** The CustomEvent a script-tag page dispatches on document to publish its state (ADR 0040). */
+export const STATE_EVENT = 'tabdock:state';
+
+/** How a proposal left the queue (ADR 0042). */
+export type ProposalOutcome =
+  'accepted' | 'dismissed' | 'refused' | 'expired' | 'withdrawn' | 'cancelled' | 'not_run';
+
+/**
+ * An observer's call the page holds for the operator to accept or dismiss
+ * (ADR 0042). Its arguments are here as text to show, never to run: an
+ * accepted proposal runs the page's own parsed copy.
+ */
+export interface PendingProposal {
+  readonly proposalId: string;
+  readonly tool: string;
+  readonly proposer: Caller;
+  /** The arguments' JSON as received, unseen characters escaped (escapeUnseen), for showing. */
+  readonly arguments: string;
+  readonly argumentChars: number;
+  /** By the page's own rule (ADR 0002): accepting it is then that call's confirmation (S6). */
+  readonly consequential: boolean;
+  /** Local epoch milliseconds. */
+  readonly receivedAt: number;
+  readonly expiresAt: number;
+}
+
+/** A proposal that left the queue, as the session record keeps it (ADR 0045); never its arguments. */
+export interface ProposalLogEntry {
+  readonly proposalId: string;
+  readonly tool: string;
+  readonly proposer: User;
+  readonly client: ClientInfo | null;
+  readonly outcome: ProposalOutcome;
+  /** The call that ran an accepted proposal; null for every other. */
+  readonly callId: string | null;
+  /** Local epoch milliseconds. */
+  readonly time: number;
+}
+
+/** A time-boxed session this page started (ADR 0043). Never its invite link, which shows once. */
+export interface SessionView {
+  readonly sessionId: string;
+  /** Written on this page: shown as its own words (S10). */
+  readonly label: string;
+  /** Local epoch milliseconds. */
+  readonly startedAt: number;
+  readonly endsAt: number;
+  readonly lengthMinutes: number;
+  /** The page's policy as the session narrows it; never wider than attach()'s. */
+  readonly policy: Policy;
+  /** Seats offered by watch invite, and the invites minted for them. */
+  readonly observers: number;
+  readonly inviteIds: readonly string[];
+  /** The member the relay named as sponsor of the session's invites; null without observers. */
+  readonly sponsor: User | null;
+}
+
+/** Why a session ended: the relay's reasons, or 'relay' when it started a new page session. */
+export type SessionEndedReason = SessionEndReason | 'relay';
+
+export interface SessionEnded {
+  readonly sessionId: string;
+  readonly label: string;
+  readonly reason: SessionEndedReason;
+  /** Local epoch milliseconds. */
+  readonly time: number;
+}
+
+/** What the operator asks for when starting a session (ADR 0043), each within attach()'s policy. */
+export interface SessionOptions {
+  /** 1 to 60 characters, shown wherever the session is. */
+  readonly label: string;
+  /** Whole minutes from 30 to 240. */
+  readonly lengthMinutes: number;
+  /** Driver seats, 1 to policy.maxDrivers. */
+  readonly drivers?: number;
+  /** Seats by watch invite; none unless set. */
+  readonly observers?: number;
+  /** Who may propose, no wider than policy.proposals. */
+  readonly proposals?: ProposalPolicy;
+}
+
+/** The observers' link shows here once and is never stored, as an invite's is. */
+export type SessionResult =
+  | {
+      readonly ok: true;
+      readonly sessionId: string;
+      /** Local epoch milliseconds. */
+      readonly endsAt: number;
+      readonly link: string | null;
+      /** Why a session with observers started without its link. */
+      readonly inviteRefusal?: InviteRefusal;
+    }
+  | {
+      readonly ok: false;
+      readonly reason:
+        'invalid' | 'policy' | 'active' | 'link_down' | 'unavailable' | SessionRefusalReason;
+    };
+
+/** How long an agent token works (ADR 0044). */
+export type AgentLifetime = '1h' | '4h' | '8h';
+
+export interface AgentTokenOptions {
+  /** 1 to 60 characters, shown in the prompt the token's first request raises. */
+  readonly label: string;
+  /** An hour unless set. */
+  readonly lifetime?: AgentLifetime;
+}
+
+/** The token and its command show here once and are never stored: only the token's hash is. */
+export type AgentTokenResult =
+  | {
+      readonly ok: true;
+      readonly tokenId: string;
+      readonly token: string;
+      readonly endpoint: string;
+      readonly command: string;
+      /** Local epoch milliseconds. */
+      readonly expiresAt: number;
+    }
+  | { readonly ok: false; readonly reason: InviteRefusal };
+
+/** One live agent token this page minted, as the relay lists it and this page's record holds it. */
+export interface AgentView {
+  readonly tokenId: string;
+  /** Written on this page: shown as its own words (S10). */
+  readonly label: string;
+  readonly expiresAt: number;
+  readonly state: AgentState;
+  /** Prompts its requests left to time out; three burn it. */
+  readonly timeouts: number;
+  readonly sponsor: User;
+}
+
+/** What a relay that takes agent tokens said in its last agents frame. */
+export interface AgentsOffered {
+  /** `<public URL>/g/mcp`; null where the relay mints no agent endpoint. */
+  readonly endpoint: string | null;
+}
+
+/** The relay's seat numbers from its welcome (ADR 0044), within the protocol's ceilings. */
+export interface SeatLimits {
+  /** The people limit. */
+  readonly usersPerPage: number;
+  /** Watching seats for invitees beside it; 0 where there are none. */
+  readonly observersPerPage: number;
+}
+
 /** How a call ended, as the page activity log shows it; 'running' until it does. */
 export type ActivityOutcome = 'running' | 'ok' | PageErrorCode;
 
@@ -354,6 +530,12 @@ export interface ActivityEntry {
    * the page meanwhile, so later writes wait for it.
    */
   readonly handlerRunning: boolean;
+  /** An image result's type and size, never its data (ADR 0039); null for every other call. */
+  readonly image: { readonly mimeType: ImageMimeType; readonly bytes: number } | null;
+  /** The proposal this call ran, accepted on this page (ADR 0042); null for every other call. */
+  readonly proposalId: string | null;
+  /** True once the page bound the call to a proposal its own record shows accepted. */
+  readonly acceptedOnPage: boolean;
 }
 
 /** What this page lets one user the roster lists do; see DockState.pageRoles. */
@@ -477,6 +659,35 @@ export interface DockState {
    * say a guest will join as observer. A copy; changing it changes nothing.
    */
   readonly policy: Policy;
+  /** Whether the page's state reaches the relay (ADR 0040); see PublishStatus. */
+  readonly published: PublishStatus;
+  /**
+   * The largest image result, in bytes, this link's relay takes (ADR 0039),
+   * within MAX_IMAGE_BYTES; 0 for a relay that takes none, and null until a
+   * welcome says and whenever the link drops.
+   */
+  readonly maxImageBytes: number | null;
+  /** Proposals waiting for the operator, oldest first (ADR 0042). */
+  readonly proposals: readonly PendingProposal[];
+  /** The last ACTIVITY_LIMIT proposals that left the queue, newest first. */
+  readonly proposalLog: readonly ProposalLogEntry[];
+  /** The time-boxed session this page runs (ADR 0043), or null. */
+  readonly session: SessionView | null;
+  /**
+   * Whether this link's relay sent a session frame after its welcome, which
+   * only a relay that takes sessions does; the page offers none otherwise.
+   */
+  readonly sessionsOffered: boolean;
+  /** How the last session ended, for the end notice and the session record; null before any has. */
+  readonly sessionEnded: SessionEnded | null;
+  /** This page's live agent tokens (ADR 0044), oldest first, holding only those its own record knows. */
+  readonly agents: readonly AgentView[];
+  /** null until an agents frame arrives on this link, which only a relay with agent tokens on sends. */
+  readonly agentsOffered: AgentsOffered | null;
+  /** This link's welcome's seat numbers (ADR 0044); null from a relay that sends none. */
+  readonly seatLimits: SeatLimits | null;
+  /** The session records held now (ADR 0045): counts and times, never a name. */
+  readonly records: readonly RecordView[];
 }
 
 /** The only control handle. Each method returns false when there was nothing to act on. */
@@ -519,6 +730,35 @@ export interface Dock {
   /** Pauses or resumes calls on this page. Only false resumes, and the choice survives a reload. */
   pause(paused: boolean): void;
   close(): void;
+  /**
+   * Shares a JSON object, or null, as the page's state for attached clients
+   * to read (ADR 0040). It never throws: a value too large, or not an
+   * object, clears what the relay holds and says why.
+   */
+  publishState(value: unknown): PublishResult;
+  /**
+   * Accepts a waiting proposal (ADR 0042), which is that call's confirmation
+   * (S6); the relay then runs it in turn. False when there is none to accept now.
+   */
+  acceptProposal(proposalId: string): boolean;
+  dismissProposal(proposalId: string): boolean;
+  /** Dismisses every waiting proposal and says how many. */
+  dismissAllProposals(): number;
+  /** Starts a time-boxed session (ADR 0043), never wider than attach()'s policy. */
+  startSession(options: SessionOptions): Promise<SessionResult>;
+  /** Lengthens the running session by whole minutes, up to 4 hours from its start. */
+  extendSession(minutes: number): boolean;
+  /** Ends the running session now, and with it every attachment, invite and agent token it let in. */
+  endSession(): boolean;
+  /** A new observers' link for the running session, since a reload keeps none. */
+  renewSessionLink(): Promise<InviteResult>;
+  /** Mints an agent token (ADR 0044) whose first request asks the operator; the token shows once. */
+  agentToken(options: AgentTokenOptions): Promise<AgentTokenResult>;
+  cancelAgent(tokenId: string): boolean;
+  /** A schema-checked copy of one session record (ADR 0045), the current one unless named. */
+  sessionRecord(which?: RecordWhich): SessionRecord | null;
+  /** Drops a sealed record, or restarts the current one from now. */
+  discardRecord(which: RecordWhich): boolean;
 }
 
 /**
@@ -585,6 +825,15 @@ export const REMEMBERED_PROMPT_IDS = 1000;
 /** Results are cut this far under the cap so the truncation marker fits under it too. */
 const MARKER_ROOM = 100;
 
+/**
+ * Image calls start one at a time on a page, at least this far apart (ADR
+ * 0039), so a client looping on a capture cannot keep the page drawing.
+ */
+export const IMAGE_CALL_SPACING_MS = 250;
+
+/** Image calls one page holds waiting at once; past it they are answered page_busy (ADR 0039). */
+export const MAX_WAITING_IMAGE_CALLS = 8;
+
 /** The protocol caps result error messages at this length. */
 const MAX_ERROR_CHARS = 2000;
 
@@ -604,9 +853,11 @@ const INVITE_ID_BYTES = 9;
 /**
  * What the adapter keeps in the tab's storage, each for one relay and one
  * page: from M4 also its invite records (StoredInvites, ADR 0017), beside
- * the grants and dropped with them.
+ * the grants and dropped with them, and from M6 its time-boxed session
+ * (StoredSession, ADR 0043) and agent token records (StoredAgents, ADR 0044).
  */
-export type StoredRecord = 'resume' | 'grants' | 'revoked' | 'paused' | 'invites';
+export type StoredRecord =
+  'resume' | 'grants' | 'revoked' | 'paused' | 'invites' | 'session' | 'agents';
 
 const STORED_RECORDS: readonly StoredRecord[] = [
   'resume',
@@ -614,6 +865,8 @@ const STORED_RECORDS: readonly StoredRecord[] = [
   'revoked',
   'paused',
   'invites',
+  'session',
+  'agents',
 ];
 
 const LOCK_PREFIX = 'tabdock:';
@@ -671,6 +924,10 @@ type InvokeFrame = Extract<RelayFrame, { t: 'invoke' }>;
 type WelcomeFrame = Extract<RelayFrame, { t: 'welcome' }>;
 type AttachRequestFrame = Extract<RelayFrame, { t: 'attach_request' }>;
 type InvitesFrame = Extract<RelayFrame, { t: 'invites' }>;
+type ProposalFrame = Extract<RelayFrame, { t: 'proposal' }>;
+type ProposalEndFrame = Extract<RelayFrame, { t: 'proposal_end' }>;
+type SessionFrame = Extract<RelayFrame, { t: 'session' }>;
+type AgentsFrame = Extract<RelayFrame, { t: 'agents' }>;
 
 type Outcome = { ok: true; content: string } | { ok: false; code: PageErrorCode; message: string };
 type Refusal = Extract<Outcome, { ok: false }>;
@@ -930,6 +1187,21 @@ function lifetimeMs(lifetime: InviteLifetime): number | null {
   return lifetime === '15m' ? SHORT_INVITE_LIFETIME_MS : DEFAULT_INVITE_LIFETIME_MS;
 }
 
+/**
+ * The relay's seat numbers (ADR 0044), for the widget to show and never for
+ * a decision: the relay seats people, and the page enforces its own grants
+ * whatever it says. The schema caps neither number, so a hostile relay's
+ * large one is clamped here rather than closing the link; a relay that sends
+ * no people limit (0.1.0) gives none.
+ */
+function seatLimitsOf(limits: WelcomeFrame['limits']): SeatLimits | null {
+  if (limits.usersPerPage === undefined) return null;
+  return Object.freeze({
+    usersPerPage: Math.min(MAX_USERS_PER_PAGE, limits.usersPerPage),
+    observersPerPage: Math.min(MAX_OBSERVERS_PER_PAGE, limits.observersPerPage ?? 0),
+  });
+}
+
 /** Each UTF-16 code unit becomes at most 3 UTF-8 bytes, so only longer strings need counting. */
 function overByteLimit(text: string, limit: number): boolean {
   if (text.length > limit) return true;
@@ -1141,6 +1413,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   const revokedKey = storageKey('revoked', options.relayUrl, options.pageUrl);
   const pausedKey = storageKey('paused', options.relayUrl, options.pageUrl);
   const invitesKey = storageKey('invites', options.relayUrl, options.pageUrl);
+  const sessionKey = storageKey('session', options.relayUrl, options.pageUrl);
+  const agentsKey = storageKey('agents', options.relayUrl, options.pageUrl);
   forgetLegacyRecords(options.storage, options.relayUrl);
   const webCrypto = usableCrypto(options.crypto);
   const polyfillMarker: unknown = context && Reflect.get(context, POLYFILL_MARKER);
@@ -1151,6 +1425,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    * hides when the handler really ends, which the write queue must know.
    */
   const abortReachesHandlers = polyfillMarker !== true;
+  // M6 seam: not built
+  const recorder = options.recorder ?? NOOP_RECORDER;
 
   let state: DockState = Object.freeze({
     link: 'idle',
@@ -1168,7 +1444,22 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     invitesOffered: null,
     joins: [],
     observerSeats: [],
-    policy: { ...policy, consequentialTools: [...policy.consequentialTools] },
+    policy: {
+      ...policy,
+      consequentialTools: [...policy.consequentialTools],
+      imageTools: [...policy.imageTools],
+    },
+    published: 'none',
+    maxImageBytes: null,
+    proposals: [],
+    proposalLog: [],
+    session: null,
+    sessionsOffered: false,
+    sessionEnded: null,
+    agents: [],
+    agentsOffered: null,
+    seatLimits: null,
+    records: recorder.views(),
   });
   const listeners = new Set<(state: DockState) => void>();
 
@@ -1427,6 +1718,10 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     for (const inviteId of [...invites.keys()]) forgetInvite(inviteId, 'cancelled');
     grantsPage = null;
     saveGrants();
+    // A time-boxed session and agent tokens belong to the page session too
+    // (ADRs 0043 and 0044), so a detach leaves neither record in storage.
+    writeStored(sessionKey, null, "the page's session");
+    writeStored(agentsKey, null, "the page's agent tokens");
   }
 
   /**
@@ -1695,6 +1990,18 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       case 'cancel':
         onCancel(frame.callId);
         return;
+      case 'proposal':
+        onProposal(frame);
+        return;
+      case 'proposal_end':
+        onProposalEnd(frame);
+        return;
+      case 'session':
+        onSession(frame);
+        return;
+      case 'agents':
+        onAgents(frame);
+        return;
     }
   }
 
@@ -1728,11 +2035,13 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     cancelSent.clear();
     grantsPage = frame.pageId;
     saveGrants();
+    sessionWelcome(frame, samePage);
     frameLimit = Math.max(MIN_FRAME_BYTES, Math.min(MAX_FRAME_BYTES, frame.limits.maxFrameBytes));
     resultLimit = Math.max(
       MARKER_ROOM * 2,
       Math.min(MAX_RESULT_CHARS, frame.limits.maxResultChars),
     );
+    imageWelcome(frame);
     // Never shorter than the protocol's own: a tiny value would turn the
     // watchdog into a reconnect loop. Nor past the timer maximum: the schema
     // takes any positive integer, and a longer timer fires at once in
@@ -1748,11 +2057,15 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       pairing: frame.pairing,
       roster: frame.roster,
       error: null,
+      seatLimits: seatLimitsOf(frame.limits),
     });
     log.info(frame.resumed ? `resumed page ${frame.pageId}` : `linked as page ${frame.pageId}`);
     for (const userId of revoked) send({ t: 'revoke', userId });
     takeLock(frame.pageId);
     lastToolsKey = null;
+    // State goes before tools (ADR 0040): the relay serves reads again only
+    // once the tools frame comes, so no reader sees the null a sleep left.
+    stateWelcome();
     void syncTools();
     schedulePoll();
   }
@@ -1784,6 +2097,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       (seat) => observers.has(seat.user.userId) && !fresh.has(seat.user.userId),
     );
     setState({ roster: attachments, observerSeats: [...seats, ...kept] });
+    proposalsRoster();
   }
 
   /**
@@ -1819,7 +2133,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       const drivers = attachments.filter(
         (other) => other.role === 'driver' && other.userId !== userId,
       ).length;
-      if (drivers < policy.maxDrivers) {
+      if (drivers < effective().maxDrivers) {
         if (asked.asked === 'allow') {
           // The first roster that lists someone new is the relay's answer.
           askedDriver.delete(userId);
@@ -1831,7 +2145,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         continue;
       }
       log.info(
-        `${who} ${asked.asked === 'allow' ? 'joined as observer' : 'is still an observer'}: the page already has its maximum drivers (${String(policy.maxDrivers)})`,
+        `${who} ${asked.asked === 'allow' ? 'joined as observer' : 'is still an observer'}: the page already has its maximum drivers (${String(effective().maxDrivers)})`,
       );
       if (asked.asked === 'allow') askedDriver.delete(userId);
       else asked.saidObserver = true;
@@ -1914,12 +2228,20 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     // relay list it, the page closes it as one it holds no record of.
     for (const inviteId of [...minting.keys()]) forgetInvite(inviteId, 'link_down');
     listings = new Map();
+    stateLinkDown();
+    proposalsLinkDown();
+    // What this link's relay said of itself goes with it, until the next welcome says again.
     setState({
       pairing: null,
       pendingRequests: [],
       pendingConfirms: [],
       invites: [],
       invitesOffered: null,
+      maxImageBytes: null,
+      sessionsOffered: false,
+      agents: [],
+      agentsOffered: null,
+      seatLimits: null,
     });
   }
 
@@ -2096,6 +2418,9 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       confirmedBy: null,
       durationMs: null,
       handlerRunning: false,
+      image: null,
+      proposalId: null,
+      acceptedOnPage: false,
     });
     const call: CallRecord = {
       frame,
@@ -3150,6 +3475,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         finish(call, { ok: false, code: 'cancelled', message: REVOKED_MESSAGE });
       }
     }
+    proposalsRevoked(target);
+    agentsRevoked(target);
     return true;
   }
 
@@ -3263,6 +3590,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     writePaused(paused);
     if (paused === state.paused) return;
     setState({ paused });
+    stateFlush();
     log.info(paused ? 'the operator paused calls' : 'the operator resumed calls');
     if (!paused) {
       pump();
@@ -3272,6 +3600,82 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       if (call.stage !== 'running') finish(call, PAUSED);
     }
   }
+
+  // M6 seams (plan section 2.6). Each stub below does nothing, or answers a
+  // refusal, until the workstream that owns it fills it in; the marker on each
+  // is what tests/e2e/test/m6-seams.test.ts looks for, so none ships unbuilt.
+  // Each has its final signature, so the call sites above and the handle
+  // below stay as they are when its body comes.
+
+  // Page state (ADR 0040)
+  // M6 seam: not built
+  const publishState: Dock['publishState'] = () => Object.freeze({ ok: true });
+  // M6 seam: not built
+  const stateWelcome = (): void => undefined;
+  // M6 seam: not built
+  const stateLinkDown = (): void => undefined;
+  // M6 seam: not built
+  const stateFlush = (): void => undefined;
+
+  // Image results (ADR 0039)
+  // M6 seam: not built
+  const imageWelcome: (frame: WelcomeFrame) => void = () => undefined;
+
+  // Proposals (ADR 0042)
+  // M6 seam: not built
+  const onProposal: (frame: ProposalFrame) => void = () => undefined;
+  // M6 seam: not built
+  const onProposalEnd: (frame: ProposalEndFrame) => void = () => undefined;
+  // M6 seam: not built
+  const proposalsRoster = (): void => undefined;
+  // M6 seam: not built
+  const proposalsLinkDown = (): void => undefined;
+  // M6 seam: not built
+  const proposalsRevoked: (target: string) => void = () => undefined;
+  // M6 seam: not built
+  const acceptProposal: Dock['acceptProposal'] = () => false;
+  // M6 seam: not built
+  const dismissProposal: Dock['dismissProposal'] = () => false;
+  // M6 seam: not built
+  const dismissAllProposals: Dock['dismissAllProposals'] = () => 0;
+
+  // Time-boxed sessions (ADR 0043)
+  // M6 seam: not built
+  /** attach()'s policy as a running session narrows it; every read a session may narrow goes through here. */
+  function effective(): Policy {
+    return policy;
+  }
+  // M6 seam: not built
+  const sessionWelcome: (frame: WelcomeFrame, samePage: boolean) => void = () => undefined;
+  // M6 seam: not built
+  const onSession: (frame: SessionFrame) => void = () => undefined;
+  // M6 seam: not built
+  const startSession: Dock['startSession'] = () =>
+    Promise.resolve<SessionResult>(Object.freeze({ ok: false, reason: 'unavailable' }));
+  // M6 seam: not built
+  const extendSession: Dock['extendSession'] = () => false;
+  // M6 seam: not built
+  const endSession: Dock['endSession'] = () => false;
+  // M6 seam: not built
+  const renewSessionLink: Dock['renewSessionLink'] = () =>
+    Promise.resolve<InviteResult>(Object.freeze({ ok: false, reason: 'unavailable' }));
+
+  // Agent tokens (ADR 0044)
+  // M6 seam: not built
+  const onAgents: (frame: AgentsFrame) => void = () => undefined;
+  // M6 seam: not built
+  const agentsRevoked: (target: string) => void = () => undefined;
+  // M6 seam: not built
+  const agentToken: Dock['agentToken'] = () =>
+    Promise.resolve<AgentTokenResult>(Object.freeze({ ok: false, reason: 'unavailable' }));
+  // M6 seam: not built
+  const cancelAgent: Dock['cancelAgent'] = () => false;
+
+  // The session record (ADR 0045)
+  // M6 seam: not built
+  const sessionRecord: Dock['sessionRecord'] = () => null;
+  // M6 seam: not built
+  const discardRecord: Dock['discardRecord'] = () => false;
 
   // Public surface
 
@@ -3360,6 +3764,18 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     close: () => {
       close('detach');
     },
+    publishState: (value: unknown) => publishState(value),
+    acceptProposal: (proposalId: string) => acceptProposal(proposalId),
+    dismissProposal: (proposalId: string) => dismissProposal(proposalId),
+    dismissAllProposals: () => dismissAllProposals(),
+    startSession: (sessionOptions: SessionOptions) => startSession(sessionOptions),
+    extendSession: (minutes: number) => extendSession(minutes),
+    endSession: () => endSession(),
+    renewSessionLink: () => renewSessionLink(),
+    agentToken: (agentOptions: AgentTokenOptions) => agentToken(agentOptions),
+    cancelAgent: (tokenId: string) => cancelAgent(tokenId),
+    sessionRecord: (which?: RecordWhich) => sessionRecord(which),
+    discardRecord: (which: RecordWhich) => discardRecord(which),
   });
 
   return Object.freeze({ dock, start, close });
