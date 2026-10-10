@@ -155,7 +155,7 @@ describe('an invitee with invites on (ADR 0016)', () => {
     );
   });
 
-  it('gets the five fixed tools and never the spike marker', async () => {
+  it('gets the fixed tools and never the spike marker', async () => {
     const { relay } = await setup({ spike: true });
     relay.spike?.addMarker();
     const names = async (who: Client) =>
@@ -163,11 +163,16 @@ describe('an invitee with invites on (ADR 0016)', () => {
     expect(await names(await client(G1))).toEqual([
       'call_page_tool',
       'detach_page',
+      'get_page_state',
+      'get_proposal',
       'list_page_tools',
       'list_pages',
       'pair_page',
+      'wait_for_page_state',
+      'withdraw_proposal',
     ]);
-    expect((await names(await client(ALICE))).length).toBe(6);
+    // A member gets the marker beside the nine.
+    expect((await names(await client(ALICE))).length).toBe(10);
   });
 
   it('gets 403 with invites off, as in M3', async () => {

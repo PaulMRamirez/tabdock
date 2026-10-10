@@ -51,6 +51,7 @@ import {
 import { legacyExchange, modernExchange } from './helpers/wire.ts';
 import type { Client } from '@modelcontextprotocol/client';
 import type { DevTokenUser } from '../src/index.ts';
+import { FIXED_TOOL_NAMES } from '../src/mcp.ts';
 
 interface WireTool {
   name: string;
@@ -536,7 +537,7 @@ describe('first-class names and entries, as built', () => {
 });
 
 describe("a member's first-class list", () => {
-  it("names each attached page's tools after the five fixed tools, the same on both eras", async () => {
+  it("names each attached page's tools after the fixed tools, the same on both eras", async () => {
     await relayWith();
     const page = await pageWith([
       ...TOOLS,
@@ -545,12 +546,8 @@ describe("a member's first-class list", () => {
     await pairAndApprove(await member(), page);
     const modern = await modernList();
     const legacy = await legacyList();
-    expect(modern.slice(0, 5).map((each) => each.name)).toEqual([
-      'list_pages',
-      'pair_page',
-      'list_page_tools',
-      'call_page_tool',
-      'detach_page',
+    expect(modern.slice(0, FIXED_TOOL_NAMES.size).map((each) => each.name)).toEqual([
+      ...FIXED_TOOL_NAMES,
     ]);
     expect(names(modern)).toEqual([
       `${page.pageId}__get_view`,
@@ -682,14 +679,7 @@ describe("a member's first-class list", () => {
       expect(
         tools.map((each) => each.name),
         modern ? '2026-07-28' : '2025-11-25',
-      ).toEqual([
-        'list_pages',
-        'pair_page',
-        'list_page_tools',
-        'call_page_tool',
-        'detach_page',
-        `${page.pageId}__good`,
-      ]);
+      ).toEqual([...FIXED_TOOL_NAMES, `${page.pageId}__good`]);
     }
     // Each stays the page's tool, named in list_page_tools without a first-class name.
     const listing = await callTool(alice, 'list_page_tools', { page: page.pageId });

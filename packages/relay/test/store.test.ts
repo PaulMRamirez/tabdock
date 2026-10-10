@@ -13,22 +13,25 @@ import {
 } from '../src/index.ts';
 
 function pageRecord(pageId: string, resumeTokenHash: string): PageRecord {
+  const policy: PageRecord['policy'] = {
+    autoApprove: 'none',
+    maxDrivers: 1,
+    consequential: 'confirm',
+    consequentialTools: [],
+    invites: 'watch',
+    confirmVia: 'page',
+    imageTools: [],
+    proposals: 'off',
+  };
   return {
     pageId,
     origin: 'http://localhost:5173',
     title: 't',
     url: 'http://localhost:5173/',
     adapterVersion: 'test',
-    policy: {
-      autoApprove: 'none',
-      maxDrivers: 1,
-      consequential: 'confirm',
-      consequentialTools: [],
-      invites: 'watch',
-      confirmVia: 'page',
-      imageTools: [],
-      proposals: 'off',
-    },
+    policy,
+    ceiling: policy,
+    timedSession: null,
     tools: [],
     toolsPending: false,
     state: 'awake',
@@ -210,6 +213,7 @@ describe('the in-memory store', () => {
       createdAt: 0,
       requestedExpiresAt: null,
       expiresAt: 86_400_000,
+      ownExpiresAt: 86_400_000,
       secretHash: hash(fill),
       sponsor: { userId: 'alice', displayName: 'Alice' },
       pendingRequestId: null,

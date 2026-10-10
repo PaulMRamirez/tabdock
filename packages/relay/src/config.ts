@@ -18,20 +18,32 @@
 // proxy and health checks need; every other mode keeps M3's loopback rule.
 // M5 adds two settings that every mode allows: first-class page tools (ADR
 // 0025), off by default, and the origins /mcp accepts beside its mode's own
-// (ADR 0027).
+// (ADR 0027). M6 adds the largest image a page may return (ADR 0039, where 0
+// turns images off), relay-wide budgets for page state, proposals and
+// answers waiting to be read (ADRs 0040, 0042 and 0044), the watching seats
+// and the invitee pool, both only with invites (ADR 0044), agent tokens,
+// which need invites (ADR 0044), the members file, public URL mode's
+// alternative to TABDOCK_OAUTH_USERS (ADR 0043), and the restart snapshot,
+// which needs an audit directory (ADR 0046). No refusal quotes a value.
 
 import { BlockList, isIP, isIPv6 } from 'node:net';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 import {
   ATTACH_REQUEST_TTL_MS,
   DEFAULT_CALL_DEADLINE_MS,
+  DEFAULT_IMAGE_BYTES,
   IDLE_TIMEOUT_MS,
   MAX_FRAME_BYTES,
+  MAX_IMAGE_BYTES,
+  MAX_OBSERVERS_PER_PAGE,
   MAX_TIMER_MS,
+  MAX_USERS_PER_PAGE,
   MEMBER_RESERVED_SEATS,
+  MEMBERS_POLL_MS,
   PAIR_WAIT_MS,
   PAIRING_TTL_MS,
   PING_INTERVAL_MS,
+  PROPOSAL_TTL_MS,
   type RelayMode,
   RESUME_WINDOW_MS,
 } from '@tabdock/protocol';
@@ -90,6 +102,13 @@ export interface RelayTimings {
    * and never more; a test may shorten it.
    */
   confirmationTtlMs: number;
+  /**
+   * How long a proposal waits for the operator (ADR 0042): PROPOSAL_TTL_MS,
+   * which the adapter holds too, and never more; a test may shorten it.
+   */
+  proposalTtlMs: number;
+  /** How often the members file is looked at for a change (ADR 0043); a test may shorten it. */
+  membersPollMs: number;
 }
 
 export interface RelayRateLimits {
@@ -134,6 +153,26 @@ export interface RelayRateLimits {
   toolsFramesPerAddress: number;
   /** Short, so a burst is caught at once while a page that changes its tools now and then never is. */
   toolsFramesWindowMs: number;
+  /**
+   * state frames one page socket may send per stateFramesWindowMs, an equal
+   * one included; past it the socket is closed with 1008 (ADR 0040). The
+   * relay re-encodes each value to know whether it changed, so the work is
+   * bounded before the comparison. A conforming adapter sends at most two a
+   * second, and this leaves room for a stalled backlog arriving at once.
+   */
+  stateFramesPerSocket: number;
+  /** The same for all page sockets from one remote address, counted across reconnects. */
+  stateFramesPerAddress: number;
+  stateFramesWindowMs: number;
+  /**
+   * Calls the page's watchers together may make to it per windowMs: the
+   * invitees watching by invite, apart from its people (ADR 0044), so a room
+   * of them cannot make the operator's tab stutter. No setting: tests lower
+   * it, and the room measurement may.
+   */
+  watchingCallsPerPage: number;
+  /** The same for one watcher on one page. */
+  watchingCallsPerUserPerPage: number;
   /**
    * Frames one page socket may send per windowMs that the relay ignores or
    * refuses, changing nothing, whose log lines are written: a frame of
@@ -213,6 +252,8 @@ export interface RelayLimits {
    * only to someone ranked above its holder (a stranger's to a guest, a
    * guest's to a member) unless it is idle and the newcomer's rank is its
    * holder's own (sessions.ts, A4.3). Listen streams the same, never idle.
+   * TABDOCK_MAX_INVITEE_SESSIONS from M6, sized for a class (ADR 0044): at
+   * most `sessions`, and unless given, `sessions` where that is less.
    */
   inviteeSessions: number;
   /**
@@ -273,6 +314,41 @@ export interface RelayLimits {
    * At least MIN_REQUEST_BYTES and at most requestBytes (ADR 0030).
    */
   requestBytesPerUser: number;
+  /**
+   * The largest image, in decoded bytes, the relay passes from a page to a
+   * client (ADR 0039); 0 refuses every image. At most MAX_IMAGE_BYTES, and
+   * sent in the welcome, so the adapter refuses a larger one first. Validated
+   * as a whole number, since 0 means something (wholeNumbers).
+   */
+  imageBytes: number;
+  /**
+   * Heap every page's held state may take together, each page charged its
+   * canonical text and an overhead (ADR 0040); past it a new value is
+   * withheld, never the page's link closed. Apart from toolBytes, whose
+   * meaning it leaves as it was. At least MAX_FRAME_BYTES.
+   */
+  stateBytes: number;
+  /**
+   * Heap every pending proposal's arguments and every kept outcome may take
+   * together (ADR 0042), since a proposal outlives its request's charge. At
+   * least MAX_FRAME_BYTES.
+   */
+  proposalBytes: number;
+  /**
+   * Bytes all /mcp answers still waiting to be read may hold together (ADR
+   * 0044); past it strangers' answers are cut first, then guests', oldest
+   * first, and never a member's. At least MIN_RESPONSE_BYTES, in every mode.
+   */
+  responseBytes: number;
+  /**
+   * The watching seats: invitees watching a page by invite, counted apart
+   * from usersPerPage (ADR 0044). 0 counts them among the page's people under
+   * the two-seat rule, as in M5. At most MAX_OBSERVERS_PER_PAGE, and only with
+   * invites on; validated as a whole number (wholeNumbers).
+   */
+  observersPerPage: number;
+  /** Calls from a page's watchers that may be on the page at once (ADR 0044); no setting. */
+  watchingCallsInFlight: number;
 }
 
 /**
@@ -360,7 +436,7 @@ export interface RelayOptions {
   store?: RelayStore | undefined;
   /**
    * The M3 spike's measurements (ADR 0014, A3.3), off by default and refused
-   * in production: a marker tool that can be added beside the five fixed tools
+   * in production: a marker tool that can be added beside the fixed tools
    * and announced to open sessions, a log line for every tools/list and every
    * stream a client opens, timestamps for each call_page_tool, and pairing
    * milestones. See spike.ts.
@@ -378,9 +454,32 @@ export interface RelayOptions {
    * First-class page tools (TABDOCK_FIRST_CLASS_TOOLS, ADR 0025), off unless
    * exactly true, in every mode, local mode included, and allowed in
    * production: members' clients list each attached page's tools as
-   * `<page id>__<tool>` beside the five fixed tools. Off, the tool surface is M4's.
+   * `<page id>__<tool>` beside the fixed tools. Off, the tool surface is M4's.
    */
   firstClassTools?: boolean | undefined;
+  /**
+   * Agent tokens (TABDOCK_AGENT_TOKENS, ADR 0044), off unless exactly true:
+   * a page may mint a bearer token for /g/mcp, watching that one page while
+   * a member sponsors it. Needs invites, so local mode never has them.
+   */
+  agentTokens?: boolean | undefined;
+  /**
+   * The members file (TABDOCK_MEMBERS_FILE, ADR 0043): an absolute path whose
+   * lines list the members OAuth signs in, read again when it changes, in
+   * place of TABDOCK_OAUTH_USERS. Public URL mode only.
+   */
+  membersFile?: string | undefined;
+  /**
+   * What the members file's checks read the platform through, as local
+   * mode's place checks do; tests stand in for it. Never from the environment.
+   */
+  membersSystem?: Partial<LocalTokenSystem> | undefined;
+  /**
+   * The restart snapshot (TABDOCK_RESTART_SNAPSHOT, ADR 0046), off unless
+   * exactly true: written into the audit directory at a graceful stop and
+   * read once at the next start, so it needs an audit directory.
+   */
+  restartSnapshot?: boolean | undefined;
   /**
    * Hosted mode (ADR 0018): the one header a host edge in front of the relay
    * sets to the client's address, replacing any value a client sent. Only in
@@ -440,6 +539,8 @@ export const DEFAULT_TIMINGS: RelayTimings = {
   argumentCheckMs: ARGUMENT_CHECK_MS,
   pairSessionMs: PAIR_SESSION_MS,
   confirmationTtlMs: CONFIRMATION_TTL_MS,
+  proposalTtlMs: PROPOSAL_TTL_MS,
+  membersPollMs: MEMBERS_POLL_MS,
 };
 
 export const DEFAULT_RATE_LIMITS: RelayRateLimits = {
@@ -452,6 +553,15 @@ export const DEFAULT_RATE_LIMITS: RelayRateLimits = {
   toolsFramesPerSocket: 10,
   toolsFramesPerAddress: 30,
   toolsFramesWindowMs: 10_000,
+  // ADR 0040: a conforming adapter sends at most 21 state frames in 10 s, and
+  // 200 an address covers five hosted sockets at full rate twice over.
+  stateFramesPerSocket: 40,
+  stateFramesPerAddress: 200,
+  stateFramesWindowMs: 10_000,
+  // ADR 0044, provisional until the room measurement: forty watchers share
+  // two calls a second of the operator's tab, one of them a call every 2 s.
+  watchingCallsPerPage: 120,
+  watchingCallsPerUserPerPage: 30,
   ignoredFramesPerSocket: 20,
   ignoredFramesPerAddress: 60,
   connectionLinesPerAddress: 60,
@@ -463,10 +573,34 @@ export const DEFAULT_RATE_LIMITS: RelayRateLimits = {
   auditRefusalsForStrangers: 30,
 };
 
+/**
+ * limits.stateBytes by default (ADR 0040): every hosted page slot holding the
+ * largest state, about 33 KiB charged each, fits with room to spare.
+ */
+export const STATE_BYTES = 4 * 1024 * 1024;
+/** limits.proposalBytes by default (ADR 0042). */
+export const PROPOSAL_BYTES = 16 * 1024 * 1024;
+/**
+ * limits.responseBytes by default (ADR 0044, provisional until the room
+ * measurement): inside the reference host's 512 MB beside its 192 MiB heap.
+ */
+export const RESPONSE_BYTES = 96 * 1024 * 1024;
+/** The least limits.responseBytes may be: room for a few full answers. */
+export const MIN_RESPONSE_BYTES = 4 * MAX_FRAME_BYTES;
+/** limits.observersPerPage by default (ADR 0044): a class of 20 to 35 with room to spare. */
+export const OBSERVERS_PER_PAGE = 40;
+/**
+ * limits.inviteeSessions by default (ADR 0044): forty watchers with two
+ * sessions each, and a stranger's session each as a room joins.
+ */
+export const INVITEE_SESSIONS = 100;
+/** The least TABDOCK_MAX_INVITEE_SESSIONS may be: one invited account's phone and laptop. */
+export const MIN_INVITEE_SESSIONS = 2;
+
 export const DEFAULT_LIMITS: RelayLimits = {
   sessionsPerUser: 20,
   sessions: 1000,
-  inviteeSessions: 50,
+  inviteeSessions: INVITEE_SESSIONS,
   sessionsPerInvitee: 2,
   usersPerPage: 10,
   queueDepth: 32,
@@ -488,6 +622,12 @@ export const DEFAULT_LIMITS: RelayLimits = {
   // seven calls of 1 MB string arguments.
   requestBytes: 64 * 1024 * 1024,
   requestBytesPerUser: 24 * 1024 * 1024,
+  imageBytes: DEFAULT_IMAGE_BYTES,
+  stateBytes: STATE_BYTES,
+  proposalBytes: PROPOSAL_BYTES,
+  responseBytes: RESPONSE_BYTES,
+  observersPerPage: OBSERVERS_PER_PAGE,
+  watchingCallsInFlight: 4,
 };
 
 /**
@@ -496,6 +636,23 @@ export const DEFAULT_LIMITS: RelayLimits = {
  * copy, with room to spare.
  */
 export const MIN_REQUEST_BYTES = 4 * MAX_FRAME_BYTES;
+
+/**
+ * The limits that may be 0 (wholeNumbers), each with its ceiling and the
+ * words that refuse anything else: 0 turns images off, and 0 watching seats
+ * restores M5's rule. positiveIntegers checks every other limit.
+ */
+const WHOLE_LIMITS = {
+  imageBytes: {
+    max: MAX_IMAGE_BYTES,
+    refusal: `imageBytes (TABDOCK_MAX_IMAGE_BYTES) must be a whole number from 0 to ${String(MAX_IMAGE_BYTES)} (ADR 0039)`,
+  },
+  observersPerPage: {
+    max: MAX_OBSERVERS_PER_PAGE,
+    refusal: `observersPerPage (TABDOCK_MAX_OBSERVERS_PER_PAGE) must be a whole number from 0 to ${String(MAX_OBSERVERS_PER_PAGE)}, so the page's roster fits one page link frame (ADR 0044)`,
+  },
+} as const;
+type WholeLimit = keyof typeof WHOLE_LIMITS;
 
 /**
  * Hosted mode's defaults where they differ, sized for the reference
@@ -564,6 +721,12 @@ export interface ResolvedConfig {
   invites: boolean;
   /** First-class page tools are on (ADR 0025). */
   firstClassTools: boolean;
+  /** Agent tokens are on (ADR 0044): never without invites. */
+  agentTokens: boolean;
+  /** The members file's absolute path in public URL mode (ADR 0043), else null. */
+  membersFile: string | null;
+  /** The restart snapshot is on (ADR 0046): never without an audit directory. */
+  restartSnapshot: boolean;
   /** Production with a public URL behind an edge that names the client in clientAddressHeader (ADR 0018). */
   hosted: boolean;
   /** The edge's client address header, lower-cased; null outside hosted mode. */
@@ -910,9 +1073,19 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
       `confirmationTtlMs must be at most ${String(CONFIRMATION_TTL_MS)}: a question in a client lives 120 s at most (ADR 0026)`,
     );
   }
-  const limits = positiveIntegers(
+  // The adapter ends a proposal on its own clock at the same constant, so a
+  // longer wait here would keep one the page has already let go (ADR 0042).
+  if (timings.proposalTtlMs > PROPOSAL_TTL_MS) {
+    throw new Error(
+      `proposalTtlMs must be at most ${String(PROPOSAL_TTL_MS)}: a proposal lives 10 minutes at most (ADR 0042)`,
+    );
+  }
+  // Only true turns invites on, so a stray value from JavaScript leaves them off.
+  const invites = options.invites === true;
+  const limits = resolveLimits(
     hosted ? { ...DEFAULT_LIMITS, ...HOSTED_LIMITS } : DEFAULT_LIMITS,
     options.limits,
+    invites,
   );
   if (limits.toolBytes < MAX_FRAME_BYTES) {
     throw new Error(
@@ -937,8 +1110,6 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
       "requestBytesPerUser (TABDOCK_MAX_REQUEST_BYTES_PER_USER) must be at most requestBytes (TABDOCK_MAX_REQUEST_BYTES): one user's share of what waiting requests hold cannot pass the relay's total, so lower the share with the total (ADR 0030)",
     );
   }
-  // Only true turns invites on, so a stray value from JavaScript leaves them off.
-  const invites = options.invites === true;
   // Invitees together may hold a quarter of the total or MIN_REQUEST_BYTES,
   // whichever is more, so below twice that floor they could hold more than
   // half of it, and all of it at the least total, leaving members nothing.
@@ -950,6 +1121,25 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
   if (invites && limits.usersPerPage <= MEMBER_RESERVED_SEATS) {
     throw new Error(
       `invites (TABDOCK_INVITES) always leave members ${String(MEMBER_RESERVED_SEATS)} seats of usersPerPage (TABDOCK_MAX_USERS_PER_PAGE), so it must be at least ${String(MEMBER_RESERVED_SEATS + 1)} (ADR 0017)`,
+    );
+  }
+  // Only true turns agent tokens on. A token is minted on a page as an
+  // invite is and watches by invite's rules, so it needs invites, which
+  // local mode's plugin already refuses above (ADR 0044).
+  const agentTokens = options.agentTokens === true;
+  if (agentTokens && !invites) {
+    throw new Error(
+      'agentTokens (TABDOCK_AGENT_TOKENS) needs invites (TABDOCK_INVITES): an agent token is minted on a page as an invite is, while a member sponsors it (ADR 0044)',
+    );
+  }
+  const membersFile = resolveMembersFile(options.membersFile, publicUrl);
+  const audit = resolveAudit(options.audit);
+  // Only true turns it on: a snapshot carries attachments over a restart,
+  // which deploy.md's rotation relies on a restart to end (ADR 0046).
+  const restartSnapshot = options.restartSnapshot === true;
+  if (restartSnapshot && audit.dir === null) {
+    throw new Error(
+      'restartSnapshot (TABDOCK_RESTART_SNAPSHOT) keeps its file in the audit directory (TABDOCK_AUDIT_DIR), and without one the relay keeps none (ADR 0046)',
     );
   }
   const mode: RelayMode =
@@ -984,11 +1174,92 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
     mode,
     invites,
     firstClassTools,
+    agentTokens,
+    membersFile,
+    restartSnapshot,
     hosted,
     clientAddressHeader,
     trustedProxies,
-    audit: resolveAudit(options.audit),
+    audit,
   };
+}
+
+/**
+ * The limits from their defaults and whatever was given, each within its own
+ * bounds. Two may be 0 (WHOLE_LIMITS), so they are checked apart from the
+ * rest, which positiveIntegers holds to positive whole numbers; the watching
+ * seats and the invitee pool mean something only with invites (ADR 0044).
+ */
+function resolveLimits(
+  defaults: RelayLimits,
+  given: RelayOptions['limits'],
+  invites: boolean,
+): RelayLimits {
+  const { imageBytes, observersPerPage, ...positive } = given ?? {};
+  if (!invites && observersPerPage !== undefined) {
+    throw new Error(
+      'observersPerPage (TABDOCK_MAX_OBSERVERS_PER_PAGE) sizes how many invited accounts may watch a page apart from its users, and there are none unless invites (TABDOCK_INVITES) are on (ADR 0044)',
+    );
+  }
+  if (!invites && positive.inviteeSessions !== undefined) {
+    throw new Error(
+      'inviteeSessions (TABDOCK_MAX_INVITEE_SESSIONS) sizes the session pool invited accounts share, and there are none unless invites (TABDOCK_INVITES) are on (ADR 0044)',
+    );
+  }
+  const limits: RelayLimits = {
+    ...positiveIntegers(defaults, positive),
+    ...wholeNumbers(defaults, { imageBytes, observersPerPage }),
+  };
+  // The pool is part of the relay's sessions: one given above them is
+  // refused, and the default gives way to a smaller total, as M5's did.
+  if (positive.inviteeSessions === undefined) {
+    limits.inviteeSessions = Math.min(limits.inviteeSessions, limits.sessions);
+  } else if (limits.inviteeSessions > limits.sessions) {
+    throw new Error(
+      "inviteeSessions (TABDOCK_MAX_INVITEE_SESSIONS) must be at most sessions (TABDOCK_MAX_SESSIONS): the invitee pool is part of the relay's sessions (ADR 0044)",
+    );
+  }
+  if (limits.usersPerPage > MAX_USERS_PER_PAGE) {
+    throw new Error(
+      `usersPerPage (TABDOCK_MAX_USERS_PER_PAGE) must be at most ${String(MAX_USERS_PER_PAGE)}, so the page's roster always fits one page link frame (ADR 0044)`,
+    );
+  }
+  // Kept apart from toolBytes and from the request budget, whose meanings
+  // stay as they were; each must hold at least one frame's worth.
+  if (limits.stateBytes < MAX_FRAME_BYTES) {
+    throw new Error(
+      `stateBytes (TABDOCK_MAX_STATE_BYTES) must be at least ${String(MAX_FRAME_BYTES)}, so the budget holds about thirty pages at the largest state (ADR 0040)`,
+    );
+  }
+  if (limits.proposalBytes < MAX_FRAME_BYTES) {
+    throw new Error(
+      `proposalBytes (TABDOCK_MAX_PROPOSAL_BYTES) must be at least ${String(MAX_FRAME_BYTES)}, so the relay holds a few proposals and their outcomes (ADR 0042)`,
+    );
+  }
+  if (limits.responseBytes < MIN_RESPONSE_BYTES) {
+    throw new Error(
+      `responseBytes (TABDOCK_MAX_RESPONSE_BYTES) must be at least ${String(MIN_RESPONSE_BYTES)}, room for a few full answers (ADR 0044)`,
+    );
+  }
+  return limits;
+}
+
+/**
+ * The members file's path, checked without reading it: an absolute path,
+ * in public URL mode only, since its lines list who OAuth signs in (ADR
+ * 0043). The path is never repeated, as a token may sit in the wrong variable.
+ */
+function resolveMembersFile(path: string | undefined, publicUrl: string | null): string | null {
+  if (path === undefined) return null;
+  if (publicUrl === null) {
+    throw new Error(
+      'membersFile (TABDOCK_MEMBERS_FILE) lists the members OAuth signs in, which only public URL mode does (TABDOCK_PUBLIC_URL) (ADR 0043)',
+    );
+  }
+  if (!isAbsolute(path)) {
+    throw new Error('membersFile (TABDOCK_MEMBERS_FILE) must be an absolute path (ADR 0043)');
+  }
+  return path;
 }
 
 /** HTTP header names are tokens; the relay compares the lower-cased form, as node stores headers. */
@@ -1100,6 +1371,26 @@ function positiveIntegers<T extends { [K in keyof T]: number }>(
 }
 
 /**
+ * The limits that may be 0 (WHOLE_LIMITS), each the default unless given,
+ * and given only as a whole number from 0 to its ceiling; anything else is
+ * refused in that limit's own words, which never quote the value.
+ */
+function wholeNumbers(
+  defaults: Pick<RelayLimits, WholeLimit>,
+  given: { [K in WholeLimit]?: number | undefined },
+): Pick<RelayLimits, WholeLimit> {
+  const out = { imageBytes: defaults.imageBytes, observersPerPage: defaults.observersPerPage };
+  for (const key of Object.keys(WHOLE_LIMITS) as WholeLimit[]) {
+    const value = given[key];
+    if (value === undefined) continue;
+    const { max, refusal } = WHOLE_LIMITS[key];
+    if (!Number.isInteger(value) || value < 0 || value > max) throw new Error(refusal);
+    out[key] = value;
+  }
+  return out;
+}
+
+/**
  * Surrounding spaces are trimmed as for every other setting, so a flag of
  * spaces alone is blank and counts as unset, which leaves it off.
  */
@@ -1117,6 +1408,18 @@ function parseCount(name: string, value: string | undefined): number | undefined
   if (!/^\d{1,9}$/.test(text) || Number(text) === 0) {
     throw new Error(`${name} must be a positive whole number`);
   }
+  return Number(text);
+}
+
+/**
+ * As parseCount, but 0 is a value, for the settings where 0 turns something
+ * off (WHOLE_LIMITS); resolveConfig then holds it to its ceiling. Digits
+ * only, and the refusal never quotes what was given.
+ */
+function parseWhole(name: string, value: string | undefined): number | undefined {
+  const text = value?.trim() ?? '';
+  if (text === '') return undefined;
+  if (!/^\d{1,9}$/.test(text)) throw new Error(`${name} must be a whole number`);
   return Number(text);
 }
 
@@ -1140,6 +1443,7 @@ export const AUTH_SETTINGS: readonly string[] = [
   'TABDOCK_PUBLIC_URL',
   'TABDOCK_OAUTH_ISSUER',
   'TABDOCK_OAUTH_USERS',
+  'TABDOCK_MEMBERS_FILE',
   'TABDOCK_PAIR_CLIENT_ID',
   'TABDOCK_PAIR_CLIENT_SECRET',
 ];
@@ -1187,7 +1491,16 @@ function authFromEnv(
   const oauthUsers = env.TABDOCK_OAUTH_USERS?.trim() ?? '';
   const pairClientId = env.TABDOCK_PAIR_CLIENT_ID?.trim() ?? '';
   const pairClientSecret = env.TABDOCK_PAIR_CLIENT_SECRET?.trim() ?? '';
+  const membersFile = env.TABDOCK_MEMBERS_FILE?.trim() ?? '';
   if (publicText !== '') {
+    // The members file's rules were checked before this (refuseSettingsOutOfMode).
+    if (membersFile !== '') {
+      // M6 seam: not built. Until this relay reads the file, a start that
+      // names one is refused rather than run with no members (ADR 0043).
+      throw new Error(
+        'TABDOCK_MEMBERS_FILE is not read by this relay yet; list the members in TABDOCK_OAUTH_USERS (ADR 0043)',
+      );
+    }
     if (issuer === '' || oauthUsers === '') {
       throw new Error(
         'TABDOCK_PUBLIC_URL needs TABDOCK_OAUTH_ISSUER and TABDOCK_OAUTH_USERS: a relay with a public URL signs people in only through OAuth (ADR 0014)',
@@ -1274,8 +1587,9 @@ function authFromEnv(
 function refuseSettingsOutOfMode(
   env: NodeJS.ProcessEnv,
   relayEnv: RelayEnv,
-  invites: boolean,
+  flags: { invites: boolean; agentTokens: boolean; restartSnapshot: boolean },
 ): void {
+  const { invites } = flags;
   const isSet = (name: string): boolean => (env[name]?.trim() ?? '') !== '';
   const publicMode = isSet('TABDOCK_PUBLIC_URL');
   const localMode = !AUTH_SETTINGS.some(isSet) && relayEnv !== 'production';
@@ -1307,12 +1621,54 @@ function refuseSettingsOutOfMode(
       'TABDOCK_MAX_REQUESTS_PER_INVITEE limits invitees, and there are none unless TABDOCK_INVITES is on (ADR 0018)',
     );
   }
+  if (isSet('TABDOCK_MAX_OBSERVERS_PER_PAGE') && !invites) {
+    throw new Error(
+      'TABDOCK_MAX_OBSERVERS_PER_PAGE sizes how many invited accounts may watch a page apart from its users, and there are none unless TABDOCK_INVITES is on (ADR 0044)',
+    );
+  }
+  if (isSet('TABDOCK_MAX_INVITEE_SESSIONS') && !invites) {
+    throw new Error(
+      'TABDOCK_MAX_INVITEE_SESSIONS sizes the session pool invited accounts share, and there are none unless TABDOCK_INVITES is on (ADR 0044)',
+    );
+  }
+  // Local mode refuses invites above, so it refuses agent tokens through them.
+  if (flags.agentTokens && !invites) {
+    throw new Error(
+      'TABDOCK_AGENT_TOKENS needs TABDOCK_INVITES: an agent token is minted on a page as an invite is, while a member sponsors it (ADR 0044)',
+    );
+  }
+  if (isSet('TABDOCK_MEMBERS_FILE')) {
+    if (isSet('TABDOCK_OAUTH_USERS')) {
+      throw new Error(
+        'TABDOCK_OAUTH_USERS and TABDOCK_MEMBERS_FILE both list members; keep one (ADR 0043)',
+      );
+    }
+    if (isSet('TABDOCK_DEV_TOKENS')) {
+      throw new Error(
+        'TABDOCK_MEMBERS_FILE lists the members OAuth signs in, and TABDOCK_DEV_TOKENS lists users of its own; keep one (ADR 0043)',
+      );
+    }
+    if (!publicMode) {
+      throw new Error(
+        'TABDOCK_MEMBERS_FILE lists the members OAuth signs in, which only public URL mode does; it works only with TABDOCK_PUBLIC_URL (ADR 0043)',
+      );
+    }
+    // The path is never repeated: a token may sit in the wrong variable.
+    if (!isAbsolute(env.TABDOCK_MEMBERS_FILE?.trim() ?? '')) {
+      throw new Error('TABDOCK_MEMBERS_FILE must be an absolute path (ADR 0043)');
+    }
+  }
   for (const name of ['TABDOCK_AUDIT_RETENTION_DAYS', 'TABDOCK_AUDIT_MAX_MB']) {
     if (isSet(name) && !isSet('TABDOCK_AUDIT_DIR') && !localMode) {
       throw new Error(
         `${name} bounds the audit files, and without TABDOCK_AUDIT_DIR, or local mode's directory beside its token, the relay keeps none (ADR 0019)`,
       );
     }
+  }
+  if (flags.restartSnapshot && !isSet('TABDOCK_AUDIT_DIR') && !localMode) {
+    throw new Error(
+      "TABDOCK_RESTART_SNAPSHOT keeps its file in the audit directory, and without TABDOCK_AUDIT_DIR, or local mode's directory beside its token, the relay keeps none (ADR 0046)",
+    );
   }
 }
 
@@ -1445,9 +1801,28 @@ export function loadConfigFromEnv(
       'TABDOCK_MAX_REQUEST_BYTES_PER_USER',
       env.TABDOCK_MAX_REQUEST_BYTES_PER_USER,
     ),
+    imageBytes: parseWhole('TABDOCK_MAX_IMAGE_BYTES', env.TABDOCK_MAX_IMAGE_BYTES),
+    stateBytes: parseCount('TABDOCK_MAX_STATE_BYTES', env.TABDOCK_MAX_STATE_BYTES),
+    proposalBytes: parseCount('TABDOCK_MAX_PROPOSAL_BYTES', env.TABDOCK_MAX_PROPOSAL_BYTES),
+    responseBytes: parseCount('TABDOCK_MAX_RESPONSE_BYTES', env.TABDOCK_MAX_RESPONSE_BYTES),
+    observersPerPage: parseWhole(
+      'TABDOCK_MAX_OBSERVERS_PER_PAGE',
+      env.TABDOCK_MAX_OBSERVERS_PER_PAGE,
+    ),
+    inviteeSessions: parseCount('TABDOCK_MAX_INVITEE_SESSIONS', env.TABDOCK_MAX_INVITEE_SESSIONS),
   };
+  // Below this one invited account could not hold its phone and laptop. Held
+  // here, on the setting, so a test may still build a pool of one in code.
+  if (limits.inviteeSessions !== undefined && limits.inviteeSessions < MIN_INVITEE_SESSIONS) {
+    throw new Error(
+      `TABDOCK_MAX_INVITEE_SESSIONS must be at least ${String(MIN_INVITEE_SESSIONS)}, room for one invited account's two sessions (ADR 0044)`,
+    );
+  }
   const invites = parseFlag('TABDOCK_INVITES', env.TABDOCK_INVITES);
   const firstClassTools = parseFlag('TABDOCK_FIRST_CLASS_TOOLS', env.TABDOCK_FIRST_CLASS_TOOLS);
+  const agentTokens = parseFlag('TABDOCK_AGENT_TOKENS', env.TABDOCK_AGENT_TOKENS);
+  const restartSnapshot = parseFlag('TABDOCK_RESTART_SNAPSHOT', env.TABDOCK_RESTART_SNAPSHOT);
+  const membersText = env.TABDOCK_MEMBERS_FILE?.trim() ?? '';
   const headerText = env.TABDOCK_CLIENT_ADDRESS_HEADER?.trim() ?? '';
   const cidrText = env.TABDOCK_TRUSTED_PROXY_CIDR?.trim() ?? '';
   const auditDirText = env.TABDOCK_AUDIT_DIR?.trim() ?? '';
@@ -1456,7 +1831,7 @@ export function loadConfigFromEnv(
     env.TABDOCK_AUDIT_RETENTION_DAYS,
   );
   const maxMb = parseCount('TABDOCK_AUDIT_MAX_MB', env.TABDOCK_AUDIT_MAX_MB);
-  refuseSettingsOutOfMode(env, relayEnv, invites);
+  refuseSettingsOutOfMode(env, relayEnv, { invites, agentTokens, restartSnapshot });
 
   // Last, so a mistake in any other setting is reported before local mode draws a token.
   const { auth, publicUrl, pairClient, localMode } = authFromEnv(
@@ -1495,6 +1870,9 @@ export function loadConfigFromEnv(
     limits,
     invites,
     firstClassTools,
+    agentTokens,
+    membersFile: membersText === '' ? undefined : membersText,
+    restartSnapshot,
     clientAddressHeader: headerText === '' ? undefined : headerText,
     trustedProxyCidr:
       cidrText === ''

@@ -94,6 +94,7 @@ const alice: CallerIdentity = {
   account: { kind: 'member', email: null },
   oauthClientId: null,
   client: null,
+  agentPageId: null,
 };
 
 describe('pair_page waiters on one attach request', () => {

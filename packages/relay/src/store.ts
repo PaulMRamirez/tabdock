@@ -13,6 +13,7 @@ import type {
   PageTool,
   Policy,
   Role,
+  SessionPolicy,
   UserKind,
 } from '@tabdock/protocol';
 import type { UserAccount } from './auth.ts';
@@ -22,6 +23,19 @@ export type { AuditOutcome } from '@tabdock/protocol';
 
 export type PageState = 'awake' | 'asleep' | 'gone';
 
+/**
+ * A time-boxed session the operator started on a page (ADR 0043): when it
+ * started and ends on the relay's clock, and the policy it set within the
+ * page's own.
+ */
+export interface TimedSession {
+  sessionId: string;
+  startedAt: number;
+  endsAt: number;
+  lengthMs: number;
+  policy: SessionPolicy;
+}
+
 export interface PageRecord {
   pageId: string;
   /** From the WebSocket Origin header only (S1). */
@@ -29,7 +43,16 @@ export interface PageRecord {
   title: string;
   url: string;
   adapterVersion: string;
+  /**
+   * What the page allows now: its hello's policy, narrowed by a live
+   * time-boxed session field by field (ADR 0043), so every reader keeps
+   * reading this one field.
+   */
   policy: Policy;
+  /** The hello's policy as the page sent it, which no session may pass (ADR 0043). */
+  ceiling: Policy;
+  /** The time-boxed session live on the page, or null (ADR 0043). */
+  timedSession: TimedSession | null;
   tools: PageTool[];
   /**
    * True from a resume until the adapter's first tools frame: until then the
@@ -157,9 +180,12 @@ export interface InviteRecord {
    * When it stops working, on the relay's clock: the page's expiry, never
    * past createdAt plus MAX_INVITE_LIFETIME_MS. An invite_create whose
    * expiresAt is less than MIN_INVITE_REMAINING_MS past the relay's now is
-   * refused as expired rather than kept (ADR 0017's notes).
+   * refused as expired rather than kept (ADR 0017's notes). A live
+   * time-boxed session caps it at its own end (ADR 0043).
    */
   expiresAt: number;
+  /** expiresAt before any session's cap, which a session's end or extension recomputes from (ADR 0043). */
+  ownExpiresAt: number;
   /** SHA-256 of the secret, hex, as invite_create carried it; unique across the relay. */
   secretHash: string;
   /** The member attached longest when it was minted; fixed, since /i has shown the name. */
