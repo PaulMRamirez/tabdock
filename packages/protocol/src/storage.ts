@@ -7,7 +7,14 @@
 // First, before zod builds anything: no eval probe on Trusted Types pages.
 import './zod-config.ts';
 import * as z from 'zod/mini';
-import { INVITE_BURN_REFUSALS, MAX_INVITE_USES, MAX_LIVE_INVITES_PER_PAGE } from './constants.ts';
+import {
+  AGENT_BURN_TIMEOUTS,
+  INVITE_BURN_REFUSALS,
+  MAX_INVITE_USES,
+  MAX_LIVE_AGENTS_PER_PAGE,
+  MAX_LIVE_INVITES_PER_PAGE,
+  MAX_OBSERVERS_PER_PAGE,
+} from './constants.ts';
 import {
   controlForOneUse,
   EpochMsSchema,
@@ -16,6 +23,8 @@ import {
   InviteSecretHashSchema,
   type Role,
   RoleSchema,
+  SessionLengthSchema,
+  SessionPolicySchema,
 } from './page-link.ts';
 
 /**
@@ -91,3 +100,48 @@ export const StoredInvitesSchema = z.strictObject({
   invites: z.array(StoredInviteSchema).check(z.maxLength(MAX_LIVE_INVITES_PER_PAGE)),
 });
 export type StoredInvites = z.infer<typeof StoredInvitesSchema>;
+
+/**
+ * The page's time-boxed session (ADR 0043), so a reload within the resume
+ * window picks it up again: its label (page text, shown only here and as its
+ * invites' label), its times on the page's clock, its policy, how many
+ * watchers it was sized for and the invites it minted. Never an invite's link
+ * or secret: a strict object, so a record holding one is no record.
+ */
+export const StoredSessionSchema = z.strictObject({
+  pageId: IdSchema,
+  sessionId: IdSchema,
+  label: InviteLabelSchema,
+  startedAt: EpochMsSchema,
+  endsAt: EpochMsSchema,
+  lengthMs: SessionLengthSchema,
+  policy: SessionPolicySchema,
+  observers: z.number().check(z.int(), z.gte(0), z.lte(MAX_OBSERVERS_PER_PAGE)),
+  inviteIds: z.array(IdSchema).check(z.maxLength(MAX_LIVE_INVITES_PER_PAGE)),
+});
+export type StoredSession = z.infer<typeof StoredSessionSchema>;
+
+/**
+ * The adapter's own record of one agent token it minted (ADR 0044): its id,
+ * the hash of the token, its label and times, its timed-out prompts and
+ * whether it burned. Never the token: a strict object, so a record holding
+ * one is no record. An agent's grant is an ordinary StoredGrant whose invite
+ * is the token.
+ */
+export const StoredAgentSchema = z.strictObject({
+  tokenId: IdSchema,
+  secretHash: InviteSecretHashSchema,
+  label: InviteLabelSchema,
+  createdAt: EpochMsSchema,
+  expiresAt: EpochMsSchema,
+  timeouts: z.number().check(z.int(), z.gte(0), z.lte(AGENT_BURN_TIMEOUTS)),
+  burned: z.boolean(),
+});
+export type StoredAgent = z.infer<typeof StoredAgentSchema>;
+
+/** Every agent token record of one page session, dropped with its grants when a session does not resume. */
+export const StoredAgentsSchema = z.strictObject({
+  pageId: IdSchema,
+  agents: z.array(StoredAgentSchema).check(z.maxLength(MAX_LIVE_AGENTS_PER_PAGE)),
+});
+export type StoredAgents = z.infer<typeof StoredAgentsSchema>;

@@ -89,6 +89,9 @@ describe('linking', () => {
           invites: 'watch',
           // M5's default (ADR 0026): the operator confirms on the page.
           confirmVia: 'page',
+          // M6's defaults (ADRs 0039 and 0042): no image tools and no proposals.
+          imageTools: [],
+          proposals: 'off',
         },
       },
     ]);

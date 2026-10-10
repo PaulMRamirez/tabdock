@@ -1561,6 +1561,21 @@ export class PageHub {
         return;
       case 'pong':
         return;
+      case 'state':
+      case 'proposal_decision':
+      case 'session_start':
+      case 'session_extend':
+      case 'session_end':
+      case 'agent_create':
+      case 'agent_cancel':
+        // M6 seam: not built. The protocol knows these frames from M6, and
+        // until this relay acts on them each is ignored, logged and counted
+        // within ADR 0023's budget exactly as an unknown type was before.
+        this.#mayChangeNothing(conn, 'unknown type', () => {
+          this.#log.warn('ignored a frame of unknown type', { pageId, frameType: frame.t });
+          return false;
+        });
+        return;
     }
   }
 
