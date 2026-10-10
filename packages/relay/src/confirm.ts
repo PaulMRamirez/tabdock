@@ -18,7 +18,16 @@
 
 import { createHash, randomBytes } from 'node:crypto';
 import { createRequestStateCodec, type ServerContext } from '@modelcontextprotocol/server';
-import type { ClientInfo, ErrorCode, JsonObject, Policy, Role, UserKind } from '@tabdock/protocol';
+import {
+  canonicalJson,
+  type ClientInfo,
+  type ErrorCode,
+  escapeUnseen,
+  type JsonObject,
+  type Policy,
+  type Role,
+  type UserKind,
+} from '@tabdock/protocol';
 import { z } from 'zod';
 
 /** How long a question waits for its answer, on either leg (ADR 0026). */
@@ -88,33 +97,10 @@ export function asksClient(
 
 // The arguments' digest
 
-/**
- * An object with its own keys sorted, holding the same values, for
- * JSON.stringify's replacer. A null prototype keeps a key named __proto__
- * an ordinary key, as JSON.parse made it.
- */
-function sortedKeys(value: unknown): unknown {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return value;
-  const source = value as Record<string, unknown>;
-  const sorted = Object.create(null) as Record<string, unknown>;
-  for (const key of Object.keys(source).sort()) sorted[key] = source[key];
-  return sorted;
-}
-
-/**
- * The arguments as canonical JSON: every object's keys in code unit order,
- * no white space. Two calls whose arguments mean the same JSON give the same
- * text whatever order their keys came in, and any change to a value gives
- * another. JSON.stringify does the walk, so the depth it can take is the
- * depth the invoke itself was encoded at; null when it cannot.
- */
-export function canonicalJson(args: JsonObject): string | null {
-  try {
-    return JSON.stringify(args, (_key, value: unknown) => sortedKeys(value));
-  } catch {
-    return null;
-  }
-}
+// canonicalJson lives in the protocol from M6, so the adapter binds an
+// accepted proposal to its arguments exactly as the relay binds a
+// confirmation (ADR 0042); it is re-exported here for this module's callers.
+export { canonicalJson };
 
 /** SHA-256 of the canonical JSON, hex: what binds a confirmation to one exact call. Never logged. */
 export function argumentsDigest(args: JsonObject): string | null {
@@ -159,22 +145,12 @@ export const CONFIRM_SCHEMA: ConfirmSchema = {
 };
 
 /**
- * Characters that would not read as written in a client's dialog: controls,
- * line and paragraph breaks, format characters (the bidirectional controls
- * among them), surrogate halves and every other default-ignorable code
- * point. Shown escaped, so the arguments a person confirms cannot reorder or
- * hide the relay's words around them.
+ * Characters that would not read as written in a client's dialog are shown
+ * escaped, so the arguments a person confirms cannot reorder or hide the
+ * relay's words around them. The protocol's escapeUnseen does it, so the
+ * widget escapes a proposal's arguments alike (ADR 0042).
  */
-const NOT_AS_WRITTEN = /[\p{Cc}\p{Zl}\p{Zp}\p{Cf}\p{Cs}\p{Default_Ignorable_Code_Point}]/gu;
-
-function escapedForQuestion(text: string): string {
-  return text.replace(NOT_AS_WRITTEN, (char) => {
-    const point = char.codePointAt(0) ?? 0;
-    return point > 0xffff
-      ? `\\u{${point.toString(16)}}`
-      : `\\u${point.toString(16).padStart(4, '0')}`;
-  });
-}
+const escapedForQuestion = escapeUnseen;
 
 /** The first `max` code units, one fewer when the cut would split a surrogate pair. */
 function cutAt(text: string, max: number): string {

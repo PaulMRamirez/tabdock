@@ -38,6 +38,7 @@ import {
 import {
   EmailSchema,
   IdSchema,
+  MemberSubSchema,
   OAuthClientIdSchema,
   type User,
   type UserKind,
@@ -209,8 +210,12 @@ const ALGORITHMS = ['RS256'];
 const REQUIRED_CLAIMS = ['exp', 'sub', 'iat', 'jti'];
 const RESOURCE_NAME = 'Tabdock relay';
 
-/** OIDC limits `sub` to 255 ASCII characters; spaces and controls never belong in one. */
-const SubSchema = z.string().regex(/^[\x21-\x7e]{1,255}$/);
+/**
+ * OIDC limits `sub` to 255 ASCII characters; spaces and controls never belong
+ * in one. The rule lives in the protocol from M6, where the members file reads
+ * it too (ADR 0043).
+ */
+const SubSchema = MemberSubSchema;
 
 /**
  * The fields of the provider's metadata the relay relies on. Loose, so the
