@@ -961,6 +961,11 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   function requestView(request: PendingRequest, state: DockState): PromptView {
     const box = element('div', 'prompt');
     dom.attr(box, 'data-request-id', request.requestId);
+    // ADR 0041: the testing helper approves only the request whose client it
+    // names exactly, never by a match on the prompt's words, which a client
+    // named after another could share. The name is the one the prompt shows.
+    const clientName = request.client === null ? '' : plainLine(request.client.name);
+    if (clientName !== '') dom.attr(box, 'data-client-name', clientName);
     const who = personText(request.user, request.account);
     const line = element('p');
     if (request.invite !== null) {
