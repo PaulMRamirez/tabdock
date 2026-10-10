@@ -21,3 +21,7 @@ The WebMCP draft, now dated 9 October, serializes a handler's result to a JSON s
 ## Consequences
 
 The 6 leg tests the release pages will meet, not a beta, and the demo still shows the runtime most pages run today. If Chrome starts quoting results as the draft says, every string result from every page would arrive quoted; ADR 0001's rule passes it through and the image unwrap already handles it, and a Chrome Canary leg joins the owner's checklist to catch it. Section 3 stays a dated record that each milestone refreshes from `verified.md`.
+
+## Notes from building the 6.0.0 leg (10 October 2026)
+
+6.0.0 did not break the leg, so the beta pin is gone. `tests/mcpb6` pins `@mcp-b/webmcp-polyfill` and `@mcp-b/webmcp-local-relay` at exactly 6.0.0 under the aliases `webmcp-polyfill-6` and `webmcp-local-relay-6`. Since an init script cannot be a module, the harness has esbuild wrap the polyfill's ESM entry as a classic script, unminified, and calls `installWebMCP()` after it, which is what an npm page does; the script-tag build, which still installs itself as it loads, is not used, so the leg can see that the import alone installs nothing. The call, cancel and consequential specs passed unchanged apart from that new check, and the baseline re-run (`docs/notes/baseline.raw.mcpb6.json`) matched the beta's every shape.
