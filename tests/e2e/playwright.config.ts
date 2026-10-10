@@ -23,7 +23,7 @@ export default defineConfig({
     },
     {
       // Run alone with `playwright test --project mcpb6`. Without the
-      // WebMCPTesting flag no Chrome turns native WebMCP on, so the beta
+      // WebMCPTesting flag no Chrome turns native WebMCP on, so the 6.0.0
       // polyfill installs instead of keeping a native context; the specs
       // still check that it did before they trust a result.
       name: 'mcpb6',
