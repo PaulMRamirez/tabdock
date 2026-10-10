@@ -3,9 +3,11 @@
 // field at rest, the page's own policy fields are shown as a copy, the seat
 // numbers come from each welcome within the protocol's ceilings and go with
 // the link, the relay's new frames never cost the page its link, and a detach
-// leaves no stored session or agent token record behind.
+// leaves no stored session or agent token record behind. publishState already
+// refuses what ADR 0040 refuses, and says a valid value goes nowhere yet
+// rather than report it shared.
 
-import { MAX_OBSERVERS_PER_PAGE, MAX_USERS_PER_PAGE } from '@tabdock/protocol';
+import { MAX_OBSERVERS_PER_PAGE, MAX_STATE_BYTES, MAX_USERS_PER_PAGE } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
 import { flush, link, setup, welcome } from './harness.ts';
 
@@ -42,6 +44,56 @@ describe('the M6 state fields', () => {
       imageTools: ['get_value'],
       proposals: 'members',
     });
+  });
+});
+
+describe('publishState before page state is built (ADR 0040)', () => {
+  it('refuses what the final API refuses, and never throws', () => {
+    const h = setup();
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const refused: [string, unknown][] = [
+      ['a string', 'a string'],
+      ['a number', 7],
+      ['an array', [1, 2]],
+      ['a cycle', cyclic],
+      ['a BigInt', { big: 1n }],
+      ['undefined', undefined],
+      ['a function', () => 1],
+    ];
+    for (const [what, value] of refused) {
+      expect(h.dock.publishState(value), what).toEqual({ ok: false, reason: 'invalid' });
+      expect(h.dock.state.published).toBe('invalid');
+    }
+    // {"t":"..."} is 8 bytes around its text: at the cap exactly, then a byte past it.
+    expect(h.dock.publishState({ t: 'a'.repeat(MAX_STATE_BYTES - 8) })).toEqual({ ok: true });
+    expect(h.dock.publishState({ t: 'a'.repeat(MAX_STATE_BYTES - 7) })).toEqual({
+      ok: false,
+      reason: 'too_large',
+    });
+    // Counted in UTF-8, as the frame will be, never in characters.
+    const accented = { t: 'é'.repeat((MAX_STATE_BYTES - 8) / 2 + 1) };
+    expect(JSON.stringify(accented).length).toBeLessThan(MAX_STATE_BYTES);
+    expect(h.dock.publishState(accented)).toEqual({ ok: false, reason: 'too_large' });
+    expect(h.dock.state.published).toBe('too_large');
+  });
+
+  it('says a valid value is shared with no one yet, and sends nothing', async () => {
+    const h = setup();
+    const socket = await link(h, {}, {});
+    let changes = 0;
+    h.dock.on('state', () => {
+      changes += 1;
+    });
+    // M6 seam: not built. W1-C sends these to a relay that takes state and shows 'shared'.
+    for (const value of [{ view: { zoom: 3 } }, null, { view: { zoom: 4 } }]) {
+      expect(h.dock.publishState(value)).toEqual({ ok: true });
+      expect(h.dock.state.published).toBe('unsupported');
+    }
+    // The status changed once, so a page publishing twice a second re-renders nothing.
+    expect(changes).toBe(1);
+    await flush();
+    expect(socket.framesOf('state')).toEqual([]);
   });
 });
 

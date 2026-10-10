@@ -18,6 +18,7 @@ import {
   CONTROL_INVITE_USES,
   DEFAULT_INVITE_LIFETIME_MS,
   encodeFrame,
+  encodeValue,
   IdSchema,
   IDLE_TIMEOUT_MS,
   type ImageMimeType,
@@ -36,6 +37,7 @@ import {
   MAX_LIVE_INVITES_PER_PAGE,
   MAX_OBSERVERS_PER_PAGE,
   MAX_RESULT_CHARS,
+  MAX_STATE_BYTES,
   MAX_TIMER_MS,
   MAX_USERS_PER_PAGE,
   type PageErrorCode,
@@ -44,6 +46,7 @@ import {
   type PageTool,
   type Pairing,
   parseRelayFrame,
+  parseValue,
   type Policy,
   type PolicyInput,
   PolicySchema,
@@ -58,6 +61,7 @@ import {
   type SessionRecord,
   type SessionRefusalReason,
   SHORT_INVITE_LIFETIME_MS,
+  StateValueSchema,
   type StoredGrant,
   StoredGrantSchema,
   type StoredInvite,
@@ -1100,6 +1104,27 @@ const typedArrayLength = (() => {
  */
 function byteLength(text: string): number {
   return typedArrayLength(encodeUtf8(text));
+}
+
+/**
+ * Why a value the page publishes as its state is refused, or null (ADR
+ * 0040). It is written once through the protocol's taken JSON.stringify, so
+ * a getter that changes between reads cannot make what is sent differ from
+ * what was checked; that text, read back, must be a JSON object or null, and
+ * at most MAX_STATE_BYTES. Never a throw: pages publish from render loops.
+ */
+function stateRefusal(value: unknown): 'invalid' | 'too_large' | null {
+  let text: string | undefined;
+  try {
+    text = encodeValue(value);
+  } catch {
+    // A cycle or a BigInt.
+    return 'invalid';
+  }
+  if (text === undefined || !StateValueSchema.safeParse(parseValue(text)).success) {
+    return 'invalid';
+  }
+  return byteLength(text) > MAX_STATE_BYTES ? 'too_large' : null;
 }
 
 /** Unpadded base64url, as the relay's Buffer.toString('base64url') writes it: 16 bytes make 22 characters. */
@@ -3609,8 +3634,16 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   // below stay as they are when its body comes.
 
   // Page state (ADR 0040)
-  // M6 seam: not built
-  const publishState: Dock['publishState'] = () => Object.freeze({ ok: true });
+  // M6 seam: not built. W1-C sends a valid value to a relay that takes
+  // state. Until then a value is checked as the final API checks it, so a
+  // page sees the same refusals, and a valid one shows 'unsupported': this
+  // adapter shares nothing yet, and says so rather than seem to.
+  const publishState: Dock['publishState'] = (value) => {
+    const refusal = stateRefusal(value);
+    const published: PublishStatus = refusal ?? 'unsupported';
+    if (state.published !== published) setState({ published });
+    return Object.freeze(refusal === null ? { ok: true } : { ok: false, reason: refusal });
+  };
   // M6 seam: not built
   const stateWelcome = (): void => undefined;
   // M6 seam: not built
