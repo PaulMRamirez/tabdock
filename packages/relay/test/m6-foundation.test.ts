@@ -11,6 +11,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Client } from '@modelcontextprotocol/client';
+import type { ImageRefusal, PolicyInput } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
 import { DEFAULT_LIMITS, DEFAULT_RATE_LIMITS, DEFAULT_TIMINGS } from '../src/config.ts';
 import { createMemoryStore, type RelayStore } from '../src/index.ts';
@@ -73,7 +74,7 @@ function answerWithImage(page: TestPage): void {
 describe('a result carrying an image (ADR 0039)', () => {
   // M6 seam: not built. W1-B passes a declared tool's checked image on, and
   // turns the declared case below into one that reaches the client.
-  for (const [what, policy, reason, words] of [
+  const cases: [string, PolicyInput, ImageRefusal, string][] = [
     [
       'from a tool the hello did not declare',
       {},
@@ -86,7 +87,8 @@ describe('a result carrying an image (ADR 0039)', () => {
       'off',
       "tabdock refused this tool's image: this relay passes no images",
     ],
-  ] as const) {
+  ];
+  for (const [what, policy, reason, words] of cases) {
     it(`is refused whole ${what}, never answered ok without it`, async () => {
       const { relay, page, alice } = await world({ policy });
       answerWithImage(page);
