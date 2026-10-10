@@ -449,7 +449,7 @@ try {
   }
 
   // A consumer of the libraries, installed from the registry: Node loads the
-  // protocol, tsc takes both packages' types.
+  // protocol and both packages' second entries, and tsc takes all their types.
   const consumer = join(scratch, 'consumer');
   mkdirSync(consumer);
   writeFileSync(
@@ -479,15 +479,41 @@ try {
     loaded.status === 0,
     `Node imports @tabdock/protocol from its dist${loaded.status === 0 ? '' : `:\n${loaded.stderr}`}`,
   );
+  // ADR 0041's subpaths: a CI check imports the helper in Node, with no DOM, so loading it here proves it needs none.
+  const subpaths = run(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      [
+        "const t = await import('@tabdock/adapter/testing');",
+        "const d = await import('@tabdock/protocol/devtools');",
+        "if (typeof t.allowAttach !== 'function' || typeof t.readPairingCode !== 'function') process.exit(1);",
+        'if (!d.DevToolsDocumentSchema.safeParse({ root: { backendNodeId: 1 } }).success) process.exit(1);',
+      ].join(' '),
+    ],
+    { cwd: consumer },
+  );
+  check(
+    subpaths.status === 0,
+    `Node imports @tabdock/adapter/testing and @tabdock/protocol/devtools from their dist${subpaths.status === 0 ? '' : `:\n${subpaths.stderr}`}`,
+  );
   writeFileSync(
     join(consumer, 'consumer.ts'),
     [
       "import { attach, type AttachOptions } from '@tabdock/adapter';",
+      "import { allowAttach, readPairingCode, type DevToolsSession } from '@tabdock/adapter/testing';",
       "import { SUBPROTOCOL, type PolicyInput } from '@tabdock/protocol';",
+      "import { DevToolsDocumentSchema } from '@tabdock/protocol/devtools';",
       "const policy: PolicyInput = { consequentialTools: ['clear_board'] };",
       "const options: AttachOptions = { relay: 'ws://127.0.0.1:8787/page', policy };",
       'export const start = (): unknown => attach(options);',
       'export const subprotocol: string = SUBPROTOCOL;',
+      'export const code = (cdp: DevToolsSession): Promise<string> => readPairingCode(cdp);',
+      'export const allow = (cdp: DevToolsSession): Promise<string> =>',
+      "  allowAttach(cdp, { as: 'driver', client: 'pack-install' });",
+      'export const isDocument = (reply: unknown): boolean =>',
+      '  DevToolsDocumentSchema.safeParse(reply).success;',
       '',
     ].join('\n'),
   );

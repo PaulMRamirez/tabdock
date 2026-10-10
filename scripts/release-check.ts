@@ -56,7 +56,15 @@ const COMMON_REQUIRED = ['package.json', 'README.md', 'LICENSE', 'NOTICE'];
 const RULES: Record<PackageName, Rules> = {
   protocol: {
     allowed: [...COMMON, /^dist\/[a-z-]+\.(?:js|d\.ts)$/],
-    required: [...COMMON_REQUIRED, 'dist/index.js', 'dist/index.d.ts', 'dist/zod-config.js'],
+    required: [
+      ...COMMON_REQUIRED,
+      'dist/index.js',
+      'dist/index.d.ts',
+      'dist/zod-config.js',
+      // The DevTools reply schemas the adapter's testing entry checks with (ADR 0041).
+      'dist/devtools.js',
+      'dist/devtools.d.ts',
+    ],
   },
   adapter: {
     allowed: [...COMMON, /^dist\/[a-z-]+\.(?:js|d\.ts)$/, /^dist\/tabdock-adapter\.js\.map$/],
@@ -66,6 +74,9 @@ const RULES: Record<PackageName, Rules> = {
       'dist/index.d.ts',
       'dist/tabdock-adapter.js',
       'dist/tabdock-adapter.js.map',
+      // @tabdock/adapter/testing, the helper a CI check reads the widget with (ADR 0041).
+      'dist/testing.js',
+      'dist/testing.d.ts',
     ],
   },
   relay: {
