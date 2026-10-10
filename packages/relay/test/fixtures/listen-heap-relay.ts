@@ -1,5 +1,6 @@
-// node --expose-gc listen-heap-relay.ts: a relay with invites on, sixty
-// invitee accounts (invitee-<n>-dev-token-5a8c1e7f2b9d4063, n from 0) and one
+// node --expose-gc listen-heap-relay.ts: a relay with invites on, ten more
+// invitee accounts than the invitee pool holds by default
+// (invitee-<n>-dev-token-5a8c1e7f2b9d4063, n from 0) and one
 // member (member-heap-dev-token-7c2e9a4b1d6f8035), room for that member's
 // waiting calls to hold all their bodies, and every other setting at its
 // default. It prints its /mcp and /page URLs, space apart, as its first line,
@@ -7,6 +8,7 @@
 // listen-heap.test.ts can measure what the listen streams it opens, and the
 // calls it leaves waiting on a page, hold.
 
+import { DEFAULT_LIMITS } from '../../src/config.ts';
 import { createDevTokenAuth, createRelay, type DevTokenUser } from '../../src/index.ts';
 
 const collect = (globalThis as { gc?: () => void }).gc;
@@ -14,12 +16,16 @@ if (collect === undefined) throw new Error('run with --expose-gc');
 const send = process.send?.bind(process);
 if (send === undefined) throw new Error('run with an IPC channel');
 
-const users: DevTokenUser[] = Array.from({ length: 60 }, (_, n) => ({
-  userId: `g_${(n + 1).toString(16).padStart(32, '0')}`,
-  displayName: 'ignored',
-  token: `invitee-${String(n)}-dev-token-5a8c1e7f2b9d4063`,
-  kind: 'invitee',
-}));
+// The test fills the whole pool, which ADR 0044 sized for a class.
+const users: DevTokenUser[] = Array.from(
+  { length: DEFAULT_LIMITS.inviteeSessions + 10 },
+  (_, n) => ({
+    userId: `g_${(n + 1).toString(16).padStart(32, '0')}`,
+    displayName: 'ignored',
+    token: `invitee-${String(n)}-dev-token-5a8c1e7f2b9d4063`,
+    kind: 'invitee',
+  }),
+);
 users.push({
   userId: 'member',
   displayName: 'Member',

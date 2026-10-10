@@ -12,6 +12,7 @@ import type { Client } from '@modelcontextprotocol/client';
 import { afterEach, describe, expect, it } from 'vitest';
 import { resolveConfig } from '../src/config.ts';
 import { createLogger } from '../src/log.ts';
+import { FIXED_TOOL_NAMES } from '../src/mcp.ts';
 import { Spike } from '../src/spike.ts';
 import {
   attachSpikeConsole,
@@ -36,7 +37,7 @@ import {
   type TestRelay,
 } from './helpers/relay.ts';
 
-const FIXED = ['call_page_tool', 'detach_page', 'list_page_tools', 'list_pages', 'pair_page'];
+const FIXED = [...FIXED_TOOL_NAMES].sort();
 
 let current: TestRelay | undefined;
 const clients: Client[] = [];
@@ -99,7 +100,7 @@ afterEach(async () => {
 });
 
 describe('the spike flag', () => {
-  it('is off by default: no control, five tools, no timestamps and no spike log lines', async () => {
+  it('is off by default: no control, the fixed tools alone, no timestamps and no spike log lines', async () => {
     const { relay, lines } = await setup(false);
     expect(relay.spike).toBeNull();
     expect(loadConfigFromEnv({ TABDOCK_DEV_TOKENS: `alice=${ALICE.token}` }).spike).toBe(false);

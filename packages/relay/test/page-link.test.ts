@@ -4,10 +4,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   ATTACH_REQUEST_TTL_MS,
+  DEFAULT_IMAGE_BYTES,
   IDLE_TIMEOUT_MS,
   MAX_DESCRIPTION_CHARS,
   MAX_FRAME_BYTES,
   MAX_RESULT_CHARS,
+  MAX_STATE_BYTES,
   PAIRING_TTL_MS,
   PING_INTERVAL_MS,
   RESUME_WINDOW_MS,
@@ -198,6 +200,27 @@ describe('hello', () => {
       idleTimeoutMs: 10_000,
       resumeWindowMs: 5000,
       attachRequestTtlMs: 5000,
+      // M6: images up to the relay's setting (ADR 0039), page state (ADR
+      // 0040), and the page's people with no watching seats, invites off
+      // (ADR 0044).
+      maxImageBytes: DEFAULT_IMAGE_BYTES,
+      maxStateBytes: MAX_STATE_BYTES,
+      usersPerPage: 10,
+      observersPerPage: 0,
+    });
+  });
+
+  it('tells the page its watching seats and image size as set, with invites on', async () => {
+    const { relay } = await relayWith({
+      invites: true,
+      limits: { observersPerPage: 25, usersPerPage: 6, imageBytes: 0 },
+    });
+    const opened = await page(relay.pageUrl, { tools: TOOLS });
+    expect(opened.welcome?.limits).toMatchObject({
+      maxImageBytes: 0,
+      maxStateBytes: MAX_STATE_BYTES,
+      usersPerPage: 6,
+      observersPerPage: 25,
     });
   });
 

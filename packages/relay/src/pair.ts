@@ -499,6 +499,8 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
       account: user.account.kind === 'member' ? { ...MEMBER_ACCOUNT } : { ...user.account },
       oauthClientId: null,
       client: null,
+      // A browser signed in at /pair or /i, never an agent token (ADR 0044).
+      agentPageId: null,
     };
   }
 

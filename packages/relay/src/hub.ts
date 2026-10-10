@@ -34,6 +34,8 @@ import {
   CLOSE_REPLACED,
   encodeFrame,
   type ErrorCode,
+  type ImageMimeType,
+  type ImageRefusal,
   INVITE_BURN_REFUSALS,
   INVITE_PATH,
   type InviteListing,
@@ -52,6 +54,7 @@ import {
   MAX_INVITE_LIFETIME_MS,
   MAX_LIVE_INVITES_PER_PAGE,
   MAX_RESULT_CHARS,
+  MAX_STATE_BYTES,
   MEMBER_RESERVED_SEATS,
   MIN_INVITE_REMAINING_MS,
   type PageErrorCode,
@@ -61,9 +64,11 @@ import {
   parsePageFrame,
   type RelayFrame,
   type Role,
+  type SessionEndReason,
   type ToolAnnotations,
   truncate,
   UNVERIFIED_EMAIL,
+  type UserKind,
 } from '@tabdock/protocol';
 import { createHash } from 'node:crypto';
 import type { RawData, WebSocket } from 'ws';
@@ -94,7 +99,12 @@ import {
   firstClassName,
   firstClassToolPart,
 } from './first-class.ts';
+import { AgentTokens } from './agents.ts';
+import { type HeldTally, holdValue } from './held-tally.ts';
 import type { LogFields, Logger, LogLevel } from './log.ts';
+import { PageParts } from './page-parts.ts';
+import { PageStates } from './page-state.ts';
+import { PageProposals } from './proposals.ts';
 import { SlidingWindowLimiter } from './rate-limit.ts';
 import { RepeatedLines } from './repeated-lines.ts';
 import { childPosition, SCHEMA_TEXT_KEYS, type SchemaPosition } from './schema-keywords.ts';
@@ -133,11 +143,22 @@ type InviteCloseReason = AuditEventOf<'invite_closed'>['reason'];
 /**
  * The fixed tools whose requests ADR 0018's per-user budget can refuse, with
  * what each names; a call by a first-class name is refused as the
- * call_page_tool it stands for (ADR 0025).
+ * call_page_tool it stands for (ADR 0025). The four M6 tools read state or
+ * proposals and reach no page, so each is a request_refused record (ADRs
+ * 0040 and 0042).
  */
 export type BudgetRefusal =
   | { tool: 'list_pages' }
-  | { tool: 'list_page_tools' | 'detach_page'; page: string }
+  | {
+      tool:
+        | 'list_page_tools'
+        | 'detach_page'
+        | 'get_page_state'
+        | 'wait_for_page_state'
+        | 'get_proposal'
+        | 'withdraw_proposal';
+      page: string;
+    }
   | { tool: 'call_page_tool'; page: string; pageTool: PageToolRef }
   | { tool: 'pair_page'; via: 'code' | 'invite' };
 
@@ -171,6 +192,11 @@ export interface CallerIdentity {
   /** The access token's client_id, for the audit log's attach records (ADR 0019); null for none. */
   oauthClientId: string | null;
   client: ClientInfo | null;
+  /**
+   * The one page an agent token watches, for a caller on /g/mcp (ADR 0044);
+   * null for everyone else, who signed in.
+   */
+  agentPageId: string | null;
 }
 
 export interface HubError {
@@ -307,6 +333,8 @@ export interface ToolListing {
    * the tool, or null when their list leaves it off; absent with them off.
    */
   firstClass?: string | null;
+  /** The caller may not run it but may propose it, on a page that takes proposals (ADR 0042). */
+  proposable?: true;
 }
 
 export type ToolsOutcome =
@@ -318,12 +346,42 @@ export type ToolsOutcome =
  * whichever route named the tool (ADR 0025).
  */
 export type SettledCall =
-  | { kind: 'ok'; origin: string; content: string; tool?: string }
+  | {
+      kind: 'ok';
+      origin: string;
+      content: string;
+      tool?: string;
+      /** An image from a tool the page declared, checked by the relay (ADR 0039). */
+      image?: SettledImage;
+    }
   /** The page's handler failed; its message is page-supplied text. */
-  | { kind: 'tool_error'; origin: string; message: string; tool?: string }
+  | {
+      kind: 'tool_error';
+      origin: string;
+      message: string;
+      tool?: string;
+      /** Why the relay refused the page's image, when that is what failed (ADR 0039). */
+      imageRefused?: ImageRefusal;
+    }
   /** The MCP client abandoned the call. */
   | { kind: 'cancelled' }
+  /**
+   * The caller's role may not run the tool, and the page takes proposals,
+   * so the call waits for the operator as a proposal; the page has not run
+   * it (ADR 0042).
+   */
+  | { kind: 'proposed'; pageId: string; proposalId: string; tool: string; expiresAt: number }
   | HubError;
+
+/** An image a call returned, as the relay checked it: its base64 data for the client, and what the record keeps. */
+export interface SettledImage {
+  mimeType: ImageMimeType;
+  data: string;
+  /** Decoded bytes. */
+  bytes: number;
+  /** SHA-256 of the decoded bytes, lower-case hex. */
+  sha256: string;
+}
 
 /**
  * A 2026-07-28 first round the relay answers with input_required (ADR
@@ -397,6 +455,52 @@ interface ClientConfirmation {
 
 export type DetachOutcome = { kind: 'detached'; pageId: string } | HubError;
 
+/**
+ * A page's published state as get_page_state and wait_for_page_state read
+ * it (ADR 0040): the canonical text the page sent, never parsed again, and
+ * whether a wait saw it change (null for a read that did not wait).
+ */
+export type StateOutcome =
+  | {
+      kind: 'state';
+      pageId: string;
+      origin: string;
+      version: number;
+      publishedAt: number | null;
+      heardAt: number;
+      text: string | null;
+      changed: boolean | null;
+    }
+  | HubError;
+
+/** Where a proposal stands (ADR 0042): pending until the operator decides or it ends some other way. */
+export type ProposalStatus =
+  'pending' | 'accepted' | 'dismissed' | 'refused' | 'expired' | 'withdrawn' | 'cancelled';
+
+/** A proposal as get_proposal and withdraw_proposal answer it (ADR 0042), to its proposer alone. */
+export type ProposalAnswer =
+  | {
+      kind: 'proposal';
+      pageId: string;
+      origin: string;
+      proposalId: string;
+      tool: string;
+      status: ProposalStatus;
+      /** For an accepted proposal: running, or how its run ended. */
+      outcome?: 'running' | 'ok' | 'tool_error' | ErrorCode;
+      expiresAt?: number;
+      /** An accepted run's result, cut to MAX_PROPOSAL_RESULT_CHARS: page text, shown only behind its label. */
+      result?: { text: string; cut: boolean };
+    }
+  | HubError;
+
+/**
+ * Which of a page's two allowances an attachment fills (ADR 0044): an
+ * invitee watching by invite takes a watching seat while the page has any,
+ * and everyone else one of its people, usersPerPage.
+ */
+type Seat = 'people' | 'watching';
+
 /** Why a page socket was refused before it was upgraded. */
 export interface SocketRefusal {
   status: 429 | 503;
@@ -426,6 +530,16 @@ interface CallTrace {
    * (S7, ADR 0026).
    */
   confirmedBy: 'client' | null;
+  /** The invoke's call id, exactly when it went out, so a saved session record matches the line (ADR 0045). */
+  callId: string | null;
+  /** The image that reached the client: its type, decoded size and digest, never its data (ADR 0039). */
+  image: Omit<SettledImage, 'data'> | null;
+  /** Why the relay refused the page's image (ADR 0039). */
+  imageRefused: ImageRefusal | null;
+  /** The proposal the call made, or the accepted proposal it runs (ADR 0042). */
+  proposalId: string | null;
+  /** Whether it runs a proposal the operator accepted on the page (ADR 0042). */
+  acceptedOnPage: boolean;
 }
 
 /** Why the relay tells a page to stop a call. */
@@ -466,6 +580,12 @@ interface PendingCall {
    * out (#sendInvoke).
    */
   confirmation: ClientConfirmation | null;
+  /**
+   * The accepted proposal it runs, and the grantedAt of the proposer's
+   * attachment it was made under, which must still be theirs as it goes out;
+   * null for an ordinary call (ADR 0042). Never beside a confirmation.
+   */
+  proposal: { proposalId: string; grantedAt: number } | null;
   /** Filled in for the spike's timing (spike.ts); null otherwise. */
   marks: CallMarks | null;
   /** Whether its invoke went out, which decides how its audit record is written. */
@@ -625,6 +745,10 @@ interface Conn {
   inflight: Map<string, PendingCall>;
   /** When this socket's recent tools frames arrived, for toolsFramesPerSocket. */
   toolsFrames: number[];
+  /** When this socket's recent state frames arrived, for stateFramesPerSocket (ADR 0040). */
+  stateFrames: number[];
+  /** When the last frame of any kind arrived, which state reads report as heardAt (ADR 0040). */
+  heardAt: number;
   /** When this socket's recent frames that changed nothing arrived, for ignoredFramesPerSocket. */
   ignoredFrames: number[];
   /**
@@ -906,39 +1030,15 @@ class SchemaTooDeep extends Error {}
 class SchemaKeyTooLong extends Error {}
 
 /**
- * What a listed tool keeps on the heap, counted as it is cut: the values and
- * object keys of the copy clients are shown, and the characters of every
- * string it holds. limits.toolBytes is charged from this (heldBytes), never
- * from the frame's size on the wire (S9, ADR 0018).
- */
-interface HeldTally {
-  nodes: number;
-  chars: number;
-}
-
-/**
- * Counts a string the cut copy keeps. A cut string is a new one that may
- * still point into the page's original, so both are counted.
+ * Counts a string a listed tool's cut copy keeps (held-tally.ts). A cut
+ * string is a new one that may still point into the page's original, so
+ * both are counted.
  */
 function holdText(text: string, tally: HeldTally): string {
   const cut = truncate(text, MAX_DESCRIPTION_CHARS);
   tally.nodes += 1;
   tally.chars += cut.truncated ? text.length + cut.text.length : text.length;
   return cut.text;
-}
-
-/** Counts a small value the relay made itself and keeps as it is, such as a stub schema. */
-function holdValue(value: unknown, tally: HeldTally): void {
-  tally.nodes += 1;
-  if (typeof value === 'string') tally.chars += value.length;
-  else if (Array.isArray(value)) for (const item of value) holdValue(item, tally);
-  else if (typeof value === 'object' && value !== null) {
-    for (const [key, item] of Object.entries(value)) {
-      tally.nodes += 1;
-      tally.chars += key.length;
-      holdValue(item, tally);
-    }
-  }
 }
 
 /**
@@ -1238,6 +1338,12 @@ export class PageHub {
    * MAX_PENDING_CONFIRMATIONS a user, in memory only.
    */
   readonly #confirmations: PendingConfirmations;
+  /**
+   * What M6 keeps per page beside the records here: published state (ADR
+   * 0040), proposals (ADR 0042) and agent tokens (ADR 0044), each told of
+   * the page's life where the hub changes it (page-parts.ts).
+   */
+  readonly #parts: PageParts;
   /** The M3 spike's pairing milestones (spike.ts), when TABDOCK_SPIKE is on. */
   readonly #spike: SpikeHooks | null;
   #closed = false;
@@ -1314,6 +1420,7 @@ export class PageHub {
         this.#confirmationExpired(record);
       },
     });
+    this.#parts = new PageParts([new PageStates(), new PageProposals(), new AgentTokens()]);
   }
 
   /**
@@ -1438,6 +1545,8 @@ export class PageHub {
       idleTimer: null,
       inflight: new Map(),
       toolsFrames: [],
+      stateFrames: [],
+      heardAt: Date.now(),
       ignoredFrames: [],
       queue: { epoch: 0, frames: 0, counted: 0 },
       held: [],
@@ -1474,6 +1583,7 @@ export class PageHub {
 
   #onMessage(conn: Conn, data: RawData, isBinary: boolean): void {
     if (conn.closing) return;
+    conn.heardAt = Date.now();
     conn.idleTimer?.refresh();
     if (isBinary) {
       this.connectionLine(conn.address, 'warn', 'closing page socket: binary frame', {
@@ -1562,21 +1672,63 @@ export class PageHub {
       case 'pong':
         return;
       case 'state':
+        this.#stateFrame(conn, pageId, frame);
+        return;
       case 'proposal_decision':
+        this.#mayChangeNothing(conn, frame.t, () => this.#proposalDecision(pageId, frame));
+        return;
       case 'session_start':
       case 'session_extend':
       case 'session_end':
+        this.#mayChangeNothing(conn, frame.t, () => this.#sessionFrame(pageId, frame));
+        return;
       case 'agent_create':
       case 'agent_cancel':
-        // M6 seam: not built. The protocol knows these frames from M6, and
-        // until this relay acts on them each is ignored, logged and counted
-        // within ADR 0023's budget exactly as an unknown type was before.
-        this.#mayChangeNothing(conn, 'unknown type', () => {
-          this.#log.warn('ignored a frame of unknown type', { pageId, frameType: frame.t });
-          return false;
-        });
+        this.#mayChangeNothing(conn, frame.t, () => this.#agentFrame(pageId, frame));
         return;
     }
+  }
+
+  /**
+   * A page publishing its state (ADR 0040): budgeted per socket and per
+   * address before the value is looked at, then kept if it changed.
+   */
+  #stateFrame(conn: Conn, pageId: string, frame: FrameOf<'state'>): void {
+    // M6 seam: not built. Until this relay keeps state, the frame is ignored,
+    // logged and counted within ADR 0023's budget as an unknown type was.
+    this.#mayChangeNothing(conn, frame.t, () => this.#notActedOn(pageId, frame.t));
+  }
+
+  /** The operator's answer to a proposal (ADR 0042); false when it named none of the page's. */
+  #proposalDecision(pageId: string, frame: FrameOf<'proposal_decision'>): boolean {
+    // M6 seam: not built. No proposal is ever made, so none is decided.
+    return this.#notActedOn(pageId, frame.t);
+  }
+
+  /** The operator starting, extending or ending a time-boxed session (ADR 0043); false when nothing changed. */
+  #sessionFrame(
+    pageId: string,
+    frame: FrameOf<'session_start' | 'session_extend' | 'session_end'>,
+  ): boolean {
+    // M6 seam: not built. Refused by being ignored, so no session starts.
+    return this.#notActedOn(pageId, frame.t);
+  }
+
+  /** The page minting or cancelling an agent token (ADR 0044); false when nothing changed. */
+  #agentFrame(pageId: string, frame: FrameOf<'agent_create' | 'agent_cancel'>): boolean {
+    // M6 seam: not built. Refused by being ignored, so no token is minted.
+    return this.#notActedOn(pageId, frame.t);
+  }
+
+  /**
+   * A frame the protocol knows from M6 that this relay does not act on yet:
+   * its line, held by #mayChangeNothing, is written only within ADR 0023's
+   * budget, and it changed nothing.
+   */
+  #notActedOn(pageId: string, frameType: string): false {
+    // M6 seam: not built. Goes with the last of the stubs above.
+    this.#log.warn('ignored a frame this relay does not act on yet', { pageId, frameType });
+    return false;
   }
 
   /**
@@ -1671,6 +1823,7 @@ export class PageHub {
    * Answers whether it minted one.
    */
   #inviteCreate(pageId: string, frame: FrameOf<'invite_create'>): boolean {
+    this.#endSessionIfDue(pageId);
     const page = this.#store.pages.get(pageId);
     if (!page) return false;
     const now = Date.now();
@@ -1716,6 +1869,7 @@ export class PageHub {
       return false;
     }
     const longest = now + MAX_INVITE_LIFETIME_MS;
+    const ownExpiresAt = frame.expiresAt === null ? longest : Math.min(frame.expiresAt, longest);
     const invite: InviteRecord = {
       inviteId: frame.inviteId,
       pageId,
@@ -1725,7 +1879,8 @@ export class PageHub {
       usesLeft: frame.uses,
       createdAt: now,
       requestedExpiresAt: frame.expiresAt,
-      expiresAt: frame.expiresAt === null ? longest : Math.min(frame.expiresAt, longest),
+      expiresAt: ownExpiresAt,
+      ownExpiresAt,
       secretHash: frame.secretHash,
       sponsor: { userId: sponsor.userId, displayName: sponsor.displayName },
       pendingRequestId: null,
@@ -1873,6 +2028,8 @@ export class PageHub {
     const hash = digest(secret);
     const invite = this.#store.invites.findBySecretHash(hash.toString('hex'));
     if (!invite || !sameDigest(Buffer.from(invite.secretHash, 'hex'), hash)) return null;
+    // A session past its end closes its invites first, however late its timer (ADR 0043).
+    this.#endSessionIfDue(invite.pageId);
     if (invite.expiresAt <= now || invite.usesLeft <= 0) return null;
     return this.#sponsored(invite) ? invite : null;
   }
@@ -1900,6 +2057,8 @@ export class PageHub {
    * member before naming a sponsor.
    */
   #chainInTime(pageId: string, userId: string): boolean {
+    // A session past its end ends what it let in first, however late its timer (ADR 0043).
+    this.#endSessionIfDue(pageId);
     const seen = new Set<string>();
     let next: string | null = userId;
     while (next !== null && !seen.has(next)) {
@@ -1910,6 +2069,48 @@ export class PageHub {
       next = attachment.sponsorId;
     }
     return true;
+  }
+
+  // Time-boxed sessions (ADR 0043)
+
+  /** The page's session as it stands, after every welcome and on every change. */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- a stub: its body comes with ADR 0043
+  #sendSession(_pageId: string): void {
+    // M6 seam: not built. No session ever starts, so there is none to send.
+  }
+
+  /**
+   * Ends the page's session: what its invites let in, its live invites and
+   * its agent tokens end with it, unless the page itself is gone.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- a stub: its body comes with ADR 0043
+  #endSession(_pageId: string, _reason: SessionEndReason): void {
+    // M6 seam: not built. No session ever starts, so there is none to end.
+  }
+
+  /** Ends the page's session if its end has passed, whatever its timer: a late timer lets nobody past it. */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- a stub: its body comes with ADR 0043
+  #endSessionIfDue(_pageId: string): void {
+    // M6 seam: not built. No session ever starts, so none is ever due.
+  }
+
+  /** An invite-made attachment's end, at most the live session's (ADR 0043). */
+  #sessionCap(_pageId: string, endsAt: number): number {
+    // M6 seam: not built. With no session there is nothing to cap it at.
+    return endsAt;
+  }
+
+  /** Stops every session timer at shutdown. */
+  #clearSessionTimers(): void {
+    // M6 seam: not built. No session ever starts, so no timer runs.
+  }
+
+  // Agent tokens (ADR 0044)
+
+  /** The page's agent tokens, after every welcome and on every change, while agent tokens are on. */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- a stub: its body comes with ADR 0044
+  #sendAgents(_pageId: string): void {
+    // M6 seam: not built. No token is ever minted, so the page hears nothing.
   }
 
   /** A control invite's prompt was refused or ran out: three burn it (ADR 0016). */
@@ -1959,6 +2160,8 @@ export class PageHub {
         this.#closeSocket(previous, CLOSE_RESUMED_ELSEWHERE, 'session resumed elsewhere');
         // The reloaded page never saw these requests, so nobody is left to answer them.
         this.#dropRequests(page.pageId);
+        // Nor what the old socket published or was asked to decide (page-parts.ts).
+        this.#parts.resumed(page.pageId);
       }
       this.#clearTimer(this.#lifecycleTimers, page.pageId);
       this.#asleep.delete(page.pageId);
@@ -1974,6 +2177,7 @@ export class PageHub {
       page.url = frame.url;
       page.adapterVersion = frame.adapterVersion;
       page.policy = frame.policy;
+      page.ceiling = frame.policy;
     } else {
       const noRoom = this.#makeRoom(conn.address);
       if (noRoom !== null) {
@@ -1996,6 +2200,8 @@ export class PageHub {
         url: frame.url,
         adapterVersion: frame.adapterVersion,
         policy: frame.policy,
+        ceiling: frame.policy,
+        timedSession: null,
         tools: [],
         toolsPending: false,
         state: 'awake',
@@ -2029,6 +2235,9 @@ export class PageHub {
     // Right after every welcome with invites on, so the page knows at once
     // whether it may mint and which of its invites the relay still holds.
     this.#sendInvites(page.pageId);
+    // Likewise its time-boxed session (ADR 0043) and agent tokens (ADR 0044).
+    this.#sendSession(page.pageId);
+    this.#sendAgents(page.pageId);
     this.#rosterSentAt.set(page.pageId, now);
     this.#startHeartbeat(conn);
     this.connectionLine(conn.address, 'info', 'page connected', {
@@ -2038,8 +2247,15 @@ export class PageHub {
     });
   }
 
+  /**
+   * From M6 the welcome also says how large an image the relay passes (0
+   * for none, ADR 0039), that it takes page state (ADR 0040), and the
+   * page's people limit and watching seats, none of which exist with
+   * invites off (ADR 0044), so the adapter sends nothing an older relay
+   * would only ignore.
+   */
   #limits(): Limits {
-    const { timings } = this.#config;
+    const { timings, limits, invites } = this.#config;
     return {
       maxFrameBytes: MAX_FRAME_BYTES,
       maxResultChars: MAX_RESULT_CHARS,
@@ -2048,6 +2264,10 @@ export class PageHub {
       idleTimeoutMs: timings.idleTimeoutMs,
       resumeWindowMs: timings.resumeWindowMs,
       attachRequestTtlMs: timings.attachRequestTtlMs,
+      maxImageBytes: limits.imageBytes,
+      maxStateBytes: MAX_STATE_BYTES,
+      usersPerPage: limits.usersPerPage,
+      observersPerPage: invites ? limits.observersPerPage : 0,
     };
   }
 
@@ -2409,6 +2629,8 @@ export class PageHub {
     // The welcome on resume carries the roster as it is by then.
     this.#clearTimer(this.#rosterTimers, pageId);
     this.#dropRequests(pageId);
+    // Nothing reaches a sleeping page, so what waits on it ends too (page-parts.ts).
+    this.#parts.sleep(pageId);
     this.#setTimer(this.#lifecycleTimers, pageId, this.#config.timings.resumeWindowMs, () => {
       this.#gone(pageId);
     });
@@ -2431,8 +2653,12 @@ export class PageHub {
     const page = this.#store.pages.get(pageId);
     if (page?.state !== 'asleep') return;
     const now = Date.now();
+    // A time-boxed session ends with its page, before the attachments go,
+    // so its record counts them (ADR 0043).
+    this.#endSession(pageId, 'page_gone');
     // Questions about calls to it end with it, and one held open answers page_gone now (ADR 0026).
     this.#confirmations.drop(pageId, null, PAGE_GONE_ANSWER);
+    this.#parts.gone(pageId);
     // Invites end with their page session, and so does everything they made (S14).
     for (const invite of this.#store.invites.listForPage(pageId)) {
       this.#closeInvite(invite, 'page_gone', false);
@@ -2451,7 +2677,8 @@ export class PageHub {
     // A gone record keeps only what list_pages, page_gone and detach_page read.
     page.url = '';
     page.adapterVersion = '';
-    page.policy = { ...page.policy, consequentialTools: [] };
+    page.policy = { ...page.policy, consequentialTools: [], imageTools: [] };
+    page.ceiling = { ...page.ceiling, consequentialTools: [], imageTools: [] };
     this.#store.pages.put(page);
     this.#dropListed(pageId);
     this.#rosterSentAt.delete(pageId);
@@ -2591,6 +2818,49 @@ export class PageHub {
       'page_busy',
       `the page ${when} ${String(this.#config.limits.usersPerPage)} users attached, the most it allows; its operator can revoke someone to make room`,
     );
+  }
+
+  /** The watching seats a page has, beside its people: none without invites, whatever the setting (ADR 0044). */
+  #watchingSeats(): number {
+    return this.#config.invites ? this.#config.limits.observersPerPage : 0;
+  }
+
+  /**
+   * Which seat an attachment of this kind and role fills (ADR 0044). Only an
+   * invitee's observer watches: a member in any role, an invitee driver and
+   * anything let in by code, QR or autoApprove count among the people. With
+   * no watching seats, 0 restoring M5's rule, everyone does.
+   */
+  #seatOf(kind: UserKind, role: Role): Seat {
+    return this.#watchingSeats() > 0 && kind === 'invitee' && role === 'observer'
+      ? 'watching'
+      : 'people';
+  }
+
+  /** The page's attachments in one seat. */
+  #seated(pageId: string, seat: Seat): number {
+    return this.#store.attachments
+      .listForPage(pageId)
+      .filter((attachment) => this.#seatOf(attachment.kind, attachment.role) === seat).length;
+  }
+
+  /**
+   * Whether the page's watching seats are full, counting `waiting` requests
+   * that would take one; a page with none is always full (ADR 0044).
+   */
+  // eslint-disable-next-line no-unused-private-class-members -- the watching seats' redemption checks call it (ADR 0044)
+  #watchingFull(pageId: string, waiting: number): boolean {
+    return this.#seated(pageId, 'watching') + waiting >= this.#watchingSeats();
+  }
+
+  /**
+   * A watcher's call past the page's share of its calls, or null to go on
+   * (ADR 0044); members and the page's people are never held to it.
+   */
+  #watchingShareRefusal(_pageId: string, attachment: AttachmentRecord): HubError | null {
+    if (this.#seatOf(attachment.kind, attachment.role) !== 'watching') return null;
+    // M6 seam: not built. Every watcher's call goes on, as before the share.
+    return null;
   }
 
   /**
@@ -2766,7 +3036,9 @@ export class PageHub {
     // Newest first, as every roster lists clients; a joined device came after the first.
     const clients = [...(request.joined ?? [])].reverse();
     if (request.client) clients.push(request.client);
-    const endsAt = invite === undefined ? null : now + MAX_INVITE_LIFETIME_MS;
+    // A live time-boxed session ends what its invites let in with it (ADR 0043).
+    const endsAt =
+      invite === undefined ? null : this.#sessionCap(request.pageId, now + MAX_INVITE_LIFETIME_MS);
     const idleEnd = now + this.#config.timings.attachmentIdleMs;
     const { account } = request;
     const attachment: AttachmentRecord = {
@@ -2822,6 +3094,7 @@ export class PageHub {
 
   /** maxDrivers counts users, so one person's phone and laptop share a single driver seat. */
   #cappedRole(pageId: string, userId: string, wanted: Role): Role {
+    this.#endSessionIfDue(pageId);
     if (wanted !== 'driver') return wanted;
     const page = this.#store.pages.get(pageId);
     const drivers = this.#store.attachments
@@ -2836,6 +3109,7 @@ export class PageHub {
 
   /** The operator's role change; false when nobody's role changed. */
   #setRole(pageId: string, frame: FrameOf<'set_role'>): boolean {
+    this.#endSessionIfDue(pageId);
     const attachment = this.#store.attachments.get(pageId, frame.userId);
     if (!attachment) {
       this.#log.warn('ignored set_role for a user who is not attached', { pageId });
@@ -3049,6 +3323,8 @@ export class PageHub {
     // ADR 0026: no confirmation outlives the attachment it was given under,
     // and a 2025-era call waiting on its question answers now (S8).
     this.#confirmations.drop(pageId, users, outcome);
+    // Nor a wait, a proposal or an agent token's hold (S8, page-parts.ts).
+    this.#parts.attachmentsEnded(pageId, users, outcome);
     // Queued calls first, so a running one settling does not hand the page a call that is ending.
     for (const call of [...(this.#queues.get(pageId)?.waiting ?? [])]) {
       if (users.has(call.caller.userId)) call.settle(outcome);
@@ -3549,6 +3825,61 @@ export class PageHub {
       }),
     };
   }
+
+  /* eslint-disable @typescript-eslint/no-unused-vars -- stubs: their bodies come with ADRs 0040 and 0042 */
+
+  /**
+   * get_page_state (ADR 0040): the page's latest published state, read
+   * through the same access check as list_page_tools, so a page asleep or
+   * still resuming answers page_asleep. Reading moves no idle expiry.
+   */
+  getPageState(_userId: string, _pageId: string): StateOutcome {
+    // M6 seam: not built.
+    throw new Error('M6 seam: not built');
+  }
+
+  /**
+   * wait_for_page_state (ADR 0040): answers once the version passes `after`,
+   * or at `timeoutMs`, holding a wait slot (waits.ts) and its request charge
+   * meanwhile.
+   */
+  async waitForPageState(
+    _caller: CallerIdentity,
+    _pageId: string,
+    _after: number,
+    _timeoutMs: number,
+    _signal: AbortSignal,
+    _heldBytes: number,
+  ): Promise<StateOutcome> {
+    // M6 seam: not built.
+    await Promise.resolve();
+    throw new Error('M6 seam: not built');
+  }
+
+  /**
+   * get_proposal (ADR 0042): the caller's own proposal on the page, waiting
+   * up to `waitMs` for it to change, with a wait slot as a state wait holds.
+   */
+  async getProposal(
+    _caller: CallerIdentity,
+    _pageId: string,
+    _proposalId: string,
+    _waitMs: number,
+    _signal: AbortSignal,
+    _heldBytes: number,
+  ): Promise<ProposalAnswer> {
+    // M6 seam: not built.
+    await Promise.resolve();
+    throw new Error('M6 seam: not built');
+  }
+
+  /** withdraw_proposal (ADR 0042): a pending proposal of the caller's ends; any other answers as it stands. */
+  withdrawProposal(_caller: CallerIdentity, _pageId: string, _proposalId: string): ProposalAnswer {
+    // M6 seam: not built.
+    throw new Error('M6 seam: not built');
+  }
+
+  /* eslint-enable @typescript-eslint/no-unused-vars */
 
   /**
    * `heldBytes` as for callPageTool: the request waits for the operator, so
@@ -4224,6 +4555,11 @@ export class PageHub {
       release: null,
       tool: this.#calledToolName(pageId, tool),
       confirmedBy: null,
+      callId: null,
+      image: null,
+      imageRefused: null,
+      proposalId: null,
+      acceptedOnPage: false,
     };
     try {
       const outcome = await this.#call(
@@ -4253,21 +4589,7 @@ export class PageHub {
       trace.release?.();
       if (!asked) {
         // In finally, so every attempt leaves a record even when the relay itself fails (S7).
-        const record: AuditCallEvent = {
-          v: AUDIT_VERSION,
-          type: 'call',
-          at: started,
-          // The client's own text: kept when it is an id or a tool name, else only its length (ADR 0019).
-          pageId: auditPageId(pageId),
-          origin: this.#store.pages.get(pageId)?.origin ?? null,
-          userId: caller.userId,
-          client: caller.client,
-          tool: auditToolName(trace.tool),
-          outcome: auditOutcome,
-          durationMs: Math.round(performance.now() - startedMono),
-          // Exactly when its invoke went out confirmed (S7, ADR 0026).
-          ...(trace.confirmedBy === null ? {} : { confirmedBy: trace.confirmedBy }),
-        };
+        const record = this.#callRecord(started, startedMono, pageId, caller, trace, auditOutcome);
         // A call that reached its page is always written in full; one refused
         // before it went out, or failed by the relay before it could, only
         // within the refusal budget (ADR 0019).
@@ -4276,6 +4598,42 @@ export class PageHub {
         this.#spike?.callFinished(pageId, caller.userId, auditOutcome);
       }
     }
+  }
+
+  /**
+   * A call's line (S7): the client's own text for page and tool, kept when it
+   * is an id or a tool name, else only its length (ADR 0019), and from the
+   * trace exactly what happened: confirmed in a client (ADR 0026), the
+   * invoke's id (ADR 0045), the image's type, size and digest or why the
+   * relay refused it (ADR 0039), and the proposal it made or ran (ADR 0042).
+   * Never its arguments or results.
+   */
+  #callRecord(
+    started: number,
+    startedMono: number,
+    pageId: string,
+    caller: CallerIdentity,
+    trace: CallTrace,
+    outcome: AuditOutcome,
+  ): AuditCallEvent {
+    return {
+      v: AUDIT_VERSION,
+      type: 'call',
+      at: started,
+      pageId: auditPageId(pageId),
+      origin: this.#store.pages.get(pageId)?.origin ?? null,
+      userId: caller.userId,
+      client: caller.client,
+      tool: auditToolName(trace.tool),
+      outcome,
+      durationMs: Math.round(performance.now() - startedMono),
+      ...(trace.confirmedBy === null ? {} : { confirmedBy: trace.confirmedBy }),
+      ...(trace.callId === null ? {} : { callId: trace.callId }),
+      ...(trace.image === null ? {} : { image: trace.image }),
+      ...(trace.imageRefused === null ? {} : { imageRefused: trace.imageRefused }),
+      ...(trace.proposalId === null ? {} : { proposalId: trace.proposalId }),
+      ...(trace.acceptedOnPage ? { acceptedOnPage: true } : {}),
+    };
   }
 
   /**
@@ -4485,6 +4843,9 @@ export class PageHub {
           `you are an observer on this page, and ${toolName} is not marked read-only`,
         );
       }
+      // ADR 0044: a page's watchers share a part of its calls, so a room cannot make its tab stutter.
+      const share = this.#watchingShareRefusal(pageId, attachment);
+      if (share !== null) return share;
 
       const callId = newId('cl');
       const call: PendingCall = {
@@ -4502,6 +4863,7 @@ export class PageHub {
         heldOn: null,
         invokeBytes: 0,
         confirmation,
+        proposal: null,
         marks,
         trace,
         timer: null,
@@ -5206,6 +5568,8 @@ export class PageHub {
     call.heldOn = null;
     call.conn = conn;
     call.trace.reached = true;
+    // The page sees this id, so a saved session record can name the audit line (ADR 0045).
+    call.trace.callId = call.callId;
     call.trace.confirmedBy = confirmation === null ? null : 'client';
     conn.inflight.set(call.callId, call);
     this.#armCallTimer(call);
@@ -5555,6 +5919,9 @@ export class PageHub {
     const shuttingDown = hubError('page_asleep', 'the relay is shutting down');
     // A restart voids every confirmation, failing closed (ADR 0026).
     this.#confirmations.close(shuttingDown);
+    // And every wait, proposal and agent token, writing no lines (page-parts.ts).
+    this.#parts.close();
+    this.#clearSessionTimers();
     for (const queue of [...this.#queues.values()]) {
       for (const call of [...queue.waiting]) call.settle(shuttingDown);
     }

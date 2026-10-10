@@ -186,4 +186,5 @@ export {
   type SingleUseTicketRecord,
   type SingleUseTicketStore,
   type TicketStore,
+  type TimedSession,
 } from './store.ts';

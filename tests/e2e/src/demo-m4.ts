@@ -270,7 +270,7 @@ try {
   clients.push(local);
   const tools = (await local.listTools()).tools.map((tool) => tool.name);
   say(`   tools/list: ${tools.join(', ')}`);
-  check(tools.length === 5, 'the relay should offer its five fixed tools');
+  check(tools.length === 9, 'the relay should offer its nine fixed tools');
   const wrong = await fetch(banner.mcpUrl, {
     method: 'POST',
     headers: { Authorization: 'Bearer tabdock_not-the-owner-token' },
