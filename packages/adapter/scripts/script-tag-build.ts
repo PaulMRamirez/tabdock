@@ -1,7 +1,7 @@
 // The script-tag build's esbuild options, shared by scripts/build.ts, which
 // writes dist/tabdock-adapter.js, and by the size test
 // (tests/e2e/test/adapter-size.test.ts), which builds the same file in memory
-// and holds it under 150,000 bytes (ADR 0028), so the size measured is the
+// and holds it under 200,000 bytes (ADRs 0028 and 0048), so the size measured is the
 // size shipped; tests/e2e/specs/widget.spec.ts loads that same file in a page.
 
 import { join, resolve, sep } from 'node:path';

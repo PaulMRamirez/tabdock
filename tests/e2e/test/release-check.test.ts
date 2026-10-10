@@ -550,9 +550,9 @@ describe('the release check', () => {
     [
       'a script-tag build at the ceiling',
       (f) => {
-        f.adapter.files['dist/tabdock-adapter.js'] = Buffer.alloc(150_000, 0x20);
+        f.adapter.files['dist/tabdock-adapter.js'] = Buffer.alloc(200_000, 0x20);
       },
-      /dist\/tabdock-adapter\.js is 150000 bytes, not under 150000/,
+      /dist\/tabdock-adapter\.js is 200000 bytes, not under 200000/,
     ],
     [
       'a sideEffects false that would drop zod-config.ts',

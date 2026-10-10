@@ -13,3 +13,7 @@ The ceiling rises from 150,000 to 200,000 bytes, minified, measured as ADR 0028 
 ## Consequences
 
 A page loading the script tag pays up to a third more than in 0.1.0, in exchange for M6's features with every check still on the page. The checkpoints keep growth visible wave by wave, and the remaining 5,000 bytes leave room for M6's fixes. A later milestone that needs more must raise the ceiling again by its own record.
+
+## Notes from the foundation's review (10 October 2026)
+
+The foundation left `SCRIPT_TAG_LIMIT_BYTES` and the size test at 150,000 while SPEC section 8 already said 200,000; its review moved both to 200,000, as the Decision asks before any wave passes the old ceiling, and the adapter's README with them. The checkpoints stay recorded in `docs/plans/M6.md` at each merge rather than asserted by a test, since the foundation alone measured 145,623 bytes at `796fc39` and 146,091 after the review's fixes, past Wave 1's 145,000 before Wave 1 adds anything. Wave 1's merge meets that checkpoint by trimming CSS and strings first, as decided above, unless a further note here amends the checkpoints. A5.5 keeps M5's 150,000 and now says that section 8 and A6.26 hold the build from M6 on.

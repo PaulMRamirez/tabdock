@@ -33,8 +33,12 @@ export const DEFAULT_OUT = join(ROOT, 'dist', 'packages');
 /** The repository exactly as trusted publishing compares it with package.json's repository.url. */
 export const REPOSITORY_URL = 'git+https://github.com/PaulMRamirez/tabdock.git';
 
-/** Over this, the script-tag build fails the size test and the release (ADR 0028). */
-export const SCRIPT_TAG_LIMIT_BYTES = 150_000;
+/**
+ * Over this, the script-tag build fails the size test and the release: ADR
+ * 0028's 150,000 bytes, raised for M6 by ADR 0048, whose per-wave checkpoints
+ * docs/plans/M6.md records at each wave's merge.
+ */
+export const SCRIPT_TAG_LIMIT_BYTES = 200_000;
 
 export const PACKAGES = ['protocol', 'adapter', 'relay'] as const;
 export type PackageName = (typeof PACKAGES)[number];
