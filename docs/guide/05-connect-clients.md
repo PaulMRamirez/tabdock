@@ -69,7 +69,7 @@ A public relay takes only tokens from its provider, which the SDK's OAuth suppor
 | `get_proposal`        | `page`, `proposal`, `waitMs`                     | A proposal you made: pending, accepted with the page's result behind its label, dismissed, refused, expired, withdrawn or cancelled           |
 | `withdraw_proposal`   | `page`, `proposal`                               | Withdraws your pending proposal, so the operator is no longer asked                                                                           |
 
-You rarely name them: ask Claude to pair with a code, list your pages or do something on a page. A page that went gone stays in `list_pages` for 10 minutes. `pair_page`, `detach_page` and an empty `list_pages` also return structured content, which some clients, Claude Code among them, show in place of the text. Errors are tool errors whose text starts with a code, such as `not_attached: ...`; [Troubleshooting](11-troubleshooting.md) gives each code's remedy.
+You rarely name them: ask Claude to pair with a code, list your pages or do something on a page. A page that went gone stays in `list_pages` for 10 minutes. `pair_page`, `detach_page`, an empty `list_pages`, a `proposed` answer and `get_proposal`'s answers other than a run's result also return structured content, which some clients, Claude Code among them, show in place of the text. Errors are tool errors whose text starts with a code, such as `not_attached: ...`; [Troubleshooting](11-troubleshooting.md) gives each code's remedy.
 
 ## First-class tools
 

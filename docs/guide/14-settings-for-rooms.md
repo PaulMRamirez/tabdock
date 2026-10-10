@@ -23,7 +23,7 @@ An image travels as base64, a third larger than its bytes, and Claude Code caps 
 | `TABDOCK_MAX_OBSERVERS_PER_PAGE` | 40      | 40             | invitees | 0, at most 100; refused without invites                    | The watching seats: invitees watching one page by invite, counted apart from its people (ADR 0044); 0 seats them among people, as before |
 | `TABDOCK_MAX_INVITEE_SESSIONS`   | 100     | 100            | sessions | 2, at most `TABDOCK_MAX_SESSIONS`; refused without invites | 2025-era MCP sessions and listen streams all invitees hold together, a pool evicted strangers first                                      |
 
-The two page limits together fit one roster frame, which is why each has a ceiling. With the watching seats on, invited guests never take a member's seat at all; with them at 0, guests leave members two seats of the people limit, as in M5. Promoting a watcher to driver is refused while the people limit is full, and demoting is always allowed. A relay with invites off sends no watching seats, whatever this says.
+The two page limits together fit one roster frame, which is why each has a ceiling. With the watching seats on, invitees watching by invite take no people seat at all; any other invite-made attachment, and every one with the seats at 0, leaves members two seats of the people limit, as in M5. Promoting a watcher to driver is refused while the people limit is full, and demoting is always allowed. A relay with invites off sends no watching seats, whatever this says.
 
 ## Members, agents and restarts
 
