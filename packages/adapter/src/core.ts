@@ -81,6 +81,7 @@ import {
 } from './tools.ts';
 
 export type { HintSupport, RuntimeTool } from './tools.ts';
+export type { Recorder, RecordView, RecordWhich } from './record.ts';
 export type { StoredGrant, StoredInvite, StoredInvites } from '@tabdock/protocol';
 
 // Ports: everything the core needs from its environment.

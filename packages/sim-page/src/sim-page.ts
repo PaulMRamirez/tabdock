@@ -12,6 +12,8 @@
 
 import {
   type ActivityEntry,
+  type AgentTokenOptions,
+  type AgentTokenResult,
   createAdapterCore,
   type AdapterCore,
   type CryptoLike,
@@ -21,13 +23,17 @@ import {
   type InviteResult,
   type Logger,
   type PendingConfirm,
+  type PublishResult,
+  type RecordWhich,
   type RevokeOptions,
+  type SessionOptions,
+  type SessionResult,
   type SocketFactory,
   type StorageLike,
   type Timers,
   type UiPort,
 } from '@tabdock/adapter/core';
-import type { PolicyInput, Role } from '@tabdock/protocol';
+import type { PolicyInput, Role, SessionRecord } from '@tabdock/protocol';
 import { WebSocket } from 'ws';
 import { createDefaultTools, createSimStore, type SimStore } from './default-tools.ts';
 import {
@@ -152,6 +158,37 @@ export interface SimPage {
   invite(options: InviteOptions): Promise<InviteResult>;
   /** The operator's pause switch (Dock.pause); it survives reload(), as the adapter stores it. */
   pause(paused: boolean): void;
+  /**
+   * The current page publishing its state (Dock.publishState, ADR 0040). A
+   * reload() is a new document, so a test publishes again after one, as a
+   * real page would.
+   */
+  publishState(value: unknown): PublishResult;
+  /** The operator's Accept on a proposal row (Dock.acceptProposal, ADR 0042). */
+  acceptProposal(proposalId: string): boolean;
+  /** The operator's Dismiss on a proposal row (Dock.dismissProposal). */
+  dismissProposal(proposalId: string): boolean;
+  /** The operator's Dismiss all (Dock.dismissAllProposals). */
+  dismissAllProposals(): number;
+  /** The operator's Start in the session form (Dock.startSession, ADR 0043). */
+  startSession(options: SessionOptions): Promise<SessionResult>;
+  /** The operator's Extend (Dock.extendSession). */
+  extendSession(minutes: number): boolean;
+  /** The operator's End session (Dock.endSession). */
+  endSession(): boolean;
+  /** The operator's New link for a running session (Dock.renewSessionLink). */
+  renewSessionLink(): Promise<InviteResult>;
+  /** The operator minting an agent token (Dock.agentToken, ADR 0044). */
+  agentToken(options: AgentTokenOptions): Promise<AgentTokenResult>;
+  /** The operator's Cancel beside one agent token (Dock.cancelAgent). */
+  cancelAgent(tokenId: string): boolean;
+  /**
+   * The current page's session record (Dock.sessionRecord, ADR 0045). It is
+   * kept in memory only, so a reload() starts an empty one.
+   */
+  sessionRecord(which?: RecordWhich): SessionRecord | null;
+  /** The operator's Discard or Clear on a session record (Dock.discardRecord). */
+  discardRecord(which: RecordWhich): boolean;
   /** Resolves with the first state, current or later, that matches; rejects after timeoutMs (5000). */
   waitFor(predicate: (state: DockState) => boolean, timeoutMs?: number): Promise<DockState>;
   /**
@@ -340,6 +377,42 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
     },
     pause(paused) {
       current.core.dock.pause(paused);
+    },
+    publishState(value) {
+      return current.core.dock.publishState(value);
+    },
+    acceptProposal(proposalId) {
+      return current.core.dock.acceptProposal(proposalId);
+    },
+    dismissProposal(proposalId) {
+      return current.core.dock.dismissProposal(proposalId);
+    },
+    dismissAllProposals() {
+      return current.core.dock.dismissAllProposals();
+    },
+    startSession(sessionOptions) {
+      return current.core.dock.startSession(sessionOptions);
+    },
+    extendSession(minutes) {
+      return current.core.dock.extendSession(minutes);
+    },
+    endSession() {
+      return current.core.dock.endSession();
+    },
+    renewSessionLink() {
+      return current.core.dock.renewSessionLink();
+    },
+    agentToken(agentOptions) {
+      return current.core.dock.agentToken(agentOptions);
+    },
+    cancelAgent(tokenId) {
+      return current.core.dock.cancelAgent(tokenId);
+    },
+    sessionRecord(which) {
+      return current.core.dock.sessionRecord(which);
+    },
+    discardRecord(which) {
+      return current.core.dock.discardRecord(which);
     },
     waitFor(predicate, timeoutMs = 5000) {
       const dock = current.core.dock;
