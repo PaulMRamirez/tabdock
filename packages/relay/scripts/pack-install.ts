@@ -45,6 +45,7 @@ import { join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Worker } from 'node:worker_threads';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import { FIXED_TOOL_NAMES } from '../src/mcp.ts';
 import { privateTempRoot } from '../test/helpers/private-tmp.ts';
 import { leakIn } from '../test/helpers/secrecy.ts';
 import { type LocalRegistry, npmEnvFor, runAsync, startLocalRegistry } from './local-registry.ts';
@@ -356,7 +357,8 @@ try {
       'the helper prints the header for the token',
     );
     check(
-      (await toolCount(config.url, authorization)) === 5,
+      // Every fixed tool the sources list, nine from M6, and no page's.
+      (await toolCount(config.url, authorization)) === FIXED_TOOL_NAMES.size,
       'an MCP client connects with what the helper prints',
     );
     check(
