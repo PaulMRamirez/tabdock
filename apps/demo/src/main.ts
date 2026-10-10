@@ -2,6 +2,7 @@ import { initializeWebMCPPolyfill } from '@mcp-b/webmcp-polyfill';
 import { attach, type Dock } from '@tabdock/adapter';
 import { Board } from './board.ts';
 import { busyFromQuery, startBusy } from './busy.ts';
+import { captureBoard } from './capture.ts';
 import { mountConnectBar, mountConnectForm, tabStore, wasChosen } from './connect.ts';
 import { linkPolicyFromQuery, policyInput, policyNotes, policyTag } from './policy.ts';
 import { relayFromQuery } from './relay.ts';
@@ -61,7 +62,7 @@ if (busy) {
 
 const context = document.modelContext;
 if (context) {
-  const tools = createTools(board, ui.logCall);
+  const tools = createTools(board, ui.logCall, (options) => captureBoard(board, options));
   // Registration lives as long as the page; aborting this signal would remove every tool.
   const registration = new AbortController();
   await Promise.all(

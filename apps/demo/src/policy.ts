@@ -23,6 +23,9 @@ import type { PolicyInput } from '@tabdock/adapter';
 
 export const DEMO_CONSEQUENTIAL_TOOLS = ['clear_board'];
 
+/** The tools whose results the adapter reads as an image envelope (ADR 0039). */
+export const DEMO_IMAGE_TOOLS = ['capture_board'];
+
 /** Driver seats under ?invites=all: the operator's own client and one guest. */
 export const DEMO_SHARED_DRIVERS = 2;
 
@@ -48,7 +51,10 @@ export function linkPolicyFromQuery(params: URLSearchParams): LinkPolicy {
 }
 
 export function policyInput(link: LinkPolicy): PolicyInput {
-  const policy: PolicyInput = { consequentialTools: [...DEMO_CONSEQUENTIAL_TOOLS] };
+  const policy: PolicyInput = {
+    consequentialTools: [...DEMO_CONSEQUENTIAL_TOOLS],
+    imageTools: [...DEMO_IMAGE_TOOLS],
+  };
   if (link.confirmInClient) policy.confirmVia = 'client';
   if (link.invites === 'all') return { ...policy, invites: 'all', maxDrivers: DEMO_SHARED_DRIVERS };
   if (link.invites === 'off') return { ...policy, invites: 'off' };

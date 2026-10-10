@@ -97,7 +97,7 @@ try {
   say('\ntools/call list_pages');
   // Tools reach the relay right after the link comes up; wait until all six are there.
   let pages = await callTool(client, 'list_pages');
-  for (let i = 0; i < 40 && !pages.text.includes('"toolCount":6'); i += 1) {
+  for (let i = 0; i < 40 && !pages.text.includes('"toolCount":7'); i += 1) {
     await new Promise((resolve) => setTimeout(resolve, 50));
     pages = await callTool(client, 'list_pages');
   }

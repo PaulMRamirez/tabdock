@@ -46,64 +46,9 @@ export function mountBoard(root: HTMLElement, board: Board): BoardUi {
       canvas.height = Math.round(height * dpr);
     }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, width, height);
-
-    // World to screen: translate so the view centre lands mid-canvas, then scale.
-    const toScreenX = (x: number) => (x - view.x) * view.zoom + width / 2;
-    const toScreenY = (y: number) => (y - view.y) * view.zoom + height / 2;
-
-    ctx.strokeStyle = '#e9ecef';
-    ctx.lineWidth = 1;
-    const left = view.x - width / 2 / view.zoom;
-    const top = view.y - height / 2 / view.zoom;
-    for (
-      let gx = Math.floor(left / GRID_STEP) * GRID_STEP;
-      toScreenX(gx) < width;
-      gx += GRID_STEP
-    ) {
-      line(toScreenX(gx), 0, toScreenX(gx), height);
-    }
-    for (
-      let gy = Math.floor(top / GRID_STEP) * GRID_STEP;
-      toScreenY(gy) < height;
-      gy += GRID_STEP
-    ) {
-      line(0, toScreenY(gy), width, toScreenY(gy));
-    }
-    ctx.strokeStyle = '#ced4da';
-    line(toScreenX(0), 0, toScreenX(0), height);
-    line(0, toScreenY(0), width, toScreenY(0));
-
-    ctx.font = '13px system-ui, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    for (const item of items) {
-      const sx = toScreenX(item.x);
-      const sy = toScreenY(item.y);
-      const radius = 18 * Math.sqrt(view.zoom);
-      if (item.highlighted) {
-        ctx.beginPath();
-        ctx.arc(sx, sy, radius + 8, 0, Math.PI * 2);
-        ctx.strokeStyle = '#fab005';
-        ctx.lineWidth = 5;
-        ctx.stroke();
-      }
-      ctx.beginPath();
-      ctx.arc(sx, sy, radius, 0, Math.PI * 2);
-      ctx.fillStyle = FILL[item.color];
-      ctx.fill();
-      ctx.fillStyle = '#212529';
-      ctx.fillText(item.label, sx, sy + radius + 12);
-    }
+    drawBoard(ctx, latest, { width, height });
 
     viewLabel.textContent = `centre ${round(view.x)}, ${round(view.y)} · zoom ${round(view.zoom)} · ${items.length} items`;
-  }
-
-  function line(x1: number, y1: number, x2: number, y2: number): void {
-    ctx.beginPath();
-    ctx.moveTo(x1, y1);
-    ctx.lineTo(x2, y2);
-    ctx.stroke();
   }
 
   board.subscribe(schedule);
@@ -162,6 +107,73 @@ export function mountBoard(root: HTMLElement, board: Board): BoardUi {
       status.textContent = text;
     },
   };
+}
+
+/**
+ * Draws the board as the view shows it on a canvas of `size` CSS pixels,
+ * already scaled to it: the live canvas and a capture (capture.ts) share
+ * this, so a picture shows what the tab shows. `background` fills the canvas
+ * first, which a capture needs, since JPEG has no transparency.
+ */
+export function drawBoard(
+  ctx: CanvasRenderingContext2D,
+  snapshot: BoardSnapshot,
+  size: { width: number; height: number },
+  background?: string,
+): void {
+  const { items, view } = snapshot;
+  const { width, height } = size;
+  ctx.clearRect(0, 0, width, height);
+  if (background !== undefined) {
+    ctx.fillStyle = background;
+    ctx.fillRect(0, 0, width, height);
+  }
+  const line = (x1: number, y1: number, x2: number, y2: number): void => {
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+  };
+
+  // World to screen: translate so the view centre lands mid-canvas, then scale.
+  const toScreenX = (x: number) => (x - view.x) * view.zoom + width / 2;
+  const toScreenY = (y: number) => (y - view.y) * view.zoom + height / 2;
+
+  ctx.strokeStyle = '#e9ecef';
+  ctx.lineWidth = 1;
+  const left = view.x - width / 2 / view.zoom;
+  const top = view.y - height / 2 / view.zoom;
+  for (let gx = Math.floor(left / GRID_STEP) * GRID_STEP; toScreenX(gx) < width; gx += GRID_STEP) {
+    line(toScreenX(gx), 0, toScreenX(gx), height);
+  }
+  for (let gy = Math.floor(top / GRID_STEP) * GRID_STEP; toScreenY(gy) < height; gy += GRID_STEP) {
+    line(0, toScreenY(gy), width, toScreenY(gy));
+  }
+  ctx.strokeStyle = '#ced4da';
+  line(toScreenX(0), 0, toScreenX(0), height);
+  line(0, toScreenY(0), width, toScreenY(0));
+
+  ctx.font = '13px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  for (const item of items) {
+    const sx = toScreenX(item.x);
+    const sy = toScreenY(item.y);
+    const radius = 18 * Math.sqrt(view.zoom);
+    if (item.highlighted) {
+      ctx.beginPath();
+      ctx.arc(sx, sy, radius + 8, 0, Math.PI * 2);
+      ctx.strokeStyle = '#fab005';
+      ctx.lineWidth = 5;
+      ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.arc(sx, sy, radius, 0, Math.PI * 2);
+    ctx.fillStyle = FILL[item.color];
+    ctx.fill();
+    ctx.fillStyle = '#212529';
+    ctx.fillText(item.label, sx, sy + radius + 12);
+  }
 }
 
 function required<T>(value: T | null): T {

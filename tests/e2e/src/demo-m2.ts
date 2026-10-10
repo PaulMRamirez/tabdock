@@ -238,7 +238,7 @@ try {
   }
   // Tools reach the relay right after the link comes up; wait until all six are listed.
   let toolCount = 0;
-  for (let i = 0; i < 100 && toolCount !== 6; i += 1) {
+  for (let i = 0; i < 100 && toolCount !== 7; i += 1) {
     if (i > 0) await new Promise((resolve) => setTimeout(resolve, 50));
     const listed = await callTool(laptop, 'list_pages');
     toolCount =
@@ -260,8 +260,8 @@ try {
         : `   ${name.padEnd(13)} ${listed.text.slice(0, 120)}`,
     );
     check(
-      pages.length === 1 && first?.page === pageId && first.toolCount === 6,
-      `list_pages from ${name} should list the board with its six tools`,
+      pages.length === 1 && first?.page === pageId && first.toolCount === 7,
+      `list_pages from ${name} should list the board with its seven tools`,
     );
   }
 
