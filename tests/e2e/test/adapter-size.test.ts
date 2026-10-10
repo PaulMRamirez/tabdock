@@ -2,8 +2,9 @@
 // adapter a page loads with one <script> tag, built here in memory with
 // exactly the options packages/adapter/scripts/build.ts writes it with,
 // minified, must stay under 200,000 bytes, raised for M6 from M5's 150,000.
-// It measured 286,140 on classic zod, about 127,000 on zod/mini, and 146,091
-// after M6's foundation; a dependency or a locale that creeps back in fails
+// It measured 286,140 on classic zod, about 127,000 on zod/mini, 146,091
+// after M6's foundation and 136,645 once the protocol named its one side
+// effect; a dependency or a locale that creeps back in fails
 // here before a release ships it. ADR 0048's per-wave checkpoints are
 // recorded in docs/plans/M6.md at each wave's merge.
 

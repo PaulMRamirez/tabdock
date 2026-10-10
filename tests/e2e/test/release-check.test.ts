@@ -562,6 +562,13 @@ describe('the release check', () => {
       /declares sideEffects false/,
     ],
     [
+      'a sideEffects list that leaves out zod-config.js',
+      (f) => {
+        f.protocol.manifest.sideEffects = ['./src/zod-config.ts'];
+      },
+      /sideEffects does not name \.\/dist\/zod-config\.js/,
+    ],
+    [
       'an export that points at nothing',
       (f) => {
         delete f.protocol.files['dist/index.d.ts'];

@@ -19,6 +19,10 @@
     "dist",
     "NOTICE"
   ],
+  "sideEffects": [
+    "./src/zod-config.ts",
+    "./dist/zod-config.js"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json"

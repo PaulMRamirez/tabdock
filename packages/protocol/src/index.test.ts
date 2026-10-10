@@ -124,3 +124,16 @@ describe("M6's modules", () => {
     expect(names.filter((name) => name.startsWith('DevTools'))).toEqual([]);
   });
 });
+
+describe('the package manifest', () => {
+  // Importing any schema must still run zod-config.ts, in the workspace's
+  // sources and in the published dist alike; every other module is pure, so a
+  // bundler may drop the ones a page never imports (ADR 0048's notes).
+  it('names zod-config as its only side effect', async () => {
+    const { readFile } = await import('node:fs/promises');
+    const manifest = JSON.parse(
+      await readFile(new URL('../package.json', import.meta.url), 'utf8'),
+    ) as { sideEffects?: unknown };
+    expect(manifest.sideEffects).toEqual(['./src/zod-config.ts', './dist/zod-config.js']);
+  });
+});

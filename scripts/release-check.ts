@@ -436,6 +436,14 @@ function checkManifest(
   }
   if (manifest.sideEffects === false) {
     problems.push(`${where} declares sideEffects false, which would drop zod-config.ts`);
+  } else if (
+    name === 'protocol' &&
+    Array.isArray(manifest.sideEffects) &&
+    !manifest.sideEffects.includes('./dist/zod-config.js')
+  ) {
+    // A list lets a bundler drop the modules a page never imports (ADR 0048's
+    // notes), but one without zod-config.js would drop the jitless setting too.
+    problems.push(`${where}'s sideEffects does not name ./dist/zod-config.js`);
   }
   if (JSON.stringify(manifest).includes('workspace:')) {
     problems.push(`${where}'s package.json still holds a workspace: specifier`);

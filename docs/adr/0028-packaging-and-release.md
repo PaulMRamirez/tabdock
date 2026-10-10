@@ -105,3 +105,5 @@ A second review of that change found refusals that still repeated part of a valu
 ## Notes from M6 (10 October 2026)
 
 The adapter also publishes `./testing`, with which a test reads the pairing code and clicks the widget's buttons through the DevTools protocol, and the protocol `./devtools`, the schemas it checks replies with, in the first release cut after M6 (ADR 0041); `./core` and `./qr` stay workspace-only. The script-tag build's ceiling rises from 150,000 to 200,000 bytes (ADR 0048). The audit format stays at version 1 while 0.1.0 is unpublished (ADR 0045's version rule).
+
+The protocol now declares `sideEffects` as a list naming `zod-config` alone, in its sources and in `dist/` (ADR 0048's notes): importing any schema still runs `zod-config` first, and a bundler may drop the modules a page never imports. It still never declares `sideEffects: false`, which the release check refuses, as it refuses a list without `./dist/zod-config.js`.
