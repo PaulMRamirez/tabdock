@@ -3,9 +3,10 @@
 // field at rest, the page's own policy fields are shown as a copy, the seat
 // numbers come from each welcome within the protocol's ceilings and go with
 // the link, the relay's new frames never cost the page its link, and a detach
-// leaves no stored session or agent token record behind. publishState already
-// refuses what ADR 0040 refuses, and says a valid value goes nowhere yet
-// rather than report it shared.
+// leaves no stored session or agent token record behind. publishState
+// refuses what ADR 0040 refuses, and says a valid value goes nowhere on a
+// relay that takes no state rather than report it shared (state.test.ts has
+// the rest).
 
 import { MAX_OBSERVERS_PER_PAGE, MAX_STATE_BYTES, MAX_USERS_PER_PAGE } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
@@ -47,7 +48,7 @@ describe('the M6 state fields', () => {
   });
 });
 
-describe('publishState before page state is built (ADR 0040)', () => {
+describe('publishState (ADR 0040)', () => {
   it('refuses what the final API refuses, and never throws', () => {
     const h = setup();
     const cyclic: Record<string, unknown> = {};
@@ -78,20 +79,23 @@ describe('publishState before page state is built (ADR 0040)', () => {
     expect(h.dock.state.published).toBe('too_large');
   });
 
-  it('says a valid value is shared with no one yet, and sends nothing', async () => {
+  it('says a valid value goes nowhere on a relay whose welcome names no maxStateBytes, and sends nothing', async () => {
     const h = setup();
+    // The harness's welcome is a 0.1.0 relay's: it names no maxStateBytes.
     const socket = await link(h, {}, {});
     let changes = 0;
     h.dock.on('state', () => {
       changes += 1;
     });
-    // M6 seam: not built. W1-C sends these to a relay that takes state and shows 'shared'.
-    for (const value of [{ view: { zoom: 3 } }, null, { view: { zoom: 4 } }]) {
+    for (const value of [{ view: { zoom: 3 } }, { view: { zoom: 4 } }]) {
       expect(h.dock.publishState(value)).toEqual({ ok: true });
       expect(h.dock.state.published).toBe('unsupported');
     }
     // The status changed once, so a page publishing twice a second re-renders nothing.
     expect(changes).toBe(1);
+    // Null shares nothing, so there is nothing to say a relay does not take.
+    expect(h.dock.publishState(null)).toEqual({ ok: true });
+    expect(h.dock.state.published).toBe('none');
     await flush();
     expect(socket.framesOf('state')).toEqual([]);
   });

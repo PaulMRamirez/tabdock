@@ -12,9 +12,10 @@
 // therefore sends page text only in labelled text content. This check holds
 // it there for a hostile page: a result that is a JSON object, the same
 // result by its first-class name, a tool list whose description claims the
-// relay vouches for it, and a page list whose title does the same, each on
-// 2026-07-28 and on a 2025-11-25 session, and fails if any reaches the model
-// without its [tabdock: ...] line.
+// relay vouches for it, a page list whose title does the same, and the page's
+// published state read and waited on (ADR 0040), each on 2026-07-28 and on a
+// 2025-11-25 session, and fails if any reaches the model without its
+// [tabdock: ...] line.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -23,7 +24,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
-import { untrustedHeader } from '@tabdock/protocol';
+import { pageStateHeader, untrustedHeader } from '@tabdock/protocol';
 import { createDevTokenAuth, createRelay, type DevTokenUser, type Relay } from '@tabdock/relay';
 import { privateTempRoot } from '@tabdock/relay/test/private-tmp';
 import { leakIn } from '@tabdock/relay/test/secrecy';
@@ -291,6 +292,8 @@ try {
     ],
   });
   const pageId = await attachAlice(relay, alice, sim);
+  // State the page publishes is page text too, so it carries the same hostile words (ADR 0040).
+  if (!sim.publishState({ note: HOSTILE }).ok) throw new Error('the page could not publish');
   const origin = DEFAULT_SIM_ORIGIN;
   const firstClass = `mcp__${SERVER}__${pageId}__get_note`;
   const steps: Step[] = [
@@ -323,6 +326,18 @@ try {
       input: { page: pageId, tool: 'get_text', arguments: {} },
       label: untrustedHeader(origin, 'get_text'),
       carries: 'plain words',
+    },
+    {
+      tool: `mcp__${SERVER}__get_page_state`,
+      input: { page: pageId },
+      label: pageStateHeader(origin),
+      carries: 'PAGE-TEXT',
+    },
+    {
+      tool: `mcp__${SERVER}__wait_for_page_state`,
+      input: { page: pageId, after: 0, timeoutMs: 1000 },
+      label: pageStateHeader(origin),
+      carries: 'PAGE-TEXT',
     },
   ];
   say(`Alice is attached to the sim page ${pageId} at ${origin} as a driver.`);
@@ -421,7 +436,7 @@ try {
   passed = failures === 0 && leak === null;
   say(
     passed
-      ? 'Labels check PASS: every page result, tool list and page list reached the model behind its [tabdock: ...] line, on both revisions.'
+      ? 'Labels check PASS: every page result, tool list, page list and page state reached the model behind its [tabdock: ...] line, on both revisions.'
       : 'Labels check FAIL: the lines above say which result reached the model without its label.',
   );
 } catch (error) {

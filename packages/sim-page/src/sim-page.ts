@@ -90,6 +90,13 @@ export interface SimPageOptions {
   operator?: SimOperator;
   /** Builds the page's tools; createDefaultTools by default. */
   tools?: (store: SimStore) => FakeToolDefinition[];
+  /**
+   * Test only: the state the page publishes (ADR 0040), read from its store
+   * when it boots and after each tool call that succeeds, as a page that
+   * publishes on every change would. Left out, the page publishes nothing
+   * unless a test calls publishState.
+   */
+  stateFrom?: (store: SimStore) => Record<string, unknown> | null;
   title?: string;
   /** Path part of the page's URL, '/' by default; navigate() moves the tab to another. */
   path?: string;
@@ -291,8 +298,23 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
     const context = new FakeModelContext({ profile, origin: pageOrigin });
     // Registrations last as long as the simulated page.
     const registration = new AbortController();
+    const stateFrom = options.stateFrom;
+    // A tool that succeeded publishes the store's state after it, for stateFrom.
+    const publishing = (tool: FakeToolDefinition): FakeToolDefinition =>
+      stateFrom === undefined
+        ? tool
+        : {
+            ...tool,
+            execute: async (input, executeOptions) => {
+              const result: unknown = await tool.execute(input, executeOptions);
+              current.core.dock.publishState(stateFrom(store));
+              return result;
+            },
+          };
     await Promise.all(
-      buildTools(store).map((tool) => context.registerTool(tool, { signal: registration.signal })),
+      buildTools(store).map((tool) =>
+        context.registerTool(publishing(tool), { signal: registration.signal }),
+      ),
     );
     const core = createAdapterCore({
       relayUrl: options.relayUrl,
@@ -316,6 +338,7 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
         prompts.push(pending);
       }
     });
+    if (stateFrom !== undefined) core.dock.publishState(stateFrom(store));
     core.start();
     return { core, context };
   }
