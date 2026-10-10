@@ -17,6 +17,14 @@ import {
   type RuntimeProfile,
 } from '@tabdock/sim-page';
 import { imageLine, untrustedHeader } from '@tabdock/protocol';
+import { Client as Client1102 } from 'mcp-sdk-1.10.2/client/index.js';
+import { StreamableHTTPClientTransport as Http1102 } from 'mcp-sdk-1.10.2/client/streamableHttp.js';
+import { Client as Client1123 } from 'mcp-sdk-1.12.3/client/index.js';
+import { StreamableHTTPClientTransport as Http1123 } from 'mcp-sdk-1.12.3/client/streamableHttp.js';
+import { Client as Client1240 } from 'mcp-sdk-1.24.0/client/index.js';
+import { StreamableHTTPClientTransport as Http1240 } from 'mcp-sdk-1.24.0/client/streamableHttp.js';
+import { Client as Client1320 } from 'mcp-sdk-1.32.0/client/index.js';
+import { StreamableHTTPClientTransport as Http1320 } from 'mcp-sdk-1.32.0/client/streamableHttp.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   firstText,
@@ -160,5 +168,84 @@ describe('a declared image tool for an observer, and a crafted envelope (A6.3, A
     expect(world.relay.audit.records()[0]?.image?.sha256).toBe(
       createHash('sha256').update(imageBytes(image)).digest('hex'),
     );
+  });
+});
+
+/** One v1 SDK's client and transport, behind the constructors the check needs. */
+interface V1Kit {
+  Client: new (
+    info: { name: string; version: string },
+    options: { capabilities: Record<string, unknown> },
+  ) => unknown;
+  Transport: new (url: URL, options: { requestInit: RequestInit }) => unknown;
+}
+
+/** The four v1 SDKs of A5.2's client matrix, which validate a result with schemas of their own. */
+const V1_SDKS: [string, V1Kit][] = [
+  ['1.10.2', { Client: Client1102, Transport: Http1102 }],
+  ['1.12.3', { Client: Client1123, Transport: Http1123 }],
+  ['1.24.0', { Client: Client1240, Transport: Http1240 }],
+  ['1.32.0', { Client: Client1320, Transport: Http1320 }],
+];
+
+interface V1Client {
+  connect(transport: unknown): Promise<void>;
+  callTool(request: { name: string; arguments: Record<string, unknown> }): Promise<unknown>;
+  close(): Promise<void>;
+}
+
+describe('an image part for every older SDK of the client matrix (A6.3)', () => {
+  it('parses the label block and the image whole in SDK 1.10.2, 1.12.3, 1.24.0 and 1.32.0', async () => {
+    world = await startWorld();
+    const sim = await world.page({
+      policy: { imageTools: [...IMAGE_TOOL_NAMES] },
+      ...IMAGE_TOOLS(),
+    });
+    // Each code works once, and the page hears of its successor apart from the answer.
+    const used = new Set<string>();
+    for (const [version, { Client, Transport }] of V1_SDKS) {
+      const client = new Client(
+        { name: `sdk-${version}`, version: '0.0.0' },
+        { capabilities: {} },
+      ) as V1Client;
+      await client.connect(
+        new Transport(new URL(world.relay.mcpUrl), {
+          requestInit: { headers: { Authorization: `Bearer ${world.alice.token}` } },
+        }),
+      );
+      try {
+        const state = await sim.waitFor(
+          (s) => s.link === 'linked' && s.pairing !== null && !used.has(s.pairing.code),
+        );
+        const code = state.pairing?.code ?? '';
+        used.add(code);
+        const pending = client.callTool({ name: 'pair_page', arguments: { code } });
+        const asked = sim.state.roster.some((attachment) => attachment.userId === 'alice')
+          ? null
+          : await sim.waitFor((s) => s.pendingRequests.length > 0);
+        const request = asked?.pendingRequests[0];
+        if (request !== undefined) expect(sim.dock.approve(request.requestId, 'driver')).toBe(true);
+        const paired = (await pending) as ResultContent;
+        expect(paired.isError, version).toBeFalsy();
+        const pageId = (paired.structuredContent as { page: string }).page;
+        const result = (await client.callTool({
+          name: 'call_page_tool',
+          arguments: { page: pageId, tool: 'capture', arguments: { width: 8, height: 6 } },
+        })) as ResultContent;
+        expect(result.isError, version).toBeFalsy();
+        expect(
+          result.content.map((block) => block.type),
+          version,
+        ).toEqual(['text', 'image']);
+        const image = imagePart(result);
+        if (image === null) throw new Error('no image part');
+        expect(pngDimensions(imageBytes(image)), version).toEqual({ width: 8, height: 6 });
+        expect(firstText(result).startsWith(untrustedHeader(DEFAULT_SIM_ORIGIN, 'capture'))).toBe(
+          true,
+        );
+      } finally {
+        await client.close();
+      }
+    }
   });
 });
