@@ -270,8 +270,9 @@ test('call: on the 6.0 beta a driver lists and calls tools, the object input is 
 }) => {
   const pageId = await openOnMcpb6(page);
   expect(await pairByClick(page)).toBe(pageId);
-  expect((await waitForToolCount(pageId, 6)).sort()).toEqual([
+  expect((await waitForToolCount(pageId, 7)).sort()).toEqual([
     'add_item',
+    'capture_board',
     'clear_board',
     'get_view',
     'highlight_item',
@@ -447,7 +448,7 @@ test('consequential: clear_board prompts on the page and Deny returns denied_by_
 }) => {
   const pageId = await openOnMcpb6(page);
   expect(await pairByClick(page)).toBe(pageId);
-  await waitForToolCount(pageId, 6);
+  await waitForToolCount(pageId, 7);
   // 6 keeps the demo's consequentialHint and reports all four hints, where 5.1.0 drops it.
   expect(
     await page.evaluate(async () => {
