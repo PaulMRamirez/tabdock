@@ -5,7 +5,8 @@
 // the policy a live time-boxed session narrowed (S5, ADR 0043); and every
 // setting the relay accepts is either read by the code that enforces it or
 // carries the seam marker on its default, so the Wave 3 gate sees each one
-// that is not (A6.26).
+// that is not (A6.26); and the first-class prefix is SPEC section 7's, or
+// marked until W1-B rewords it.
 
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -214,5 +215,26 @@ describe('the settings the relay accepts (plan section 2.1, A6.26)', () => {
     expect(reads('const { usersPerPage, queueDepth } = config.limits;', 'queueDepth')).toBe(true);
     expect(reads('const toolBytes = 1;', 'toolBytes')).toBe(false);
     expect(codeOutsideConfig()).not.toContain('// ');
+  });
+});
+
+describe('what SPEC says ahead of the code (docs/plans/M6.md)', () => {
+  it("gives first-class tools section 7's prefix, or marks the prefix as a seam", () => {
+    const spec = readFileSync(join(import.meta.dirname, '..', '..', '..', 'SPEC.md'), 'utf8');
+    const promised =
+      /description is the prefix `\[tabdock: tool <name> of page <page id> at <origin>; ([^`\]]+)\]`/.exec(
+        spec,
+      )?.[1];
+    const source = readFileSync(join(import.meta.dirname, '..', 'src', 'first-class.ts'), 'utf8');
+    const built = /; (this tool's [^\]]+)\] Page description: `/.exec(source)?.[1];
+    expect(promised).toMatch(/^this tool's /);
+    expect(built).toMatch(/^this tool's /);
+    const before = source
+      .slice(0, source.indexOf(built ?? ''))
+      .split('\n')
+      .slice(-4)
+      .join('\n');
+    // Equal, or the seam marker sits just above the prefix: never different and unmarked.
+    expect(built === promised || before.includes('// M6 seam: not built')).toBe(true);
   });
 });
