@@ -8,7 +8,7 @@
 // never the null the sleep left, since the adapter sends state before its
 // tools and the relay serves reads only after them. Whether Chrome's own
 // Energy Saver freezes a tab that holds the adapter's Web Lock is the
-// owner's run (docs/checklists/M6.md), which no headless browser can show.
+// owner's run (A6.7), which no headless browser can show.
 
 import { expect, test } from '@playwright/test';
 import type { DockState } from '@tabdock/adapter';
