@@ -1,7 +1,9 @@
 // ADR 0045's session record: a full record parses; every object in it is
 // strict, so a key added at any level (an argument or a result among them)
-// makes it no record; every cap and rule refuses one past it; and a reason
-// for refusing a file never repeats what the file held.
+// makes it no record; every cap and rule refuses one past it; a proposal's
+// status and an attachment's way in take every value ADRs 0042 and 0044
+// give them; and a reason for refusing a file never repeats what the file
+// held.
 
 import { describe, expect, it } from 'vitest';
 import {
@@ -255,6 +257,37 @@ describe('a session record', () => {
     expect(parses({ ...record, calls: [running] })).toBe(true);
     const pending = { ...proposal, status: 'pending', decidedAt: null, callId: null };
     expect(parses({ ...record, proposals: [pending] })).toBe(true);
+  });
+
+  it("names a proposal by ADR 0042's seven statuses and not_run, a call only when accepted", () => {
+    for (const status of [
+      'dismissed',
+      'refused',
+      'expired',
+      'withdrawn',
+      'cancelled',
+      'not_run',
+    ] as const) {
+      const ended = { ...proposal, status, callId: null };
+      expect(parses({ ...record, proposals: [ended] }), status).toBe(true);
+      expect(parses({ ...record, proposals: [{ ...ended, callId: 'c_2' }] }), status).toBe(false);
+      expect(parses({ ...record, proposals: [{ ...ended, decidedAt: null }] }), status).toBe(false);
+    }
+    for (const status of ['proposed', 'denied', 'run']) {
+      expect(parses({ ...record, proposals: [{ ...proposal, status }] }), status).toBe(false);
+    }
+  });
+
+  it("records an agent token's span as its own way in, naming the token, an invitee's only", () => {
+    const agent = { ...attachment, how: 'agent', inviteId: 'tok_1' };
+    expect(parses({ ...record, attachments: [agent] })).toBe(true);
+    for (const [what, span] of [
+      ['an agent span without its token', { ...agent, inviteId: null }],
+      ['an agent span of a member', { ...agent, user: alice }],
+      ['an approved span naming a token', { ...agent, how: 'approved' }],
+    ] as const) {
+      expect(parses({ ...record, attachments: [span] }), what).toBe(false);
+    }
   });
 
   it("names its scope as ADR 0043 does, ended by the adapter's four reasons", () => {

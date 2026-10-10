@@ -101,12 +101,18 @@ export const RecordRoleSchema = z.strictObject({
   role: z.nullable(RoleSchema),
 });
 
-/** One attachment span: who, how they came in, when they joined and left, and their roles. */
+/**
+ * One attachment span: who, how they came in, when they joined and left, and
+ * their roles. An agent token's span (ADR 0044) is its own way in, as the
+ * audit's attach record names it, and names the token in inviteId, as the
+ * agent's grant does.
+ */
 export const RecordAttachmentSchema = z
   .strictObject({
     user: RecordPersonSchema,
     pageId: IdSchema,
-    how: z.enum(['approved', 'invite', 'auto', 'unapproved']),
+    how: z.enum(['approved', 'invite', 'agent', 'auto', 'unapproved']),
+    /** The invite, or for an agent the token, that let them in; null for any other way. */
     inviteId: z.nullable(IdSchema),
     /** Attached before the record began. */
     before: z.boolean(),
@@ -122,13 +128,26 @@ export const RecordAttachmentSchema = z
     z.refine((span) => (span.leftAt === null) === (span.ended === null), {
       message: 'a span that ended has its end and how, and an open one neither',
     }),
-    z.refine((span) => (span.how === 'invite') === (span.inviteId !== null), {
-      message: 'an invite names its invite, and no other way in does',
+    z.refine(
+      (span) => (span.how === 'invite' || span.how === 'agent') === (span.inviteId !== null),
+      {
+        message: 'an invite or an agent token names itself, and no other way in does',
+      },
+    ),
+    z.refine((span) => span.how !== 'agent' || span.user.kind === 'invitee', {
+      message: "an agent token's span is an invitee's",
     }),
   );
 export type RecordAttachment = z.infer<typeof RecordAttachmentSchema>;
 
-/** One proposal (ADR 0042), never its arguments; callId links an accepted one to its run. */
+/**
+ * One proposal (ADR 0042), never its arguments; callId links an accepted one
+ * to its run. Its status is ADR 0042's seven, as get_proposal and the audit's
+ * proposal_closed name them, and not_run for one the operator accepted that
+ * never ran: the relay found it no longer allowed, or no invoke matching it
+ * came within ACCEPTED_PROPOSAL_RUN_MS. Like every status but accepted, it
+ * names no call, since none ran for it.
+ */
 export const RecordProposalSchema = z
   .strictObject({
     proposalId: IdSchema,
@@ -136,7 +155,16 @@ export const RecordProposalSchema = z
     at: EpochMsSchema,
     user: RecordPersonSchema,
     tool: ToolNameSchema,
-    status: z.enum(['pending', 'accepted', 'dismissed', 'expired', 'withdrawn']),
+    status: z.enum([
+      'pending',
+      'accepted',
+      'dismissed',
+      'refused',
+      'expired',
+      'withdrawn',
+      'cancelled',
+      'not_run',
+    ]),
     decidedAt: z.nullable(EpochMsSchema),
     callId: z.nullable(IdSchema),
   })

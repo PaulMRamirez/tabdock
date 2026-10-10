@@ -61,7 +61,7 @@ Conflicts between the M6 records, settled by the plan, that touch this one:
 
 - **C14:** the session record holds no image type or size.
 - **C18:** every M6 change to CallShape and callRule lands in one foundation commit.
-- **C26, record scope names.** RecordScopeSchema uses `endsAt` (was plannedEndAt), `maxDrivers` (was drivers), `observers` and `invites`. endedBy is 'operator', 'time', 'page_gone' or 'relay'.
+- **C26, record scope names.** RecordScopeSchema uses `endsAt` (was plannedEndAt), `maxDrivers` (was drivers), `observers` and `invites`. endedBy is 'operator', 'time', 'page_gone' or 'relay'. The foundation's review (10 October) widened the same schemas once more, since the design predates ADRs 0042 and 0044 settling: a proposal's status takes ADR 0042's seven (pending, accepted, dismissed, refused, expired, withdrawn and cancelled) and `not_run` for an acceptance that never ran, as the adapter's ProposalOutcome names them, and only `accepted` names a call; an attachment's `how` gains `agent`, which names its token in `inviteId` and is always an invitee's, as the audit's attach record does.
 
 ## Notes from the other M6 records (10 October 2026)
 
