@@ -257,6 +257,13 @@ export interface AuthPlugin {
    */
   readonly members?: MemberList | undefined;
   /**
+   * The answer to a request the relay signed in and then found a member list
+   * change had ended its user id while its body was on its way (ADR 0043): a
+   * 401 whose challenge has the client sign in again, which only the plugin
+   * can write. A plugin with `members` gives it.
+   */
+  signInAgain?(): Promise<AuthRefusal>;
+  /**
    * Set on a plugin whose credential is good only on this machine, as local
    * mode's owner token is (ADR 0022). resolveConfig refuses a plugin so
    * marked, whatever its name, with a public URL, in production or off

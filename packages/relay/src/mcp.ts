@@ -729,6 +729,13 @@ export interface McpFactoryOptions {
   refusedLine?: (userId: string) => void;
   /** The `mcp client` lines; a 2025-era session's is written when its initialize completes. */
   clientLines?: ClientLines | null;
+  /**
+   * From the same object, whether a member list change since the request
+   * signed in ended its user id (relay.ts, ADR 0043). relay.ts refuses such
+   * a request once its body is read; this is asked again as a handler
+   * starts, after the SDK's own awaits, so nothing reaches the hub under it.
+   */
+  signInEnded?: (authInfo: AuthInfo | undefined) => boolean;
 }
 
 /** The answer McpServer gave a throw in a tool handler: an isError result in the thrown words. */
@@ -779,6 +786,7 @@ export function createMcpFactory(
   const paidOnArrival = options.paidOnArrival ?? (() => undefined);
   const refusedLine = options.refusedLine ?? (() => undefined);
   const clientLines = options.clientLines ?? null;
+  const signInEnded = options.signInEnded ?? (() => false);
   const fixed = fixedEntries(config);
   const firstClassOn = config.firstClassTools;
   // One codec per relay process, its key drawn here, so a restart voids every state (ADR 0026).
@@ -862,12 +870,21 @@ export function createMcpFactory(
     /**
      * From this request's own auth, with the per-request address. sessions.ts
      * already answers 404 to anyone but a session's owner; this refuses again,
-     * so a session reached some other way still cannot act for its owner.
+     * so a session reached some other way still cannot act for its owner. A
+     * request whose user id a member list change ended since it signed in is
+     * refused too: every handler asks this before it reaches the hub, with
+     * no await between (S8, S13).
      */
     const identityOf = (ctx: ServerContext): Omit<CallerIdentity, 'client'> => {
-      const identity = identityFrom(ctx.http?.authInfo ?? authInfo);
+      const auth = ctx.http?.authInfo ?? authInfo;
+      const identity = identityFrom(auth);
       if (identity.userId !== owner.userId) {
         throw new Error('MCP request from a user other than the one this server serves');
+      }
+      if (signInEnded(auth)) {
+        throw new Error(
+          'your membership on this relay changed while this request was on its way; sign in again and send it again',
+        );
       }
       return identity;
     };

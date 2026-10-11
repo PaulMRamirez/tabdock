@@ -233,6 +233,14 @@ function indexed(entries: readonly MemberEntry[]): Map<string, User> {
 }
 
 /**
+ * How many ended user ids a list remembers for endedSince. One change ends at
+ * most about three ids per member (an old id, a subject's invitee id and a
+ * new id), so this holds a whole change of the largest list; past it the
+ * oldest are forgotten, and a request signed in before them is refused.
+ */
+export const ENDED_IDS_KEPT = 4 * MAX_MEMBERS;
+
+/**
  * The members, by subject, read live: the oauth plugin maps every request's
  * subject through it, so the request after a replace() already maps as the
  * new list says.
@@ -242,6 +250,11 @@ export class MemberList {
   #names: readonly string[];
   #userIds: ReadonlySet<string>;
   #digest: string | null;
+  #generation = 0;
+  // Each id a change ended, at the generation that change made, oldest first.
+  readonly #endedAt = new Map<string, number>();
+  // A request signed in under an older generation than this can no longer be told apart.
+  #forgottenBefore = 0;
 
   /** `digest` is the SHA-256 of the file text the entries came from, or null for a list given in code. */
   constructor(entries: readonly MemberEntry[], digest: string | null = null) {
@@ -271,6 +284,24 @@ export class MemberList {
 
   userIds(): ReadonlySet<string> {
     return this.#userIds;
+  }
+
+  /** Raised by every replace(); relay.ts keeps the one each /mcp request signed in under. */
+  get generation(): number {
+    return this.#generation;
+  }
+
+  /**
+   * Whether a change made since `generation` ended `userId`. A request that
+   * signed in under it as that id, and whose body was still on its way when
+   * the change applied, held nothing the change could end, and acts for
+   * someone the list no longer gives the id to (S8, S13). Answers true when
+   * the list no longer remembers that far back.
+   */
+  endedSince(generation: number, userId: string): boolean {
+    if (generation >= this.#generation) return false;
+    if (generation < this.#forgottenBefore) return true;
+    return (this.#endedAt.get(userId) ?? generation) > generation;
   }
 
   /**
@@ -308,6 +339,17 @@ export class MemberList {
     this.#names = [...next.values()].map((user) => user.displayName);
     this.#userIds = nowIds;
     this.#digest = digest;
+    this.#generation += 1;
+    for (const id of ended) {
+      // Deleted first, so the map stays in the order of the changes.
+      this.#endedAt.delete(id);
+      this.#endedAt.set(id, this.#generation);
+    }
+    for (const [id, at] of this.#endedAt) {
+      if (this.#endedAt.size <= ENDED_IDS_KEPT) break;
+      this.#endedAt.delete(id);
+      this.#forgottenBefore = Math.max(this.#forgottenBefore, at);
+    }
     return { ended, renamed, added, removed, total: next.size, memberNames: this.#names };
   }
 }

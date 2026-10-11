@@ -25,7 +25,9 @@ import {
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Client } from '@modelcontextprotocol/client';
+import { Readable } from 'node:stream';
+import type { Client, FetchLike } from '@modelcontextprotocol/client';
+import { type AuthInfo, createMcpHandler } from '@modelcontextprotocol/server';
 import {
   INVITEE_ID_PREFIX,
   INVITEE_SHORT_ID_CHARS,
@@ -35,12 +37,15 @@ import {
 import { afterEach, describe, expect, it } from 'vitest';
 import { startRelay as startFromEnv } from '../src/cli.ts';
 import { resolveConfig } from '../src/config.ts';
+import type { PageHub } from '../src/hub.ts';
 import {
+  createDevTokenAuth,
   createMemoryStore,
   type DevTokenUser,
   inviteeKeyOf,
   loadConfigFromEnv,
 } from '../src/index.ts';
+import { createMcpFactory } from '../src/mcp.ts';
 import { MEMBER_SESSIONS_CLOSE_MS } from '../src/relay.ts';
 import {
   attachMember,
@@ -690,6 +695,219 @@ describe('a sign-in a change ends while its request is on the way (S8)', () => {
       ['alice', 'code'],
       ['bob', 'qr'],
     ]);
+  });
+});
+
+/**
+ * A fetch for a 2026-07-28 client that sends the next tools/call naming
+ * `tool` with its headers at once and its body only when `send` is called,
+ * as a client on a slow link may: the relay signs /mcp requests in from the
+ * headers, before it reads the body. Every other request passes untouched.
+ */
+function heldMcp(
+  relayUrl: string,
+  tool: string,
+): { wrap: (base: FetchLike) => FetchLike; signedIn: Promise<void>; send: () => void } {
+  let send!: () => void;
+  const released = new Promise<void>((resolve) => {
+    send = resolve;
+  });
+  let sent!: () => void;
+  const headersSent = new Promise<void>((resolve) => {
+    sent = resolve;
+  });
+  let armed = true;
+  const wrap =
+    (base: FetchLike): FetchLike =>
+    (input, init) => {
+      const body = typeof init?.body === 'string' ? init.body : undefined;
+      if (!armed || body === undefined || !body.includes(`"name":"${tool}"`)) {
+        return base(input, init);
+      }
+      armed = false;
+      const url = new URL(String(input));
+      const headers = Object.fromEntries(new Headers(init?.headers).entries());
+      return new Promise<Response>((resolve, reject) => {
+        const req = httpRequest(
+          new URL(`${url.pathname}${url.search}`, relayUrl),
+          {
+            method: 'POST',
+            headers: {
+              ...headers,
+              host: new URL(PUBLIC_ORIGIN).host,
+              'content-length': String(Buffer.byteLength(body)),
+            },
+          },
+          (res) => {
+            resolve(
+              new Response(Readable.toWeb(res) as ReadableStream<Uint8Array>, {
+                status: res.statusCode ?? 0,
+                headers: Object.entries(res.headers).flatMap(([name, value]) =>
+                  value === undefined
+                    ? []
+                    : (Array.isArray(value) ? value : [value]).map((each): [string, string] => [
+                        name,
+                        each,
+                      ]),
+                ),
+              }),
+            );
+          },
+        );
+        req.on('error', reject);
+        req.flushHeaders();
+        sent();
+        void released.then(() => req.end(body));
+      });
+    };
+  // Long enough for the relay to take the headers and sign the request in.
+  const signedIn = headersSent.then(() => delay(300));
+  return { wrap, signedIn, send };
+}
+
+/** A call's answer, or its rejection's message, whichever it comes to. */
+async function settled(
+  pending: Promise<Awaited<ReturnType<typeof call>>>,
+): Promise<{ isError: boolean; text: string }> {
+  try {
+    return await pending;
+  } catch (error) {
+    return { isError: true, text: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+describe('a /mcp request a change ends while its body is on the way (S8, S13)', () => {
+  it('raises no pairing request under a removed member, by code', async () => {
+    const { relay, save: saveMembers } = await membersRelay([ALICE, BOB]);
+    const page = await relay.page();
+    const held = heldMcp(relay.relay.url, 'pair_page');
+    const alice = await relay.claude('sub-alice', null, true, held.wrap, true);
+    const pending = settled(call(alice, 'pair_page', { code: page.code }));
+    await held.signedIn;
+    saveMembers([BOB]);
+    expect(await relay.relay.reloadMembers()).toBe('applied');
+    held.send();
+    const outcome = await pending;
+    // The plugin's 401, so the client signs in again as the list now says.
+    expect(outcome).toEqual({
+      isError: true,
+      text: expect.stringMatching(/unauthorized/i) as unknown,
+    });
+    await page.sync();
+    expect(page.all('attach_request').map((frame) => frame.user.userId)).not.toContain('alice');
+    expect(relay.store.attachments.listForPage(page.pageId)).toEqual([]);
+    expect(linesOf(relay)).toContain('a member list change ended its sign-in');
+  });
+
+  it('redeems no invite for a removed member, leaving its use for someone else', async () => {
+    const { relay, save: saveMembers } = await membersRelay([ALICE, BOB]);
+    const page = await relay.page();
+    const bob = await relay.claude('sub-bob');
+    await attachMember(bob, page);
+    const invite = await mintOk(page, { role: 'observer', uses: 1 });
+    const held = heldMcp(relay.relay.url, 'pair_page');
+    const alice = await relay.claude('sub-alice', null, true, held.wrap, true);
+    const pending = settled(call(alice, 'pair_page', { invite: invite.link }));
+    await held.signedIn;
+    saveMembers([BOB]);
+    expect(await relay.relay.reloadMembers()).toBe('applied');
+    held.send();
+    expect((await pending).isError).toBe(true);
+    await page.sync();
+    expect(page.all('attach_request').map((frame) => frame.user.userId)).toEqual(['bob']);
+    expect((await latest(page, 'invites')).invites.map((listed) => listed.inviteId)).toEqual([
+      invite.inviteId,
+    ]);
+  });
+
+  it('runs no call under an id the file gave someone else, who attached under it meanwhile', async () => {
+    const { relay, save: saveMembers } = await membersRelay([ALICE, BOB]);
+    const page = await relay.page();
+    const held = heldMcp(relay.relay.url, 'call_page_tool');
+    const alice = await relay.claude('sub-alice', null, true, held.wrap, true);
+    await attachMember(alice, page);
+    const pending = settled(call(alice, 'call_page_tool', { page: page.pageId, tool: 'get_view' }));
+    await held.signedIn;
+    // The id alice now names Carol, who pairs under it before Alice's body arrives.
+    saveMembers(['sub-carol=alice:Carol', BOB]);
+    expect(await relay.relay.reloadMembers()).toBe('applied');
+    const carol = await relay.claude('sub-carol');
+    await attachMember(carol, page);
+    held.send();
+    expect((await pending).isError).toBe(true);
+    await page.sync();
+    expect(page.all('invoke')).toEqual([]);
+  });
+
+  it('is refused again as a tool handler starts, after the awaits between the body and the hub', async () => {
+    // relay.ts refuses such a request once its body is read; the SDK's own
+    // awaits (a request state's MAC among them) lie between that and a
+    // handler, so the dispatcher asks again before it reaches the hub.
+    const config = resolveConfig({
+      auth: createDevTokenAuth([{ userId: 'alice', displayName: 'Alice', token: 't'.repeat(32) }]),
+    });
+    const reached: string[] = [];
+    const hub = new Proxy(
+      {},
+      {
+        get(_target, key) {
+          if (key === 'then') return undefined;
+          return () => {
+            reached.push(String(key));
+            throw new Error(`the hub was reached through ${String(key)}`);
+          };
+        },
+      },
+    ) as unknown as PageHub;
+    const authInfo: AuthInfo = {
+      token: '',
+      clientId: 'alice',
+      scopes: [],
+      extra: {
+        userId: 'alice',
+        displayName: 'Alice',
+        kind: 'member',
+        email: null,
+        oauthClientId: null,
+      },
+    };
+    const handler = createMcpHandler(
+      createMcpFactory(hub, config, { signInEnded: (auth) => auth === authInfo }),
+    );
+    try {
+      const response = await handler.fetch(
+        new Request('http://localhost/mcp', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json, text/event-stream',
+            'Mcp-Protocol-Version': '2026-07-28',
+            'Mcp-Method': 'tools/call',
+            'Mcp-Name': 'pair_page',
+          },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'tools/call',
+            params: {
+              name: 'pair_page',
+              arguments: { code: 'ABCD-EFGH' },
+              _meta: {
+                'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+                'io.modelcontextprotocol/clientInfo': { name: 'x', version: '1' },
+                'io.modelcontextprotocol/clientCapabilities': {},
+              },
+            },
+          }),
+        }),
+        { authInfo },
+      );
+      const text = await response.text();
+      expect(text).toContain('your membership on this relay changed');
+      expect(reached).toEqual([]);
+    } finally {
+      await handler.close();
+    }
   });
 });
 

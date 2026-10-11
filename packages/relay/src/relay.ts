@@ -137,6 +137,20 @@ import { type AuditLog, callRecords, createMemoryStore, recordAudit } from './st
  */
 export const MEMBER_SESSIONS_CLOSE_MS = 1000;
 
+/**
+ * A bare sign-in challenge, for a request a member list change ended on its
+ * way when the plugin writes none of its own (AuthPlugin.signInAgain).
+ */
+const SIGN_IN_AGAIN: AuthRefusal = {
+  kind: 'refused',
+  status: 401,
+  reason: 'membership changed',
+  body: 'Unauthorized',
+  headers: { 'WWW-Authenticate': 'Bearer' },
+  accountKind: null,
+  oauthClientId: null,
+};
+
 export interface Relay {
   /** http://127.0.0.1:<port> */
   readonly url: string;
@@ -662,6 +676,35 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   // Whether each 2026-07-28 request spent its budget as it arrived, under the
   // same key, so the dispatcher neither spends again nor serves one past it.
   const paidOnArrival = new WeakMap<AuthInfo, boolean>();
+  // The member list generation each /mcp request signed in under, by the
+  // same key. A change ends what is held under an id it takes away, and a
+  // request whose body is still on its way holds nothing yet, so the request
+  // is held to the list it signed in under once it can act (S8, S13).
+  const signedInUnder = new WeakMap<AuthInfo, number>();
+  /** Whether a member list change since this request signed in ended its user id. */
+  const signInEnded = (authInfo: AuthInfo | undefined): boolean => {
+    if (members === null || authInfo === undefined) return false;
+    const generation = signedInUnder.get(authInfo);
+    const userId = userIdOf(authInfo);
+    return generation !== undefined && userId !== null && members.endedSince(generation, userId);
+  };
+  /**
+   * The answer to such a request: the plugin's challenge, so the client signs
+   * in again and its retry maps as the list now says, with one line a window
+   * naming the user id alone.
+   */
+  const endedSignIn = async (userId: string | null): Promise<Response> => {
+    mcpLines.write('info', 'mcp request refused: a member list change ended its sign-in', {
+      userId,
+    });
+    const answer: unknown = await auth.signInAgain?.().catch(() => null);
+    const parsed = AuthOutcomeSchema.safeParse(answer);
+    const refusal =
+      parsed.success && parsed.data.kind === 'refused' && parsed.data.status === 401
+        ? parsed.data
+        : SIGN_IN_AGAIN;
+    return new Response(refusal.body, { status: refusal.status, headers: refusal.headers });
+  };
   const refusedLine = (userId: string): void => {
     mcpLines.write('warn', 'mcp request refused: past the request budget', { userId });
   };
@@ -674,6 +717,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     paidOnArrival: (authInfo) => (authInfo === undefined ? undefined : paidOnArrival.get(authInfo)),
     refusedLine,
     clientLines,
+    signInEnded,
   });
   /**
    * A strict 2026-07-28 handler. One serves every request but a listen; each
@@ -892,6 +936,15 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         }
         heldBytes.set(options.authInfo, charge);
       }
+      // After the body, which a client may hold back for minutes: a change
+      // to the member list since this request signed in may have ended its
+      // user id, and then nothing is done under it on either leg (S8, S13).
+      // The dispatcher checks again before a tool acts (mcp.ts), since the
+      // SDK's own awaits lie between here and there.
+      if (signInEnded(options?.authInfo)) {
+        await request.body?.cancel().catch(() => undefined);
+        return endedSignIn(userIdOf(options?.authInfo));
+      }
       const legacy = await isLegacyRequest(request, undefined, {
         maxRequestBodySize: MAX_MCP_BODY_BYTES,
       });
@@ -1032,6 +1085,10 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       send(response, 403, 'This relay serves only clients on its own machine');
       return;
     }
+    // Taken before the plugin maps the subject, so a change made while the
+    // request signs in counts as made after it: at worst a member the change
+    // added is asked to sign in again once (signInEnded).
+    const generation = members?.generation ?? null;
     const outcome = await authenticate(request, response);
     if (outcome === null) return;
     const refuse = (refusal: AuthRefusal): void => {
@@ -1067,6 +1124,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     const withAuth = request as IncomingMessage & { auth?: AuthInfo };
     withAuth.auth = authInfo;
     nodeResponses.set(authInfo, response);
+    if (generation !== null) signedInUnder.set(authInfo, generation);
     // Until it finishes or closes: one the client leaves unread is cut off
     // (ADR 0030), and one queued on a connection that closes is ended with it.
     stalls.track(response, outcome.user.userId, request.socket);

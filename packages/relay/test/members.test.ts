@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { INVITEE_ID_PREFIX, MAX_MEMBERS, MAX_MEMBERS_FILE_BYTES } from '@tabdock/protocol';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  ENDED_IDS_KEPT,
   inviteeKeyOf,
   joinChanges,
   type MemberChange,
@@ -188,6 +189,55 @@ describe('MemberList.replace (ADR 0043, S8, S13)', () => {
     const change = list.replace([BOB, ALICE], 'd2');
     expect(change.ended.size).toBe(0);
     expect(change.renamed.size).toBe(0);
+  });
+
+  it('says which ids a change since a generation ended, for a request signed in under it', () => {
+    const list = new MemberList([ALICE, BOB]);
+    const before = list.generation;
+    expect(list.endedSince(before, 'bob')).toBe(false);
+    list.replace([ALICE], null);
+    const afterRemoval = list.generation;
+    expect(afterRemoval).toBeGreaterThan(before);
+    expect(list.endedSince(before, 'bob')).toBe(true);
+    expect(list.endedSince(before, 'alice')).toBe(false);
+    // Signed in after the change, Bob's request is his own new identity's.
+    expect(list.endedSince(afterRemoval, 'bob')).toBe(false);
+    // An unchanged list still raises the generation, and ends nobody.
+    list.replace([ALICE], null);
+    expect(list.endedSince(afterRemoval, 'alice')).toBe(false);
+    // The id alice handed to another subject ends for requests signed in before.
+    const beforeMove = list.generation;
+    list.replace([{ sub: 's-other', userId: 'alice', displayName: 'Alice' }], null);
+    expect(list.endedSince(beforeMove, 'alice')).toBe(true);
+    expect(list.endedSince(before, 'alice')).toBe(true);
+  });
+
+  it('remembers a bounded number of ended ids, refusing what it forgot', () => {
+    const list = new MemberList([ALICE]);
+    const start = list.generation;
+    const members = (from: number): { sub: string; userId: string; displayName: string }[] =>
+      Array.from({ length: MAX_MEMBERS }, (_, i) => ({
+        sub: `s-${String(from + i)}`,
+        userId: `u${String(from + i)}`,
+        displayName: `U${String(from + i)}`,
+      }));
+    // Each whole new list ends the old ids, the new subjects' invitee ids and the new ids.
+    list.replace(members(0), null);
+    const middle = list.generation;
+    list.replace(members(MAX_MEMBERS), null);
+    list.replace(members(2 * MAX_MEMBERS), null);
+    // ENDED_IDS_KEPT is far short of what three such changes end, so the
+    // first change's ids are forgotten and a request from before it refused,
+    // whoever it names.
+    expect(ENDED_IDS_KEPT).toBeLessThan(3 * 3 * MAX_MEMBERS);
+    expect(list.endedSince(start, 'nobody-ever')).toBe(true);
+    // One signed in after the last change is never refused.
+    expect(list.endedSince(list.generation, 'u0')).toBe(false);
+    // The latest change's ids are still known.
+    const late = list.generation - 1;
+    expect(list.endedSince(late, `u${String(2 * MAX_MEMBERS)}`)).toBe(true);
+    expect(list.endedSince(late, 'nobody-ever')).toBe(false);
+    expect(middle).toBeLessThan(late);
   });
 });
 

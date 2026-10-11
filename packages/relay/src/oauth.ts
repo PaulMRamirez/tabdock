@@ -730,6 +730,15 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
     routes: new Map([[new URL(resourceMetadataUrl).pathname, metadataRoute]]),
     browserSignIn: { provider: () => provider, accountOf, userOf },
     members,
+    // The token itself is sound: the client signs in again and its next
+    // request maps its subject as the list now says.
+    signInAgain: () =>
+      challenge(
+        new OAuthError(
+          OAuthErrorCode.InvalidToken,
+          'Membership on this relay changed while the request was on its way',
+        ),
+      ),
 
     async start(context) {
       log = context.log;
