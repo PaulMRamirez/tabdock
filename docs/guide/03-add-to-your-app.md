@@ -11,7 +11,7 @@ Tools live on `document.modelContext`, only in a secure context (https, or http 
 ```ts
 import { initializeWebMCPPolyfill } from '@mcp-b/webmcp-polyfill';
 
-initializeWebMCPPolyfill(); // the 6.0 beta exports installWebMCP() instead
+initializeWebMCPPolyfill(); // on 6.0.0, call installWebMCP() instead: importing it installs nothing
 ```
 
 Without a bundler, load the package's `dist/index.iife.js` in a classic script tag before the adapter; it installs itself. The adapter looks for `document.modelContext` once, at `attach()`; if it is missing, the adapter logs how to add a polyfill, puts that text in `state.error` and stays idle.
