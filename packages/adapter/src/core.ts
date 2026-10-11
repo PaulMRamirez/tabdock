@@ -108,8 +108,17 @@ import {
   withinCeiling,
 } from '@tabdock/protocol';
 import * as z from 'zod/mini';
-import { NOOP_RECORDER, type Recorder, type RecordView, type RecordWhich } from './record.ts';
-import { apply } from './taken.ts';
+import {
+  createRecorder,
+  NOOP_RECORDER,
+  type RecordContext,
+  type Recorder,
+  type RecordHandle,
+  type RecordView,
+  type RecordWayIn,
+  type RecordWhich,
+} from './record.ts';
+import { apply, type Taken } from './taken.ts';
 import {
   isConsequential,
   isReadOnly,
@@ -1051,6 +1060,8 @@ interface CallRecord {
   } | null;
   /** The accepted proposal this call ran under, bound once from this page's own record (ADR 0042). */
   proposal: HeldProposal | null;
+  /** Where the session record keeps this call (ADR 0045), so each change to its line reaches it. */
+  readonly recorded: RecordHandle;
 }
 
 /** This page's own record of a proposal (ADR 0042), in memory only. */
@@ -1575,8 +1586,56 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    * hides when the handler really ends, which the write queue must know.
    */
   const abortReachesHandlers = polyfillMarker !== true;
-  // M6 seam: not built
-  const recorder = options.recorder ?? NOOP_RECORDER;
+  /** The relay's host alone, which a saved session record names (ADR 0045). */
+  const relayHost = new URL(options.relayUrl).host.slice(0, 300);
+  /**
+   * The session record (ADR 0045) is advisory, so every hook the core calls
+   * goes through this guard (decision 22): the first throw stops the record,
+   * logged once by its class alone, and the no-op recorder takes every later
+   * hook, so the call, decision or link it was told of goes on exactly as it
+   * would have. Its views then show one failed record, which the widget
+   * offers no Save for, saying the audit log keeps every call.
+   */
+  let keeper: Recorder = options.recorder ?? createRecorder();
+  let recordStopped: readonly RecordView[] | null = null;
+  const recorder = Object.freeze(
+    Object.fromEntries(
+      Object.keys(NOOP_RECORDER).map((hook) => [
+        hook,
+        (...args: unknown[]): unknown => {
+          const run = (held: Recorder): unknown =>
+            apply((held as unknown as Record<string, Taken>)[hook] as Taken, held, args);
+          try {
+            return run(keeper);
+          } catch (error) {
+            keeper = NOOP_RECORDER;
+            recordStopped ??= Object.freeze([
+              Object.freeze({
+                which: 'current' as const,
+                scope: 'page' as const,
+                label: null,
+                from: clock(),
+                to: null,
+                calls: 0,
+                people: 0,
+                emails: 0,
+                proposals: 0,
+                dropped: 0,
+                failed: true,
+              }),
+            ]);
+            log.warn(`session record stopped: ${errorParts(error).name}`);
+            return run(NOOP_RECORDER);
+          }
+        },
+      ]),
+    ) as unknown as Recorder,
+  );
+  /** The records as DockState shows them: the failed one once a fault, even in views, stopped them. */
+  const recordViews = (): readonly RecordView[] => {
+    const views = recorder.views();
+    return recordStopped ?? views;
+  };
 
   let state: DockState = Object.freeze({
     link: 'idle',
@@ -1609,7 +1668,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     agents: [],
     agentsOffered: null,
     seatLimits: null,
-    records: recorder.views(),
+    records: recordViews(),
   });
   const listeners = new Set<(state: DockState) => void>();
 
@@ -1723,7 +1782,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
 
   function setState(patch: Partial<DockState>): void {
     const next = { ...state, ...patch };
-    state = Object.freeze({ ...next, pageRoles: rolesFor(next.roster) });
+    state = Object.freeze({ ...next, pageRoles: rolesFor(next.roster), records: recordViews() });
     for (const listener of [...listeners]) {
       try {
         listener(state);
@@ -1731,6 +1790,11 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         log.error(`a state listener threw: ${describe(error)}`);
       }
     }
+  }
+
+  /** Shows the records again after a hook, telling listeners only when a count or a time changed. */
+  function noteRecords(): void {
+    if (recordViews() !== state.records) setState({});
   }
 
   // Storage can throw (blocked cookies, sandboxed frames); the link still works without it.
@@ -2233,6 +2297,15 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       seatLimits: seatLimitsOf(frame.limits),
     });
     log.info(frame.resumed ? `resumed page ${frame.pageId}` : `linked as page ${frame.pageId}`);
+    // A new page session seals the page record and a resumed one keeps it (ADR 0045, decision 5).
+    recorder.pageSession(frame.pageId, frame.resumed, clock());
+    // A session the relay has listed, which a reload or a resumed link left
+    // running, goes on in a record of its own from here, with everyone
+    // listed now there from its start. A start the relay has not answered
+    // waits for its session frame: refused, or never heard, it never ran.
+    const running = sessionView();
+    if (running !== null && session?.listed === true) recorder.sessionStarted(running);
+    recordRoster(frame.roster);
     for (const userId of revoked) send({ t: 'revoke', userId });
     takeLock(frame.pageId);
     lastToolsKey = null;
@@ -2271,6 +2344,54 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     );
     setState({ roster: attachments, observerSeats: [...seats, ...kept] });
     proposalsRoster();
+    recordRoster(attachments);
+  }
+
+  /**
+   * The roster as the session record keeps it, with the roles this page
+   * enforces and how its own grants let each one in, never the relay's word:
+   * an agent by the label its token has here, as the widget names it (ADR 0044).
+   */
+  function recordRoster(attachments: readonly AttachmentView[]): void {
+    recorder.roster(
+      attachments.map((attachment) => ({
+        ...attachment,
+        displayName: agentName(attachment.userId) ?? attachment.displayName,
+      })),
+      state.pageRoles,
+      wayIn,
+      clock(),
+    );
+    noteRecords();
+  }
+
+  /** How the page let a listed user in, by its own grant: an invite's, an agent token's, the operator's, autoApprove's, or none. */
+  function wayIn(userId: string): RecordWayIn {
+    const grant = grants.get(userId);
+    const inviteId = grant?.inviteId ?? null;
+    return {
+      how:
+        inviteId !== null
+          ? agentRecords.has(inviteId)
+            ? 'agent'
+            : 'invite'
+          : grant
+            ? 'approved'
+            : policy.autoApprove === 'observer' && !isInvitee(userId)
+              ? 'auto'
+              : 'unapproved',
+      inviteId,
+    };
+  }
+
+  /**
+   * An agent as this page names it (ADR 0044): by the label its token has in
+   * this page's own record, never the relay's word; null for anyone else.
+   */
+  function agentName(userId: string): string | null {
+    const tokenId = grants.get(userId)?.inviteId;
+    const agent = tokenId === undefined ? undefined : agentRecords.get(tokenId);
+    return agent === undefined ? null : `agent "${agent.label}"`;
   }
 
   /**
@@ -2395,6 +2516,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   /** Everything tied to one socket ends with it; the relay answers waiting callers itself. */
   function tearDownLink(): void {
     welcomed = false;
+    // Should the next welcome start a new page session, everyone left when the link went.
+    recorder.linkLost(clock());
     for (const handle of [watchdogTimer, pollTimer, syncTimer]) timers.clearTimeout(handle);
     watchdogTimer = null;
     pollTimer = null;
@@ -2600,7 +2723,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     const entry: ActivityEntry = Object.freeze({
       callId: frame.callId,
       time: now,
-      user: Object.freeze({ userId, displayName }),
+      // An agent by its token's label here, in the log as in the roster (ADR 0044, S7).
+      user: Object.freeze({ userId, displayName: agentName(userId) ?? displayName }),
       client: client === null ? null : Object.freeze({ ...client }),
       tool: frame.tool,
       outcome: 'running',
@@ -2623,6 +2747,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       deadline: null,
       confirm: null,
       proposal,
+      // Every call the page accepted, past the checks above (ADR 0045, decision 16).
+      recorded: recorder.call(entry, state.pageId ?? ''),
     };
     calls.set(frame.callId, call);
     setState({ activity: [entry, ...state.activity].slice(0, ACTIVITY_LIMIT) });
@@ -2664,12 +2790,17 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     log.info(`call ${callId} ${tool} by ${logName(caller)} (${caller.role}): ${outcome}`);
   }
 
+  /**
+   * The call's line changes in the session record always, and in the
+   * activity log while it is still there: a call fifty newer ones pushed out
+   * of the log still ends in the record (ADR 0045).
+   */
   function updateEntry(call: CallRecord, patch: Partial<ActivityEntry>): void {
     const index = state.activity.indexOf(call.entry);
-    // Gone when fifty newer calls have pushed it out.
+    call.entry = Object.freeze({ ...call.entry, ...patch });
+    recorder.update(call.recorded, call.entry);
     if (index === -1) return;
     const activity = [...state.activity];
-    call.entry = Object.freeze({ ...call.entry, ...patch });
     activity[index] = call.entry;
     setState({ activity });
   }
@@ -2897,6 +3028,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     // refused above all the same.
     const accepted = rule === 'confirm' && call.proposal !== null;
     if (accepted) {
+      recorder.confirmedOnPage(call.recorded);
       logCall(
         call,
         `accepted on the page as proposal ${call.proposal?.view.proposalId ?? ''}, so the page did not ask again`,
@@ -3091,7 +3223,9 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       });
     }
     // The operator may have lowered this caller's role while the prompt was up.
-    return allowed && checkedAgain(call, snapshot);
+    const confirmed = allowed && checkedAgain(call, snapshot);
+    if (confirmed) recorder.confirmedOnPage(call.recorded);
+    return confirmed;
   }
 
   /** check() once more after an await, since the roster, grants and tools may have changed. */
@@ -3763,6 +3897,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     // Barred first, so nothing below can let them back in by it.
     if (!everyone) bar(target, theirs);
     for (const userId of listed) revoked.add(userId);
+    // Their spans close as revoked once the relay's roster drops them.
+    recorder.revoking(target);
     for (const userId of granted) grants.delete(userId);
     // Whatever they were asked for, nothing is announced for someone revoked.
     for (const userId of [...askedDriver.keys()].filter(hits)) askedDriver.delete(userId);
@@ -3938,11 +4074,9 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     }
   }
 
-  // M6 seams (plan section 2.6). Each stub below does nothing, or answers a
-  // refusal, until the workstream that owns it fills it in; the marker on each
-  // is what tests/e2e/test/m6-seams.test.ts looks for, so none ships unbuilt.
-  // Each has its final signature, so the call sites above and the handle
-  // below stay as they are when its body comes.
+  // The M6 parts (plan section 2.6), each built by its workstream behind the
+  // signature the foundation gave it, so the call sites above and the handle
+  // below kept their shape as each body came.
 
   // Page state (ADR 0040). The page's latest value is kept as canonical
   // text, and at most one state frame goes out each STATE_MIN_INTERVAL_MS:
@@ -4282,8 +4416,9 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       Math.max(0, held.view.expiresAt - now),
     );
     proposals.set(proposalId, held);
-    showProposals();
+    // Told first, so the state this shows counts it; never its arguments (ADR 0045, decision 25).
     if (state.pageId !== null) recorder.proposal(held.view, state.pageId);
+    showProposals();
     log.info(`${named}: waiting for the operator`);
   }
 
@@ -4306,9 +4441,9 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       callId,
       time: clock(),
     });
+    recorder.proposalSettled(entry);
     setState({ proposalLog: [entry, ...state.proposalLog].slice(0, ACTIVITY_LIMIT) });
     showProposals();
-    recorder.proposalSettled(entry);
     log.info(`proposal ${proposalId} ${tool} by ${logName(proposer)}: ${outcome}`);
   }
 
@@ -4562,6 +4697,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       kept.lengthMs = lengthMs;
       kept.endsAt = Math.min(clock() + live.remainingMs, kept.startedAt + lengthMs);
       if (withinCeiling(effective(), live.policy)) kept.policy = { ...live.policy };
+      kept.listed = true;
       if (starting?.sessionId === kept.sessionId) starting.answer(null);
       armSessionEnd();
       demoteBeyond(effective().maxDrivers);
@@ -5219,11 +5355,32 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     return true;
   }
 
-  // The session record (ADR 0045)
-  // M6 seam: not built
-  const sessionRecord: Dock['sessionRecord'] = () => null;
-  // M6 seam: not built
-  const discardRecord: Dock['discardRecord'] = () => false;
+  // The session record (ADR 0045): what the widget saves, and what a host
+  // with ui: false reads. Checked at run time, since a page script can pass anything.
+
+  const recordSlots: readonly unknown[] = ['current', 'previous', 'ended'];
+
+  /** What a saved record says of its page, read only as one is saved. */
+  function recordContext(): RecordContext {
+    const split = address.indexOf('/', address.indexOf('//') + 2);
+    return {
+      adapterVersion: options.adapterVersion.slice(0, 50),
+      origin: split < 0 ? address : address.slice(0, split),
+      path: split < 0 ? '' : address.slice(split),
+      title: options.pageInfo().title,
+      relay: relayHost,
+      policy,
+    };
+  }
+
+  const sessionRecord: Dock['sessionRecord'] = (which = 'current') =>
+    recordSlots.includes(which) ? recorder.snapshot(which, recordContext(), clock()) : null;
+
+  const discardRecord: Dock['discardRecord'] = (which) => {
+    const dropped = recordSlots.includes(which) && recorder.discard(which, clock());
+    noteRecords();
+    return dropped;
+  };
 
   // Public surface
 
@@ -5274,6 +5431,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       writeToken(null);
       clearGrants();
     }
+    // Memory only (decision 13): the records go with the page's link, whichever way it closed.
+    recorder.dropAll();
     stopForGood(null);
   }
 

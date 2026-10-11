@@ -6,8 +6,9 @@
 // it). A record holds names the operator's own screen already showed, in
 // memory only, and never arguments, results, images, page state or secrets:
 // each hook copies named fields, never a frame or an entry whole, so nothing
-// added to those later reaches a record unnoticed. NOOP_RECORDER keeps
-// nothing; CoreOptions.recorder lets a test hand the core a recorder of its own.
+// added to those later reaches a record unnoticed. The core keeps one made
+// by createRecorder and stops it for NOOP_RECORDER, which keeps nothing, at
+// the first fault; CoreOptions.recorder lets a test hand it one of its own.
 
 import {
   type AttachmentView,
@@ -75,8 +76,14 @@ export interface RecordView {
   readonly to: number | null;
   readonly calls: number;
   readonly people: number;
-  /** How many of those people are invitees, whose names are emails (ADR 0017). */
-  readonly invitees: number;
+  /**
+   * How many of those people it names by an email address: an invitee's
+   * verified email (ADR 0017), or any name holding one. Not every invitee:
+   * an unverified one, one renamed `invitee <short id>` and an agent
+   * (ADR 0044) carry none. Told by the '@' every address holds, which a
+   * name cut short past the name cap keeps.
+   */
+  readonly emails: number;
   readonly proposals: number;
   /** Calls, spans and proposals the caps pushed out, so a capped record never passes for a whole one. */
   readonly dropped: number;
@@ -134,7 +141,7 @@ export interface Recorder {
    * operator extends it, it takes the session's new end and settings.
    */
   sessionStarted(session: SessionView): void;
-  /** It ended: its record is sealed into `ended` and a page-scope record starts again. */
+  /** It ended: its record, if it holds anything, is sealed into `ended`, and a page-scope record starts again. */
   sessionEnded(ended: SessionEnded): void;
   /** The records held now, the same frozen list until a count changes. */
   views(): readonly RecordView[];
@@ -148,7 +155,10 @@ export interface Recorder {
 
 const NO_VIEWS: readonly RecordView[] = Object.freeze([]);
 
-/** A recorder that keeps nothing, so a record is never more than ADR 0045's own recorder makes it. */
+/**
+ * A recorder that keeps nothing: what the core asks once a fault stopped the
+ * record (decision 22), and the list of hooks its guard wraps.
+ */
 export const NOOP_RECORDER: Recorder = Object.freeze({
   pageSession: () => undefined,
   linkLost: () => undefined,
@@ -285,7 +295,8 @@ export function createRecorder(): Recorder {
       open: new Map(),
       base: next,
       seen: new Set(),
-      carry: false,
+      // A session a reload resumed takes over before the first roster, so who is listed was here before.
+      carry: carry?.carry === true,
     };
     for (const [userId, span] of carry?.open ?? []) {
       kept.seen.add(span.user);
@@ -334,15 +345,37 @@ export function createRecorder(): Recorder {
   }
 
   /**
-   * Seals a record that holds anything into its slot, so an empty one never
-   * replaces a kept one. It ends no earlier than it began or than anything
-   * it holds was decided, so every time it holds lies within its span.
+   * The latest time a record holds. The core tells of a session only once
+   * the relay has listed it (on this link, or on one before a reload), after
+   * a round trip in which calls, role changes and decisions may land, so a
+   * record sealed then ends after them, never at the session's start before them.
+   */
+  function latest(kept: Kept): number {
+    let at = kept.from;
+    const see = (time: number | null): void => {
+      if (time !== null && time > at) at = time;
+    };
+    for (const call of kept.calls) see(call.at);
+    for (const span of kept.spans) {
+      see(span.joinedAt);
+      see(span.leftAt);
+      for (const role of span.roles) see(role.at);
+    }
+    for (const proposal of kept.proposals) see(proposal.decidedAt);
+    return at;
+  }
+
+  /** Whether a record holds anything: an empty one never replaces a kept one, which may not be saved yet. */
+  const holds = (kept: Kept): boolean =>
+    kept.spans.length + kept.calls.length + kept.proposals.length + kept.dropped.calls > 0;
+
+  /**
+   * Seals a record that holds anything into its slot. It ends no earlier
+   * than anything it holds, so every time it holds lies within its span.
    */
   function seal(kept: Kept, at: number): void {
-    if (kept.spans.length + kept.calls.length + kept.proposals.length + kept.dropped.calls === 0) {
-      return;
-    }
-    kept.to = Math.max(at, kept.from, ...kept.proposals.map((proposal) => proposal.decidedAt ?? 0));
+    if (!holds(kept)) return;
+    kept.to = Math.max(at, latest(kept));
     if (kept.scope.kind === 'page') previous = kept;
     else ended = kept;
   }
@@ -552,8 +585,10 @@ export function createRecorder(): Recorder {
         kept.scope = scope;
         return;
       }
-      seal(kept, session.startedAt);
-      start(begin(scope, session.startedAt, kept));
+      // From its start, or after whatever the page record took in before the relay listed it.
+      const at = Math.max(session.startedAt, latest(kept));
+      seal(kept, at);
+      start(begin(scope, at, kept));
     },
 
     sessionEnded(end) {
@@ -568,8 +603,8 @@ export function createRecorder(): Recorder {
         // first and with it everyone, so no one carries into the page record.
         close(kept, lostAt, () => 'page_session_ended');
       }
-      kept.to = Math.max(end.time, kept.from);
-      ended = kept;
+      kept.to = Math.max(end.time, latest(kept));
+      if (holds(kept)) ended = kept;
       start(begin({ kind: 'page' }, kept.to, kept));
     },
 
@@ -586,7 +621,7 @@ export function createRecorder(): Recorder {
           to: kept.to,
           calls: kept.calls.length,
           people: kept.seen.size,
-          invitees: [...kept.seen].filter((named) => named.kind === 'invitee').length,
+          emails: [...kept.seen].filter((named) => named.name.includes('@')).length,
           proposals: kept.proposals.length,
           dropped: dropped.calls + dropped.attachments + dropped.proposals,
           failed: false,

@@ -6,11 +6,15 @@
 // after M6's foundation and 136,645 once the protocol named its one side
 // effect; a dependency or a locale that creeps back in fails
 // here before a release ships it. ADR 0048's per-wave checkpoints are
-// recorded in docs/plans/M6.md at each wave's merge.
+// recorded in docs/plans/M6.md at each wave's merge, and the session
+// record's modules are held to their own budget from the build's metafile.
 
 import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
-import { scriptTagBytes } from '../../../packages/adapter/scripts/script-tag-build.ts';
+import {
+  scriptTagBytes,
+  scriptTagModuleBytes,
+} from '../../../packages/adapter/scripts/script-tag-build.ts';
 import { SCRIPT_TAG_LIMIT_BYTES } from '../../../scripts/release-check.ts';
 
 describe('the adapter script-tag build', () => {
@@ -42,6 +46,31 @@ describe('the adapter script-tag build', () => {
       ),
     ).toBe(decided);
   });
+
+  // The record's modules as built (decision 23): each must be in the file,
+  // so a record left unwired cannot pass for a small one, and together they
+  // stay under the budget ADR 0045 decides, read from the ADR itself.
+  it("holds the session record's modules to their own budget", async () => {
+    const adr = await readFile(
+      new URL('../../../docs/adr/0045-session-record-for-the-operator.md', import.meta.url),
+      'utf8',
+    );
+    const budget = Number(
+      /^23\. \*\*Budget:\*\* at most ([\d,]+) bytes/m.exec(adr)?.[1]?.replace(/,/g, ''),
+    );
+    expect(budget).toBe(13_000);
+    const built = await scriptTagModuleBytes();
+    const bytes = [
+      'packages/protocol/src/session-record.ts',
+      'packages/adapter/src/record.ts',
+      'packages/adapter/src/record-markdown.ts',
+    ].map((module) => {
+      const found = [...built].find(([path]) => path.endsWith(module));
+      expect(found?.[1] ?? 0, module).toBeGreaterThan(0);
+      return found?.[1] ?? 0;
+    });
+    expect(bytes.reduce((sum, each) => sum + each, 0)).toBeLessThan(budget);
+  }, 60_000);
 
   // Importing any schema must still run zod-config.ts, in the workspace's
   // sources and in the published dist alike; every other protocol module is

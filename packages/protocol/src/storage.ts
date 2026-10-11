@@ -105,8 +105,10 @@ export type StoredInvites = z.infer<typeof StoredInvitesSchema>;
  * The page's time-boxed session (ADR 0043), so a reload within the resume
  * window picks it up again: its label (page text, shown only here and as its
  * invites' label), its times on the page's clock, its policy, how many
- * watchers it was sized for and the invites it minted. Never an invite's link
- * or secret: a strict object, so a record holding one is no record.
+ * watchers it was sized for, the invites it minted, and whether the relay
+ * has listed it, so a reload tells a start it confirmed from one it never
+ * answered (ADR 0045's session record). Never an invite's link or secret: a
+ * strict object, so a record holding one is no record.
  */
 export const StoredSessionSchema = z.strictObject({
   pageId: IdSchema,
@@ -118,6 +120,7 @@ export const StoredSessionSchema = z.strictObject({
   policy: SessionPolicySchema,
   observers: z.number().check(z.int(), z.gte(0), z.lte(MAX_OBSERVERS_PER_PAGE)),
   inviteIds: z.array(IdSchema).check(z.maxLength(MAX_LIVE_INVITES_PER_PAGE)),
+  listed: z.optional(z.boolean()),
 });
 export type StoredSession = z.infer<typeof StoredSessionSchema>;
 

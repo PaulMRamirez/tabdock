@@ -47,6 +47,10 @@
 // trusted-page rule (SPEC.md section 2) covers all of this, since such a
 // script can run the page's tools itself; docs/threat-model.md (B5) records
 // it.
+// From M6 the panel also saves the session record (ADR 0045). It leaves the
+// page only on a trusted click in an armed box that says whom it names, as a
+// file through the Blob, object URL and click dom.ts took at mount, never
+// unasked; the page itself, and scripts before attach(), stay trusted.
 // Buttons carry stable data-action attributes, and blocks data-role ones, for
 // browser tests and the testing helper; widget-names.ts lists every name.
 
@@ -89,6 +93,12 @@ import type {
 import { sessionSeats } from './core.ts';
 import { type BoxRect, takeDom } from './dom.ts';
 import { createQrView, inviteQrUrl, QR_SIDE_PX } from './qr.ts';
+import {
+  sessionRecordFileName,
+  sessionRecordJson,
+  sessionRecordMarkdown,
+} from './record-markdown.ts';
+import type { RecordView, RecordWhich } from './record.ts';
 import { apply, taken } from './taken.ts';
 import { HOST_TAG, type WidgetAction, type WidgetRole } from './widget-names.ts';
 
@@ -215,8 +225,8 @@ const AGENT_STATES = {
   asking: 'asking now',
   attached: 'attached',
 } as const;
-/** The session record's block and its offer (ADR 0045). */
-const RECORD_STYLE = '';
+/** The session record's choices, one to a line so a long one wraps at phone width (ADR 0045). */
+const RECORD_STYLE = '.col { flex-direction: column; }';
 
 const STYLE = `
 :host { all: initial; position: fixed; right: 16px; bottom: 16px; z-index: 2147483647;
@@ -2540,9 +2550,223 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     );
     return box;
   }
-  // M6 seam: not built
+  // The session record (ADR 0045): what the current record holds, Save
+  // record to open the box that saves one, and the offer of a session's
+  // record at its end. Each Save sits in an armed box beside a warning that
+  // says whom the file names, and the offer and the box are never on show
+  // together, so each Save is the only one of its name.
+  const recordSummary = element('p', 'muted');
+  role(recordSummary, 'record-summary');
+  const recordOpen = button('Save record', 'record-open', () => {
+    showRecordBox(recordBox === null);
+    render(dock.state);
+  });
+  dom.append(recordBlock, element('div', 'label', 'Session record'), recordSummary, recordOpen);
+  /**
+   * The box while it is open, the record chosen in it, that record's own
+   * identity (its slot, kind and start), and its parts that change.
+   */
+  let recordBox: (ArmedBox & { which: RecordWhich; chosen: string }) | null = null;
+  const recordChoices = element('div', 'choices col');
+  dom.attr(recordChoices, 'role', 'radiogroup');
+  let shownChoices = '';
+  const boxWarning = element('p');
+  role(boxWarning, 'record-warning');
+  let discardButton: HTMLButtonElement | null = null;
+  /** The offer while it shows, and the ended record it was made for, by its span. */
+  let offer: ArmedBox | null = null;
+  let offeredKey = '';
+  dom.attr(recordOfferBox, 'aria-live', 'polite');
+
+  const recordCounts = (view: RecordView): string =>
+    `${counted(view.calls, 'call', 'calls')}, ${counted(view.people, 'person', 'people')}`;
+
+  /** Whom a record names, said before any Save: everyone in it, and how many by an email address (ADR 0017). */
+  function warning(view: RecordView): string {
+    return `This record names ${counted(view.people, 'person', 'people')}${view.emails > 0 ? `, ${String(view.emails)} of them by email address,` : ''} and every call they made on this page, never its arguments or result. Anyone you share the file with can read it.`;
+  }
+
+  /** Saves one record as JSON or as its Markdown summary; the object URL goes a minute later. */
+  function saveRecord(which: RecordWhich, kind: 'json' | 'md'): void {
+    const record = dock.sessionRecord(which);
+    if (record === null) return;
+    timers.after(
+      dom.save(
+        wrap,
+        sessionRecordFileName(record, kind),
+        kind === 'json' ? 'application/json' : 'text/markdown;charset=utf-8',
+        kind === 'json' ? sessionRecordJson(record) : sessionRecordMarkdown(record),
+      ),
+      60_000,
+    );
+  }
+
+  function saveButtons(box: ArmedBox, which: () => RecordWhich): HTMLElement {
+    const buttons = element('div', 'buttons');
+    dom.append(
+      buttons,
+      boxButton(
+        box,
+        'Save JSON',
+        'record-save-json',
+        () => {
+          saveRecord(which(), 'json');
+        },
+        true,
+      ),
+      boxButton(box, 'Save summary', 'record-save-md', () => {
+        saveRecord(which(), 'md');
+      }),
+    );
+    return buttons;
+  }
+
+  function showRecordBox(open: boolean): void {
+    if (recordBox !== null) dropBox(recordBox);
+    recordBox = null;
+    if (!open) return;
+    closeOffer();
+    const box = {
+      ...newBox(element('div', 'prompt')),
+      which: 'current' as RecordWhich,
+      chosen: '',
+    };
+    role(box.element, 'record-box');
+    boxes.add(box);
+    recordBox = box;
+    shownChoices = '';
+    const buttons = saveButtons(box, () => box.which);
+    discardButton = boxButton(box, '', 'record-discard', () => {
+      dock.discardRecord(box.which);
+      box.which = 'current';
+      restartArming(box);
+      render(dock.state);
+    });
+    dom.append(buttons, discardButton);
+    dom.append(box.element, recordChoices, boxWarning, buttons);
+    dom.append(recordBlock, box.element);
+  }
+
+  function closeOffer(): void {
+    if (offer === null) return;
+    timers.cancel(offer.timer);
+    boxes.delete(offer);
+    offer = null;
+    dom.replaceChildren(recordOfferBox, []);
+    dom.flag(recordOfferBox, 'hidden', true);
+  }
+
+  /** A session's end offers its record, armed like the box, and never saves it by itself. */
+  function showOffer(view: RecordView): void {
+    showRecordBox(false);
+    const box = newBox(recordOfferBox);
+    boxes.add(box);
+    offer = box;
+    dom.attr(recordOfferBox, 'class', 'prompt');
+    const buttons = saveButtons(box, () => 'ended');
+    dom.append(
+      buttons,
+      boxButton(box, 'Close', 'record-offer-close', () => {
+        closeOffer();
+        render(dock.state);
+      }),
+    );
+    const told = element('p', '', warning(view));
+    role(told, 'record-warning');
+    dom.replaceChildren(recordOfferBox, [
+      element('p', '', `Session "${view.label ?? ''}" ended. Save its record?`),
+      told,
+      buttons,
+    ]);
+    dom.flag(recordOfferBox, 'hidden', false);
+  }
+
+  /** A record's name in the box's choice: whose session, when, and what it holds. */
+  function recordName(view: RecordView): string {
+    const what =
+      view.scope === 'session'
+        ? `Session "${view.label ?? ''}"`
+        : view.which === 'current'
+          ? 'This page session'
+          : 'The last page session';
+    const when =
+      view.to === null
+        ? `since ${timeText(view.from)}`
+        : `${timeText(view.from)} to ${timeText(view.to)}`;
+    return `${what}, ${when}: ${recordCounts(view)}`;
+  }
+
   /** Returns whether a session's end offers its record, which opens the panel as a join notice does. */
-  const syncRecords: (state: DockState) => boolean = () => false;
+  function syncRecords(state: DockState): boolean {
+    const views = state.records;
+    const failed = views.some((view) => view.failed);
+    const now = views.find((view) => view.which === 'current');
+    dom.flag(recordBlock, 'hidden', views.length === 0);
+    setText(
+      recordSummary,
+      failed
+        ? 'The record stopped after an error; the audit log keeps every call.'
+        : now === undefined || now.calls + now.people === 0
+          ? 'Nothing recorded yet'
+          : `${recordCounts(now)} since ${timeText(now.from)}`,
+    );
+    const held = failed
+      ? []
+      : views.filter((view) => view.calls + view.people + view.proposals > 0);
+    dom.flag(recordOpen, 'disabled', held.length === 0);
+    if (held.length === 0) showRecordBox(false);
+    const box = recordBox;
+    if (box !== null) {
+      const chosen = held.find((view) => view.which === box.which) ?? held[0];
+      // Another record in the chosen slot is another file to save, so the box
+      // waits again whether or not it moved: a session's start, a new page
+      // session or a page script's discardRecord replaces a slot's record in place.
+      const identity = chosen && `${chosen.which} ${chosen.scope} ${String(chosen.from)}`;
+      if (chosen !== undefined && identity !== box.chosen) {
+        box.which = chosen.which;
+        box.chosen = identity ?? '';
+        restartArming(box);
+      }
+      const names = held.map(recordName);
+      const key = JSON.stringify([names, box.which]);
+      if (key !== shownChoices) {
+        shownChoices = key;
+        dom.replaceChildren(
+          recordChoices,
+          held.map((view, at) => {
+            const made = choice(
+              'record-which',
+              view.which,
+              names[at] ?? '',
+              `record-which-${view.which}`,
+            );
+            dom.setChecked(made.input, view.which === box.which);
+            dom.listen(made.input, 'change', () => {
+              box.which = view.which;
+              // Save now saves another record, so the box waits again.
+              restartArming(box);
+              render(dock.state);
+            });
+            return made.label;
+          }),
+        );
+      }
+      dom.flag(recordChoices, 'hidden', held.length < 2);
+      if (chosen !== undefined) setText(boxWarning, warning(chosen));
+      if (discardButton !== null) {
+        setText(discardButton, box.which === 'current' ? 'Clear' : 'Discard');
+      }
+    }
+    // Only a record that holds something is offered, as only such a one is in the box.
+    const ended = held.find((view) => view.which === 'ended');
+    const key = ended === undefined ? '' : `${String(ended.from)}:${String(ended.to)}`;
+    if (key === offeredKey) return false;
+    offeredKey = key;
+    closeOffer();
+    if (ended === undefined) return false;
+    showOffer(ended);
+    return true;
+  }
 
   function tick(): void {
     for (const view of [...requestViews.values(), ...confirmViews.values()]) {
