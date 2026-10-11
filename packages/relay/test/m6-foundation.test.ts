@@ -154,22 +154,11 @@ describe('a reload during a time-boxed session (S5, ADR 0043)', () => {
     const wide = { maxDrivers: 3, proposals: 'all' } as const;
     const { page } = await world({ policy: wide }, store);
     const pageId = page.pageId;
-    const record = store.pages.get(pageId);
-    if (record === undefined) throw new Error('no page record');
-    // W2-B starts sessions; here one is put in place as #sessionFrame will.
-    const now = Date.now();
+    // The operator starts one from the page, as the adapter does.
     const session = { maxDrivers: 1, proposals: 'members' } as const;
-    store.pages.put({
-      ...record,
-      policy: { ...record.policy, ...session },
-      timedSession: {
-        sessionId: 'ss_test',
-        startedAt: now,
-        endsAt: now + 1_800_000,
-        lengthMs: 1_800_000,
-        policy: session,
-      },
-    });
+    page.send({ t: 'session_start', sessionId: 'ss_test', lengthMs: 1_800_000, policy: session });
+    await page.sync();
+    expect(page.all('session').at(-1)?.session).toMatchObject({ sessionId: 'ss_test' });
     const token = page.welcome?.resumeToken ?? '';
     page.ws.terminate();
     await page.closed;
@@ -187,6 +176,15 @@ describe('a reload during a time-boxed session (S5, ADR 0043)', () => {
     const third = await connectPage(page.ws.url, { resumeToken: token2, policy: narrower });
     pages.push(third);
     expect(store.pages.get(pageId)?.policy).toMatchObject({ maxDrivers: 1, proposals: 'off' });
+    // So is the session's own, which the page hears after the welcome.
+    expect(store.pages.get(pageId)?.timedSession?.policy).toEqual({
+      maxDrivers: 1,
+      proposals: 'off',
+    });
+    expect((await third.next('session')).session).toMatchObject({
+      sessionId: 'ss_test',
+      policy: { maxDrivers: 1, proposals: 'off' },
+    });
   });
 });
 

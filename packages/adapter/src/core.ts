@@ -48,9 +48,12 @@ import {
   MAX_PENDING_PROPOSALS_PER_PAGE,
   MAX_PENDING_PROPOSALS_PER_USER,
   MAX_RESULT_CHARS,
+  MAX_SESSION_MS,
   MAX_STATE_BYTES,
   MAX_TIMER_MS,
   MAX_USERS_PER_PAGE,
+  MEMBER_RESERVED_SEATS,
+  narrowPolicy,
   type PageErrorCode,
   type PageFrameInput,
   PageFrameSchema,
@@ -73,7 +76,11 @@ import {
   type RelayFrame,
   type Role,
   RoleSchema,
+  SESSION_END_GRACE_MS,
+  SESSION_LENGTH_UNIT_MS,
   type SessionEndReason,
+  SessionLengthSchema,
+  SessionPolicySchema,
   type SessionRecord,
   type SessionRefusalReason,
   SHORT_INVITE_LIFETIME_MS,
@@ -83,10 +90,13 @@ import {
   StoredGrantSchema,
   type StoredInvite,
   StoredInvitesSchema,
+  type StoredSession,
+  StoredSessionSchema,
   SUBPROTOCOL,
   TOOL_POLL_MS,
   truncate,
   type User,
+  withinCeiling,
 } from '@tabdock/protocol';
 import * as z from 'zod/mini';
 import { NOOP_RECORDER, type Recorder, type RecordView, type RecordWhich } from './record.ts';
@@ -456,14 +466,23 @@ export interface SessionOptions {
   readonly proposals?: ProposalPolicy;
 }
 
-/** The observers' link shows here once and is never stored, as an invite's is. */
+/** One of a session's watch invites and its link, which shows once (ADR 0043). */
+export interface SessionLink {
+  readonly inviteId: string;
+  readonly link: string;
+}
+
+/** The observers' links show here once and are never stored, as an invite's is. */
 export type SessionResult =
   | {
       readonly ok: true;
       readonly sessionId: string;
       /** Local epoch milliseconds. */
       readonly endsAt: number;
+      /** The first of links, or null with no observers. */
       readonly link: string | null;
+      /** One watch invite for every 20 observers, each to be shown in turn (conflict C12). */
+      readonly links: readonly SessionLink[];
       /** Why a session with observers started without its link. */
       readonly inviteRefusal?: InviteRefusal;
     }
@@ -472,6 +491,9 @@ export type SessionResult =
       readonly reason:
         'invalid' | 'policy' | 'active' | 'link_down' | 'unavailable' | SessionRefusalReason;
     };
+
+/** Why no session started. */
+type SessionFailure = Extract<SessionResult, { ok: false }>['reason'];
 
 /** How long an agent token works (ADR 0044). */
 export type AgentLifetime = '1h' | '4h' | '8h';
@@ -770,7 +792,11 @@ export interface Dock {
   startSession(options: SessionOptions): Promise<SessionResult>;
   /** Lengthens the running session by whole minutes, up to 4 hours from its start. */
   extendSession(minutes: number): boolean;
-  /** Ends the running session now, and with it every attachment, invite and agent token it let in. */
+  /**
+   * Ends the running session now, and with it every attachment an invite or
+   * agent token made, every live invite and every agent token on the page,
+   * those from before the session too, as Revoke all ends invites.
+   */
   endSession(): boolean;
   /** A new observers' link for the running session, since a reload keeps none. */
   renewSessionLink(): Promise<InviteResult>;
@@ -1272,6 +1298,16 @@ function seatLimitsOf(limits: WelcomeFrame['limits']): SeatLimits | null {
   });
 }
 
+/**
+ * How many may watch by a session's invites (conflict C12): the relay's
+ * watching seats, or its people less the members' two where it has none,
+ * or one invite's uses from a relay that names no seats (0.1.0).
+ */
+export function sessionSeats(seats: SeatLimits | null): number {
+  if (seats === null) return MAX_INVITE_USES;
+  return seats.observersPerPage || Math.max(0, seats.usersPerPage - MEMBER_RESERVED_SEATS);
+}
+
 /** Each UTF-16 code unit becomes at most 3 UTF-8 bytes, so only longer strings need counting. */
 function overByteLimit(text: string, limit: number): boolean {
   if (text.length > limit) return true;
@@ -1635,6 +1671,11 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   const rolesUnanswered: SentRole[] = [];
   /** The seq of the last ObserverSeat recorded. */
   let seatSeq = 0;
+  /**
+   * The time-boxed session this page started (ADR 0043), as its stored
+   * record holds it; up here because pageRole reads it from the first grant.
+   */
+  let session: StoredSession | null = null;
 
   function setState(patch: Partial<DockState>): void {
     const next = { ...state, ...patch };
@@ -1875,6 +1916,10 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     let granted: Role;
     if (grant) {
       if (grant.endsAt !== undefined && clock() >= grant.endsAt) return null;
+      // Past a live session's end, before its end has run, an invite or token lets in nobody (ADR 0043).
+      if (grant.inviteId !== undefined && session !== null && clock() >= session.endsAt) {
+        return null;
+      }
       granted = grant.inviteRole === 'observer' ? 'observer' : grant.role;
     } else {
       if (policy.autoApprove !== 'observer' || isInvitee(userId)) return null;
@@ -2105,7 +2150,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     cancelSent.clear();
     grantsPage = frame.pageId;
     saveGrants();
-    sessionWelcome(frame, samePage);
+    sessionWelcome(frame);
     frameLimit = Math.max(MIN_FRAME_BYTES, Math.min(MAX_FRAME_BYTES, frame.limits.maxFrameBytes));
     resultLimit = Math.max(
       MARKER_ROOM * 2,
@@ -3193,6 +3238,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       return "the page's policy no longer allows it";
     }
     if (clock() >= inviteEnd(invite)) return 'it has expired';
+    // A live session ends every invite with it, however long its own life (ADR 0043).
+    if (session !== null && clock() >= session.endsAt) return 'the session has ended';
     if (invite.usesLeft <= 0) return 'it is used up';
     if (invite.refusals >= INVITE_BURN_REFUSALS) return 'three refusals burnt it';
     if (invite.barred.includes(userId)) return 'the operator revoked this account from it';
@@ -3653,15 +3700,42 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    * so a reload while the relay answers still knows the invite it may hold.
    */
   async function invite(request: InviteOptions): Promise<InviteResult> {
-    const refuse = (reason: InviteRefusal): InviteResult => Object.freeze({ ok: false, reason });
     const given: unknown = request;
     if (typeof given !== 'object' || given === null || !validInvite(request)) {
-      return refuse('invalid');
+      return refuseInvite('invalid');
     }
     // ADR 0016: watch by default, so Can control needs a page that opted into 'all'.
     if (policy.invites === 'off' || (request.role === 'driver' && policy.invites !== 'all')) {
-      return refuse('policy');
+      return refuseInvite('policy');
     }
+    const lifetime = lifetimeMs(request.lifetime ?? '1h');
+    return mintInvite(
+      request.role,
+      request.label,
+      request.role === 'driver' ? CONTROL_INVITE_USES : (request.uses ?? 1),
+      lifetime === null ? null : clock() + lifetime,
+    );
+  }
+
+  function refuseInvite(reason: InviteRefusal): InviteResult {
+    return Object.freeze({ ok: false, reason });
+  }
+
+  /**
+   * The mint itself, for invite() and a time-boxed session's watch invites
+   * alike, its terms already checked: `expiresAt` on this page's clock, or
+   * null for "while the page is open". `live` says whether what the invite
+   * is for still stands once its digest is made: a session's link minted
+   * after the session ended would outlive it, uncapped.
+   */
+  async function mintInvite(
+    role: Role,
+    label: string,
+    uses: number,
+    expiresAt: number | null,
+    live: () => boolean = () => true,
+  ): Promise<InviteResult> {
+    const refuse = refuseInvite;
     if (!isLinked()) return refuse('link_down');
     const offered = state.invitesOffered;
     if (offered === null || !webCrypto) return refuse('unavailable');
@@ -3678,19 +3752,17 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     }
     // The link may have dropped, or the page closed, while the hash was made.
     if (!isLinked()) return refuse('link_down');
+    if (!live()) return refuse('cancelled');
     if (invites.size >= MAX_LIVE_INVITES_PER_PAGE) return refuse('limit');
-    const now = clock();
-    const lifetime = lifetimeMs(request.lifetime ?? '1h');
-    const uses = request.role === 'driver' ? CONTROL_INVITE_USES : (request.uses ?? 1);
     const record: StoredInvite = {
       inviteId,
       secretHash,
-      role: request.role,
-      label: request.label,
+      role,
+      label,
       uses,
       usesLeft: uses,
-      createdAt: now,
-      expiresAt: lifetime === null ? null : now + lifetime,
+      createdAt: clock(),
+      expiresAt,
       refusals: 0,
       barred: [],
     };
@@ -4243,26 +4315,393 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     return dismissed;
   };
 
-  // Time-boxed sessions (ADR 0043)
-  // M6 seam: not built
+  // Time-boxed sessions (ADR 0043). This page starts, extends and ends its
+  // own; the relay applies one only within the hello's policy and holds its
+  // end on its own clock, and this page holds the end on its clock too, so
+  // neither a silent relay nor a frozen tab keeps a guest past it. Only a
+  // session this page started is ever adopted: a relay cannot impose one,
+  // nor make one longer than the operator asked. Its links show once, as an
+  // invite's do, and are never stored.
+
+  /** The session the relay listed in its last session frame on this link. */
+  let relayLists: string | null = null;
+  /** The last session this page ended itself; the relay hears of it while it still lists it. */
+  let endedHere: string | null = null;
+  /** The session this page last asked the relay to end on this link, so it asks once. */
+  let endSent: string | null = null;
+  /** The longest the operator asked the session to run, which no relay can pass. */
+  let askedMs = 0;
+  let sessionTimer: unknown = null;
+  let graceTimer: unknown = null;
+  /** A start waiting for the relay: its answer is null once listed, or why not. */
+  let starting: {
+    readonly sessionId: string;
+    readonly answer: (refused: SessionFailure | null) => void;
+  } | null = null;
+
   /** attach()'s policy as a running session narrows it; every read a session may narrow goes through here. */
   function effective(): Policy {
-    return policy;
+    return narrowPolicy(policy, session?.policy ?? null);
   }
-  // M6 seam: not built
-  const sessionWelcome: (frame: WelcomeFrame, samePage: boolean) => void = () => undefined;
-  // M6 seam: not built
-  const onSession: (frame: SessionFrame) => void = () => undefined;
-  // M6 seam: not built
-  const startSession: Dock['startSession'] = () =>
-    Promise.resolve<SessionResult>(Object.freeze({ ok: false, reason: 'unavailable' }));
-  // M6 seam: not built
-  const extendSession: Dock['extendSession'] = () => false;
-  // M6 seam: not built
-  const endSession: Dock['endSession'] = () => false;
-  // M6 seam: not built
-  const renewSessionLink: Dock['renewSessionLink'] = () =>
-    Promise.resolve<InviteResult>(Object.freeze({ ok: false, reason: 'unavailable' }));
+
+  function sessionView(): SessionView | null {
+    if (session === null) return null;
+    // The sponsor the relay named for its invites, fixed at minting (ADR 0017).
+    let sponsor: User | null = null;
+    for (const inviteId of session.inviteIds) sponsor ??= listings.get(inviteId)?.sponsor ?? null;
+    return Object.freeze({
+      sessionId: session.sessionId,
+      label: session.label,
+      startedAt: session.startedAt,
+      endsAt: session.endsAt,
+      lengthMinutes: session.lengthMs / SESSION_LENGTH_UNIT_MS,
+      policy: effective(),
+      observers: session.observers,
+      inviteIds: [...session.inviteIds],
+      sponsor: sponsor === null ? null : { ...sponsor },
+    });
+  }
+
+  /** Every change to the session ends here, so storage and the state shown match memory. */
+  function showSession(): void {
+    writeStored(sessionKey, session && JSON.stringify(session), "the page's session");
+    setState({ session: sessionView(), records: recorder.views() });
+  }
+
+  function armSessionEnd(): void {
+    timers.clearTimeout(sessionTimer);
+    sessionTimer = null;
+    if (session === null || closed) return;
+    sessionTimer = timers.setTimeout(
+      () => {
+        sessionTimer = null;
+        if (session === null || closed) return;
+        if (clock() >= session.endsAt) finishSession('time', true);
+        else armSessionEnd();
+      },
+      Math.min(Math.max(0, session.endsAt - clock()), MAX_TIMER_MS),
+    );
+  }
+
+  /**
+   * The drivers past `seats`, newest grant first as the relay picks them,
+   * become observers on this page at once, before the relay hears (S5).
+   */
+  function demoteBeyond(seats: number): void {
+    const drivers = state.roster
+      .filter((entry) => entry.role === 'driver')
+      .sort((a, b) => a.grantedAt - b.grantedAt);
+    for (const entry of drivers.slice(seats)) setRole(entry.userId, 'observer');
+  }
+
+  /** Asks the relay to end a session it lists, once per link. */
+  function endListed(sessionId: string): void {
+    if (endSent !== sessionId && isLinked() && send({ t: 'session_end', sessionId })) {
+      endSent = sessionId;
+    }
+  }
+
+  /** The relay hears of an end this page made only while it still lists that session. */
+  function tellEnd(): void {
+    if (endedHere !== null && relayLists === endedHere) endListed(endedHere);
+  }
+
+  const sessionWelcome = (frame: WelcomeFrame): void => {
+    relayLists = null;
+    endSent = null;
+    if (session === null) {
+      const text = readStored(sessionKey);
+      const stored = text === null ? null : StoredSessionSchema.safeParse(parseJson(text));
+      if (stored?.success === false) log.warn('ignored a stored session that did not parse');
+      if (stored?.success) session = { ...stored.data };
+    }
+    if (session === null) return;
+    // Kept across a reload that resumed its page session, until the relay's frame says.
+    if (session.pageId === frame.pageId) {
+      armSessionEnd();
+      showSession();
+    } else {
+      finishSession('relay');
+    }
+  };
+
+  const onSession = (frame: SessionFrame): void => {
+    if (!state.sessionsOffered) setState({ sessionsOffered: true });
+    const live = frame.session;
+    relayLists = live?.sessionId ?? null;
+    const { refused, ended } = frame;
+    if (refused !== undefined) {
+      log.info(`the relay refused session ${refused.sessionId}: ${refused.reason}`);
+      if (starting?.sessionId === refused.sessionId) starting.answer(refused.reason);
+    }
+    const kept = session;
+    if (kept !== null && live?.sessionId === kept.sessionId) {
+      // Reckoned again on this clock, never past what the operator asked,
+      // and the relay's policy taken only where it is no wider than this page's.
+      const lengthMs = Math.min(live.lengthMs, Math.max(kept.lengthMs, askedMs));
+      kept.lengthMs = lengthMs;
+      kept.endsAt = Math.min(clock() + live.remainingMs, kept.startedAt + lengthMs);
+      if (withinCeiling(effective(), live.policy)) kept.policy = { ...live.policy };
+      if (starting?.sessionId === kept.sessionId) starting.answer(null);
+      armSessionEnd();
+      demoteBeyond(effective().maxDrivers);
+      const view = sessionView();
+      // Told after each decision, through the seam W3-A guards (ADR 0045, decision 22).
+      if (view !== null) recorder.sessionStarted(view);
+      showSession();
+      return;
+    }
+    // The relay holds none of this page's: it ended there, unless a start still waits.
+    if (kept !== null && starting?.sessionId !== kept.sessionId) {
+      finishSession(ended?.sessionId === kept.sessionId ? ended.reason : 'relay');
+    }
+    // One the relay lists while this page holds none is never adopted, and is
+    // ended there, as an unknown invite is closed: whether this page ended it
+    // while the relay could not hear and a reload lost that, or never started
+    // it. An end only takes access away, and without one the relay would keep
+    // the seats narrowed and refuse every start until its own clock ran out.
+    // One this page ended on its own clock waits out the grace first.
+    if (live !== null && session === null) {
+      if (live.sessionId !== endedHere) {
+        if (endSent !== live.sessionId) {
+          log.warn(`ended session ${live.sessionId}, which this page holds no record of`);
+        }
+        endListed(live.sessionId);
+      } else if (graceTimer === null) {
+        tellEnd();
+      }
+    }
+  };
+
+  /**
+   * The end, however it came: everyone an invite or agent token let in
+   * leaves, their redemptions are refused and their calls cancelled, as on
+   * revoke (S8, C11), and the page's own policy returns. An end this page
+   * made itself is told to the relay, at once for the operator's, after
+   * SESSION_END_GRACE_MS for its clock's, so the relay's own end wins a tie.
+   */
+  function finishSession(reason: SessionEndedReason, local = false): void {
+    const ended = session;
+    if (ended === null) return;
+    session = null;
+    timers.clearTimeout(sessionTimer);
+    if (starting?.sessionId === ended.sessionId) starting.answer('unavailable');
+    const listed = new Set(state.roster.map((entry) => entry.userId));
+    const gone: string[] = [];
+    for (const [userId, grant] of grants) {
+      if (grant.inviteId === undefined) continue;
+      gone.push(userId);
+      grants.delete(userId);
+      // Refused here until the relay drops them, and revoked there should a later link find them.
+      if (listed.has(userId)) revoked.add(userId);
+    }
+    for (const inviteId of [...invites.keys()]) forgetInvite(inviteId, 'cancelled');
+    saveGrants();
+    for (const call of [...calls.values()]) {
+      if (!gone.includes(call.frame.caller.userId)) continue;
+      if (!call.confirm) call.controller.abort();
+      finish(call, {
+        ok: false,
+        code: call.confirm ? 'denied_by_operator' : 'cancelled',
+        message: 'the time-boxed session ended',
+      });
+    }
+    for (const userId of gone) proposalsRevoked(userId);
+    agentsRevoked('*');
+    const end: SessionEnded = Object.freeze({
+      sessionId: ended.sessionId,
+      label: ended.label,
+      reason,
+      time: clock(),
+    });
+    recorder.sessionEnded(end);
+    setState({ sessionEnded: end });
+    showSession();
+    log.info(`session ${ended.sessionId} ended (${reason})`);
+    if (!local) return;
+    endedHere = ended.sessionId;
+    timers.clearTimeout(graceTimer);
+    graceTimer = null;
+    if (reason !== 'time') {
+      tellEnd();
+      return;
+    }
+    graceTimer = timers.setTimeout(() => {
+      graceTimer = null;
+      tellEnd();
+    }, SESSION_END_GRACE_MS);
+  }
+
+  /** The session under this id, while it runs; an await may end it. */
+  function runs(sessionId: string): StoredSession | null {
+    return session?.sessionId === sessionId ? session : null;
+  }
+
+  /** A start the relay refused or never answered leaves nothing behind but its demotions. */
+  function dropStart(sessionId: string): void {
+    if (runs(sessionId) === null) return;
+    session = null;
+    timers.clearTimeout(sessionTimer);
+    showSession();
+    // Should the relay hold it after all, it hears the end once it lists it.
+    endedHere = sessionId;
+    tellEnd();
+  }
+
+  /**
+   * Starts a session: checked at run time, since a page script can pass
+   * anything, and never wider than attach()'s policy, so a start this page
+   * would refuse never leaves it (S5). The drivers past its seats are
+   * demoted here first. Its watch invites are minted once the relay lists
+   * it, each ending with the session at the latest.
+   */
+  const startSession: Dock['startSession'] = async (options) => {
+    const refuse = (reason: SessionFailure): SessionResult => Object.freeze({ ok: false, reason });
+    const given: unknown = options;
+    if (typeof given !== 'object' || given === null) return refuse('invalid');
+    const {
+      label,
+      lengthMinutes,
+      drivers = policy.maxDrivers,
+      observers = 0,
+      proposals = policy.proposals,
+    } = options;
+    const lengthMs =
+      typeof lengthMinutes === 'number' ? lengthMinutes * SESSION_LENGTH_UNIT_MS : Number.NaN;
+    const wanted = SessionPolicySchema.safeParse({ maxDrivers: drivers, proposals });
+    if (
+      !wanted.success ||
+      !InviteLabelSchema.safeParse(label).success ||
+      !SessionLengthSchema.safeParse(lengthMs).success ||
+      !Number.isInteger(observers) ||
+      observers < 0 ||
+      observers > sessionSeats(state.seatLimits)
+    ) {
+      return refuse('invalid');
+    }
+    if (!withinCeiling(policy, wanted.data) || (observers > 0 && policy.invites === 'off')) {
+      return refuse('policy');
+    }
+    if (session !== null) return refuse('active');
+    if (!isLinked()) return refuse('link_down');
+    const offered = state.invitesOffered?.linkBase ?? null;
+    if (
+      !state.sessionsOffered ||
+      (observers > 0 &&
+        (offered === null || !webCrypto || !state.roster.some((entry) => entry.kind === 'member')))
+    ) {
+      return refuse('unavailable');
+    }
+    if (invites.size + Math.ceil(observers / MAX_INVITE_USES) > MAX_LIVE_INVITES_PER_PAGE) {
+      return refuse('limit');
+    }
+    demoteBeyond(wanted.data.maxDrivers);
+    const now = clock();
+    const sessionId = `ses_${webCrypto ? randomText(webCrypto, INVITE_ID_BYTES) : String(now)}`;
+    session = {
+      pageId: state.pageId ?? '',
+      sessionId,
+      label,
+      startedAt: now,
+      endsAt: now + lengthMs,
+      lengthMs,
+      policy: wanted.data,
+      observers,
+      inviteIds: [],
+    };
+    askedMs = lengthMs;
+    armSessionEnd();
+    showSession();
+    if (!send({ t: 'session_start', sessionId, lengthMs, policy: wanted.data })) {
+      dropStart(sessionId);
+      return refuse('link_down');
+    }
+    const answer = await new Promise<SessionFailure | null>((resolve) => {
+      const settle = (reason: SessionFailure | null): void => {
+        timers.clearTimeout(timer);
+        starting = null;
+        if (reason !== null) dropStart(sessionId);
+        resolve(reason);
+      };
+      const timer = timers.setTimeout(() => {
+        settle('unavailable');
+      }, MINT_ANSWER_MS);
+      starting = { sessionId, answer: settle };
+    });
+    if (answer !== null) return refuse(answer);
+    const links: SessionLink[] = [];
+    let inviteRefusal: InviteRefusal | undefined;
+    // One watch invite for every MAX_INVITE_USES observers, as far as the relay mints them.
+    for (let left = observers; left > 0 && runs(sessionId); left -= MAX_INVITE_USES) {
+      const minted = await mintInvite(
+        'observer',
+        label,
+        Math.min(left, MAX_INVITE_USES),
+        now + MAX_SESSION_MS,
+        () => runs(sessionId) !== null,
+      );
+      if (!minted.ok) {
+        inviteRefusal = minted.reason;
+        break;
+      }
+      links.push({ inviteId: minted.inviteId, link: minted.link });
+      runs(sessionId)?.inviteIds.push(minted.inviteId);
+      showSession();
+    }
+    return Object.freeze({
+      ok: true,
+      sessionId,
+      endsAt: runs(sessionId)?.endsAt ?? now,
+      link: links[0]?.link ?? null,
+      links: Object.freeze(links),
+      ...(inviteRefusal === undefined ? {} : { inviteRefusal }),
+    });
+  };
+
+  const extendSession: Dock['extendSession'] = (minutes) => {
+    const live = session;
+    const step = typeof minutes === 'number' && minutes > 0 ? minutes : Number.NaN;
+    const lengthMs = (live?.lengthMs ?? 0) + step * SESSION_LENGTH_UNIT_MS;
+    if (live === null || relayLists !== live.sessionId) return false;
+    if (!SessionLengthSchema.safeParse(lengthMs).success) return false;
+    askedMs = Math.max(askedMs, lengthMs);
+    return send({ t: 'session_extend', sessionId: live.sessionId, lengthMs });
+  };
+
+  const endSession: Dock['endSession'] = () => {
+    if (session === null || closed) return false;
+    finishSession('operator', true);
+    return true;
+  };
+
+  /**
+   * A new watch link for the running session, since its links live only in
+   * the widget's memory and a reload loses them: the old invites close, and
+   * one mint covers the seats still open, up to an invite's uses.
+   */
+  const renewSessionLink: Dock['renewSessionLink'] = async () => {
+    const live = session;
+    if (live === null || live.observers === 0) return refuseInvite('invalid');
+    let joined = 0;
+    for (const grant of grants.values()) {
+      if (grant.inviteId !== undefined && live.inviteIds.includes(grant.inviteId)) joined += 1;
+    }
+    for (const inviteId of live.inviteIds) cancelInvite(inviteId);
+    live.inviteIds = [];
+    showSession();
+    const minted = await mintInvite(
+      'observer',
+      live.label,
+      Math.min(MAX_INVITE_USES, Math.max(1, live.observers - joined)),
+      live.startedAt + MAX_SESSION_MS,
+      () => session === live,
+    );
+    if (minted.ok && session === live) {
+      live.inviteIds.push(minted.inviteId);
+      showSession();
+    }
+    return minted;
+  };
 
   // Agent tokens (ADR 0044)
   // M6 seam: not built

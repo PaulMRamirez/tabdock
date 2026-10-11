@@ -63,6 +63,7 @@ import {
   MAX_PROPOSAL_ARGUMENT_BYTES,
   MAX_PROPOSAL_ARGUMENT_NODES,
   MAX_RESULT_CHARS,
+  MAX_SESSION_MS,
   MAX_STATE_BYTES,
   MAX_STATE_FRAME_BYTES,
   MAX_WAIT_MS,
@@ -82,11 +83,13 @@ import {
   type RelayFrame,
   type Role,
   type SessionEndReason,
+  type SessionRefusalReason,
   type ToolAnnotations,
   truncate,
   UNVERIFIED_EMAIL,
   type UserKind,
   type WireImage,
+  withinCeiling,
 } from '@tabdock/protocol';
 import { createHash } from 'node:crypto';
 import type { RawData, WebSocket } from 'ws';
@@ -159,6 +162,7 @@ import {
   recordAudit,
   type RelayStore,
   type SingleUseTicketRecord,
+  type TimedSession,
 } from './store.ts';
 
 type FrameOf<T extends PageFrame['t']> = Extract<PageFrame, { t: T }>;
@@ -1425,6 +1429,10 @@ export class PageHub {
   readonly #inviteLimiter: SlidingWindowLimiter;
   /** One per live invite, keyed by inviteKey: fires at the invite's expiresAt. */
   readonly #inviteTimers = new Map<string, NodeJS.Timeout>();
+  /** One per live time-boxed session, keyed by page id: fires at its end (ADR 0043). */
+  readonly #sessionTimers = new Map<string, NodeJS.Timeout>();
+  /** A session that ended while its page slept, told to the page with its next welcome. */
+  readonly #sessionEnds = new Map<string, { sessionId: string; reason: SessionEndReason }>();
   /** Promotions and mints per page (OPERATOR_GRANTS_PER_PAGE), kept across its reconnects. */
   readonly #grantLimiter: SlidingWindowLimiter;
   /** One warning per page and window once its grants run out, so a flood writes no line per frame. */
@@ -1447,6 +1455,8 @@ export class PageHub {
   readonly #states: PageStates;
   /** Observers' proposals and the outcomes kept for them (ADR 0042), one of #parts. */
   readonly #proposals: PageProposals;
+  /** Each page's agent tokens (ADR 0044), one of #parts, which a session's end closes (C11). */
+  readonly #agents: AgentTokens;
   /**
    * The slots waiting fixed tool calls take, shared by wait_for_page_state
    * and get_proposal (waits.ts, conflict C2 of the M6 plan).
@@ -1541,7 +1551,8 @@ export class PageHub {
       },
       admitted: (record) => this.#stillProposes(record),
     });
-    this.#parts = new PageParts([this.#states, this.#proposals, new AgentTokens()]);
+    this.#agents = new AgentTokens();
+    this.#parts = new PageParts([this.#states, this.#proposals, this.#agents]);
   }
 
   /**
@@ -1999,15 +2010,6 @@ export class PageHub {
     return null;
   }
 
-  /** The operator starting, extending or ending a time-boxed session (ADR 0043); false when nothing changed. */
-  #sessionFrame(
-    pageId: string,
-    frame: FrameOf<'session_start' | 'session_extend' | 'session_end'>,
-  ): boolean {
-    // M6 seam: not built. Refused by being ignored, so no session starts.
-    return this.#notActedOn(pageId, frame.t);
-  }
-
   /** The page minting or cancelling an agent token (ADR 0044); false when nothing changed. */
   #agentFrame(pageId: string, frame: FrameOf<'agent_create' | 'agent_cancel'>): boolean {
     // M6 seam: not built. Refused by being ignored, so no token is minted.
@@ -2173,7 +2175,9 @@ export class PageHub {
       usesLeft: frame.uses,
       createdAt: now,
       requestedExpiresAt: frame.expiresAt,
-      expiresAt: ownExpiresAt,
+      // A live session ends it with itself, however long its own life (ADR
+      // 0043); its own expiry stays apart, so an extension can lengthen it.
+      expiresAt: this.#sessionCap(pageId, ownExpiresAt),
       ownExpiresAt,
       secretHash: frame.secretHash,
       sponsor: { userId: sponsor.userId, displayName: sponsor.displayName },
@@ -2244,6 +2248,8 @@ export class PageHub {
       attachmentKey(pageId, inviteId),
       Math.max(0, invite.expiresAt - Date.now()),
       () => {
+        // An expiry the session capped is the session's end, whichever timer runs first (ADR 0043).
+        this.#endSessionIfDue(pageId);
         const current = this.#store.invites.get(pageId, inviteId);
         if (current) this.#closeInvite(current, 'expired');
       },
@@ -2365,38 +2371,331 @@ export class PageHub {
     return true;
   }
 
-  // Time-boxed sessions (ADR 0043)
+  // Time-boxed sessions (ADR 0043). One per page at most, started,
+  // lengthened and ended only by the operator's own page, and never wider
+  // than the hello's policy: a session_start past it is refused, never
+  // clamped, since an adapter that sent one is wrong about the page and the
+  // operator should hear so. Its end holds on the relay's own clock, a timer
+  // plus #endSessionIfDue on every path that reads the policy, an invite or
+  // an attachment, so a frozen tab or a late timer lets nobody past it.
 
-  /** The page's session as it stands, after every welcome and on every change. */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- a stub: its body comes with ADR 0043
-  #sendSession(_pageId: string): void {
-    // M6 seam: not built. No session ever starts, so there is none to send.
+  /** The operator starting, extending or ending a time-boxed session (ADR 0043); false when nothing changed. */
+  #sessionFrame(
+    pageId: string,
+    frame: FrameOf<'session_start' | 'session_extend' | 'session_end'>,
+  ): boolean {
+    this.#endSessionIfDue(pageId);
+    const page = this.#store.pages.get(pageId);
+    if (!page) return false;
+    const live = page.timedSession;
+    const ours = live?.sessionId === frame.sessionId ? live : null;
+    if (frame.t === 'session_end') {
+      // An end for a session that is not live changes nothing (#ignored counts it).
+      if (ours === null) return false;
+      this.#endSession(pageId, 'operator');
+      return true;
+    }
+    const now = Date.now();
+    let refused: SessionRefusalReason | null = null;
+    if (frame.t === 'session_start') {
+      // The same start again, as after a lost answer: the page hears it as it stands.
+      if (ours !== null) {
+        this.#sendSession(pageId);
+        return false;
+      }
+      if (live !== null) refused = 'active';
+      else if (!withinCeiling(page.ceiling, frame.policy)) refused = 'policy';
+    } else if (ours === null) {
+      refused = 'unknown';
+    } else if (frame.lengthMs <= ours.lengthMs) {
+      refused = 'length';
+    }
+    // Lengthening keeps guests in, so it counts against the page's grants as a mint does.
+    if (refused === null && !this.#grantAllowed(pageId, now)) refused = 'limit';
+    if (refused !== null) {
+      this.#log.info('time-boxed session refused', {
+        pageId,
+        sessionId: frame.sessionId,
+        frameType: frame.t,
+        reason: refused,
+      });
+      this.#sendSession(pageId, { refused: { sessionId: frame.sessionId, reason: refused } });
+      return false;
+    }
+    if (frame.t === 'session_start') {
+      const session: TimedSession = {
+        sessionId: frame.sessionId,
+        startedAt: now,
+        endsAt: now + frame.lengthMs,
+        lengthMs: frame.lengthMs,
+        policy: { ...frame.policy },
+      };
+      page.timedSession = session;
+      page.policy = narrowPolicy(page.ceiling, session.policy);
+      this.#store.pages.put(page);
+      const demoted = this.#demoteDrivers(page);
+      this.#capToSession(pageId, null);
+      this.#armSession(pageId, session.endsAt);
+      this.#audit({
+        v: AUDIT_VERSION,
+        type: 'session_start',
+        at: now,
+        pageId,
+        origin: page.origin,
+        sessionId: session.sessionId,
+        lengthMs: session.lengthMs,
+        maxDrivers: session.policy.maxDrivers,
+        proposals: session.policy.proposals,
+        demoted,
+      });
+      this.#log.info('time-boxed session started', {
+        pageId,
+        sessionId: session.sessionId,
+        lengthMs: session.lengthMs,
+        maxDrivers: session.policy.maxDrivers,
+        proposals: session.policy.proposals,
+        demoted,
+      });
+      this.#parts.policyChanged(pageId);
+    } else if (ours !== null) {
+      const before = ours.endsAt;
+      ours.lengthMs = frame.lengthMs;
+      ours.endsAt = ours.startedAt + frame.lengthMs;
+      this.#store.pages.put(page);
+      this.#capToSession(pageId, before);
+      this.#armSession(pageId, ours.endsAt);
+      this.#audit({
+        v: AUDIT_VERSION,
+        type: 'session_extend',
+        at: now,
+        pageId,
+        origin: page.origin,
+        sessionId: ours.sessionId,
+        lengthMs: ours.lengthMs,
+      });
+      this.#log.info('time-boxed session extended', {
+        pageId,
+        sessionId: ours.sessionId,
+        lengthMs: ours.lengthMs,
+      });
+    }
+    this.#sendRoster(pageId);
+    this.#sendInvites(pageId);
+    this.#sendSession(pageId);
+    return true;
+  }
+
+  #armSession(pageId: string, endsAt: number): void {
+    this.#setTimer(this.#sessionTimers, pageId, Math.max(0, endsAt - Date.now()), () => {
+      this.#endSessionIfDue(pageId);
+    });
   }
 
   /**
-   * Ends the page's session: what its invites let in, its live invites and
-   * its agent tokens end with it, unless the page itself is gone.
+   * Demotes the drivers past the policy's maxDrivers, newest grant first, so
+   * the member attached first, normally the operator's own client, keeps
+   * driving (ADR 0043). Nobody is promoted back later: that is a grant only
+   * the operator makes. Answers how many it demoted.
    */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- a stub: its body comes with ADR 0043
-  #endSession(_pageId: string, _reason: SessionEndReason): void {
-    // M6 seam: not built. No session ever starts, so there is none to end.
+  #demoteDrivers(page: PageRecord): number {
+    const drivers = this.#store.attachments
+      .listForPage(page.pageId)
+      .filter((attachment) => attachment.role === 'driver')
+      .sort((a, b) => b.grantedAt - a.grantedAt);
+    const demoted = drivers.slice(0, Math.max(0, drivers.length - page.policy.maxDrivers));
+    const now = Date.now();
+    for (const attachment of demoted) {
+      attachment.role = 'observer';
+      this.#store.attachments.put(attachment);
+      this.#audit({
+        v: AUDIT_VERSION,
+        type: 'role',
+        at: now,
+        pageId: page.pageId,
+        origin: page.origin,
+        userId: attachment.userId,
+        role: 'observer',
+        previous: 'driver',
+      });
+      this.#log.info('role changed', {
+        pageId: page.pageId,
+        userId: attachment.userId,
+        role: 'observer',
+      });
+    }
+    this.#firstClassChanged(demoted.map((attachment) => attachment.userId));
+    return demoted.length;
   }
 
-  /** Ends the page's session if its end has passed, whatever its timer: a late timer lets nobody past it. */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- a stub: its body comes with ADR 0043
-  #endSessionIfDue(_pageId: string): void {
-    // M6 seam: not built. No session ever starts, so none is ever due.
+  /**
+   * Caps every live invite and invite-made attachment at the live session's
+   * end, on the relay's clock (S14). `before` is the end an extension moved
+   * from: an attachment the old end capped moves with the session, within its
+   * own 24 hours, and one that ends sooner for another reason keeps its end.
+   * An invite keeps its own expiry apart (ownExpiresAt) for the same reason.
+   */
+  #capToSession(pageId: string, before: number | null): void {
+    const session = this.#store.pages.get(pageId)?.timedSession;
+    if (!session) return;
+    const idleMs = this.#config.timings.attachmentIdleMs;
+    for (const attachment of this.#store.attachments.listForPage(pageId)) {
+      if (attachment.inviteId === null || attachment.endsAt === null) continue;
+      const endsAt =
+        attachment.endsAt === before
+          ? Math.min(attachment.grantedAt + MAX_INVITE_LIFETIME_MS, session.endsAt)
+          : Math.min(attachment.endsAt, session.endsAt);
+      if (endsAt === attachment.endsAt) continue;
+      attachment.endsAt = endsAt;
+      attachment.expiresAt = Math.min(
+        (attachment.lastUsedAt ?? attachment.grantedAt) + idleMs,
+        endsAt,
+      );
+      this.#store.attachments.put(attachment);
+      this.#armExpiry(attachment);
+    }
+    for (const invite of this.#store.invites.listForPage(pageId)) {
+      invite.expiresAt = Math.min(invite.ownExpiresAt, session.endsAt);
+      this.#store.invites.put(invite);
+      this.#armInviteExpiry(invite);
+    }
+  }
+
+  /**
+   * The page's session as it stands, after every welcome and on every
+   * change: relative times only, as invoke's deadline is, so the page's
+   * clock never has to agree with this one, and never its label, which is
+   * page text the relay is never given. `extra` says why it changed.
+   */
+  #sendSession(
+    pageId: string,
+    extra: {
+      ended?: { sessionId: string; reason: SessionEndReason };
+      refused?: { sessionId: string; reason: SessionRefusalReason };
+    } = {},
+  ): void {
+    const conn = this.#live.get(pageId);
+    if (!conn) return;
+    const session = this.#store.pages.get(pageId)?.timedSession ?? null;
+    // One that ended while the page slept is told once, with the next welcome.
+    const ended = extra.ended ?? this.#sessionEnds.get(pageId);
+    this.#sessionEnds.delete(pageId);
+    this.#send(conn, {
+      t: 'session',
+      session:
+        session === null
+          ? null
+          : {
+              sessionId: session.sessionId,
+              lengthMs: session.lengthMs,
+              remainingMs: Math.min(MAX_SESSION_MS, Math.max(0, session.endsAt - Date.now())),
+              policy: { ...session.policy },
+            },
+      ...(ended === undefined || session !== null ? {} : { ended }),
+      ...(extra.refused === undefined ? {} : { refused: extra.refused }),
+    });
+  }
+
+  /**
+   * Ends the page's session: its agent tokens, what its invites let in and
+   * its live invites end with it (C11), and the page's own policy returns.
+   * Members' own attachments stay. A page that is gone ends its attachments
+   * and invites itself (#gone), so then those are only counted, before it
+   * does.
+   */
+  #endSession(pageId: string, reason: SessionEndReason): void {
+    if (reason === 'page_gone') this.#sessionEnds.delete(pageId);
+    const page = this.#store.pages.get(pageId);
+    const session = page?.timedSession;
+    if (!page || !session) return;
+    this.#clearTimer(this.#sessionTimers, pageId);
+    // First, so nothing the ends below run can find it due again.
+    page.timedSession = null;
+    page.policy = narrowPolicy(page.ceiling, null);
+    this.#store.pages.put(page);
+    const now = Date.now();
+    const made = this.#store.attachments
+      .listForPage(pageId)
+      .filter((attachment) => attachment.inviteId !== null);
+    const invites = this.#store.invites.listForPage(pageId);
+    // The tokens before the attachments: a token's close ends the attachment
+    // it made, with its own expire record (the AgentTokens closed hook), so
+    // every token, in use or not, closes as session_ended rather than as its
+    // attachment's end, and only what is left ends below, once each. A gone
+    // page's tokens close here as page_gone, as #gone's parts would close
+    // them next, so the record counts them.
+    const agents = this.#agents.closePage(
+      pageId,
+      reason === 'page_gone' ? 'page_gone' : 'session_ended',
+    );
+    const left = made.filter(
+      (attachment) => this.#store.attachments.get(pageId, attachment.userId) !== undefined,
+    );
+    if (reason !== 'page_gone') {
+      this.#endAttachments(
+        pageId,
+        new Set(left.map((attachment) => attachment.userId)),
+        'revoked',
+        'the time-boxed session you joined by invite has ended',
+      );
+      for (const attachment of left) {
+        this.#auditExpire(page, attachment.userId, 'session_ended', now);
+      }
+      for (const invite of invites) this.#closeInvite(invite, 'session_ended', false);
+    }
+    this.#audit({
+      v: AUDIT_VERSION,
+      type: 'session_end',
+      at: now,
+      pageId,
+      origin: page.origin,
+      sessionId: session.sessionId,
+      reason,
+      attachments: made.length,
+      invites: invites.length,
+      agents,
+    });
+    this.#log.info('time-boxed session ended', {
+      pageId,
+      sessionId: session.sessionId,
+      reason,
+      attachments: made.length,
+      invites: invites.length,
+      agents,
+    });
+    this.#parts.policyChanged(pageId);
+    if (reason === 'page_gone') return;
+    // A member an invite let in may have sponsored invites of their own.
+    this.#loseSponsors(pageId, left);
+    if (!this.#live.has(pageId)) {
+      this.#sessionEnds.set(pageId, { sessionId: session.sessionId, reason });
+      return;
+    }
+    this.#sendRoster(pageId);
+    this.#sendInvites(pageId);
+    this.#sendSession(pageId, { ended: { sessionId: session.sessionId, reason } });
+  }
+
+  /**
+   * Ends the page's session if its end has passed, whatever its timer: a
+   * late timer lets nobody past it. One that fired early waits again.
+   */
+  #endSessionIfDue(pageId: string): void {
+    const session = this.#store.pages.get(pageId)?.timedSession;
+    if (!session) return;
+    if (session.endsAt <= Date.now()) this.#endSession(pageId, 'time');
+    else if (!this.#sessionTimers.has(pageId)) this.#armSession(pageId, session.endsAt);
   }
 
   /** An invite-made attachment's end, at most the live session's (ADR 0043). */
-  #sessionCap(_pageId: string, endsAt: number): number {
-    // M6 seam: not built. With no session there is nothing to cap it at.
-    return endsAt;
+  #sessionCap(pageId: string, endsAt: number): number {
+    const session = this.#store.pages.get(pageId)?.timedSession;
+    return session ? Math.min(endsAt, session.endsAt) : endsAt;
   }
 
   /** Stops every session timer at shutdown. */
   #clearSessionTimers(): void {
-    // M6 seam: not built. No session ever starts, so no timer runs.
+    for (const timer of this.#sessionTimers.values()) clearTimeout(timer);
+    this.#sessionTimers.clear();
   }
 
   // Agent tokens (ADR 0044)
@@ -2471,11 +2770,23 @@ export class PageHub {
       page.url = frame.url;
       page.adapterVersion = frame.adapterVersion;
       // A reload may send a new ceiling, never a way past a live session
-      // (S5, ADR 0043): the policy in force stays the narrower of the two.
+      // (S5, ADR 0043): the policy in force stays the narrower of the two,
+      // field by field, and so does the session's own, which the session
+      // frame after the welcome tells the page. Drivers past a seat count the
+      // smaller ceiling lowered are demoted before the welcome lists them.
+      this.#endSessionIfDue(page.pageId);
+      const was = page.policy;
       page.ceiling = frame.policy;
-      // M6 seam: not built. W2-B also narrows the session itself under a
-      // smaller ceiling, demotes drivers past its seats and tells the page.
-      page.policy = narrowPolicy(frame.policy, page.timedSession?.policy ?? null);
+      const session = page.timedSession;
+      if (session !== null) {
+        const narrowed = narrowPolicy(frame.policy, session.policy);
+        session.policy = { maxDrivers: narrowed.maxDrivers, proposals: narrowed.proposals };
+      }
+      page.policy = narrowPolicy(frame.policy, session?.policy ?? null);
+      if (session !== null) this.#demoteDrivers(page);
+      if (page.policy.maxDrivers !== was.maxDrivers || page.policy.proposals !== was.proposals) {
+        this.#parts.policyChanged(page.pageId);
+      }
     } else {
       const noRoom = this.#makeRoom(conn.address);
       if (noRoom !== null) {
@@ -2501,7 +2812,7 @@ export class PageHub {
         // in force is its ceiling.
         policy: frame.policy,
         ceiling: frame.policy,
-        // M6 seam: not built. W2-B starts sessions here (#sessionFrame).
+        // The operator starts one on the page, never the hello (#sessionFrame).
         timedSession: null,
         tools: [],
         toolsPending: false,
@@ -3700,6 +4011,8 @@ export class PageHub {
    * after redemption however much it is used (S14). True if it ended.
    */
   #expireIfDue(pageId: string, userId: string): boolean {
+    // An end the session capped is the session's to end, whichever timer runs first (ADR 0043).
+    this.#endSessionIfDue(pageId);
     const attachment = this.#store.attachments.get(pageId, userId);
     if (!attachment || attachment.expiresAt === null) return false;
     const now = Date.now();
