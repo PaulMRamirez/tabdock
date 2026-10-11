@@ -131,3 +131,7 @@ In SPEC section 7, "JSON results also pass through as structured content." now r
 ## Notes from M6 (10 October 2026)
 
 The first-class prefix now calls a tool's results "untrusted page content" rather than page text (ADR 0039), and a first-class call to a declared image tool returns its image as `call_page_tool` does, after the same label and relay line. Where this record says "the five fixed tools", read "the fixed tools", nine from M6 (ADRs 0040 and 0042); invitees and invite-made attachments still list only those. Where it says that with the flag off the surface is M4's, read that it is the fixed tools alone, M4's five first and unchanged in name, input schema and annotations, three of their descriptions having changed (C1); SPEC section 7 and A5.1 say so too.
+
+## Notes from M6's build (11 October 2026)
+
+An observer's write by a first-class name becomes a proposal on a page that takes them, as by `call_page_tool`, since both reach the same path (ADR 0042; `proposals.test.ts`). A first-class call to a declared image tool waits at the adapter's image gate only after the operator's prompt, as every image call does (ADR 0039's notes), and returns its picture after the same label and relay line.
