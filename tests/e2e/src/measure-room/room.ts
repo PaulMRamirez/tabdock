@@ -185,7 +185,7 @@ export interface PhaseResult {
   calls: ReturnType<CallBook['toJSON']>;
   statuses: Record<string, number>;
   logLines: Record<string, number>;
-  /** Answers the relay cut, by rule, from its own lines and their repeat counts. */
+  /** Answers the relay cut, by rule, from its own lines and their repeat counts, read once the minute the phase ended in is over. */
   cuts: { stall: number; cap: number; ceiling: number };
   /** Students' answers left unread, settled by draining. */
   held: HeldTally;
@@ -768,9 +768,15 @@ export async function measureRoom(
         .filter(([status]) => status.startsWith('http '))
         .reduce((sum, [, count]) => sum + count, 0);
       const at = phase.groupAtStart;
+      const calls = phase.calls.toJSON();
+      const statuses = phase.statuses.toJSON();
+      const seconds = round((performance.now() - phase.started) / 1000, 0) ?? 0;
+      // The relay writes a repeated line's count when its wall-clock minute ends,
+      // so the phase's lines are read once the minute it ended in is over.
+      await afterLogWindow();
       const result: PhaseResult = {
         name: phase.name,
-        seconds: round((performance.now() - phase.started) / 1000, 0) ?? 0,
+        seconds,
         quotaUs: phase.quotaUs,
         peaks: phase.peaks,
         heapAfterGcUnderLoadMiB: phase.heapUnderLoadMiB,
@@ -793,8 +799,8 @@ export async function measureRoom(
             ? null
             : round(group.throttledMs - at.throttledMs, 0),
         oomKills: group?.oomKills ?? null,
-        calls: phase.calls.toJSON(),
-        statuses: phase.statuses.toJSON(),
+        calls,
+        statuses,
         logLines: phase.logs.toJSON(),
         cuts: {
           stall: phase.logs.get(`warn ${RESPONSE_CUT_LINE}`),
@@ -1361,6 +1367,17 @@ export async function measureRoom(
     // The returned result is this object, so the relay's way out reaches the report.
     if (result !== null) result.relayExit = relayExit;
   }
+}
+
+/**
+ * Waits out the wall-clock minute now running, and a little more: the
+ * relay's repeated lines (repeated-lines.ts) count each line past the first
+ * in a minute and write the count when that minute ends.
+ */
+async function afterLogWindow(): Promise<void> {
+  const windowMs = DEFAULT_RATE_LIMITS.windowMs;
+  const now = Date.now();
+  await sleep((Math.floor(now / windowMs) + 1) * windowMs - now + 2000);
 }
 
 let heldIds = 1000;
