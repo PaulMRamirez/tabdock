@@ -19,3 +19,4 @@ export {
   type SimPage,
   type SimPageOptions,
 } from './sim-page.ts';
+export { startMapSimPage, type MapSimPage, type MapSimPageOptions } from './map-sim.ts';

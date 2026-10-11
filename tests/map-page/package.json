@@ -1,0 +1,23 @@
+{
+  "name": "@tabdock/map-page",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A canvas map and globe page with no map library: the map profile's tools in a browser, for Playwright specs and the CI check. Never published.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    "./server": "./scripts/server.ts"
+  },
+  "scripts": {
+    "dev": "node scripts/server.ts",
+    "typecheck": "tsc -p tsconfig.json && tsc -p scripts/tsconfig.json && tsc -p test/tsconfig.json"
+  },
+  "dependencies": {
+    "@mcp-b/webmcp-polyfill": "5.1.0",
+    "@tabdock/adapter": "workspace:*",
+    "@tabdock/sim-page": "workspace:*"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

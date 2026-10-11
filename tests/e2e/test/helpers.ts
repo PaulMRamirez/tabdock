@@ -22,8 +22,11 @@ import {
 import type { DockState } from '@tabdock/adapter/core';
 import {
   type FakeToolDefinition,
+  type MapSimPage,
+  type MapSimPageOptions,
   type SimPage,
   type SimPageOptions,
+  startMapSimPage,
   startSimPage,
 } from '@tabdock/sim-page';
 import { expect } from 'vitest';
@@ -43,6 +46,8 @@ export interface World {
   /** Every sim page started in this world, including closed ones. */
   pages: SimPage[];
   page(options?: Omit<SimPageOptions, 'relayUrl'>): Promise<SimPage>;
+  /** A sim page running the map profile's worked example (ADR 0038), closed with the world. */
+  mapPage(options?: Omit<MapSimPageOptions, 'relayUrl'>): Promise<MapSimPage>;
   client(user: DevTokenUser, name?: string, options?: ClientOptions): Promise<Client>;
   close(): Promise<void>;
 }
@@ -95,6 +100,11 @@ export async function startWorld(options: WorldOptions = {}): Promise<World> {
     pages,
     async page(pageOptions = {}) {
       const sim = await startSimPage({ relayUrl: relay.pageUrl, ...pageOptions });
+      pages.push(sim);
+      return sim;
+    },
+    async mapPage(pageOptions = {}) {
+      const sim = await startMapSimPage({ relayUrl: relay.pageUrl, ...pageOptions });
       pages.push(sim);
       return sim;
     },

@@ -128,6 +128,9 @@ importers:
       ws:
         specifier: 8.22.0
         version: 8.22.0
+      zod:
+        specifier: 4.6.5
+        version: 4.6.5
     devDependencies:
       '@types/ws':
         specifier: 8.18.2
@@ -153,6 +156,9 @@ importers:
       '@tabdock/demo':
         specifier: workspace:*
         version: link:../../apps/demo
+      '@tabdock/map-page':
+        specifier: workspace:*
+        version: link:../map-page
       '@tabdock/mcpb6':
         specifier: workspace:*
         version: link:../mcpb6
@@ -183,6 +189,22 @@ importers:
       ws:
         specifier: 8.22.0
         version: 8.22.0
+
+  tests/map-page:
+    dependencies:
+      '@mcp-b/webmcp-polyfill':
+        specifier: 5.1.0
+        version: 5.1.0
+      '@tabdock/adapter':
+        specifier: workspace:*
+        version: link:../../packages/adapter
+      '@tabdock/sim-page':
+        specifier: workspace:*
+        version: link:../../packages/sim-page
+    devDependencies:
+      esbuild:
+        specifier: 0.28.2
+        version: 0.28.2
 
   tests/mcpb6:
     dependencies:

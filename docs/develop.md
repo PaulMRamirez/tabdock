@@ -19,6 +19,7 @@ pnpm relay --new-token  # the same, after replacing local mode's owner token in 
 pnpm dev           # relay and demo board together, local mode unless .env says otherwise
 pnpm dev:public    # the same in public URL mode, for Claude on a phone through a tunnel
 pnpm dev:demo      # the demo board alone at http://127.0.0.1:5173/
+pnpm dev:map       # the canvas map page alone at http://127.0.0.1:5174/ (tests/map-page)
 pnpm audit:log     # read the persistent audit log, or --verify its chain
 
 pnpm demo:m0       # the M0 baseline through MCP-B's local relay, narrated
