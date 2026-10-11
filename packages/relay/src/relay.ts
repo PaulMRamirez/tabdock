@@ -607,8 +607,10 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   // Responses a client leaves unread are cut off once they stop moving, and a
   // user's oldest once more of theirs wait than they may, an invitee a
   // quarter as many as a member (responsesWaitingFor, ADR 0030 and its notes).
-  // Past the bytes all of them may hold together, strangers' oldest go first,
-  // then guests', ranked as sessions are, and never a member's (S9, ADR 0044).
+  // Past the bytes they may hold together, invited accounts' answers waiting
+  // to be read give way, strangers' oldest first, then guests', ranked as
+  // sessions are; a member's never does, so members' alone may pass it (S9,
+  // ADR 0044).
   const stalls = new ResponseStalls({
     lines: mcpLines,
     ceilingBytes: config.limits.responseBytes,

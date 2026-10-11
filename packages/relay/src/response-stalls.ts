@@ -291,7 +291,7 @@ export interface ResponseStallOptions {
   checkMs?: number;
   /** Responses with bytes waiting each user may have; left out, responsesWaitingFor. */
   waitingCapOf?: (userId: string) => number;
-  /** Bytes every watched response may hold together (limits.responseBytes); left out, no ceiling. */
+  /** What watched responses may hold before invited accounts' give way (limits.responseBytes); left out, no ceiling. */
   ceilingBytes?: number;
   /** Where a user stands when the ceiling is passed (sessions.ts's rankOf); left out, a member. */
   rankOf?: (userId: string) => TierRank;
