@@ -15,6 +15,7 @@ import {
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CallerIdentity } from '../src/hub.ts';
 import {
+  MAX_PROPOSAL_CHARGE,
   PageProposals,
   PROPOSAL_HEAP_BYTES,
   proposalCharge,
@@ -168,6 +169,23 @@ describe('PageProposals', () => {
     expect(make('pg_2', 'e', { label: 'x'.repeat(5000) })).toBe('relay');
     expect(proposals.byId(settled[1]?.proposalId ?? '')).toBe(settled[1]);
     expect(proposals.byId(settled[2]?.proposalId ?? '')).toBe(settled[2]);
+    proposals.close();
+  });
+
+  it("gives each user an eighth of the budget across pages, never less than one proposal at the caps, before the relay's", () => {
+    const MIB = 1024 * 1024;
+    expect(held(16 * MIB).proposals.userShare).toBe(2 * MIB);
+    expect(held(MIB).proposals.userShare).toBe(MAX_PROPOSAL_CHARGE);
+    const { proposals, make, made } = held(2 * MIB);
+    // About 127 KiB each: two fit in a 256 KiB share.
+    const dense = { label: 'x', n: Array.from({ length: 995 }, () => 0) };
+    const first = made('pg_1', 'bob', dense);
+    made('pg_2', 'bob', dense);
+    expect(make('pg_3', 'bob', dense)).toBe('share');
+    expect(make('pg_3', 'carol', dense)).toMatchObject({ proposer: { userId: 'carol' } });
+    // Settling frees its arguments' charge, and with it the share.
+    proposals.end(first, 'dismissed', null);
+    expect(make('pg_3', 'bob', dense)).toMatchObject({ proposer: { userId: 'bob' } });
     proposals.close();
   });
 

@@ -85,6 +85,9 @@ async function setup(options: Parameters<typeof startRelay>[0] = {}): Promise<Te
 
 const MEMBERS: PolicyInput = { proposals: 'members' };
 
+/** About 127 KiB charged: a thousand values, at the node cap. */
+const DENSE = { label: 'x', n: Array.from({ length: 995 }, () => 0) };
+
 async function page(policy: PolicyInput = MEMBERS, options: PageOptions = {}): Promise<TestPage> {
   if (!current) throw new Error('no relay');
   const opened = await fence.keep(
@@ -610,24 +613,48 @@ describe('proposal limits (A6.12)', () => {
   });
 
   it('refuses a proposal once what the relay holds for proposals is full', async () => {
-    const users = [BOB, CAROL, member(1)];
+    // At 1 MiB one user's share is one proposal at the caps, so nine users propose once each.
+    const users = Array.from({ length: 9 }, (_, n) => member(n + 1));
     await setup({
       auth: createDevTokenAuth([ALICE, ...users]),
       limits: { proposalBytes: 1024 * 1024 },
     });
     const opened = await page();
     // About 127 KiB charged each, so eight fit in 1 MiB and the ninth does not.
-    const dense = { label: 'x', n: Array.from({ length: 995 }, () => 0) };
     const answers: string[] = [];
     for (const user of users) {
       const joined = await observer(opened, user);
-      for (let n = 0; n < MAX_PENDING_PROPOSALS_PER_USER; n += 1) {
-        answers.push((await propose(joined, opened.pageId, dense)).text);
-      }
+      answers.push((await propose(joined, opened.pageId, DENSE)).text);
     }
     expect(answers.slice(0, 8).every((text) => text.startsWith('proposed: '))).toBe(true);
     expect(answers[8]).toBe(
       'rate_limited: the relay holds as many proposals as it can; try again later',
     );
+  });
+
+  it("holds one user's proposals across pages to their share of what the relay holds (S9)", async () => {
+    // At 2 MiB a user's share is 256 KiB: two proposals of about 127 KiB, on any pages.
+    await setup({ limits: { proposalBytes: 2 * 1024 * 1024 } });
+    const own = [await page(), await page(), await page()];
+    // One member on pages of their own, as /page lets anyone open one.
+    const bob = await client(BOB);
+    for (const opened of own) await pairAndApprove(bob, opened, 'observer');
+    const [first, second, third] = own;
+    if (first === undefined || second === undefined || third === undefined)
+      throw new Error('pages');
+    const made = proposalIdOf(await propose(bob, first.pageId, DENSE));
+    expect((await propose(bob, second.pageId, DENSE)).text).toMatch(/^proposed: /);
+    expect((await propose(bob, third.pageId, DENSE)).text).toBe(
+      "rate_limited: your proposals waiting across pages already hold as much of the relay's memory as one user's may; wait for their operators, or withdraw one with withdraw_proposal",
+    );
+    await third.sync();
+    expect(third.all('proposal')).toEqual([]);
+    // Far below the relay's budget, so anyone else still proposes there.
+    expect((await propose(await observer(third, CAROL), third.pageId, DENSE)).text).toMatch(
+      /^proposed: /,
+    );
+    // A settled proposal holds no arguments, so its share is free again.
+    await withdrawProposal(bob, first.pageId, made);
+    expect((await propose(bob, third.pageId, DENSE)).text).toMatch(/^proposed: /);
   });
 });

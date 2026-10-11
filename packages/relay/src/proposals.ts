@@ -12,7 +12,9 @@
 // oldest results the relay holds; a new proposal by dropping those and then
 // the oldest kept outcomes; never a pending proposal's arguments. Past that
 // a new proposal is refused, dropping nothing, and a result that still does
-// not fit is dropped, its outcome kept. A settled proposal stays readable
+// not fit is dropped, its outcome kept. One user's proposals that may still
+// run hold at most a share of the budget across every page, so nobody
+// running pages of their own can fill it for the relay. A settled proposal stays readable
 // for PROPOSAL_OUTCOME_KEEP_MS on its own timer, whether or not anyone looks,
 // at most MAX_SETTLED_PROPOSALS_PER_PAGE a page, and every one ends with its
 // page (decision 12).
@@ -26,6 +28,8 @@ import {
   type JsonObject,
   MAX_PENDING_PROPOSALS_PER_PAGE,
   MAX_PENDING_PROPOSALS_PER_USER,
+  MAX_PROPOSAL_ARGUMENT_BYTES,
+  MAX_PROPOSAL_ARGUMENT_NODES,
   MAX_PROPOSAL_RESULT_CHARS,
   MAX_SETTLED_PROPOSALS_PER_PAGE,
   PROPOSAL_OUTCOME_KEEP_MS,
@@ -47,6 +51,27 @@ export const PROPOSAL_HEAP_BYTES = 2048;
 
 /** Each value and key of a kept argument object, as a listed tool's cut copy costs (hub.ts). */
 const PROPOSAL_NODE_HEAP_BYTES = 128;
+
+/**
+ * The most one proposal is charged, at the argument caps (decision 9): each
+ * node counted once, and every character of its strings and keys, which are
+ * no more than the bytes of its canonical JSON.
+ */
+export const MAX_PROPOSAL_CHARGE =
+  PROPOSAL_HEAP_BYTES +
+  MAX_PROPOSAL_ARGUMENT_NODES * PROPOSAL_NODE_HEAP_BYTES +
+  2 * MAX_PROPOSAL_ARGUMENT_BYTES;
+
+/**
+ * One user's proposals that may still run, across every page, hold at most
+ * this part of limits.proposalBytes, or one proposal at the caps where that
+ * is less. The per-page caps alone let one member running pages of their
+ * own, approving themselves as observer, hold the whole budget, refusing
+ * every proposal on the relay and dropping everyone's kept results; now
+ * that takes eight accounts. Three proposals on a page at the caps are
+ * under 0.5 MiB, so no one proposing on a few pages meets it.
+ */
+const USER_SHARE_DIVISOR = 8;
 
 /** What a proposal's arguments are charged while it may still run: V8 keeps a string at two bytes a unit at most. */
 export function proposalCharge(args: JsonObject): number {
@@ -190,6 +215,8 @@ export class PageProposals implements PagePart {
   /** Kept entries holding a result, oldest first: what makes room first. */
   readonly #results = new Set<Entry>();
   #held = 0;
+  /** What each user's reserved, pending and running proposals are charged, across pages. */
+  readonly #heldBy = new Map<string, number>();
   /** What #kept is charged together, results included: what dropping every one of them would free. */
   #keptBytes = 0;
   /** What kept results add together: what dropping every result would free. */
@@ -204,11 +231,17 @@ export class PageProposals implements PagePart {
     return this.#held;
   }
 
+  /** What one user's proposals that may still run may hold across the relay. */
+  get userShare(): number {
+    return Math.max(Math.floor(this.#hooks.budgetBytes / USER_SHARE_DIVISOR), MAX_PROPOSAL_CHARGE);
+  }
+
   /**
    * A place for a new proposal by this user on this page, or which limit
    * refuses it: theirs (MAX_PENDING_PROPOSALS_PER_USER), the page's
-   * (MAX_PENDING_PROPOSALS_PER_PAGE), or the relay's budget. Reserved places
-   * count as pending, so proposals checked at the same time cannot pass a cap
+   * (MAX_PENDING_PROPOSALS_PER_PAGE), their share of the budget across
+   * pages (userShare), or the relay's budget. Reserved places count as
+   * pending, so proposals checked at the same time cannot pass a cap
    * together. It holds until committed or released.
    */
   reserve(
@@ -216,7 +249,7 @@ export class PageProposals implements PagePart {
     userId: string,
     charge: number,
     now: number,
-  ): ProposalReservation | 'user' | 'page' | 'relay' {
+  ): ProposalReservation | 'user' | 'page' | 'share' | 'relay' {
     this.#prune(pageId, now);
     let mine = 0;
     let page = 0;
@@ -230,15 +263,26 @@ export class PageProposals implements PagePart {
     for (const held of this.#reserved) if (held.pageId === pageId) count(held.userId);
     if (mine >= MAX_PENDING_PROPOSALS_PER_USER) return 'user';
     if (page >= MAX_PENDING_PROPOSALS_PER_PAGE) return 'page';
+    // Before #room, so a user past their share drops nobody's kept outcomes.
+    if ((this.#heldBy.get(userId) ?? 0) + charge > this.userShare) return 'share';
     if (!this.#room(charge, true)) return 'relay';
     const reservation: ProposalReservation = { pageId, userId, charge };
     this.#reserved.add(reservation);
     this.#held += charge;
+    this.#holdFor(userId, charge);
     return reservation;
   }
 
   release(reservation: ProposalReservation): void {
-    if (this.#reserved.delete(reservation)) this.#held -= reservation.charge;
+    if (!this.#reserved.delete(reservation)) return;
+    this.#held -= reservation.charge;
+    this.#holdFor(reservation.userId, -reservation.charge);
+  }
+
+  #holdFor(userId: string, change: number): void {
+    const now = (this.#heldBy.get(userId) ?? 0) + change;
+    if (now > 0) this.#heldBy.set(userId, now);
+    else this.#heldBy.delete(userId);
   }
 
   /** The reserved place becomes a pending proposal, expiring at `expiresAt` on the relay's clock. */
@@ -425,6 +469,7 @@ export class PageProposals implements PagePart {
   #dropArgs(entry: Entry): void {
     if (entry.record.args === null) return;
     this.#held -= entry.charge;
+    this.#holdFor(entry.record.proposer.userId, -entry.charge);
     entry.charge = 0;
     entry.record.args = null;
   }

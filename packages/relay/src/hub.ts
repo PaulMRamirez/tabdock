@@ -994,9 +994,11 @@ const WAIT_REFUSALS: Record<'user' | 'page' | 'invitee', string> = {
 };
 
 /** What a proposal refused by proposals.ts answers, by the limit that refused it (ADR 0042, S9). */
-const PROPOSAL_REFUSALS: Record<'user' | 'page' | 'relay', string> = {
+const PROPOSAL_REFUSALS: Record<'user' | 'page' | 'share' | 'relay', string> = {
   user: `you already have ${String(MAX_PENDING_PROPOSALS_PER_USER)} proposals waiting on this page; wait for the operator, or withdraw one with withdraw_proposal`,
   page: `this page already has ${String(MAX_PENDING_PROPOSALS_PER_PAGE)} proposals waiting for its operator; try again later`,
+  share:
+    "your proposals waiting across pages already hold as much of the relay's memory as one user's may; wait for their operators, or withdraw one with withdraw_proposal",
   relay: 'the relay holds as many proposals as it can; try again later',
 };
 
