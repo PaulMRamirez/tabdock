@@ -25,19 +25,31 @@ flowchart TB
 
 The relay never runs a tool: it signs clients in and checks and routes each call, and the adapter checks it again before the page's handler runs. It sees calls in plain text, so you run your own. Page origins are allowlisted, tokens and codes never reach a log, and every call is audited; [Security](docs/guide/10-security.md) has the rest. [Concepts](docs/guide/01-concepts.md) explains the parts, the flows and the three dials of roles, consequence and reach.
 
+## For a room
+
+Clients see nine fixed tools: `list_pages`, `pair_page`, `list_page_tools`, `call_page_tool`, `detach_page`, `get_page_state`, `wait_for_page_state`, `get_proposal` and `withdraw_proposal`. M6, not yet released ([CHANGELOG.md](CHANGELOG.md)), lets one projected tab hold a class or a review:
+
+- **Map and globe pages.** A shared tool profile every client drives alike, with a canvas test page to try it on ([Map and globe pages](docs/guide/16-map-pages.md)).
+- **Images and page state.** A tool the page declares returns one PNG, JPEG or WebP, checked again by the relay and shown only behind the untrusted label; a page publishes a small JSON object any attached client reads or waits on without running a tool ([Images and page state](docs/guide/18-images-and-state.md)).
+- **Proposals and time-boxed sessions.** An observer's write becomes a proposal the operator accepts or dismisses in the widget, and a session of 30 to 240 minutes narrows the policy, shows one QR at a time and at its end closes everything its invites let in ([Lessons and reviews](docs/guide/19-lessons-and-reviews.md)).
+- **Session records.** The widget keeps who did what, saves it as JSON and Markdown only on the operator's click, and `pnpm audit:log --match` holds a saved record to the audit log.
+- **Larger rooms and agent tokens.** 40 watching seats apart from the people limit, in a compact roster, a members file read again without a restart, a response ceiling, an optional restart snapshot, and tokens with which Claude Code or a script watches one page once the operator allows it ([Larger rooms](docs/guide/20-larger-rooms.md)).
+- **CI checks.** `pnpm ci-check` walks a map page's every stop against local mode, as CI's `ci-check` job does with no secret ([Check a page from CI](docs/guide/17-check-from-ci.md)).
+
 ## Status
 
 Version 0.1.0 is prepared but not yet on npm, so today Tabdock runs from a clone; `npx @tabdock/relay` and `npm install @tabdock/adapter` work once 0.1.0 is on npm. Every security requirement in `SPEC.md` section 9 has automated tests. What has been checked, and where:
 
-| Path                                                | Checked in the sandbox                                                                                      | Waiting for the owner's own devices                                                                                                                        |
-| --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Claude Code in local mode                           | Claude Code 2.1.289 headless, on MCP 2026-07-28 and 2025-11-25, first-class tools included                  | The header helper on macOS; on Windows, which shell would run one (the PowerShell `--header` line serves meanwhile); the confirmation dialog with a person |
-| Other MCP clients                                   | The SDK client matrix and the official conformance suite in CI; confirmation in the client with SDK clients | Nothing                                                                                                                                                    |
-| The adapter in a browser                            | Headless Chromium with the MCP-B polyfill 5.1.0 and 6.0.0                                                   | An hour in a background tab, Energy Saver and laptop sleep                                                                                                 |
-| Claude on web, desktop and phone; QR scans; invites | Public URL mode against a stand-in identity provider, in a phone-sized browser                              | All of it: none has run live yet                                                                                                                           |
-| The container image                                 | Built and smoke-tested                                                                                      | A real host                                                                                                                                                |
+| Path                                                | Checked in the sandbox                                                                                                                  | Waiting for the owner's own devices                                                                                                                        |
+| --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claude Code in local mode                           | Claude Code 2.1.289 headless, on MCP 2026-07-28 and 2025-11-25, first-class tools included                                              | The header helper on macOS; on Windows, which shell would run one (the PowerShell `--header` line serves meanwhile); the confirmation dialog with a person |
+| Other MCP clients                                   | The SDK client matrix and the official conformance suite in CI; confirmation in the client with SDK clients                             | Nothing                                                                                                                                                    |
+| The adapter in a browser                            | Headless Chromium with the MCP-B polyfill 5.1.0 and 6.0.0                                                                               | An hour in a background tab, Energy Saver and laptop sleep                                                                                                 |
+| Claude on web, desktop and phone; QR scans; invites | Public URL mode against a stand-in identity provider, in a phone-sized browser                                                          | All of it: none has run live yet                                                                                                                           |
+| The container image                                 | Built and smoke-tested                                                                                                                  | A real host                                                                                                                                                |
+| M6's rooms, images, proposals and records           | The sim page, the canvas map page and the demo in headless Chromium, a stand-in provider, and a measured class of 40 on a 512 MiB relay | Hosted Claude with images, waits and proposals; a members file and a deploy during a lesson on Fly; a real class                                           |
 
-The open steps are in `docs/checklists/` (M3, M4 and M5). WebMCP is an early draft in a Chrome origin trial, so the demo board uses the MCP-B polyfill.
+The open steps are in `docs/checklists/` (M3 to M6). WebMCP is an early draft in a Chrome origin trial, so the demo board uses the MCP-B polyfill.
 
 ## Quick start
 
@@ -100,14 +112,16 @@ Hosted Claude reaches a connector from the cloud, so a relay on loopback cannot 
 
 [The guide](docs/guide/README.md) is for people using Tabdock, with a reading order for each audience:
 
-| You want to                        | Read                                                                                                                                                |
-| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Understand it                      | [Concepts](docs/guide/01-concepts.md), [Use cases](docs/guide/09-use-cases.md)                                                                      |
-| Try it                             | [Quick start](docs/guide/02-quick-start.md)                                                                                                         |
-| Add it to a web app                | [Add to your app](docs/guide/03-add-to-your-app.md), [Adapter reference](docs/guide/04-adapter-reference.md), [Security](docs/guide/10-security.md) |
-| Use a page from Claude or a client | [Connect clients](docs/guide/05-connect-clients.md), [Troubleshooting](docs/guide/11-troubleshooting.md)                                            |
-| Share a page you run               | [Sharing](docs/guide/06-sharing.md)                                                                                                                 |
-| Run a relay                        | [Run a relay](docs/guide/07-run-a-relay.md), [Relay settings](docs/guide/08-relay-settings.md)                                                      |
+| You want to                        | Read                                                                                                                                                          |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Understand it                      | [Concepts](docs/guide/01-concepts.md), [Use cases](docs/guide/09-use-cases.md)                                                                                |
+| Try it                             | [Quick start](docs/guide/02-quick-start.md)                                                                                                                   |
+| Add it to a web app                | [Add to your app](docs/guide/03-add-to-your-app.md), [Adapter reference](docs/guide/04-adapter-reference.md), [Security](docs/guide/10-security.md)           |
+| Use a page from Claude or a client | [Connect clients](docs/guide/05-connect-clients.md), [Troubleshooting](docs/guide/11-troubleshooting.md)                                                      |
+| Share a page you run               | [Sharing](docs/guide/06-sharing.md)                                                                                                                           |
+| Run a relay                        | [Run a relay](docs/guide/07-run-a-relay.md), [Relay settings](docs/guide/08-relay-settings.md)                                                                |
+| Teach a class or review on one tab | [Lessons and reviews](docs/guide/19-lessons-and-reviews.md), [Larger rooms](docs/guide/20-larger-rooms.md), [Map and globe pages](docs/guide/16-map-pages.md) |
+| Check a page from CI               | [Check a page from CI](docs/guide/17-check-from-ci.md)                                                                                                        |
 
 For contributors: `docs/develop.md` (every command), `SPEC.md` (the source of truth), `docs/adr/` (the decisions), `docs/threat-model.md` (each boundary and its tests), `docs/mcp-b-comparison.md`, `docs/tour/` (the build's history, a milestone a page), `docs/deploy.md` (the reference deployment), `docs/release.md`, `CHANGELOG.md`, `.env.example` (every setting), and the READMEs of `packages/adapter`, `packages/relay`, `packages/protocol` and `apps/demo`. `pnpm site:build` builds the demo board, the tour and the guide into a static site for GitHub Pages, not yet published; until it is, run the board with `pnpm dev`.
 
