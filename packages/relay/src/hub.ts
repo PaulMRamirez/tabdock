@@ -348,6 +348,8 @@ export interface AgentIdentity {
   user: AuthUser;
   tokenId: string;
   pageId: string;
+  /** Whether the operator has let it in, so its requests raise no prompt and need no client named. */
+  attached: boolean;
 }
 
 /** A page title longer than this is cut before /pair shows it (S10). */
@@ -2367,22 +2369,13 @@ export class PageHub {
    * sponsor, and each member above them, is attached and in time: a sponsor
    * found past their end is ended here as their timer would, which closes
    * the token (attachmentsEnded), so no request slips into the gap before a
-   * late timer.
+   * late timer. Asked again once the body is in (relay.ts), with the token
+   * presented, so a request whose token closed meanwhile serves nothing (S8),
+   * as a member list change ends a /mcp request signed in before it.
    */
   agentCaller(token: string, now: number): AgentIdentity | null {
     const agent = this.#agents.byToken(token, now);
     return agent === null ? null : this.#agentIdentity(agent, now);
-  }
-
-  /**
-   * Whether the token behind a /g/mcp request is still live, asked again once
-   * its body has arrived, which a client may hold back for minutes: a token
-   * closed meanwhile serves nothing more (S8), as a member list change ends
-   * a /mcp request signed in before it (ADR 0043's notes).
-   */
-  agentLive(pageId: string, tokenId: string, now: number): boolean {
-    const agent = this.#store.agents.get(pageId, tokenId);
-    return agent !== undefined && this.#agentIdentity(agent, now) !== null;
   }
 
   #agentIdentity(agent: AgentTokenRecord, now: number): AgentIdentity | null {
@@ -2399,6 +2392,7 @@ export class PageHub {
       user: agentUser(agent.pageId, agent.tokenId),
       tokenId: agent.tokenId,
       pageId: agent.pageId,
+      attached: agent.state === 'attached',
     };
   }
 

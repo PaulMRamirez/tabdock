@@ -23,7 +23,7 @@ import {
   type AuditEventType,
   MAX_LIVE_AGENTS_PER_PAGE,
 } from '@tabdock/protocol';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   AGENT_URL,
   agentRequest,
@@ -114,6 +114,41 @@ function auditValid(relay: InviteRelay): void {
   for (const event of relay.relay.audit.events()) {
     expect(AuditEventSchema.safeParse(event).success, JSON.stringify(event)).toBe(true);
   }
+}
+
+/**
+ * An initialize on /g/mcp whose headers go now and whose body waits for
+ * `meanwhile`, as a client holding its body back would send it; resolves
+ * with the status the relay answered.
+ */
+function heldBody(
+  relay: InviteRelay,
+  token: string,
+  meanwhile: () => Promise<void>,
+): Promise<number> {
+  const body = JSON.stringify(INITIALIZE);
+  return new Promise<number>((resolve, reject) => {
+    const req = httpRequest(new URL('/g/mcp', relay.relay.url), {
+      method: 'POST',
+      headers: {
+        Host: new URL(PUBLIC_ORIGIN).host,
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        'Content-Length': String(Buffer.byteLength(body)),
+      },
+    });
+    req.on('response', (res) => {
+      res.resume();
+      resolve(res.statusCode ?? 0);
+    });
+    req.on('error', reject);
+    req.flushHeaders();
+    // The token checks out on arrival; the body comes once `meanwhile` is done.
+    setTimeout(() => {
+      meanwhile().then(() => req.end(body), reject);
+    }, 100);
+  });
 }
 
 async function gone(relay: InviteRelay, token: string): Promise<void> {
@@ -527,36 +562,30 @@ describe('every way a token ends (S8, S14)', () => {
   it('a token closed while its request body was on its way serves nothing (S8)', async () => {
     const { relay, page } = await room();
     const minted = await mintAgent(page);
-    const body = JSON.stringify(INITIALIZE);
-    const answered = new Promise<number>((resolve, reject) => {
-      const req = httpRequest(new URL('/g/mcp', relay.relay.url), {
-        method: 'POST',
-        headers: {
-          Host: new URL(PUBLIC_ORIGIN).host,
-          Authorization: `Bearer ${minted.token}`,
-          'Content-Type': 'application/json',
-          Accept: 'application/json, text/event-stream',
-          'Content-Length': String(Buffer.byteLength(body)),
-        },
-      });
-      req.on('response', (res) => {
-        res.resume();
-        resolve(res.statusCode ?? 0);
-      });
-      req.on('error', reject);
-      req.flushHeaders();
-      // The token checks out on arrival, then closes before the body comes.
-      setTimeout(() => {
-        page.send({ t: 'agent_cancel', tokenId: minted.tokenId });
-        void page.sync().then(() => {
-          req.end(body);
-        });
-      }, 100);
+    const answered = heldBody(relay, minted.token, async () => {
+      page.send({ t: 'agent_cancel', tokenId: minted.tokenId });
+      await page.sync();
     });
     expect(await answered).toBe(404);
     // Nothing reached the page: no prompt was raised.
     await page.sync();
     expect(page.all('attach_request')).toHaveLength(1);
+  });
+
+  it('nor does one closed and minted again under the same id meanwhile, which is another token', async () => {
+    const { relay, page } = await room();
+    const minted = await mintAgent(page);
+    const answered = heldBody(relay, minted.token, async () => {
+      page.send({ t: 'agent_cancel', tokenId: minted.tokenId });
+      await page.sync();
+      const again = await mintAgent(page, { tokenId: minted.tokenId });
+      expect(again.answer.refused).toBeUndefined();
+    });
+    expect(await answered).toBe(404);
+    // The new token raised no prompt carrying the old one, which would burn it.
+    await page.sync();
+    expect(page.all('attach_request')).toHaveLength(1);
+    expect(relay.store.agents.get(page.pageId, minted.tokenId)?.state).toBe('dormant');
   });
 });
 
@@ -651,6 +680,27 @@ describe('/g/mcp answers (S11, S12)', () => {
       body: JSON.stringify(toolCall('list_pages', {})),
     });
     expect(alice.status).toBe(404);
+  });
+
+  it('parses no large body to name a client, nor any body an attached agent sends (ADR 0030)', async () => {
+    const { relay, page } = await room();
+    const attached = await attachedAgent(relay, page);
+    const dormant = await mintAgent(page);
+    // About 1.8 MB of empty objects, which would hold some fifty times that once parsed.
+    const flood = Array.from({ length: 600_000 }, () => ({}));
+    const parse = vi.spyOn(JSON, 'parse');
+    try {
+      for (const token of [dormant.token, attached.token]) {
+        const answer = await agentRequest(relay.relay.url, token, flood);
+        expect(answer.status).toBe(413);
+      }
+      const long = parse.mock.calls.filter(
+        ([text]) => typeof text === 'string' && text.length > 16 * 1024,
+      );
+      expect(long).toHaveLength(0);
+    } finally {
+      parse.mockRestore();
+    }
   });
 
   it('never writes the token, its digest or its label to a line or a record', async () => {

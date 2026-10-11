@@ -76,7 +76,6 @@ import { WebSocketServer } from 'ws';
 import { auditDirByPath, FileAuditLog } from './audit-file.ts';
 import { createAuthRefusalLog } from './auth-log.ts';
 import {
-  agentUser,
   type AuthOutcome,
   AuthOutcomeSchema,
   type AuthRefusal,
@@ -246,6 +245,13 @@ const MAX_MCP_BODY_BYTES = 2 * MAX_FRAME_BYTES;
  * it, and whatever the request carried may stay with it (A4.3).
  */
 const MAX_LISTEN_BODY_BYTES = 16 * 1024;
+
+/**
+ * The most of a /g/mcp body parsed to name its client in a token's prompt.
+ * An initialize or a discover naming one is a few hundred bytes, and only
+ * the leg past the per-user heap measure parses anything larger (ADR 0044).
+ */
+const MAX_AGENT_NAMING_BYTES = 16 * 1024;
 
 /** A JSON-RPC error answer, shaped as the SDK shapes its own. */
 function jsonRpcError(status: number, code: number, message: string, id: unknown = null): Response {
@@ -483,7 +489,14 @@ function bearerOf(header: string | undefined): string | null {
  * session, the envelope's on 2026-07-28; null when it names none. Self-declared,
  * so capped and made plain (parseClientInfo); for the prompt, never a check.
  */
-function agentClientOf(message: unknown): ClientInfo | null {
+function agentClientOf(bytes: ArrayBuffer): ClientInfo | null {
+  let message: unknown;
+  try {
+    message = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+  } catch {
+    // Not JSON: the leg answers it, and it names no client.
+    return null;
+  }
   const first: unknown = Array.isArray(message) ? (message as unknown[])[0] : message;
   if (!isJSONRPCRequest(first)) return null;
   if (first.method === 'initialize') return parseClientInfo(recordAt(first.params, 'clientInfo'));
@@ -1042,10 +1055,13 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   /**
    * /g/mcp ahead of the same legs as /mcp (ADR 0044), so sessions, listen
    * streams, budgets, the dispatcher and the response ceiling are shared.
-   * Its body read, the token is asked about again, as a member list change
-   * is for /mcp (S8): one closed while the client held its body back gets
-   * the same 404. Then its arrival can prompt the operator, naming the
-   * client the body names.
+   * Its body read, the token presented is asked about again, as a member
+   * list change is for /mcp (S8): one closed while the client held its body
+   * back gets the same 404, and so does one closed and minted again under
+   * the same id, which is another token. Then its arrival can prompt the
+   * operator, naming the client a small body names; nothing larger is
+   * parsed before the leg's heap measure, nor anything an attached agent
+   * sends, which no prompt needs.
    */
   const agentSliced = {
     fetch: async (request: Request, options?: McpHandlerRequestOptions): Promise<Response> => {
@@ -1059,20 +1075,17 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         return new Response(AGENT_NOT_FOUND, { status: 404 });
       }
       const { pageId, tokenId } = agent.data.agent;
-      let message: unknown = undefined;
-      if (request.method === 'POST') {
-        const text = await request
-          .clone()
-          .text()
-          .catch(() => null);
-        try {
-          message = text === null ? undefined : (JSON.parse(text) as unknown);
-        } catch {
-          // Not JSON: the leg answers it, and it names no client.
-        }
-      }
+      // A copy, read whole and dropped, as legs.fetch reads its own.
+      const bytes =
+        request.method === 'POST'
+          ? await request
+              .clone()
+              .arrayBuffer()
+              .catch(() => null)
+          : null;
       const now = Date.now();
-      if (!hub.agentLive(pageId, tokenId, now)) {
+      const live = hub.agentCaller(token, now);
+      if (live === null || live.pageId !== pageId || live.tokenId !== tokenId) {
         await request.body?.cancel().catch(() => undefined);
         mcpLines.write('info', 'agent request refused: its token closed while the body arrived', {
           tokenId,
@@ -1083,12 +1096,9 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         });
       }
       if (request.method === 'POST') {
-        hub.agentArrived(
-          { user: agentUser(pageId, tokenId), tokenId, pageId },
-          token,
-          agentClientOf(message),
-          now,
-        );
+        const named =
+          !live.attached && bytes !== null && bytes.byteLength <= MAX_AGENT_NAMING_BYTES;
+        hub.agentArrived(live, token, named ? agentClientOf(bytes) : null, now);
       }
       return sliced.fetch(request, options);
     },
