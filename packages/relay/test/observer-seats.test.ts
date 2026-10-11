@@ -5,7 +5,8 @@
 // provider, the page answering every request as the adapter would.
 
 import { MAX_INVITE_USES } from '@tabdock/protocol';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { DEFAULT_RATE_LIMITS } from '../src/config.ts';
 import {
   attachMember,
   call,
@@ -28,6 +29,7 @@ const MORE_MEMBERS = [
 let current: InviteRelay | undefined;
 
 afterEach(async () => {
+  vi.useRealTimers();
   await current?.close();
   current = undefined;
 });
@@ -95,6 +97,37 @@ describe('watching seats beside the people (ADR 0044, A6.19)', () => {
     // The people still have their seats.
     await attachMember(await relay.claude('sub-carol'), page, 'observer');
     expect(await seats(page)).toEqual({ people: 3, watching: 40 });
+  }, 60_000);
+
+  it("seat a class on the default pairing limits: past the page's 30 pairings a minute the rest join the next minute (S14)", async () => {
+    // No raised limit here: what a class meets on a relay as shipped.
+    current = await startInviteRelay({ users: [...MEMBERS, ...MORE_MEMBERS] });
+    const relay = current;
+    const { pairAttemptsPerPage: perMinute, windowMs } = DEFAULT_RATE_LIMITS;
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const page = await relay.page({ policy: { invites: 'all' } });
+    // Alice's own pairing is one of the page's 30 this minute.
+    await attachMember(await relay.claude('sub-alice'), page);
+    const { secrets } = await fillRoom(relay, page, perMinute - 1);
+    expect(secrets).toHaveLength(2);
+    const secret = secrets.at(-1) ?? '';
+    // The 30th student is turned away at /i before the page hears of it.
+    await page.sync();
+    const asked = page.all('attach_request').length;
+    const late = await signedInAtI(relay, guestSub(perMinute - 1), guestEmail(perMinute - 1));
+    expect(await late.post('/i/claim', { secret })).toMatchObject({
+      status: 429,
+      data: { error: 'rate_limited' },
+    });
+    await page.sync();
+    expect(page.all('attach_request')).toHaveLength(asked);
+    // A minute on, the rest of the class joins by the same link, to its twentieth use.
+    vi.setSystemTime(Date.now() + windowMs + 1000);
+    for (let index = perMinute - 1; index < 40; index += 1) {
+      await joinRoom(relay, page, index, secret);
+    }
+    expect(await seats(page)).toEqual({ people: 1, watching: 40 });
+    await refusedAtI(relay, page, 40, (await mintOk(page, { uses: 2 })).secret);
   }, 60_000);
 
   it('serve a seated room on the default invitee pool: forty guests, two sessions each, every one reading the page (A6.20)', async () => {
