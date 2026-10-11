@@ -73,7 +73,8 @@ export class MemoryStorage implements StorageLike {
  * token's first request (ADR 0044) reaches attach with via 'agent' and
  * `agent` naming the token's id and label, only once the adapter has checked
  * it against the page's own record; whatever attach answers, the page grants
- * an agent observer alone, and a deny or three silences burn the token.
+ * an agent observer alone. A deny burns the token at once; a silence sends
+ * the relay nothing, whose own timer counts it, and the third burns it.
  */
 export type SimOperator = UiPort;
 
@@ -109,6 +110,8 @@ export interface SimPageOptions {
   adapterVersion?: string;
   /** Timers for the adapter core; a test can shorten one, such as the silence watchdog. */
   timers?: Timers;
+  /** The page's clock, Date.now unless set; a test can run it ahead of the relay's, as a real tab's may be. */
+  clock?: () => number;
   /**
    * WebCrypto for minting and checking invites (ADR 0017); Node's global
    * crypto unless set, which mints for real. A test can pass one without
@@ -333,6 +336,7 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
       adapterVersion: options.adapterVersion ?? '0.0.0-sim',
       logger,
       timers: options.timers,
+      clock: options.clock,
       crypto: options.crypto,
     });
     core.dock.on('state', (state) => {

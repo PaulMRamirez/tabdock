@@ -3334,7 +3334,11 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     // frame, which went first; a decision would only reach a request already
     // gone there, and count against the page's budget for frames that change
     // nothing (A4.3). While the link is down the relay dropped them anyway.
-    if (cause === 'revoke') return true;
+    // An agent token's silence is the relay's to count: its own timer ends
+    // the request as a timeout, which only the third time burns the token,
+    // whereas a refusal from here reads as the operator's deny and burns it
+    // at once (ADR 0044), whichever clock runs ahead.
+    if (cause === 'revoke' || (cause === 'timeout' && agentId !== undefined)) return true;
     return send({
       t: 'attach_decision',
       requestId,

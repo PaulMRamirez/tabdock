@@ -403,6 +403,11 @@ describe('every way the page ends a token', () => {
         expect(socket.framesOf('agent_cancel')).toEqual([]);
       }
     }
+    // Silence is never sent as a refusal, which the relay would take for the
+    // operator's deny and burn the token on: its own timer counts each one.
+    expect(
+      socket.framesOf('attach_decision').filter((frame) => frame.requestId.startsWith('ask-')),
+    ).toEqual([]);
     expect(socket.framesOf('agent_cancel')).toEqual([
       { t: 'agent_cancel', tokenId: minted.tokenId },
     ]);
