@@ -1,33 +1,38 @@
-// One class on one page, as the classroom scenario has it (ADR 0044, A6.22;
-// docs/plans/map-classroom.md), against main.ts as the image runs it: hosted
-// mode behind a stand-in edge, the image's heap flag, invites on and every
-// other setting at its default unless a run names it. A teacher's Claude
-// pairs as a member and drives set_view every 2 s; the page runs the map
-// profile, publishes about 4 KiB of state twice a second and answers images
-// up to the relay's cap; the teacher starts a time-boxed session whose watch
-// invites the class redeems at /i, each student's browser on an address of
-// its own (or all on one, as behind a campus NAT). Each student then holds
-// two 2025-11-25 sessions and a 2026-07-28 client with a listen stream.
+// One or more classes, each on a page of its own, as the classroom scenario
+// has it (ADR 0044, A6.22; docs/plans/map-classroom.md), against main.ts as
+// the image runs it: hosted mode behind a stand-in edge, the image's heap
+// flag, invites on and every other setting at its default unless a run
+// names it. Each page's teacher, a member, pairs their Claude and drives
+// set_view every 2 s; the page runs the map profile, publishes about 4 KiB
+// of state twice a second and answers images up to the relay's cap; the
+// teacher starts a time-boxed session whose watch invites the class redeems
+// at /i, each student's browser on an address of its own (or all on one, as
+// behind a campus NAT). Each student then holds two 2025-11-25 sessions and
+// a 2026-07-28 client with a listen stream.
 //
-// The phases follow the design's profiles. join (P4) is the class arriving
-// within half a minute under the shipped pairing and sign-in limits. class
-// (P1 with images and proposals) reads state every 20 s, the view every
-// 60 s, captures every 2 min and proposes a stop every 3 min, the teacher
-// accepting one proposal every 20 s and dismissing the rest. agents (P2) has
-// every student's agent loop wait_for_page_state at its 60-a-minute budget,
-// at the burst quota and then at Fly's 6.25% baseline. stalled (P3) has a
-// quarter of the class leave a 0.72 MB answer and an image unread until the
-// relay cuts them. ceiling has every student read two 0.72 MB answers at
-// most 64 KiB every 25 s, so unread bytes pile up toward
-// TABDOCK_MAX_RESPONSE_BYTES, past which the relay must cut guests' answers,
-// never the teacher's. Those two phases run with TCP buffers narrowed, so the
-// relay rather than loopback's kernel holds what nobody reads (sockets.ts).
-// No token, secret, code or invite link is ever printed.
+// The phases follow the design's profiles. join (P4) is the classes
+// arriving within half a minute under the shipped pairing and sign-in
+// limits. class (P1 with images and proposals) reads state every 20 s, the
+// view every 60 s, captures every 2 min and proposes a stop every 3 min, the
+// teacher accepting one proposal every 20 s and dismissing the rest. agents
+// (P2) has every student's agent loop wait_for_page_state at its
+// 60-a-minute budget. Both run at the burst quota and then at Fly's 6.25%
+// baseline. stalled (P3) has a quarter of each class leave a 0.72 MB answer
+// and an image unread until the relay cuts them. ceiling has every student
+// read two 0.72 MB answers at most 64 KiB every 25 s, so unread bytes pile
+// up toward TABDOCK_MAX_RESPONSE_BYTES, past which the relay must cut
+// guests' answers, while each teacher keeps two answers of their own
+// waiting, read a little every 5 s, which must never be cut. Those two
+// phases run with TCP buffers narrowed, so the relay rather than loopback's
+// kernel holds what nobody reads (sockets.ts). Every answer left unread is
+// settled at its phase's end by draining it (held.ts), so whether it was
+// cut is the client's own finding. No token, secret, code or invite link is
+// ever printed.
 
 import { type ChildProcess, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
-import { request as httpRequest, type ClientRequest, type IncomingMessage } from 'node:http';
+import { request as httpRequest } from 'node:http';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
@@ -47,8 +52,19 @@ import {
   createMapWorld,
   type MapCaptured,
 } from '@tabdock/sim-page/map';
+import {
+  RESPONSE_CAP_LINE,
+  RESPONSE_CEILING_LINE,
+  RESPONSE_CUT_LINE,
+} from '../../../../packages/relay/src/response-stalls.ts';
 import { waitPageState } from '../state-helpers.ts';
-import { BASELINE_QUOTA_US, BURST_QUOTA_US, type Confinement, type GroupStats } from './confine.ts';
+import {
+  applyQuota,
+  BASELINE_QUOTA_US,
+  BURST_QUOTA_US,
+  type Confinement,
+  type GroupStats,
+} from './confine.ts';
 import {
   edgeFetch,
   PUBLIC_HOST,
@@ -58,7 +74,8 @@ import {
   StudentBrowser,
   type PageEdge,
 } from './edge.ts';
-import { narrowSocketBuffers } from './sockets.ts';
+import { type HeldAnswer, holdAnswer } from './held.ts';
+import { narrowSocketBuffers, type NarrowScope } from './sockets.ts';
 import { CallBook, CallLog, mib, round, sleep, Tally } from './stats.ts';
 
 const ROOT = resolve(import.meta.dirname, '../../../..');
@@ -70,10 +87,15 @@ const MAIN = join(ROOT, 'packages/relay/src/main.ts');
 const PROBE = resolve(import.meta.dirname, 'probe.ts');
 const PAGE_ORIGIN = 'https://class-map.test';
 const PAGE_ADDRESS = '198.51.100.10';
-const TEACHER_SUB = 'sub-teacher';
 const SHARED_ADDRESS = '203.0.113.250';
+/** Students on addresses of their own take 203.0.113.1 onward, short of the shared one. */
+export const MAX_STUDENTS = 249;
+/** Unread answers each teacher keeps waiting through the ceiling phase. */
+const MEMBER_HELD = 2;
+/** How long settling may drain the answers left unread at a phase's end. */
+const SETTLE_MS = 30_000;
 
-/** How far apart the ceiling phase asks for answers: just under the watchers' share of a page. */
+/** How far apart a page's unread answers are asked for: just under the watchers' share of a page. */
 export const FILL_SPACING_MS =
   Math.ceil(DEFAULT_RATE_LIMITS.windowMs / DEFAULT_RATE_LIMITS.watchingCallsPerPage) + 50;
 
@@ -96,19 +118,31 @@ function blankSettings(): Record<string, string> {
   return Object.fromEntries(names.map((name) => [name, '']));
 }
 
+/** The relays a run has started and not yet seen exit, so an interrupt can stop them. */
+const liveRelays = new Set<ChildProcess>();
+
+/** Kills every relay still running, for a run cut short; its groups are then empty. */
+export function killRelays(): void {
+  for (const child of liveRelays) child.kill('SIGKILL');
+}
+
 export interface RoomPlan {
-  /** Students in the class. */
+  /** Students in each class. */
   size: number;
+  /** Classes at once, each on a page of its own with its own teacher. */
+  pages: number;
   /** Settings beyond the defaults this run names, such as more watching seats. */
   settings: Record<string, string>;
   /** Every student on one address, as a class behind one NAT. */
   sharedAddress: boolean;
   /** Stop after the join, for the shared-address run. */
   joinOnly: boolean;
-  /** Each phase's length after its ramp. */
+  /** Each phase's length after its ramp; the baseline phases take the agents' length. */
   phaseMs: { class: number; agents: number; stalled: number; ceiling: number };
-  /** Where the join may spread its students' first taps. */
+  /** Where the join may spread each class's first taps. */
   joinSpreadMs: number;
+  /** Whose TCP buffers the unread phases may narrow (sockets.ts). */
+  narrow: NarrowScope;
 }
 
 export interface MemoryPeaks {
@@ -118,14 +152,27 @@ export interface MemoryPeaks {
   externalMiB: number | null;
   arrayBuffersMiB: number | null;
   groupPeakMiB: number | null;
+  /** What answers waiting to be read held as the response ceiling counts them, sampled every 2 s. */
+  responsesHeldMiB: number | null;
+}
+
+export interface HeldTally {
+  asked: number;
+  /** whole, cut, open, or a refusal's code, once settled. */
+  outcomes: Record<string, number>;
 }
 
 export interface PhaseResult {
   name: string;
   seconds: number;
+  /** The CPU quota per 80 ms period the phase ran under, or null when none could be set. */
   quotaUs: number | null;
   peaks: MemoryPeaks;
+  /** The heap after a collection taken while the phase's load still ran: what the bar reads. */
+  heapAfterGcUnderLoadMiB: number | null;
+  /** The same once the load stopped and its unread answers settled. */
   heapAfterGcMiB: number | null;
+  /** The event loop's delay past the probe's 10 ms sampling interval. */
   eventLoopMs: { p50: number | null; p99: number | null; max: number | null };
   cpuMs: number | null;
   /** The relay's CPU per request /mcp answered in the phase. */
@@ -138,13 +185,12 @@ export interface PhaseResult {
   calls: ReturnType<CallBook['toJSON']>;
   statuses: Record<string, number>;
   logLines: Record<string, number>;
-  held: {
-    asked: number;
-    cut: number;
-    ended: number;
-    open: number;
-    refused: Record<string, number>;
-  };
+  /** Answers the relay cut, by rule, from its own lines and their repeat counts. */
+  cuts: { stall: number; cap: number; ceiling: number };
+  /** Students' answers left unread, settled by draining. */
+  held: HeldTally;
+  /** The teachers' answers left waiting, which must all end whole. */
+  memberHeld: HeldTally;
   harnessLoopP99Ms: number | null;
 }
 
@@ -153,7 +199,7 @@ export interface JoinResult {
   joined: number;
   /** Seconds from the first tap until the last student was approved. */
   allJoinedSeconds: number | null;
-  /** How many were approved within 60 s of the first tap. */
+  /** How many were approved within 60 s of their class's first tap. */
   joinedInFirstMinute: number;
   signInRefusals: number;
   claimRefusals: Record<string, number>;
@@ -165,6 +211,7 @@ export interface JoinResult {
 
 export interface RoomResult {
   size: number;
+  pages: number;
   settings: Record<string, string>;
   sharedAddress: boolean;
   confinement: { kind: string; cpu: number | null; notes: readonly string[] };
@@ -172,6 +219,8 @@ export interface RoomResult {
   rosterFrameMaxBytes: number;
   join: JoinResult;
   phases: PhaseResult[];
+  /** Phases left out, and why. */
+  skipped: string[];
   /** How the unread phases narrowed TCP buffers, or why they could not (sockets.ts). */
   socketBuffers: string;
   relayExit: string;
@@ -184,6 +233,7 @@ interface ProbeMemory {
   heapUsed: number;
   external: number;
   arrayBuffers: number;
+  responsesHeld: number | null;
 }
 
 function num(value: unknown): number | null {
@@ -202,7 +252,14 @@ function probeMemory(value: unknown): ProbeMemory | null {
   const external = num(raw.external);
   const arrayBuffers = num(raw.arrayBuffers);
   if (vmRss === null || vmHwm === null || heapUsed === null || external === null) return null;
-  return { vmRss, vmHwm, heapUsed, external, arrayBuffers: arrayBuffers ?? 0 };
+  return {
+    vmRss,
+    vmHwm,
+    heapUsed,
+    external,
+    arrayBuffers: arrayBuffers ?? 0,
+    responsesHeld: num(raw.responsesHeld),
+  };
 }
 
 /** The IPC side of probe.ts: one request at a time per id, each given up after a while. */
@@ -223,7 +280,10 @@ class ProbeChannel {
     });
   }
 
-  ask(t: 'sample' | 'mark' | 'read', timeoutMs = 30_000): Promise<Record<string, unknown> | null> {
+  ask(
+    t: 'sample' | 'mark' | 'gc' | 'read',
+    timeoutMs = 30_000,
+  ): Promise<Record<string, unknown> | null> {
     const id = this.#next;
     this.#next += 1;
     return new Promise((resolveAnswer) => {
@@ -274,11 +334,13 @@ async function startRelay(
     env: { ...blankSettings(), PATH: process.env.PATH ?? '', TABDOCK_PORT: '0', ...env },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
+  liveRelays.add(child);
   let sink = new Tally();
   let output = '';
   let partial = '';
   const exited = new Promise<string>((resolveExit) => {
     child.once('exit', (code, signal) => {
+      liveRelays.delete(child);
       resolveExit(signal ?? `code ${String(code)}`);
     });
   });
@@ -298,12 +360,10 @@ async function startRelay(
           const parsed = record(JSON.parse(line));
           const level = typeof parsed.level === 'string' ? parsed.level : '?';
           const msg = typeof parsed.msg === 'string' ? parsed.msg : '?';
-          // A line about the teacher is told apart, so a member's cut can never hide among guests'.
-          const who = parsed.userId === 'teacher' ? ' (teacher)' : '';
           // A window's summary of a repeated line counts as the lines it stands for.
           const repeated = msg.endsWith(', repeated') ? num(parsed.repeated) : null;
           const key = repeated === null ? msg : msg.slice(0, -', repeated'.length);
-          if (level !== 'debug') sink.add(`${level} ${key}${who}`, repeated ?? 1);
+          if (level !== 'debug') sink.add(`${level} ${key}`, repeated ?? 1);
           if (level === 'warn' || level === 'error') debug(`relay: ${line.slice(0, 400)}`);
         } catch {
           // A torn line; the next one is whole.
@@ -364,8 +424,25 @@ function caption(tick: number): string {
   return parts.join(' ').slice(0, 4000);
 }
 
-interface Student {
+/** One page with its teacher and class. */
+interface Classroom {
   index: number;
+  sim: SimPage;
+  pageId: string;
+  teacher: Client;
+  teacherSub: string;
+  teacherToken: string;
+  /** A 2025-11-25 session of the teacher's, for answers they leave waiting. */
+  teacherSessionId: string | null;
+  secrets: string[];
+}
+
+interface Student {
+  /** Across every class, for its address. */
+  index: number;
+  /** Within its own class, for its invite and its place in the join. */
+  local: number;
+  room: Classroom;
   sub: string;
   email: string;
   address: string;
@@ -400,19 +477,18 @@ function thrownOutcome(error: unknown): string {
   return 'thrown';
 }
 
-/** One held answer: its client reads the first KiB, then at most 64 KiB every 25 s, or nothing. */
-interface Held {
-  /** pending or held while open, ended, cut, or the code a refusal began with. */
-  outcome: string;
-  close(): void;
+function tallyOf(answers: readonly HeldAnswer[]): HeldTally {
+  const outcomes = new Tally();
+  for (const answer of answers) outcomes.add(answer.outcome);
+  return { asked: answers.length, outcomes: outcomes.toJSON() };
 }
 
 class Phase {
   readonly calls = new CallBook();
   readonly statuses = new Tally();
   readonly logs = new Tally();
-  readonly heldRefused = new Tally();
-  readonly held: Held[] = [];
+  readonly held: HeldAnswer[] = [];
+  readonly memberHeld: HeldAnswer[] = [];
   readonly started = performance.now();
   peaks: MemoryPeaks = {
     vmRssMiB: null,
@@ -421,7 +497,9 @@ class Phase {
     externalMiB: null,
     arrayBuffersMiB: null,
     groupPeakMiB: null,
+    responsesHeldMiB: null,
   };
+  heapUnderLoadMiB: number | null = null;
   harnessDelays: number[] = [];
   groupAtStart: GroupStats | null = null;
 
@@ -442,6 +520,7 @@ class Phase {
       this.peaks.heapUsedMiB = max(this.peaks.heapUsedMiB, mib(memory.heapUsed));
       this.peaks.externalMiB = max(this.peaks.externalMiB, mib(memory.external));
       this.peaks.arrayBuffersMiB = max(this.peaks.arrayBuffersMiB, mib(memory.arrayBuffers));
+      this.peaks.responsesHeldMiB = max(this.peaks.responsesHeldMiB, mib(memory.responsesHeld));
     }
     if (group !== null) {
       this.peaks.groupPeakMiB = max(
@@ -452,19 +531,31 @@ class Phase {
   }
 }
 
+/** Lists grouped by each student's page, in the order given. */
+function byRoom<T extends { room: Classroom }>(items: readonly T[], pages: number): T[][] {
+  const lists: T[][] = Array.from({ length: pages }, () => []);
+  for (const item of items) lists[item.room.index]?.push(item);
+  return lists;
+}
+
 export async function measureRoom(
   plan: RoomPlan,
   confinement: Confinement,
   say: (line: string) => void,
 ): Promise<RoomResult> {
+  if (plan.size * plan.pages > MAX_STUDENTS) {
+    throw new Error(`at most ${String(MAX_STUDENTS)} students in all`);
+  }
   const scratch = realpathSync(mkdtempSync(join(ROOT, 'tests/e2e/test-results/measure-room-')));
   const cleanups: (() => Promise<unknown>)[] = [];
   let phase = new Phase('start', BURST_QUOTA_US);
   const sink: StatusSink = { current: () => phase.statuses };
   const phases: PhaseResult[] = [];
+  const skipped: string[] = [];
   let relayExit = 'never started';
   let socketBuffers = 'not narrowed: no phase left answers unread';
   let result: RoomResult | null = null;
+  const teacherSubs = Array.from({ length: plan.pages }, (_, n) => `sub-teacher-${String(n + 1)}`);
   try {
     const provider: TestProvider = await startProvider();
     cleanups.push(() => provider.stop());
@@ -474,7 +565,9 @@ export async function measureRoom(
       TABDOCK_HOST: '127.0.0.1',
       TABDOCK_PUBLIC_URL: `https://${PUBLIC_HOST}`,
       TABDOCK_OAUTH_ISSUER: provider.issuer,
-      TABDOCK_OAUTH_USERS: `${TEACHER_SUB}=teacher:Teacher`,
+      TABDOCK_OAUTH_USERS: teacherSubs
+        .map((sub, n) => `${sub}=teacher${String(n + 1)}:Teacher ${String(n + 1)}`)
+        .join(','),
       TABDOCK_PAIR_CLIENT_ID: PAIR_CLIENT.clientId,
       TABDOCK_PAIR_CLIENT_SECRET: PAIR_CLIENT.clientSecret,
       TABDOCK_ALLOWED_ORIGINS: PAGE_ORIGIN,
@@ -498,62 +591,6 @@ export async function measureRoom(
     relay.setLogSink(phase.logs);
     const edge: PageEdge = await startPageEdge(Number(new URL(relay.url).port), PAGE_ADDRESS);
     cleanups.push(() => edge.close());
-
-    // The page: the map profile, a large read-only notes tool and images at the cap.
-    const world = createMapWorld();
-    const png = noisePng();
-    const capture = (): Promise<MapCaptured> =>
-      Promise.resolve({
-        mimeType: 'image/png',
-        data: png.data,
-        widthPx: png.width,
-        heightPx: png.height,
-      });
-    const notesTool: FakeToolDefinition = {
-      name: 'read_notes',
-      description: "Return the lesson's notes as text.",
-      inputSchema: { type: 'object', properties: {} },
-      annotations: { readOnlyHint: true, untrustedContentHint: true },
-      execute: () => NOTES_TEXT,
-    };
-    const sim: SimPage = await startSimPage({
-      relayUrl: edge.pageUrl,
-      origin: PAGE_ORIGIN,
-      title: 'Class map',
-      policy: {
-        consequentialTools: ['reset_edits'],
-        imageTools: ['capture_view'],
-        maxDrivers: 2,
-        proposals: 'all',
-      },
-      operator: { askAttach: () => 'driver' },
-      tools: () => [...createMapTools(world, { capture }), ...createMapEditTools(world), notesTool],
-    });
-    cleanups.push(() => sim.close());
-    await sim.waitFor((state) => state.link === 'linked' && state.pairing !== null, 20_000);
-    let rosterFrameMaxBytes = 0;
-    const watchFrames = (): void => {
-      sim.socket?.on('message', (data: Buffer) => {
-        if (
-          data.length > rosterFrameMaxBytes &&
-          data.subarray(0, 40).toString().includes('"t":"roster"')
-        ) {
-          rosterFrameMaxBytes = data.length;
-        }
-      });
-    };
-    watchFrames();
-
-    // State twice a second, as a flyby playing its clock with a caption.
-    let tick = 0;
-    const publisher = setInterval(() => {
-      tick += 1;
-      sim.publishState({ ...world.state(), tick, caption: caption(tick) });
-    }, 500);
-    cleanups.push(() => {
-      clearInterval(publisher);
-      return Promise.resolve();
-    });
 
     const tokenFor = (sub: string, email?: string): Promise<string> =>
       provider.token({
@@ -585,34 +622,105 @@ export async function measureRoom(
       return client;
     };
 
-    // The teacher pairs as a member and drives.
-    const teacher = await connectClient(
-      await tokenFor(TEACHER_SUB),
-      PAGE_ADDRESS,
-      'claude-code',
-      true,
-    );
-    const code = sim.state.pairing?.code ?? '';
-    const pairing = teacher.callTool({ name: 'pair_page', arguments: { code } });
-    const paired = await pairing;
-    if (paired.isError === true) throw new Error('the teacher could not pair');
-    const pageId = String(record(paired.structuredContent).page);
-    const started = await sim.dock.startSession({
-      label: 'Class',
-      lengthMinutes: 240,
-      observers: plan.size,
-      proposals: 'all',
-    });
-    if (!started.ok) throw new Error(`no session: ${started.reason}`);
-    const secrets = started.links.map((link) => link.link.split('#')[1] ?? '');
-    if (secrets.length < Math.ceil(plan.size / MAX_INVITE_USES)) {
-      throw new Error('the session minted too few watch invites for the class');
-    }
+    // Each page: the map profile, a large read-only notes tool and images at the cap.
+    const png = noisePng();
+    const capture = (): Promise<MapCaptured> =>
+      Promise.resolve({
+        mimeType: 'image/png',
+        data: png.data,
+        widthPx: png.width,
+        heightPx: png.height,
+      });
+    const notesTool: FakeToolDefinition = {
+      name: 'read_notes',
+      description: "Return the lesson's notes as text.",
+      inputSchema: { type: 'object', properties: {} },
+      annotations: { readOnlyHint: true, untrustedContentHint: true },
+      execute: () => NOTES_TEXT,
+    };
+    let rosterFrameMaxBytes = 0;
+    const rooms: Classroom[] = [];
+    for (let index = 0; index < plan.pages; index += 1) {
+      const world = createMapWorld();
+      const sim: SimPage = await startSimPage({
+        relayUrl: edge.pageUrl,
+        origin: PAGE_ORIGIN,
+        title: `Class map ${String(index + 1)}`,
+        policy: {
+          consequentialTools: ['reset_edits'],
+          imageTools: ['capture_view'],
+          maxDrivers: 2,
+          proposals: 'all',
+        },
+        operator: { askAttach: () => 'driver' },
+        tools: () => [
+          ...createMapTools(world, { capture }),
+          ...createMapEditTools(world),
+          notesTool,
+        ],
+      });
+      cleanups.push(() => sim.close());
+      await sim.waitFor((state) => state.link === 'linked' && state.pairing !== null, 20_000);
+      sim.socket?.on('message', (data: Buffer) => {
+        if (
+          data.length > rosterFrameMaxBytes &&
+          data.subarray(0, 40).toString().includes('"t":"roster"')
+        ) {
+          rosterFrameMaxBytes = data.length;
+        }
+      });
+      // State twice a second, as a flyby playing its clock with a caption.
+      let tick = 0;
+      const publisher = setInterval(() => {
+        tick += 1;
+        sim.publishState({ ...world.state(), tick, caption: caption(tick) });
+      }, 500);
+      cleanups.push(() => {
+        clearInterval(publisher);
+        return Promise.resolve();
+      });
 
-    // How large each held answer is on the wire, read whole once by the teacher.
+      // The teacher pairs as a member and drives.
+      const teacherSub = teacherSubs[index] ?? '';
+      const teacherToken = await tokenFor(teacherSub);
+      const teacher = await connectClient(teacherToken, PAGE_ADDRESS, 'claude-code', true);
+      const paired = await teacher.callTool({
+        name: 'pair_page',
+        arguments: { code: sim.state.pairing?.code ?? '' },
+      });
+      if (paired.isError === true) throw new Error('a teacher could not pair');
+      const pageId = String(record(paired.structuredContent).page);
+      const started = await sim.dock.startSession({
+        label: `Class ${String(index + 1)}`,
+        lengthMinutes: 240,
+        observers: plan.size,
+        proposals: 'all',
+      });
+      if (!started.ok) throw new Error(`no session: ${started.reason}`);
+      const secrets = started.links.map((link) => link.link.split('#')[1] ?? '');
+      if (secrets.length < Math.ceil(plan.size / MAX_INVITE_USES)) {
+        throw new Error('the session minted too few watch invites for the class');
+      }
+      // The teacher's second device, a 2025-era client, holds the answers they leave waiting.
+      const second = await connectClient(teacherToken, PAGE_ADDRESS, 'claude-ai', false);
+      rooms.push({
+        index,
+        sim,
+        pageId,
+        teacher,
+        teacherSub,
+        teacherToken,
+        teacherSessionId: sessionOf(second),
+        secrets,
+      });
+    }
+    const [first] = rooms;
+    if (first === undefined) throw new Error('no page');
+
+    // How large each held answer is on the wire, read whole once by a teacher.
     const answerBytes = {
-      notes: await answerSize(relay.url, await tokenFor(TEACHER_SUB), pageId, 'read_notes', {}),
-      capture: await answerSize(relay.url, await tokenFor(TEACHER_SUB), pageId, 'capture_view', {}),
+      notes: await answerSize(relay.url, first.teacherToken, first.pageId, 'read_notes'),
+      capture: await answerSize(relay.url, first.teacherToken, first.pageId, 'capture_view'),
     };
 
     // Samples every 2 s into the running phase; the harness's own loop delay beside them.
@@ -630,16 +738,26 @@ export async function measureRoom(
       return Promise.resolve();
     });
 
-    const beginPhase = async (name: string, quotaUs: number | null): Promise<void> => {
-      if (quotaUs !== null) confinement.setQuota(quotaUs);
+    /** Starts a phase under the quota it asks for, recording the one that applied. */
+    const beginPhase = async (name: string, quotaUs: number): Promise<void> => {
+      const applied = applyQuota(confinement, quotaUs);
       confinement.resetPeak();
       await relay.probe.ask('mark');
-      phase = new Phase(name, quotaUs);
+      phase = new Phase(name, applied);
       phase.groupAtStart = confinement.stats();
       relay.setLogSink(phase.logs);
-      say(`  ${name}: started`);
+      say(`  ${name}: started${applied === null ? ' (no CPU quota could be set)' : ''}`);
+    };
+    /** A collection while the load still runs: the heap that load keeps. */
+    const underLoad = async (): Promise<void> => {
+      const answer = await relay.probe.ask('gc', 60_000);
+      phase.heapUnderLoadMiB = mib(num(answer?.heapAfterGc));
+      phase.note(probeMemory(answer?.memory), confinement.stats());
     };
     const endPhase = async (): Promise<PhaseResult> => {
+      await Promise.all(
+        [...phase.held, ...phase.memberHeld].map((answer) => answer.settle(SETTLE_MS)),
+      );
       const read = await relay.probe.ask('read', 60_000);
       const group = confinement.stats();
       phase.note(probeMemory(read?.memory), group);
@@ -650,13 +768,12 @@ export async function measureRoom(
         .filter(([status]) => status.startsWith('http '))
         .reduce((sum, [, count]) => sum + count, 0);
       const at = phase.groupAtStart;
-      const heldOutcomes = new Tally();
-      for (const held of phase.held) heldOutcomes.add(held.outcome);
       const result: PhaseResult = {
         name: phase.name,
         seconds: round((performance.now() - phase.started) / 1000, 0) ?? 0,
         quotaUs: phase.quotaUs,
         peaks: phase.peaks,
+        heapAfterGcUnderLoadMiB: phase.heapUnderLoadMiB,
         heapAfterGcMiB: mib(num(read?.heapAfterGc)),
         eventLoopMs: {
           p50: round(num(loop.p50)),
@@ -679,13 +796,13 @@ export async function measureRoom(
         calls: phase.calls.toJSON(),
         statuses: phase.statuses.toJSON(),
         logLines: phase.logs.toJSON(),
-        held: {
-          asked: phase.held.length,
-          cut: heldOutcomes.get('cut'),
-          ended: heldOutcomes.get('ended'),
-          open: heldOutcomes.get('held'),
-          refused: phase.heldRefused.toJSON(),
+        cuts: {
+          stall: phase.logs.get(`warn ${RESPONSE_CUT_LINE}`),
+          cap: phase.logs.get(`warn ${RESPONSE_CAP_LINE}`),
+          ceiling: phase.logs.get(`warn ${RESPONSE_CEILING_LINE}`),
         },
+        held: tallyOf(phase.held),
+        memberHeld: tallyOf(phase.memberHeld),
         harnessLoopP99Ms: round(
           phase.harnessDelays.length === 0
             ? null
@@ -696,7 +813,7 @@ export async function measureRoom(
       };
       phases.push(result);
       say(
-        `  ${result.name}: RSS ${String(result.peaks.vmRssMiB)} MiB, heap ${String(result.peaks.heapUsedMiB)} MiB, loop p99 ${String(result.eventLoopMs.p99)} ms, CPU ${String(result.cpuShare)}`,
+        `  ${result.name}: RSS ${String(result.peaks.vmRssMiB)} MiB, heap ${String(result.peaks.heapUsedMiB)} MiB, held ${String(result.peaks.responsesHeldMiB)} MiB, loop p99 ${String(result.eventLoopMs.p99)} ms, CPU ${String(result.cpuShare)}`,
       );
       return result;
     };
@@ -719,54 +836,97 @@ export async function measureRoom(
       }
     };
 
-    // The teacher drives all through, from the join on.
+    /** A tools/call on a 2025-era session whose answer its client reads slowly or not at all. */
+    const hold = (
+      who: { token: string; address: string },
+      sessionId: string,
+      pageId: string,
+      tool: string,
+      mode: 'stall' | 'trickle',
+      everyMs = 25_000,
+    ): HeldAnswer =>
+      holdAnswer({
+        url: new URL('/mcp', relay.url),
+        headers: {
+          host: PUBLIC_HOST,
+          'fly-client-ip': who.address,
+          authorization: `Bearer ${who.token}`,
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          'mcp-session-id': sessionId,
+          'mcp-protocol-version': '2025-11-25',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: nextHeldId(),
+          method: 'tools/call',
+          params: { name: 'call_page_tool', arguments: { page: pageId, tool, arguments: {} } },
+        }),
+        mode,
+        takeBytes: 65_536,
+        everyMs,
+        onStatus: (status) => {
+          sink.current().add(`http ${String(status)}`);
+        },
+      });
+
+    // Each teacher drives all through, from the join on.
     // Flags the loops read after each await, so they live on an object.
     const flags = { teaching: true, operating: true };
-    const teacherLoop = (async () => {
-      let n = 0;
-      while (flags.teaching) {
-        n += 1;
-        const due = performance.now() + 2000;
-        await timed('teacher set_view', () =>
-          teacher.callTool({
-            name: 'call_page_tool',
-            arguments: {
-              page: pageId,
-              tool: 'set_view',
+    const teacherLoops = rooms.map((room) =>
+      (async () => {
+        let n = 0;
+        while (flags.teaching) {
+          n += 1;
+          const due = performance.now() + 2000;
+          await timed('teacher set_view', () =>
+            room.teacher.callTool({
+              name: 'call_page_tool',
               arguments: {
-                lon: ((n * 37) % 340) - 170,
-                lat: ((n * 13) % 120) - 60,
-                widthM: 750_000,
+                page: room.pageId,
+                tool: 'set_view',
+                arguments: {
+                  lon: ((n * 37) % 340) - 170,
+                  lat: ((n * 13) % 120) - 60,
+                  widthM: 750_000,
+                },
               },
-            },
-          }),
-        );
-        await sleep(Math.max(0, due - performance.now()));
-      }
-    })();
+            }),
+          );
+          await sleep(Math.max(0, due - performance.now()));
+        }
+      })(),
+    );
 
-    // P4, the join: each student taps within joinSpreadMs, adds the connector
-    // (a stranger's session), signs in at /i and joins by the session's
-    // invite, tapping Join again 10 s after a refusal, as a person would.
+    // P4, the join: each class's students tap within joinSpreadMs, add the
+    // connector (a stranger's session), sign in at /i and join by their
+    // session's invite, tapping Join again 10 s after a refusal, as a person would.
     await beginPhase('join', BURST_QUOTA_US);
     const students: Student[] = [];
-    for (let index = 0; index < plan.size; index += 1) {
-      const sub = `sub-student-${String(index)}`;
-      const email = `student${String(index)}@example.com`;
-      students.push({
-        index,
-        sub,
-        email,
-        address: plan.sharedAddress ? SHARED_ADDRESS : `203.0.113.${String(index + 1)}`,
-        token: await tokenFor(sub, email),
-        chatA: null,
-        chatB: null,
-        agent: null,
-        listening: null,
-        joinedAt: null,
-        lastVersion: 0,
-      });
+    for (const room of rooms) {
+      for (let local = 0; local < plan.size; local += 1) {
+        const index = students.length;
+        const sub = `sub-student-${String(index)}`;
+        const email = `student${String(index)}@example.com`;
+        students.push({
+          index,
+          local,
+          room,
+          sub,
+          email,
+          address: plan.sharedAddress ? SHARED_ADDRESS : `203.0.113.${String(index + 1)}`,
+          token: await tokenFor(sub, email),
+          chatA: null,
+          chatB: null,
+          agent: null,
+          listening: null,
+          joinedAt: null,
+          lastVersion: 0,
+        });
+      }
     }
+    const tapAt = (student: Student): number =>
+      (student.local * plan.joinSpreadMs) / Math.max(1, plan.size);
     const joinStart = performance.now();
     let signInRefusals = 0;
     let sessionRefusals = 0;
@@ -788,7 +948,7 @@ export async function measureRoom(
       return turn;
     };
     const joinOne = async (student: Student): Promise<void> => {
-      await sleep((student.index * plan.joinSpreadMs) / Math.max(1, plan.size));
+      await sleep(tapAt(student));
       const firstTap = performance.now();
       try {
         student.chatA = await connectClient(student.token, student.address, 'claude-ai', false);
@@ -798,7 +958,7 @@ export async function measureRoom(
       }
       debug(`student ${String(student.index)} connected`);
       const browser = new StudentBrowser(relay.url, student.address, sink);
-      const secret = secrets[Math.floor(student.index / MAX_INVITE_USES)] ?? '';
+      const secret = student.room.secrets[Math.floor(student.local / MAX_INVITE_USES)] ?? '';
       const deadline = firstTap + 10 * 60_000;
       // /i keeps a sign-in for 15 minutes, so a student signs in again only when it asks.
       let signedIn = false;
@@ -842,27 +1002,21 @@ export async function measureRoom(
       .filter((at): at is number => at !== null);
     const lastJoin = students.reduce(
       (latest, student) =>
-        student.joinedAt === null
-          ? latest
-          : Math.max(
-              latest,
-              (student.index * plan.joinSpreadMs) / Math.max(1, plan.size) + student.joinedAt,
-            ),
+        student.joinedAt === null ? latest : Math.max(latest, tapAt(student) + student.joinedAt),
       0,
     );
     const joinedWithinMinute = students.filter(
-      (student) =>
-        student.joinedAt !== null &&
-        (student.index * plan.joinSpreadMs) / Math.max(1, plan.size) + student.joinedAt <= 60_000,
+      (student) => student.joinedAt !== null && tapAt(student) + student.joinedAt <= 60_000,
     ).length;
     const sortedWaits = [...joinedTimes].sort((a, b) => a - b);
     const at = (p: number): number | null =>
       round((sortedWaits[Math.max(0, Math.ceil(p * sortedWaits.length) - 1)] ?? NaN) / 1000);
+    const total = plan.size * plan.pages;
     const joinResult: JoinResult = {
-      students: plan.size,
+      students: total,
       joined: joinedTimes.length,
       allJoinedSeconds:
-        joinedTimes.length === plan.size ? round((performance.now() - joinStart) / 1000) : null,
+        joinedTimes.length === total ? round((performance.now() - joinStart) / 1000) : null,
       joinedInFirstMinute: joinedWithinMinute,
       signInRefusals,
       claimRefusals: claimRefusals.toJSON(),
@@ -874,7 +1028,7 @@ export async function measureRoom(
       sessionRefusals,
     };
     say(
-      `  join: ${String(joinResult.joined)} of ${String(plan.size)} in ${String(joinResult.allJoinedSeconds)} s (${String(round(lastJoin / 1000))} s to the last), ${String(joinedWithinMinute)} in the first minute`,
+      `  join: ${String(joinResult.joined)} of ${String(total)} in ${String(joinResult.allJoinedSeconds)} s (${String(round(lastJoin / 1000))} s to the last), ${String(joinedWithinMinute)} in the first minute`,
     );
     // The second device and the agent, now that each holds an attachment.
     await Promise.all(
@@ -895,25 +1049,28 @@ export async function measureRoom(
       }),
     );
     joinResult.sessionRefusals = sessionRefusals;
+    await underLoad();
     await endPhase();
     if (plan.joinOnly) {
       flags.teaching = false;
-      await teacherLoop;
+      await Promise.all(teacherLoops);
       return (result = finish());
     }
 
     const attached = students.filter((student) => student.joinedAt !== null);
-    // The operator accepts the oldest proposal every 20 s and dismisses the rest.
-    const operatorLoop = (async () => {
-      while (flags.operating) {
-        await sleep(20_000);
-        const [oldest] = sim.state.proposals;
-        if (oldest !== undefined) {
-          sim.acceptProposal(oldest.proposalId);
-          sim.dismissAllProposals();
+    // Each operator accepts the oldest proposal every 20 s and dismisses the rest.
+    const operatorLoops = rooms.map((room) =>
+      (async () => {
+        while (flags.operating) {
+          await sleep(20_000);
+          const [oldest] = room.sim.state.proposals;
+          if (oldest !== undefined) {
+            room.sim.acceptProposal(oldest.proposalId);
+            room.sim.dismissAllProposals();
+          }
         }
-      }
-    })();
+      })(),
+    );
 
     // P1 with images and proposals. A chat is one conversation, so its calls
     // go one at a time, each when it falls due; the second device reads the
@@ -926,22 +1083,18 @@ export async function measureRoom(
         while (live() && performance.now() < at)
           await sleep(Math.min(1000, at - performance.now()));
       };
-      const pageCall = (
-        client: Client,
-        kind: string,
-        tool: string,
-        args: Record<string, unknown>,
-      ) =>
-        timed(kind, () =>
-          client.callTool({
-            name: 'call_page_tool',
-            arguments: { page: pageId, tool, arguments: args },
-          }),
-        );
       const loops: Promise<void>[] = [];
       for (const student of attached) {
         const { chatA, chatB } = student;
+        const { pageId } = student.room;
         if (chatA === null || chatB === null) continue;
+        const pageCall = (kind: string, tool: string, args: Record<string, unknown>) =>
+          timed(kind, () =>
+            chatA.callTool({
+              name: 'call_page_tool',
+              arguments: { page: pageId, tool, arguments: args },
+            }),
+          );
         const actions: { periodMs: number; run: () => Promise<unknown> }[] = [
           {
             periodMs: 20_000,
@@ -953,14 +1106,14 @@ export async function measureRoom(
         ];
         if (options.pageCalls) {
           actions.push(
-            { periodMs: 60_000, run: () => pageCall(chatA, 'get_view', 'get_view', {}) },
-            { periodMs: 120_000, run: () => pageCall(chatA, 'capture_view', 'capture_view', {}) },
+            { periodMs: 60_000, run: () => pageCall('get_view', 'get_view', {}) },
+            { periodMs: 120_000, run: () => pageCall('capture_view', 'capture_view', {}) },
             {
               periodMs: 180_000,
               run: async () => {
-                const proposed = await pageCall(chatA, 'propose go_to_stop', 'go_to_stop', {
+                const proposed = await pageCall('propose go_to_stop', 'go_to_stop', {
                   walkthroughId: 'flyby',
-                  index: student.index % 3,
+                  index: student.local % 3,
                 });
                 const proposal = record(proposed?.structuredContent).proposal;
                 if (typeof proposal !== 'string') return;
@@ -978,7 +1131,7 @@ export async function measureRoom(
           (async () => {
             const begun = performance.now();
             const due = actions.map(
-              (action, n) => begun + 500 + ((student.index * 7919 + n * 4111) % action.periodMs),
+              (action, n) => begun + 500 + ((student.local * 7919 + n * 4111) % action.periodMs),
             );
             while (live()) {
               let next = 0;
@@ -995,7 +1148,7 @@ export async function measureRoom(
         );
         loops.push(
           (async () => {
-            let at = performance.now() + 500 + ((student.index * 6007) % 60_000);
+            let at = performance.now() + 500 + ((student.local * 6007) % 60_000);
             while (live()) {
               await until(at);
               if (!live()) break;
@@ -1015,12 +1168,6 @@ export async function measureRoom(
       };
     };
 
-    await beginPhase('class', BURST_QUOTA_US);
-    let load = classLoad({ pageCalls: true });
-    await sleep(plan.phaseMs.class);
-    await load.stop();
-    await endPhase();
-
     // P2: every agent waits on the state at its budget, the chat quiet.
     const agentLoad = (): { stop(): Promise<void> } => {
       const state = { on: true };
@@ -1035,7 +1182,12 @@ export async function measureRoom(
             const due = performance.now() + 1100;
             const start = performance.now();
             try {
-              const read = await waitPageState(agent, pageId, student.lastVersion, 25_000);
+              const read = await waitPageState(
+                agent,
+                student.room.pageId,
+                student.lastVersion,
+                25_000,
+              );
               phase.calls
                 .of('wait_for_page_state')
                 .record(read.ok ? 'ok' : (read.code ?? 'tool_error'), performance.now() - start);
@@ -1056,22 +1208,65 @@ export async function measureRoom(
         },
       };
     };
-    for (const [name, quota] of [
-      ['agents', BURST_QUOTA_US],
-      ['agents at the 6.25% baseline', BASELINE_QUOTA_US],
-    ] as const) {
-      await beginPhase(name, quota);
-      const agents = agentLoad();
-      await sleep(plan.phaseMs.agents);
-      await agents.stop();
+
+    const runPhase = async (
+      name: string,
+      quotaUs: number,
+      ms: number,
+      start: () => { stop(): Promise<void> },
+    ): Promise<void> => {
+      await beginPhase(name, quotaUs);
+      const load = start();
+      await sleep(ms);
+      await underLoad();
+      await load.stop();
       await endPhase();
+    };
+    await runPhase('class', BURST_QUOTA_US, plan.phaseMs.class, () =>
+      classLoad({ pageCalls: true }),
+    );
+    await runPhase('agents', BURST_QUOTA_US, plan.phaseMs.agents, agentLoad);
+    // Only where a quota can be set, so a phase never claims a baseline it did not run at.
+    if (applyQuota(confinement, BASELINE_QUOTA_US) === null) {
+      skipped.push(
+        'class and agents at the 6.25% baseline: the confinement could not set a CPU quota',
+      );
+    } else {
+      await runPhase('class at the 6.25% baseline', BASELINE_QUOTA_US, plan.phaseMs.agents, () =>
+        classLoad({ pageCalls: true }),
+      );
+      await runPhase(
+        'agents at the 6.25% baseline',
+        BASELINE_QUOTA_US,
+        plan.phaseMs.agents,
+        agentLoad,
+      );
     }
-    confinement.setQuota(BURST_QUOTA_US);
+    applyQuota(confinement, BURST_QUOTA_US);
     await sleep(5000);
 
-    // P3: a quarter of the class leaves a large answer and an image unread,
+    // Asks for each item, one per page every FILL_SPACING_MS, so no page's
+    // watchers pass their share of its calls, until `ends`.
+    const paced = async <T extends { room: Classroom }>(
+      items: readonly T[],
+      ask: (item: T) => void,
+      ends = Infinity,
+    ): Promise<void> => {
+      const lists = byRoom(items, plan.pages);
+      const steps = Math.max(0, ...lists.map((list) => list.length));
+      for (let step = 0; step < steps; step += 1) {
+        if (performance.now() > ends) break;
+        for (const list of lists) {
+          const item = list[step];
+          if (item !== undefined) ask(item);
+        }
+        await sleep(FILL_SPACING_MS);
+      }
+    };
+
+    // P3: a quarter of each class leaves a large answer and an image unread,
     // through an edge that buffers little (sockets.ts).
-    const narrowed = narrowSocketBuffers();
+    const narrowed = narrowSocketBuffers(plan.narrow);
     socketBuffers = narrowed.note;
     say(`  ${narrowed.note}`);
     cleanups.push(() => {
@@ -1079,54 +1274,75 @@ export async function measureRoom(
       return Promise.resolve();
     });
     await beginPhase('stalled', BURST_QUOTA_US);
-    load = classLoad({ pageCalls: true });
-    const quarter = attached.filter((student) => student.index % 4 === 0);
-    for (const student of quarter) {
+    let load = classLoad({ pageCalls: true });
+    const quarter = attached
+      .filter((student) => student.local % 4 === 0)
+      .flatMap((student) =>
+        ['read_notes', 'capture_view'].map((tool) => ({ student, tool, room: student.room })),
+      );
+    await paced(quarter, ({ student, tool }) => {
       const sessionId = sessionOf(student.chatB);
-      if (sessionId === null) continue;
-      phase.held.push(
-        heldCall(relay.url, student, sessionId, pageId, 'read_notes', 'stall', phase, sink),
-      );
-      await sleep(FILL_SPACING_MS);
-      phase.held.push(
-        heldCall(relay.url, student, sessionId, pageId, 'capture_view', 'stall', phase, sink),
-      );
-      await sleep(FILL_SPACING_MS);
-    }
+      if (sessionId !== null) {
+        phase.held.push(hold(student, sessionId, student.room.pageId, tool, 'stall'));
+      }
+    });
     await sleep(plan.phaseMs.stalled);
+    await underLoad();
     await load.stop();
-    for (const held of phase.held) held.close();
     await endPhase();
 
-    // Unread bytes toward the ceiling: every student reads two of the largest answers slowly.
+    // Unread bytes toward the ceiling: every student reads two of the largest
+    // answers slowly, while each teacher keeps two of their own waiting.
     await beginPhase('ceiling', BURST_QUOTA_US);
     load = classLoad({ pageCalls: false });
+    const holding = { on: true };
+    const memberLoops = rooms.map((room) =>
+      (async () => {
+        const sessionId = room.teacherSessionId;
+        if (sessionId === null) return;
+        const teacherAt = { token: room.teacherToken, address: PAGE_ADDRESS };
+        const waiting = new Set<HeldAnswer>();
+        while (holding.on) {
+          while (waiting.size < MEMBER_HELD) {
+            // Read a little every 5 s: always progress at the relay's 10 s checks, so
+            // only the ceiling could take it, and the ceiling never takes a member's.
+            const answer = hold(teacherAt, sessionId, room.pageId, 'read_notes', 'trickle', 5000);
+            phase.memberHeld.push(answer);
+            waiting.add(answer);
+            void answer.done.then(() => waiting.delete(answer));
+          }
+          await sleep(1000);
+        }
+      })(),
+    );
     const fillEnds = performance.now() + plan.phaseMs.ceiling;
-    const asking = attached.flatMap((student) => [student, student]);
-    for (const student of asking) {
-      if (performance.now() > fillEnds) break;
-      const sessionId = sessionOf(student.chatB);
-      if (sessionId === null) continue;
-      // Just under the page's watching share as the relay ships it.
-      phase.held.push(
-        heldCall(relay.url, student, sessionId, pageId, 'read_notes', 'trickle', phase, sink),
-      );
-      await sleep(FILL_SPACING_MS);
-    }
+    await paced(
+      attached.flatMap((student) => [student, student]),
+      (student) => {
+        const sessionId = sessionOf(student.chatB);
+        if (sessionId !== null) {
+          phase.held.push(hold(student, sessionId, student.room.pageId, 'read_notes', 'trickle'));
+        }
+      },
+      fillEnds,
+    );
     await sleep(Math.max(0, fillEnds - performance.now()));
+    await underLoad();
+    holding.on = false;
+    await Promise.all(memberLoops);
     await load.stop();
-    for (const held of phase.held) held.close();
     await endPhase();
     narrowed.restore();
 
     flags.operating = false;
     flags.teaching = false;
-    await Promise.all([operatorLoop, teacherLoop]);
+    await Promise.all([...operatorLoops, ...teacherLoops]);
     return (result = finish());
 
     function finish(): RoomResult {
       return {
         size: plan.size,
+        pages: plan.pages,
         settings: plan.settings,
         sharedAddress: plan.sharedAddress,
         confinement: { kind: confinement.kind, cpu: confinement.cpu, notes: confinement.notes },
@@ -1134,6 +1350,7 @@ export async function measureRoom(
         rosterFrameMaxBytes,
         join: joinResult,
         phases,
+        skipped,
         socketBuffers,
         relayExit: 'running',
       };
@@ -1146,18 +1363,24 @@ export async function measureRoom(
   }
 }
 
+let heldIds = 1000;
+
+function nextHeldId(): number {
+  heldIds += 1;
+  return heldIds;
+}
+
 function sessionOf(client: Client | null): string | null {
   const transport = client?.transport;
   return transport instanceof StreamableHTTPClientTransport ? (transport.sessionId ?? null) : null;
 }
 
-/** One answer read whole, by the teacher, for its size on the wire. */
+/** One answer read whole, by a teacher, for its size on the wire. */
 async function answerSize(
   relayUrl: string,
   token: string,
   pageId: string,
   tool: string,
-  args: Record<string, unknown>,
 ): Promise<number> {
   return new Promise((resolveSize, reject) => {
     const req = httpRequest(
@@ -1198,7 +1421,7 @@ async function answerSize(
         method: 'tools/call',
         params: {
           name: 'call_page_tool',
-          arguments: { page: pageId, tool, arguments: args },
+          arguments: { page: pageId, tool, arguments: {} },
           _meta: {
             'io.modelcontextprotocol/protocolVersion': '2026-07-28',
             'io.modelcontextprotocol/clientInfo': { name: 'claude-code', version: '1.0.0' },
@@ -1208,104 +1431,4 @@ async function answerSize(
       }),
     );
   });
-}
-
-let heldIds = 1000;
-
-/**
- * A tools/call on a student's 2025-11-25 session whose answer the client
- * reads only its first KiB of, then nothing ('stall') or at most 64 KiB every 25 s
- * ('trickle'), on a connection of its own. Its outcome is held while open,
- * ended if the relay finished it, cut if the relay closed it first, or the
- * refusal's code if the relay refused the call.
- */
-function heldCall(
-  relayUrl: string,
-  student: Student,
-  sessionId: string,
-  pageId: string,
-  tool: string,
-  mode: 'stall' | 'trickle',
-  phase: Phase,
-  statuses: StatusSink,
-): Held {
-  heldIds += 1;
-  let closedByUs = false;
-  let timer: ReturnType<typeof setInterval> | undefined;
-  let req: ClientRequest | null = null;
-  const held: Held = {
-    outcome: 'pending',
-    close() {
-      closedByUs = true;
-      if (timer !== undefined) clearInterval(timer);
-      if (held.outcome === 'pending') held.outcome = 'held';
-      req?.destroy();
-    },
-  };
-  req = httpRequest(
-    new URL('/mcp', relayUrl),
-    {
-      method: 'POST',
-      agent: false,
-      headers: {
-        host: PUBLIC_HOST,
-        'fly-client-ip': student.address,
-        authorization: `Bearer ${student.token}`,
-        'content-type': 'application/json',
-        accept: 'application/json, text/event-stream',
-        'mcp-session-id': sessionId,
-        'mcp-protocol-version': '2025-11-25',
-      },
-    },
-    (res: IncomingMessage) => {
-      statuses.current().add(`http ${String(res.statusCode ?? 0)}`);
-      res.pause();
-      res.once('readable', () => {
-        const first = (res.read(1024) as Buffer | null) ?? (res.read() as Buffer | null);
-        const text = first?.toString('utf8') ?? '';
-        if (/"isError":true/.test(text) || (res.statusCode ?? 0) !== 200) {
-          const code =
-            /"text":"([a-z_]+): /.exec(text)?.[1] ?? `http ${String(res.statusCode ?? 0)}`;
-          held.outcome = code;
-          phase.heldRefused.add(code);
-          res.resume();
-          return;
-        }
-        held.outcome = 'pending';
-        if (mode === 'trickle') {
-          // The relay cuts a response that made no progress at three checks 10 s
-          // apart, and lets go of an answer once what is left of it fits in the
-          // buffers past it, about 250 KB here. So every 25 s the reader takes
-          // what Node holds, up to 64 KiB, which mostly frees enough of a narrowed
-          // window for the relay to send again within three checks, and keeps each
-          // answer in the relay for about three minutes. A reader whose window
-          // stays shut is one the relay rightly sees take nothing for 30 s.
-          // read(n) takes nothing while fewer than n bytes wait, so it asks for what is there.
-          timer = setInterval(() => {
-            res.read(Math.min(65_536, res.readableLength));
-          }, 25_000);
-        }
-      });
-      res.on('end', () => {
-        if (held.outcome === 'pending') held.outcome = 'ended';
-      });
-      res.on('close', () => {
-        if (timer !== undefined) clearInterval(timer);
-        if (!closedByUs && held.outcome === 'pending' && !res.complete) held.outcome = 'cut';
-      });
-      res.on('error', () => undefined);
-    },
-  );
-  req.on('error', () => {
-    if (!closedByUs && held.outcome === 'pending') held.outcome = 'cut';
-  });
-  req.end(
-    JSON.stringify({
-      jsonrpc: '2.0',
-      id: heldIds,
-      method: 'tools/call',
-      params: { name: 'call_page_tool', arguments: { page: pageId, tool, arguments: {} } },
-    }),
-  );
-  return held;
 }

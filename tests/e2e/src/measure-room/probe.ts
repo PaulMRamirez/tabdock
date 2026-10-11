@@ -1,20 +1,38 @@
 // Loaded into the measured relay with `node --import` (ADR 0044, A6.22), so
-// main.ts runs as the image runs it and nothing in the relay changes for the
-// measurement. It reads what only the relay's own process can: the event
-// loop's delay, its heap and its CPU time. It speaks only over the IPC
-// channel the harness opened, answers only the three requests below, and
-// sends nothing a request did not ask for. Without a channel it does nothing.
+// main.ts runs as the image runs it and nothing the relay does changes for
+// the measurement. It reads what only the relay's own process can: the event
+// loop's delay, its heap, its CPU time and what its answers waiting to be
+// read hold as the response ceiling counts them (ResponseStalls.heldBytes,
+// read-only). It speaks only over the IPC channel the harness opened,
+// answers only the requests below, and sends nothing a request did not ask
+// for. Without a channel it does nothing; when its harness goes, by any end
+// at all, it asks the relay to stop as a host's SIGTERM would, so no relay
+// outlives the run that started it.
 
 import { readFileSync } from 'node:fs';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
+import { ResponseStalls } from '../../../../packages/relay/src/response-stalls.ts';
 
 const NS_PER_MS = 1e6;
 
+/**
+ * The histogram's sampling interval. Node records the time between two of
+ * its timer's turns, interval included, so an idle loop reads about this
+ * much; every figure the probe reports has it taken off, leaving the delay.
+ */
+export const LOOP_RESOLUTION_MS = 10;
+
 /** A whole histogram per phase: `mark` starts one, `read` reports it. */
-const delay = monitorEventLoopDelay({ resolution: 10 });
-delay.enable();
+const delay = monitorEventLoopDelay({ resolution: LOOP_RESOLUTION_MS });
 let cpuAtMark = process.cpuUsage();
 let markedAt = performance.now();
+
+/**
+ * The relay's response watchers, noted the first time each watches an
+ * answer. main.ts imports the same module this file does (one URL, one
+ * class), so the note is the only thing added to what the relay runs.
+ */
+const watchers = new Set<ResponseStalls>();
 
 /** VmRSS and VmHWM from the kernel, in bytes; the peak the process ever touched. */
 function vm(): { rss: number; hwm: number } {
@@ -29,6 +47,8 @@ function vm(): { rss: number; hwm: number } {
 function memory(): Record<string, number> {
   const usage = process.memoryUsage();
   const { rss, hwm } = vm();
+  let held = 0;
+  for (const watcher of watchers) held += watcher.heldBytes;
   return {
     rss: usage.rss,
     heapUsed: usage.heapUsed,
@@ -37,16 +57,23 @@ function memory(): Record<string, number> {
     arrayBuffers: usage.arrayBuffers,
     vmRss: rss,
     vmHwm: hwm,
+    responsesHeld: held,
   };
+}
+
+/** A recorded figure less the sampling interval, never below nothing. */
+function lessResolution(ns: number): number {
+  return Math.max(0, ns / NS_PER_MS - LOOP_RESOLUTION_MS);
 }
 
 function eventLoop(): Record<string, number> {
   return {
-    p50: delay.percentile(50) / NS_PER_MS,
-    p99: delay.percentile(99) / NS_PER_MS,
-    max: delay.max / NS_PER_MS,
-    mean: delay.mean / NS_PER_MS,
+    p50: lessResolution(delay.percentile(50)),
+    p99: lessResolution(delay.percentile(99)),
+    max: lessResolution(delay.max),
+    mean: lessResolution(delay.mean),
     count: delay.count,
+    resolutionMs: LOOP_RESOLUTION_MS,
   };
 }
 
@@ -63,6 +90,15 @@ function answer(id: unknown, body: Record<string, unknown>): void {
 }
 
 if (process.send !== undefined) {
+  delay.enable();
+  const track = Object.getOwnPropertyDescriptor(ResponseStalls.prototype, 'track')?.value as
+    ResponseStalls['track'] | undefined;
+  if (track !== undefined) {
+    ResponseStalls.prototype.track = function noted(this: ResponseStalls, ...args) {
+      watchers.add(this);
+      track.apply(this, args);
+    };
+  }
   process.on('message', (message: unknown) => {
     if (typeof message !== 'object' || message === null) return;
     const { id, t } = message as { id?: unknown; t?: unknown };
@@ -74,6 +110,9 @@ if (process.send !== undefined) {
       cpuAtMark = process.cpuUsage();
       markedAt = performance.now();
       answer(id, {});
+    } else if (t === 'gc') {
+      // While the phase's load still runs, so the heap is what that load keeps.
+      answer(id, { heapAfterGc: collected(), memory: memory() });
     } else if (t === 'read') {
       // Read before any collection, so a forced GC never shows in the phase's delay.
       const loop = eventLoop();
@@ -87,6 +126,9 @@ if (process.send !== undefined) {
         heapAfterGc,
       });
     }
+  });
+  process.once('disconnect', () => {
+    process.kill(process.pid, 'SIGTERM');
   });
   // The channel must not keep the relay alive past its own SIGTERM handling.
   process.channel?.unref();

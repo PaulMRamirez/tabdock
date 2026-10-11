@@ -9,7 +9,14 @@
 // report says which confinement the figures came from and why.
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmdirSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmdirSync,
+  writeFileSync,
+} from 'node:fs';
 import { cpus } from 'node:os';
 import { join } from 'node:path';
 
@@ -44,6 +51,8 @@ export interface Confinement {
   wrap(argv: readonly string[]): { command: string; args: string[] };
   /** Sets the CPU quota per CPU_PERIOD_US period; false where it cannot. */
   setQuota(quotaUs: number): boolean;
+  /** Kills whatever still runs in the group, for a run cut short. */
+  killAll(): void;
   /** Starts the peak counter afresh, where the group keeps one that can be reset. */
   resetPeak(): void;
   stats(): GroupStats | null;
@@ -81,6 +90,78 @@ async function removeGroups(dirs: readonly string[]): Promise<void> {
       }
     }
   }
+}
+
+/** SIGKILLs every process a group's cgroup.procs lists. */
+function killProcs(procsFile: string): void {
+  let pids: number[];
+  try {
+    pids = readFileSync(procsFile, 'utf8')
+      .split('\n')
+      .filter((line) => /^\d+$/.test(line))
+      .map(Number);
+  } catch {
+    return;
+  }
+  for (const pid of pids) {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      // Gone already.
+    }
+  }
+}
+
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means it runs, as someone else.
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/** Where earlier runs' groups would be, by hierarchy. */
+const GROUP_PARENTS = ['/sys/fs/cgroup/memory', '/sys/fs/cgroup/cpu'];
+
+/**
+ * Removes the empty groups an earlier run left when it was killed outright,
+ * so they never pile up, and names any that still hold a process.
+ */
+export function sweepStaleGroups(): string[] {
+  const notes: string[] = [];
+  const v2 = cgroupV2Root();
+  for (const parent of [...GROUP_PARENTS, ...(v2 === null ? [] : [v2])]) {
+    let names: string[];
+    try {
+      names = readdirSync(parent).filter((name) => name.startsWith('tabdock-measure-'));
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      const dir = join(parent, name);
+      // A run still going owns its groups, empty or not.
+      const owner = Number(/^tabdock-measure-(\d+)-/.exec(name)?.[1] ?? NaN);
+      if (Number.isInteger(owner) && alive(owner)) continue;
+      try {
+        rmdirSync(dir);
+        notes.push(`removed ${dir}, left by an earlier run`);
+      } catch {
+        notes.push(`${dir}, left by an earlier run, still holds a process`);
+      }
+    }
+  }
+  return notes;
+}
+
+/**
+ * Applies a phase's CPU quota and says which applied: the quota, or null
+ * where the confinement could not set one, so a phase never reports a
+ * quota it did not run under.
+ */
+export function applyQuota(confinement: Confinement, quotaUs: number): number | null {
+  return confinement.setQuota(quotaUs) ? quotaUs : null;
 }
 
 function hasCommand(name: string): boolean {
@@ -157,6 +238,9 @@ function cgroupV1(name: string, cpu: number | null, notes: string[]): Confinemen
       } catch {
         return false;
       }
+    },
+    killAll() {
+      killProcs(join(memory, 'cgroup.procs'));
     },
     resetPeak() {
       try {
@@ -247,6 +331,9 @@ function cgroupV2(name: string, cpu: number | null, notes: string[]): Confinemen
         return false;
       }
     },
+    killAll() {
+      killProcs(join(group, 'cgroup.procs'));
+    },
     resetPeak() {
       // memory.peak resets only on kernels that let it be written; otherwise it runs from the start.
       try {
@@ -322,6 +409,9 @@ function systemdScope(name: string, cpu: number | null, notes: string[]): Confin
         ).status === 0
       );
     },
+    killAll() {
+      spawnSync('systemctl', ['--user', 'kill', '--signal=SIGKILL', unit], { stdio: 'ignore' });
+    },
     resetPeak() {
       // A scope's peak is not read here.
     },
@@ -359,6 +449,9 @@ export function confine(name: string): Confinement {
     },
     setQuota() {
       return false;
+    },
+    killAll() {
+      // No group to look in; the harness kills the relay it started.
     },
     resetPeak() {
       // Nothing keeps a peak but the process itself (VmHWM).
