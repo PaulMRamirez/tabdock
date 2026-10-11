@@ -56,6 +56,10 @@ import {
   MAX_INVITE_LIFETIME_MS,
   MAX_LIVE_INVITES_PER_PAGE,
   MAX_RESULT_CHARS,
+  MAX_STATE_BYTES,
+  MAX_STATE_FRAME_BYTES,
+  MAX_WAIT_MS,
+  MAX_WAITS_PER_USER,
   MEMBER_RESERVED_SEATS,
   MIN_INVITE_REMAINING_MS,
   narrowPolicy,
@@ -106,7 +110,7 @@ import { AgentTokens } from './agents.ts';
 import { type HeldTally, holdValue } from './held-tally.ts';
 import type { LogFields, Logger, LogLevel } from './log.ts';
 import { PageParts } from './page-parts.ts';
-import { PageStates } from './page-state.ts';
+import { PageStates, type StateView } from './page-state.ts';
 import { PageProposals } from './proposals.ts';
 import { SlidingWindowLimiter } from './rate-limit.ts';
 import { RepeatedLines } from './repeated-lines.ts';
@@ -124,6 +128,7 @@ import {
   SINGLE_USE_SECRET_PATTERN,
 } from './secrets.ts';
 import type { CallMarks, SpikeHooks } from './spike.ts';
+import { WaitSlots, waitLimitsOf } from './waits.ts';
 import {
   type AttachmentRecord,
   type AttachRequestRecord,
@@ -873,6 +878,8 @@ class FrameLog implements Logger {
 }
 
 const CLOSE_POLICY = 1008;
+/** The standard "message too big", which SPEC section 6 uses for a frame past its size (ADR 0040). */
+const CLOSE_TOO_LARGE = 1009;
 const CLOSE_GOING_AWAY = 1001;
 /** The standard "try again later": a page refused for want of room reconnects with backoff. */
 const CLOSE_TRY_AGAIN_LATER = 1013;
@@ -953,6 +960,14 @@ function mebibytes(bytes: number): string {
 
 /** A request's charge against what requests waiting on pages may hold, and its return. */
 type HeldBytes = { kind: 'held'; release: () => void } | HubError;
+
+/** What a wait refused by waits.ts answers, by the limit that refused it (ADR 0040, S9). */
+const WAIT_REFUSALS: Record<'user' | 'page' | 'invitee', string> = {
+  user: `you already hold ${String(MAX_WAITS_PER_USER)} waits, the most one user may hold at once across pages; let one end first`,
+  page: 'this page already has as many waits as it allows; try again shortly',
+  invitee:
+    'invited accounts already hold as many waits on this page as they may; try again shortly',
+};
 
 function notAttached(pageId: string): HubError {
   return hubError('not_attached', `you are not attached to page ${pageId}`);
@@ -1302,6 +1317,8 @@ export class PageHub {
   #heldByInvitees = 0;
   /** Tools frames per remote address, shared by its sockets and kept across reconnects. */
   readonly #toolsFrameLimiter: SlidingWindowLimiter;
+  /** State frames per remote address, likewise shared and kept (ADR 0040). */
+  readonly #stateFrameLimiter: SlidingWindowLimiter;
   /**
    * Lines of frames that changed nothing, per remote address: written in full
    * up to ignoredFramesPerAddress a window, across the address's sockets and
@@ -1347,6 +1364,13 @@ export class PageHub {
    * the page's life where the hub changes it (page-parts.ts).
    */
   readonly #parts: PageParts;
+  /** Each page's published state and the waits on it (ADR 0040), one of #parts. */
+  readonly #states: PageStates;
+  /**
+   * The slots waiting fixed tool calls take, shared by wait_for_page_state
+   * and get_proposal (waits.ts, conflict C2 of the M6 plan).
+   */
+  readonly #waits: WaitSlots;
   /** The M3 spike's pairing milestones (spike.ts), when TABDOCK_SPIKE is on. */
   readonly #spike: SpikeHooks | null;
   #closed = false;
@@ -1369,6 +1393,8 @@ export class PageHub {
       windowMs,
       toolsFramesPerAddress,
       toolsFramesWindowMs,
+      stateFramesPerAddress,
+      stateFramesWindowMs,
       ignoredFramesPerAddress,
       connectionLinesPerAddress,
       redemptionsPerInvite,
@@ -1379,6 +1405,7 @@ export class PageHub {
     this.#pageLimiter = new SlidingWindowLimiter(pairAttemptsPerPage, windowMs);
     this.#callLimiter = new SlidingWindowLimiter(callsPerUserPerPage, windowMs);
     this.#toolsFrameLimiter = new SlidingWindowLimiter(toolsFramesPerAddress, toolsFramesWindowMs);
+    this.#stateFrameLimiter = new SlidingWindowLimiter(stateFramesPerAddress, stateFramesWindowMs);
     this.#ignoredLines = new RepeatedLines({
       linesPerKey: ignoredFramesPerAddress,
       windowMs,
@@ -1423,7 +1450,9 @@ export class PageHub {
         this.#confirmationExpired(record);
       },
     });
-    this.#parts = new PageParts([new PageStates(), new PageProposals(), new AgentTokens()]);
+    this.#states = new PageStates(config.limits.stateBytes);
+    this.#waits = new WaitSlots(waitLimitsOf(config));
+    this.#parts = new PageParts([this.#states, new PageProposals(), new AgentTokens()]);
   }
 
   /**
@@ -1675,7 +1704,9 @@ export class PageHub {
       case 'pong':
         return;
       case 'state':
-        this.#stateFrame(conn, pageId, frame);
+        if (this.#stateFrameAllowed(conn)) {
+          this.#stateFrame(conn, pageId, frame, Buffer.byteLength(text, 'utf8'));
+        }
         return;
       case 'proposal_decision':
         this.#mayChangeNothing(conn, frame.t, () => this.#proposalDecision(pageId, frame));
@@ -1693,13 +1724,68 @@ export class PageHub {
   }
 
   /**
-   * A page publishing its state (ADR 0040): budgeted per socket and per
-   * address before the value is looked at, then kept if it changed.
+   * A page publishing its state (ADR 0040), already within its frame budgets
+   * (#stateFrameAllowed): past MAX_STATE_FRAME_BYTES on the wire, or
+   * MAX_STATE_BYTES once written again as canonical JSON, the socket closes
+   * with 1009 as for any frame too large (SPEC section 6), and a value that
+   * cannot be written again (nesting past the stack) with 1008 as a
+   * malformed frame. Only the canonical text is kept, never the parsed
+   * object. An equal value is a frame that changes nothing (ADR 0023), its
+   * line written only within that budget. No line ever holds the value.
    */
-  #stateFrame(conn: Conn, pageId: string, frame: FrameOf<'state'>): void {
-    // M6 seam: not built. Until this relay keeps state, the frame is ignored,
-    // logged and counted within ADR 0023's budget as an unknown type was.
-    this.#mayChangeNothing(conn, frame.t, () => this.#notActedOn(pageId, frame.t));
+  #stateFrame(conn: Conn, pageId: string, frame: FrameOf<'state'>, rawBytes: number): void {
+    if (rawBytes > MAX_STATE_FRAME_BYTES) {
+      this.#stateTooLarge(conn, pageId, rawBytes);
+      return;
+    }
+    let text: string | null = null;
+    if (frame.value !== null) {
+      try {
+        text = JSON.stringify(frame.value);
+      } catch {
+        this.connectionLine(conn.address, 'warn', 'closing page socket: malformed frame', {
+          pageId,
+          reason: 'page state could not be written as JSON',
+        });
+        this.#closeSocket(conn, CLOSE_POLICY, 'malformed frame');
+        return;
+      }
+      const bytes = Buffer.byteLength(text, 'utf8');
+      if (bytes > MAX_STATE_BYTES) {
+        this.#stateTooLarge(conn, pageId, bytes);
+        return;
+      }
+    }
+    const bytes = text === null ? 0 : Buffer.byteLength(text, 'utf8');
+    this.#mayChangeNothing(conn, frame.t, () => {
+      const outcome = this.#states.publish(pageId, text, Date.now());
+      const { version } = this.#states.read(pageId);
+      const fields = { pageId, version, bytes, allPagesStateBytes: this.#states.held };
+      if (outcome === 'unchanged') {
+        this.#log.debug('page state unchanged', { pageId, version });
+        return false;
+      }
+      if (outcome === 'withheld') {
+        this.connectionLine(
+          conn.address,
+          'warn',
+          'page state withheld: pages hold all the page state this relay allows',
+          fields,
+        );
+      } else {
+        this.#log.debug('page state published', fields);
+      }
+      return true;
+    });
+  }
+
+  #stateTooLarge(conn: Conn, pageId: string, bytes: number): void {
+    this.connectionLine(conn.address, 'warn', 'closing page socket: page state too large', {
+      pageId,
+      bytes,
+      maxBytes: MAX_STATE_BYTES,
+    });
+    this.#closeSocket(conn, CLOSE_TOO_LARGE, 'page state too large');
   }
 
   /** The operator's answer to a proposal (ADR 0042); false when it named none of the page's. */
@@ -2276,9 +2362,7 @@ export class PageHub {
       resumeWindowMs: timings.resumeWindowMs,
       attachRequestTtlMs: timings.attachRequestTtlMs,
       maxImageBytes: limits.imageBytes,
-      // M6 seam: not built. W1-C adds maxStateBytes: MAX_STATE_BYTES once
-      // this relay keeps state; until then it is absent, which tells the
-      // adapter the relay takes none.
+      maxStateBytes: MAX_STATE_BYTES,
       usersPerPage: limits.usersPerPage,
       observersPerPage: invites ? limits.observersPerPage : 0,
     };
@@ -2331,6 +2415,40 @@ export class PageHub {
     }
     this.#toolsFrameLimiter.record(conn.address, now);
     conn.toolsFrames.push(now);
+    return true;
+  }
+
+  /**
+   * A state frame costs a parse and a re-encode of up to MAX_STATE_BYTES,
+   * whether or not it changes anything, so like a tools frame each socket
+   * gets a budget of them and each remote address one across its sockets and
+   * reconnects, every frame counted, an equal one too (ADR 0040, S9). A
+   * conforming adapter sends at most two a second; past either budget the
+   * socket closes as a policy breach, leaving the page asleep and resumable.
+   */
+  #stateFrameAllowed(conn: Conn): boolean {
+    const now = Date.now();
+    const { stateFramesPerSocket, stateFramesWindowMs } = this.#config.rateLimits;
+    conn.stateFrames = conn.stateFrames.filter((at) => at > now - stateFramesWindowMs);
+    if (conn.stateFrames.length >= stateFramesPerSocket) {
+      this.connectionLine(conn.address, 'warn', 'closing page socket: too many state frames', {
+        pageId: conn.pageId,
+      });
+      this.#closeSocket(conn, CLOSE_POLICY, 'too many state frames');
+      return false;
+    }
+    if (!this.#stateFrameLimiter.allows(conn.address, now)) {
+      this.connectionLine(
+        conn.address,
+        'warn',
+        'closing page socket: too many state frames from its address',
+        { pageId: conn.pageId, address: conn.address },
+      );
+      this.#closeSocket(conn, CLOSE_POLICY, 'too many state frames from this address');
+      return false;
+    }
+    this.#stateFrameLimiter.record(conn.address, now);
+    conn.stateFrames.push(now);
     return true;
   }
 
@@ -2616,7 +2734,7 @@ export class PageHub {
     this.#failPageCalls(pageId, conn, outcome);
     this.#live.delete(pageId);
     if (this.#closed) return;
-    this.#sleep(pageId, conn.address);
+    this.#sleep(pageId, conn.address, detached);
     // A deliberate detach will not come back, so skip the resume window.
     if (detached) {
       this.connectionLine(conn.address, 'info', 'page detached', { pageId });
@@ -2624,7 +2742,8 @@ export class PageHub {
     }
   }
 
-  #sleep(pageId: string, address: string): void {
+  /** `detaching`: the page detached on purpose, and #gone follows at once. */
+  #sleep(pageId: string, address: string, detaching: boolean): void {
     const page = this.#store.pages.get(pageId);
     if (!page) return;
     page.state = 'asleep';
@@ -2642,8 +2761,10 @@ export class PageHub {
     // The welcome on resume carries the roster as it is by then.
     this.#clearTimer(this.#rosterTimers, pageId);
     this.#dropRequests(pageId);
-    // Nothing reaches a sleeping page, so what waits on it ends too (page-parts.ts).
-    this.#parts.sleep(pageId);
+    // Nothing reaches a sleeping page, so what waits on it ends too
+    // (page-parts.ts). A detach is told to the parts only as their page's
+    // end, so a waiter hears page_gone, never that the page may come back.
+    if (!detaching) this.#parts.sleep(pageId);
     this.#setTimer(this.#lifecycleTimers, pageId, this.#config.timings.resumeWindowMs, () => {
       this.#gone(pageId);
     });
@@ -3893,35 +4014,94 @@ export class PageHub {
     };
   }
 
-  /* eslint-disable @typescript-eslint/no-unused-vars -- stubs: their bodies come with ADRs 0040 and 0042 */
-
   /**
    * get_page_state (ADR 0040): the page's latest published state, read
-   * through the same access check as list_page_tools, so a page asleep or
-   * still resuming answers page_asleep. Reading moves no idle expiry.
+   * through the same access check as list_page_tools, so an unknown page and
+   * someone else's answer alike (S13), and a page asleep or still resuming
+   * answers page_asleep. Every attached role may read it, and reading runs
+   * no page code, writes no record and moves no idle expiry (ADR 0009).
    */
-  getPageState(_userId: string, _pageId: string): StateOutcome {
-    // M6 seam: not built.
-    throw new Error('M6 seam: not built');
+  getPageState(userId: string, pageId: string): StateOutcome {
+    const access = this.#access(userId, pageId);
+    if (access.kind === 'error') return access;
+    return this.#stateOutcome(access, this.#states.read(pageId), null);
+  }
+
+  #stateOutcome(
+    access: { page: PageRecord; conn: Conn },
+    view: StateView,
+    changed: boolean | null,
+  ): StateOutcome {
+    return {
+      kind: 'state',
+      pageId: access.page.pageId,
+      origin: access.page.origin,
+      version: view.version,
+      publishedAt: view.publishedAt,
+      heardAt: access.conn.heardAt,
+      text: view.text,
+      changed,
+    };
   }
 
   /**
-   * wait_for_page_state (ADR 0040): answers once the version passes `after`,
-   * or at `timeoutMs`, holding a wait slot (waits.ts) and its request charge
-   * meanwhile.
+   * wait_for_page_state (ADR 0040): answers at once when the version is not
+   * `after` (it moved, or `after` is ahead of it, so nobody waits on a number
+   * the page never reached) or when `timeoutMs` is 0, and otherwise once the
+   * version moves or the time runs out, which is never past MAX_WAIT_MS or
+   * the call deadline. A wait that waits holds one of its user's two wait
+   * slots and one of the page's (waits.ts), and its request's charge
+   * (#holdBytes), so a room cannot pin the relay with idle waits; refused
+   * past either, it answers rate_limited with a request_refused record
+   * within the refusal budget (S7, S9). An ended attachment, a sleep, a
+   * reload or the page's end answer it at once (S8), and access is checked
+   * again after the wait, so a late expiry timer never hands a value to
+   * someone no longer attached.
    */
   async waitForPageState(
-    _caller: CallerIdentity,
-    _pageId: string,
-    _after: number,
-    _timeoutMs: number,
-    _signal: AbortSignal,
-    _heldBytes: number,
+    caller: CallerIdentity,
+    pageId: string,
+    after: number,
+    timeoutMs: number,
+    signal: AbortSignal,
+    heldBytes: number,
   ): Promise<StateOutcome> {
-    // M6 seam: not built.
-    await Promise.resolve();
-    throw new Error('M6 seam: not built');
+    const { userId } = caller;
+    const access = this.#access(userId, pageId);
+    if (access.kind === 'error') return access;
+    const now = this.#states.read(pageId);
+    if (now.version !== after || timeoutMs <= 0) {
+      return this.#stateOutcome(access, now, now.version !== after);
+    }
+    const slot = this.#waits.take(userId, pageId, caller.account.kind === 'invitee');
+    if (typeof slot === 'string') {
+      this.#log.debug('page state wait refused: too many waits', { userId, pageId, limit: slot });
+      this.refusedByBudget(caller, { tool: 'wait_for_page_state', page: pageId });
+      return hubError('rate_limited', WAIT_REFUSALS[slot]);
+    }
+    const held = this.#holdBytes(caller, heldBytes, 'rate_limited');
+    if (held.kind === 'error') {
+      slot.release();
+      this.refusedByBudget(caller, { tool: 'wait_for_page_state', page: pageId });
+      return held;
+    }
+    try {
+      const waitMs = Math.min(timeoutMs, MAX_WAIT_MS, this.#config.timings.callDeadlineMs);
+      this.#log.debug('page state wait started', { userId, pageId, after, waitMs });
+      const ended = await this.#states.wait(pageId, userId, waitMs, signal);
+      if (ended.kind === 'error') return ended;
+      if (ended.kind === 'cancelled') return hubError('timeout', 'the wait was cancelled');
+      const again = this.#access(userId, pageId);
+      if (again.kind === 'error') return again;
+      const latest = this.#states.read(pageId);
+      return this.#stateOutcome(again, latest, latest.version !== after);
+    } finally {
+      held.release();
+      slot.release();
+    }
   }
+
+  /* eslint-disable @typescript-eslint/no-unused-vars -- stubs: their bodies come with ADR 0042 */
 
   /**
    * get_proposal (ADR 0042): the caller's own proposal on the page, waiting

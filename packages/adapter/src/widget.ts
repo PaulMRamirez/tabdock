@@ -59,6 +59,7 @@ import {
   MAX_INVITE_LABEL_CHARS,
   MAX_INVITE_USES,
   MAX_LIVE_INVITES_PER_PAGE,
+  MAX_STATE_BYTES,
   plainLine,
   type Role,
   UNVERIFIED_ACCOUNT_NAME,
@@ -138,8 +139,20 @@ const REFUSAL_TEXT: Record<InviteRefusal, string> = {
 
 // The M6 blocks' rules, a labelled section each with its own dark-mode
 // rules, so each workstream edits its own lines alone (plan section 2.6).
-/** The page state line (ADR 0040). */
+/**
+ * The page state line (ADR 0040) needs no rules of its own: a muted line,
+ * wrapped within the panel's width like every other, so none are added.
+ */
 const STATE_STYLE = '';
+
+/** The state line for each status but 'none', which hides it. */
+const STATE_LINES = {
+  shared: 'This page shares its state with everyone attached, invited people included.',
+  paused: 'Page state is held while paused.',
+  too_large: `Page state not shared: over ${String(MAX_STATE_BYTES)} bytes.`,
+  invalid: 'Page state not shared: not a JSON object.',
+  unsupported: 'This relay does not take page state.',
+} as const;
 /** The proposal queue and its badge (ADR 0042). */
 const PROPOSALS_STYLE = '';
 /** The time-boxed session's form, countdown and badge (ADR 0043). */
@@ -1612,8 +1625,21 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   // M6 seams (plan section 2.6), each its workstream's own: until one is
   // filled in, its block stays hidden. core.ts says what the marker is for.
 
-  // M6 seam: not built
-  const syncStateLine: (state: DockState) => void = () => undefined;
+  /**
+   * Whether the page's state reaches everyone attached (ADR 0040): the
+   * operator sees that a guest can read it, and that pause holds it. Hidden
+   * while the page shares nothing. The value itself is never shown.
+   */
+  let shownPublished: DockState['published'] = 'none';
+  function syncStateLine(state: DockState): void {
+    const published = state.published;
+    if (published === shownPublished) return;
+    shownPublished = published;
+    dom.flag(stateLine, 'hidden', published === 'none');
+    if (published === 'none') return;
+    dom.attr(stateLine, 'class', 'muted');
+    dom.setText(stateLine, STATE_LINES[published]);
+  }
   // M6 seam: not built
   const syncProposals: (state: DockState) => void = () => undefined;
   // M6 seam: not built

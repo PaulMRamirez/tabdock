@@ -558,9 +558,9 @@ export const DEFAULT_RATE_LIMITS: RelayRateLimits = {
   toolsFramesWindowMs: 10_000,
   // ADR 0040: a conforming adapter sends at most 21 state frames in 10 s, and
   // 200 an address covers five hosted sockets at full rate twice over.
-  stateFramesPerSocket: 40, // M6 seam: not built. W1-C's #stateFrameAllowed reads it.
-  stateFramesPerAddress: 200, // M6 seam: not built. W1-C's #stateFrameAllowed reads it.
-  stateFramesWindowMs: 10_000, // M6 seam: not built. W1-C's #stateFrameAllowed reads it.
+  stateFramesPerSocket: 40,
+  stateFramesPerAddress: 200,
+  stateFramesWindowMs: 10_000,
   // ADR 0044, provisional until the room measurement: forty watchers share
   // two calls a second of the operator's tab, one of them a call every 2 s.
   watchingCallsPerPage: 120, // M6 seam: not built. W2-C's #watchingShareRefusal reads it.
@@ -626,7 +626,7 @@ export const DEFAULT_LIMITS: RelayLimits = {
   requestBytes: 64 * 1024 * 1024,
   requestBytesPerUser: 24 * 1024 * 1024,
   imageBytes: DEFAULT_IMAGE_BYTES,
-  stateBytes: STATE_BYTES, // M6 seam: not built. W1-C's page-state.ts charges against it.
+  stateBytes: STATE_BYTES,
   proposalBytes: PROPOSAL_BYTES, // M6 seam: not built. W2-A's proposals.ts charges against it.
   responseBytes: RESPONSE_BYTES, // M6 seam: not built. W1-F's ResponseStalls ceiling reads it.
   observersPerPage: OBSERVERS_PER_PAGE,

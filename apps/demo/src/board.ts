@@ -39,6 +39,26 @@ export interface BoardSnapshot {
   view: View;
 }
 
+/**
+ * What the board publishes as its page state (ADR 0040): where the view is,
+ * how many items there are and which are highlighted, never their labels,
+ * which are what agents wrote. A few hundred bytes, far under the 16 KiB cap
+ * even with every item highlighted.
+ */
+export interface BoardState {
+  view: View;
+  itemCount: number;
+  highlighted: string[];
+}
+
+export function boardState(snapshot: BoardSnapshot): BoardState {
+  return {
+    view: { ...snapshot.view },
+    itemCount: snapshot.items.length,
+    highlighted: snapshot.items.filter((item) => item.highlighted).map((item) => item.id),
+  };
+}
+
 export class BoardError extends Error {
   override name = 'BoardError';
 }

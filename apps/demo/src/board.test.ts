@@ -1,5 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
-import { Board, BoardError, MAX_ITEMS, MAX_ZOOM, MIN_ZOOM, WORLD_LIMIT } from './board.ts';
+import {
+  Board,
+  BoardError,
+  boardState,
+  MAX_ITEMS,
+  MAX_ZOOM,
+  MIN_ZOOM,
+  WORLD_LIMIT,
+} from './board.ts';
 
 describe('Board', () => {
   it('adds items with sequential ids and a default colour', () => {
@@ -81,5 +89,32 @@ describe('Board', () => {
     unsubscribe();
     board.clear();
     expect(listener).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('boardState (ADR 0040)', () => {
+  it('publishes the view, the item count and the highlighted ids, never a label', () => {
+    const board = new Board();
+    board.addItem({ label: 'Start', x: 0, y: 0 });
+    const north = board.addItem({ label: 'North', x: 0, y: -150 });
+    board.highlightItem(north.id);
+    board.moveView({ x: 12, y: -4, zoom: 2 });
+    const state = boardState(board.snapshot());
+    expect(state).toEqual({
+      view: { x: 12, y: -4, zoom: 2 },
+      itemCount: 2,
+      highlighted: ['item-2'],
+    });
+    expect(JSON.stringify(state)).not.toContain('North');
+  });
+
+  it('stays far under the 16 KiB cap with every item highlighted', () => {
+    const board = new Board();
+    for (let i = 0; i < MAX_ITEMS; i += 1) {
+      board.highlightItem(board.addItem({ label: `item ${String(i)}`, x: 0, y: 0 }).id);
+    }
+    expect(
+      new TextEncoder().encode(JSON.stringify(boardState(board.snapshot()))).length,
+    ).toBeLessThan(16_384);
   });
 });

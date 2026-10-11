@@ -31,6 +31,7 @@ import {
   type InviteListing,
   type InviteRefusalReason,
   INVITEE_SHORT_ID_CHARS,
+  type JsonObject,
   JsonObjectSchema,
   MAX_FRAME_BYTES,
   MAX_IMAGE_BYTES,
@@ -65,6 +66,7 @@ import {
   type SessionRecord,
   type SessionRefusalReason,
   SHORT_INVITE_LIFETIME_MS,
+  STATE_MIN_INTERVAL_MS,
   StateValueSchema,
   type StoredGrant,
   StoredGrantSchema,
@@ -1120,13 +1122,14 @@ function byteLength(text: string): number {
 }
 
 /**
- * Why a value the page publishes as its state is refused, or null (ADR
- * 0040). It is written once through the protocol's taken JSON.stringify, so
- * a getter that changes between reads cannot make what is sent differ from
- * what was checked; that text, read back, must be a JSON object or null, and
- * at most MAX_STATE_BYTES. Never a throw: pages publish from render loops.
+ * A value the page publishes as its state, as the canonical text the adapter
+ * keeps and sends, or why it is refused (ADR 0040). It is written once
+ * through the protocol's taken JSON.stringify, so a getter that changes
+ * between reads cannot make what is sent differ from what was checked; that
+ * text, read back, must be a JSON object or null. Null comes back as null
+ * text. Never a throw: pages publish from render loops.
  */
-function stateRefusal(value: unknown): 'invalid' | 'too_large' | null {
+function stateTextOf(value: unknown): { text: string | null; bytes: number } | 'invalid' {
   let text: string | undefined;
   try {
     text = encodeValue(value);
@@ -1134,10 +1137,10 @@ function stateRefusal(value: unknown): 'invalid' | 'too_large' | null {
     // A cycle or a BigInt.
     return 'invalid';
   }
-  if (text === undefined || !StateValueSchema.safeParse(parseValue(text)).success) {
-    return 'invalid';
-  }
-  return byteLength(text) > MAX_STATE_BYTES ? 'too_large' : null;
+  if (text === undefined) return 'invalid';
+  const parsed = parseValue(text);
+  if (!StateValueSchema.safeParse(parsed).success) return 'invalid';
+  return parsed === null ? { text: null, bytes: 0 } : { text, bytes: byteLength(text) };
 }
 
 /** Unpadded base64url, as the relay's Buffer.toString('base64url') writes it: 16 bytes make 22 characters. */
@@ -2104,7 +2107,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     lastToolsKey = null;
     // State goes before tools (ADR 0040): the relay serves reads again only
     // once the tools frame comes, so no reader sees the null a sleep left.
-    stateWelcome();
+    stateWelcome(frame);
     void syncTools();
     schedulePoll();
   }
@@ -3696,23 +3699,113 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   // Each has its final signature, so the call sites above and the handle
   // below stay as they are when its body comes.
 
-  // Page state (ADR 0040)
-  // M6 seam: not built. W1-C sends a valid value to a relay that takes
-  // state. Until then a value is checked as the final API checks it, so a
-  // page sees the same refusals, and a valid one shows 'unsupported': this
-  // adapter shares nothing yet, and says so rather than seem to.
+  // Page state (ADR 0040). The page's latest value is kept as canonical
+  // text, and at most one state frame goes out each STATE_MIN_INTERVAL_MS:
+  // the first change after a quiet spell at once, the last of a burst when
+  // the interval ends, and nothing when the relay already holds that text
+  // from this link. While paused the relay is sent null, as pause refuses
+  // every call, reads included. The value is never logged.
+
+  /** The page's latest valid value as canonical text; null for nothing, or after a refusal. */
+  let stateText: string | null = null;
+  let stateBytes = 0;
+  /** Why the page's latest value was refused, or null. */
+  let stateRefused: 'too_large' | 'invalid' | null = null;
+  /** What the relay holds from this link: nothing after every welcome, since a sleep drops it. */
+  let sentStateText: string | null = null;
+  let stateSentAt = Number.NEGATIVE_INFINITY;
+  let stateTimer: unknown = null;
+  /** The welcome's maxStateBytes within the protocol's own; null until a welcome names one. */
+  let stateCap: number | null = null;
+  /** Whether the last welcome named maxStateBytes; null before any welcome. */
+  let relayTakesState: boolean | null = null;
+
+  function publishedNow(): PublishStatus {
+    if (stateRefused !== null) return stateRefused;
+    if (stateText === null) return 'none';
+    if (relayTakesState === false) return 'unsupported';
+    return state.paused ? 'paused' : 'shared';
+  }
+
+  /** Says the status once each time it changes, never per value, so a busy page re-renders nothing. */
+  function syncPublished(): void {
+    const published = publishedNow();
+    if (state.published === published) return;
+    if (published === 'too_large') {
+      log.warn(
+        `page state not shared: ${stateBytes} bytes, over the ${stateCap ?? MAX_STATE_BYTES} byte limit`,
+      );
+    } else if (published === 'invalid') {
+      log.warn('page state not shared: not a JSON object or null');
+    } else if (published === 'unsupported') {
+      log.warn('page state not shared: this relay does not take page state');
+    }
+    setState({ published });
+  }
+
   const publishState: Dock['publishState'] = (value) => {
-    const refusal = stateRefusal(value);
-    const published: PublishStatus = refusal ?? 'unsupported';
-    if (state.published !== published) setState({ published });
+    const written = stateTextOf(value);
+    let refusal: 'too_large' | 'invalid' | null = 'invalid';
+    // A refused value clears what the relay holds rather than leave a stale one current.
+    stateText = null;
+    if (written !== 'invalid') {
+      stateBytes = written.bytes;
+      refusal = written.bytes > (stateCap ?? MAX_STATE_BYTES) ? 'too_large' : null;
+      if (refusal === null) stateText = written.text;
+    }
+    stateRefused = refusal;
+    syncPublished();
+    flushState();
     return Object.freeze(refusal === null ? { ok: true } : { ok: false, reason: refusal });
   };
-  // M6 seam: not built
-  const stateWelcome = (): void => undefined;
-  // M6 seam: not built
-  const stateLinkDown = (): void => undefined;
-  // M6 seam: not built
-  const stateFlush = (): void => undefined;
+
+  function flushState(): void {
+    if (!isLinked() || stateCap === null) return;
+    const wanted = state.paused ? null : stateText;
+    if (wanted === sentStateText) return;
+    const now = clock();
+    const due = stateSentAt + STATE_MIN_INTERVAL_MS;
+    if (now < due) {
+      // One timer for the rest of the interval, which sends whatever is latest then.
+      stateTimer ??= timers.setTimeout(() => {
+        stateTimer = null;
+        flushState();
+      }, due - now);
+      return;
+    }
+    // The text read back, so what goes out is exactly what was measured.
+    // stateTextOf checked it is an object; send() checks the frame again.
+    const value = wanted === null ? null : (parseValue(wanted) as JsonObject);
+    if (!send({ t: 'state', value })) return;
+    sentStateText = wanted;
+    stateSentAt = now;
+  }
+
+  /** Before the tools frame: the relay serves reads again only once tools come, so none sees the gap. */
+  const stateWelcome = (frame: WelcomeFrame): void => {
+    const offered = frame.limits.maxStateBytes;
+    relayTakesState = offered !== undefined;
+    stateCap = offered === undefined ? null : Math.min(MAX_STATE_BYTES, offered);
+    sentStateText = null;
+    stateSentAt = Number.NEGATIVE_INFINITY;
+    if (stateCap !== null && stateText !== null && stateBytes > stateCap) {
+      stateText = null;
+      stateRefused = 'too_large';
+    }
+    syncPublished();
+    flushState();
+  };
+
+  const stateLinkDown = (): void => {
+    timers.clearTimeout(stateTimer);
+    stateTimer = null;
+    sentStateText = null;
+  };
+
+  const stateFlush = (): void => {
+    syncPublished();
+    flushState();
+  };
 
   // Image results (ADR 0039)
 
