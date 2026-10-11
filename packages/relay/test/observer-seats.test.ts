@@ -135,9 +135,14 @@ describe('watching seats beside the people (ADR 0044, A6.19)', () => {
     const page = await relay.page({ policy: { invites: 'all' } });
     await attachMember(await relay.claude('sub-alice'), page);
     const { guests } = await fillRoom(relay, page, 40);
+    // The watchers share DEFAULT_RATE_LIMITS.watchingCallsPerPage calls to the
+    // page a minute, fewer than the room's 80 reads, so each device reads in
+    // a minute of its own while both devices' sessions stay open.
+    vi.useFakeTimers({ toFake: ['Date'] });
     const reads: boolean[] = [];
-    for (const guest of guests) {
-      for (let session = 0; session < 2; session += 1) {
+    for (let session = 0; session < 2; session += 1) {
+      if (session > 0) vi.setSystemTime(Date.now() + DEFAULT_RATE_LIMITS.windowMs + 1000);
+      for (const guest of guests) {
         const claude = await relay.claude(guest.sub, guest.email);
         const listed = await call(claude, 'list_pages');
         reads.push(
@@ -147,6 +152,7 @@ describe('watching seats beside the people (ADR 0044, A6.19)', () => {
         );
       }
     }
+    expect(guests.length).toBeLessThanOrEqual(DEFAULT_RATE_LIMITS.watchingCallsPerPage);
     expect(reads).toEqual(Array<boolean>(80).fill(true));
   }, 120_000);
 

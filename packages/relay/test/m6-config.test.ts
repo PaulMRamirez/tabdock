@@ -144,7 +144,8 @@ describe('defaults (docs/plans/M6.md, section 2.5)', () => {
       stateFramesPerSocket: 40,
       stateFramesPerAddress: 200,
       stateFramesWindowMs: 10_000,
-      watchingCallsPerPage: 120,
+      // Lowered from ADR 0044's 120 by the room measurement (its notes).
+      watchingCallsPerPage: 60,
       watchingCallsPerUserPerPage: 30,
     });
     expect(DEFAULT_TIMINGS).toMatchObject({
@@ -683,7 +684,7 @@ describe('options with no environment variable', () => {
       TABDOCK_MEMBERS_POLL_MS: '1',
     });
     expect(config.rateLimits.stateFramesPerSocket).toBe(40);
-    expect(config.rateLimits.watchingCallsPerPage).toBe(120);
+    expect(config.rateLimits.watchingCallsPerPage).toBe(60);
     expect(config.timings.proposalTtlMs).toBe(PROPOSAL_TTL_MS);
     expect(config.timings.membersPollMs).toBe(MEMBERS_POLL_MS);
   });

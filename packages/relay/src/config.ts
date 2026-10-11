@@ -169,7 +169,7 @@ export interface RelayRateLimits {
    * Calls the page's watchers together may make to it per windowMs: the
    * invitees watching by invite, apart from its people (ADR 0044), so a room
    * of them cannot make the operator's tab stutter. No setting: tests lower
-   * it, and the room measurement may.
+   * it, and the room measurement set it (ADR 0044's notes).
    */
   watchingCallsPerPage: number;
   /** The same for one watcher on one page. */
@@ -567,9 +567,11 @@ export const DEFAULT_RATE_LIMITS: RelayRateLimits = {
   stateFramesPerSocket: 40,
   stateFramesPerAddress: 200,
   stateFramesWindowMs: 10_000,
-  // ADR 0044, provisional until the room measurement: forty watchers share
-  // two calls a second of the operator's tab, one of them a call every 2 s.
-  watchingCallsPerPage: 120,
+  // ADR 0044, as the room measurement left it: watchers share one call a
+  // second of the operator's tab, the most at which the canvas map page kept
+  // its 99th percentile frame on time; at two a second it missed frames
+  // (docs/notes/m6/room-measure.md). Each watcher has 30 of them.
+  watchingCallsPerPage: 60,
   watchingCallsPerUserPerPage: 30,
   ignoredFramesPerSocket: 20,
   ignoredFramesPerAddress: 60,
