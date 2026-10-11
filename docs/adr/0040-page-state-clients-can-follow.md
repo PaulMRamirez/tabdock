@@ -85,3 +85,7 @@ Conflicts between the M6 records, settled by the plan, that touch this one:
 **From ADR 0044.** A page's waits are bounded by `usersPerPage` plus `observersPerPage`, invitees by that less two, and agents may hold waits (C2, C28).
 
 **Open questions.** Settled under Decisions: the names (1), the wait's answer (2), the size (3), the limits (6, 7) and latest value only (5).
+
+## Notes after the build
+
+**A withheld value stays withheld until the page moves.** Past `TABDOCK_MAX_STATE_BYTES` the relay withholds a value without telling the page (decision 13), and the adapter never sends an equal value again (decision 9). A withheld page therefore reads null, at a raised version, until it publishes a different value, its operator pauses and resumes it, or its link comes back with a new welcome; room that other pages free does not bring the value back by itself, and a page that publishes only on discrete changes stays null until its next one. This is accepted rather than given a frame of its own: at the defaults a hosted relay never withholds, since every page it admits fits at the largest state (`state-heap.test.ts`), and resending an equal value on a timer would spend every page's frame budget to serve a relay set below its default. The relay's warn line, "page state withheld", is the operator's sign to raise the setting.

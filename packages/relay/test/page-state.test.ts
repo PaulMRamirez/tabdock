@@ -361,7 +361,10 @@ describe('what every page holds (TABDOCK_MAX_STATE_BYTES, S9)', () => {
     expect(
       linesNamed(relay, 'page state withheld: pages hold all the page state this relay allows'),
     ).toEqual([expect.objectContaining({ pageId: last.pageId, version: 1 })]);
-    // Room made, the same value is taken.
+    // Room made, the relay takes the value when it comes again. An adapter
+    // sends an equal value again only on a pause and resume or a new link,
+    // since it never resends one (decision 9) and is not told of the
+    // withhold, so until then the page reads null (ADR 0040's notes).
     await publish(first, null);
     await publish(last, big(fitting));
     expect((await readState(alice, last.pageId)).body).toMatchObject({
