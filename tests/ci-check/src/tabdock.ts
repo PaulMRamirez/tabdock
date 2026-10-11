@@ -21,6 +21,7 @@ import { allowAttach, readPairingCode, waitingPrompts } from '@tabdock/adapter/t
 import { z } from 'zod';
 import type { ResultLike } from './labelled.ts';
 import { createPacer, PAGE_CALLS_PER_MINUTE, REQUESTS_PER_MINUTE } from './pacer.ts';
+import { failOnPrompt } from './prompt-watch.ts';
 import type { Caller } from './walk.ts';
 
 /** What the check's client calls itself: the widget's prompt and the audit log both name it. */
@@ -134,31 +135,11 @@ export const test = base.extend<object, { tabdock: Tabdock }>({
         }
         const pending = client.callTool({ name: tool, arguments: args }) as Promise<ResultLike>;
         if (tool !== 'call_page_tool') return pending;
-        // A write the page asks its operator about would wait out its deadline; fail at once instead.
-        let settled = false;
-        void pending.finally(() => {
-          settled = true;
-        });
-        const watch = new Promise<never>((_resolve, reject) => {
-          const look = async (): Promise<void> => {
-            if (settled) return;
-            if ((await waitingPrompts(cdp)).confirm.length > 0) {
-              reject(
-                new Error(
-                  'the page prompts for a write; set consequential or consequentialTools (ADR 0034)',
-                ),
-              );
-              return;
-            }
-            setTimeout(next, PROMPT_CHECK_MS);
-          };
-          // A look that fails, such as one that finds two widgets, fails the call it watched.
-          const next = (): void => {
-            look().catch(reject);
-          };
-          setTimeout(next, PROMPT_CHECK_MS);
-        });
-        return Promise.race([pending, watch]);
+        return failOnPrompt(
+          pending,
+          async () => (await waitingPrompts(cdp)).confirm.length > 0,
+          PROMPT_CHECK_MS,
+        );
       };
 
       await use({ client, pageId, page, cdp, caller, pageCalls: () => pageCalls });
