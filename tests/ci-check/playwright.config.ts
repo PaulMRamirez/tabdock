@@ -31,7 +31,8 @@ export default defineConfig({
     },
     {
       name: 'page',
-      command: process.env.CI_CHECK_PAGE_COMMAND ?? 'echo set CI_CHECK_PAGE_COMMAND && exit 1',
+      // Required: with none set, the run stops here saying so.
+      command: process.env.CI_CHECK_PAGE_COMMAND ?? 'echo set CI_CHECK_PAGE_COMMAND >&2; exit 1',
       url: process.env.CI_CHECK_PAGE_URL ?? 'http://127.0.0.1:5180/',
       reuseExistingServer: false,
       gracefulShutdown: { signal: 'SIGINT', timeout: 5_000 },
