@@ -69,7 +69,11 @@ export class MemoryStorage implements StorageLike {
 /**
  * A scripted operator. attach returns 'driver', 'observer' or 'deny'; confirm
  * returns true or false. Leaving a method out, or returning undefined, leaves
- * that prompt to sim.dock, and silence until the deadline denies.
+ * that prompt to sim.dock, and silence until the deadline denies. An agent
+ * token's first request (ADR 0044) reaches attach with via 'agent' and
+ * `agent` naming the token's id and label, only once the adapter has checked
+ * it against the page's own record; whatever attach answers, the page grants
+ * an agent observer alone, and a deny or three silences burn the token.
  */
 export type SimOperator = UiPort;
 
