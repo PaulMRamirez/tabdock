@@ -17,10 +17,10 @@
 // every student's agent loop wait_for_page_state at its 60-a-minute budget,
 // at the burst quota and then at Fly's 6.25% baseline. stalled (P3) has a
 // quarter of the class leave a 0.72 MB answer and an image unread until the
-// relay cuts them. ceiling has every student read two 0.72 MB answers 16 KiB
-// every 8 s, so unread bytes pile up past TABDOCK_MAX_RESPONSE_BYTES where
-// the class is large enough and the relay must cut guests' answers, never
-// the teacher's. Those two phases run with TCP buffers narrowed, so the
+// relay cuts them. ceiling has every student read two 0.72 MB answers at
+// most 64 KiB every 25 s, so unread bytes pile up toward
+// TABDOCK_MAX_RESPONSE_BYTES, past which the relay must cut guests' answers,
+// never the teacher's. Those two phases run with TCP buffers narrowed, so the
 // relay rather than loopback's kernel holds what nobody reads (sockets.ts).
 // No token, secret, code or invite link is ever printed.
 
@@ -400,7 +400,7 @@ function thrownOutcome(error: unknown): string {
   return 'thrown';
 }
 
-/** One held answer: a call whose client reads its first KiB, then 16 KiB every 8 s or nothing more. */
+/** One held answer: its client reads the first KiB, then at most 64 KiB every 25 s, or nothing. */
 interface Held {
   /** pending or held while open, ended, cut, or the code a refusal began with. */
   outcome: string;
@@ -1098,7 +1098,7 @@ export async function measureRoom(
     for (const held of phase.held) held.close();
     await endPhase();
 
-    // Unread bytes past the ceiling: every student reads two of the largest answers 16 KiB every 8 s.
+    // Unread bytes toward the ceiling: every student reads two of the largest answers slowly.
     await beginPhase('ceiling', BURST_QUOTA_US);
     load = classLoad({ pageCalls: false });
     const fillEnds = performance.now() + plan.phaseMs.ceiling;
@@ -1214,7 +1214,7 @@ let heldIds = 1000;
 
 /**
  * A tools/call on a student's 2025-11-25 session whose answer the client
- * reads only its first KiB of, then nothing ('stall') or 16 KiB every 8 s
+ * reads only its first KiB of, then nothing ('stall') or at most 64 KiB every 25 s
  * ('trickle'), on a connection of its own. Its outcome is held while open,
  * ended if the relay finished it, cut if the relay closed it first, or the
  * refusal's code if the relay refused the call.
@@ -1273,13 +1273,17 @@ function heldCall(
         }
         held.outcome = 'pending';
         if (mode === 'trickle') {
-          // Enough each time to reopen a narrowed window, so the relay sees progress at
-          // every 10 s check, and little enough that an answer outlasts the phase: about
-          // 2 KB a second, six minutes to an answer.
+          // The relay cuts a response that made no progress at three checks 10 s
+          // apart, and lets go of an answer once what is left of it fits in the
+          // buffers past it, about 250 KB here. So every 25 s the reader takes
+          // what Node holds, up to 64 KiB, which mostly frees enough of a narrowed
+          // window for the relay to send again within three checks, and keeps each
+          // answer in the relay for about three minutes. A reader whose window
+          // stays shut is one the relay rightly sees take nothing for 30 s.
           // read(n) takes nothing while fewer than n bytes wait, so it asks for what is there.
           timer = setInterval(() => {
-            res.read(Math.min(16_384, res.readableLength));
-          }, 8000);
+            res.read(Math.min(65_536, res.readableLength));
+          }, 25_000);
         }
       });
       res.on('end', () => {
