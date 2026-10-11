@@ -313,3 +313,65 @@ test("says when the page's people have no seat for a watcher made a driver", asy
     'observer',
   );
 });
+
+test("Revoke on a watcher's row closes the link they joined by, unless the section's box is unticked", async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  room = await startRoomTabdock();
+  const live = room;
+  await page.goto(live.pageUrl);
+  await waitForLink(page);
+  await pairMember(page, live, ALICE, 'driver');
+  await waitForDock(page, (state) => (state.invitesOffered?.linkBase ?? null) !== null);
+  if (!(await widgetVisible(page, 'pause-box'))) await clickInWidget(page, { action: 'toggle' });
+
+  /** Two students join by a fresh five-use link; returns the link's invite id and their ids. */
+  const joinTwo = async (label: string, from: number) => {
+    const before = new Set((await dockState(page))?.invites.map((view) => view.inviteId));
+    const secret = await mint(page, { label, role: 'observer', uses: 5 });
+    const inviteId =
+      (await dockState(page))?.invites.find((view) => !before.has(view.inviteId))?.inviteId ?? '';
+    for (const index of [from, from + 1]) {
+      expect((await joinAtI(live, index, secret)).data).toEqual({
+        status: 'approved',
+        role: 'observer',
+      });
+    }
+    const ids = await waitForDock(page, (state) => {
+      const made = state.roster.filter((entry) => entry.inviteId === inviteId);
+      return made.length === 2 ? made.map((entry) => entry.userId) : null;
+    });
+    return { inviteId, ids };
+  };
+
+  // Ticked by default, as ADR 0016 asks of a multi-use link: Revoke closes it.
+  const first = await joinTwo('Class', 0);
+  await clickInWidget(page, { action: 'revoke', userId: first.ids[0] ?? '' });
+  await waitForDock(page, (state) =>
+    !state.invites.some((view) => view.inviteId === first.inviteId) &&
+    !state.roster.some((entry) => entry.userId === first.ids[0])
+      ? true
+      : null,
+  );
+
+  // Unticked, Revoke ends the one person only, and the link stays live.
+  const second = await joinTwo('Class two', 2);
+  const box = (await widgetEvaluate(
+    page,
+    'watching',
+    `function () {
+      const input = this.querySelector('[data-action="close-link"]');
+      input.scrollIntoView({ block: 'center' });
+      const at = input.getBoundingClientRect();
+      return { x: at.x + at.width / 2, y: at.y + at.height / 2, checked: input.checked };
+    }`,
+  )) as { x: number; y: number; checked: boolean };
+  expect(box.checked).toBe(true);
+  await page.mouse.click(box.x, box.y);
+  await clickInWidget(page, { action: 'revoke', userId: second.ids[0] ?? '' });
+  await waitForDock(page, (state) =>
+    !state.roster.some((entry) => entry.userId === second.ids[0]) ? true : null,
+  );
+  expect((await dockState(page))?.invites.map((view) => view.inviteId)).toContain(second.inviteId);
+});
