@@ -119,6 +119,32 @@ describe('walkPage', () => {
     expect(calls).toContain('call_page_tool view_from_observation');
   });
 
+  it('finds a capture that is no PNG, whatever type it names', async () => {
+    const notPng = await walk({ captureNotPng: true });
+    expect(
+      notPng.findings.map(({ stop, check, expected, got }) => [stop, check, expected, got]),
+    ).toEqual([
+      [0, 'capture', 'image/png', 'not a PNG'],
+      [1, 'capture', 'image/png', 'not a PNG'],
+    ]);
+    const mislabelled = await walk({ captureMimeType: 'image/jpeg' });
+    expect(mislabelled.findings.map(({ stop, check, got }) => [stop, check, got])).toEqual([
+      [0, 'capture', 'image/jpeg'],
+      [1, 'capture', 'image/jpeg'],
+    ]);
+  });
+
+  it('finds a capture larger than the image cap, and takes one at the cap', async () => {
+    const over = scriptedPage({ captureBytes: 65 });
+    const findings = await walkPage(over.call, PAGE_ID, { ...OPTIONS, maxImageBytes: 64 });
+    expect(findings.map(({ stop, check, expected, got }) => [stop, check, expected, got])).toEqual([
+      [0, 'capture', 'at most 64 bytes', '65 bytes'],
+      [1, 'capture', 'at most 64 bytes', '65 bytes'],
+    ]);
+    const at = scriptedPage({ captureBytes: 64 });
+    expect(await walkPage(at.call, PAGE_ID, { ...OPTIONS, maxImageBytes: 64 })).toEqual([]);
+  });
+
   it('finds a capture that carries no image, and a caller that is no driver', async () => {
     const noImage = await walk({ noImage: true });
     expect(noImage.findings.map(({ stop, check, got }) => [stop, check, got])).toEqual([
