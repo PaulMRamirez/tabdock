@@ -10,6 +10,8 @@ import {
   INVITEE_ID_PREFIX,
 } from '@tabdock/protocol';
 import { createHash } from 'node:crypto';
+import { vi } from 'vitest';
+import { ArgumentChecker } from '../../src/argument-checker.ts';
 import type { AttachmentRecord, DevTokenUser, RelayStore } from '../../src/index.ts';
 import type { RelayFrameOf, TestPage } from './page-client.ts';
 import { callTool, type ToolOutcome } from './relay.ts';
@@ -166,4 +168,46 @@ export function proposalCalls(events: AuditEvent[], proposalId: string): AuditEv
     (event): event is AuditEventOf<'call'> =>
       event.type === 'call' && event.proposalId === proposalId,
   );
+}
+
+/** A step in the relay held until a test releases it. */
+export interface Hold {
+  /** Resolves once the relay waits on the held step. */
+  started: Promise<void>;
+  release: () => void;
+}
+
+/**
+ * Holds the relay's argument check of the next call to `tool` until
+ * released, so a test lands a revoke and a fresh approval exactly while
+ * #propose waits on its worker, however quick the check would be. The
+ * caller restores the spy (vi.restoreAllMocks).
+ */
+export function holdCheck(tool: string): Hold {
+  let started: () => void = () => undefined;
+  let release: () => void = () => undefined;
+  const begun = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  // Called below with the relay's own checker as `this`.
+  // eslint-disable-next-line @typescript-eslint/unbound-method
+  const check = ArgumentChecker.prototype.check;
+  let held = false;
+  vi.spyOn(ArgumentChecker.prototype, 'check').mockImplementation(async function (
+    this: ArgumentChecker,
+    name,
+    schema,
+    args,
+  ) {
+    if (name === tool && !held) {
+      held = true;
+      started();
+      await gate;
+    }
+    return check.call(this, name, schema, args);
+  });
+  return { started: begun, release };
 }

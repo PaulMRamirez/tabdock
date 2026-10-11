@@ -16,7 +16,7 @@ import {
   type PolicyInput,
   untrustedHeader,
 } from '@tabdock/protocol';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AuthPlugin } from '../src/auth.ts';
 import { createDevTokenAuth, createMemoryStore, type DevTokenUser } from '../src/index.ts';
 import {
@@ -36,6 +36,7 @@ import {
   closedLines,
   decide,
   getProposal,
+  holdCheck,
   member,
   nextProposal,
   propose,
@@ -65,6 +66,7 @@ const clients: Client[] = [];
 const fence = new TestFence();
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   fence.end();
   const ending = current;
   current = undefined;
@@ -518,6 +520,33 @@ describe('the operator decides (A6.11)', () => {
     expect(closedLines(events(relay))).toEqual([
       expect.objectContaining({ proposalId, reason: 'cancelled' }),
     ]);
+  });
+  it('makes no proposal when its observer is revoked and approved afresh while its arguments are checked (S8)', async () => {
+    const relay = await setup();
+    const opened = await page();
+    const bob = await observer(opened);
+    // A reservation is no proposal yet, so the revoke's attachmentsEnded
+    // cannot reach it: only the look at the attachment after the check can.
+    const hold = holdCheck('add_item');
+    const before = events(relay).length;
+    const pending = propose(bob, opened.pageId);
+    await hold.started;
+    opened.send({ t: 'revoke', userId: 'bob' });
+    await opened.sync();
+    await pairAndApprove(await client(BOB), opened, 'observer');
+    hold.release();
+    const outcome = await pending;
+    expect(outcome.text).toBe('not_attached: the attachment you proposed under has ended');
+    await opened.sync();
+    expect(opened.all('proposal')).toEqual([]);
+    const after = events(relay).slice(before);
+    expect(closedLines(after)).toEqual([]);
+    expect(after.filter((event) => event.type === 'call' && event.tool === 'add_item')).toEqual([
+      expect.objectContaining({ userId: 'bob', outcome: 'not_attached' }),
+    ]);
+    expect(after.some((event) => event.type === 'call' && event.proposalId !== undefined)).toBe(
+      false,
+    );
   });
 });
 
