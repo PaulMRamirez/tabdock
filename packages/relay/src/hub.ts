@@ -5198,7 +5198,7 @@ export class PageHub {
           );
           continue;
         }
-        const name = this.#renamed(request.userId, request.displayName, change, members);
+        const name = this.#renamed(request.userId, request.displayName, change.renamed, members);
         if (name !== null) {
           request.displayName = name;
           this.#store.requests.put(request);
@@ -5206,7 +5206,12 @@ export class PageHub {
       }
       let renamed = false;
       for (const attachment of this.#store.attachments.listForPage(pageId)) {
-        const name = this.#renamed(attachment.userId, attachment.displayName, change, members);
+        const name = this.#renamed(
+          attachment.userId,
+          attachment.displayName,
+          change.renamed,
+          members,
+        );
         if (name === null) continue;
         attachment.displayName = name;
         this.#store.attachments.put(attachment);
@@ -5232,15 +5237,17 @@ export class PageHub {
   /**
    * The name a member list change gives someone the relay holds, or null
    * when it stays: a renamed member's new name, and for an invitee whose
-   * name now folds to a member's, `invitee <short id>`, as at sign-in.
+   * name now folds to a member's, `invitee <short id>`, as at sign-in. It
+   * takes the renames alone, so a restart snapshot's restore names people
+   * by the same rule (restoreSnapshot).
    */
   #renamed(
     userId: string,
     displayName: string,
-    change: MemberChange,
+    renamed: ReadonlyMap<string, string>,
     members: ReadonlySet<string>,
   ): string | null {
-    const name = change.renamed.get(userId);
+    const name = renamed.get(userId);
     if (name !== undefined) return name === displayName ? null : name;
     if (!userId.startsWith(INVITEE_ID_PREFIX) || !members.has(foldName(displayName))) return null;
     const short = `invitee ${userId.slice(INVITEE_ID_PREFIX.length, INVITEE_ID_PREFIX.length + INVITEE_SHORT_ID_CHARS)}`;
