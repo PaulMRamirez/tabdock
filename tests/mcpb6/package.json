@@ -12,8 +12,10 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "esbuild": "0.28.2",
     "webmcp-local-relay-6": "npm:@mcp-b/webmcp-local-relay@6.0.0",
     "webmcp-polyfill-6": "npm:@mcp-b/webmcp-polyfill@6.0.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
   }
 }

@@ -186,15 +186,16 @@ importers:
 
   tests/mcpb6:
     dependencies:
-      esbuild:
-        specifier: 0.28.2
-        version: 0.28.2
       webmcp-local-relay-6:
         specifier: npm:@mcp-b/webmcp-local-relay@6.0.0
         version: '@mcp-b/webmcp-local-relay@6.0.0'
       webmcp-polyfill-6:
         specifier: npm:@mcp-b/webmcp-polyfill@6.0.0
         version: '@mcp-b/webmcp-polyfill@6.0.0'
+    devDependencies:
+      esbuild:
+        specifier: 0.28.2
+        version: 0.28.2
 
 packages:
 

@@ -6,7 +6,7 @@
 // 6.0.0 lives in @tabdock/mcpb6 and is reached by path alone, pinned exactly,
 // since a range would let the leg move to a release nobody has read.
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -18,6 +18,7 @@ import { describe, expect, it } from 'vitest';
 
 const E2E = fileURLToPath(new URL('..', import.meta.url));
 const MCPB6 = fileURLToPath(new URL('../../mcpb6', import.meta.url));
+const ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 
 /** The name and version of the package a file under its dist/ belongs to. */
 function packageOf(file: string): { name: string; version: string } {
@@ -77,6 +78,42 @@ describe('MCP-B versions in the tests (ADRs 0032 and 0047)', () => {
     }
     for (const file of [MCPB6_LOCAL_RELAY_CLI, MCPB6_POLYFILL_MODULE, MCPB6_POLYFILL_SCRIPT]) {
       expect(readFileSync(file).byteLength).toBeGreaterThan(0);
+    }
+  });
+
+  it('lists the esbuild that wraps the ESM entry as a development dependency, as the whole workspace does', () => {
+    // Dependabot merges a package's listings from every manifest and counts it
+    // as production if any one lists it under dependencies; a single listing
+    // here would move every esbuild bump into the runtime group, the one read
+    // as shipped code (.github/dependabot.yml, docs/notes/verified.md).
+    const manifest = (dir: string) =>
+      JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as {
+        dependencies?: Record<string, string>;
+        devDependencies?: Record<string, string>;
+      };
+    expect(Object.keys(manifest(MCPB6).dependencies ?? {}).toSorted()).toEqual([
+      'webmcp-local-relay-6',
+      'webmcp-polyfill-6',
+    ]);
+    const workspace = readFileSync(join(ROOT, 'pnpm-workspace.yaml'), 'utf8');
+    const globs = [...workspace.matchAll(/^ {2}- (\S+)$/gm)].map((match) => match[1] ?? '');
+    const members = globs.flatMap((glob) =>
+      glob.endsWith('/*')
+        ? readdirSync(join(ROOT, glob.slice(0, -2)), { withFileTypes: true })
+            .filter((entry) => entry.isDirectory())
+            .map((entry) => join(ROOT, glob.slice(0, -2), entry.name))
+        : [join(ROOT, glob)],
+    );
+    const listings = members
+      .filter((dir) => existsSync(join(dir, 'package.json')))
+      .map((dir) => ({ dir, ...manifest(dir) }))
+      .filter(
+        (m) => m.dependencies?.esbuild !== undefined || m.devDependencies?.esbuild !== undefined,
+      );
+    expect(listings.map((m) => m.dir)).toContain(MCPB6);
+    for (const { dir, dependencies, devDependencies } of listings) {
+      expect(dependencies?.esbuild, dir).toBeUndefined();
+      expect(devDependencies?.esbuild, dir).toBe('0.28.2');
     }
   });
 
