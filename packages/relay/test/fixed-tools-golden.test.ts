@@ -26,6 +26,8 @@ import type { PageHub } from '../src/hub.ts';
 import { createDevTokenAuth } from '../src/index.ts';
 import { createMcpFactory, RELAY_VERSION } from '../src/mcp.ts';
 import { SERVED_REVISIONS } from '../src/relay.ts';
+import { agentWire, mintAgent } from './helpers/agents.ts';
+import { attachMember, type InviteRelay, startInviteRelay } from './helpers/invites.ts';
 import { connectPage, type TestPage, TOOLS } from './helpers/page-client.ts';
 import {
   ALICE,
@@ -89,12 +91,15 @@ function expectM4First(tools: unknown[]): void {
 }
 
 let current: TestRelay | undefined;
+let agents: InviteRelay | undefined;
 const pages: TestPage[] = [];
 
 afterEach(async () => {
   for (const page of pages.splice(0)) page.ws.terminate();
   await current?.close();
   current = undefined;
+  await agents?.close();
+  agents = undefined;
 });
 
 describe('the fixed tools stay as clients were last shown them', () => {
@@ -168,6 +173,37 @@ describe('the fixed tools stay as clients were last shown them', () => {
       expectWire(tools.slice(0, fixed.length), fixed);
       expectM4First(tools);
     }
+  });
+});
+
+describe('the fixed tools on /g/mcp (ADR 0044)', () => {
+  it("are what /mcp serves, on both eras, to an agent token's agent", async () => {
+    agents = await startInviteRelay({ agentTokens: true });
+    const page = await agents.page({ policy: { invites: 'all' } });
+    await attachMember(await agents.claude('sub-alice'), page);
+    const minted = await mintAgent(page);
+    const wire = agentWire(agents.relay.url, minted.token);
+
+    const init = await wire.legacyInitialize();
+    expectWire(asCaptured(init), GOLDEN.legacy.initialize);
+    const sessionId = init.sessionId ?? '';
+    const list = await wire.legacy(sessionId, 'tools/list');
+    expectWire(asCaptured(list), GOLDEN.legacy.toolsList);
+    expectM4First(toolsOf(asCaptured(list)));
+    const unknown = await wire.legacy(sessionId, 'tools/call', { name: 'nope', arguments: {} });
+    expectWire(asCaptured(unknown), GOLDEN.legacy.unknownTool);
+
+    const discover = await wire.modern('server/discover');
+    const captured = GOLDEN.modern.discover as { result: Record<string, unknown> };
+    expectWire(asCaptured(discover), {
+      ...captured,
+      result: { ...captured.result, supportedVersions: [...SERVED_REVISIONS] },
+    });
+    const modern = await wire.modern('tools/list');
+    expectWire(asCaptured(modern), GOLDEN.modern.toolsList);
+    expectM4First(toolsOf(asCaptured(modern)));
+    const modernUnknown = await wire.modern('tools/call', { name: 'nope', arguments: {} });
+    expectWire(asCaptured(modernUnknown), GOLDEN.modern.unknownTool);
   });
 });
 

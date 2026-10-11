@@ -16,6 +16,7 @@ import {
 import { latest } from './invites.ts';
 import type { TestPage } from './page-client.ts';
 import { PUBLIC_ORIGIN, type RawAnswer, tunnelFetch } from './tunnel.ts';
+import { answerOf, MODERN, type WireAnswer } from './wire.ts';
 
 export const AGENT_URL = `${PUBLIC_ORIGIN}${AGENT_PATH}`;
 
@@ -138,4 +139,95 @@ export async function connectAgent(
     }),
   );
   return client;
+}
+
+/** What wire.ts's exchanges read back, on /g/mcp with a token as the bearer. */
+export interface AgentWire {
+  /** A 2025-era initialize, acknowledged, its session left open. */
+  legacyInitialize(): Promise<WireAnswer & { sessionId: string | null }>;
+  /** One request on that session. */
+  legacy(sessionId: string, method: string, params?: Record<string, unknown>): Promise<WireAnswer>;
+  /** One 2026-07-28 request, with the envelope and headers the SDK client sends. */
+  modern(method: string, params?: Record<string, unknown>): Promise<WireAnswer>;
+}
+
+/**
+ * wire.ts's exchanges on /g/mcp through the stand-in tunnel, read back
+ * exactly as they crossed the wire, so the fixed tools' golden test can hold
+ * what an agent receives to what a member does on /mcp (ADR 0044).
+ */
+export function agentWire(relayUrl: string, token: string): AgentWire {
+  const send = tunnelFetch(relayUrl);
+  let nextId = 9000;
+  const post = async (
+    body: unknown,
+    headers: Record<string, string> = {},
+  ): Promise<{ status: number; sessionId: string | null; text: string }> => {
+    const response = await send(AGENT_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        ...headers,
+      },
+      body: JSON.stringify(body),
+    });
+    return {
+      status: response.status,
+      sessionId: response.headers.get('mcp-session-id'),
+      text: await response.text(),
+    };
+  };
+  const onSession = (sessionId: string): Record<string, string> => ({
+    'Mcp-Session-Id': sessionId,
+    'Mcp-Protocol-Version': '2025-11-25',
+  });
+  return {
+    async legacyInitialize() {
+      nextId += 1;
+      const id = nextId;
+      const { status, sessionId, text } = await post({
+        jsonrpc: '2.0',
+        id,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2025-11-25',
+          capabilities: {},
+          clientInfo: { name: 'wire-test', version: '1.0.0' },
+        },
+      });
+      if (sessionId !== null) {
+        await post({ jsonrpc: '2.0', method: 'notifications/initialized' }, onSession(sessionId));
+      }
+      return { status, message: answerOf(text, id), body: text, sessionId };
+    },
+    async legacy(sessionId, method, params = {}) {
+      nextId += 1;
+      const id = nextId;
+      const { status, text } = await post(
+        { jsonrpc: '2.0', id, method, params },
+        onSession(sessionId),
+      );
+      return { status, message: answerOf(text, id), body: text };
+    },
+    async modern(method, params = {}) {
+      nextId += 1;
+      const id = nextId;
+      const meta = {
+        'io.modelcontextprotocol/protocolVersion': MODERN,
+        'io.modelcontextprotocol/clientInfo': { name: 'wire-test', version: '1.0.0' },
+        'io.modelcontextprotocol/clientCapabilities': {},
+      };
+      const { status, text } = await post(
+        { jsonrpc: '2.0', id, method, params: { ...params, _meta: meta } },
+        {
+          'Mcp-Protocol-Version': MODERN,
+          'Mcp-Method': method,
+          ...(typeof params.name === 'string' ? { 'Mcp-Name': params.name } : {}),
+        },
+      );
+      return { status, message: answerOf(text, id), body: text };
+    },
+  };
 }

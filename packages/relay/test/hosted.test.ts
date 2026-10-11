@@ -50,6 +50,8 @@ import {
   TOOLS,
   UpgradeRefused,
 } from './helpers/page-client.ts';
+import { mintAgent, newAgentToken } from './helpers/agents.ts';
+import { latest } from './helpers/invites.ts';
 import { PAIR_CLIENT, startProvider, type TestProvider } from './helpers/provider.ts';
 import { ALICE, delay, eventually } from './helpers/relay.ts';
 import {
@@ -592,6 +594,87 @@ describe('a relay on a host (ADR 0018)', () => {
     const logged = lines.join('\n');
     expect(logged).not.toContain(token);
     expect(logged).not.toContain(code);
+  });
+
+  it("serves /g/mcp through the edge: every miss the same 404 naming the edge's client, and a live token prompts", async () => {
+    const relay = await hosted({ invites: true, agentTokens: true });
+    const page = await connectPage(relay.pageUrl, {
+      tools: TOOLS,
+      headers: through('203.0.113.7'),
+      policy: { invites: 'all' },
+    });
+    pages.push(page);
+    expect((await latest(page, 'agents')).endpoint).toBe(`${PUBLIC_ORIGIN}/g/mcp`);
+    // Alice signs in through the edge and attaches, so she can sponsor a token.
+    const token = await provider.token({ sub: 'sub-alice', aud: PUBLIC_MCP_URL });
+    const tunnel = tunnelFetch(relay.url);
+    const edge: FetchLike = (input, init) =>
+      tunnel(input, {
+        ...init,
+        headers: {
+          ...Object.fromEntries(new Headers(init?.headers).entries()),
+          [HEADER]: '198.51.100.23',
+        },
+      });
+    const alice = new Client({ name: 'phone', version: '1.0.0' });
+    await alice.connect(
+      new StreamableHTTPClientTransport(new URL(PUBLIC_MCP_URL), {
+        authProvider: { token: () => Promise.resolve(token) },
+        fetch: edge,
+      }),
+    );
+    clients.push(alice);
+    const pairing = alice.callTool({ name: 'pair_page', arguments: { code: page.code } });
+    const request = await page.next('attach_request');
+    page.send({ t: 'attach_decision', requestId: request.requestId, allow: true, role: 'driver' });
+    expect((await pairing).isError ?? false).toBe(false);
+    const minted = await mintAgent(page);
+    expect(minted.answer.refused).toBeUndefined();
+
+    const initialize = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2025-11-25',
+        capabilities: {},
+        clientInfo: { name: 'lab-agent', version: '1.0.0' },
+      },
+    });
+    const agentPost = (bearer: string, host = PUBLIC_HOST): Promise<RawAnswer> =>
+      rawRequest(relay.url, '/g/mcp', {
+        method: 'POST',
+        host,
+        headers: {
+          Authorization: `Bearer ${bearer}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+          [HEADER]: '198.51.100.23',
+        },
+        body: initialize,
+      });
+    const miss = await agentPost(newAgentToken().token);
+    expect(miss.status).toBe(404);
+    expect(miss.body).toBe(
+      JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: 'Not found' }, id: null }),
+    );
+    expect(miss.headers.get('www-authenticate')).toBeNull();
+    const refused = lines.filter((line) =>
+      line.includes('agent request refused: no live agent token'),
+    );
+    expect(refused).toHaveLength(1);
+    expect(refused[0]).toContain('"address":"198.51.100.23"');
+    // The platform's own name for the app is refused before any token is read.
+    expect((await agentPost(minted.token, 'tabdock-a1b2.fly.dev')).status).toBe(403);
+    // A live token goes on as its agent and raises the operator's prompt.
+    const asked = await agentPost(minted.token);
+    expect(asked.status).toBe(200);
+    expect(await page.next('attach_request')).toMatchObject({
+      via: 'agent',
+      agent: { tokenId: minted.tokenId },
+      client: { name: 'lab-agent' },
+    });
+    expect(lines.join('\n')).not.toContain(minted.token);
   });
 
   /**
