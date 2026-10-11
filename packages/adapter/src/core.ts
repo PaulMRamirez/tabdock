@@ -44,6 +44,7 @@ import {
   MAX_STATE_BYTES,
   MAX_TIMER_MS,
   MAX_USERS_PER_PAGE,
+  MEMBER_RESERVED_SEATS,
   type PageErrorCode,
   type PageFrameInput,
   PageFrameSchema,
@@ -598,6 +599,11 @@ export interface ObserverSeat {
   readonly asked: 'allow' | 'promote';
   /** Local epoch milliseconds of the roster that showed it. */
   readonly time: number;
+  /**
+   * 'people' when no driver limit held them back but the page's people had
+   * no seat for a watcher made a driver (ADR 0044); absent for the driver limit.
+   */
+  readonly heldBy?: 'people';
 }
 
 /** A set_role the page sent, until a roster that could answer it has come. */
@@ -1242,6 +1248,30 @@ function seatLimitsOf(limits: WelcomeFrame['limits']): SeatLimits | null {
     usersPerPage: Math.min(MAX_USERS_PER_PAGE, limits.usersPerPage),
     observersPerPage: Math.min(MAX_OBSERVERS_PER_PAGE, limits.observersPerPage ?? 0),
   });
+}
+
+/**
+ * Whether the roster shows `entry`, an invitee watching by invite, kept out
+ * of the people's seats (ADR 0044): the people fill the people limit, or
+ * those an invite let in leave members no more than their reserve. For the
+ * widget's words only, as seatLimitsOf is.
+ */
+function noPeopleSeat(
+  limits: SeatLimits | null,
+  roster: readonly AttachmentView[],
+  entry: AttachmentView,
+): boolean {
+  if (limits === null || limits.observersPerPage === 0) return false;
+  const watching = (row: AttachmentView): boolean =>
+    row.kind === 'invitee' && row.role === 'observer';
+  if (!watching(entry)) return false;
+  const people = roster.filter((row) => !watching(row));
+  return (
+    people.length >= limits.usersPerPage ||
+    (entry.inviteId !== null &&
+      people.filter((row) => row.inviteId !== null).length >=
+        limits.usersPerPage - MEMBER_RESERVED_SEATS)
+  );
 }
 
 /** Each UTF-16 code unit becomes at most 3 UTF-8 bytes, so only longer strings need counting. */
@@ -2182,7 +2212,21 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
           log.info(`${who} joined as observer`);
         } else {
           asked.saidObserver = true;
-          log.info(`the relay kept ${who} an observer`);
+          // ADR 0044: a watcher the people had no seat for is told of, as the driver limit is.
+          if (noPeopleSeat(state.seatLimits, attachments, entry)) {
+            log.info(`${who} is still an observer: the page has no seat left among its people`);
+            seatSeq += 1;
+            seats.push(
+              Object.freeze({
+                seq: seatSeq,
+                user: Object.freeze({ ...asked.user }),
+                account: null,
+                asked: asked.asked,
+                time: clock(),
+                heldBy: 'people' as const,
+              }),
+            );
+          } else log.info(`the relay kept ${who} an observer`);
         }
         continue;
       }
