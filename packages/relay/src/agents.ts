@@ -19,6 +19,7 @@ export class AgentTokens implements PagePart {
    */
   // eslint-disable-next-line @typescript-eslint/no-unused-vars -- holds nothing to close until ADR 0044's tokens
   closeAll(_pageId: string, _reason: AgentCloseReason): number {
+    // M6 seam: not built. W2-D closes the page's live tokens here.
     return 0;
   }
 
