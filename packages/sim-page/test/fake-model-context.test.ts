@@ -49,8 +49,8 @@ const PROFILES: { profile: RuntimeProfile; files: string[] }[] = [
     profile: 'chrome-156',
     files: ['baseline.raw.chrome156.json', 'baseline.raw.chrome155.json'],
   },
-  // The 6.0 beta's run; 6.0.0 serializes and reports the same (verified.md, 10 October).
-  { profile: 'mcpb-6', files: ['baseline.raw.mcpb6-beta.json'] },
+  // 6.0.0's run first (baseline.md, 10 October), and the beta's, whose shapes it matched.
+  { profile: 'mcpb-6', files: ['baseline.raw.mcpb6.json', 'baseline.raw.mcpb6-beta.json'] },
 ];
 
 const DEMO_TOOLS = [
