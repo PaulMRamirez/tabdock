@@ -17,7 +17,14 @@ import { Client as Client1320 } from 'mcp-sdk-1.32.0/client/index.js';
 import { StreamableHTTPClientTransport as Http1320 } from 'mcp-sdk-1.32.0/client/streamableHttp.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { labelledAlone, readPageState, stateBody, waitPageState } from '../src/state-helpers.ts';
-import { attachAs, callTool, startWorld, type World } from './helpers.ts';
+import {
+  attachAs,
+  callTool,
+  SIM_TOOL_COUNT,
+  startWorld,
+  waitForTools,
+  type World,
+} from './helpers.ts';
 
 let world: World | undefined;
 
@@ -97,6 +104,9 @@ describe('a sim page publishing its state (ADR 0040)', () => {
     const before = stateBody(await waitPageState(alice, pageId, 0, 5000));
     await sim.reload();
     await sim.waitFor((state) => state.link === 'linked');
+    // The welcome comes before the adapter's tools frame, and until that frame
+    // the relay answers a resumed page's reads page_asleep, as it does calls.
+    await waitForTools(alice, pageId, SIM_TOOL_COUNT);
     // A reload is a new document, which publishes again, as a real page would.
     sim.publishState({ stop: 1 });
     let after = stateBody(await waitPageState(alice, pageId, before.version, 5000));
