@@ -234,9 +234,10 @@ test('pair by code, approve by clicking Allow as driver, then list and call tool
     .poll(async () => (await dockState(page))?.roster.map((a) => [a.userId, a.role]))
     .toEqual([['alice', 'driver']]);
 
-  const tools = await waitForToolCount(pageId, 6);
+  const tools = await waitForToolCount(pageId, 7);
   expect(tools.map((t) => t.name).sort()).toEqual([
     'add_item',
+    'capture_board',
     'clear_board',
     'get_view',
     'highlight_item',
@@ -252,7 +253,7 @@ test('pair by code, approve by clicking Allow as driver, then list and call tool
       title: 'Tabdock demo board',
       role: 'driver',
       state: 'awake',
-      toolCount: 6,
+      toolCount: 7,
     },
   ]);
 
@@ -316,7 +317,7 @@ test('Allow as observer attaches an observer, whose add_item returns role_denied
   await expect
     .poll(async () => (await dockState(page))?.roster.map((a) => [a.userId, a.role]))
     .toEqual([['alice', 'observer']]);
-  await waitForToolCount(pageId, 6);
+  await waitForToolCount(pageId, 7);
 
   const added = await callTool(client, 'call_page_tool', {
     page: pageId,
@@ -380,7 +381,7 @@ test('clear_board shows a confirm prompt on the page, and Deny returns denied_by
 }) => {
   await openDemo(page);
   const pageId = await pairByClick(page);
-  await waitForToolCount(pageId, 6);
+  await waitForToolCount(pageId, 7);
 
   const pending = callTool(client, 'call_page_tool', { page: pageId, tool: 'clear_board' });
   const confirm = await waitForDock(page, (s) => s.pendingConfirms[0]);
@@ -397,7 +398,7 @@ test('clear_board shows a confirm prompt on the page, and Deny returns denied_by
 test('a page reload keeps the attachment, and calls work afterwards (A1.3)', async ({ page }) => {
   await openDemo(page);
   const pageId = await pairByClick(page);
-  await waitForToolCount(pageId, 6);
+  await waitForToolCount(pageId, 7);
 
   await page.reload();
   await page.waitForSelector('html[data-tools="ready"]');
@@ -405,7 +406,7 @@ test('a page reload keeps the attachment, and calls work afterwards (A1.3)', asy
   expect(after.pageId).toBe(pageId);
   expect((await dockState(page))?.roster.map((a) => a.userId)).toEqual(['alice']);
 
-  await waitForToolCount(pageId, 6);
+  await waitForToolCount(pageId, 7);
   const pages = await callTool(client, 'list_pages');
   expect((pages.structured as { pages: unknown[] }).pages).toMatchObject([
     { page: pageId, state: 'awake', role: 'driver' },
@@ -470,7 +471,7 @@ test.describe('M2: many clients, many users', () => {
   async function attachTwoUsers(page: Page): Promise<TwoUsers> {
     const { pageId } = await openDemo(page);
     expect(await pairAs(page, client, 'alice', 'driver')).toBe(pageId);
-    await waitForToolCount(pageId, 6);
+    await waitForToolCount(pageId, 7);
     const bob = await extraClient(tabdock.users.bob, BOB_CLIENT);
     expect(await pairAs(page, bob, 'bob', 'observer')).toBe(pageId);
     // Her attachment covers every client she uses, so this one needs no pairing of its own.
@@ -643,7 +644,7 @@ test.describe('M2: many clients, many users', () => {
   }) => {
     const { pageId, aliceModern, bob } = await attachTwoUsers(page);
     await registerSlowWrite(page);
-    await waitForToolCount(pageId, 7);
+    await waitForToolCount(pageId, 8);
 
     let runningSettled = false;
     const running = callTool(client, 'call_page_tool', { page: pageId, tool: 'slow_write' });
@@ -906,7 +907,7 @@ test.describe('M2: many clients, many users', () => {
   }) => {
     const { pageId } = await openDemo(page);
     expect(await pairAs(page, client, 'alice', 'driver')).toBe(pageId);
-    await waitForToolCount(pageId, 6);
+    await waitForToolCount(pageId, 7);
 
     await clickInWidget(page, { action: 'pause' });
     await waitForDock(page, (s) => s.paused);

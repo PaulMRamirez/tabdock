@@ -15,6 +15,7 @@ import { startDemoServer, type DemoServer } from '@tabdock/demo/server';
 
 export const DEMO_TOOL_NAMES = [
   'add_item',
+  'capture_board',
   'clear_board',
   'get_view',
   'highlight_item',

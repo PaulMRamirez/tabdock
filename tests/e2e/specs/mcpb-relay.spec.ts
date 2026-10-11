@@ -17,14 +17,14 @@ function structured(result: unknown): unknown {
   return (result as { structuredContent?: unknown }).structuredContent;
 }
 
-test('lists the six demo tools beside the relay management tools', async () => {
+test('lists the demo tools beside the relay management tools', async () => {
   const { tools } = await baseline.client.listTools(undefined, { cacheMode: 'refresh' });
   const names = tools.map((t) => t.name);
   for (const name of DEMO_TOOL_NAMES) expect(names).toContain(name);
   expect(names).toContain('webmcp_list_sources');
 });
 
-test('calls every demo tool and sees each change land', async () => {
+test('calls every demo tool but capture_board and sees each change land', async () => {
   const { client } = baseline;
   const call = (name: string, args: Record<string, unknown> = {}) =>
     client.callTool({ name, arguments: args });

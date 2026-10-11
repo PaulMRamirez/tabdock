@@ -9,15 +9,26 @@
  * WebMCP in Chrome 154 and 'chrome-156' native WebMCP in Chrome 156. Neither
  * Chrome profile fits its neighbour: Chrome 153 drops consequentialHint like
  * the polyfill, and Chrome 155 takes object input but lacks the debugging hint
- * (docs/notes/baseline.md).
+ * (docs/notes/baseline.md). 'mcpb-6' is MCP-B's polyfill 6.0.0 (ADRs 0039 and
+ * 0047): it takes and reports what Chrome 156 does, but serializes every
+ * result as JSON, so a handler's string arrives quoted, and its errors are
+ * all one opaque text (the 6.0 rows of docs/notes/baseline.md, matched by
+ * 6.0.0 in verified.md).
  */
-export type RuntimeProfile = 'polyfill-5.1' | 'chrome-154' | 'chrome-156';
+export type RuntimeProfile = 'polyfill-5.1' | 'chrome-154' | 'chrome-156' | 'mcpb-6';
 
+/** The three runtimes every loop in the suite has run since M2; MCP-B 6 joins only ALL_RUNTIME_PROFILES. */
 export const RUNTIME_PROFILES: readonly RuntimeProfile[] = [
   'polyfill-5.1',
   'chrome-154',
   'chrome-156',
 ];
+
+/** Every profile, MCP-B 6 included, for the tests that hold a result's form on each (ADR 0039). */
+export const ALL_RUNTIME_PROFILES: readonly RuntimeProfile[] = [...RUNTIME_PROFILES, 'mcpb-6'];
+
+/** What MCP-B 6 rejects with for any failure: a handler's error, a missing tool, a result of undefined. */
+export const MCPB6_FAILED_TEXT = 'Tool execution failed';
 
 export interface FakeToolExecuteOptions {
   signal: AbortSignal;
@@ -180,7 +191,9 @@ export class FakeModelContext extends EventTarget {
       // Chrome converts a dictionary: every member present, keys in alphabetical order.
       case 'chrome-154':
         return { consequentialHint, readOnlyHint, untrustedContentHint };
+      // MCP-B 6 reports all four, as Chrome 156 does (the 6.0 rows of the baseline).
       case 'chrome-156':
+      case 'mcpb-6':
         return {
           consequentialHint,
           debugging: Boolean(hints.debugging),
@@ -210,7 +223,9 @@ export class FakeModelContext extends EventTarget {
       throw new DOMException(
         this.profile === 'polyfill-5.1'
           ? `Tool already registered: ${tool.name}`
-          : 'Duplicate tool name',
+          : this.profile === 'mcpb-6'
+            ? `A tool named ${tool.name} is already registered`
+            : 'Duplicate tool name',
         'InvalidStateError',
       );
     }
@@ -263,7 +278,7 @@ export class FakeModelContext extends EventTarget {
       };
     }
     let inputSchema: Record<string, unknown> | string | undefined = entry.schemaJson;
-    if (this.profile === 'chrome-156' && entry.schemaJson !== undefined) {
+    if (this.profile !== 'chrome-154' && entry.schemaJson !== undefined) {
       inputSchema = JSON.parse(entry.schemaJson) as Record<string, unknown>;
     }
     return {
@@ -297,11 +312,63 @@ export class FakeModelContext extends EventTarget {
     ...rest: [input?: unknown, options?: { signal?: AbortSignal }]
   ): Promise<string> {
     // Promise-returning WebIDL operations report every failure as a rejection.
-    return Promise.resolve().then(() =>
-      this.profile === 'polyfill-5.1'
-        ? this.#executePolyfill(tool, rest[0], rest[1]?.signal)
-        : this.#executeChrome(tool, rest.length === 0, rest[0], rest[1]?.signal),
-    );
+    return Promise.resolve().then(() => {
+      if (this.profile === 'polyfill-5.1')
+        return this.#executePolyfill(tool, rest[0], rest[1]?.signal);
+      if (this.profile === 'mcpb-6') return this.#executeMcpb6(tool, rest[0], rest[1]?.signal);
+      return this.#executeChrome(tool, rest.length === 0, rest[0], rest[1]?.signal);
+    });
+  }
+
+  /**
+   * MCP-B 6.0 as measured on its beta and diffed against 6.0.0 (verified.md,
+   * 10 October): object input only, omitted read as {}; the handler gets a
+   * signal that follows the caller's; every result is JSON.stringify'd, so a
+   * string arrives quoted and undefined fails; every failure, a missing tool
+   * included, is the same opaque UnknownError. Unregistering mid-call does
+   * not end the call: it resolves when the handler ends.
+   */
+  async #executeMcpb6(
+    tool: unknown,
+    input: unknown,
+    signal: AbortSignal | undefined,
+  ): Promise<string> {
+    const failed = (): DOMException => unknownError(MCPB6_FAILED_TEXT);
+    const record = isPlainObject(tool) ? tool : {};
+    // Measured for a tool passed by name alone; the order of the rest follows the polyfill's.
+    for (const key of ['name', 'description', 'window', 'origin']) {
+      if (record[key] === undefined) throw new TypeError(`${key} is required`);
+    }
+    if (input !== undefined && (typeof input !== 'object' || input === null)) {
+      throw new TypeError('inputObject must be an object');
+    }
+    const args: unknown = input === undefined ? {} : JSON.parse(JSON.stringify(input));
+    signal?.throwIfAborted();
+    const window = record.window;
+    const entry =
+      typeof window === 'object' && window !== null
+        ? this.#registry.get(window)?.get(String(record.name))
+        : undefined;
+    if (!entry) throw failed();
+    const handler = new AbortController();
+    const forward = (): void => {
+      handler.abort(signal?.reason);
+    };
+    signal?.addEventListener('abort', forward, { once: true });
+    try {
+      const value = await raceAbort(
+        Promise.resolve().then(() => entry.execute(args, { signal: handler.signal })),
+        signal,
+      );
+      const json = JSON.stringify(value) as string | undefined;
+      if (json === undefined) throw failed();
+      return json;
+    } catch (error) {
+      if (signal?.aborted && error === signal.reason) throw error;
+      throw failed();
+    } finally {
+      signal?.removeEventListener('abort', forward);
+    }
   }
 
   async #executePolyfill(

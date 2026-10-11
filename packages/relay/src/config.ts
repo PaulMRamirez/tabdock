@@ -625,7 +625,7 @@ export const DEFAULT_LIMITS: RelayLimits = {
   // seven calls of 1 MB string arguments.
   requestBytes: 64 * 1024 * 1024,
   requestBytesPerUser: 24 * 1024 * 1024,
-  imageBytes: DEFAULT_IMAGE_BYTES, // M6 seam: not built. W1-B's #checkedImage and welcome read it.
+  imageBytes: DEFAULT_IMAGE_BYTES,
   stateBytes: STATE_BYTES, // M6 seam: not built. W1-C's page-state.ts charges against it.
   proposalBytes: PROPOSAL_BYTES, // M6 seam: not built. W2-A's proposals.ts charges against it.
   responseBytes: RESPONSE_BYTES, // M6 seam: not built. W1-F's ResponseStalls ceiling reads it.

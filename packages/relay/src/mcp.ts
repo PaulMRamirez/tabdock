@@ -58,9 +58,11 @@ import {
   FIRST_CLASS_LIST_TTL_MS,
   formatError,
   IdSchema,
+  imageLine,
   type JsonObject,
   MAX_CODE_INPUT_CHARS,
   MAX_DISPLAY_NAME_CHARS,
+  MAX_IMAGE_TEXT_CHARS,
   MAX_INVITE_INPUT_CHARS,
   MAX_RESULT_CHARS,
   MAX_WAIT_MS,
@@ -300,14 +302,32 @@ export function callResult(asked: string, outcome: SettledCall): CallToolResult 
   const tool =
     outcome.kind === 'ok' || outcome.kind === 'tool_error' ? (outcome.tool ?? asked) : asked;
   switch (outcome.kind) {
-    case 'ok':
+    case 'ok': {
+      const { image } = outcome;
+      if (image === undefined) {
+        return {
+          content: [
+            text(
+              `${untrustedHeader(outcome.origin, tool)}\n${truncate(outcome.content, MAX_RESULT_CHARS).text}`,
+            ),
+          ],
+        };
+      }
+      // ADR 0039: the label, the relay's line calling the image untrusted
+      // and the page's words share the first block, so a client that shows
+      // blocks apart never shows page text or the image before relay words;
+      // then the image, never as structured content (S10). The text is cut
+      // again here, since the relay does not trust the adapter to have.
+      const words = truncate(outcome.content, MAX_IMAGE_TEXT_CHARS).text;
       return {
         content: [
           text(
-            `${untrustedHeader(outcome.origin, tool)}\n${truncate(outcome.content, MAX_RESULT_CHARS).text}`,
+            `${untrustedHeader(outcome.origin, tool)}\n${imageLine(image.mimeType, image.bytes)}${words === '' ? '' : `\n${words}`}`,
           ),
+          { type: 'image', data: image.data, mimeType: image.mimeType },
         ],
       };
+    }
     case 'tool_error':
       return {
         content: [

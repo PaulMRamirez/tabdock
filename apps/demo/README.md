@@ -1,6 +1,6 @@
 # @tabdock/demo
 
-A small canvas board whose state is easy to see, with six WebMCP tools: `get_view` and `list_items` read; `add_item`, `move_view` and `highlight_item` change the board; `clear_board` is consequential. People can pan by dragging and zoom with the wheel; every tool call is drawn at once and listed in the strip under the board.
+A small canvas board whose state is easy to see, with seven WebMCP tools: `get_view` and `list_items` read, and `capture_board` returns a picture of the board, which the policy names in `imageTools` (ADR 0039); `add_item`, `move_view` and `highlight_item` change the board; `clear_board` is consequential. People can pan by dragging and zoom with the wheel; every tool call is drawn at once and listed in the strip under the board.
 
 `pnpm dev:demo` (from the repo root) serves it at `http://127.0.0.1:5173/` with live rebuilds; set `DEMO_PORT` in `.env` to move it. `pnpm dev` serves it beside a Tabdock relay and prints a link with `?relay=` set.
 
@@ -10,6 +10,6 @@ The board dials only a relay its visitor chose (ADR 0029). With `?relay=ws://127
 
 `node scripts/server.ts --build` writes the static build into `dist/`, as the Pages site uses it (`apps/site`, `pnpm site:build`): `index.html` gains a Content-Security-Policy meta (`default-src 'none'`, scripts from its own origin, the one inline style by its hash computed at build time, `connect-src wss: ws:`) and a no-referrer meta, and loads `./main.js` by a relative path, so a copy under `<user>.github.io/<repository>/` works too. The dev server sends its own headers instead and no meta policy.
 
-Files: `src/board.ts` holds the state, `src/tools.ts` defines the tools with zod schemas that double as their JSON Schemas, `src/render.ts` draws, `src/main.ts` installs the polyfill, registers the tools and attaches the adapter once the visitor chooses, `src/connect.ts` draws the Connect bar and form, arms the bar's button and remembers the choice, `src/relay.ts` checks a relay URL, `src/policy.ts` reads `?invites` and `?confirm` into the page's policy, and `scripts/server.ts` builds and serves with esbuild.
+Files: `src/board.ts` holds the state, `src/tools.ts` defines the tools with zod schemas that double as their JSON Schemas, `src/render.ts` draws, `src/capture.ts` draws the board again for `capture_board` and fits its picture under the image cap, `src/main.ts` installs the polyfill, registers the tools and attaches the adapter once the visitor chooses, `src/connect.ts` draws the Connect bar and form, arms the bar's button and remembers the choice, `src/relay.ts` checks a relay URL, `src/policy.ts` reads `?invites` and `?confirm` into the page's policy, and `scripts/server.ts` builds and serves with esbuild.
 
 The guide's [Quick start](../../docs/guide/02-quick-start.md) walks through the board with Claude Code, and [Sharing](../../docs/guide/06-sharing.md) explains what `?invites` and `?confirm` change for the people a page lets in.

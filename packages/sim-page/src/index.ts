@@ -20,3 +20,12 @@ export {
   type SimPageOptions,
 } from './sim-page.ts';
 export { startMapSimPage, type MapSimPage, type MapSimPageOptions } from './map-sim.ts';
+export { ALL_RUNTIME_PROFILES, MCPB6_FAILED_TEXT } from './fake-model-context.ts';
+export {
+  base64Of,
+  createImageTools,
+  IMAGE_TOOL_NAMES,
+  pngImage,
+  type ImageToolsOptions,
+  type PngOptions,
+} from './image-tools.ts';

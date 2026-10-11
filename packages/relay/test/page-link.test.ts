@@ -200,10 +200,10 @@ describe('hello', () => {
       resumeWindowMs: 5000,
       attachRequestTtlMs: 5000,
       // M6: the page's people with no watching seats, invites off (ADR
-      // 0044). M6 seam: not built. Until W1-B and W1-C pass images and keep
-      // state, the welcome says the relay takes no image (0) and, by leaving
-      // maxStateBytes out, no state, whatever TABDOCK_MAX_IMAGE_BYTES says.
-      maxImageBytes: 0,
+      // 0044), and the largest image the relay passes (ADR 0039). M6 seam:
+      // not built. Until W1-C keeps state, the welcome leaves maxStateBytes
+      // out, which says the relay takes none.
+      maxImageBytes: DEFAULT_IMAGE_BYTES,
       usersPerPage: 10,
       observersPerPage: 0,
     });
@@ -212,13 +212,13 @@ describe('hello', () => {
   it('tells the page its watching seats as set, with invites on', async () => {
     const { relay } = await relayWith({
       invites: true,
-      limits: { observersPerPage: 25, usersPerPage: 6, imageBytes: DEFAULT_IMAGE_BYTES },
+      limits: { observersPerPage: 25, usersPerPage: 6, imageBytes: 4096 },
     });
     const opened = await page(relay.pageUrl, { tools: TOOLS });
     expect(opened.welcome?.limits).toMatchObject({ usersPerPage: 6, observersPerPage: 25 });
-    // M6 seam: not built. W1-B sends the image size as set, and W1-C
-    // MAX_STATE_BYTES; until then neither is claimed.
-    expect(opened.welcome?.limits.maxImageBytes).toBe(0);
+    // The image size as set (ADR 0039). M6 seam: not built. W1-C sends
+    // MAX_STATE_BYTES; until then it is not claimed.
+    expect(opened.welcome?.limits.maxImageBytes).toBe(4096);
     expect(opened.welcome?.limits).not.toHaveProperty('maxStateBytes');
   });
 

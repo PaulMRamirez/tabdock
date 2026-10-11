@@ -1,12 +1,12 @@
 // What the M6 foundation holds on the relay's side before any wave fills a
 // seam (plan section 2.1), so a seam left half built fails here rather than
-// shipping quietly: a result carrying an image is refused whole, never passed
-// on as plain text with the image dropped (ADR 0039); a reload never widens
+// shipping quietly: a result carrying an image the relay does not pass is
+// refused whole, never passed on as plain text with the image dropped, and
+// a declared one reaches the client after its label (ADR 0039); a reload never widens
 // the policy a live time-boxed session narrowed (S5, ADR 0043); and every
 // setting the relay accepts is either read by the code that enforces it or
 // carries the seam marker on its default, so the Wave 3 gate sees each one
-// that is not (A6.26); and the first-class prefix is SPEC section 7's, or
-// marked until W1-B rewords it.
+// that is not (A6.26); and the first-class prefix is SPEC section 7's.
 
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -14,7 +14,7 @@ import type { Client } from '@modelcontextprotocol/client';
 import type { ImageRefusal, PolicyInput } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
 import { DEFAULT_LIMITS, DEFAULT_RATE_LIMITS, DEFAULT_TIMINGS } from '../src/config.ts';
-import { createMemoryStore, type RelayStore } from '../src/index.ts';
+import { createMemoryStore, type RelayOptions, type RelayStore } from '../src/index.ts';
 import {
   connectPage,
   type InvokeFrame,
@@ -42,12 +42,16 @@ afterEach(async () => {
   for (const relay of relays.splice(0)) await relay.close();
 });
 
-/** A 1 by 1 PNG, as a declared image tool would send it once W1-B passes images on. */
+/** A 1 by 1 PNG, as a declared image tool sends it. */
 const PNG =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==';
 
-async function world(options: PageOptions = {}, store?: RelayStore) {
-  const relay = await startRelay(store === undefined ? {} : { store });
+async function world(
+  options: PageOptions = {},
+  store?: RelayStore,
+  relayOptions: Partial<RelayOptions> = {},
+) {
+  const relay = await startRelay(store === undefined ? relayOptions : { ...relayOptions, store });
   relays.push(relay);
   const page = await connectPage(relay.relay.pageUrl, { tools: TOOLS, ...options });
   pages.push(page);
@@ -72,25 +76,29 @@ function answerWithImage(page: TestPage): void {
 }
 
 describe('a result carrying an image (ADR 0039)', () => {
-  // M6 seam: not built. W1-B passes a declared tool's checked image on, and
-  // turns the declared case below into one that reaches the client.
-  const cases: [string, PolicyInput, ImageRefusal, string][] = [
+  const cases: [string, PolicyInput, number | undefined, ImageRefusal, string][] = [
     [
       'from a tool the hello did not declare',
       {},
+      undefined,
       'undeclared',
       "tabdock refused this tool's image: the page did not declare this tool an image tool",
     ],
     [
       'from a declared tool, while this relay passes none',
       { imageTools: [READ_TOOL.name] },
+      0,
       'off',
-      "tabdock refused this tool's image: this relay passes no images",
+      "tabdock refused this tool's image: image results are off here (a cap of 0 bytes)",
     ],
   ];
-  for (const [what, policy, reason, words] of cases) {
+  for (const [what, policy, imageBytes, reason, words] of cases) {
     it(`is refused whole ${what}, never answered ok without it`, async () => {
-      const { relay, page, alice } = await world({ policy });
+      const { relay, page, alice } = await world(
+        { policy },
+        undefined,
+        imageBytes === undefined ? {} : { limits: { imageBytes } },
+      );
       answerWithImage(page);
       const result = await alice.callTool({
         name: 'call_page_tool',
@@ -119,6 +127,25 @@ describe('a result carrying an image (ADR 0039)', () => {
       expect(next.text).toContain('words only');
     });
   }
+
+  it('from a declared tool reaches the client after its label, never as structured content', async () => {
+    const { relay, page, alice } = await world({ policy: { imageTools: [READ_TOOL.name] } });
+    answerWithImage(page);
+    const result = await alice.callTool({
+      name: 'call_page_tool',
+      arguments: { page: page.pageId, tool: READ_TOOL.name, arguments: {} },
+    });
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toEqual([
+      expect.objectContaining({ type: 'text' }),
+      { type: 'image', mimeType: 'image/png', data: PNG },
+    ]);
+    expect(result.structuredContent).toBeUndefined();
+    expect(relay.relay.audit.records()[0]).toMatchObject({
+      outcome: 'ok',
+      image: { mimeType: 'image/png', bytes: 70 },
+    });
+  });
 });
 
 describe('a reload during a time-boxed session (S5, ADR 0043)', () => {
@@ -221,7 +248,7 @@ describe('the settings the relay accepts (plan section 2.1, A6.26)', () => {
 });
 
 describe('what SPEC says ahead of the code (docs/plans/M6.md)', () => {
-  it("gives first-class tools section 7's prefix, or marks the prefix as a seam", () => {
+  it("gives first-class tools section 7's prefix", () => {
     const spec = readFileSync(join(import.meta.dirname, '..', '..', '..', 'SPEC.md'), 'utf8');
     const promised =
       /description is the prefix `\[tabdock: tool <name> of page <page id> at <origin>; ([^`\]]+)\]`/.exec(
@@ -236,7 +263,8 @@ describe('what SPEC says ahead of the code (docs/plans/M6.md)', () => {
       .split('\n')
       .slice(-4)
       .join('\n');
-    // Equal, or the seam marker sits just above the prefix: never different and unmarked.
-    expect(built === promised || before.includes('// M6 seam: not built')).toBe(true);
+    // Built (ADR 0039): equal, with no seam marker left above it.
+    expect(built).toBe(promised);
+    expect(before).not.toContain('M6 seam');
   });
 });

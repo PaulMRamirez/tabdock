@@ -29,6 +29,8 @@ import {
   type AuditEventOf,
   auditPageId,
   auditToolName,
+  type CheckedImage,
+  checkImage,
   type ClientInfo,
   CLOSE_DETACH,
   CLOSE_REPLACED,
@@ -69,6 +71,7 @@ import {
   truncate,
   UNVERIFIED_EMAIL,
   type UserKind,
+  type WireImage,
 } from '@tabdock/protocol';
 import { createHash } from 'node:crypto';
 import type { RawData, WebSocket } from 'ws';
@@ -2272,9 +2275,7 @@ export class PageHub {
       idleTimeoutMs: timings.idleTimeoutMs,
       resumeWindowMs: timings.resumeWindowMs,
       attachRequestTtlMs: timings.attachRequestTtlMs,
-      // M6 seam: not built. W1-B sends limits.imageBytes once #result passes
-      // checked images on; until then this relay takes none.
-      maxImageBytes: 0,
+      maxImageBytes: limits.imageBytes,
       // M6 seam: not built. W1-C adds maxStateBytes: MAX_STATE_BYTES once
       // this relay keeps state; until then it is absent, which tells the
       // adapter the relay takes none.
@@ -3621,23 +3622,9 @@ export class PageHub {
     if (call.marks) call.marks.resultIn = performance.now();
     const origin = conn.origin;
     if (frame.ok && frame.image !== undefined) {
-      // M6 seam: not built. W1-B's #checkedImage passes a declared tool's
-      // checked image on. Until then this relay passes none, as its welcome
-      // says, so an image is refused whole rather than dropped while the
-      // call reads as ok: 'undeclared' when the hello named no such image
-      // tool, as ADR 0039 checks first, else 'off'. Relay words only.
-      const declared =
-        this.#store.pages.get(pageId)?.policy.imageTools.includes(call.toolName) ?? false;
-      const imageRefused: ImageRefusal = declared ? 'off' : 'undeclared';
-      call.trace.imageRefused = imageRefused;
-      call.settle({
-        kind: 'tool_error',
-        origin,
-        message: declared
-          ? "tabdock refused this tool's image: this relay passes no images"
-          : "tabdock refused this tool's image: the page did not declare this tool an image tool",
-        imageRefused,
-      });
+      // Checked only here, after the lookup on this socket, so a frame for
+      // no call of this page costs no decoding or hashing (S9).
+      call.settle(this.#checkedImage(pageId, call, origin, frame.content ?? '', frame.image));
       return;
     }
     if (frame.ok) {
@@ -3654,6 +3641,54 @@ export class PageHub {
       return;
     }
     call.settle(PAGE_ERRORS[error.code]);
+  }
+
+  /**
+   * A page's image, checked again before any client sees it (ADR 0039,
+   * S10). The tool must be one the hello's policy.imageTools names, so no
+   * crafted frame turns any other tool into an image source; then the
+   * protocol's checkImage, the one the adapter ran, since the SDK passes
+   * malformed base64 and any type and its client then fails the whole
+   * result, label included. A refusal is a tool_error in relay words alone,
+   * the page's text dropped with it, and its reason goes on the call's
+   * record. A pass keeps the base64 as it came, since nothing here
+   * re-encodes, and records the type, decoded size and SHA-256, never the
+   * data (S7).
+   */
+  #checkedImage(
+    pageId: string,
+    call: PendingCall,
+    origin: string,
+    content: string,
+    image: WireImage,
+  ): SettledCall {
+    const declared = this.#store.pages.get(pageId)?.policy.imageTools.includes(call.toolName);
+    const checked: CheckedImage =
+      declared === true
+        ? checkImage(image, this.#config.limits.imageBytes)
+        : {
+            ok: false,
+            reason: 'undeclared',
+            message: 'the page did not declare this tool an image tool',
+          };
+    if (!checked.ok) {
+      call.trace.imageRefused = checked.reason;
+      return {
+        kind: 'tool_error',
+        origin,
+        message: `tabdock refused this tool's image: ${checked.message}`,
+        imageRefused: checked.reason,
+      };
+    }
+    const bytes = checked.bytes.length;
+    const sha256 = createHash('sha256').update(checked.bytes).digest('hex');
+    call.trace.image = { mimeType: checked.mimeType, bytes, sha256 };
+    return {
+      kind: 'ok',
+      origin,
+      content,
+      image: { mimeType: checked.mimeType, data: image.data, bytes, sha256 },
+    };
   }
 
   /** Every call of this page ends with `outcome`: the queued ones first, then those on `conn`. */

@@ -27,9 +27,10 @@ export type ImageMimeType = (typeof IMAGE_MIME_TYPES)[number];
  * name the tool (the relay's check); off: the cap is 0; type: not one of
  * IMAGE_MIME_TYPES; encoding: not canonical base64; size: over the cap;
  * signature: the first bytes are not its type's; dimensions: the header
- * cannot be read or declares too many pixels.
+ * cannot be read or declares too many pixels. Marked pure, so a page's
+ * bundle, which never reads it, leaves it out (ADR 0048).
  */
-export const ImageRefusalSchema = z.enum([
+export const ImageRefusalSchema = /* @__PURE__ */ z.enum([
   'undeclared',
   'off',
   'type',
@@ -73,16 +74,10 @@ export function decodedLength(text: string): number | null {
 }
 
 const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-const PAD = 0x3d;
 /** Each character code's value in the standard alphabet, -1 for any other, '=' among them. */
 const SEXTETS = new Int8Array(256).fill(-1);
 for (let index = 0; index < BASE64_ALPHABET.length; index += 1) {
   SEXTETS[BASE64_ALPHABET.charCodeAt(index)] = index;
-}
-
-function sextet(text: string, index: number): number {
-  const code = text.charCodeAt(index);
-  return code < 256 ? (SEXTETS[code] ?? -1) : -1;
 }
 
 /**
@@ -91,70 +86,44 @@ function sextet(text: string, index: number): number {
  * over all zero, so every byte string has exactly one text that decodes to
  * it. null for anything else. A character-code loop over a table, with no
  * atob or Buffer, so a browser and Node refuse alike and a page script that
- * replaced atob is never handed an image.
+ * replaced atob is never handed an image. An `=` anywhere but the last one
+ * or two places is no sextet, so it fails like any other stray character.
  */
 export function decodeBase64(text: string): Uint8Array | null {
   const length = text.length;
   if (length % 4 !== 0) return null;
-  let padding = 0;
-  if (length > 0 && text.charCodeAt(length - 1) === PAD) {
-    padding = text.charCodeAt(length - 2) === PAD ? 2 : 1;
-  }
+  const padding = text.endsWith('==') ? 2 : text.endsWith('=') ? 1 : 0;
   const bytes = new Uint8Array((length / 4) * 3 - padding);
+  // Sextets go in at the bottom of `bits`, and a byte comes out each time
+  // eight are held; shifts keep 32 bits, and no more than 14 are ever needed.
+  let bits = 0;
+  let held = 0;
   let out = 0;
-  for (let index = 0; index < length; index += 4) {
-    const a = sextet(text, index);
-    const b = sextet(text, index + 1);
-    if (a < 0 || b < 0) return null;
-    if (index + 4 === length && padding === 2) {
-      if ((b & 0x0f) !== 0) return null;
-      bytes[out] = (a << 2) | (b >> 4);
-      return bytes;
+  for (let index = 0; index < length - padding; index += 1) {
+    const code = text.charCodeAt(index);
+    const value = code < 256 ? (SEXTETS[code] ?? -1) : -1;
+    if (value < 0) return null;
+    bits = (bits << 6) | value;
+    held += 6;
+    if (held >= 8) {
+      held -= 8;
+      // A Uint8Array keeps the low eight bits of what it is given.
+      bytes[out] = bits >> held;
+      out += 1;
     }
-    const c = sextet(text, index + 2);
-    if (c < 0) return null;
-    if (index + 4 === length && padding === 1) {
-      if ((c & 0x03) !== 0) return null;
-      bytes[out] = (a << 2) | (b >> 4);
-      bytes[out + 1] = ((b & 0x0f) << 4) | (c >> 2);
-      return bytes;
-    }
-    const d = sextet(text, index + 3);
-    if (d < 0) return null;
-    bytes[out] = (a << 2) | (b >> 4);
-    bytes[out + 1] = ((b & 0x0f) << 4) | (c >> 2);
-    bytes[out + 2] = ((c & 0x03) << 6) | d;
-    out += 3;
   }
-  return bytes;
+  return (bits & ((1 << held) - 1)) === 0 ? bytes : null;
 }
 
 // Reading headers. Every read is checked against the buffer's length first.
 
-function byteAt(bytes: Uint8Array, index: number): number {
-  return bytes[index] ?? 0;
-}
-
-function bigEndian16(bytes: Uint8Array, index: number): number {
-  return (byteAt(bytes, index) << 8) | byteAt(bytes, index + 1);
-}
-
-function bigEndian32(bytes: Uint8Array, index: number): number {
-  return (
-    ((byteAt(bytes, index) << 24) |
-      (byteAt(bytes, index + 1) << 16) |
-      (byteAt(bytes, index + 2) << 8) |
-      byteAt(bytes, index + 3)) >>>
-    0
-  );
-}
-
-function littleEndian24(bytes: Uint8Array, index: number): number {
-  return byteAt(bytes, index) | (byteAt(bytes, index + 1) << 8) | (byteAt(bytes, index + 2) << 16);
-}
-
-function littleEndian32(bytes: Uint8Array, index: number): number {
-  return (littleEndian24(bytes, index) | (byteAt(bytes, index + 3) << 24)) >>> 0;
+/** `count` bytes at `index` as one unsigned number, big-endian unless `little`. */
+function readUint(bytes: Uint8Array, index: number, count: number, little = false): number {
+  let value = 0;
+  for (let offset = 0; offset < count; offset += 1) {
+    value = value * 256 + (bytes[index + (little ? count - 1 - offset : offset)] ?? 0);
+  }
+  return value;
 }
 
 /** Whether `text`, in ASCII, sits at `index`. */
@@ -166,12 +135,11 @@ function hasAscii(bytes: Uint8Array, index: number, text: string): boolean {
   return true;
 }
 
-const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] as const;
+/** 89 50 4E 47 0D 0A 1A 0A, each character's code one byte. */
+const PNG_SIGNATURE = '\x89PNG\r\n\x1a\n';
 
 function isPng(bytes: Uint8Array): boolean {
-  return (
-    PNG_SIGNATURE.every((value, index) => bytes[index] === value) && hasAscii(bytes, 12, 'IHDR')
-  );
+  return hasAscii(bytes, 0, PNG_SIGNATURE) && hasAscii(bytes, 12, 'IHDR');
 }
 
 function isJpeg(bytes: Uint8Array): boolean {
@@ -207,19 +175,19 @@ function jpegSize(bytes: Uint8Array): { width: number; height: number } | null {
     // A marker may follow any number of 0xFF fill bytes.
     while (offset < bytes.length && bytes[offset] === 0xff) offset += 1;
     if (offset >= bytes.length) return null;
-    const marker = byteAt(bytes, offset);
+    const marker = readUint(bytes, offset, 1);
     offset += 1;
     // TEM and the restart markers stand alone, with no length.
     if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
     // The image data or its end came before any frame header.
     if (marker === 0xd8 || marker === 0xd9 || marker === 0xda) return null;
     if (offset + 2 > bytes.length) return null;
-    const length = bigEndian16(bytes, offset);
+    const length = readUint(bytes, offset, 2);
     if (length < 2 || offset + length > bytes.length) return null;
     if (isStartOfFrame(marker)) {
       // Length, precision, then height and width, each two bytes big-endian.
       if (length < 7) return null;
-      return { width: bigEndian16(bytes, offset + 5), height: bigEndian16(bytes, offset + 3) };
+      return { width: readUint(bytes, offset + 5, 2), height: readUint(bytes, offset + 3, 2) };
     }
     offset += length;
   }
@@ -229,19 +197,19 @@ function jpegSize(bytes: Uint8Array): { width: number; height: number } | null {
 function webpSize(bytes: Uint8Array): { width: number; height: number } | null {
   if (hasAscii(bytes, 12, 'VP8X')) {
     if (bytes.length < 30) return null;
-    return { width: littleEndian24(bytes, 24) + 1, height: littleEndian24(bytes, 27) + 1 };
+    return { width: readUint(bytes, 24, 3, true) + 1, height: readUint(bytes, 27, 3, true) + 1 };
   }
   if (hasAscii(bytes, 12, 'VP8 ')) {
     if (bytes.length < 30) return null;
     if (bytes[23] !== 0x9d || bytes[24] !== 0x01 || bytes[25] !== 0x2a) return null;
     return {
-      width: (byteAt(bytes, 26) | (byteAt(bytes, 27) << 8)) & 0x3fff,
-      height: (byteAt(bytes, 28) | (byteAt(bytes, 29) << 8)) & 0x3fff,
+      width: readUint(bytes, 26, 2, true) & 0x3fff,
+      height: readUint(bytes, 28, 2, true) & 0x3fff,
     };
   }
   if (hasAscii(bytes, 12, 'VP8L')) {
     if (bytes.length < 25 || bytes[20] !== 0x2f) return null;
-    const bits = littleEndian32(bytes, 21);
+    const bits = readUint(bytes, 21, 4, true);
     return { width: (bits & 0x3fff) + 1, height: ((bits >>> 14) & 0x3fff) + 1 };
   }
   return null;
@@ -259,7 +227,7 @@ export function imageSize(
 ): { width: number; height: number } | null {
   if (type === 'image/png') {
     if (bytes.length < 24 || !isPng(bytes)) return null;
-    return { width: bigEndian32(bytes, 16), height: bigEndian32(bytes, 20) };
+    return { width: readUint(bytes, 16, 4), height: readUint(bytes, 20, 4) };
   }
   if (type === 'image/jpeg') return isJpeg(bytes) ? jpegSize(bytes) : null;
   return isWebp(bytes) ? webpSize(bytes) : null;

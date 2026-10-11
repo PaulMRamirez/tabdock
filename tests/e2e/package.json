@@ -18,6 +18,7 @@
     "conformance": "node src/conformance.ts",
     "check:claude-code:m5": "node src/claude-code-check-m5.ts",
     "check:claude-code:labels": "node src/claude-code-check-labels.ts",
+    "check:claude-code:images": "node src/claude-code-check-images.ts",
     "demo:m1": "node src/demo-m1.ts",
     "demo:m2": "node src/demo-m2.ts",
     "demo:m3": "node src/demo-m3.ts",

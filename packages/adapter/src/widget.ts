@@ -368,6 +368,18 @@ export function confirmedIn(
   return { client: client === '' ? null : client, person: personText(entry.user) };
 }
 
+/**
+ * What an activity line says of an image a call returned (ADR 0039), such as
+ * "image, PNG, 47 KB": its type and size, never what it shows, so the
+ * operator sees each time someone's client took a picture of the page. null
+ * for every other call.
+ */
+export function imageText(entry: ActivityEntry): string | null {
+  if (entry.image === null) return null;
+  const kb = entry.image.bytes / 1024;
+  return `image, ${entry.image.mimeType.slice(6).toUpperCase()}, ${kb < 10 ? kb.toFixed(1) : String(Math.round(kb))} KB`;
+}
+
 function timeText(epochMs: number): string {
   return new Date(epochMs).toLocaleTimeString([], { hour12: false });
 }
@@ -1577,7 +1589,8 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const took = entry.durationMs === null ? '' : ` in ${entry.durationMs} ms`;
     // A write answered early still holds the page while its handler runs on.
     const lingering = entry.handlerRunning ? ', but its handler is still running' : '';
-    dom.append(what, `, ${entry.outcome}${took}${lingering}`);
+    const image = imageText(entry);
+    dom.append(what, `, ${entry.outcome}${took}${lingering}${image === null ? '' : `, ${image}`}`);
     // The grid lays out no white space between its cells; the space keeps
     // the entry's text, as a screen reader or a copy has it, readable.
     dom.append(line, element('span', 'time', timeText(entry.time)), ' ', what);
