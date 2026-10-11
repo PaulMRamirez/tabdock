@@ -76,6 +76,65 @@ const INITIALIZE = {
   },
 };
 
+const INITIALIZED = { jsonrpc: '2.0', method: 'notifications/initialized' };
+
+function delay<T>(ms: number, value: T): Promise<T> {
+  return new Promise((resolve) => setTimeout(resolve, ms, value));
+}
+
+/**
+ * A 2026-07-28 subscriptions/listen on /g/mcp with the token as its bearer,
+ * held open: whether the relay answered with an event stream, and when the
+ * stream ends from the relay's side.
+ */
+function agentListen(
+  relay: InviteRelay,
+  token: string,
+): Promise<{ streaming: boolean; ended: Promise<void> }> {
+  const body = JSON.stringify({
+    jsonrpc: '2.0',
+    id: 'listen:1',
+    method: 'subscriptions/listen',
+    params: {
+      _meta: {
+        'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+        'io.modelcontextprotocol/clientInfo': { name: 'raw-agent', version: '1.0.0' },
+        'io.modelcontextprotocol/clientCapabilities': {},
+      },
+      notifications: { toolsListChanged: true },
+    },
+  });
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(new URL('/g/mcp', relay.relay.url), {
+      method: 'POST',
+      headers: {
+        Host: new URL(PUBLIC_ORIGIN).host,
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        'Mcp-Method': 'subscriptions/listen',
+        'Mcp-Protocol-Version': '2026-07-28',
+      },
+    });
+    req.on('response', (res) => {
+      const ended = new Promise<void>((done) => {
+        res.on('end', done);
+        res.on('close', done);
+        res.on('error', () => {
+          done();
+        });
+      });
+      res.resume();
+      resolve({
+        streaming: (res.headers['content-type'] ?? '').startsWith('text/event-stream'),
+        ended,
+      });
+    });
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
 /** A relay with agent tokens on, a page that allows them, and Alice attached as its driver. */
 async function room(options: InviteRelayOptions = {}, policy: Record<string, unknown> = {}) {
   current = await startInviteRelay({ agentTokens: true, ...options });
@@ -634,24 +693,55 @@ describe('/g/mcp answers (S11, S12)', () => {
     expect(page.all('attach_request')).toHaveLength(1);
   });
 
-  it("closes the agent's sessions with its token, and neither leg takes the other's", async () => {
+  it("neither leg takes the other's live session, and the token's close ends its sessions and streams", async () => {
     const { relay, page } = await room();
     const { token, tokenId, userId } = await attachedAgent(relay, page);
+    const host = new URL(PUBLIC_ORIGIN).host;
+    const signedIn = `Bearer ${await relay.provider.token({ sub: 'sub-alice', aud: `${PUBLIC_ORIGIN}/mcp` })}`;
+    const onMcp = (authorization: string, body: unknown, sessionId?: string) =>
+      rawRequest(relay.relay.url, '/mcp', {
+        method: 'POST',
+        host,
+        headers: {
+          Authorization: authorization,
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+          ...(sessionId === undefined
+            ? {}
+            : { 'Mcp-Session-Id': sessionId, 'Mcp-Protocol-Version': '2025-11-25' }),
+        },
+        body: JSON.stringify(body),
+      });
+    const onAgent = (body: unknown, sessionId: string) =>
+      agentRequest(relay.relay.url, token, body, {
+        headers: { 'Mcp-Session-Id': sessionId, 'Mcp-Protocol-Version': '2025-11-25' },
+      });
+    const presentedBy = (who: string) =>
+      relay
+        .events()
+        .some(
+          (line) => line.msg === 'MCP session id presented by another user' && line.userId === who,
+        );
     // The token is no OAuth token, so /mcp asks for a sign-in instead.
-    const onMcp = await rawRequest(relay.relay.url, '/mcp', {
-      method: 'POST',
-      host: new URL(PUBLIC_ORIGIN).host,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json, text/event-stream',
-      },
-      body: JSON.stringify(INITIALIZE),
-    });
-    expect(onMcp.status).toBe(401);
-    const opened = await agentRequest(relay.relay.url, token, INITIALIZE);
-    const sessionId = opened.headers.get('mcp-session-id');
-    expect(sessionId).not.toBeNull();
+    expect((await onMcp(`Bearer ${token}`, INITIALIZE)).status).toBe(401);
+    const agentSession = (await agentRequest(relay.relay.url, token, INITIALIZE)).headers.get(
+      'mcp-session-id',
+    );
+    const aliceSession = (await onMcp(signedIn, INITIALIZE)).headers.get('mcp-session-id');
+    if (agentSession === null || aliceSession === null) throw new Error('no session');
+    expect((await onAgent(INITIALIZED, agentSession)).status).toBe(202);
+    expect((await onMcp(signedIn, INITIALIZED, aliceSession)).status).toBe(202);
+    // While both are live, each id is the same 404 as an unknown one to the
+    // other's leg and account, and its line says whose it was not (S13).
+    expect((await onMcp(signedIn, toolCall('list_pages', {}), agentSession)).status).toBe(404);
+    expect(presentedBy('alice')).toBe(true);
+    expect((await onAgent(toolCall('list_pages', {}), aliceSession)).status).toBe(404);
+    expect(presentedBy(userId)).toBe(true);
+    // Each still serves its own owner.
+    expect((await onAgent(toolCall('list_pages', {}), agentSession)).status).toBe(200);
+    expect((await onMcp(signedIn, toolCall('list_pages', {}), aliceSession)).status).toBe(200);
+    const listen = await agentListen(relay, token);
+    expect(listen.streaming).toBe(true);
     page.send({ t: 'agent_cancel', tokenId });
     await page.sync();
     await expect
@@ -666,20 +756,13 @@ describe('/g/mcp answers (S11, S12)', () => {
           ),
       )
       .toBe(true);
-    // Its session id means nothing to anyone else (S13).
-    const alice = await rawRequest(relay.relay.url, '/mcp', {
-      method: 'POST',
-      host: new URL(PUBLIC_ORIGIN).host,
-      headers: {
-        Authorization: `Bearer ${await relay.provider.token({ sub: 'sub-alice', aud: `${PUBLIC_ORIGIN}/mcp` })}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json, text/event-stream',
-        'Mcp-Session-Id': sessionId ?? '',
-        'Mcp-Protocol-Version': '2025-11-25',
-      },
-      body: JSON.stringify(toolCall('list_pages', {})),
-    });
-    expect(alice.status).toBe(404);
+    // Its listen stream ends with it (ADR 0044, decision 26).
+    expect(await Promise.race([listen.ended.then(() => 'ended'), delay(5000, 'open')])).toBe(
+      'ended',
+    );
+    // Its session id still means nothing to anyone else, and Alice's own goes on.
+    expect((await onMcp(signedIn, toolCall('list_pages', {}), agentSession)).status).toBe(404);
+    expect((await onMcp(signedIn, toolCall('list_pages', {}), aliceSession)).status).toBe(200);
   });
 
   it('parses no large body to name a client, nor any body an attached agent sends (ADR 0030)', async () => {
