@@ -25,7 +25,7 @@ A view's bounds are `west`, `south`, `east` and `north`, with west greater than 
 | walkthroughs | `list_walkthroughs`     | read-only, untrusted content | none                                                                               | each `WalkthroughSummary`, and the current `walkthroughId` and `stopIndex`  |
 | walkthroughs | `get_stop`              | read-only, untrusted content | `walkthroughId` and index, the current stop by default                             | `MapStop`                                                                   |
 | walkthroughs | `go_to_stop`            | write                        | index, and `walkthroughId` unless the current one                                  | the stop's index and `stopCount`, the new view and clock, its observation   |
-| observations | `list_observations`     | read-only, untrusted content | `walkthroughId`, from, to, limit 1 to 200 (100)                                    | `{ observations, total, truncated }`, each an `ObservationSummary`, by time |
+| observations | `list_observations`     | read-only, untrusted content | `walkthroughId`, from, to, limit 1 to 150 (100)                                    | `{ observations, total, truncated }`, each an `ObservationSummary`, by time |
 | observations | `get_observation`       | read-only, untrusted content | id                                                                                 | `MapObservation`                                                            |
 | observations | `view_from_observation` | write                        | id                                                                                 | the `observationId` and the new view, on the globe where the page has one   |
 
@@ -184,13 +184,13 @@ A map page that shares its state with `publishState()` (ADR 0040) publishes `Map
 
 ## Limits
 
-At these caps every answer stays under the relay's 120,000 character result cap, and the published state under 2 KB.
+Titles, names, notes, texts and URLs hold no control character but tab and line breaks, so JSON at most doubles them. At these caps every answer stays under the relay's 120,000 character result cap, and the published state under 2 KB.
 
 | Limit                                        | Value                   | Constant                                                                               |
 | -------------------------------------------- | ----------------------- | -------------------------------------------------------------------------------------- |
 | A tool description                           | 200 characters          | `MAP_MAX_DESCRIPTION_CHARS`                                                            |
 | Features in one answer, and unless asked     | 200, 50                 | `MAP_MAX_FEATURES`, `MAP_DEFAULT_FEATURES`                                             |
-| Observations in one answer, and unless asked | 200, 100                | `MAP_MAX_OBSERVATIONS`, `MAP_DEFAULT_OBSERVATIONS`                                     |
+| Observations in one answer, and unless asked | 150, 100                | `MAP_MAX_OBSERVATIONS`, `MAP_DEFAULT_OBSERVATIONS`                                     |
 | Layers                                       | 100                     | `MAP_MAX_LAYERS`                                                                       |
 | Walkthroughs, and stops in each              | 50, 1,000               | `MAP_MAX_WALKTHROUGHS`, `MAP_MAX_STOPS`                                                |
 | An id, a kind, and a title or name           | 64, 40, 200 characters  | `MAP_MAX_ID_CHARS`, `MAP_MAX_KIND_CHARS`, `MAP_MAX_TITLE_CHARS`                        |

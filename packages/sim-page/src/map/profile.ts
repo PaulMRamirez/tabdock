@@ -16,7 +16,7 @@ export const MAP_PROFILE = 'tabdock.map.v1';
 export const MAP_MAX_DESCRIPTION_CHARS = 200;
 export const MAP_MAX_FEATURES = 200;
 export const MAP_DEFAULT_FEATURES = 50;
-export const MAP_MAX_OBSERVATIONS = 200;
+export const MAP_MAX_OBSERVATIONS = 150;
 export const MAP_DEFAULT_OBSERVATIONS = 100;
 export const MAP_MAX_LAYERS = 100;
 export const MAP_MAX_WALKTHROUGHS = 50;
@@ -198,7 +198,7 @@ export const MAP_PROFILE_TOOLS: readonly MapToolInfo[] = [
     'list_observations',
     'observations',
     'List observations',
-    'List observations such as photos by time: id, title, kind, time and walkthroughId, filtered by walkthroughId or from and to times, at most limit (1 to 200, default 100).',
+    'List observations such as photos by time: id, title, kind, time and walkthroughId, filtered by walkthroughId or from and to times, at most limit (1 to 150, default 100).',
     true,
   ),
   read(
@@ -292,7 +292,43 @@ export const StopIndexSchema = z
   .int()
   .min(0)
   .max(MAP_MAX_STOPS - 1);
-export const TitleSchema = z.string().max(MAP_MAX_TITLE_CHARS);
+
+/**
+ * True when JSON writes `text` at most twice as long, the factor the caps
+ * above are sized for: no control character but tab, line feed and carriage
+ * return, and no lone surrogate, since JSON writes each of those as six
+ * characters. Without it, 200 titles of control characters would answer
+ * list_observations at more than twice what the relay returns uncut.
+ */
+export function isPlainText(text: string): boolean {
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code < 0x20) {
+      if (code !== 0x09 && code !== 0x0a && code !== 0x0d) return false;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      const next = text.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Text a page or a caller writes, at most `max` characters, held to
+ * isPlainText. The rule is a refinement the handler runs, as the time
+ * check is, since the relay's check drops pattern.
+ */
+export function plainText(max: number, min = 0) {
+  const sized = min > 0 ? z.string().min(min).max(max) : z.string().max(max);
+  return sized.refine(isPlainText, {
+    message: 'text holds no control character but tab and line breaks',
+  });
+}
+
+export const TitleSchema = plainText(MAP_MAX_TITLE_CHARS);
 
 const UTC_TIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?Z$/;
 
@@ -442,8 +478,8 @@ export function mapInputs(options: MapInputOptions = {}) {
       .strictObject({
         walkthroughId: MapIdSchema,
         index: StopIndexSchema,
-        title: z.string().min(1).max(MAP_MAX_TITLE_CHARS).optional(),
-        text: z.string().max(MAP_MAX_TEXT_CHARS).optional(),
+        title: plainText(MAP_MAX_TITLE_CHARS, 1).optional(),
+        text: plainText(MAP_MAX_TEXT_CHARS).optional(),
       })
       .superRefine(minFields(3))
       .meta({ minProperties: 3 }),
@@ -588,7 +624,7 @@ export const MapStopSchema = z.object({
   index: StopIndexSchema,
   stopCount: z.int().min(1).max(MAP_MAX_STOPS),
   title: TitleSchema,
-  text: z.string().max(MAP_MAX_TEXT_CHARS),
+  text: plainText(MAP_MAX_TEXT_CHARS),
   view: MapStopViewSchema,
   clock: MapStopClockSchema.nullable(),
   observationId: MapIdSchema.nullable(),
@@ -683,7 +719,7 @@ export function footprintPositions(footprint: {
 
 export const MapSourceSchema = z.object({
   name: TitleSchema,
-  url: z.string().max(MAP_MAX_URL_CHARS).nullable(),
+  url: plainText(MAP_MAX_URL_CHARS).nullable(),
   credit: TitleSchema.nullable(),
 });
 
@@ -696,7 +732,7 @@ export const MapObservationSchema = z.object({
   viewpoint: MapViewpointSchema,
   footprint: FootprintSchema.nullable(),
   source: MapSourceSchema,
-  notes: z.array(z.string().max(MAP_MAX_NOTE_CHARS)).max(MAP_MAX_NOTES),
+  notes: z.array(plainText(MAP_MAX_NOTE_CHARS)).max(MAP_MAX_NOTES),
   onScreen: z.boolean(),
 });
 export type MapObservation = z.infer<typeof MapObservationSchema>;
@@ -708,7 +744,7 @@ export const ViewFromObservationResultSchema = z.object({
 
 /** capture_view's text form, for a page that returns no images. */
 export const CaptureTextSchema = z.object({
-  description: z.string().max(MAP_MAX_CAPTURE_DESCRIPTION_CHARS),
+  description: plainText(MAP_MAX_CAPTURE_DESCRIPTION_CHARS),
   view: MapViewSchema,
   visibleLayers: z.array(MapIdSchema).max(MAP_MAX_LAYERS),
   observationId: MapIdSchema.nullable(),

@@ -33,6 +33,7 @@ import {
   MapObservationSchema,
   MapStopClockSchema,
   MapStopViewSchema,
+  plainText,
   ProjectionSchema,
   RateSchema,
   TitleSchema,
@@ -70,7 +71,7 @@ const ClockDataSchema = z.object({
 
 const StopDataSchema = z.object({
   title: TitleSchema,
-  text: z.string().max(MAP_MAX_TEXT_CHARS),
+  text: plainText(MAP_MAX_TEXT_CHARS),
   view: MapStopViewSchema,
   clock: MapStopClockSchema.nullable(),
   observationId: MapIdSchema.nullable(),

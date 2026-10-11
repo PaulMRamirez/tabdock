@@ -15,6 +15,7 @@ import {
   createMapTools,
   createMapWorld,
   GLOBE,
+  isPlainText,
   MAP_DEFAULT_FEATURES,
   MAP_EDIT_TOOLS,
   MAP_MAX_DESCRIPTION_CHARS,
@@ -254,6 +255,8 @@ describe('(d) handlers', () => {
     ['a capture wider than 2048', 'capture_view', { maxWidthPx: 4096 }],
     ['an edit with no title or text', 'edit_stop', { walkthroughId: 'maria', index: 0 }],
     ['an edit past the last stop', 'edit_stop', { walkthroughId: 'maria', index: 7, text: 'x' }],
+    ['a control character', 'edit_stop', { walkthroughId: 'maria', index: 0, text: 'a\u0007' }],
+    ['a lone surrogate', 'edit_stop', { walkthroughId: 'maria', index: 0, title: 'a\uD800' }],
   ];
 
   it.each(refusals)('refuse %s with no relay to check first', async (_label, name, args) => {
@@ -279,6 +282,25 @@ describe('(d) handlers', () => {
     expect((errors[0] as Error).message).toBe(
       'set_view refused its arguments: (root): holds fields it does not take; (root): give at least one field',
     );
+  });
+
+  it('refuse text JSON writes six times as long, and take tab, line breaks and whole emoji', async () => {
+    const world = createMapWorld();
+    const tools = toolsOf(world);
+    const before = world.stop('maria', 0);
+    for (const text of ['\u0000', 'a\u0001b', '\u001f', 'x\uD800', '\uDC00y', '\uD800\uD800']) {
+      await expect(
+        call(tools, 'edit_stop', { walkthroughId: 'maria', index: 0, text }),
+      ).rejects.toThrow(
+        'edit_stop refused its arguments: text: text holds no control character but tab and line breaks',
+      );
+    }
+    expect(world.stop('maria', 0)).toEqual(before);
+    const fine = 'One,\ttwo.\r\nThree \u{1F315} and \\ "four".';
+    expect(isPlainText(fine)).toBe(true);
+    await call(tools, 'edit_stop', { walkthroughId: 'maria', index: 0, title: fine, text: fine });
+    expect(world.stop('maria', 0)).toMatchObject({ title: fine, text: fine });
+    expect(JSON.stringify(fine).length).toBeLessThanOrEqual(2 * fine.length + 2);
   });
 
   it('honour an aborted signal before they run', async () => {
@@ -547,13 +569,18 @@ describe('(i) capture_view', () => {
   });
 });
 
-/** A string of exactly `length` characters that needs no escaping in JSON. */
-function long(prefix: string, length: number): string {
-  return `${prefix}${'x'.repeat(Math.max(0, length - prefix.length))}`.slice(0, length);
+/**
+ * A string of exactly `length` characters, padded with a character JSON
+ * writes as two, the most text held to isPlainText can grow: so the caps
+ * are measured at their escaped worst, and raising one shows here.
+ */
+function long(prefix: string, length: number, pad = '"'): string {
+  return `${prefix}${pad.repeat(Math.max(0, length - prefix.length))}`.slice(0, length);
 }
 
+/** Ids and kinds take no character JSON escapes. */
 function id(prefix: string, n: number): string {
-  return long(`${prefix}-${String(n)}-`, MAP_MAX_ID_CHARS);
+  return long(`${prefix}-${String(n)}-`, MAP_MAX_ID_CHARS, 'x');
 }
 
 /** A world at every cap the profile sets, its strings as long as allowed. */
@@ -577,7 +604,7 @@ function fullWorld(): MapWorldData {
   data.features = Array.from({ length: 2 * MAP_MAX_FEATURES }, (_, n) => ({
     id: id('feature', n),
     name: long('Feature ', MAP_MAX_TITLE_CHARS),
-    kind: long('k', MAP_MAX_KIND_CHARS),
+    kind: long('k', MAP_MAX_KIND_CHARS, 'x'),
     lon: 0.123456789012345 + (n % 20) * 0.01,
     lat: -0.123456789012345 - Math.floor(n / 20) * 0.01,
     rank: n,
@@ -598,7 +625,7 @@ function fullWorld(): MapWorldData {
   data.observations = Array.from({ length: 2 * MAP_MAX_OBSERVATIONS }, (_, n) => ({
     id: id('obs', n),
     title: long('Observation ', MAP_MAX_TITLE_CHARS),
-    kind: long('k', MAP_MAX_KIND_CHARS),
+    kind: long('k', MAP_MAX_KIND_CHARS, 'x'),
     time: '2026-01-01T02:00:00.000Z',
     walkthroughId: walkthroughIds[n % MAP_MAX_WALKTHROUGHS] ?? null,
     viewpoint: {
@@ -665,7 +692,7 @@ describe('(j) a world filled to every cap', () => {
     expect(largest.features_in_view).toBe(JSON.stringify(features).length);
     expect(features).toMatchObject({ total: 2 * MAP_MAX_FEATURES, truncated: true });
     expect(features.features).toHaveLength(MAP_MAX_FEATURES);
-    expect(largest.list_observations).toBeGreaterThan(50_000);
+    expect(largest.list_observations).toBeGreaterThan(90_000);
     world.goToStop(id('w', 0), MAP_MAX_STOPS - 1);
     world.viewFromObservation(id('obs', 0));
     const state = JSON.stringify(world.state());
@@ -686,5 +713,43 @@ describe('(j) a world filled to every cap', () => {
     const first = notes.observations[0];
     if (first) first.notes = Array.from({ length: MAP_MAX_NOTES + 1 }, () => 'n');
     expect(() => new MapWorld(notes)).toThrow(/breaks the profile at observations/);
+  });
+
+  it('refuses data with text JSON writes six times as long, which the caps do not allow for', () => {
+    const cases: [RegExp, (data: MapWorldData) => void][] = [
+      [
+        /at layers\.0\.title/,
+        (data) => {
+          const layer = data.layers[0];
+          if (layer) layer.title = 'Albedo\u0001';
+        },
+      ],
+      [
+        /at observations\.0\.notes\.0/,
+        (data) => {
+          const observation = data.observations[0];
+          if (observation) observation.notes = ['blurred \uDBFF'];
+        },
+      ],
+      [
+        /at observations\.0\.source\.url/,
+        (data) => {
+          const observation = data.observations[0];
+          if (observation) observation.source.url = 'https://example.com/\u001b';
+        },
+      ],
+      [
+        /at walkthroughs\.0\.stops\.0\.text/,
+        (data) => {
+          const stop = data.walkthroughs[0]?.stops[0];
+          if (stop) stop.text = '\u0000';
+        },
+      ],
+    ];
+    for (const [where, spoil] of cases) {
+      const data = moonWorldData();
+      spoil(data);
+      expect(() => new MapWorld(data)).toThrow(where);
+    }
   });
 });
