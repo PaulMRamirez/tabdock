@@ -32,6 +32,9 @@ import {
   type TestRelay,
 } from './helpers/relay.ts';
 
+/** The seam marker, written once here so the Wave 3 gate counts this file once. */
+const SEAM_MARKER = '// M6 seam: not built';
+
 const relays: TestRelay[] = [];
 const pages: TestPage[] = [];
 const clients: Client[] = [];
@@ -228,7 +231,7 @@ describe('the settings the relay accepts (plan section 2.1, A6.26)', () => {
     const wrong: string[] = [];
     for (const [object, defaults] of Object.entries(objects)) {
       for (const field of Object.keys(defaults)) {
-        const marked = defaultLine(config, object, field).includes('// M6 seam: not built');
+        const marked = defaultLine(config, object, field).includes(SEAM_MARKER);
         if (reads(code, field) === marked) {
           wrong.push(`${object}.${field}: ${marked ? 'read and still marked' : 'never read'}`);
         }
@@ -300,7 +303,7 @@ describe('the seams the Wave 3 gate sees (docs/plans/M6.md)', () => {
   /** The members of `files` the lint is told nothing calls and that carry no marker. */
   function unmarkedMembers(files?: [string, string[]][]): string[] {
     return unusedMembers(files)
-      .filter(({ body }) => !body.includes('// M6 seam: not built'))
+      .filter(({ body }) => !body.includes(SEAM_MARKER))
       .map(({ at }) => at);
   }
 
@@ -323,7 +326,7 @@ describe('the seams the Wave 3 gate sees (docs/plans/M6.md)', () => {
     ];
     expect(unusedMembers(sample(''))).toHaveLength(1);
     expect(unmarkedMembers(sample(''))).toEqual(['sample.ts:2']);
-    expect(unmarkedMembers(sample('// M6 seam: not built'))).toEqual([]);
+    expect(unmarkedMembers(sample(SEAM_MARKER))).toEqual([]);
   });
 
   it('marks every member the lint is told nothing calls yet', () => {
