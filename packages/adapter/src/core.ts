@@ -781,7 +781,11 @@ export interface Dock {
   startSession(options: SessionOptions): Promise<SessionResult>;
   /** Lengthens the running session by whole minutes, up to 4 hours from its start. */
   extendSession(minutes: number): boolean;
-  /** Ends the running session now, and with it every attachment, invite and agent token it let in. */
+  /**
+   * Ends the running session now, and with it every attachment an invite or
+   * agent token made, every live invite and every agent token on the page,
+   * those from before the session too, as Revoke all ends invites.
+   */
   endSession(): boolean;
   /** A new observers' link for the running session, since a reload keeps none. */
   renewSessionLink(): Promise<InviteResult>;
