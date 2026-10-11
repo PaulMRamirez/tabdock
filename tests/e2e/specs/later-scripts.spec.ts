@@ -585,7 +585,7 @@ test('a script that swaps setTimeout after attach() arms no box before it has he
 
   relay.send(attachRequest('req-1'));
   await waitForDock(page, (state) => state.pendingRequests.length === 1);
-  const target = { action: 'approve-driver', requestId: 'req-1' };
+  const target = { action: 'approve-driver', requestId: 'req-1' } as const;
   await page.clock.runFor(ARM_DELAY_MS - 100);
   const shown = await widgetButtonNow(page, target);
   expect(shown?.armed).toBe(false);
@@ -625,7 +625,7 @@ test('a script that swaps clearTimeout after attach() arms no box before it has 
 
   relay.send(attachRequest('req-1'));
   await waitForDock(page, (state) => state.pendingRequests.length === 1);
-  const target = { action: 'approve-driver', requestId: 'req-1' };
+  const target = { action: 'approve-driver', requestId: 'req-1' } as const;
   await page.clock.runFor(ARM_DELAY_MS - 100);
   const shown = await widgetButtonNow(page, target);
   expect(shown?.armed).toBe(false);
@@ -654,7 +654,7 @@ test("a script that patches DOMRect's getters after attach() keeps no box that m
   await page.clock.install();
   const relay = await openWithFakeRelay(page);
   relay.send(attachRequest('req-1'));
-  const target = { action: 'approve-driver', requestId: 'req-1' };
+  const target = { action: 'approve-driver', requestId: 'req-1' } as const;
   const before = await widgetButtonCentre(page, target);
   await pauseClock(page);
 

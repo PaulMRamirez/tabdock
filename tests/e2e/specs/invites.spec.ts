@@ -22,6 +22,7 @@ import {
   clickInWidget,
   demoPageUrl,
   dockState,
+  typeInWidget,
   waitForDock,
   widgetButtonCentre,
   widgetButtonNow,
@@ -272,13 +273,6 @@ async function pauseClock(page: Page): Promise<void> {
       if (attempt === 5 || !String(error).includes('to the past')) throw error;
     }
   }
-}
-
-/** Types into a widget input as the operator would: a real click to focus it, then keys. */
-async function typeInWidget(page: Page, action: string, text: string): Promise<void> {
-  await clickInWidget(page, { action });
-  await page.keyboard.press('ControlOrMeta+A');
-  await page.keyboard.type(text);
 }
 
 /** Mints through the page's handle (the ?e2e hook), for tests about what happens after. */

@@ -14,7 +14,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./core": "./src/core.ts",
-    "./qr": "./src/qr.ts"
+    "./qr": "./src/qr.ts",
+    "./testing": "./src/testing.ts"
   },
   "files": [
     "dist",
@@ -39,6 +40,10 @@
       ".": {
         "types": "./dist/index.d.ts",
         "default": "./dist/index.js"
+      },
+      "./testing": {
+        "types": "./dist/testing.d.ts",
+        "default": "./dist/testing.js"
       }
     },
     "types": "./dist/index.d.ts"

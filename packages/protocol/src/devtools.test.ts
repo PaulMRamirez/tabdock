@@ -118,7 +118,15 @@ describe('the DevTools reply schemas', () => {
       'pairing-code',
     ]);
     expect(document.root.children?.[1]?.children?.[1]?.contentDocument?.backendNodeId).toBe(31);
-    expect(JSON.stringify(document)).not.toContain('nodeValue');
+    // The text the helper reads, kept; the names and ids it does not use, dropped.
+    expect(host?.shadowRoots?.[0]?.children?.[0]?.children).toEqual([
+      { backendNodeId: 15, nodeType: 3, localName: '', nodeValue: 'ABCD' },
+    ]);
+    expect(JSON.stringify(document)).not.toContain('nodeName');
+    expect(JSON.stringify(document)).not.toContain('nodeId');
+    // DevTools cuts a long text node at 10,000 characters and an ellipsis, which parses.
+    const cut = { backendNodeId: 1, nodeType: 3, nodeValue: `${'x'.repeat(10_000)}\u2026` };
+    expect(DevToolsNodeSchema.parse(cut)).toEqual(cut);
     expect(DevToolsBoxModelSchema.parse(BOX_MODEL)).toEqual({
       model: { content: BOX_MODEL.model.content },
     });
@@ -164,6 +172,12 @@ describe('the DevTools reply schemas', () => {
     ).toBe(false);
     expect(
       DevToolsNodeSchema.safeParse({ backendNodeId: 1, shadowRootType: 'sealed' }).success,
+    ).toBe(false);
+    expect(DevToolsNodeSchema.safeParse({ backendNodeId: 1, nodeType: '3' }).success).toBe(false);
+    expect(DevToolsNodeSchema.safeParse({ backendNodeId: 1, nodeType: 3.5 }).success).toBe(false);
+    expect(DevToolsNodeSchema.safeParse({ backendNodeId: 1, nodeValue: 42 }).success).toBe(false);
+    expect(
+      DevToolsNodeSchema.safeParse({ backendNodeId: 1, nodeValue: 'x'.repeat(65_537) }).success,
     ).toBe(false);
     // Deep in the tree too.
     const deep = JSON.parse(JSON.stringify(DOCUMENT)) as { root: DevToolsNode };

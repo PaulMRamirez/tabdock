@@ -71,10 +71,17 @@ function common(name: PackageName, version: string): Json {
   };
 }
 
+/** Each library's second entry (ADR 0041): the protocol's DevTools schemas, the adapter's testing helper. */
+const SUBPATH = { protocol: 'devtools', adapter: 'testing' } as const;
+
 function library(name: 'protocol' | 'adapter', version: string): Json {
+  const subpath = SUBPATH[name];
   return {
     ...common(name, version),
-    exports: { '.': { types: './dist/index.d.ts', default: './dist/index.js' } },
+    exports: {
+      '.': { types: './dist/index.d.ts', default: './dist/index.js' },
+      [`./${subpath}`]: { types: `./dist/${subpath}.d.ts`, default: `./dist/${subpath}.js` },
+    },
     types: './dist/index.d.ts',
     dependencies:
       name === 'adapter'
@@ -95,6 +102,8 @@ function wellFormed(version = '0.0.0'): Record<PackageName, Fixture> {
         'dist/index.js': 'export {};\n',
         'dist/index.d.ts': 'export {};\n',
         'dist/zod-config.js': 'export {};\n',
+        'dist/devtools.js': 'export {};\n',
+        'dist/devtools.d.ts': 'export {};\n',
       },
     },
     adapter: {
@@ -105,6 +114,8 @@ function wellFormed(version = '0.0.0'): Record<PackageName, Fixture> {
         'dist/index.d.ts': 'export {};\n',
         'dist/tabdock-adapter.js': '(()=>{})();\n',
         'dist/tabdock-adapter.js.map': '{}\n',
+        'dist/testing.js': 'export {};\n',
+        'dist/testing.d.ts': 'export {};\n',
       },
     },
     relay: {
@@ -574,6 +585,39 @@ describe('the release check', () => {
         delete f.protocol.files['dist/index.d.ts'];
       },
       /@tabdock\/protocol points at \.\/dist\/index\.d\.ts, which it does not hold/,
+    ],
+    // Dropped with its export too, so only the list of files each package needs can catch it.
+    [
+      'an adapter without its testing entry',
+      (f) => {
+        delete f.adapter.files['dist/testing.js'];
+        delete (f.adapter.manifest.exports as Record<string, unknown>)['./testing'];
+      },
+      /@tabdock\/adapter lacks dist\/testing\.js/,
+    ],
+    [
+      "an adapter without its testing entry's declarations",
+      (f) => {
+        delete f.adapter.files['dist/testing.d.ts'];
+        delete (f.adapter.manifest.exports as Record<string, unknown>)['./testing'];
+      },
+      /@tabdock\/adapter lacks dist\/testing\.d\.ts/,
+    ],
+    [
+      'a protocol without its DevTools schemas',
+      (f) => {
+        delete f.protocol.files['dist/devtools.js'];
+        delete (f.protocol.manifest.exports as Record<string, unknown>)['./devtools'];
+      },
+      /@tabdock\/protocol lacks dist\/devtools\.js/,
+    ],
+    [
+      "a protocol without its DevTools schemas' declarations",
+      (f) => {
+        delete f.protocol.files['dist/devtools.d.ts'];
+        delete (f.protocol.manifest.exports as Record<string, unknown>)['./devtools'];
+      },
+      /@tabdock\/protocol lacks dist\/devtools\.d\.ts/,
     ],
   ];
 
