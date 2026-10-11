@@ -32,6 +32,7 @@
     "@modelcontextprotocol/conformance": "0.2.0-alpha.12",
     "@playwright/test": "1.56.1",
     "@tabdock/adapter": "workspace:*",
+    "@tabdock/ci-check": "workspace:*",
     "@tabdock/demo": "workspace:*",
     "@tabdock/map-page": "workspace:*",
     "@tabdock/mcpb6": "workspace:*",

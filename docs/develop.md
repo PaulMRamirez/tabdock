@@ -13,6 +13,7 @@ pnpm typecheck     # tsc over the root scripts and every workspace package
 pnpm build         # each package's build, where it has one
 pnpm test:e2e      # browser tests (Playwright; fetches Chromium on first run)
 pnpm conformance   # the official MCP conformance suite's 2025-11-25 and 2026-07-28 sets against a local relay
+pnpm ci-check      # tests/ci-check: the CI check's walk of the canvas map page in local mode, then its audit
 
 pnpm relay         # the relay alone; local mode with no settings, printing the command for Claude Code
 pnpm relay --new-token  # the same, after replacing local mode's owner token in one rename

@@ -136,6 +136,21 @@ importers:
         specifier: 8.18.2
         version: 8.18.2
 
+  tests/ci-check:
+    devDependencies:
+      '@modelcontextprotocol/client':
+        specifier: 2.3.1
+        version: 2.3.1
+      '@playwright/test':
+        specifier: 1.56.1
+        version: 1.56.1
+      '@tabdock/adapter':
+        specifier: workspace:*
+        version: link:../../packages/adapter
+      zod:
+        specifier: 4.6.5
+        version: 4.6.5
+
   tests/e2e:
     devDependencies:
       '@mcp-b/webmcp-local-relay':
@@ -153,6 +168,9 @@ importers:
       '@tabdock/adapter':
         specifier: workspace:*
         version: link:../../packages/adapter
+      '@tabdock/ci-check':
+        specifier: workspace:*
+        version: link:../ci-check
       '@tabdock/demo':
         specifier: workspace:*
         version: link:../../apps/demo
