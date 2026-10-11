@@ -1159,14 +1159,6 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
       'restartSnapshot (TABDOCK_RESTART_SNAPSHOT) keeps its file in the audit directory (TABDOCK_AUDIT_DIR), and without one the relay keeps none (ADR 0046)',
     );
   }
-  // M6 seam: not built. No snapshot is written or loaded until ADR 0046's
-  // lands (W3-B), so a relay asked for one refuses to start rather than stop
-  // with its operator expecting pages to resume.
-  if (restartSnapshot) {
-    throw new Error(
-      'restartSnapshot (TABDOCK_RESTART_SNAPSHOT) is not written by this relay yet; leave it off (ADR 0046)',
-    );
-  }
   const mode: RelayMode =
     loopbackOnly !== undefined && loopbackOnly !== false
       ? 'local'
@@ -1706,21 +1698,6 @@ function refuseSettingsOutOfMode(
 }
 
 /**
- * M6's flags this relay cannot honour yet, each refused once its own mode
- * rules above have passed, and before local mode draws a token: a relay that
- * started anyway would run as if they were off while its operator, its
- * guide page and `.env.example` expect them on.
- */
-function refuseUnbuiltSettings(flags: { restartSnapshot: boolean }): void {
-  // M6 seam: not built. W3-B writes and loads the snapshot (ADR 0046).
-  if (flags.restartSnapshot) {
-    throw new Error(
-      'TABDOCK_RESTART_SNAPSHOT is not written by this relay yet; leave it off (ADR 0046)',
-    );
-  }
-}
-
-/**
  * How refusals name the audit directory when the environment gave it: a
  * TABDOCK_AUDIT_DIR value, an absolute path that may still be a token pasted
  * into the wrong variable, by the variable alone, as the audit reader names
@@ -1880,7 +1857,6 @@ export function loadConfigFromEnv(
   );
   const maxMb = parseCount('TABDOCK_AUDIT_MAX_MB', env.TABDOCK_AUDIT_MAX_MB);
   refuseSettingsOutOfMode(env, relayEnv, { invites, agentTokens, restartSnapshot });
-  refuseUnbuiltSettings({ restartSnapshot });
 
   // Last, so a mistake in any other setting is reported before local mode draws a token.
   const { auth, publicUrl, pairClient, localMode } = authFromEnv(

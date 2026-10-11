@@ -76,7 +76,7 @@ With `confirmVia: 'client'` (`data-confirm-via="client"`, or the demo board's `&
 
 ## Adding a member
 
-A member is an entry `sub=userId:Display Name` in `TABDOCK_OAUTH_USERS`, where `sub` is the person's subject at the provider. A change takes a relay restart, which ends every page session, pairing and invite link; clients stay signed in, and pages pair again.
+A member is an entry `sub=userId:Display Name` in `TABDOCK_OAUTH_USERS`, where `sub` is the person's subject at the provider. A change takes a relay restart; unless `TABDOCK_RESTART_SNAPSHOT` is on, that ends every page session, pairing and invite link, and pages pair again, while clients stay signed in.
 
 ## The activity log and the audit log
 

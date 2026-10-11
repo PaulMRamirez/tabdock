@@ -286,6 +286,15 @@ export class MemberList {
     return this.#userIds;
   }
 
+  /**
+   * Every entry, as copies: the restart snapshot (ADR 0046) binds a member's
+   * attachment to the subject its id stood for, so a start whose list gives
+   * the id to someone else restores nothing under it, as replace() ends it.
+   */
+  entries(): MemberEntry[] {
+    return [...this.#bySub].map(([sub, user]) => ({ sub, ...user }));
+  }
+
   /** Raised by every replace(); relay.ts keeps the one each /mcp request signed in under. */
   get generation(): number {
     return this.#generation;

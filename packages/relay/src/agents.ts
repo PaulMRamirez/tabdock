@@ -74,6 +74,18 @@ export class AgentTokens implements PagePart {
   }
 
   /**
+   * A token a restart snapshot carried over (ADR 0046): kept and timed as at
+   * its mint, with no record, since its agent_minted is in the log already.
+   * One past its time is the hub's to close, through inTime, once the
+   * snapshot's other records are back.
+   */
+  restore(agent: AgentTokenRecord): void {
+    this.#options.store.put(agent);
+    this.#byUser.set(agent.userId, { pageId: agent.pageId, tokenId: agent.tokenId });
+    this.#arm(agent);
+  }
+
+  /**
    * The live token a presented one names: found by digest and confirmed in
    * constant time, as codes, nonces and invites are (S3), and within its
    * time, a token found past it closing now, however late its timer. Any

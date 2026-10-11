@@ -40,7 +40,10 @@
 // With an audit directory (production, local mode, or TABDOCK_AUDIT_DIR) the
 // audit log is a FileAuditLog there, bracketed by relay_start and relay_stop
 // records so a restart shows as a gap (ADR 0019); production refuses to start
-// without one, or if relay_start does not reach the disk. The plugin says who
+// without one, or if relay_start does not reach the disk. With
+// TABDOCK_RESTART_SNAPSHOT on, a graceful stop also writes a snapshot of the
+// hub's store there, which the next start loads only when the log binds it to
+// that stop (snapshot.ts, ADR 0046). The plugin says who
 // someone is and the relay decides whether an invitee may in (ADR 0020). The
 // M3 spike's measurements (spike.ts) hook in here when TABDOCK_SPIKE is on;
 // nothing over HTTP controls them.
@@ -70,6 +73,7 @@ import {
   type ClientInfo,
   InviteeIdSchema,
   MAX_FRAME_BYTES,
+  snapshotCounts,
   SUBPROTOCOL,
 } from '@tabdock/protocol';
 import { WebSocketServer } from 'ws';
@@ -128,6 +132,14 @@ import { requestHeapBytes } from './request-heap.ts';
 import { inSlices, ResponseStalls } from './response-stalls.ts';
 import { type InviteeSessionOptions, McpSessions, rankOf } from './sessions.ts';
 import { createSignInGate } from './sign-in-gate.ts';
+import {
+  credentialsDigest,
+  fitProblem,
+  removeTemporaryFiles,
+  snapshotAccounts,
+  takeSnapshot,
+  writeSnapshot,
+} from './snapshot.ts';
 import { Spike, type SpikeControl } from './spike.ts';
 import { type AuditLog, callRecords, createMemoryStore, recordAudit } from './store.ts';
 
@@ -628,11 +640,37 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     throw error;
   }
   const store = options.store ?? createMemoryStore(fileAudit ? { audit: fileAudit } : {});
+  // The restart snapshot a graceful stop left (ADR 0046), taken now: after
+  // the log is open, so its lock is held and its last line whole, and before
+  // relay_start, whose line ends the binding to the stop that wrote it.
+  // Taken whatever the setting, so a file an earlier run left never waits
+  // on disk; it is applied below, once the hub exists. A temporary file a
+  // stop cut short left goes first, unread, for the same reason.
+  const leftover = fileAudit === null ? 0 : removeTemporaryFiles(fileAudit.dir);
+  if (leftover > 0) {
+    log.warn('removed restart snapshot files a stop cut short left, unread', { files: leftover });
+  }
+  // A rotated /pair client refuses a snapshot written under the old one.
+  const snapshotCredentials = credentialsDigest(options.pairClient);
+  const taken =
+    fileAudit === null
+      ? null
+      : takeSnapshot({
+          dir: fileAudit.dir,
+          enabled: config.restartSnapshot,
+          now: Date.now(),
+          mode: config.mode,
+          credentials: snapshotCredentials,
+        });
+  if (taken?.kind === 'refused') {
+    // Fixed words only: never a value from the file.
+    const fields = { reason: taken.reason, removed: taken.removed };
+    if (config.restartSnapshot) log.warn('restart snapshot not loaded; starting fresh', fields);
+    else log.info('removed a restart snapshot an earlier run left, unread', fields);
+  }
   // Only a log that outlives the process marks its starts and stops; a memory
   // ring forgets everything at a restart anyway.
   if (fileAudit !== null) {
-    // M6 seam: not built. relay_start gains restartSnapshot (W3-B) once it
-    // is served; until then config.ts refuses to start with it on.
     recordAudit(fileAudit, log, {
       v: AUDIT_VERSION,
       type: 'relay_start',
@@ -642,6 +680,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       mode: config.mode,
       invites: config.invites,
       agentTokens: config.agentTokens,
+      restartSnapshot: config.restartSnapshot,
     });
     // Production serves no one until its first record is on disk (ADR 0019).
     if (!fileAudit.sync() && config.env === 'production') {
@@ -661,6 +700,78 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   };
   const spike = config.spike ? new Spike(log, MAX_MCP_BODY_BYTES) : null;
   const hub = new PageHub(config, store, log, spike);
+  if (taken?.kind === 'loaded') {
+    const unfit = fitProblem(taken.snapshot, config);
+    if (unfit !== null) {
+      log.warn('restart snapshot not loaded; starting fresh', { reason: unfit, removed: true });
+    } else {
+      try {
+        // The member list in force, the members file's when one is named, read above.
+        hub.restoreSnapshot(taken.snapshot, {
+          ageMs: taken.ageMs,
+          accounts: snapshotAccounts(auth.members ?? null),
+        });
+      } catch (error) {
+        // A store half put back is never served; the file is gone, so the next start is fresh.
+        await hub.shutdown();
+        await closeAudit(store.audit);
+        auth.stop?.();
+        throw error;
+      }
+    }
+  }
+  /**
+   * Whether a member list change is in force that settleMembers has not
+   * finished ending (members.ts, settlingMembers keeps it owed): set when a
+   * settle begins, cleared only when one finishes with every step done.
+   */
+  let membersUnsettled = false;
+  /**
+   * At a graceful stop with the setting on (ADR 0046): the hub's store, once
+   * it takes no more work, into the snapshot file, and its digest into the
+   * log, which relay_stop follows at once. Anything that goes wrong writes no
+   * record, so the next start finds nothing bound and starts fresh; the stop
+   * itself goes on whatever happens here.
+   */
+  const writeRestartSnapshot = (): void => {
+    if (!config.restartSnapshot || fileAudit === null) return;
+    if (membersUnsettled) {
+      // The list in force has not yet ended what it took away (settleMembers
+      // threw part way, so the change is owed): keyed to that list, the file
+      // would hand a moved id's attachments to whoever the id names now
+      // (S8, S13). With none written, the next start ends everything.
+      log.error('restart snapshot not written', {
+        reason: 'a member list change is still unsettled',
+      });
+      return;
+    }
+    let outcome: ReturnType<typeof writeSnapshot>;
+    let snapshot: ReturnType<typeof hub.exportSnapshot>;
+    try {
+      snapshot = hub.exportSnapshot(
+        Date.now(),
+        snapshotAccounts(auth.members ?? null).memberKey,
+        snapshotCredentials,
+      );
+      outcome = writeSnapshot(fileAudit.dir, snapshot);
+    } catch (error) {
+      log.error('restart snapshot not written', { reason: errorKind(error) });
+      return;
+    }
+    if (outcome.kind === 'refused') {
+      // An error, not a warning: the operator turned the setting on, and the
+      // next start will end every attachment instead of resuming them.
+      log.error('restart snapshot not written', { reason: outcome.reason });
+      return;
+    }
+    recordAudit(store.audit, log, {
+      v: AUDIT_VERSION,
+      type: 'snapshot_written',
+      at: Date.now(),
+      ...snapshotCounts(snapshot),
+      sha256: outcome.sha256,
+    });
+  };
   const addresses = createClientAddresses(config, log);
   const refusals = createAuthRefusalLog(log);
   let pair: PairFlow | null = null;
@@ -830,6 +941,8 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
    * name.
    */
   const settleMembers = (change: MemberChange): void => {
+    // Each settle carries every change still owed, so one that finishes settles them all.
+    membersUnsettled = true;
     const faults: unknown[] = [];
     const step = <T>(run: () => T, otherwise: T): T => {
       try {
@@ -859,6 +972,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       log.info('sessions closed for a member list change', { mcpSessions, streams });
     }
     if (faults.length > 0) throw faults[0];
+    membersUnsettled = false;
   };
   const applyMembers = members === null ? null : settlingMembers(members, settleMembers);
   // A closed agent token's user holds nothing more (ADR 0044): its 2025-era
@@ -1562,6 +1676,10 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         membersWatch?.stop();
         pair?.close();
         await hub.shutdown();
+        // Then, with nothing awaited between them, the snapshot_written
+        // record and relay_stop, so they are the log's last two lines and a
+        // start can tell this stop's snapshot from any other (ADR 0046).
+        writeRestartSnapshot();
         // After the hub, whose shutdown audits the calls it fails (ADR 0019).
         await closeAudit(store.audit);
         for (const ws of wss.clients) ws.terminate();

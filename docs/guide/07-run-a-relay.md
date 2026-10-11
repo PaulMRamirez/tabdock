@@ -156,7 +156,7 @@ The image caps the heap at 192 MiB, which holds the default byte budgets (`TABDO
 
 ## Operating it
 
-Run one relay per URL; a second one on the same audit directory refuses to start. Stop it with SIGTERM (Ctrl-C, `docker stop`, `systemctl stop`): it closes within about a second and releases its locks. Every restart forgets every page, attachment, pairing code, invite and `/pair` sign-in, so pages reconnect under new ids and people pair again, while clients stay signed in at the provider; only the audit log and local mode's token survive. Settings, members in `TABDOCK_OAUTH_USERS` included, take effect only at a restart.
+Run one relay per URL; a second one on the same audit directory refuses to start. Stop it with SIGTERM (Ctrl-C, `docker stop`, `systemctl stop`): it closes within about a second and releases its locks. Every restart forgets every pairing code and `/pair` sign-in, and every page, attachment and invite unless `TABDOCK_RESTART_SNAPSHOT` keeps them, so pages reconnect anew and people pair again, while clients stay signed in; only the audit log, that snapshot and local mode's token survive. Settings, members in `TABDOCK_OAUTH_USERS` included, take effect only at a restart.
 
 To upgrade, read the [changelog](../../CHANGELOG.md) (while versions start with 0, a minor version may change settings), then `git pull` and `pnpm install` in the clone, or rebuild the image, and restart.
 

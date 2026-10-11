@@ -6,11 +6,10 @@
 // watching seats, the invitee pool and agent tokens, which mean nothing
 // without invites (ADR 0044), the members file in public URL mode (ADR 0043)
 // and the restart snapshot, which needs an audit directory (ADR 0046). Every
-// refusal names its setting and never the value it was given (R1, R2). Until
-// W3-B serves it, the snapshot passes its own rules and is then refused at
-// start, so no relay runs as if it were on while nothing honours it. Agent
-// tokens are served (W2-D, agent-tokens.test.ts), and the members file is
-// read (W1-E): its own tests are members.test.ts and members-file.test.ts.
+// refusal names its setting and never the value it was given (R1, R2). Agent
+// tokens are served (W2-D, agent-tokens.test.ts), the members file is read
+// (W1-E: members.test.ts and members-file.test.ts), and the snapshot is
+// written and loaded (W3-B: restart-snapshot.test.ts).
 
 import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -584,25 +583,24 @@ describe('TABDOCK_RESTART_SNAPSHOT (ADR 0046)', () => {
     expect(resolveEnv({ TABDOCK_HOME: freshHome() }).restartSnapshot).toBe(false);
   });
 
-  it('is refused at start when on until this relay writes it, before local mode draws a token', () => {
-    // M6 seam: not built. W3-B writes the snapshot and turns these into relays with it on.
-    const words =
-      'TABDOCK_RESTART_SNAPSHOT is not written by this relay yet; leave it off (ADR 0046)';
-    refusedWith(
-      { ...DEV, TABDOCK_AUDIT_DIR: scratch(), TABDOCK_RESTART_SNAPSHOT: '1' },
-      'xx',
-      words,
-    );
-    refusedWith(
-      { ...HOSTED, TABDOCK_AUDIT_DIR: scratch(), TABDOCK_RESTART_SNAPSHOT: 'TRUE' },
-      'TRUE',
-      words,
-    );
+  it("is on when set beside an audit directory, local mode's beside its token included", () => {
+    const dev = resolveEnv({ ...DEV, TABDOCK_AUDIT_DIR: scratch(), TABDOCK_RESTART_SNAPSHOT: '1' });
+    expect(dev.restartSnapshot).toBe(true);
+    const hosted = resolveEnv({
+      ...HOSTED,
+      TABDOCK_AUDIT_DIR: scratch(),
+      TABDOCK_RESTART_SNAPSHOT: 'TRUE',
+    });
+    expect([hosted.mode, hosted.restartSnapshot]).toEqual(['hosted', true]);
     const home = freshHome();
-    expect(
-      thrown(() => loadConfigFromEnv({ TABDOCK_HOME: home, TABDOCK_RESTART_SNAPSHOT: 'true' })),
-    ).toBe(words);
-    expect(existsSync(home)).toBe(false);
+    const local = resolveEnv({ TABDOCK_HOME: home, TABDOCK_RESTART_SNAPSHOT: 'true' });
+    expect([local.mode, local.restartSnapshot]).toEqual(['local', true]);
+    expect(local.audit.dir?.startsWith(home)).toBe(true);
+    expect(existsSync(home)).toBe(true);
+    const dir = scratch();
+    expect(resolveConfig({ auth, restartSnapshot: true, audit: { dir } }).restartSnapshot).toBe(
+      true,
+    );
   });
 
   it('is refused without an audit directory, in either layer', () => {
@@ -617,9 +615,7 @@ describe('TABDOCK_RESTART_SNAPSHOT (ADR 0046)', () => {
       'restartSnapshot (TABDOCK_RESTART_SNAPSHOT) keeps its file in the audit directory (TABDOCK_AUDIT_DIR), and without one the relay keeps none (ADR 0046)',
     );
     const dir = scratch();
-    expect(thrown(() => resolveConfig({ auth, restartSnapshot: true, audit: { dir } }))).toBe(
-      'restartSnapshot (TABDOCK_RESTART_SNAPSHOT) is not written by this relay yet; leave it off (ADR 0046)',
-    );
+    // Only true turns it on: a string from code that bypassed the types is off.
     expect(resolveConfig(stray({ restartSnapshot: 'true', audit: { dir } })).restartSnapshot).toBe(
       false,
     );
