@@ -2997,7 +2997,11 @@ export class PageHub {
    * A watcher's call past the page's share of its calls, or null to go on
    * (ADR 0044); members and the page's people are never held to it.
    */
-  #watchingShareRefusal(_pageId: string, attachment: AttachmentRecord): HubError | null {
+  #watchingShareRefusal(
+    _pageId: string,
+    attachment: AttachmentRecord,
+    _trace: CallTrace,
+  ): HubError | null {
     if (this.#seatOf(attachment.kind, attachment.role) !== 'watching') return null;
     // M6 seam: not built. Every watcher's call goes on, as before the share.
     return null;
@@ -5198,7 +5202,7 @@ export class PageHub {
         );
       }
       // ADR 0044: a page's watchers share a part of its calls, so a room cannot make its tab stutter.
-      const share = this.#watchingShareRefusal(pageId, attachment);
+      const share = this.#watchingShareRefusal(pageId, attachment, trace);
       if (share !== null) return share;
 
       const callId = newId('cl');
