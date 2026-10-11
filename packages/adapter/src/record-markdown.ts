@@ -42,14 +42,17 @@ function tally(keys: string[], limit: number, show = (key: string) => key): stri
     .join(', ');
 }
 
-/** A section listing at most LIST_LINES lines, then how many more the JSON holds. */
-function section(title: string, lines: string[]): string[] {
-  const more = lines.length - LIST_LINES;
+/**
+ * A section listing at most `cap` lines, then how many more the JSON holds.
+ * People are listed whole (decision 4), since the record's own caps bound them.
+ */
+function section(title: string, lines: string[], cap = LIST_LINES): string[] {
+  const more = lines.length - cap;
   return lines.length === 0
     ? []
     : [
         `\n## ${title}\n`,
-        ...lines.slice(0, LIST_LINES).map((line) => `- ${line}`),
+        ...lines.slice(0, cap).map((line) => `- ${line}`),
         ...(more > 0 ? [`- and ${String(more)} more`] : []),
       ];
 }
@@ -125,6 +128,7 @@ export function sessionRecordMarkdown(
           .filter(Boolean)
           .join('; ');
       }),
+      Infinity,
     ),
     ...section(
       'Proposals',

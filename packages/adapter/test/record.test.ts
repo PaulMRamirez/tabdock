@@ -3,9 +3,11 @@
 // counted by person and outcome; attachment spans that open, change role and
 // close as left, revoked, page_session_ended or session_ended; where a call
 // was confirmed; proposals without their arguments; the current, previous and
-// ended records a new page session, a time-boxed session and its end make;
-// and a snapshot the protocol's strict schema checks, which names an invitee
-// by short id and never holds an argument, a result or a secret.
+// ended records a new page session, a time-boxed session and its end make,
+// in either order on a relay restart, each holding only times within its own
+// span; people no record names any more forgotten; and a snapshot the
+// protocol's strict schema checks, which names an invitee by short id and
+// never holds an argument, a result or a secret.
 
 import {
   type AttachmentView,
@@ -829,6 +831,161 @@ describe('a time-boxed session in the record (ADR 0043)', () => {
     const record = snap(recorder);
     expect(record.pageIds).toHaveLength(SESSION_RECORD_MAX_PAGE_IDS);
     expect(record.calls).toEqual([]);
-    expect(record.dropped.calls).toBe(1);
+    // Counted, but outside the dropped span, which only the cap's oldest-first drops set.
+    expect(record.dropped).toMatchObject({ calls: 1, firstAt: null, lastAt: null });
+  });
+});
+
+/**
+ * Every time a record holds lies within its own span, as `audit --match`
+ * requires of a record before it trusts that span: calls, joins, leaves,
+ * role changes and decisions, and the dropped span.
+ */
+function withinSpan(record: ReturnType<typeof snap>): void {
+  const { from, to } = record;
+  const inside = (at: number): boolean => at >= from && at <= to;
+  expect(record.calls.every((call) => inside(call.at))).toBe(true);
+  for (const span of record.attachments) {
+    expect(inside(span.joinedAt)).toBe(true);
+    expect(span.leftAt === null || (span.leftAt >= span.joinedAt && span.leftAt <= to)).toBe(true);
+    expect(span.roles.every((role) => role.at >= span.joinedAt && role.at <= to)).toBe(true);
+  }
+  expect(
+    record.proposals.every(
+      (proposal) =>
+        proposal.at <= to && (proposal.decidedAt === null || inside(proposal.decidedAt)),
+    ),
+  ).toBe(true);
+  for (const at of [record.dropped.firstAt, record.dropped.lastAt]) {
+    expect(at === null || inside(at)).toBe(true);
+  }
+}
+
+describe('times that stay within each record', () => {
+  for (const sessionFirst of [true, false]) {
+    it(`keeps every record whole when a relay restart is told ${sessionFirst ? 'as the session ending, then the page session' : 'as the page session, then the session ending'}`, () => {
+      const recorder = createRecorder();
+      recorder.pageSession('pg_1', false, 100);
+      roster(recorder, 200, view(alice));
+      recorder.call(entry('c_0', alice, { time: 300 }), 'pg_1');
+      recorder.sessionStarted(session());
+      roster(recorder, 5_100, view(alice), view(guest, 'observer', 'inv_watch'));
+      recorder.call(entry('c_1', guest, { time: 5_200 }), 'pg_1');
+      recorder.linkLost(6_000);
+      const ending = {
+        sessionId: 'ss_1',
+        label: 'Period 3',
+        reason: 'relay' as const,
+        time: 6_100,
+      };
+      if (sessionFirst) recorder.sessionEnded(ending);
+      recorder.pageSession('pg_2', false, 6_100);
+      if (!sessionFirst) recorder.sessionEnded(ending);
+
+      for (const which of ['current', 'previous', 'ended'] as const)
+        withinSpan(snap(recorder, which));
+      // The page record the session sealed is still the one kept, not an empty one after it.
+      expect(snap(recorder, 'previous')).toMatchObject({
+        pageIds: ['pg_1'],
+        from: 100,
+        to: 5_000,
+        calls: [expect.objectContaining({ callId: 'c_0' })],
+      });
+      // Everyone left when the link went, and no one carries on into the page record.
+      const lesson = snap(recorder, 'ended');
+      expect(lesson.calls.map((call) => call.callId)).toEqual(['c_1']);
+      expect(lesson.attachments.map((span) => [span.user.id, span.leftAt, span.ended])).toEqual([
+        ['alice', 6_000, 'page_session_ended'],
+        ['g_0123abcd', 6_000, 'page_session_ended'],
+      ]);
+      expect(snap(recorder)).toMatchObject({ pageIds: ['pg_2'], from: 6_100, attachments: [] });
+    });
+  }
+
+  it('ends a record restarted while the link was down no earlier than it began', () => {
+    const recorder = createRecorder();
+    recorder.pageSession('pg_1', false, 100);
+    roster(recorder, 200, view(alice));
+    recorder.linkLost(300);
+    recorder.discard('current', 400);
+    recorder.pageSession('pg_2', false, 500);
+    const previous = snap(recorder, 'previous');
+    withinSpan(previous);
+    expect(previous).toMatchObject({ from: 400, to: 400 });
+    expect(previous.attachments).toEqual([
+      expect.objectContaining({
+        before: true,
+        joinedAt: 400,
+        leftAt: 400,
+        ended: 'page_session_ended',
+      }),
+    ]);
+  });
+
+  it('ends a record sealed when the link went after the proposals its loss settled', () => {
+    const recorder = createRecorder();
+    recorder.pageSession('pg_1', false, 100);
+    recorder.proposal(
+      {
+        proposalId: 'pr_1',
+        tool: 'go_to_stop',
+        proposer: { ...guest, client: null, role: 'observer' },
+        arguments: '{}',
+        argumentChars: 2,
+        consequential: false,
+        receivedAt: 200,
+        expiresAt: 60_200,
+      },
+      'pg_1',
+    );
+    recorder.linkLost(300);
+    recorder.proposalSettled({
+      proposalId: 'pr_1',
+      tool: 'go_to_stop',
+      proposer: guest,
+      client: null,
+      outcome: 'cancelled',
+      callId: null,
+      time: 301,
+    });
+    recorder.pageSession('pg_2', false, 400);
+    const previous = snap(recorder, 'previous');
+    withinSpan(previous);
+    expect(previous).toMatchObject({
+      to: 301,
+      proposals: [expect.objectContaining({ decidedAt: 301 })],
+    });
+  });
+});
+
+describe('the people the records name', () => {
+  it('forgets whoever no record names any more, so their short id goes back to the next one to come', () => {
+    const recorder = createRecorder();
+    const other: User = { userId: `g_0123abcd${'f'.repeat(24)}`, displayName: 'other@example.com' };
+    const idOf = (callId: string, which: 'current' | 'previous' = 'current'): string | undefined =>
+      snap(recorder, which).calls.find((call) => call.callId === callId)?.user.id;
+    recorder.pageSession('pg_1', false, 100);
+    recorder.call(entry('c_1', guest), 'pg_1');
+    recorder.call(entry('c_2', other), 'pg_1');
+    expect([idOf('c_1'), idOf('c_2')]).toEqual(['g_0123abcd', 'g_0123abcd~2']);
+    recorder.pageSession('pg_2', false, 200);
+    // While a record still names the first, the second keeps its ~2 in every record.
+    recorder.call(entry('c_3', other), 'pg_2');
+    expect(idOf('c_3')).toBe('g_0123abcd~2');
+    recorder.discard('previous', 300);
+    recorder.discard('current', 400);
+    recorder.call(entry('c_4', other), 'pg_2');
+    expect(idOf('c_4')).toBe('g_0123abcd');
+
+    // A sealed record that a later one replaces lets go of its people too.
+    const later = createRecorder();
+    later.pageSession('pg_1', false, 100);
+    later.call(entry('c_1', guest), 'pg_1');
+    later.call(entry('c_2', other), 'pg_1');
+    later.pageSession('pg_2', false, 200);
+    later.call(entry('c_3', bob), 'pg_2');
+    later.pageSession('pg_3', false, 300);
+    later.call(entry('c_4', other), 'pg_3');
+    expect(later.snapshot('current', CONTEXT, 400)?.calls[0]?.user.id).toBe('g_0123abcd');
   });
 });

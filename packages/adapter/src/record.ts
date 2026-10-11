@@ -213,15 +213,35 @@ export function createRecorder(): Recorder {
   const revoked = new Set<string>();
   /**
    * How the records name each user, shared by all three so an invitee's
-   * short id, and the ~n that keeps two apart, never differ between them.
+   * short id, and the ~n that keeps two apart, never differ between them,
+   * and pruned to the people they name whenever one is replaced, so the
+   * tab keeps no one its records no longer hold.
    */
   const people = new Map<string, RecordPerson>();
+  /** The ids `people` hands out, so a clash is found without a scan. */
+  const ids = new Set<string>();
 
   const slots = (): [RecordWhich, Kept | null][] => [
     ['current', current],
     ['previous', previous],
     ['ended', ended],
   ];
+
+  function prune(): void {
+    const named = new Set(slots().flatMap(([, kept]) => [...(kept?.seen ?? [])]));
+    for (const [userId, held] of people) {
+      if (!named.has(held)) {
+        people.delete(userId);
+        ids.delete(held.id);
+      }
+    }
+  }
+
+  /** The record kept from now on, after whatever it replaced has gone. */
+  function start(kept: Kept): void {
+    current = kept;
+    prune();
+  }
 
   /**
    * A user as the widget names them: a member by id and plain-line name, an
@@ -234,11 +254,10 @@ export function createRecorder(): Recorder {
       const invitee = InviteeIdSchema.safeParse(userId).success;
       const short = invitee ? userId.slice(0, 2 + INVITEE_SHORT_ID_CHARS) : userId;
       let id = short;
-      for (let n = 2; invitee && [...people.values()].some((other) => other.id === id); n++) {
-        id = `${short}~${String(n)}`;
-      }
+      for (let n = 2; invitee && ids.has(id); n++) id = `${short}~${String(n)}`;
       named = { id, name: plainLine(displayName) || id, kind: invitee ? 'invitee' : 'member' };
       people.set(userId, named);
+      ids.add(id);
     }
     kept.seen.add(named);
     return named;
@@ -308,27 +327,34 @@ export function createRecorder(): Recorder {
     for (const [userId, span] of kept.open) {
       span.ended = why(userId, span);
       if (span.ended === null) continue;
-      span.leftAt = at;
+      // A span that began after the link went (a record restarted offline) ends as it began.
+      span.leftAt = Math.max(at, span.joinedAt);
       kept.open.delete(userId);
     }
   }
 
-  /** Seals a record that holds anything into its slot, so an empty one never replaces a kept one. */
+  /**
+   * Seals a record that holds anything into its slot, so an empty one never
+   * replaces a kept one. It ends no earlier than it began or than anything
+   * it holds was decided, so every time it holds lies within its span.
+   */
   function seal(kept: Kept, at: number): void {
     if (kept.spans.length + kept.calls.length + kept.proposals.length + kept.dropped.calls === 0) {
       return;
     }
-    kept.to = at;
+    kept.to = Math.max(at, kept.from, ...kept.proposals.map((proposal) => proposal.decidedAt ?? 0));
     if (kept.scope.kind === 'page') previous = kept;
     else ended = kept;
   }
 
-  /** A call the cap, or a page the record cannot name, pushed out: counted, so the record never passes for whole. */
+  /**
+   * A call the cap, or a page the record cannot name, pushed out: counted,
+   * so the record never passes for whole. Only the cap's drops set the
+   * dropped span, which is then older than every call kept.
+   */
   function drop(kept: Kept, call: RecordCall): void {
     const { dropped, byUser } = kept;
     dropped.calls++;
-    dropped.firstAt = Math.min(dropped.firstAt ?? call.at, call.at);
-    dropped.lastAt = Math.max(dropped.lastAt ?? call.at, call.at);
     const counts =
       byUser.get(call.user.id) ??
       (byUser.size < SESSION_RECORD_MAX_DROPPED_USERS
@@ -349,13 +375,15 @@ export function createRecorder(): Recorder {
   return {
     pageSession(pageId, resumed, at) {
       const kept = current;
-      const end = lostAt ?? at;
       const same = resumed && pageId === live;
+      // When the link went; close and seal keep a record restarted since within its own span.
+      const end = lostAt ?? at;
       lostAt = null;
       live = pageId;
       if (kept === null) {
-        current = begin({ kind: 'page' }, at);
-        current.carry = resumed;
+        const first = begin({ kind: 'page' }, at);
+        first.carry = resumed;
+        start(first);
         return;
       }
       if (same) return;
@@ -363,7 +391,7 @@ export function createRecorder(): Recorder {
       close(kept, end, () => 'page_session_ended');
       if (kept.scope.kind === 'page') {
         seal(kept, end);
-        current = begin(kept.scope, at);
+        start(begin(kept.scope, at));
       } else if (
         !kept.pageIds.includes(pageId) &&
         kept.pageIds.length < SESSION_RECORD_MAX_PAGE_IDS
@@ -442,7 +470,11 @@ export function createRecorder(): Recorder {
         return null;
       }
       if (kept.calls.length >= SESSION_RECORD_MAX_CALLS) {
-        drop(kept, kept.calls.shift() ?? call);
+        // The oldest goes first, so the span runs from the first dropped to the latest.
+        const oldest = kept.calls.shift() ?? call;
+        drop(kept, oldest);
+        kept.dropped.firstAt ??= oldest.at;
+        kept.dropped.lastAt = oldest.at;
         kept.base++;
       }
       kept.calls.push(call);
@@ -521,18 +553,24 @@ export function createRecorder(): Recorder {
         return;
       }
       seal(kept, session.startedAt);
-      current = begin(scope, session.startedAt, kept);
+      start(begin(scope, session.startedAt, kept));
     },
 
     sessionEnded(end) {
       const kept = current;
       if (kept?.scope.kind !== 'session' || kept.scope.sessionId !== end.sessionId) return;
       kept.scope = { ...kept.scope, endedAt: end.time, endedBy: end.reason };
-      // The session's end closes every attachment an invite or agent token made (ADR 0043).
-      close(kept, end.time, (_userId, span) => (span.inviteId === null ? null : 'session_ended'));
-      kept.to = end.time;
+      if (lostAt === null) {
+        // The session's end closes every attachment an invite or agent token made (ADR 0043).
+        close(kept, end.time, (_userId, span) => (span.inviteId === null ? null : 'session_ended'));
+      } else {
+        // Told while the link is down (a relay restart), the page session ended
+        // first and with it everyone, so no one carries into the page record.
+        close(kept, lostAt, () => 'page_session_ended');
+      }
+      kept.to = Math.max(end.time, kept.from);
       ended = kept;
-      current = begin({ kind: 'page' }, end.time, kept);
+      start(begin({ kind: 'page' }, kept.to, kept));
     },
 
     views() {
@@ -598,6 +636,7 @@ export function createRecorder(): Recorder {
       if (which === 'previous') previous = null;
       else if (which === 'ended') ended = null;
       else if (current !== null) current = begin(current.scope, at, current);
+      prune();
       return had;
     },
 
@@ -607,6 +646,7 @@ export function createRecorder(): Recorder {
       live = '';
       revoked.clear();
       people.clear();
+      ids.clear();
     },
   };
 }

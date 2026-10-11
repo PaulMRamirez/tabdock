@@ -2,7 +2,7 @@
 // name, client, title, label and tool lands in one code span that CommonMark
 // closes only where the summary meant it to, so no HTML, link, autolink or
 // table pipe a caller wrote is read as anything but text, whatever it holds;
-// no line holds an en or em dash; people are grouped with their counts; the
+// no line holds an en or em dash; every person gets a line with their counts; the
 // time-ordered lists stop at 100 lines and say how many more the JSON keeps;
 // and a record saves under a name built from its start and its label alone.
 
@@ -321,6 +321,18 @@ describe('the session record summary', () => {
     const notable = markdown.split('## Notable calls\n\n')[1]?.trim().split('\n') ?? [];
     expect(notable).toHaveLength(101);
     expect(notable.at(-1)).toBe('- and 30 more');
+  });
+
+  it('lists every person, one line each, however many there are', () => {
+    const calls = Array.from({ length: 130 }, (_, n) =>
+      call(n, { id: `u${String(n)}`, name: `User ${String(n)}`, kind: 'member' }),
+    );
+    const markdown = sessionRecordMarkdown(record({ to: START + 200 * MINUTE, calls }), {
+      offsetMinutes: 0,
+    });
+    const people = markdown.split('## People\n\n')[1]?.split('\n\n')[0]?.trim().split('\n') ?? [];
+    expect(people).toHaveLength(130);
+    expect(people.at(-1)).toMatch(/^- `User 129 \(u129\)`, member; 1 calls/);
   });
 
   it('gives full dates when the record runs past midnight, and says what the caps dropped', () => {
