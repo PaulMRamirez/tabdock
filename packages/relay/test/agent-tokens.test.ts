@@ -39,6 +39,8 @@ import {
   type InviteRelay,
   type InviteRelayOptions,
   latest,
+  mintOk,
+  redeem,
   startInviteRelay,
 } from './helpers/invites.ts';
 import { PAGE_ORIGIN, READ_TOOL, type TestPage, WRITE_TOOL } from './helpers/page-client.ts';
@@ -448,6 +450,80 @@ describe('an allowed agent (S5, S13)', () => {
       timeoutMs: 300,
     });
     expect(waited.isError, waited.text).toBe(false);
+  });
+});
+
+describe('seats (S14)', () => {
+  it('takes a watching seat, and a token that finds none raises no prompt and says page_busy', async () => {
+    const { relay, page } = await room({ limits: { observersPerPage: 1 } });
+    await attachedAgent(relay, page);
+    const second = await mintAgent(page);
+    const agent = await agentOn(relay, second.token);
+    const paired = await call(agent, 'pair_page', { code: page.code });
+    expect(paired.text).toMatch(/^page_busy/);
+    await page.sync();
+    // Alice's prompt and the first agent's only.
+    expect(page.all('attach_request')).toHaveLength(2);
+    expect(relay.store.agents.get(page.pageId, second.tokenId)?.state).toBe('dormant');
+  });
+
+  it('answers an approval page_busy once a demotion filled the watching seat meanwhile', async () => {
+    const { relay, page } = await room({ limits: { observersPerPage: 1 } }, { maxDrivers: 2 });
+    const carol = await relay.claude('sub-carol', 'carol@example.com');
+    const invite = await mintOk(page, { role: 'driver' });
+    const joined = await redeem(carol, page, invite.link, { allow: true, role: 'driver' });
+    expect(joined.outcome.isError, joined.outcome.text).toBe(false);
+    const guest = relay.store.attachments
+      .listForPage(page.pageId)
+      .find((attachment) => attachment.inviteId === invite.inviteId);
+    if (guest === undefined) throw new Error('no guest');
+    expect(guest.role).toBe('driver');
+    const minted = await mintAgent(page);
+    await agentOn(relay, minted.token);
+    const request = await page.next('attach_request');
+    expect(request.via).toBe('agent');
+    // A demotion is always allowed, and moves Carol into the one watching seat.
+    page.send({ t: 'set_role', userId: guest.userId, role: 'observer' });
+    await page.sync();
+    page.send({
+      t: 'attach_decision',
+      requestId: request.requestId,
+      allow: true,
+      role: 'observer',
+    });
+    await page.sync();
+    expect(records(relay, 'attach_refused').at(-1)).toMatchObject({
+      via: 'agent',
+      inviteId: minted.tokenId,
+      outcome: 'page_busy',
+    });
+    const userId = agentUserId(page.pageId, minted.tokenId);
+    expect(relay.store.attachments.get(page.pageId, userId)).toBeUndefined();
+    expect(relay.store.agents.get(page.pageId, minted.tokenId)?.state).toBe('dormant');
+  });
+
+  it("with no watching seats, agents keep to the invites' share of the people, leaving members two", async () => {
+    const { relay, page } = await room({ limits: { usersPerPage: 4, observersPerPage: 0 } });
+    await attachedAgent(relay, page, 'One');
+    await attachedAgent(relay, page, 'Two');
+    const third = await mintAgent(page);
+    const agent = await agentOn(relay, third.token);
+    expect((await call(agent, 'pair_page', { code: page.code })).text).toMatch(/^page_busy/);
+    // Bob, a member, still pairs by code into the fourth seat.
+    await attachMember(await relay.claude('sub-bob'), page, 'observer');
+    expect(relay.store.attachments.listForPage(page.pageId)).toHaveLength(4);
+  });
+
+  // Needs W2-C's #pageFull, which counts the people alone: until W2-C merges,
+  // every attachment counts toward the people limit, watchers included, so
+  // this one fails on W2-D's branch by itself (docs/plans/M6.md, W2-D).
+  it("watching agents never take a member's seat among the people", async () => {
+    const { relay, page } = await room({ limits: { usersPerPage: 3, observersPerPage: 5 } });
+    await attachedAgent(relay, page, 'One');
+    await attachedAgent(relay, page, 'Two');
+    await attachedAgent(relay, page, 'Three');
+    await attachMember(await relay.claude('sub-bob'), page, 'observer');
+    expect(relay.store.attachments.listForPage(page.pageId)).toHaveLength(5);
   });
 });
 
