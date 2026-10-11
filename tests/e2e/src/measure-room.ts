@@ -35,6 +35,7 @@ const USAGE = `pnpm measure:room [options]
   --phase-minutes <n>  the class phase's length; the others scale from it (default 5)
   --quick              a smoke run: a class of 6, 20 s phases, written under test-results
   --skip <list>        any of: rooms, nat, frames
+  --frame-repeats <n>  time the frames this many times over, since one tab varies (default 1)
   --out <file>         where the figures go (default docs/notes/m6/room-measure.raw.json)
 `;
 
@@ -53,6 +54,7 @@ function readArgs() {
         'phase-minutes': { type: 'string' },
         quick: { type: 'boolean', default: false },
         skip: { type: 'string' },
+        'frame-repeats': { type: 'string' },
         out: { type: 'string' },
         help: { type: 'boolean', default: false },
       },
@@ -83,6 +85,10 @@ if (!(phaseMinutes > 0 && phaseMinutes <= 60))
 const skip = new Set((values.skip ?? '').split(',').filter((part) => part !== ''));
 for (const part of skip) {
   if (!['rooms', 'nat', 'frames'].includes(part)) fail(`--skip takes rooms, nat or frames`);
+}
+const frameRepeats = Number(values['frame-repeats'] ?? '1');
+if (!Number.isInteger(frameRepeats) || frameRepeats < 1 || frameRepeats > 10) {
+  fail('--frame-repeats takes a whole number from 1 to 10');
 }
 const out =
   values.out ?? (quick ? join(ROOT, 'tests/e2e/test-results/room-measure.quick.json') : RAW);
@@ -226,6 +232,8 @@ say(
 const rooms: { result: RoomResult; bars: Bar[] }[] = [];
 let nat: RoomResult | null = null;
 let frames: { runs: FrameRun[]; browser: string } | null = null;
+/** Each repeat after the first, kept apart so a one-repeat file reads as before. */
+const moreFrames: { runs: FrameRun[]; browser: string }[] = [];
 const failures: string[] = [];
 
 if (!skip.has('rooms')) {
@@ -265,11 +273,17 @@ if (!skip.has('nat')) {
 }
 
 if (!skip.has('frames')) {
-  say("frames on the canvas map page under watchers' calls");
-  try {
-    frames = await measureFrames(quick ? 5 : 40, say);
-  } catch (error) {
-    failures.push(`frames: ${error instanceof Error ? error.message : String(error)}`);
+  for (let repeat = 1; repeat <= frameRepeats; repeat += 1) {
+    say(
+      `frames on the canvas map page under watchers' calls (${String(repeat)} of ${String(frameRepeats)})`,
+    );
+    try {
+      const timed = await measureFrames(quick ? 5 : 40, say);
+      if (frames === null) frames = timed;
+      else moreFrames.push(timed);
+    } catch (error) {
+      failures.push(`frames: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 }
 
@@ -285,6 +299,7 @@ writeFileSync(
       rooms: rooms.map(({ result, bars }) => ({ ...result, bars })),
       sharedAddressJoin: nat,
       frames,
+      ...(moreFrames.length === 0 ? {} : { moreFrames }),
       failures,
     },
     null,
