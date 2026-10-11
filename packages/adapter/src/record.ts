@@ -217,6 +217,13 @@ export function createRecorder(): Recorder {
   let live = '';
   /** When the link went, which is when a new page session ended the spans still open. */
   let lostAt: number | null = null;
+  /**
+   * A session's record its end sealed while the link was down. It ended as
+   * on a live link, since the relay may resume the page session (a dropped
+   * link, or a restart with its snapshot, ADR 0046); a new page session at
+   * the next welcome means everyone in it left when the link went instead.
+   */
+  let endedOffline: Kept | null = null;
   let next = 0;
   let shown = NO_VIEWS;
   /** Users the operator revoked whose spans have not closed yet. */
@@ -411,7 +418,8 @@ export function createRecorder(): Recorder {
       const same = resumed && pageId === live;
       // When the link went; close and seal keep a record restarted since within its own span.
       const end = lostAt ?? at;
-      lostAt = null;
+      const offline = endedOffline;
+      lostAt = endedOffline = null;
       live = pageId;
       if (kept === null) {
         const first = begin({ kind: 'page' }, at);
@@ -420,6 +428,17 @@ export function createRecorder(): Recorder {
         return;
       }
       if (same) return;
+      if (offline !== null) {
+        // The page session ended when the link went, before the session did:
+        // everyone in the lesson's record left then, and no one stayed on into
+        // the page record its end began, which nothing else can reach offline.
+        for (const span of offline.spans) {
+          if (span.ended === 'session_ended') offline.open.set(span.user.id, span);
+        }
+        close(offline, end, () => 'page_session_ended');
+        kept.spans = [];
+        kept.open.clear();
+      }
       // A new page session ended every attachment of the one before (ADR 0019).
       close(kept, end, () => 'page_session_ended');
       if (kept.scope.kind === 'page') {
@@ -595,16 +614,12 @@ export function createRecorder(): Recorder {
       const kept = current;
       if (kept?.scope.kind !== 'session' || kept.scope.sessionId !== end.sessionId) return;
       kept.scope = { ...kept.scope, endedAt: end.time, endedBy: end.reason };
-      if (lostAt === null) {
-        // The session's end closes every attachment an invite or agent token made (ADR 0043).
-        close(kept, end.time, (_userId, span) => (span.inviteId === null ? null : 'session_ended'));
-      } else {
-        // Told while the link is down (a relay restart), the page session ended
-        // first and with it everyone, so no one carries into the page record.
-        close(kept, lostAt, () => 'page_session_ended');
-      }
+      // The session's end closes every attachment an invite or agent token made (ADR 0043).
+      close(kept, end.time, (_userId, span) => (span.inviteId === null ? null : 'session_ended'));
       kept.to = Math.max(end.time, latest(kept));
       if (holds(kept)) ended = kept;
+      // Told while the link is down, it ends as a resumed page session will find it.
+      if (lostAt !== null) endedOffline = kept;
       start(begin({ kind: 'page' }, kept.to, kept));
     },
 
@@ -676,7 +691,7 @@ export function createRecorder(): Recorder {
     },
 
     dropAll() {
-      current = previous = ended = null;
+      current = previous = ended = endedOffline = null;
       lostAt = null;
       live = '';
       revoked.clear();

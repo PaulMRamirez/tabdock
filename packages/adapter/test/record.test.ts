@@ -926,6 +926,80 @@ describe('times that stay within each record', () => {
     });
   }
 
+  // ADR 0046: a relay restart with its snapshot resumes the page session, as
+  // a dropped link always could, so an end the page gives while the link is
+  // down cannot mean everyone left; only a new page session at the welcome says so.
+  it('ends a lesson told of its end while the link is down as a live link would, when the welcome resumes the page session', () => {
+    const recorder = createRecorder();
+    recorder.pageSession('pg_1', false, 100);
+    roster(recorder, 200, view(alice));
+    recorder.sessionStarted(session());
+    roster(recorder, 5_100, view(alice), view(guest, 'observer', 'inv_watch'));
+    recorder.call(entry('c_1', guest, { time: 5_200 }), 'pg_1');
+    recorder.linkLost(6_000);
+    recorder.sessionEnded({
+      sessionId: 'ss_1',
+      label: 'Period 3',
+      reason: 'operator',
+      time: 6_500,
+    });
+    recorder.pageSession('pg_1', true, 7_000);
+    roster(recorder, 7_000, view(alice), view(guest, 'observer', 'inv_watch'));
+    roster(recorder, 7_100, view(alice));
+    recorder.call(entry('c_2', alice, { time: 7_200 }), 'pg_1');
+
+    for (const which of ['current', 'previous', 'ended'] as const)
+      withinSpan(snap(recorder, which));
+    const lesson = snap(recorder, 'ended');
+    expect(lesson).toMatchObject({ from: 5_000, to: 6_500, pageIds: ['pg_1'] });
+    // Alice was never detached; the guest left with the session.
+    expect(lesson.attachments.map((span) => [span.user.id, span.leftAt, span.ended])).toEqual([
+      ['alice', null, null],
+      ['g_0123abcd', 6_500, 'session_ended'],
+    ]);
+    // Alice stays on into the page record from its start, and calls there.
+    const page = snap(recorder);
+    expect(page).toMatchObject({ pageIds: ['pg_1'], from: 6_500 });
+    expect(page.attachments.map((span) => [span.user.id, span.before, span.joinedAt])).toEqual([
+      ['alice', true, 6_500],
+      ['g_0123abcd', false, 7_000],
+    ]);
+    expect(page.calls.map((call) => call.callId)).toEqual(['c_2']);
+  });
+
+  it('ends everyone in a lesson told of its end while the link is down when the link was lost, should a new page session follow', () => {
+    const recorder = createRecorder();
+    recorder.pageSession('pg_1', false, 100);
+    roster(recorder, 200, view(alice));
+    recorder.call(entry('c_0', alice, { time: 300 }), 'pg_1');
+    recorder.sessionStarted(session());
+    roster(recorder, 5_100, view(alice), view(guest, 'observer', 'inv_watch'));
+    recorder.linkLost(6_000);
+    recorder.sessionEnded({ sessionId: 'ss_1', label: 'Period 3', reason: 'time', time: 6_500 });
+    // Before the welcome the lesson reads as a live link's end would leave it.
+    expect(snap(recorder, 'ended').attachments.map((span) => [span.user.id, span.ended])).toEqual([
+      ['alice', null],
+      ['g_0123abcd', 'session_ended'],
+    ]);
+    recorder.pageSession('pg_2', false, 7_000);
+
+    for (const which of ['current', 'previous', 'ended'] as const)
+      withinSpan(snap(recorder, which));
+    expect(
+      snap(recorder, 'ended').attachments.map((span) => [span.user.id, span.leftAt, span.ended]),
+    ).toEqual([
+      ['alice', 6_000, 'page_session_ended'],
+      ['g_0123abcd', 6_000, 'page_session_ended'],
+    ]);
+    // The page record the lesson sealed stays the one kept, and the new one carries no one.
+    expect(snap(recorder, 'previous')).toMatchObject({
+      pageIds: ['pg_1'],
+      to: 5_000,
+      calls: [expect.objectContaining({ callId: 'c_0' })],
+    });
+    expect(snap(recorder)).toMatchObject({ pageIds: ['pg_2'], from: 7_000, attachments: [] });
+  });
+
   it('ends a record restarted while the link was down no earlier than it began', () => {
     const recorder = createRecorder();
     recorder.pageSession('pg_1', false, 100);
