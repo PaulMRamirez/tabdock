@@ -89,7 +89,10 @@ test('Start waits until the form holds still, then runs a session with its watch
   expect((await dockState(page))?.policy).toMatchObject({ invites: 'all', maxDrivers: 2 });
   await fillSessionForm(page, { label: 'Class 7B', minutes: 45, drivers: 1, observers: 25 });
   expect(await sidewaysScroll(page)).toBeLessThanOrEqual(0);
-  expect(await widgetText(page, 'session-effects')).toContain('0 guests leave and 0 links close');
+  // The form names the member whose invites the room joins by before Start grants anything.
+  expect(await widgetText(page, 'session-effects')).toBe(
+    "Invites shared by Alice, whose leaving ends guests' access. At its end 0 guests leave and 0 links close.",
+  );
   await widgetButtonCentre(page, { action: 'session-start' });
 
   // A change to the seats makes Start mean something else, so it waits again.

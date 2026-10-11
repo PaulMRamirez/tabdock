@@ -1850,11 +1850,15 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
         PROPOSALS_ORDER.indexOf(value) > PROPOSALS_ORDER.indexOf(policy.proposals),
       );
     }
+    const observers = dom.has(sObservers.label, 'hidden') ? 0 : Number(dom.value(sObservers.input));
+    // Whom the relay names the invites' sponsor (ADR 0017): the member attached longest.
+    const sponsor = roster
+      .filter((entry) => entry.kind === 'member')
+      .sort((a, b) => a.grantedAt - b.grantedAt)[0];
     const blocker =
       state.link !== 'linked'
         ? REFUSAL_TEXT.link_down
-        : Number(dom.value(sObservers.input)) > 0 &&
-            !roster.some((entry) => entry.kind === 'member')
+        : observers > 0 && sponsor === undefined
           ? REFUSAL_TEXT.no_sponsor
           : null;
     const reason = blocker ?? (sessionStarting ? 'Starting' : sessionError);
@@ -1866,9 +1870,10 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       .sort((a, b) => a.grantedAt - b.grantedAt)
       .slice(Number(dom.value(sDrivers.input)) || 1)
       .map((entry) => personText(entry));
+    // Named before Start, since their leaving ends everyone the invites let in (S14).
     setText(
       sEffects,
-      `At its end ${counted(guests, 'guest leaves', 'guests leave')} and ${counted(state.invites.length, 'link closes', 'links close')}.${demoted.length > 0 ? ` Start makes ${demoted.join(', ')} observers.` : ''}`,
+      `${observers > 0 && sponsor !== undefined ? `Invites shared by ${personText(sponsor)}, whose leaving ends guests' access. ` : ''}At its end ${counted(guests, 'guest leaves', 'guests leave')} and ${counted(state.invites.length, 'link closes', 'links close')}.${demoted.length > 0 ? ` Start makes ${demoted.join(', ')} observers.` : ''}`,
     );
     dom.flag(
       startButton,
