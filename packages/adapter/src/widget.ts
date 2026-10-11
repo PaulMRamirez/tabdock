@@ -2745,7 +2745,8 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
         setText(discardButton, box.which === 'current' ? 'Clear' : 'Discard');
       }
     }
-    const ended = failed ? undefined : views.find((view) => view.which === 'ended');
+    // Only a record that holds something is offered, as only such a one is in the box.
+    const ended = held.find((view) => view.which === 'ended');
     const key = ended === undefined ? '' : `${String(ended.from)}:${String(ended.to)}`;
     if (key === offeredKey) return false;
     offeredKey = key;

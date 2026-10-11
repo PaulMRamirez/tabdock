@@ -450,6 +450,39 @@ describe('a time-boxed session in the record (ADR 0043)', () => {
     ]);
   });
 
+  it('keeps the last lesson’s record when a session nobody joined ends', async () => {
+    const { h, socket } = await offering();
+    /** Starts a session the relay lists at once. */
+    const run = async (label: string): Promise<void> => {
+      const sent = socket.framesOf('session_start').length;
+      const pending = h.dock.startSession({ label, lengthMinutes: 30 });
+      await until(() => socket.framesOf('session_start').length === sent + 1, 'a start');
+      const start = socket.framesOf('session_start').at(-1);
+      if (start === undefined) throw new Error('no session_start');
+      socket.deliver(listed(start));
+      expect((await pending).ok).toBe(true);
+    };
+    await run('Period 3');
+    socket.deliver(invoke('get_value', { callId: 'during' }));
+    await until(() => results(socket).length === 1, 'the result');
+    h.clock.now += 60_000;
+    expect(h.dock.endSession()).toBe(true);
+    // Everyone leaves before the next lesson, and nobody joins it.
+    socket.deliver({ t: 'session', session: null });
+    socket.deliver({ t: 'roster', attachments: [] });
+    h.clock.now += 60_000;
+    await run('Empty');
+    h.clock.now += 60_000;
+    expect(h.dock.endSession()).toBe(true);
+    expect(saved(h, 'ended')).toMatchObject({
+      scope: { label: 'Period 3' },
+      calls: [expect.objectContaining({ callId: 'during' })],
+    });
+    expect(
+      h.dock.state.records.filter((view) => view.which === 'ended').map((view) => view.label),
+    ).toEqual(['Period 3']);
+  });
+
   it('goes on in a record of its own after a reload, everyone listed there from its start', async () => {
     const storage = new MapStorage();
     const first = await offering(storage);

@@ -135,7 +135,7 @@ export interface Recorder {
    * operator extends it, it takes the session's new end and settings.
    */
   sessionStarted(session: SessionView): void;
-  /** It ended: its record is sealed into `ended` and a page-scope record starts again. */
+  /** It ended: its record, if it holds anything, is sealed into `ended`, and a page-scope record starts again. */
   sessionEnded(ended: SessionEnded): void;
   /** The records held now, the same frozen list until a count changes. */
   views(): readonly RecordView[];
@@ -359,15 +359,16 @@ export function createRecorder(): Recorder {
     return at;
   }
 
+  /** Whether a record holds anything: an empty one never replaces a kept one, which may not be saved yet. */
+  const holds = (kept: Kept): boolean =>
+    kept.spans.length + kept.calls.length + kept.proposals.length + kept.dropped.calls > 0;
+
   /**
-   * Seals a record that holds anything into its slot, so an empty one never
-   * replaces a kept one. It ends no earlier than anything it holds, so every
-   * time it holds lies within its span.
+   * Seals a record that holds anything into its slot. It ends no earlier
+   * than anything it holds, so every time it holds lies within its span.
    */
   function seal(kept: Kept, at: number): void {
-    if (kept.spans.length + kept.calls.length + kept.proposals.length + kept.dropped.calls === 0) {
-      return;
-    }
+    if (!holds(kept)) return;
     kept.to = Math.max(at, latest(kept));
     if (kept.scope.kind === 'page') previous = kept;
     else ended = kept;
@@ -597,7 +598,7 @@ export function createRecorder(): Recorder {
         close(kept, lostAt, () => 'page_session_ended');
       }
       kept.to = Math.max(end.time, latest(kept));
-      ended = kept;
+      if (holds(kept)) ended = kept;
       start(begin({ kind: 'page' }, kept.to, kept));
     },
 

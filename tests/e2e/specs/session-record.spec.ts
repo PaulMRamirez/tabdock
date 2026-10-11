@@ -263,6 +263,44 @@ test("offers a session's record at its end, and saves nothing until the operator
   await expect.poll(() => widgetVisible(page, 'record-offer')).toBe(false);
 });
 
+test("keeps offering the last lesson's record when a session nobody joined ends", async ({
+  page,
+}) => {
+  const relay = await openWithSessionRelay(page, demo);
+  const downloads = countDownloads(page);
+  /** Ends the running session from the widget, as the operator does. */
+  const endInWidget = async (label: string): Promise<void> => {
+    await clickInWidget(page, { action: 'session-end' });
+    await clickInWidget(page, { action: 'session-end-yes' });
+    await waitForDock(page, (state) => state.sessionEnded?.label === label);
+  };
+  await startSessionInWidget(page, { label: 'Period 3', minutes: 30 });
+  await endInWidget('Period 3');
+  await expect
+    .poll(() => widgetText(page, 'record-offer'))
+    .toMatch(/^Session "Period 3" ended\. Save its record\?This record names 1 person/);
+
+  // Alice leaves, and the next lesson starts and ends with nobody in it.
+  relay.send({ t: 'roster', attachments: [] });
+  await waitForDock(page, (state) => state.roster.length === 0);
+  await startSessionInWidget(page, { label: 'Empty', minutes: 30 });
+  await endInWidget('Empty');
+  await waitForDock(page, (state) => state.session === null);
+  expect(
+    (await waitForDock(page, (state) => state.records))
+      .filter((view) => view.which === 'ended')
+      .map((view) => view.label),
+  ).toEqual(['Period 3']);
+  expect(await widgetText(page, 'record-offer')).toMatch(/^Session "Period 3" ended\./);
+  expect(downloads.count).toBe(0);
+
+  const saved = await saveOfferedRecord(page, 'json');
+  const parsed = parseSessionRecord(saved.text);
+  if (!parsed.ok) throw new Error(parsed.reason);
+  expect(parsed.record.scope).toMatchObject({ kind: 'session', label: 'Period 3' });
+  expect(parsed.record.attachments.map((span) => span.user.id)).toEqual(['alice']);
+});
+
 test('saves from the static build under its own Content Security Policy', async ({ page }) => {
   const outDir = mkdtempSync(join(tmpdir(), 'tabdock-static-record-'));
   try {
