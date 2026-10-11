@@ -44,6 +44,13 @@ export interface RoomTabdock {
   close(): Promise<void>;
 }
 
+/**
+ * What a student's join and a member's Claude need of a room: its relay and
+ * the stand-in provider, so demo:m6's classroom, which starts its own relay,
+ * can seat students the same way.
+ */
+export type RoomRelay = Pick<RoomTabdock, 'relay' | 'provider'>;
+
 export async function startRoomTabdock(
   options: { limits?: RelayOptions['limits']; logSink?: LogSink } = {},
 ): Promise<RoomTabdock> {
@@ -86,7 +93,7 @@ export async function startRoomTabdock(
 }
 
 /** Claude on a member's account: an MCP client through the stand-in tunnel. */
-export async function memberClaude(room: RoomTabdock, sub: string, name: string): Promise<Client> {
+export async function memberClaude(room: RoomRelay, sub: string, name: string): Promise<Client> {
   const token = await room.provider.token({ sub, aud: PUBLIC_MCP_URL });
   const client = new Client({ name, version: '1.0.0' });
   await client.connect(
@@ -104,7 +111,7 @@ export function student(index: number): { sub: string; email: string } {
 }
 
 /** A student's browser at /i, signed in with a verified email, as /i's "Sign in" does it. */
-export async function studentAtI(room: RoomTabdock, index: number): Promise<Phone> {
+export async function studentAtI(room: RoomRelay, index: number): Promise<Phone> {
   const { sub, email } = student(index);
   room.provider.signInSubject = sub;
   room.provider.idTokenClaims = { email, email_verified: true };
@@ -126,7 +133,7 @@ export async function studentAtI(room: RoomTabdock, index: number): Promise<Phon
  * status and error when the relay refused the claim outright.
  */
 export async function joinAtI(
-  room: RoomTabdock,
+  room: RoomRelay,
   index: number,
   secret: string,
 ): Promise<{ status: number; data: Record<string, unknown> }> {
