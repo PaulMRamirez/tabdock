@@ -5,7 +5,7 @@
 // format. A world filled to every cap still answers within what the relay
 // returns uncut.
 
-import { MAX_RESULT_CHARS } from '@tabdock/protocol';
+import { MAX_IMAGE_SIDE, MAX_IMAGE_TEXT_CHARS, MAX_RESULT_CHARS } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
 import {
   CaptureEnvelopeSchema,
@@ -18,6 +18,8 @@ import {
   isPlainText,
   MAP_DEFAULT_FEATURES,
   MAP_EDIT_TOOLS,
+  MAP_MAX_CAPTURE_TEXT_CHARS,
+  MAP_MAX_CAPTURE_WIDTH_PX,
   MAP_MAX_DESCRIPTION_CHARS,
   MAP_MAX_FEATURES,
   MAP_MAX_FOOTPRINT_POSITIONS,
@@ -40,6 +42,7 @@ import {
   mapAnnotations,
   mapInputs,
   type MapToolDefinition,
+  MapViewSchema,
   MapWorld,
   type MapWorldData,
   moonWorldData,
@@ -556,11 +559,15 @@ describe('(i) capture_view', () => {
       await call(tools, 'capture_view', { maxWidthPx: 640, format: 'jpeg' }),
     );
     expect(envelope.image).toEqual({ mimeType: 'image/jpeg', data: 'AAAA' });
-    expect(CaptureImageTextSchema.parse(JSON.parse(envelope.text))).toMatchObject({
+    const text = CaptureImageTextSchema.parse(JSON.parse(envelope.text));
+    expect(text).toMatchObject({
       view: world.view(),
+      visibleLayers: world.visibleLayers(),
       widthPx: 640,
       heightPx: 360,
     });
+    // Every layer fits, so none is counted as left out.
+    expect(text).not.toHaveProperty('visibleLayersOmitted');
     await call(tools, 'capture_view', {});
     expect(asked).toEqual([
       { maxWidthPx: 640, format: 'jpeg' },
@@ -697,6 +704,65 @@ describe('(j) a world filled to every cap', () => {
     world.viewFromObservation(id('obs', 0));
     const state = JSON.stringify(world.state());
     expect(new TextEncoder().encode(state).length).toBeLessThan(2048);
+  });
+
+  it("keeps capture_view's image text whole, listing the layers that fit and counting the rest", async () => {
+    // The longest body name the profile takes, and an observation on screen, so the view and its ids are long too.
+    const body = long('b', 32, 'x');
+    const data = JSON.parse(
+      JSON.stringify(fullWorld()).replaceAll('"moon"', JSON.stringify(body)),
+    ) as MapWorldData;
+    const world = new MapWorld(data);
+    const capture: MapCapture = () =>
+      Promise.resolve({ mimeType: 'image/png', data: 'AAAA', widthPx: 2048, heightPx: 8192 });
+    const tools = toolsOf(world, capture);
+    world.viewFromObservation(id('obs', 0));
+    const shown = world.visibleLayers();
+    expect(shown).toHaveLength(MAP_MAX_LAYERS);
+    const envelope = CaptureEnvelopeSchema.parse(await call(tools, 'capture_view', {}));
+    // An adapter keeps 100 of ADR 0039's 2,000 characters for the marker it adds when it cuts.
+    expect(envelope.text.length).toBeLessThanOrEqual(MAP_MAX_CAPTURE_TEXT_CHARS);
+    expect(MAP_MAX_CAPTURE_TEXT_CHARS).toBeLessThanOrEqual(MAX_IMAGE_TEXT_CHARS - 100);
+    const text = CaptureImageTextSchema.parse(JSON.parse(envelope.text));
+    expect(text.view).toEqual(world.view());
+    expect(text.view.body).toBe(body);
+    expect(text.observationId).toBe(id('obs', 0));
+    expect(text.visibleLayers.length).toBeGreaterThan(10);
+    expect(text.visibleLayers).toEqual(shown.slice(0, text.visibleLayers.length));
+    expect(text.visibleLayers.length + (text.visibleLayersOmitted ?? 0)).toBe(MAP_MAX_LAYERS);
+    // One more id would not have fit.
+    const more = JSON.stringify({
+      ...text,
+      visibleLayers: shown.slice(0, text.visibleLayers.length + 1),
+      visibleLayersOmitted: (text.visibleLayersOmitted ?? 0) - 1,
+    });
+    expect(more.length).toBeGreaterThan(MAP_MAX_CAPTURE_TEXT_CHARS);
+
+    // The longest view the schema takes still leaves room for ten ids, so the text never passes the cap.
+    const n = -1.2345678901234568e-300;
+    const p = -n;
+    const longest = MapViewSchema.parse({
+      profile: MAP_PROFILE,
+      body,
+      projection: GLOBE,
+      lon: n,
+      lat: n,
+      widthM: p,
+      headingDeg: p,
+      pitchDeg: n,
+      altitudeM: p,
+      fovDeg: p,
+      bounds: { west: n, south: n, east: n, north: n },
+    });
+    const bare = JSON.stringify({
+      view: longest,
+      visibleLayers: [],
+      visibleLayersOmitted: MAP_MAX_LAYERS,
+      observationId: id('obs', 0),
+      widthPx: MAP_MAX_CAPTURE_WIDTH_PX,
+      heightPx: MAX_IMAGE_SIDE,
+    });
+    expect(bare.length + 10 * (MAP_MAX_ID_CHARS + 3)).toBeLessThan(MAP_MAX_CAPTURE_TEXT_CHARS);
   });
 
   it('refuses data past a cap, so a world cannot answer beyond the profile', () => {

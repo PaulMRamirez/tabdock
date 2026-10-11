@@ -149,7 +149,9 @@ attach({
 
 ## capture_view
 
-A page that names `capture_view` in `imageTools` returns ADR 0039's envelope, `{ image: { mimeType, data }, text }`, with the view, `visibleLayers`, `observationId`, `widthPx` and `heightPx` as JSON in its text. A page that does not returns that JSON with a description, as text. Capture only the page's own canvas, never the tab, which shows the pairing code, with `toDataURL` and `image/png` or `image/jpeg`. A WebGL canvas captures in the same task as its render, or keeps `preserveDrawingBuffer`; tiles from another origin need CORS, or the canvas cannot be read at all. Refuse a `"data:,"` result, or one of another type than you asked for. `maxWidthPx` lets a client retry smaller when a capture is refused as too large.
+A page that names `capture_view` in `imageTools` returns ADR 0039's envelope, `{ image: { mimeType, data }, text }`, with the view, `visibleLayers`, `observationId`, `widthPx` and `heightPx` as JSON in its text. A page that does not returns that JSON with a description, as text.
+
+The text beside an image stays within 1,800 characters, so no adapter cuts it: where the visible layers' ids would not fit, the list stops and `visibleLayersOmitted` counts the rest, which `list_layers` names. Capture only the page's own canvas, never the tab, which shows the pairing code, with `toDataURL` and `image/png` or `image/jpeg`. A WebGL canvas captures in the same task as its render, or keeps `preserveDrawingBuffer`; tiles from another origin need CORS, or the canvas cannot be read at all. Refuse a `"data:,"` result, or one of another type than you asked for. `maxWidthPx` lets a client retry smaller when a capture is refused as too large.
 
 ## Published state
 
@@ -198,6 +200,7 @@ Titles, names, notes, texts and URLs hold no control character but tab and line 
 | Positions in one footprint                   | 1,000                   | `MAP_MAX_FOOTPRINT_POSITIONS`                                                          |
 | Notes on an observation, and each note       | 10, 500 characters      | `MAP_MAX_NOTES`, `MAP_MAX_NOTE_CHARS`                                                  |
 | A capture's width: least, unless asked, most | 64, 1,024, 2,048 pixels | `MAP_MIN_CAPTURE_WIDTH_PX`, `MAP_DEFAULT_CAPTURE_WIDTH_PX`, `MAP_MAX_CAPTURE_WIDTH_PX` |
+| The JSON beside a captured image             | 1,800 characters        | `MAP_MAX_CAPTURE_TEXT_CHARS`                                                           |
 
 ## Worked examples
 

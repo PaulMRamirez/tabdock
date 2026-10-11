@@ -30,6 +30,12 @@ export const MAP_MAX_FOOTPRINT_POSITIONS = 1000;
 export const MAP_MAX_NOTES = 10;
 export const MAP_MAX_NOTE_CHARS = 500;
 export const MAP_MAX_CAPTURE_DESCRIPTION_CHARS = 2000;
+/**
+ * The JSON beside a captured image. ADR 0039 holds an image's text to
+ * 2,000 characters, and an adapter cuts what passes 1,900 to fit its
+ * marker, so this leaves room and the text always arrives whole and parses.
+ */
+export const MAP_MAX_CAPTURE_TEXT_CHARS = 1800;
 export const MAP_MIN_CAPTURE_WIDTH_PX = 64;
 export const MAP_DEFAULT_CAPTURE_WIDTH_PX = 1024;
 export const MAP_MAX_CAPTURE_WIDTH_PX = 2048;
@@ -750,10 +756,16 @@ export const CaptureTextSchema = z.object({
   observationId: MapIdSchema.nullable(),
 });
 
-/** The JSON text beside a captured image (ADR 0039's envelope). */
+/**
+ * The JSON text beside a captured image (ADR 0039's envelope), at most
+ * MAP_MAX_CAPTURE_TEXT_CHARS: visibleLayers lists the shown layers' ids in
+ * drawing order while they fit, and visibleLayersOmitted, present only when
+ * some did not, counts the rest, which list_layers names.
+ */
 export const CaptureImageTextSchema = z.object({
   view: MapViewSchema,
   visibleLayers: z.array(MapIdSchema).max(MAP_MAX_LAYERS),
+  visibleLayersOmitted: z.int().min(1).max(MAP_MAX_LAYERS).optional(),
   observationId: MapIdSchema.nullable(),
   widthPx: z.int().min(1).max(MAP_MAX_CAPTURE_WIDTH_PX),
   heightPx: z.int().min(1),

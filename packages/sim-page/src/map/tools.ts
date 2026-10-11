@@ -12,6 +12,7 @@ import {
   MAP_DEFAULT_CAPTURE_WIDTH_PX,
   MAP_EDIT_TOOLS,
   MAP_MAX_CAPTURE_DESCRIPTION_CHARS,
+  MAP_MAX_CAPTURE_TEXT_CHARS,
   MAP_PROFILE_TOOLS,
   MAP_TOOL_GROUPS,
   mapAnnotations,
@@ -21,6 +22,7 @@ import {
   type MapToolGroup,
   type MapToolInfo,
   type MapToolName,
+  type MapView,
   toInputSchema,
 } from './profile.ts';
 import type { MapWorld } from './world.ts';
@@ -119,6 +121,35 @@ function describeView(world: MapWorld): string {
 }
 
 /**
+ * The JSON beside a captured image, within MAP_MAX_CAPTURE_TEXT_CHARS, since
+ * an adapter cuts an image's text to fit ADR 0039's cap and a cut text no
+ * longer parses: at the caps, 100 layer ids alone pass 6,000 characters.
+ * The ids are listed in drawing order while they fit, and
+ * visibleLayersOmitted counts the rest.
+ */
+function captureText(
+  view: MapView,
+  visibleLayers: readonly string[],
+  observationId: string | null,
+  shot: MapCaptured,
+): string {
+  let text = '';
+  for (let shown = visibleLayers.length; shown >= 0; shown -= 1) {
+    const omitted = visibleLayers.length - shown;
+    text = JSON.stringify({
+      view,
+      visibleLayers: visibleLayers.slice(0, shown),
+      ...(omitted > 0 ? { visibleLayersOmitted: omitted } : {}),
+      observationId,
+      widthPx: shot.widthPx,
+      heightPx: shot.heightPx,
+    });
+    if (text.length <= MAP_MAX_CAPTURE_TEXT_CHARS) break;
+  }
+  return text;
+}
+
+/**
  * The fourteen profile tools over `world`, in the table's order. With a
  * capture function, capture_view returns ADR 0039's envelope, one image and
  * its JSON text; without one, the text form a page that returns no images
@@ -145,13 +176,7 @@ export function createMapTools(world: MapWorld, options: MapToolOptions = {}): M
       signal?.throwIfAborted();
       return {
         image: { mimeType: shot.mimeType, data: shot.data },
-        text: JSON.stringify({
-          view,
-          visibleLayers,
-          observationId,
-          widthPx: shot.widthPx,
-          heightPx: shot.heightPx,
-        }),
+        text: captureText(view, visibleLayers, observationId, shot),
       };
     }),
     define(world, inputs, 'get_clock', () => requireClock(world)),
