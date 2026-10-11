@@ -334,6 +334,11 @@ test('Allow as observer attaches an observer, whose add_item returns role_denied
 test('a prompt that arrives as the operator clicks cannot take a click meant for another', async ({
   page,
 }) => {
+  // Room for both prompts in the bottom-pinned panel, as the other specs that
+  // stack rows give it: at 720 px the panel, with the time-boxed session's
+  // block since ADR 0043, reaches its height and scrolls, so a new prompt on
+  // top moves Alice's down and disarms it (widget.spec.ts holds that case).
+  await page.setViewportSize({ width: 1280, height: 1200 });
   const { code } = await openDemo(page);
   const bob = await connectMcp(tabdock.relay, tabdock.users.bob, 'tabdock-playwright-bob');
   try {
