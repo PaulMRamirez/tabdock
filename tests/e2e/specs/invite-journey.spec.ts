@@ -272,6 +272,8 @@ test('a watch invite and a control invite from the widget, joined at /i and thro
   // 4. Revoke all: every attachment ends, and so does every live invite.
   expect(await rosterIds(page)).toHaveLength(3);
   await clickInWidget(page, { action: 'revoke-all' });
+  // Invites let two people in, so it asks first (ADR 0043, plan C21).
+  await clickInWidget(page, { action: 'revoke-anyway' });
   await waitForDock(page, (state) => state.roster.length === 0 && state.invites.length === 0);
   await expect.poll(() => widgetItems(page, 'invite-list')).toEqual([]);
   expect(errorCode(await onPage(bob, pageId, 'get_view'))).toBe('not_attached');
