@@ -21,6 +21,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Client } from '@modelcontextprotocol/client';
@@ -486,6 +487,105 @@ describe('a member removed from the file (S8)', () => {
   });
 });
 
+/**
+ * A POST from a signed-in browser that sends its headers now and its body
+ * when `send` is called, as a browser on a slow link may: the relay looks the
+ * sign-in up before it reads the body.
+ */
+async function heldPost(
+  phone: Phone,
+  relayUrl: string,
+  path: string,
+  json: unknown,
+): Promise<{ send: () => Promise<{ status: number; data: Record<string, unknown> }> }> {
+  const body = JSON.stringify(json);
+  const held: (() => void)[] = [];
+  const answer = new Promise<{ status: number; data: Record<string, unknown> }>(
+    (resolve, reject) => {
+      const req = httpRequest(
+        new URL(path, relayUrl),
+        {
+          method: 'POST',
+          headers: {
+            Host: new URL(PUBLIC_ORIGIN).host,
+            Origin: PUBLIC_ORIGIN,
+            Cookie: [...phone.cookies].map(([name, value]) => `${name}=${value}`).join('; '),
+            'Content-Type': 'application/json',
+            'Content-Length': String(Buffer.byteLength(body)),
+          },
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk: Buffer) => chunks.push(chunk));
+          res.on('end', () => {
+            resolve({
+              status: res.statusCode ?? 0,
+              data: JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>,
+            });
+          });
+          res.on('error', reject);
+        },
+      );
+      req.on('error', reject);
+      req.flushHeaders();
+      held.push(() => {
+        req.end(body);
+      });
+    },
+  );
+  // Long enough for the relay to take the headers and look the sign-in up.
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  return {
+    send: () => {
+      for (const end of held) end();
+      return answer;
+    },
+  };
+}
+
+describe('a sign-in a change ends while its request is on the way (S8)', () => {
+  it('refuses the claim or status whose body arrives after the change, at /pair and /i', async () => {
+    const { relay, save: saveMembers } = await membersRelay([ALICE, BOB]);
+    const page = await relay.page();
+    const alice = await relay.claude('sub-alice');
+    await attachMember(alice, page);
+    const invite = await mintOk(page, { uses: 3 });
+    relay.provider.signInSubject = 'sub-bob';
+    const bobPhone = new Phone(relay.relay.url);
+    try {
+      await bobPhone.signIn();
+    } finally {
+      relay.provider.signInSubject = null;
+    }
+    const first = await bobPhone.claim(page.nonce);
+    expect(first.status).toBe(200);
+    await page.next('attach_request');
+    const carolPhone = await signedInAtI(relay, 'sub-carol', 'carol@example.com');
+    const status = await heldPost(bobPhone, relay.relay.url, '/pair/status', {
+      claim: first.data.claim,
+    });
+    await page.sync();
+    const claim = await heldPost(bobPhone, relay.relay.url, '/pair/claim', { nonce: page.nonce });
+    const join = await heldPost(carolPhone, relay.relay.url, '/i/claim', {
+      secret: invite.secret,
+    });
+    // Bob leaves, and Carol's subject becomes a member under an id of its own.
+    saveMembers([ALICE, 'sub-carol=carol:Carol']);
+    expect(await relay.relay.reloadMembers()).toBe('applied');
+    for (const answer of [await status.send(), await claim.send(), await join.send()]) {
+      expect(answer).toEqual({
+        status: 401,
+        data: expect.objectContaining({ error: 'sign_in_required' }) as unknown,
+      });
+    }
+    // Alice's by code and Bob's first by QR, and nothing raised after the change.
+    expect(page.all('attach_request').map((frame) => [frame.user.userId, frame.via])).toEqual([
+      ['alice', 'code'],
+      ['bob', 'qr'],
+    ]);
+  });
+});
+
 describe('a user id the file moves (S13)', () => {
   it("shows the new holder none of the former holder's pages, gone ones included", async () => {
     const { relay, save: saveMembers } = await membersRelay([ALICE, BOB], {
@@ -608,6 +708,34 @@ describe('a renamed member (ADR 0043)', () => {
     expect(relay.relay.audit.events()).toContainEqual(
       expect.objectContaining({ type: 'members_reloaded', renamed: 1, attachments: 0 }),
     );
+  });
+
+  it('names a browser signed in before it as a sign-in would now, at /i and at /pair', async () => {
+    const { relay, save: saveMembers } = await membersRelay([ALICE, BOB]);
+    const page = await relay.page();
+    const alice = await relay.claude('sub-alice');
+    await attachMember(alice, page);
+    const invite = await mintOk(page, { uses: 3 });
+    // Both sign in while the list still says Alice and Bob.
+    const carolPhone = await signedInAtI(relay, 'sub-carol', 'teacher@example.com');
+    relay.provider.signInSubject = 'sub-bob';
+    const bobPhone = new Phone(relay.relay.url);
+    try {
+      await bobPhone.signIn();
+    } finally {
+      relay.provider.signInSubject = null;
+    }
+    saveMembers(['sub-alice=alice:Teacher@Example.com', 'sub-bob=bob:Robert']);
+    expect(await relay.relay.reloadMembers()).toBe('applied');
+    const carol = inviteeId('sub-carol');
+    const short = `invitee ${carol.slice(INVITEE_ID_PREFIX.length, INVITEE_ID_PREFIX.length + INVITEE_SHORT_ID_CHARS)}`;
+    expect((await joinAtI(carolPhone, page, invite.secret)).request.user.displayName).toBe(short);
+    expect((await bobPhone.preview(page.nonce)).data.account).toMatchObject({
+      displayName: 'Robert',
+    });
+    const claimed = await bobPhone.claim(page.nonce);
+    expect(claimed.status, JSON.stringify(claimed.data)).toBe(200);
+    expect((await page.next('attach_request')).user.displayName).toBe('Robert');
   });
 });
 

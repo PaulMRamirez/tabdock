@@ -719,7 +719,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     if (members === null) return;
     const change = members.replace(entries, digest);
     const { attachments } = hub.membershipChanged(change);
-    const signIns = pair?.endSessionsOf(change.ended) ?? 0;
+    const signIns = pair?.membersChanged(change) ?? 0;
     log.info('members reloaded', {
       members: change.total,
       added: change.added,
