@@ -14,7 +14,10 @@
 // a new proposal is refused, dropping nothing, and a result that still does
 // not fit is dropped, its outcome kept. One user's proposals that may still
 // run hold at most a share of the budget across every page, so nobody
-// running pages of their own can fill it for the relay. A settled proposal stays readable
+// running pages of their own can fill it for the relay. A proposal its
+// proposer withdrew, or the page refused, keeps its place in the caps for a
+// minute, so the caps bound how often a page is sent proposals, not only
+// how many wait at once. A settled proposal stays readable
 // for PROPOSAL_OUTCOME_KEEP_MS on its own timer, whether or not anyone looks,
 // at most MAX_SETTLED_PROPOSALS_PER_PAGE a page, and every one ends with its
 // page (decision 12).
@@ -72,6 +75,21 @@ export const MAX_PROPOSAL_CHARGE =
  * under 0.5 MiB, so no one proposing on a few pages meets it.
  */
 const USER_SHARE_DIVISOR = 8;
+
+/**
+ * How long a proposal withdrawn by its proposer, or refused by the page,
+ * keeps its place among its proposer's MAX_PENDING_PROPOSALS_PER_USER and
+ * the page's MAX_PENDING_PROPOSALS_PER_PAGE. withdraw_proposal freed a place
+ * at once, so proposing and withdrawing at the call rate sent the operator's
+ * tab a proposal frame to check, hash and show each time, however few
+ * waited: forty invitees at 30 a minute each. Now, beyond the places the
+ * operator frees by deciding, a page is sent at most
+ * MAX_PENDING_PROPOSALS_PER_PAGE new proposals a minute.
+ */
+export const PROPOSAL_PLACE_HOLD_MS = 60_000;
+
+/** Ends that free a place without the operator: the proposer's, or a page refusing what the relay let through. */
+const HOLDS_PLACE: ReadonlySet<ProposalCloseReason> = new Set(['withdrawn', 'refused']);
 
 /** What a proposal's arguments are charged while it may still run: V8 keeps a string at two bytes a unit at most. */
 export function proposalCharge(args: JsonObject): number {
@@ -217,6 +235,8 @@ export class PageProposals implements PagePart {
   #held = 0;
   /** What each user's reserved, pending and running proposals are charged, across pages. */
   readonly #heldBy = new Map<string, number>();
+  /** Per page, the places withdrawn and refused proposals still hold, and until when (PROPOSAL_PLACE_HOLD_MS). */
+  readonly #places = new Map<string, { userId: string; until: number }[]>();
   /** What #kept is charged together, results included: what dropping every one of them would free. */
   #keptBytes = 0;
   /** What kept results add together: what dropping every result would free. */
@@ -239,17 +259,18 @@ export class PageProposals implements PagePart {
   /**
    * A place for a new proposal by this user on this page, or which limit
    * refuses it: theirs (MAX_PENDING_PROPOSALS_PER_USER), the page's
-   * (MAX_PENDING_PROPOSALS_PER_PAGE), their share of the budget across
-   * pages (userShare), or the relay's budget. Reserved places count as
-   * pending, so proposals checked at the same time cannot pass a cap
-   * together. It holds until committed or released.
+   * (MAX_PENDING_PROPOSALS_PER_PAGE), either counting the places recently
+   * withdrawn and refused proposals still hold ('recent'), their share of
+   * the budget across pages (userShare), or the relay's budget. Reserved
+   * places count as pending, so proposals checked at the same time cannot
+   * pass a cap together. It holds until committed or released.
    */
   reserve(
     pageId: string,
     userId: string,
     charge: number,
     now: number,
-  ): ProposalReservation | 'user' | 'page' | 'share' | 'relay' {
+  ): ProposalReservation | 'user' | 'page' | 'recent' | 'share' | 'relay' {
     this.#prune(pageId, now);
     let mine = 0;
     let page = 0;
@@ -263,6 +284,10 @@ export class PageProposals implements PagePart {
     for (const held of this.#reserved) if (held.pageId === pageId) count(held.userId);
     if (mine >= MAX_PENDING_PROPOSALS_PER_USER) return 'user';
     if (page >= MAX_PENDING_PROPOSALS_PER_PAGE) return 'page';
+    for (const place of this.#heldPlaces(pageId, now)) count(place.userId);
+    if (mine >= MAX_PENDING_PROPOSALS_PER_USER || page >= MAX_PENDING_PROPOSALS_PER_PAGE) {
+      return 'recent';
+    }
     // Before #room, so a user past their share drops nobody's kept outcomes.
     if ((this.#heldBy.get(userId) ?? 0) + charge > this.userShare) return 'share';
     if (!this.#room(charge, true)) return 'relay';
@@ -279,13 +304,28 @@ export class PageProposals implements PagePart {
     this.#holdFor(reservation.userId, -reservation.charge);
   }
 
+  /** The places still held on this page at `now`, the rest let go. */
+  #heldPlaces(pageId: string, now: number): readonly { userId: string; until: number }[] {
+    const places = this.#places.get(pageId);
+    if (places === undefined) return [];
+    const live = places.filter((place) => place.until > now);
+    if (live.length === 0) this.#places.delete(pageId);
+    else this.#places.set(pageId, live);
+    return live;
+  }
+
   #holdFor(userId: string, change: number): void {
     const now = (this.#heldBy.get(userId) ?? 0) + change;
     if (now > 0) this.#heldBy.set(userId, now);
     else this.#heldBy.delete(userId);
   }
 
-  /** The reserved place becomes a pending proposal, expiring at `expiresAt` on the relay's clock. */
+  /** When a proposal made at `createdAt` expires, on the relay's clock. */
+  expiresAt(createdAt: number): number {
+    return createdAt + this.#hooks.ttlMs;
+  }
+
+  /** The reserved place becomes a pending proposal, expiring at expiresAt(createdAt). */
   commit(
     reservation: ProposalReservation,
     fields: Pick<
@@ -297,7 +337,7 @@ export class PageProposals implements PagePart {
     const record: Held = {
       ...fields,
       pageId: reservation.pageId,
-      expiresAt: fields.createdAt + this.#hooks.ttlMs,
+      expiresAt: this.expiresAt(fields.createdAt),
       status: 'pending',
       outcome: null,
       result: null,
@@ -504,6 +544,14 @@ export class PageProposals implements PagePart {
     if (held.status !== 'pending') return false;
     this.#keep(entry);
     held.status = reason;
+    if (HOLDS_PLACE.has(reason)) {
+      const places = this.#places.get(held.pageId) ?? [];
+      places.push({
+        userId: held.proposer.userId,
+        until: (held.settledAt ?? 0) + PROPOSAL_PLACE_HOLD_MS,
+      });
+      this.#places.set(held.pageId, places);
+    }
     this.#hooks.ended(held, reason, frame);
     this.#settled(entry);
     return true;
@@ -591,6 +639,7 @@ export class PageProposals implements PagePart {
   gone(pageId: string): void {
     // A detach reaches here with no sleep first.
     this.#linkEnded(pageId, GONE);
+    this.#places.delete(pageId);
     for (const entry of [...(this.#pages.get(pageId) ?? [])]) this.#forget(entry);
   }
 
@@ -610,6 +659,7 @@ export class PageProposals implements PagePart {
   }
 
   close(): void {
+    this.#places.clear();
     for (const entry of this.#byId.values()) {
       this.#clearTimer(entry);
       this.#wake(entry, SHUTTING_DOWN);

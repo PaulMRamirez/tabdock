@@ -8,6 +8,8 @@
 
 import {
   type JsonObject,
+  MAX_PENDING_PROPOSALS_PER_PAGE,
+  MAX_PENDING_PROPOSALS_PER_USER,
   MAX_PROPOSAL_RESULT_CHARS,
   MAX_SETTLED_PROPOSALS_PER_PAGE,
   PROPOSAL_OUTCOME_KEEP_MS,
@@ -18,6 +20,7 @@ import {
   MAX_PROPOSAL_CHARGE,
   PageProposals,
   PROPOSAL_HEAP_BYTES,
+  PROPOSAL_PLACE_HOLD_MS,
   proposalCharge,
   type ProposalRecord,
   type ProposalReservation,
@@ -186,6 +189,40 @@ describe('PageProposals', () => {
     // Settling frees its arguments' charge, and with it the share.
     proposals.end(first, 'dismissed', null);
     expect(make('pg_3', 'bob', dense)).toMatchObject({ proposer: { userId: 'bob' } });
+    proposals.close();
+  });
+
+  it('keeps the places of withdrawn and refused proposals a minute, so ending them resets no cap', () => {
+    const { proposals, make, made } = held();
+    const charge = proposalCharge(ARGS);
+    proposals.end(made('pg_1', 'bob'), 'withdrawn', 'withdrawn');
+    proposals.end(made('pg_1', 'bob'), 'refused', null);
+    proposals.end(made('pg_1', 'bob'), 'withdrawn', 'withdrawn');
+    const now = Date.now();
+    expect(proposals.reserve('pg_1', 'bob', charge, now)).toBe('recent');
+    // Only Bob's on that page: another page and another user still have places.
+    expect(make('pg_2', 'bob')).toMatchObject({ proposer: { userId: 'bob' } });
+    expect(make('pg_1', 'carol')).toMatchObject({ proposer: { userId: 'carol' } });
+    // A minute on, the places are free again.
+    const later = proposals.reserve('pg_1', 'bob', charge, now + PROPOSAL_PLACE_HOLD_MS + 1);
+    expect(later).toMatchObject({ pageId: 'pg_1', userId: 'bob' });
+    if (typeof later !== 'string') proposals.release(later);
+    proposals.close();
+  });
+
+  it("keeps the page's places too, but frees a place the operator dismissed at once", () => {
+    const { proposals, make, made } = held();
+    // Twenty places, every one withdrawn by its proposer within the minute.
+    for (let n = 0; n < MAX_PENDING_PROPOSALS_PER_PAGE; n += 1) {
+      proposals.end(made('pg_1', `user${String(n)}`), 'withdrawn', 'withdrawn');
+    }
+    expect(make('pg_1', 'newcomer')).toBe('recent');
+    const other = held();
+    for (let n = 0; n < MAX_PENDING_PROPOSALS_PER_USER; n += 1) {
+      other.proposals.end(other.made('pg_1', 'bob'), 'dismissed', null);
+    }
+    expect(other.make('pg_1', 'bob')).toMatchObject({ proposer: { userId: 'bob' } });
+    other.proposals.close();
     proposals.close();
   });
 

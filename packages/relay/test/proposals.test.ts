@@ -588,6 +588,21 @@ describe('proposal limits (A6.12)', () => {
     expect(opened.all('proposal')).toHaveLength(MAX_PENDING_PROPOSALS_PER_PAGE);
   });
 
+  it("keeps a withdrawn proposal's place a minute, so proposing and withdrawing cannot reset the cap", async () => {
+    await setup();
+    const opened = await page();
+    const bob = await observer(opened);
+    for (let n = 0; n < MAX_PENDING_PROPOSALS_PER_USER; n += 1) {
+      const proposalId = proposalIdOf(await propose(bob, opened.pageId));
+      expect((await withdrawProposal(bob, opened.pageId, proposalId)).head).toBe('withdrawn');
+    }
+    expect((await propose(bob, opened.pageId)).text).toBe(
+      'rate_limited: proposals withdrawn or refused on this page keep their places for 1 minute, so the page is not asked too often; try again shortly',
+    );
+    await opened.sync();
+    expect(opened.all('proposal')).toHaveLength(MAX_PENDING_PROPOSALS_PER_USER);
+  });
+
   it('refuses arguments past 16 KiB or 1,000 values, and arguments its schema refuses, with no frame', async () => {
     await setup();
     const opened = await page();

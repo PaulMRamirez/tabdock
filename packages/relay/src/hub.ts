@@ -126,6 +126,7 @@ import { PageStates, type StateView } from './page-state.ts';
 import {
   madeByAgentToken,
   PageProposals,
+  PROPOSAL_PLACE_HOLD_MS,
   proposalCharge,
   type ProposalCloseReason,
   type ProposalOutcome,
@@ -933,6 +934,15 @@ export const MAX_UNREAD_FRAMES = 256;
  * everything else, and what else the relay sends a page is far smaller.
  */
 export const INVOKE_ROOM = MAX_FRAME_BYTES;
+/**
+ * The most a page's queue may hold, a proposal frame included, for an
+ * observer's proposal to go out (ADR 0042). A proposal answers its caller
+ * at once rather than waiting for room as an invoke does, so past this it
+ * is refused page_busy and never closes a page; a quarter of INVOKE_ROOM
+ * leaves members' calls most of theirs on a page reading over a slow link,
+ * and a proposal at its argument caps, about 17 KB, always fits.
+ */
+export const PROPOSAL_ROOM = INVOKE_ROOM / 4;
 const MAX_ROSTER_CLIENTS = 20;
 /**
  * Each call moves its attachment's expiresAt, but the roster carrying it is
@@ -994,9 +1004,10 @@ const WAIT_REFUSALS: Record<'user' | 'page' | 'invitee', string> = {
 };
 
 /** What a proposal refused by proposals.ts answers, by the limit that refused it (ADR 0042, S9). */
-const PROPOSAL_REFUSALS: Record<'user' | 'page' | 'share' | 'relay', string> = {
+const PROPOSAL_REFUSALS: Record<'user' | 'page' | 'recent' | 'share' | 'relay', string> = {
   user: `you already have ${String(MAX_PENDING_PROPOSALS_PER_USER)} proposals waiting on this page; wait for the operator, or withdraw one with withdraw_proposal`,
   page: `this page already has ${String(MAX_PENDING_PROPOSALS_PER_PAGE)} proposals waiting for its operator; try again later`,
+  recent: `proposals withdrawn or refused on this page keep their places for ${formatDuration(PROPOSAL_PLACE_HOLD_MS)}, so the page is not asked too often; try again shortly`,
   share:
     "your proposals waiting across pages already hold as much of the relay's memory as one user's may; wait for their operators, or withdraw one with withdraw_proposal",
   relay: 'the relay holds as many proposals as it can; try again later',
@@ -1914,7 +1925,10 @@ export class PageHub {
     const userId = record.proposer.userId;
     const live = frame === null ? null : this.#livePage(pageId);
     if (live !== null && frame !== null) {
-      this.#send(live.conn, { t: 'proposal_end', proposalId, reason: frame });
+      this.#sendProposalFrame(
+        live.conn,
+        encodeFrame({ t: 'proposal_end', proposalId, reason: frame }),
+      );
     }
     this.#audit({
       v: AUDIT_VERSION,
@@ -5776,6 +5790,10 @@ export class PageHub {
         `a proposal's arguments may hold at most ${String(MAX_PROPOSAL_ARGUMENT_BYTES)} bytes and ${String(MAX_PROPOSAL_ARGUMENT_NODES)} values`,
       );
     }
+    // ADR 0044: a watcher's proposal reaches the operator's tab as a call
+    // would, so it spends the watchers' share of the page's calls.
+    const share = this.#watchingShareRefusal(pageId, attachment);
+    if (share !== null) return share;
     const reservation = this.#proposals.reserve(pageId, userId, proposalCharge(args), Date.now());
     if (typeof reservation === 'string') {
       this.#log.warn('proposal refused: too many proposals', {
@@ -5812,18 +5830,10 @@ export class PageHub {
           'your standing on this page or its tools changed while the proposal was checked; call again',
         );
       }
-      const record = this.#proposals.commit(reservation, {
-        proposalId: newId('pr'),
-        origin: access.page.origin,
-        proposer: caller,
-        grantedAt: attachment.grantedAt,
-        tool: tool.name,
-        args,
-        createdAt: Date.now(),
-      });
-      made = true;
-      const { proposalId, expiresAt } = record;
-      this.#send(access.conn, {
+      const proposalId = newId('pr');
+      const createdAt = Date.now();
+      const expiresAt = this.#proposals.expiresAt(createdAt);
+      const text = encodeFrame({
         t: 'proposal',
         proposalId,
         tool: tool.name,
@@ -5836,6 +5846,27 @@ export class PageHub {
         },
         expiresAt,
       });
+      if (!this.#roomForProposal(access.conn, Buffer.byteLength(text, 'utf8'))) {
+        this.#log.debug('proposal refused: the page has not read what it was sent', {
+          pageId,
+          userId,
+        });
+        return hubError(
+          'page_busy',
+          'the page has not yet taken in what it was sent, so it takes no proposal now; try again shortly',
+        );
+      }
+      this.#proposals.commit(reservation, {
+        proposalId,
+        origin: access.page.origin,
+        proposer: caller,
+        grantedAt: attachment.grantedAt,
+        tool: tool.name,
+        args,
+        createdAt,
+      });
+      made = true;
+      this.#sendProposalFrame(access.conn, text);
       trace.reached = true;
       trace.proposalId = proposalId;
       this.#log.info('proposal made', { pageId, userId, proposalId, tool: tool.name });
@@ -5843,6 +5874,36 @@ export class PageHub {
     } finally {
       if (!made) this.#proposals.release(reservation);
     }
+  }
+
+  /**
+   * Whether a proposal frame of this many bytes may go out now (ADR 0042):
+   * onto an empty queue always, otherwise only while no call waits for room
+   * and the queue, the frame included, stays within PROPOSAL_ROOM and below
+   * MAX_UNREAD_FRAMES frames. A proposal waits for nothing, so without room
+   * it is refused, and what observers propose never closes a page (ADR 0024).
+   */
+  #roomForProposal(conn: Conn, bytes: number): boolean {
+    this.#observe(conn);
+    if (conn.held.length > 0) return false;
+    const queued = conn.ws.bufferedAmount;
+    return (
+      queued === 0 || (queued + bytes <= PROPOSAL_ROOM && conn.queue.frames < MAX_UNREAD_FRAMES)
+    );
+  }
+
+  /**
+   * A proposal frame, or the proposal_end that may follow it, goes out as an
+   * invoke or a cancel does: never counted toward closing the page. A
+   * proposal goes out only with room (#roomForProposal), and at most one
+   * proposal_end follows each, so the proposal limits bound them both; the
+   * relay's own small frames keep ADR 0024's count to themselves.
+   */
+  #sendProposalFrame(conn: Conn, text: string): void {
+    if (conn.ws.readyState !== conn.ws.OPEN) return;
+    this.#write(conn, false, (written) => {
+      conn.ws.send(text, written);
+    });
   }
 
   /**
@@ -5905,11 +5966,10 @@ export class PageHub {
       // own record of the Accept ends now rather than at its own deadline.
       const live = trace.reached ? null : this.#livePage(record.pageId);
       if (live !== null) {
-        this.#send(live.conn, {
-          t: 'proposal_end',
-          proposalId: record.proposalId,
-          reason: 'not_run',
-        });
+        this.#sendProposalFrame(
+          live.conn,
+          encodeFrame({ t: 'proposal_end', proposalId: record.proposalId, reason: 'not_run' }),
+        );
       }
       this.#audit(
         this.#callRecord(started, startedMono, record.pageId, record.proposer, trace, auditOutcome),
