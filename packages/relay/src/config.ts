@@ -335,9 +335,10 @@ export interface RelayLimits {
    */
   proposalBytes: number;
   /**
-   * Bytes all /mcp answers still waiting to be read may hold together (ADR
-   * 0044); past it strangers' answers are cut first, then guests', oldest
-   * first, and never a member's. At least MIN_RESPONSE_BYTES, in every mode.
+   * Bytes /mcp answers waiting to be read may hold together before invited
+   * accounts' give way (ADR 0044): past it strangers' are cut first, then
+   * guests', oldest first, and never a member's, so members' alone may pass
+   * it. At least MIN_RESPONSE_BYTES, in every mode.
    */
   responseBytes: number;
   /**

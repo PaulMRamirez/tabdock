@@ -11,7 +11,7 @@ Each applies in every mode, and past each the relay refuses or withholds rather 
 | `TABDOCK_MAX_IMAGE_BYTES`    | 65536     | 65536          | bytes | 0, at most 524288 | The largest image, decoded, a page may return to a client (ADR 0039); 0 refuses every image                                                     |
 | `TABDOCK_MAX_STATE_BYTES`    | 4194304   | 4194304        | bytes | 1048576           | Heap the state every page published may hold together (ADR 0040); past it a new value is withheld, never the page closed                        |
 | `TABDOCK_MAX_PROPOSAL_BYTES` | 16777216  | 16777216       | bytes | 1048576           | Heap pending proposals' arguments and kept outcomes may hold together (ADR 0042); past it a proposal is refused `rate_limited`                  |
-| `TABDOCK_MAX_RESPONSE_BYTES` | 100663296 | 100663296      | bytes | 4194304           | Bytes all `/mcp` answers still waiting to be read may hold (ADR 0044); past it strangers' answers are cut first, then guests', never a member's |
+| `TABDOCK_MAX_RESPONSE_BYTES` | 100663296 | 100663296      | bytes | 4194304           | Bytes `/mcp` answers waiting to be read may hold (ADR 0044); past it strangers' are cut first, then guests', never members': theirs may pass it |
 
 An image travels as base64, a third larger than its bytes, and Claude Code caps a tool result at 25,000 tokens unless `MAX_MCP_OUTPUT_TOKENS` raises it, while its docs do not say how an image counts against that; raise the two together, and check with your own client before going past the default.
 
