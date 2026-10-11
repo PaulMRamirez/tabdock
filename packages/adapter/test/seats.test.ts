@@ -15,6 +15,7 @@ import {
   mint,
   redemption,
   setup,
+  until,
   welcome,
 } from './harness.ts';
 
@@ -30,7 +31,8 @@ async function watchedPage(usersPerPage: number) {
   socket.deliver(invitesFrame([]));
   const minted = await mint(h, socket, { label: 'Pair', role: 'driver' });
   socket.deliver(redemption(h.clock, minted));
-  await flush();
+  // The page checks the secret against its own record with WebCrypto, which settles off the next tick.
+  await until(() => h.dock.state.pendingRequests.length > 0, 'the redemption prompt');
   expect(h.dock.approve(`redeem-${minted.inviteId}`, 'driver')).toBe(true);
   const guest = invitedAttachment(GUEST, 'observer', minted.inviteId, h.clock.now + 60_000);
   const roster = [attachment('alice', 'observer'), attachment('bob', 'observer'), guest];
