@@ -32,7 +32,7 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { DEFAULT_IMAGE_BYTES, MAX_RESULT_CHARS, MAX_INVITE_USES } from '@tabdock/protocol';
-import { EMAIL_CLAIM, EMAIL_VERIFIED_CLAIM } from '@tabdock/relay';
+import { DEFAULT_RATE_LIMITS, EMAIL_CLAIM, EMAIL_VERIFIED_CLAIM } from '@tabdock/relay';
 import { PAIR_CLIENT, startProvider, type TestProvider } from '@tabdock/relay/test/provider';
 import {
   base64Of,
@@ -72,6 +72,10 @@ const PAGE_ORIGIN = 'https://class-map.test';
 const PAGE_ADDRESS = '198.51.100.10';
 const TEACHER_SUB = 'sub-teacher';
 const SHARED_ADDRESS = '203.0.113.250';
+
+/** How far apart the ceiling phase asks for answers: just under the watchers' share of a page. */
+export const FILL_SPACING_MS =
+  Math.ceil(DEFAULT_RATE_LIMITS.windowMs / DEFAULT_RATE_LIMITS.watchingCallsPerPage) + 50;
 
 /** The heap flag the image starts node with, read from the Dockerfile's CMD. */
 export function imageHeapFlag(): string {
@@ -796,14 +800,20 @@ export async function measureRoom(
       const browser = new StudentBrowser(relay.url, student.address, sink);
       const secret = secrets[Math.floor(student.index / MAX_INVITE_USES)] ?? '';
       const deadline = firstTap + 10 * 60_000;
+      // /i keeps a sign-in for 15 minutes, so a student signs in again only when it asks.
+      let signedIn = false;
       while (performance.now() < deadline) {
-        if (!(await signIn(student, browser))) {
-          debug(`student ${String(student.index)} sign-in refused`);
-          signInRefusals += 1;
-          await sleep(10_000);
-          continue;
+        if (!signedIn) {
+          signedIn = await signIn(student, browser);
+          if (!signedIn) {
+            debug(`student ${String(student.index)} sign-in refused`);
+            signInRefusals += 1;
+            await sleep(10_000);
+            continue;
+          }
         }
         const claimed = await browser.post('/i/claim', { secret });
+        if (claimed.status === 401) signedIn = false;
         debug(
           `student ${String(student.index)} claim ${String(claimed.status)} ${errorOf(claimed.data)}`,
         );
@@ -1077,11 +1087,11 @@ export async function measureRoom(
       phase.held.push(
         heldCall(relay.url, student, sessionId, pageId, 'read_notes', 'stall', phase, sink),
       );
-      await sleep(600);
+      await sleep(FILL_SPACING_MS);
       phase.held.push(
         heldCall(relay.url, student, sessionId, pageId, 'capture_view', 'stall', phase, sink),
       );
-      await sleep(600);
+      await sleep(FILL_SPACING_MS);
     }
     await sleep(plan.phaseMs.stalled);
     await load.stop();
@@ -1097,11 +1107,11 @@ export async function measureRoom(
       if (performance.now() > fillEnds) break;
       const sessionId = sessionOf(student.chatB);
       if (sessionId === null) continue;
-      // Just under the page's watching share of calls a minute.
+      // Just under the page's watching share as the relay ships it.
       phase.held.push(
         heldCall(relay.url, student, sessionId, pageId, 'read_notes', 'trickle', phase, sink),
       );
-      await sleep(520);
+      await sleep(FILL_SPACING_MS);
     }
     await sleep(Math.max(0, fillEnds - performance.now()));
     await load.stop();

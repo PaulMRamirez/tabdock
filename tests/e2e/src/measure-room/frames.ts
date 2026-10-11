@@ -3,9 +3,9 @@
 // with requestAnimationFrame timed in the page while calls arrive at a fixed
 // rate, so a frame later than 33 ms (two missed at 60 Hz) shows the
 // projector stuttering. It measures the page, not the relay: the relay here
-// is an ordinary one in this process with its per-user call rate raised for
-// the one member making every call, since only the arrival rate matters to
-// the page. Each rate runs as capture_view, which redraws and encodes an
+// is an ordinary one in this process with its per-user call and request
+// rates raised for the one member making every call, since only the arrival
+// rate matters to the page. Each rate runs as capture_view, which redraws and encodes an
 // image within the relay's cap, and as get_view, which only reads; the
 // adapter itself starts at most one image call every 250 ms.
 
@@ -67,8 +67,8 @@ export async function measureFrames(
     port: 0,
     allowMissingOrigin: false,
     logSink: () => undefined,
-    // One member makes every call, so the per-user rate must not be what limits the arrival rate.
-    rateLimits: { callsPerUserPerPage: 100_000 },
+    // One member makes every call, so neither per-user rate may be what limits the arrival rate.
+    rateLimits: { callsPerUserPerPage: 100_000, requestsPerUser: 100_000 },
   });
   const browser = await launchChromium(true);
   const client = new Client({ name: 'frames', version: '1.0.0' });

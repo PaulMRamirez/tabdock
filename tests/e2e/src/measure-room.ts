@@ -17,7 +17,13 @@ import { parseArgs } from 'node:util';
 import { RESPONSE_CEILING_LINE } from '../../../packages/relay/src/response-stalls.ts';
 import { confine, pinHarness, relayCpu } from './measure-room/confine.ts';
 import { measureFrames, type FrameRun, LATE_FRAME_MS } from './measure-room/frames.ts';
-import { imageHeapFlag, measureRoom, type RoomPlan, type RoomResult } from './measure-room/room.ts';
+import {
+  FILL_SPACING_MS,
+  imageHeapFlag,
+  measureRoom,
+  type RoomPlan,
+  type RoomResult,
+} from './measure-room/room.ts';
 import { MIB } from './measure-room/stats.ts';
 
 const ROOT = resolve(import.meta.dirname, '../../..');
@@ -195,7 +201,7 @@ function phasePlan(size: number, sharedAddress: boolean, joinOnly: boolean): Roo
       class: ms,
       agents: Math.round(ms * 0.4),
       stalled: Math.round(ms * 0.3),
-      ceiling: Math.max(Math.round(ms * 0.5), quick ? 20_000 : size * 2 * 520 + 30_000),
+      ceiling: Math.max(Math.round(ms * 0.5), quick ? 20_000 : size * 2 * FILL_SPACING_MS + 30_000),
     },
     joinSpreadMs: quick ? 5000 : 30_000,
   };
