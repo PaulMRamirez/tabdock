@@ -1083,9 +1083,9 @@ describe('taking the file (snapshot.ts)', () => {
           if (path === fileOf(dir)) descriptors.add(fd);
           return fd;
         }) as typeof nodeFs.openSync,
-        fstatSync: ((fd: number, options?: nodeFs.StatOptions) => {
-          const stats = nodeFs.fstatSync(fd, options);
-          return descriptors.has(fd) && stats !== undefined ? Object.assign(stats, facts) : stats;
+        fstatSync: ((fd: number) => {
+          const stats = nodeFs.fstatSync(fd);
+          return descriptors.has(fd) ? Object.assign(stats, facts) : stats;
         }) as typeof nodeFs.fstatSync,
       };
       return takeSnapshot({
