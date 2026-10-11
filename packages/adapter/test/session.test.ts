@@ -246,6 +246,23 @@ describe('S5: a session is never wider than attach()', () => {
     expect(h.dock.state.session).toBeNull();
     expect(h.logs).toContain('warn ignored session ses_foreign, which this page did not start');
     expect(socket.framesOf('session_end')).toEqual([]);
+    // Nor swap its own for another: a relay that holds some other session holds none of this page's.
+    const { start } = await started(h, socket, { label: 'Class', lengthMinutes: 30 });
+    socket.deliver({
+      t: 'session',
+      session: {
+        sessionId: 'ses_foreign',
+        lengthMs: 240 * MINUTE,
+        remainingMs: 240 * MINUTE,
+        policy: { maxDrivers: 1, proposals: 'off' },
+      },
+    });
+    await flush();
+    expect(h.dock.state.session).toBeNull();
+    expect(h.dock.state.sessionEnded).toMatchObject({
+      sessionId: start.sessionId,
+      reason: 'relay',
+    });
   });
 
   it('leaves nothing behind when the relay refuses the start', async () => {
@@ -462,6 +479,18 @@ describe("the session's end on the page's own clock (A6.17)", () => {
     expect(codes(socket)).toEqual(['ok', 'role_denied']);
     await h.clock.advance(SESSION_END_GRACE_MS);
     expect(socket.framesOf('session_end')).toEqual([]);
+    // Gone for good: a relay that drops the guest and then lists them again gets them nothing.
+    socket.deliver({ t: 'roster', attachments: [attachment('alice', 'driver')] });
+    socket.deliver({
+      t: 'roster',
+      attachments: [
+        attachment('alice', 'driver'),
+        invitedAttachment(GUEST, 'observer', 'inv_any', h.clock.now + 10_000),
+      ],
+    });
+    socket.deliver(invoke('get_value', { callId: 'again', caller: guest }));
+    await flush();
+    expect(codes(socket)).toEqual(['ok', 'role_denied', 'role_denied']);
   });
 
   it("ends at once on the operator's End, telling the relay", async () => {
