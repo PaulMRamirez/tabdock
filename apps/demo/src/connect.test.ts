@@ -10,8 +10,8 @@ import {
 import { DEFAULT_LINK_POLICY, linkPolicyFromQuery, policyTag } from './policy.ts';
 
 const RELAY = 'wss://relay.example/page';
-/** The tag of ?confirm=client&invites=all, the loosest a link can ask for. */
-const LOOSE = policyTag({ confirmInClient: true, invites: 'all' });
+/** The tag of ?confirm=client&invites=all, the loosest a link could ask for before M6. */
+const LOOSE = policyTag({ confirmInClient: true, invites: 'all', proposals: 'off' });
 
 function memoryStore(): ChoiceStore & { entries: Map<string, string> } {
   const entries = new Map<string, string>();
@@ -120,14 +120,35 @@ describe('connectHref, where the Connect form goes', () => {
     expect(connectHref(page, RELAY, DEFAULT_LINK_POLICY)).toBe(
       'https://board.example/?relay=wss%3A%2F%2Frelay.example%2Fpage',
     );
-    expect(connectHref(page, RELAY, { confirmInClient: true, invites: 'watch' })).toBe(
-      'https://board.example/?relay=wss%3A%2F%2Frelay.example%2Fpage&confirm=client',
-    );
     expect(
-      connectHref('https://board.example/', RELAY, { confirmInClient: true, invites: 'all' }),
+      connectHref(page, RELAY, { confirmInClient: true, invites: 'watch', proposals: 'off' }),
+    ).toBe('https://board.example/?relay=wss%3A%2F%2Frelay.example%2Fpage&confirm=client');
+    expect(
+      connectHref('https://board.example/', RELAY, {
+        confirmInClient: true,
+        invites: 'all',
+        proposals: 'off',
+      }),
     ).toBe(
       'https://board.example/?relay=wss%3A%2F%2Frelay.example%2Fpage&confirm=client&invites=all',
     );
+  });
+
+  it('carries ?proposals only as the visitor ticked it, and remembers the choice with it (ADR 0042)', () => {
+    const page = 'https://board.example/?proposals=all';
+    expect(connectHref(page, RELAY, DEFAULT_LINK_POLICY)).toBe(
+      'https://board.example/?relay=wss%3A%2F%2Frelay.example%2Fpage',
+    );
+    const ticked = { ...DEFAULT_LINK_POLICY, proposals: 'all' as const };
+    expect(connectHref('https://board.example/', RELAY, ticked)).toBe(
+      'https://board.example/?relay=wss%3A%2F%2Frelay.example%2Fpage&proposals=all',
+    );
+    const store = memoryStore();
+    rememberChoice(store, RELAY, '');
+    expect(wasChosen(store, RELAY, policyTag(ticked))).toBe(false);
+    rememberChoice(store, RELAY, policyTag(ticked));
+    expect(wasChosen(store, RELAY, 'proposals=all')).toBe(true);
+    expect(wasChosen(store, RELAY, 'proposals=members')).toBe(false);
   });
 
   it('keeps a subpath, so a copy under <user>.github.io/<repository>/ stays where it is', () => {

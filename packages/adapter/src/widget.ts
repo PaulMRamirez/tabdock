@@ -75,6 +75,7 @@ import type {
   LinkState,
   PageRole,
   PendingConfirm,
+  PendingProposal,
   PendingRequest,
 } from './core.ts';
 import { type BoxRect, takeDom } from './dom.ts';
@@ -153,8 +154,23 @@ const STATE_LINES = {
   invalid: 'Page state not shared: not a JSON object.',
   unsupported: 'This relay does not take page state.',
 } as const;
-/** The proposal queue and its badge (ADR 0042). */
-const PROPOSALS_STYLE = '';
+/**
+ * The proposal queue and its badge (ADR 0042). The list scrolls within its
+ * own height, so twenty rows never push the rest of the panel off a phone's
+ * screen, and arguments are the caller's words: isolated, wrapped anywhere,
+ * cut to a few lines until Show all.
+ */
+const PROPOSALS_STYLE = `
+.proposals { max-height: min(45vh, 28em); overflow-y: auto; }
+.args { margin: 2px 0; padding: 2px 4px; border: 1px dashed #9ca3af; border-radius: 4px; max-height: 4.2em;
+  overflow: hidden; white-space: pre-wrap; overflow-wrap: anywhere; unicode-bidi: isolate;
+  font: 12px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.args.open { max-height: 12em; overflow-y: auto; }
+.accepted { padding: 0 6px; border-radius: 10px; background: #e0e7ff; color: #312e81; }
+@media (prefers-color-scheme: dark) { .accepted { background: #312e81; color: #e0e7ff; } }`;
+
+/** Characters of a proposal's arguments shown before Show all. */
+const ARGS_SHOWN = 160;
 /** The time-boxed session's form, countdown and badge (ADR 0043). */
 const SESSION_STYLE = '';
 /** The roster's Watching section and compact rows (ADR 0044). */
@@ -297,6 +313,15 @@ interface RowView extends ArmedBox {
   /** The role the page enforces, which the switch offers the other of; null hides the switch. */
   role: Role | null;
   expiresAt: number | null;
+}
+
+/** One waiting proposal (ADR 0042): an armed box, as its Accept runs a write. */
+interface ProposalRow extends ArmedBox {
+  accept: HTMLButtonElement;
+  readonly countdown: HTMLElement;
+  /** "Resume the page to accept", shown while paused (decision 13). */
+  readonly paused: HTMLElement;
+  readonly expiresAt: number;
 }
 
 interface PauseView extends ArmedBox {
@@ -1375,10 +1400,10 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     }
   }
 
-  /** The badge asks for attention while a prompt waits or a join notice has not been seen. */
+  /** The badge asks for attention while a prompt waits, or a join notice or a proposal has not been seen. */
   function updateAttention(): void {
     const waiting = requestViews.size + confirmViews.size > 0;
-    const attention = waiting || joinLines.some((line) => !line.seen);
+    const attention = waiting || joinLines.some((line) => !line.seen) || unseenProposals.size > 0;
     dom.attr(badgeButton, 'class', attention ? 'badge attention' : 'badge');
   }
 
@@ -1604,6 +1629,9 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     dom.append(what, `: ${entry.tool}`);
     const confirmed = confirmedIn(entry);
     if (confirmed !== null) dom.append(what, ', ', confirmedBadge(confirmed));
+    // ADR 0042's mark, the page's own on a ground of its own, as ADR 0026's is.
+    if (entry.acceptedOnPage)
+      dom.append(what, ', ', element('span', 'accepted', 'accepted proposal'));
     const took = entry.durationMs === null ? '' : ` in ${entry.durationMs} ms`;
     // A write answered early still holds the page while its handler runs on.
     const lingering = entry.handlerRunning ? ', but its handler is still running' : '';
@@ -1645,10 +1673,141 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     dom.attr(stateLine, 'class', 'muted');
     dom.setText(stateLine, STATE_LINES[published]);
   }
-  // M6 seam: not built
-  const syncProposals: (state: DockState) => void = () => undefined;
-  // M6 seam: not built
-  const tickProposals = (): void => undefined;
+  // Proposals (ADR 0042): a row a proposal, newest on top so the rows shown
+  // keep their place, each an armed box whose Accept is that call's
+  // confirmation (S6). Dismissing grants nothing, so Dismiss all is not
+  // held back, as Revoke all is not, and there is no Accept all (decision 3).
+  const proposalLabel = element('div', 'label');
+  const proposalList = element('ul', 'proposals');
+  role(proposalList, 'proposal-list');
+  dom.attr(proposalsBlock, 'aria-live', 'polite');
+  dom.append(
+    proposalsBlock,
+    proposalLabel,
+    proposalList,
+    button('Dismiss all', 'proposal-dismiss-all', () => {
+      dock.dismissAllProposals();
+    }),
+  );
+  const proposalRows = new Map<string, ProposalRow>();
+  /** Rows not yet on screen, which ring the badge as a join notice does. */
+  const unseenProposals = new Set<string>();
+  let proposalsPaused = false;
+
+  function proposalRow(view: PendingProposal): ProposalRow {
+    const box = element('li', 'row');
+    dom.attr(box, 'data-proposal-id', view.proposalId);
+    const { proposer } = view;
+    const line = element('p');
+    dom.append(
+      line,
+      person(personText(proposer)),
+      badge(shortId(proposer.userId) !== null),
+      ' proposes ',
+      element('span', 'who', view.tool),
+    );
+    dom.append(box, line);
+    const client = proposer.client === null ? '' : clientText(proposer.client);
+    if (client !== '') {
+      const said = element('p', 'muted', 'Client: ');
+      dom.append(said, quotedClient(client));
+      dom.append(box, said);
+    }
+    if (view.consequential) {
+      dom.append(
+        box,
+        element('p', 'notice', 'Accepting runs this consequential tool without asking again.'),
+      );
+    }
+    // The caller's words, escaped where a character would not read as written
+    // (escapeUnseen), as text alone, and cut with the count left out.
+    const args = element('pre', 'args');
+    role(args, 'proposal-args');
+    const text = view.arguments;
+    // Never between the two halves of a pair, which would show as a broken character.
+    const cut = ARGS_SHOWN - (/[\uD800-\uDBFF]/.test(text.charAt(ARGS_SHOWN - 1)) ? 1 : 0);
+    const short =
+      text.length > ARGS_SHOWN
+        ? `${text.slice(0, cut)}... (${String(text.length - cut)} more characters)`
+        : text;
+    dom.setText(args, short);
+    dom.append(box, element('p', 'muted', 'Arguments, as their client wrote them:'), args);
+    const row: ProposalRow = {
+      ...newBox(box),
+      accept: element('button'),
+      countdown: element('p', 'muted'),
+      paused: element('p', 'muted', 'Resume the page to accept'),
+      expiresAt: view.expiresAt,
+    };
+    if (short !== view.arguments) {
+      let open = false;
+      const toggle = button('Show all', 'proposal-args', () => {
+        open = !open;
+        dom.setText(args, open ? view.arguments : short);
+        dom.attr(args, 'class', open ? 'args open' : 'args');
+        dom.setText(toggle, open ? 'Show less' : 'Show all');
+        // The row changed under the pointer, so its Accept waits again.
+        restartArming(row);
+      });
+      dom.append(box, toggle);
+    }
+    row.accept = boxButton(row, 'Accept', 'proposal-accept', () => {
+      dock.acceptProposal(view.proposalId);
+    });
+    const buttons = element('div', 'buttons');
+    dom.append(
+      buttons,
+      row.accept,
+      boxButton(
+        row,
+        'Dismiss',
+        'proposal-dismiss',
+        () => {
+          dock.dismissProposal(view.proposalId);
+        },
+        true,
+      ),
+    );
+    dom.append(box, buttons, row.paused, row.countdown);
+    return row;
+  }
+
+  function syncProposals(state: DockState): void {
+    const live = new Set(state.proposals.map((view) => view.proposalId));
+    for (const [proposalId, row] of proposalRows) {
+      if (live.has(proposalId)) continue;
+      dropBox(row);
+      proposalRows.delete(proposalId);
+      unseenProposals.delete(proposalId);
+    }
+    for (const view of state.proposals) {
+      if (proposalRows.has(view.proposalId)) continue;
+      const row = proposalRow(view);
+      proposalRows.set(view.proposalId, row);
+      boxes.add(row);
+      dom.prepend(proposalList, row.element);
+      unseenProposals.add(view.proposalId);
+    }
+    const waiting = state.proposals.length;
+    dom.flag(proposalsBlock, 'hidden', waiting === 0);
+    dom.setText(proposalLabel, `Proposals (${String(waiting)})`);
+    dom.setText(proposedTag, `${String(waiting)} proposed`);
+    dom.flag(proposedTag, 'hidden', waiting === 0);
+    // No Accept while paused (decision 13); Resume grants again, so each row waits anew.
+    for (const row of proposalRows.values()) {
+      dom.flag(row.accept, 'disabled', state.paused);
+      dom.flag(row.paused, 'hidden', !state.paused);
+      if (proposalsPaused && !state.paused) restartArming(row);
+    }
+    proposalsPaused = state.paused;
+  }
+
+  function tickProposals(): void {
+    for (const row of proposalRows.values()) {
+      dom.setText(row.countdown, `Expires in ${clockText(secondsLeft(row.expiresAt))}`);
+    }
+    if (!dom.has(panel, 'hidden') && doc.visibilityState === 'visible') unseenProposals.clear();
+  }
   // M6 seam: not built
   const syncSession: (state: DockState) => void = () => undefined;
   // M6 seam: not built

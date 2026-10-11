@@ -268,3 +268,121 @@ describe('A2.2: the adapter refuses when the relay check is bypassed', () => {
     ]);
   });
 });
+
+describe('A6.13: the adapter runs a proposal only against its own record of the Accept', () => {
+  function caller(userId: string, displayName: string, role: Caller['role']): Caller {
+    return { userId, displayName, client: { name: 'stand-in-client', version: '0.0.0' }, role };
+  }
+
+  it('answers role_denied for every invoke but the one its Accept covers, and runs that once', async () => {
+    standIn = await startStandInRelay();
+    const relay = standIn;
+    sim = await startSimPage({
+      relayUrl: relay.url,
+      profile: 'chrome-156',
+      policy: { proposals: 'members' },
+    });
+    const page = sim;
+    await relay.next('hello');
+    relay.send({
+      t: 'welcome',
+      pageId: 'pg_standin002',
+      resumeToken: 'stand-in-resume-token',
+      resumed: false,
+      pairing: { code: 'STAND-IN000', expiresAt: Date.now() + 120_000 },
+      roster: [],
+      limits: STAND_IN_LIMITS,
+    });
+    await linked(page);
+    await relay.next('tools', (frame) => frame.tools.length === SIM_TOOL_COUNT);
+    for (const [userId, displayName] of [
+      ['bob', 'Bob'],
+      ['carol', 'Carol'],
+    ] as const) {
+      relay.send({
+        t: 'attach_request',
+        requestId: `rq_${userId}`,
+        user: { userId, displayName },
+        account: { kind: 'member', verified: true },
+        via: 'code',
+        client: { name: 'stand-in-client', version: '0.0.0' },
+        expiresAt: Date.now() + 60_000,
+      });
+      await page.waitFor((s) => s.pendingRequests.some((r) => r.requestId === `rq_${userId}`));
+      expect(page.dock.approve(`rq_${userId}`, 'observer')).toBe(true);
+    }
+    const now = Date.now();
+    const listed = (userId: string, displayName: string) => ({
+      userId,
+      displayName,
+      kind: 'member' as const,
+      role: 'observer' as const,
+      grantedAt: now,
+      lastUsedAt: null,
+      expiresAt: now + 3_600_000,
+      clients: [],
+      inviteId: null,
+      endsAt: null,
+    });
+    relay.send({ t: 'roster', attachments: [listed('bob', 'Bob'), listed('carol', 'Carol')] });
+    await page.waitFor((s) => s.roster.length === 2);
+
+    const bob = caller('bob', 'Bob', 'observer');
+    const args = { value: 'from a proposal' };
+    relay.sendProposal({
+      proposalId: 'pr_accepted',
+      tool: 'set_value',
+      arguments: args,
+      proposer: bob,
+    });
+    relay.sendProposal({
+      proposalId: 'pr_waiting',
+      tool: 'set_value',
+      arguments: args,
+      proposer: bob,
+    });
+    await page.waitFor((s) => s.proposals.length === 2);
+    expect(page.acceptProposal('pr_accepted')).toBe(true);
+    expect(
+      await relay.next('proposal_decision', (frame) => frame.proposalId === 'pr_accepted'),
+    ).toEqual({ t: 'proposal_decision', proposalId: 'pr_accepted', accept: true });
+
+    let n = 0;
+    const invoke = async (proposalId: string, tool: string, who: Caller, sent: object) => {
+      n += 1;
+      const callId = `cl_crafted${String(n)}`;
+      relay.send({
+        t: 'invoke',
+        callId,
+        tool,
+        arguments: sent as Record<string, string>,
+        caller: who,
+        deadlineMs: 5000,
+        proposal: { proposalId },
+      });
+      return relay.next('result', (frame) => frame.callId === callId);
+    };
+    for (const [what, run] of [
+      ['an id the page never received', () => invoke('pr_never', 'set_value', bob, args)],
+      ['an id received but never accepted', () => invoke('pr_waiting', 'set_value', bob, args)],
+      ['changed arguments', () => invoke('pr_accepted', 'set_value', bob, { value: 'changed' })],
+      [
+        'another caller',
+        () => invoke('pr_accepted', 'set_value', caller('carol', 'Carol', 'observer'), args),
+      ],
+      ['another tool', () => invoke('pr_accepted', 'wipe', bob, {})],
+    ] as const) {
+      const answered = await run();
+      expect(answered, what).toMatchObject({ ok: false, error: { code: 'role_denied' } });
+    }
+    expect(page.store.calls).toEqual([]);
+
+    // The one invoke the Accept covers runs, the page's own copy of the arguments, once.
+    expect(await invoke('pr_accepted', 'set_value', bob, args)).toMatchObject({ ok: true });
+    expect(page.store.value).toBe('from a proposal');
+    const replay = await invoke('pr_accepted', 'set_value', bob, args);
+    expect(replay).toMatchObject({ ok: false, error: { code: 'role_denied' } });
+    expect(page.store.calls.map((c) => c.tool)).toEqual(['set_value']);
+    expect(page.activity[1]).toMatchObject({ proposalId: 'pr_accepted', acceptedOnPage: true });
+  });
+});

@@ -100,6 +100,8 @@ export interface WidgetTarget {
   userId?: string;
   /** Inside one invite's row in the live list. */
   inviteId?: string;
+  /** Inside one proposal's row in the queue (ADR 0042), whose Accept and Dismiss every row repeats. */
+  proposalId?: string;
 }
 
 /** Which attach request to approve, and as what: by its client's name, or by its id. */
@@ -305,6 +307,7 @@ function findButton(widget: DevToolsNode, target: WidgetTarget): DevToolsNode | 
     ['data-call-id', target.callId],
     ['data-user-id', target.userId],
     ['data-invite-id', target.inviteId],
+    ['data-proposal-id', target.proposalId],
   ];
   const [name, value] = scoped.find(([, id]) => id !== undefined) ?? [null, undefined];
   const scope = name === null ? widget : find(widget, (n) => attribute(n, name) === value);

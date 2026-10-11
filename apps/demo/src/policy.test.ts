@@ -59,6 +59,30 @@ describe('policyFromQuery', () => {
     }
   });
 
+  it('lets observers propose with ?proposals=members or ?proposals=all, and reads anything else as off (ADR 0042)', () => {
+    for (const proposals of ['members', 'all'] as const) {
+      expect(read(`?proposals=${proposals}`)).toEqual({
+        consequentialTools: ['clear_board'],
+        imageTools: ['capture_board'],
+        proposals,
+      });
+    }
+    for (const value of ['off', 'ALL', 'all ', '', 'everyone', 'on']) {
+      expect(read(`?proposals=${encodeURIComponent(value)}`), value).toEqual({
+        consequentialTools: ['clear_board'],
+        imageTools: ['capture_board'],
+      });
+    }
+    const notes = (query: string) => policyNotes(linkPolicyFromQuery(new URLSearchParams(query)));
+    expect(notes('?proposals=members')).toBe(
+      'members watching may propose changes for you to accept.',
+    );
+    expect(notes('?proposals=all')).toBe(
+      'anyone watching, invited guests too, may propose changes for you to accept.',
+    );
+    expect(notes('?proposals=off')).toBe('');
+  });
+
   it('names every departure from the defaults for the person at the tab, and none for the defaults', () => {
     const notes = (query: string) => policyNotes(linkPolicyFromQuery(new URLSearchParams(query)));
     expect(notes('')).toBe('');

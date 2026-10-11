@@ -543,7 +543,7 @@ export const DEFAULT_TIMINGS: RelayTimings = {
   argumentCheckMs: ARGUMENT_CHECK_MS,
   pairSessionMs: PAIR_SESSION_MS,
   confirmationTtlMs: CONFIRMATION_TTL_MS,
-  proposalTtlMs: PROPOSAL_TTL_MS, // M6 seam: not built. W2-A's proposals.ts reads it.
+  proposalTtlMs: PROPOSAL_TTL_MS,
   membersPollMs: MEMBERS_POLL_MS,
 };
 
@@ -628,7 +628,7 @@ export const DEFAULT_LIMITS: RelayLimits = {
   requestBytesPerUser: 24 * 1024 * 1024,
   imageBytes: DEFAULT_IMAGE_BYTES,
   stateBytes: STATE_BYTES,
-  proposalBytes: PROPOSAL_BYTES, // M6 seam: not built. W2-A's proposals.ts charges against it.
+  proposalBytes: PROPOSAL_BYTES,
   responseBytes: RESPONSE_BYTES,
   observersPerPage: OBSERVERS_PER_PAGE,
   watchingCallsInFlight: 4, // M6 seam: not built. W2-C's #watchingShareRefusal reads it.

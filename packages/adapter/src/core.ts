@@ -4,12 +4,15 @@
 // timers and the operator's prompts all arrive through CoreOptions.
 
 import {
+  ACCEPTED_PROPOSAL_RUN_MS,
   type Account,
+  agentKeyInput,
   type AgentState,
   ATTACH_REQUEST_TTL_MS,
   type AttachmentView,
   type AttachVia,
   type Caller,
+  canonicalJson,
   checkImage,
   type ClientInfo,
   CLOSE_DETACH,
@@ -20,6 +23,7 @@ import {
   DEFAULT_INVITE_LIFETIME_MS,
   encodeFrame,
   encodeValue,
+  escapeUnseen,
   IdSchema,
   IDLE_TIMEOUT_MS,
   type ImageMimeType,
@@ -30,6 +34,7 @@ import {
   inviteLink,
   type InviteListing,
   type InviteRefusalReason,
+  INVITEE_ID_PREFIX,
   INVITEE_SHORT_ID_CHARS,
   type JsonObject,
   JsonObjectSchema,
@@ -40,6 +45,8 @@ import {
   MAX_INVITE_USES,
   MAX_LIVE_INVITES_PER_PAGE,
   MAX_OBSERVERS_PER_PAGE,
+  MAX_PENDING_PROPOSALS_PER_PAGE,
+  MAX_PENDING_PROPOSALS_PER_USER,
   MAX_RESULT_CHARS,
   MAX_STATE_BYTES,
   MAX_TIMER_MS,
@@ -55,7 +62,11 @@ import {
   type Policy,
   type PolicyInput,
   PolicySchema,
+  PROPOSAL_TTL_MS,
+  proposalArgumentProblem,
   type ProposalPolicy,
+  type ProposalRefusal,
+  proposalsAdmit,
   PROTOCOL_VERSION,
   RECONNECT_MAX_MS,
   RECONNECT_MIN_MS,
@@ -992,6 +1003,23 @@ interface CallRecord {
     readonly port: AbortController;
     readonly pending: PendingConfirm;
   } | null;
+  /** The accepted proposal this call ran under, bound once from this page's own record (ADR 0042). */
+  proposal: HeldProposal | null;
+}
+
+/** This page's own record of a proposal (ADR 0042), in memory only. */
+interface HeldProposal {
+  readonly view: PendingProposal;
+  /** The page's own parsed copy, which an accepted run executes. */
+  readonly args: JsonObject;
+  /** What binds an invoke to it: the arguments as canonical JSON. */
+  readonly canonical: string;
+  /** Whether an agent token made the proposer's grant; such a proposer never proposes (C13). */
+  readonly agent: boolean;
+  state: 'pending' | 'accepted';
+  /** When the operator accepted it, on this page's clock. */
+  acceptedAt: number;
+  timer: unknown;
 }
 
 type Checked = { ok: true; tool: NormalisedTool } | { ok: false; refusal: Refusal };
@@ -2450,6 +2478,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     const now = clock();
     const deadlineMs = Math.min(frame.deadlineMs, MAX_DEADLINE_MS);
     const { userId, displayName, client } = frame.caller;
+    // ADR 0042: bound now, and spent, or never; check() refuses an invoke naming a proposal it did not bind.
+    const proposal = bindProposal(frame);
     const entry: ActivityEntry = Object.freeze({
       callId: frame.callId,
       time: now,
@@ -2461,8 +2491,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       durationMs: null,
       handlerRunning: false,
       image: null,
-      proposalId: null,
-      acceptedOnPage: false,
+      proposalId: proposal === null ? null : proposal.view.proposalId,
+      acceptedOnPage: proposal !== null,
     });
     const call: CallRecord = {
       frame,
@@ -2475,6 +2505,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       executing: false,
       deadline: null,
       confirm: null,
+      proposal,
     };
     calls.set(frame.callId, call);
     setState({ activity: [entry, ...state.activity].slice(0, ACTIVITY_LIMIT) });
@@ -2639,17 +2670,26 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    * S5, second check: the caller's role on this page, then the tool. It runs
    * when a call arrives and again when a write reaches the front of the
    * queue, since the roster, the grants and the tools may have changed while
-   * it waited.
+   * it waited. An observer's write runs only as a proposal this page's own
+   * record shows the operator accepted (ADR 0042), never on the relay's word,
+   * and only while the policy in force still takes proposals from them.
    */
-  function check(frame: InvokeFrame, snapshot: ToolSnapshot | null): Checked {
+  function check(call: CallRecord, snapshot: ToolSnapshot | null): Checked {
+    const { frame, proposal } = call;
     const role = callerRole(frame.caller);
     if (role === null) {
       return refuse('role_denied', 'the operator has not approved this caller on this page');
     }
+    if (
+      frame.proposal !== undefined &&
+      (proposal === null || !takesFrom(frame.caller.userId, proposal.agent))
+    ) {
+      return refuse('role_denied', 'the page holds no accepted proposal for this call');
+    }
     if (!snapshot) return refuse('tool_error', 'the page could not list its tools');
     const tool = snapshot.byName.get(frame.tool);
     if (!tool) return refuse('tool_not_found', `no tool named ${frame.tool}`);
-    if (role === 'observer' && !isReadOnly(tool.page)) {
+    if (role === 'observer' && proposal === null && !isReadOnly(tool.page)) {
       return refuse('role_denied', 'observers may only run read-only tools');
     }
     return { ok: true, tool };
@@ -2663,7 +2703,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   async function admit(call: CallRecord): Promise<void> {
     const snapshot = await readTools();
     if (isDone(call)) return;
-    const checked = check(call.frame, snapshot);
+    const checked = check(call, snapshot);
     if (!checked.ok) {
       finish(call, checked.refusal);
       return;
@@ -2709,7 +2749,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   async function runWrite(call: CallRecord): Promise<void> {
     const snapshot = await readTools();
     if (isDone(call)) return;
-    const checked = check(call.frame, snapshot);
+    const checked = check(call, snapshot);
     if (!checked.ok) {
       finish(call, checked.refusal);
       return;
@@ -2735,9 +2775,21 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       return;
     }
     let byClient = rule === 'confirm' && takesClientConfirmation(call);
+    // ADR 0042: the operator's armed Accept on the page was this call's
+    // confirmation (S6), so the page does not ask again; under deny it was
+    // refused above all the same.
+    const accepted = rule === 'confirm' && call.proposal !== null;
+    if (accepted) {
+      logCall(
+        call,
+        `accepted on the page as proposal ${call.proposal?.view.proposalId ?? ''}, so the page did not ask again`,
+      );
+    }
     // ADR 0039: the operator answers before an image call waits at the gate,
     // so a prompt left open holds no other capture back.
-    if (rule === 'confirm' && !byClient && !(await operatorAllows(call, snapshot))) return;
+    if (rule === 'confirm' && !byClient && !accepted && !(await operatorAllows(call, snapshot))) {
+      return;
+    }
     const imageTool = policy.imageTools.includes(tool.page.name);
     if (imageTool) {
       if (!(await takeImageSlot(call, snapshot))) return;
@@ -2759,7 +2811,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     let outcome: Outcome;
     let unwatched = false;
     try {
-      const value = await execute(tool.runtime, frame.arguments, call);
+      // An accepted proposal runs the page's own copy, which its invoke had to match.
+      const value = await execute(tool.runtime, call.proposal?.args ?? frame.arguments, call);
       outcome = imageTool
         ? imageOutcome(resultText(value))
         : { ok: true, content: resultText(value) };
@@ -2927,7 +2980,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   /** check() once more after an await, since the roster, grants and tools may have changed. */
   function checkedAgain(call: CallRecord, snapshot: ToolSnapshot): boolean {
     if (isDone(call)) return false;
-    const again = check(call.frame, snapshot);
+    const again = check(call, snapshot);
     if (!again.ok) finish(call, again.refusal);
     return again.ok;
   }
@@ -3906,23 +3959,289 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     pumpImages();
   }
 
-  // Proposals (ADR 0042)
-  // M6 seam: not built
-  const onProposal: (frame: ProposalFrame) => void = () => undefined;
-  // M6 seam: not built
-  const onProposalEnd: (frame: ProposalEndFrame) => void = () => undefined;
-  // M6 seam: not built
-  const proposalsRoster = (): void => undefined;
-  // M6 seam: not built
-  const proposalsLinkDown = (): void => undefined;
-  // M6 seam: not built
-  const proposalsRevoked: (target: string) => void = () => undefined;
-  // M6 seam: not built
-  const acceptProposal: Dock['acceptProposal'] = () => false;
-  // M6 seam: not built
-  const dismissProposal: Dock['dismissProposal'] = () => false;
-  // M6 seam: not built
-  const dismissAllProposals: Dock['dismissAllProposals'] = () => 0;
+  // Proposals (ADR 0042). An observer's write reaches the page as a proposal
+  // frame, never an invoke. The page takes it only under its own policy and
+  // role rules, never from an agent token's caller (C13), and keeps its own
+  // record of it in memory alone, never in storage, so a reload or a lost
+  // link leaves nothing to accept (decision 12). The operator's Accept,
+  // armed in the widget, is that call's confirmation (S6); the relay then
+  // queues the call, and its invoke runs only against this page's record of
+  // that Accept: the same caller, tool and canonical arguments, once, within
+  // ACCEPTED_PROPOSAL_RUN_MS (S5). Arguments are shown, never logged.
+  const proposals = new Map<string, HeldProposal>();
+
+  function showProposals(): void {
+    setState({
+      proposals: [...proposals.values()]
+        .filter((held) => held.state === 'pending')
+        .map((held) => held.view),
+    });
+  }
+
+  /** Whether the policy in force, a session's narrowing included, takes proposals from this caller. */
+  function takesFrom(userId: string, agent: boolean): boolean {
+    return proposalsAdmit(effective().proposals, {
+      kind: isInvitee(userId) ? 'invitee' : 'member',
+      agent,
+    });
+  }
+
+  /**
+   * Whether an agent token made this caller's grant (ADR 0044): an agent's id
+   * is drawn from the page's id and the token's, so this page tells one from
+   * its own grant, whatever the relay says.
+   */
+  async function isAgent(userId: string): Promise<boolean> {
+    const tokenId = grants.get(userId)?.inviteId;
+    const pageId = grantsPage;
+    if (!isInvitee(userId) || tokenId === undefined || pageId === null || !webCrypto) return false;
+    const hash = await sha256Hex(webCrypto, agentKeyInput(pageId, tokenId));
+    return userId === `${INVITEE_ID_PREFIX}${hash.slice(0, 32)}`;
+  }
+
+  /** Why this page will not take the proposal now, or null; read before and after every await. */
+  function proposalProblem(frame: ProposalFrame, agent: boolean): ProposalRefusal | null {
+    const { userId } = frame.proposer;
+    if (agent) return 'role';
+    if (!takesFrom(userId, agent)) return 'policy';
+    const listed = state.roster.find((attachment) => attachment.userId === userId);
+    if (listed === undefined || pageRole(userId, listed.role) !== 'observer') return 'role';
+    if (proposalArgumentProblem(frame.arguments) !== null) return 'too_large';
+    let mine = 0;
+    let all = 0;
+    for (const held of proposals.values()) {
+      if (held.state !== 'pending') continue;
+      all += 1;
+      if (held.view.proposer.userId === userId) mine += 1;
+    }
+    if (mine >= MAX_PENDING_PROPOSALS_PER_USER || all >= MAX_PENDING_PROPOSALS_PER_PAGE) {
+      return 'limit';
+    }
+    return null;
+  }
+
+  function onProposal(frame: ProposalFrame): void {
+    void takeProposal(frame);
+  }
+
+  async function takeProposal(frame: ProposalFrame): Promise<void> {
+    const { proposalId, tool, proposer } = frame;
+    const named = `proposal ${proposalId} ${tool} by ${logName(proposer)}`;
+    if (proposals.has(proposalId)) {
+      log.warn(`ignored a repeated ${named}`);
+      return;
+    }
+    const link = socket;
+    const refuse = (refused: ProposalRefusal): void => {
+      log.info(`${named}: refused (${refused})`);
+      send({ t: 'proposal_decision', proposalId, accept: false, refused });
+    };
+    const agent = await isAgent(proposer.userId);
+    const first = proposalProblem(frame, agent);
+    if (first !== null) {
+      refuse(first);
+      return;
+    }
+    const snapshot = await readTools();
+    // A link that ended meanwhile took the proposal with it, on both sides.
+    if (socket !== link || !isLinked() || proposals.has(proposalId)) return;
+    const runtime = snapshot?.byName.get(tool);
+    const canonical = canonicalJson(frame.arguments);
+    const problem =
+      proposalProblem(frame, agent) ??
+      (runtime === undefined || isReadOnly(runtime.page) ? 'tool' : null) ??
+      (canonical === null ? 'too_large' : null);
+    if (problem !== null || runtime === undefined || snapshot === null || canonical === null) {
+      refuse(problem ?? 'tool');
+      return;
+    }
+    const consequential = isConsequential(runtime.page, snapshot.hintSupport, policy);
+    if (consequential && policy.consequential === 'deny') {
+      refuse('consequential');
+      return;
+    }
+    const now = clock();
+    const shown = escapeUnseen(encodeValue(frame.arguments) ?? '{}');
+    const held: HeldProposal = {
+      view: Object.freeze({
+        proposalId,
+        tool,
+        proposer: Object.freeze({
+          ...proposer,
+          client: proposer.client && Object.freeze({ ...proposer.client }),
+        }),
+        arguments: shown,
+        argumentChars: shown.length,
+        consequential,
+        receivedAt: now,
+        expiresAt: Math.min(frame.expiresAt, now + PROPOSAL_TTL_MS),
+      }),
+      args: frame.arguments,
+      canonical,
+      agent,
+      state: 'pending',
+      acceptedAt: 0,
+      timer: null,
+    };
+    held.timer = timers.setTimeout(
+      () => {
+        settleProposal(held, 'expired', null);
+      },
+      Math.max(0, held.view.expiresAt - now),
+    );
+    proposals.set(proposalId, held);
+    showProposals();
+    if (state.pageId !== null) recorder.proposal(held.view, state.pageId);
+    log.info(`${named}: waiting for the operator`);
+  }
+
+  /** The proposal leaves this page's record for its log, and the session record hears how (ADR 0045). */
+  function settleProposal(
+    held: HeldProposal,
+    outcome: ProposalOutcome,
+    callId: string | null,
+  ): void {
+    const { proposalId, tool, proposer } = held.view;
+    if (proposals.get(proposalId) !== held) return;
+    proposals.delete(proposalId);
+    timers.clearTimeout(held.timer);
+    const entry: ProposalLogEntry = Object.freeze({
+      proposalId,
+      tool,
+      proposer: Object.freeze({ userId: proposer.userId, displayName: proposer.displayName }),
+      client: proposer.client,
+      outcome,
+      callId,
+      time: clock(),
+    });
+    setState({ proposalLog: [entry, ...state.proposalLog].slice(0, ACTIVITY_LIMIT) });
+    showProposals();
+    recorder.proposalSettled(entry);
+    log.info(`proposal ${proposalId} ${tool} by ${logName(proposer)}: ${outcome}`);
+  }
+
+  /**
+   * S5 for an invoke naming a proposal: the page's own record of the
+   * operator's Accept, for this caller, tool and arguments, within
+   * ACCEPTED_PROPOSAL_RUN_MS of it. A match is spent at once, so a second
+   * invoke under the same proposal finds nothing; anything else binds
+   * nothing, and check() refuses the call.
+   */
+  function bindProposal(frame: InvokeFrame): HeldProposal | null {
+    const proposalId = frame.proposal?.proposalId;
+    if (proposalId === undefined) return null;
+    const held = proposals.get(proposalId);
+    if (
+      held?.state !== 'accepted' ||
+      clock() > held.acceptedAt + ACCEPTED_PROPOSAL_RUN_MS ||
+      held.view.proposer.userId !== frame.caller.userId ||
+      held.view.tool !== frame.tool ||
+      held.canonical !== canonicalJson(frame.arguments)
+    ) {
+      log.warn(
+        `call ${frame.callId} names proposal ${proposalId}, which this page holds no Accept for`,
+      );
+      return null;
+    }
+    settleProposal(held, 'accepted', frame.callId);
+    return held;
+  }
+
+  function onProposalEnd(frame: ProposalEndFrame): void {
+    const held = proposals.get(frame.proposalId);
+    if (held === undefined) return;
+    const { reason } = frame;
+    settleProposal(
+      held,
+      held.state === 'accepted' || reason === 'not_run'
+        ? 'not_run'
+        : reason === 'withdrawn' || reason === 'expired'
+          ? reason
+          : 'cancelled',
+      null,
+    );
+    // The relay narrowed the policy: whatever else it no longer admits goes too.
+    if (reason === 'policy') proposalsPolicyChanged();
+  }
+
+  /** Proposals of those the page no longer lists, or no longer runs anything for, end with them. */
+  const proposalsRoster = (): void => {
+    for (const held of [...proposals.values()]) {
+      const { userId } = held.view.proposer;
+      const listed = state.roster.find((attachment) => attachment.userId === userId);
+      if (listed === undefined || pageRole(userId, listed.role) === null) {
+        settleProposal(held, 'cancelled', null);
+      }
+    }
+  };
+
+  const proposalsLinkDown = (): void => {
+    for (const held of [...proposals.values()]) settleProposal(held, 'cancelled', null);
+  };
+
+  const proposalsRevoked = (target: string): void => {
+    for (const held of [...proposals.values()]) {
+      if (target === '*' || held.view.proposer.userId === target) {
+        settleProposal(held, 'cancelled', null);
+      }
+    }
+  };
+
+  /** A session that narrowed proposals ends the pending ones it no longer admits (ADR 0043). */
+  function proposalsPolicyChanged(): void {
+    for (const held of [...proposals.values()]) {
+      if (held.state === 'pending' && !takesFrom(held.view.proposer.userId, held.agent)) {
+        settleProposal(held, 'cancelled', null);
+      }
+    }
+  }
+
+  /**
+   * The operator's Accept: only while the proposal waits, before its end,
+   * on a linked page that is not paused (decision 13), for a proposer the
+   * page still lists and the policy still admits.
+   */
+  const acceptProposal: Dock['acceptProposal'] = (proposalId) => {
+    const held = typeof proposalId === 'string' ? proposals.get(proposalId) : undefined;
+    if (held?.state !== 'pending' || state.paused || !isLinked()) return false;
+    const { userId } = held.view.proposer;
+    const listed = state.roster.find((attachment) => attachment.userId === userId);
+    if (
+      clock() >= held.view.expiresAt ||
+      listed === undefined ||
+      pageRole(userId, listed.role) === null ||
+      !takesFrom(userId, held.agent) ||
+      !send({ t: 'proposal_decision', proposalId: held.view.proposalId, accept: true })
+    ) {
+      return false;
+    }
+    held.state = 'accepted';
+    held.acceptedAt = clock();
+    timers.clearTimeout(held.timer);
+    // An Accept no invoke binds in time ends as not run.
+    held.timer = timers.setTimeout(() => {
+      settleProposal(held, 'not_run', null);
+    }, ACCEPTED_PROPOSAL_RUN_MS);
+    showProposals();
+    log.info(`the operator accepted proposal ${held.view.proposalId}`);
+    return true;
+  };
+
+  const dismissProposal: Dock['dismissProposal'] = (proposalId) => {
+    const held = typeof proposalId === 'string' ? proposals.get(proposalId) : undefined;
+    if (held?.state !== 'pending') return false;
+    send({ t: 'proposal_decision', proposalId: held.view.proposalId, accept: false });
+    settleProposal(held, 'dismissed', null);
+    return true;
+  };
+
+  const dismissAllProposals: Dock['dismissAllProposals'] = () => {
+    let dismissed = 0;
+    for (const held of [...proposals.values()]) {
+      if (dismissProposal(held.view.proposalId)) dismissed += 1;
+    }
+    return dismissed;
+  };
 
   // Time-boxed sessions (ADR 0043)
   // M6 seam: not built

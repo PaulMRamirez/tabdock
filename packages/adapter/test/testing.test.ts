@@ -566,6 +566,26 @@ describe('arming and the hit test', () => {
     expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: 260, y: 150 });
   });
 
+  it('presses one proposal’s Accept by its id, where every row repeats the button (ADR 0042)', async () => {
+    const row = (proposalId: string, top: number): FakeNode =>
+      el(
+        'li',
+        { 'data-proposal-id': proposalId },
+        [
+          button('proposal-accept', { x: 10, y: top + 40, width: 80, height: 20 }, true),
+          button('proposal-dismiss', { x: 100, y: top + 40, width: 80, height: 20 }, true),
+        ],
+        { x: 0, y: top, width: 300, height: 80 },
+      );
+    const cdp = new FakeSession(documentOf(dock([row('pr_1', 0), row('pr_2', 100)])));
+    await expect(clickInWidget(cdp, { action: 'proposal-accept' })).rejects.toThrow(
+      new WidgetTestError('2 proposal-accept buttons match, so none is pressed'),
+    );
+    expect(cdp.mouse()).toEqual([]);
+    await clickInWidget(cdp, { action: 'proposal-accept', proposalId: 'pr_2' });
+    expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: 50, y: 150 });
+  });
+
   it('refuses an action the widget does not have', async () => {
     const cdp = new FakeSession(documentOf(dock([])));
     const target = { action: 'approve-everyone' } as unknown as Parameters<typeof clickInWidget>[1];

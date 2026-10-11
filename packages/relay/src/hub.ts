@@ -58,6 +58,10 @@ import {
   MAX_INVITE_LIFETIME_MS,
   MAX_LIVE_INVITES_PER_PAGE,
   MAX_MEMBERS,
+  MAX_PENDING_PROPOSALS_PER_PAGE,
+  MAX_PENDING_PROPOSALS_PER_USER,
+  MAX_PROPOSAL_ARGUMENT_BYTES,
+  MAX_PROPOSAL_ARGUMENT_NODES,
   MAX_RESULT_CHARS,
   MAX_STATE_BYTES,
   MAX_STATE_FRAME_BYTES,
@@ -71,6 +75,10 @@ import {
   type PageTool,
   type Pairing,
   parsePageFrame,
+  PROPOSAL_OUTCOME_KEEP_MS,
+  proposalArgumentProblem,
+  type ProposalEndReason,
+  proposalsAdmit,
   type RelayFrame,
   type Role,
   type SessionEndReason,
@@ -115,7 +123,15 @@ import type { LogFields, Logger, LogLevel } from './log.ts';
 import type { MemberChange } from './members.ts';
 import { PageParts } from './page-parts.ts';
 import { PageStates, type StateView } from './page-state.ts';
-import { PageProposals } from './proposals.ts';
+import {
+  madeByAgentToken,
+  PageProposals,
+  PROPOSAL_PLACE_HOLD_MS,
+  proposalCharge,
+  type ProposalCloseReason,
+  type ProposalOutcome,
+  type ProposalRecord,
+} from './proposals.ts';
 import { SlidingWindowLimiter } from './rate-limit.ts';
 import { RepeatedLines } from './repeated-lines.ts';
 import { childPosition, SCHEMA_TEXT_KEYS, type SchemaPosition } from './schema-keywords.ts';
@@ -499,10 +515,15 @@ export type ProposalAnswer =
       tool: string;
       status: ProposalStatus;
       /** For an accepted proposal: running, or how its run ended. */
-      outcome?: 'running' | 'ok' | 'tool_error' | ErrorCode;
+      outcome?: ProposalOutcome;
+      /** While it is pending. */
       expiresAt?: number;
       /** An accepted run's result, cut to MAX_PROPOSAL_RESULT_CHARS: page text, shown only behind its label. */
       result?: { text: string; cut: boolean };
+      /** The run returned an image, which proposals never keep (ADR 0039). */
+      image?: true;
+      /** The run's result was kept and later dropped to make room (S9). */
+      dropped?: true;
     }
   | HubError;
 
@@ -913,6 +934,15 @@ export const MAX_UNREAD_FRAMES = 256;
  * everything else, and what else the relay sends a page is far smaller.
  */
 export const INVOKE_ROOM = MAX_FRAME_BYTES;
+/**
+ * The most a page's queue may hold, a proposal frame included, for an
+ * observer's proposal to go out (ADR 0042). A proposal answers its caller
+ * at once rather than waiting for room as an invoke does, so past this it
+ * is refused page_busy and never closes a page; a quarter of INVOKE_ROOM
+ * leaves members' calls most of theirs on a page reading over a slow link,
+ * and a proposal at its argument caps, about 17 KB, always fits.
+ */
+export const PROPOSAL_ROOM = INVOKE_ROOM / 4;
 const MAX_ROSTER_CLIENTS = 20;
 /**
  * Each call moves its attachment's expiresAt, but the roster carrying it is
@@ -972,6 +1002,51 @@ const WAIT_REFUSALS: Record<'user' | 'page' | 'invitee', string> = {
   invitee:
     'invited accounts already hold as many waits on this page as they may; try again shortly',
 };
+
+/** What a proposal refused by proposals.ts answers, by the limit that refused it (ADR 0042, S9). */
+const PROPOSAL_REFUSALS: Record<'user' | 'page' | 'recent' | 'share' | 'relay', string> = {
+  user: `you already have ${String(MAX_PENDING_PROPOSALS_PER_USER)} proposals waiting on this page; wait for the operator, or withdraw one with withdraw_proposal`,
+  page: `this page already has ${String(MAX_PENDING_PROPOSALS_PER_PAGE)} proposals waiting for its operator; try again later`,
+  recent: `proposals withdrawn or refused on this page keep their places for ${formatDuration(PROPOSAL_PLACE_HOLD_MS)}, so the page is not asked too often; try again shortly`,
+  share:
+    "your proposals waiting across pages already hold as much of the relay's memory as one user's may; wait for their operators, or withdraw one with withdraw_proposal",
+  relay: 'the relay holds as many proposals as it can; try again later',
+};
+
+/** The relay's line for each way a proposal ends unaccepted (ADR 0042); never its arguments. */
+const PROPOSAL_END_LINES: Record<ProposalCloseReason, string> = {
+  dismissed: 'proposal dismissed',
+  refused: 'proposal refused by the page',
+  expired: 'proposal expired',
+  withdrawn: 'proposal withdrawn',
+  cancelled: 'proposal cancelled',
+};
+
+/**
+ * What get_proposal and withdraw_proposal answer for an unknown id and for
+ * another user's alike, after the access check (S13): an id is a name.
+ */
+const NO_SUCH_PROPOSAL = `you have no proposal by that id on this page: it never existed, is not yours, or ended more than ${formatDuration(PROPOSAL_OUTCOME_KEEP_MS)} ago`;
+
+/** An accepted proposal's run has no request of its own for a client to cancel. */
+const NEVER_ABORTED = new AbortController().signal;
+
+/** A proposal as its proposer reads it: never its arguments, and an accepted run's text only. */
+function proposalAnswer(record: ProposalRecord): ProposalAnswer {
+  return {
+    kind: 'proposal',
+    pageId: record.pageId,
+    origin: record.origin,
+    proposalId: record.proposalId,
+    tool: record.tool,
+    status: record.status,
+    ...(record.outcome === null ? {} : { outcome: record.outcome }),
+    ...(record.status === 'pending' ? { expiresAt: record.expiresAt } : {}),
+    ...(record.result === null ? {} : { result: { ...record.result } }),
+    ...(record.image ? { image: true as const } : {}),
+    ...(record.dropped ? { dropped: true as const } : {}),
+  };
+}
 
 function notAttached(pageId: string): HubError {
   return hubError('not_attached', `you are not attached to page ${pageId}`);
@@ -1370,6 +1445,8 @@ export class PageHub {
   readonly #parts: PageParts;
   /** Each page's published state and the waits on it (ADR 0040), one of #parts. */
   readonly #states: PageStates;
+  /** Observers' proposals and the outcomes kept for them (ADR 0042), one of #parts. */
+  readonly #proposals: PageProposals;
   /**
    * The slots waiting fixed tool calls take, shared by wait_for_page_state
    * and get_proposal (waits.ts, conflict C2 of the M6 plan).
@@ -1456,7 +1533,15 @@ export class PageHub {
     });
     this.#states = new PageStates(config.limits.stateBytes);
     this.#waits = new WaitSlots(waitLimitsOf(config));
-    this.#parts = new PageParts([this.#states, new PageProposals(), new AgentTokens()]);
+    this.#proposals = new PageProposals({
+      ttlMs: config.timings.proposalTtlMs,
+      budgetBytes: config.limits.proposalBytes,
+      ended: (record, reason, frame) => {
+        this.#proposalEnded(record, reason, frame);
+      },
+      admitted: (record) => this.#stillProposes(record),
+    });
+    this.#parts = new PageParts([this.#states, this.#proposals, new AgentTokens()]);
   }
 
   /**
@@ -1792,10 +1877,126 @@ export class PageHub {
     this.#closeSocket(conn, CLOSE_TOO_LARGE, 'page state too large');
   }
 
-  /** The operator's answer to a proposal (ADR 0042); false when it named none of the page's. */
+  /**
+   * The operator's answer to a proposal, or the page's own refusal of it
+   * (ADR 0042); false when it named none of the page's. A decision for one
+   * that already ended (it expired, was withdrawn or was cancelled while the
+   * operator looked) is expected, as for attach requests (#justEnded). An
+   * Accept runs the proposer's call through the write queue now, so accepted
+   * proposals enter it in the order the operator accepts them (decision 20).
+   */
   #proposalDecision(pageId: string, frame: FrameOf<'proposal_decision'>): boolean {
-    // M6 seam: not built. No proposal is ever made, so none is decided.
-    return this.#notActedOn(pageId, frame.t);
+    const record = this.#proposals.byId(frame.proposalId);
+    if (record === undefined) {
+      this.#log.warn('ignored a decision for an unknown proposal', { pageId });
+      return false;
+    }
+    const { proposalId, tool } = record;
+    if (record.pageId !== pageId) {
+      this.#log.warn("ignored a decision for another page's proposal", { pageId, proposalId });
+      return false;
+    }
+    const fields = { pageId, userId: record.proposer.userId, proposalId, tool };
+    if (record.status !== 'pending') {
+      this.#log.debug('decision for a proposal that already ended', fields);
+      return true;
+    }
+    if (frame.accept) {
+      this.#log.info('proposal accepted on the page', fields);
+      void this.#runAccepted(record);
+      return true;
+    }
+    this.#proposals.end(record, frame.refused === undefined ? 'dismissed' : 'refused', null);
+    return true;
+  }
+
+  /**
+   * A proposal ended unaccepted (proposals.ts): the page hears why when it
+   * did not decide itself and is still there to hear it, and the audit log
+   * gets its proposal_closed line, in full, beside the call line that made
+   * it (S7). Never its arguments.
+   */
+  #proposalEnded(
+    record: ProposalRecord,
+    reason: ProposalCloseReason,
+    frame: ProposalEndReason | null,
+  ): void {
+    const { pageId, proposalId, tool } = record;
+    const userId = record.proposer.userId;
+    const live = frame === null ? null : this.#livePage(pageId);
+    if (live !== null && frame !== null) {
+      this.#sendProposalFrame(
+        live.conn,
+        encodeFrame({ t: 'proposal_end', proposalId, reason: frame }),
+      );
+    }
+    this.#audit({
+      v: AUDIT_VERSION,
+      type: 'proposal_closed',
+      at: Date.now(),
+      pageId,
+      origin: record.origin,
+      proposalId,
+      userId,
+      tool,
+      reason,
+    });
+    this.#log.info(PROPOSAL_END_LINES[reason], { pageId, userId, proposalId, tool });
+  }
+
+  /**
+   * Whether the page takes proposals from this attachment's account under
+   * the policy in force (ADR 0042, a session's narrowing included): by
+   * account kind, and never from an agent token, by whichever sign the
+   * relay has of one (conflict C13).
+   */
+  #takesProposalsFrom(
+    page: PageRecord,
+    attachment: AttachmentRecord,
+    caller?: CallerIdentity,
+  ): boolean {
+    const agent = (caller?.agentPageId ?? null) !== null || madeByAgentToken(attachment);
+    return proposalsAdmit(page.policy.proposals, { kind: attachment.kind, agent });
+  }
+
+  /** Whether a pending proposal's proposer still holds the attachment it was made under, and may still propose. */
+  #stillProposes(record: ProposalRecord): boolean {
+    const page = this.#store.pages.get(record.pageId);
+    const attachment = this.#store.attachments.get(record.pageId, record.proposer.userId);
+    return (
+      page !== undefined &&
+      attachment?.grantedAt === record.grantedAt &&
+      this.#takesProposalsFrom(page, attachment, record.proposer)
+    );
+  }
+
+  /**
+   * What refuses an accepted proposal's run, looked at when it is accepted
+   * and again as its invoke goes out (#recheck): the attachment it was made
+   * under must still be the proposer's, so a revoke and a fresh approval
+   * never revive an old acceptance (S8); the page must still take proposals
+   * from them; and under deny a consequential tool runs for nobody (S6).
+   */
+  #proposalRefusal(
+    grantedAt: number,
+    caller: CallerIdentity,
+    page: PageRecord,
+    attachment: AttachmentRecord,
+    tool: PageTool,
+  ): HubError | null {
+    if (attachment.grantedAt !== grantedAt) {
+      return hubError('not_attached', 'the attachment you proposed under has ended');
+    }
+    if (!this.#takesProposalsFrom(page, attachment, caller)) {
+      return hubError('role_denied', 'the page no longer takes proposals from you');
+    }
+    if (page.policy.consequential === 'deny' && tool.consequential === true) {
+      return hubError(
+        'denied_by_operator',
+        `this page runs no consequential tools, so it runs no ${tool.name}`,
+      );
+    }
+    return null;
   }
 
   /** The operator starting, extending or ending a time-boxed session (ADR 0043); false when nothing changed. */
@@ -4100,6 +4301,9 @@ export class PageHub {
     const firstClass = this.#config.firstClassTools
       ? (this.#firstClassSnapshot(userId)?.names.get(pageId) ?? new Map<string, string>())
       : null;
+    // ADR 0042: an observer the page takes proposals from may propose what
+    // they may not run, so a model reading allowed: false still tries.
+    const proposes = attachment.role === 'observer' && this.#takesProposalsFrom(page, attachment);
     return {
       kind: 'tools',
       pageId,
@@ -4107,6 +4311,9 @@ export class PageHub {
       role: attachment.role,
       tools: page.tools.map((tool) => {
         const annotations = tool.annotations ?? {};
+        const allowed = attachment.role === 'driver' || annotations.readOnlyHint === true;
+        // Under deny a consequential tool is refused as a proposal too.
+        const denied = page.policy.consequential === 'deny' && tool.consequential === true;
         return {
           name: tool.name,
           ...(tool.title === undefined ? {} : { title: tool.title }),
@@ -4114,8 +4321,9 @@ export class PageHub {
           description: tool.description,
           inputSchema: tool.inputSchema,
           annotations,
-          allowed: attachment.role === 'driver' || annotations.readOnlyHint === true,
+          allowed,
           ...(firstClass === null ? {} : { firstClass: firstClass.get(tool.name) ?? null }),
+          ...(proposes && !allowed && !denied ? { proposable: true as const } : {}),
         };
       }),
     };
@@ -4208,32 +4416,108 @@ export class PageHub {
     }
   }
 
-  /* eslint-disable @typescript-eslint/no-unused-vars -- stubs: their bodies come with ADR 0042 */
-
   /**
-   * get_proposal (ADR 0042): the caller's own proposal on the page, waiting
-   * up to `waitMs` for it to change, with a wait slot as a state wait holds.
+   * get_proposal (ADR 0042): the caller's own proposal on the page, at once,
+   * or once it changes when `waitMs` asks to wait (a pending one leaves
+   * pending by a decision or an end, an accepted one's run settles), never
+   * past MAX_WAIT_MS or the call deadline. A wait holds one of the user's
+   * wait slots, shared with wait_for_page_state, and one of the page's
+   * (waits.ts, conflict C2), and its request's charge (#holdBytes); refused
+   * past either, it answers rate_limited with a request_refused record
+   * within the refusal budget (S7, S9). Whatever ends the proposer's
+   * attachment answers a wait at once (S8), as the page's sleep, reload or
+   * end does (SPEC section 7), and access is checked again after it.
    */
   async getProposal(
-    _caller: CallerIdentity,
-    _pageId: string,
-    _proposalId: string,
-    _waitMs: number,
-    _signal: AbortSignal,
-    _heldBytes: number,
+    caller: CallerIdentity,
+    pageId: string,
+    proposalId: string,
+    waitMs: number,
+    signal: AbortSignal,
+    heldBytes: number,
   ): Promise<ProposalAnswer> {
-    // M6 seam: not built.
-    await Promise.resolve();
-    throw new Error('M6 seam: not built');
+    const { userId } = caller;
+    const found = this.#ownProposal(userId, pageId, proposalId);
+    if (found.kind === 'error') return found;
+    const { record } = found;
+    const settled = record.status !== 'pending' && record.outcome !== 'running';
+    if (waitMs <= 0 || settled) return proposalAnswer(record);
+    const slot = this.#waits.take(userId, pageId, caller.account.kind === 'invitee');
+    if (typeof slot === 'string') {
+      this.#log.debug('proposal wait refused: too many waits', { userId, pageId, limit: slot });
+      this.refusedByBudget(caller, { tool: 'get_proposal', page: pageId });
+      return hubError('rate_limited', WAIT_REFUSALS[slot]);
+    }
+    const held = this.#holdBytes(caller, heldBytes, 'rate_limited');
+    if (held.kind === 'error') {
+      slot.release();
+      this.refusedByBudget(caller, { tool: 'get_proposal', page: pageId });
+      return held;
+    }
+    try {
+      const ms = Math.min(waitMs, MAX_WAIT_MS, this.#config.timings.callDeadlineMs);
+      this.#log.debug('proposal wait started', { userId, pageId, proposalId, waitMs: ms });
+      const ended = await this.#proposals.wait(record, ms, signal);
+      if (ended.kind === 'error') return ended;
+      if (ended.kind === 'cancelled') return hubError('timeout', 'the wait was cancelled');
+      const again = this.#ownProposal(userId, pageId, proposalId);
+      return again.kind === 'error' ? again : proposalAnswer(again.record);
+    } finally {
+      held.release();
+      slot.release();
+    }
   }
 
-  /** withdraw_proposal (ADR 0042): a pending proposal of the caller's ends; any other answers as it stands. */
-  withdrawProposal(_caller: CallerIdentity, _pageId: string, _proposalId: string): ProposalAnswer {
-    // M6 seam: not built.
-    throw new Error('M6 seam: not built');
+  /**
+   * withdraw_proposal (ADR 0042): a pending proposal of the caller's ends,
+   * the page hears so and the log closes it; any other answers as it stands,
+   * so a second withdrawal, or one that crossed the operator's Accept, is
+   * harmless (idempotentHint).
+   */
+  withdrawProposal(caller: CallerIdentity, pageId: string, proposalId: string): ProposalAnswer {
+    const found = this.#ownProposal(caller.userId, pageId, proposalId);
+    if (found.kind === 'error') return found;
+    if (found.record.status === 'pending') {
+      this.#proposals.end(found.record, 'withdrawn', 'withdrawn');
+    }
+    return proposalAnswer(found.record);
   }
 
-  /* eslint-enable @typescript-eslint/no-unused-vars */
+  /**
+   * The caller's own proposal on a page they are attached to, asleep or
+   * awake, under the attachment it was made under. A gone page answers
+   * page_gone to its former users and anyone else not_attached, as the
+   * access check does; then an unknown id and another user's answer
+   * proposal_not_found in the same words, since an id is a name and never a
+   * capability (S13).
+   */
+  #ownProposal(
+    userId: string,
+    pageId: string,
+    proposalId: string,
+  ): { kind: 'ok'; record: ProposalRecord } | HubError {
+    const attachment = this.#chainInTime(pageId, userId)
+      ? this.#store.attachments.get(pageId, userId)
+      : undefined;
+    const page = this.#store.pages.get(pageId);
+    if (attachment === undefined || page === undefined || page.state === 'gone') {
+      if (
+        page?.state === 'gone' &&
+        page.formerAttachments.some((entry) => entry.userId === userId)
+      ) {
+        return hubError(
+          'page_gone',
+          'the page closed and did not come back; its attachments are gone',
+        );
+      }
+      return notAttached(pageId);
+    }
+    const record = this.#proposals.find(pageId, proposalId, Date.now());
+    if (record?.proposer.userId !== userId || record.grantedAt !== attachment.grantedAt) {
+      return hubError('proposal_not_found', NO_SUCH_PROPOSAL);
+    }
+    return { kind: 'ok', record };
+  }
 
   /**
    * `heldBytes` as for callPageTool: the request waits for the operator, so
@@ -5192,6 +5476,12 @@ export class PageHub {
       }
       // S5, relay half: observers run only tools the page marked read-only.
       if (attachment.role === 'observer' && tool.annotations?.readOnlyHint !== true) {
+        // ADR 0042: where the page takes proposals from this caller, the
+        // write waits for the operator as a proposal instead, never as an
+        // invoke. A call confirmed in a client is no proposal (decision 18).
+        if (confirmation === null && this.#takesProposalsFrom(page, attachment, caller)) {
+          return this.#propose(caller, page, attachment, tool, args, trace);
+        }
         return hubError(
           'role_denied',
           `you are an observer on this page, and ${toolName} is not marked read-only`,
@@ -5466,6 +5756,274 @@ export class PageHub {
     );
   }
 
+  /**
+   * An observer's write on a page that takes proposals from them (ADR 0042):
+   * refused at once under deny for a consequential tool, past the argument
+   * caps or past the proposal limits; otherwise its arguments are checked
+   * against the tool's schema, everything that let it become a proposal is
+   * looked at again after that wait, and the page gets a proposal frame,
+   * never an invoke. Every refusal is a call line within the refusal budget;
+   * a proposal made reached its page, so its line is written in full, with
+   * outcome proposed and its id (S7). The call has already spent the
+   * caller's calls on this page and holds its request's charge until it
+   * answers, which is now: the operator decides later, on the page.
+   */
+  async #propose(
+    caller: CallerIdentity,
+    page: PageRecord,
+    attachment: AttachmentRecord,
+    tool: PageTool,
+    args: JsonObject,
+    trace: CallTrace,
+  ): Promise<CallOutcome> {
+    const { pageId } = page;
+    const { userId } = caller;
+    if (page.policy.consequential === 'deny' && tool.consequential === true) {
+      return hubError(
+        'denied_by_operator',
+        `this page runs no consequential tools, so it takes no proposal for ${tool.name}`,
+      );
+    }
+    if (proposalArgumentProblem(args) !== null) {
+      return hubError(
+        'invalid_arguments',
+        `a proposal's arguments may hold at most ${String(MAX_PROPOSAL_ARGUMENT_BYTES)} bytes and ${String(MAX_PROPOSAL_ARGUMENT_NODES)} values`,
+      );
+    }
+    // ADR 0044: a watcher's proposal reaches the operator's tab as a call
+    // would, so it spends the watchers' share of the page's calls.
+    const share = this.#watchingShareRefusal(pageId, attachment);
+    if (share !== null) return share;
+    const reservation = this.#proposals.reserve(pageId, userId, proposalCharge(args), Date.now());
+    if (typeof reservation === 'string') {
+      this.#log.warn('proposal refused: too many proposals', {
+        pageId,
+        userId,
+        limit: reservation,
+      });
+      return hubError('rate_limited', PROPOSAL_REFUSALS[reservation]);
+    }
+    let made = false;
+    try {
+      const argumentError = await this.#checkArguments(pageId, tool.name, args);
+      if (argumentError) return argumentError;
+      // The check waited on the worker: the caller may have been revoked,
+      // promoted or approved afresh, or the page may have changed its tools
+      // or its policy, meanwhile (S5, S8).
+      const access = this.#access(userId, pageId);
+      if (access.kind === 'error') return access;
+      const now = access.page.tools.find((candidate) => candidate.name === tool.name);
+      if (now === undefined) {
+        return hubError('tool_not_found', `page ${pageId} has no tool named ${tool.name}`);
+      }
+      const refused = this.#proposalRefusal(
+        attachment.grantedAt,
+        caller,
+        access.page,
+        access.attachment,
+        now,
+      );
+      if (refused !== null) return refused;
+      if (access.attachment.role !== 'observer' || now.annotations?.readOnlyHint === true) {
+        return hubError(
+          'page_busy',
+          'your standing on this page or its tools changed while the proposal was checked; call again',
+        );
+      }
+      const proposalId = newId('pr');
+      const createdAt = Date.now();
+      const expiresAt = this.#proposals.expiresAt(createdAt);
+      const text = encodeFrame({
+        t: 'proposal',
+        proposalId,
+        tool: tool.name,
+        arguments: args,
+        proposer: {
+          userId,
+          displayName: caller.displayName,
+          client: caller.client,
+          role: access.attachment.role,
+        },
+        expiresAt,
+      });
+      if (!this.#roomForProposal(access.conn, Buffer.byteLength(text, 'utf8'))) {
+        this.#log.debug('proposal refused: the page has not read what it was sent', {
+          pageId,
+          userId,
+        });
+        return hubError(
+          'page_busy',
+          'the page has not yet taken in what it was sent, so it takes no proposal now; try again shortly',
+        );
+      }
+      this.#proposals.commit(reservation, {
+        proposalId,
+        origin: access.page.origin,
+        proposer: caller,
+        grantedAt: attachment.grantedAt,
+        tool: tool.name,
+        args,
+        createdAt,
+      });
+      made = true;
+      this.#sendProposalFrame(access.conn, text);
+      trace.reached = true;
+      trace.proposalId = proposalId;
+      this.#log.info('proposal made', { pageId, userId, proposalId, tool: tool.name });
+      return { kind: 'proposed', pageId, proposalId, tool: tool.name, expiresAt };
+    } finally {
+      if (!made) this.#proposals.release(reservation);
+    }
+  }
+
+  /**
+   * Whether a proposal frame of this many bytes may go out now (ADR 0042):
+   * onto an empty queue always, otherwise only while no call waits for room
+   * and the queue, the frame included, stays within PROPOSAL_ROOM and below
+   * MAX_UNREAD_FRAMES frames. A proposal waits for nothing, so without room
+   * it is refused, and what observers propose never closes a page (ADR 0024).
+   */
+  #roomForProposal(conn: Conn, bytes: number): boolean {
+    this.#observe(conn);
+    if (conn.held.length > 0) return false;
+    const queued = conn.ws.bufferedAmount;
+    return (
+      queued === 0 || (queued + bytes <= PROPOSAL_ROOM && conn.queue.frames < MAX_UNREAD_FRAMES)
+    );
+  }
+
+  /**
+   * A proposal frame, or the proposal_end that may follow it, goes out as an
+   * invoke or a cancel does: never counted toward closing the page. A
+   * proposal goes out only with room (#roomForProposal), and at most one
+   * proposal_end follows each, so the proposal limits bound them both; the
+   * relay's own small frames keep ADR 0024's count to themselves.
+   */
+  #sendProposalFrame(conn: Conn, text: string): void {
+    if (conn.ws.readyState !== conn.ws.OPEN) return;
+    this.#write(conn, false, (written) => {
+      conn.ws.send(text, written);
+    });
+  }
+
+  /**
+   * The operator accepted a proposal on the page (ADR 0042): its call takes
+   * its place at the end of the page's write queue now, so proposals run in
+   * the order the operator accepts them (decision 20), with the whole call
+   * deadline from the acceptance, every check a call passes, and an invoke
+   * naming the proposal, which the adapter runs only against its own record
+   * of that Accept (S5). Its call line names the proposer, marked accepted
+   * on the page, and is written in full however the run ends, since the
+   * operator acted (S7). What the run returns is kept for the proposer as
+   * text alone (decision 15).
+   */
+  async #runAccepted(record: ProposalRecord): Promise<void> {
+    if (!this.#proposals.accept(record)) return;
+    const started = Date.now();
+    const startedMono = performance.now();
+    const trace: CallTrace = {
+      reached: false,
+      release: null,
+      tool: record.tool,
+      confirmedBy: null,
+      callId: null,
+      image: null,
+      imageRefused: null,
+      proposalId: record.proposalId,
+      acceptedOnPage: true,
+    };
+    let auditOutcome: AuditOutcome = 'relay_error';
+    let ran: Exclude<ProposalOutcome, 'running'> = 'relay_error';
+    let result: { text: string; image: boolean } | null = null;
+    try {
+      const outcome = await this.#acceptedCall(record, trace);
+      switch (outcome.kind) {
+        case 'ok':
+          ran = 'ok';
+          result = { text: outcome.content, image: outcome.image !== undefined };
+          break;
+        case 'tool_error':
+          ran = 'tool_error';
+          result = { text: outcome.message, image: false };
+          break;
+        case 'error':
+          ran = outcome.code;
+          break;
+        default:
+          // Nothing aborts an accepted run, and it neither asks nor proposes.
+          throw new Error(`an accepted proposal's run ended as ${outcome.kind}`);
+      }
+      auditOutcome = ran;
+    } catch (error) {
+      this.#log.error('an accepted proposal failed inside the relay', {
+        pageId: record.pageId,
+        proposalId: record.proposalId,
+        error,
+      });
+    } finally {
+      this.#proposals.settleRun(record, ran, result);
+      // The page heard nothing of a run refused before its invoke, so its
+      // own record of the Accept ends now rather than at its own deadline.
+      const live = trace.reached ? null : this.#livePage(record.pageId);
+      if (live !== null) {
+        this.#sendProposalFrame(
+          live.conn,
+          encodeFrame({ t: 'proposal_end', proposalId: record.proposalId, reason: 'not_run' }),
+        );
+      }
+      this.#audit(
+        this.#callRecord(started, startedMono, record.pageId, record.proposer, trace, auditOutcome),
+      );
+    }
+  }
+
+  /** An accepted proposal's call, checked again as it starts, then queued like any write. */
+  async #acceptedCall(record: ProposalRecord, trace: CallTrace): Promise<CallOutcome> {
+    const { pageId, proposer, args } = record;
+    const access = this.#access(proposer.userId, pageId);
+    if (access.kind === 'error') return access;
+    const { page, attachment } = access;
+    const resolved = this.#resolveTool(page, attachment, record.tool);
+    if (resolved.kind === 'error') return resolved;
+    const { tool } = resolved;
+    const refused = this.#proposalRefusal(record.grantedAt, proposer, page, attachment, tool);
+    if (refused !== null) return refused;
+    if (args === null) throw new Error('an accepted proposal kept no arguments');
+    const arrivedAt = Date.now();
+    const call: PendingCall = {
+      callId: newId('cl'),
+      pageId,
+      caller: proposer,
+      toolName: tool.name,
+      args,
+      mutating: tool.annotations?.readOnlyHint !== true,
+      arrivedAt,
+      rosterAtArrival: false,
+      waited: false,
+      checking: false,
+      conn: null,
+      heldOn: null,
+      invokeBytes: 0,
+      confirmation: null,
+      proposal: { proposalId: record.proposalId, grantedAt: record.grantedAt },
+      marks: null,
+      trace,
+      timer: null,
+      done: false,
+      settle: () => undefined,
+    };
+    const encoded = this.#encodeInvoke(
+      call,
+      attachment.role,
+      this.#config.timings.callDeadlineMs,
+      null,
+    );
+    if (encoded.kind === 'error') return encoded;
+    call.invokeBytes = encoded.bytes;
+    call.rosterAtArrival = this.#touchAttachment(attachment, arrivedAt);
+    return this.#proceed(call, NEVER_ABORTED, args);
+  }
+
   /** Goes to the page, or to its place in the page's queue, once every check has passed. */
   async #proceed(call: PendingCall, signal: AbortSignal, args: JsonObject): Promise<CallOutcome> {
     const { pageId } = call;
@@ -5653,6 +6211,10 @@ export class PageHub {
                 at: confirmation.at,
               },
             }),
+        // Its id alone (ADR 0042): the page runs it only against its own record of the Accept.
+        ...(call.proposal === null || confirmation !== null
+          ? {}
+          : { proposal: { proposalId: call.proposal.proposalId } }),
       });
     } catch {
       // JSON.stringify recurses: arguments nested a few thousand levels deep overflow the stack.
@@ -5841,7 +6403,19 @@ export class PageHub {
     if (!tool) {
       return hubError('tool_not_found', `page ${call.pageId} has no tool named ${call.toolName}`);
     }
-    if (attachment.role === 'observer' && tool.annotations?.readOnlyHint !== true) {
+    if (call.proposal !== null) {
+      // ADR 0042: an observer's write runs only as a proposal the operator
+      // accepted, under the attachment it was made under, while the page
+      // still takes proposals from its proposer (S5, S8).
+      const refused = this.#proposalRefusal(
+        call.proposal.grantedAt,
+        call.caller,
+        page,
+        attachment,
+        tool,
+      );
+      if (refused !== null) return refused;
+    } else if (attachment.role === 'observer' && tool.annotations?.readOnlyHint !== true) {
       return hubError(
         'role_denied',
         `you are an observer on this page now, and ${call.toolName} is not marked read-only`,

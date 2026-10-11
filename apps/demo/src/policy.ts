@@ -13,13 +13,18 @@
 // (ADR 0026); the adapter still prompts here for everyone else. Anything
 // else, or nothing, keeps the adapter's default, the board's own prompt.
 //
+// From M6, ?proposals=members or ?proposals=all lets observers propose the
+// board's writes for the operator to accept here (ADR 0042): members by
+// account, or invited guests too. Anything else, or nothing, keeps the
+// adapter's default, off.
+//
 // Whoever writes a link writes these too, so the board never takes them on
 // trust (ADR 0029's notes): the Connect bar names every one that departs from
 // the defaults before its visitor chooses, the status area names them once
 // linked, and the remembered choice covers them, so a link that changes them
 // asks again (connect.ts).
 
-import type { PolicyInput } from '@tabdock/adapter';
+import type { PolicyInput, ProposalPolicy } from '@tabdock/adapter';
 
 export const DEMO_CONSEQUENTIAL_TOOLS = ['clear_board'];
 
@@ -35,18 +40,23 @@ export interface LinkPolicy {
   readonly confirmInClient: boolean;
   /** ?invites=all or ?invites=off; `watch` is the adapter's default. */
   readonly invites: 'watch' | 'all' | 'off';
+  /** ?proposals=members or ?proposals=all; `off` is the adapter's default. */
+  readonly proposals: ProposalPolicy;
 }
 
 export const DEFAULT_LINK_POLICY: LinkPolicy = Object.freeze({
   confirmInClient: false,
   invites: 'watch',
+  proposals: 'off',
 });
 
 export function linkPolicyFromQuery(params: URLSearchParams): LinkPolicy {
   const invites = params.get('invites');
+  const proposals = params.get('proposals');
   return {
     confirmInClient: params.get('confirm') === 'client',
     invites: invites === 'all' || invites === 'off' ? invites : 'watch',
+    proposals: proposals === 'members' || proposals === 'all' ? proposals : 'off',
   };
 }
 
@@ -56,6 +66,7 @@ export function policyInput(link: LinkPolicy): PolicyInput {
     imageTools: [...DEMO_IMAGE_TOOLS],
   };
   if (link.confirmInClient) policy.confirmVia = 'client';
+  if (link.proposals !== 'off') policy.proposals = link.proposals;
   if (link.invites === 'all') return { ...policy, invites: 'all', maxDrivers: DEMO_SHARED_DRIVERS };
   if (link.invites === 'off') return { ...policy, invites: 'off' };
   return policy;
@@ -73,6 +84,7 @@ export function policyTag(link: LinkPolicy): string {
   const parts: string[] = [];
   if (link.confirmInClient) parts.push('confirm=client');
   if (link.invites !== 'watch') parts.push(`invites=${link.invites}`);
+  if (link.proposals !== 'off') parts.push(`proposals=${link.proposals}`);
   return parts.join('&');
 }
 
@@ -80,8 +92,10 @@ export function policyTag(link: LinkPolicy): string {
 export function setPolicyParams(params: URLSearchParams, link: LinkPolicy): void {
   params.delete('confirm');
   params.delete('invites');
+  params.delete('proposals');
   if (link.confirmInClient) params.set('confirm', 'client');
   if (link.invites !== 'watch') params.set('invites', link.invites);
+  if (link.proposals !== 'off') params.set('proposals', link.proposals);
 }
 
 /**
@@ -99,5 +113,10 @@ export function policyNotes(link: LinkPolicy): string {
     notes.push('the board offers Can control invites and a second driver seat');
   }
   if (link.invites === 'off') notes.push('the board offers no invites');
+  if (link.proposals !== 'off') {
+    notes.push(
+      `${link.proposals === 'all' ? 'anyone watching, invited guests too,' : 'members watching'} may propose changes for you to accept`,
+    );
+  }
   return notes.length === 0 ? '' : `${notes.join('; ')}.`;
 }

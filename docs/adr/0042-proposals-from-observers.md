@@ -93,3 +93,17 @@ Conflicts between the M6 records, settled by the plan, that touch this one:
 **From ADR 0039.** An accepted run's image is not kept, and `get_proposal` returns its text only.
 
 **Open questions.** Settled under Decisions: no dismissal reason (2), no bulk accept (3), and `get_proposal` waits with `waitMs` (4).
+
+## Notes from the review of the proposals build (11 October 2026)
+
+Taken under the owner's standing instruction; none weakens a section 9 requirement, and each has a test that fails without it.
+
+**Proposal frames and the page's link.** A proposal frame carries up to 16 KiB of arguments, and the pending caps did not bound how many reach a page, since `withdraw_proposal` freed a place at once. A proposal now goes out only where the page has room, as an invoke does (ADR 0024's notes): onto an empty queue, or with no call waiting for room and the queue, the frame included, within `PROPOSAL_ROOM` (a quarter of `INVOKE_ROOM`) and below `MAX_UNREAD_FRAMES`; otherwise it answers `page_busy` at once and keeps no place. The proposal frame and the one `proposal_end` that may follow it are never counted toward closing the page, as invokes and cancels are not, so what observers propose never closes a page. A proposal withdrawn by its proposer or refused by the page keeps its place among its proposer's three and the page's twenty for `PROPOSAL_PLACE_HOLD_MS` (one minute), answered `rate_limited`; beyond what the operator frees by deciding, a page is sent at most twenty new proposals a minute. `#propose` also spends ADR 0044's watching share, so a watcher's proposals count as its calls do once that share is built.
+
+**One user's share.** What one user's reserved, pending and running proposals hold, across every page, is at most an eighth of `TABDOCK_MAX_PROPOSAL_BYTES`, or one proposal at the argument caps where that is less, as ADR 0018 gives each user a share of the request budget; past it a proposal answers `rate_limited` before the budget drops anyone's kept outcome. Without it one member running pages of their own could hold the whole budget.
+
+**Kept outcomes are charged.** A settled proposal is charged `PROPOSAL_HEAP_BYTES` until it is forgotten, with its result's text on top while held, and its own unref'd timer forgets it ten minutes after it settled, whether or not anyone reads its page. A new result makes room by dropping the oldest results; a new proposal by dropping those and then the oldest outcomes, relay-wide; one that would not fit even then is refused without dropping anything. SPEC section 6, page 14 and `.env.example` already say the budget covers kept outcomes.
+
+**Waits.** As SPEC section 7 and `get_proposal`'s description say, `waitMs` waits for a change: the Accept wakes a wait with `accepted` while the page runs it, and a second wait answers the run's end. A wait on a page that sleeps or reloads answers `page_asleep`, and on one that goes `page_gone`, before its pending proposals are cancelled; a later read gives the status.
+
+**The attachment a proposal is made under.** The `grantedAt` check in `#proposalRefusal` is the only guard for a revoke or detach followed by a fresh approval while `#propose` waits on the argument check, since a reservation is not yet a proposal that `attachmentsEnded` can end; a relay test holds the check to cover it. Only the same check in `#stillProposes` is defense in depth.
