@@ -3667,13 +3667,16 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   /**
    * The mint itself, for invite() and a time-boxed session's watch invites
    * alike, its terms already checked: `expiresAt` on this page's clock, or
-   * null for "while the page is open".
+   * null for "while the page is open". `live` says whether what the invite
+   * is for still stands once its digest is made: a session's link minted
+   * after the session ended would outlive it, uncapped.
    */
   async function mintInvite(
     role: Role,
     label: string,
     uses: number,
     expiresAt: number | null,
+    live: () => boolean = () => true,
   ): Promise<InviteResult> {
     const refuse = refuseInvite;
     if (!isLinked()) return refuse('link_down');
@@ -3692,6 +3695,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     }
     // The link may have dropped, or the page closed, while the hash was made.
     if (!isLinked()) return refuse('link_down');
+    if (!live()) return refuse('cancelled');
     if (invites.size >= MAX_LIVE_INVITES_PER_PAGE) return refuse('limit');
     const record: StoredInvite = {
       inviteId,
@@ -4311,6 +4315,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         label,
         Math.min(left, MAX_INVITE_USES),
         now + MAX_SESSION_MS,
+        () => runs(sessionId) !== null,
       );
       if (!minted.ok) {
         inviteRefusal = minted.reason;
@@ -4366,6 +4371,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       live.label,
       Math.min(MAX_INVITE_USES, Math.max(1, live.observers - joined)),
       live.startedAt + MAX_SESSION_MS,
+      () => session === live,
     );
     if (minted.ok && session === live) {
       live.inviteIds.push(minted.inviteId);

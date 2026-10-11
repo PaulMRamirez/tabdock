@@ -13,6 +13,7 @@ import {
   SESSION_END_GRACE_MS,
 } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
+import type { CoreOptions, CryptoLike } from '../src/core.ts';
 import type { Harness } from './harness.ts';
 import {
   attachment,
@@ -46,8 +47,9 @@ async function offering(
   roster = [attachment('alice', 'driver')],
   grants: Record<string, 'driver' | 'observer'> = { alice: 'driver' },
   storage?: MapStorage,
+  core: Partial<CoreOptions> = {},
 ) {
-  const h = setup({ core: { policy }, ...(storage === undefined ? {} : { storage }) });
+  const h = setup({ core: { policy, ...core }, ...(storage === undefined ? {} : { storage }) });
   const limits = { ...welcome(h.clock).limits, usersPerPage: 10, observersPerPage: 40 };
   const socket = await link(h, { roster, limits }, grants);
   socket.deliver(invitesFrame([]));
@@ -96,6 +98,33 @@ async function started(
 }
 
 const codes = (socket: FakeSocket) => results(socket).map((frame) => frame.error?.code ?? 'ok');
+
+/** WebCrypto whose digests wait, while held, until released: the gap an invite's mint awaits. */
+function heldCrypto() {
+  let gate: Promise<void> | null = null;
+  let open: () => void = () => undefined;
+  const crypto: CryptoLike = {
+    getRandomValues: (array) => globalThis.crypto.getRandomValues(array),
+    subtle: {
+      digest: async (algorithm, data) => {
+        if (gate !== null) await gate;
+        return globalThis.crypto.subtle.digest(algorithm, data);
+      },
+    },
+  };
+  return {
+    crypto,
+    hold(): void {
+      gate = new Promise((resolve) => {
+        open = resolve;
+      });
+    },
+    release(): void {
+      gate = null;
+      open();
+    },
+  };
+}
 
 describe('S5: a session is never wider than attach()', () => {
   it('refuses wider seats or proposals, or anything malformed, and sends nothing', async () => {
@@ -405,6 +434,54 @@ describe("the session's watch invites (ADR 0043, conflict C12)", () => {
     const minted = await pending;
     expect(minted.ok).toBe(true);
     expect(h.dock.state.session?.inviteIds).toEqual([renewed.inviteId]);
+  });
+});
+
+describe('a session that ends while its link is minted (S14)', () => {
+  /** A linked page whose WebCrypto digests can be held. */
+  async function heldOffering() {
+    const digests = heldCrypto();
+    const linked = await offering(undefined, undefined, undefined, undefined, {
+      crypto: digests.crypto,
+    });
+    return { ...linked, digests };
+  }
+
+  it('mints no watch link at its start once it has ended', async () => {
+    const { h, socket, digests } = await heldOffering();
+    digests.hold();
+    const pending = h.dock.startSession({ label: 'Class', lengthMinutes: 30, observers: 3 });
+    await until(() => socket.framesOf('session_start').length === 1, 'a session_start');
+    const [start] = socket.framesOf('session_start');
+    if (start === undefined) throw new Error('no session_start');
+    socket.deliver(listed(start));
+    await flush();
+    // The digest of its watch link is still being made when the operator ends it.
+    expect(h.dock.endSession()).toBe(true);
+    digests.release();
+    expect(await pending).toMatchObject({ ok: true, link: null, links: [] });
+    expect(socket.framesOf('invite_create')).toEqual([]);
+    expect(h.dock.state.invites).toEqual([]);
+  });
+
+  it('mints none on New link once it has ended', async () => {
+    const { h, socket, digests } = await heldOffering();
+    const { result } = await started(h, socket, {
+      label: 'Class',
+      lengthMinutes: 30,
+      observers: 3,
+    });
+    digests.hold();
+    const renewing = h.dock.renewSessionLink();
+    await flush();
+    expect(socket.framesOf('invite_cancel').map((frame) => frame.inviteId)).toEqual(
+      result.links.map((entry) => entry.inviteId),
+    );
+    expect(h.dock.endSession()).toBe(true);
+    digests.release();
+    expect(await renewing).toEqual({ ok: false, reason: 'cancelled' });
+    expect(socket.framesOf('invite_create')).toHaveLength(1);
+    expect(h.dock.state.invites).toEqual([]);
   });
 });
 
