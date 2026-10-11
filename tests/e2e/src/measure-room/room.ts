@@ -18,7 +18,7 @@
 // at the burst quota and then at Fly's 6.25% baseline. stalled (P3) has a
 // quarter of the class leave a 0.72 MB answer and an image unread until the
 // relay cuts them. ceiling has every student read two 0.72 MB answers 16 KiB
-// every 4 s, so unread bytes pile up past TABDOCK_MAX_RESPONSE_BYTES where
+// every 8 s, so unread bytes pile up past TABDOCK_MAX_RESPONSE_BYTES where
 // the class is large enough and the relay must cut guests' answers, never
 // the teacher's. Those two phases run with TCP buffers narrowed, so the
 // relay rather than loopback's kernel holds what nobody reads (sockets.ts).
@@ -400,7 +400,7 @@ function thrownOutcome(error: unknown): string {
   return 'thrown';
 }
 
-/** One held answer: a call whose client reads its first KiB, then 16 KiB every 4 s or nothing more. */
+/** One held answer: a call whose client reads its first KiB, then 16 KiB every 8 s or nothing more. */
 interface Held {
   /** pending or held while open, ended, cut, or the code a refusal began with. */
   outcome: string;
@@ -1098,7 +1098,7 @@ export async function measureRoom(
     for (const held of phase.held) held.close();
     await endPhase();
 
-    // Unread bytes past the ceiling: every student reads two of the largest answers 16 KiB every 4 s.
+    // Unread bytes past the ceiling: every student reads two of the largest answers 16 KiB every 8 s.
     await beginPhase('ceiling', BURST_QUOTA_US);
     load = classLoad({ pageCalls: false });
     const fillEnds = performance.now() + plan.phaseMs.ceiling;
@@ -1214,7 +1214,7 @@ let heldIds = 1000;
 
 /**
  * A tools/call on a student's 2025-11-25 session whose answer the client
- * reads only its first KiB of, then nothing ('stall') or 16 KiB every 4 s
+ * reads only its first KiB of, then nothing ('stall') or 16 KiB every 8 s
  * ('trickle'), on a connection of its own. Its outcome is held while open,
  * ended if the relay finished it, cut if the relay closed it first, or the
  * refusal's code if the relay refused the call.
@@ -1273,12 +1273,13 @@ function heldCall(
         }
         held.outcome = 'pending';
         if (mode === 'trickle') {
-          // Enough each time to reopen a narrowed window, so the relay sees progress at every
-          // check, and little enough that an answer lasts the phase: about 4 KB a second.
+          // Enough each time to reopen a narrowed window, so the relay sees progress at
+          // every 10 s check, and little enough that an answer outlasts the phase: about
+          // 2 KB a second, six minutes to an answer.
           // read(n) takes nothing while fewer than n bytes wait, so it asks for what is there.
           timer = setInterval(() => {
             res.read(Math.min(16_384, res.readableLength));
-          }, 4000);
+          }, 8000);
         }
       });
       res.on('end', () => {
