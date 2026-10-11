@@ -20,6 +20,7 @@ import {
   flush,
   GUEST,
   invitedAttachment,
+  OTHER_GUEST,
   invitesFrame,
   invoke,
   link,
@@ -389,7 +390,7 @@ describe("the session's end on the page's own clock (A6.17)", () => {
     socket.deliver(invoke('get_value', { callId: 'before', caller: guest }));
     await flush();
     expect(codes(socket)).toEqual(['ok']);
-    return { h, socket, start, guest };
+    return { h, socket, start, guest, create, secret };
   }
 
   it('drops every grant an invite made even when the relay says nothing, then tells it', async () => {
@@ -409,13 +410,30 @@ describe("the session's end on the page's own clock (A6.17)", () => {
     ]);
   });
 
-  it('refuses the guest once its end has passed, before its timer has run', async () => {
-    const { h, socket, guest } = await withGuest();
+  it('refuses the guest, and anyone redeeming its link, once its end has passed, before its timer has run', async () => {
+    const { h, socket, guest, create, secret } = await withGuest();
     // The clock moves with no timer run, as in a tab the browser froze.
     h.clock.now += 10_000;
     socket.deliver(invoke('get_value', { callId: 'late', caller: guest }));
     await flush();
     expect(codes(socket)).toEqual(['ok', 'role_denied']);
+    // The link has uses left and its own four hours, but the session it was minted for is over.
+    socket.deliver(
+      redemption(
+        h.clock,
+        { inviteId: create.inviteId, secret, create },
+        { requestId: 'late-join', user: { userId: OTHER_GUEST, displayName: 'late@example.com' } },
+      ),
+    );
+    await until(
+      () => socket.framesOf('attach_decision').some((frame) => frame.requestId === 'late-join'),
+      'the late redemption answered',
+    );
+    expect(socket.framesOf('attach_decision').at(-1)).toEqual({
+      t: 'attach_decision',
+      requestId: 'late-join',
+      allow: false,
+    });
   });
 
   it("says nothing more when the relay's own end comes within the grace", async () => {
