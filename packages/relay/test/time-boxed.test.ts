@@ -7,7 +7,7 @@
 // sign up; the page is the test's own stand-in, never the adapter, so each
 // test shows what the relay alone does.
 
-import { MAX_INVITE_LIFETIME_MS } from '@tabdock/protocol';
+import { MAX_INVITE_LIFETIME_MS, type PolicyInput } from '@tabdock/protocol';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   attachMember,
@@ -19,13 +19,16 @@ import {
   signedInAtI,
   startInviteRelay,
 } from './helpers/invites.ts';
+import { AgentTokens } from '../src/agents.ts';
 import { OPERATOR_GRANTS_PER_PAGE } from '../src/hub.ts';
+import { PageParts } from '../src/page-parts.ts';
 import { connectPage, type TestPage } from './helpers/page-client.ts';
 
 let current: InviteRelay | undefined;
 
 afterEach(async () => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   await current?.close();
   current = undefined;
 });
@@ -64,6 +67,39 @@ async function classroom(policy: Record<string, unknown> = {}) {
   const alice = await relay.claude('sub-alice');
   await attachMember(alice, page);
   return { relay, page, alice };
+}
+
+/** The page reloading after its socket went: a new one that resumes its page session under `policy`. */
+async function resumeOf(
+  relay: InviteRelay,
+  page: TestPage,
+  policy: PolicyInput,
+): Promise<TestPage> {
+  const reloaded = await connectPage(relay.relay.pageUrl, {
+    resumeToken: page.welcome?.resumeToken ?? '',
+    policy,
+  });
+  relay.pages.push(reloaded);
+  expect(reloaded.welcome?.resumed).toBe(true);
+  return reloaded;
+}
+
+/**
+ * AgentTokens.closePage as the hub calls it, answering `closed`: each call's
+ * page and reason, and whether `guest`'s invite-made attachment was still
+ * there then. ADR 0044's tokens come with W2-D, so this stands in for them.
+ */
+function watchTokenCloses(relay: InviteRelay, guest: string, closed: number) {
+  const calls: { pageId: string; reason: string; guestAttached: boolean }[] = [];
+  vi.spyOn(AgentTokens.prototype, 'closePage').mockImplementation((pageId, reason) => {
+    calls.push({
+      pageId,
+      reason,
+      guestAttached: relay.store.attachments.get(pageId, guest) !== undefined,
+    });
+    return closed;
+  });
+  return calls;
 }
 
 /** A guest joins at /i with a signed-in browser, as a session's QR is scanned, then calls from Claude. */
@@ -233,6 +269,41 @@ describe('S8 and S14: a session end ends what its invites let in', () => {
     expect(events(relay, 'session_end')).toHaveLength(1);
   });
 
+  it("closes the page's agent tokens as session_ended before any attachment its invites made, and counts them (C11)", async () => {
+    const { relay, page } = await classroom();
+    await start(page, 'ses_tokens', { maxDrivers: 1, proposals: 'off' });
+    const minted = await mintOk(page, { uses: 5 });
+    const { userId } = await letGuestIn(relay, page, minted.secret);
+    const closes = watchTokenCloses(relay, userId, 2);
+    page.send({ t: 'session_end', sessionId: 'ses_tokens' });
+    expect((await latest(page, 'session')).ended).toEqual({
+      sessionId: 'ses_tokens',
+      reason: 'operator',
+    });
+    // First, so a token's close ends the attachment it made as the session's
+    // end, and a token not yet used closes all the same.
+    expect(closes).toEqual([{ pageId: page.pageId, reason: 'session_ended', guestAttached: true }]);
+    expect(relay.store.attachments.get(page.pageId, userId)).toBeUndefined();
+    expect(events(relay, 'session_end')).toEqual([
+      expect.objectContaining({ attachments: 1, invites: 1, agents: 2 }),
+    ]);
+  });
+
+  it('caps the invites and invite-made attachments already live when it starts at its end', async () => {
+    const { relay, page } = await classroom();
+    const minted = await mintOk(page, { uses: 5, expiresAt: Date.now() + 4 * 60 * MINUTE });
+    const { userId } = await letGuestIn(relay, page, minted.secret);
+    const before = (await latest(page, 'roster')).attachments.find((a) => a.userId === userId);
+    expect(before?.endsAt).toBeGreaterThan(Date.now() + 23 * 60 * MINUTE);
+    await start(page, 'ses_after', { maxDrivers: 1, proposals: 'off' });
+    const endsAt = relay.store.pages.get(page.pageId)?.timedSession?.endsAt;
+    expect(endsAt).toBeLessThan(Date.now() + 31 * MINUTE);
+    expect(relay.store.invites.get(page.pageId, minted.inviteId)?.expiresAt).toBe(endsAt);
+    const joined = (await latest(page, 'roster')).attachments.find((a) => a.userId === userId);
+    expect(joined?.endsAt).toBe(endsAt);
+    expect(joined?.expiresAt).toBeLessThanOrEqual(endsAt ?? 0);
+  });
+
   it('ends on the relay clock at its end, with its timer not yet run', async () => {
     const { relay, page } = await classroom();
     await start(page, 'ses_late', { maxDrivers: 1, proposals: 'off' });
@@ -280,9 +351,6 @@ describe('S8 and S14: a session end ends what its invites let in', () => {
     expect(session?.endsAt).toBe((session?.startedAt ?? 0) + 45 * MINUTE);
     const guestAttachment = relay.store.attachments.get(page.pageId, userId);
     expect(guestAttachment?.endsAt).toBe(session?.endsAt);
-    expect(guestAttachment?.endsAt).toBeLessThanOrEqual(
-      (guestAttachment?.grantedAt ?? 0) + MAX_INVITE_LIFETIME_MS,
-    );
     expect(relay.store.invites.get(page.pageId, minted.inviteId)?.expiresAt).toBe(session?.endsAt);
     expect(events(relay, 'session_extend')).toEqual([
       expect.objectContaining({ sessionId: 'ses_long', lengthMs: 45 * MINUTE }),
@@ -302,6 +370,27 @@ describe('S8 and S14: a session end ends what its invites let in', () => {
     // More than four hours from its start is a malformed frame.
     page.send({ t: 'session_extend', sessionId: 'ses_long', lengthMs: 241 * MINUTE });
     expect((await page.closed).code).toBe(1008);
+  });
+
+  it('never moves an attachment past its own 24 hours from redemption (S14)', async () => {
+    const { relay, page } = await classroom();
+    const minted = await mintOk(page, { uses: 5 });
+    const { userId } = await letGuestIn(relay, page, minted.secret);
+    await start(page, 'ses_day', { maxDrivers: 1, proposals: 'off' });
+    const firstEnd = relay.store.pages.get(page.pageId)?.timedSession?.endsAt ?? 0;
+    // As if the guest had redeemed 23.5 hours ago: their own 24 hours end
+    // just as the session's first 30 minutes do.
+    const guest = relay.store.attachments.get(page.pageId, userId);
+    if (guest === undefined) throw new Error('the guest is not attached');
+    relay.store.attachments.put({
+      ...guest,
+      grantedAt: firstEnd - MAX_INVITE_LIFETIME_MS,
+      endsAt: firstEnd,
+    });
+    page.send({ t: 'session_extend', sessionId: 'ses_day', lengthMs: 45 * MINUTE });
+    expect((await latest(page, 'session')).session?.lengthMs).toBe(45 * MINUTE);
+    expect(relay.store.pages.get(page.pageId)?.timedSession?.endsAt).toBe(firstEnd + 15 * MINUTE);
+    expect(relay.store.attachments.get(page.pageId, userId)?.endsAt).toBe(firstEnd);
   });
 
   it("counts starts and extensions against the page's operator grants", async () => {
@@ -362,16 +451,18 @@ describe('a session across the page link', () => {
     await attachMember(await relay.claude('sub-alice'), page);
     await start(page, 'ses_gone', { maxDrivers: 1, proposals: 'off' });
     const minted = await mintOk(page, { uses: 5 });
-    await letGuestIn(relay, page, minted.secret);
+    const { userId } = await letGuestIn(relay, page, minted.secret);
     const endsAt = relay.store.pages.get(page.pageId)?.timedSession?.endsAt ?? 0;
+    const closes = watchTokenCloses(relay, userId, 1);
     page.ws.terminate();
     await page.closed;
     await vi.waitFor(() => {
       expect(relay.store.pages.get(page.pageId)?.state).toBe('gone');
     });
     expect(events(relay, 'session_end')).toEqual([
-      expect.objectContaining({ reason: 'page_gone', attachments: 1, invites: 1 }),
+      expect.objectContaining({ reason: 'page_gone', attachments: 1, invites: 1, agents: 1 }),
     ]);
+    expect(closes).toEqual([{ pageId: page.pageId, reason: 'page_gone', guestAttached: true }]);
     expect(events(relay, 'expire').map((event) => event.reason)).toEqual([
       'page_gone',
       'page_gone',
@@ -383,6 +474,73 @@ describe('a session across the page link', () => {
       isError: false,
     });
     expect(events(relay, 'session_end')).toHaveLength(1);
+  });
+
+  it('tells a page that slept through its end once, after its next welcome', async () => {
+    const policy = { invites: 'watch' } as const;
+    const relay = await setup();
+    const page = await relay.page({ policy });
+    const alice = await relay.claude('sub-alice');
+    await attachMember(alice, page);
+    await start(page, 'ses_slept', { maxDrivers: 1, proposals: 'off' });
+    const minted = await mintOk(page, { uses: 5 });
+    const { userId } = await letGuestIn(relay, page, minted.secret);
+    const endsAt = relay.store.pages.get(page.pageId)?.timedSession?.endsAt ?? 0;
+    page.ws.terminate();
+    await page.closed;
+    await vi.waitFor(() => {
+      expect(relay.store.pages.get(page.pageId)?.state).toBe('asleep');
+    });
+    // Its end passes while the page sleeps, and a member's read ends it on the relay's clock.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(endsAt + 1000);
+    expect(await call(alice, 'list_pages')).toMatchObject({ isError: false });
+    expect(events(relay, 'session_end')).toEqual([
+      expect.objectContaining({ sessionId: 'ses_slept', reason: 'time', attachments: 1 }),
+    ]);
+    expect(relay.store.attachments.get(page.pageId, userId)).toBeUndefined();
+
+    const reloaded = await resumeOf(relay, page, policy);
+    expect(reloaded.welcome?.roster.map((entry) => entry.userId)).toEqual(['alice']);
+    expect(await reloaded.next('session')).toEqual({
+      t: 'session',
+      session: null,
+      ended: { sessionId: 'ses_slept', reason: 'time' },
+    });
+    // Told once: the welcome after that says only that none is live.
+    reloaded.ws.terminate();
+    await reloaded.closed;
+    const again = await resumeOf(relay, reloaded, policy);
+    expect(await again.next('session')).toEqual({ t: 'session', session: null });
+  });
+
+  it('tells the page parts its policy changed at its start, at a narrowing resume and at its end', async () => {
+    const changed = vi.spyOn(PageParts.prototype, 'policyChanged');
+    const relay = await setup();
+    const wide = { invites: 'watch', maxDrivers: 3, proposals: 'all' } as const;
+    const page = await relay.page({ policy: wide });
+    await attachMember(await relay.claude('sub-alice'), page);
+    expect(changed).not.toHaveBeenCalled();
+    await start(page, 'ses_parts', { maxDrivers: 2, proposals: 'members' });
+    expect(changed.mock.calls).toEqual([[page.pageId]]);
+    // The same ceiling again narrows nothing, so says nothing.
+    page.ws.terminate();
+    await page.closed;
+    const same = await resumeOf(relay, page, wide);
+    await same.next('session');
+    expect(changed).toHaveBeenCalledTimes(1);
+    // A smaller one narrows the session, so the parts hear of it.
+    same.ws.terminate();
+    await same.closed;
+    const smaller = await resumeOf(relay, same, { ...wide, proposals: 'off' });
+    expect((await smaller.next('session')).session?.policy).toEqual({
+      maxDrivers: 2,
+      proposals: 'off',
+    });
+    expect(changed).toHaveBeenCalledTimes(2);
+    smaller.send({ t: 'session_end', sessionId: 'ses_parts' });
+    expect((await latest(smaller, 'session')).ended?.reason).toBe('operator');
+    expect(changed.mock.calls).toEqual([[page.pageId], [page.pageId], [page.pageId]]);
   });
 
   it('spends the budget for frames that change nothing on an end for no live session, never the link', async () => {

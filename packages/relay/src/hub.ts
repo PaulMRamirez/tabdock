@@ -2395,10 +2395,11 @@ export class PageHub {
   }
 
   /**
-   * Ends the page's session: what its invites let in, its live invites and
-   * its agent tokens end with it (C11), and the page's own policy returns.
-   * A page that is gone ends all of those itself (#gone), so then they are
-   * only counted, before it does. Members' own attachments stay.
+   * Ends the page's session: its agent tokens, what its invites let in and
+   * its live invites end with it (C11), and the page's own policy returns.
+   * Members' own attachments stay. A page that is gone ends its attachments
+   * and invites itself (#gone), so then those are only counted, before it
+   * does.
    */
   #endSession(pageId: string, reason: SessionEndReason): void {
     if (reason === 'page_gone') this.#sessionEnds.delete(pageId);
@@ -2415,22 +2416,31 @@ export class PageHub {
       .listForPage(pageId)
       .filter((attachment) => attachment.inviteId !== null);
     const invites = this.#store.invites.listForPage(pageId);
-    if (reason !== 'page_gone') {
-      this.#endAttachments(
-        pageId,
-        new Set(made.map((attachment) => attachment.userId)),
-        'revoked',
-        'the time-boxed session you joined by invite has ended',
-      );
-      for (const attachment of made) {
-        this.#auditExpire(page, attachment.userId, 'session_ended', now);
-      }
-      for (const invite of invites) this.#closeInvite(invite, 'session_ended', false);
-    }
+    // The tokens before the attachments: a token's close ends the attachment
+    // it made, with its own expire record (the AgentTokens closed hook), so
+    // every token, in use or not, closes as session_ended rather than as its
+    // attachment's end, and only what is left ends below, once each. A gone
+    // page's tokens close here as page_gone, as #gone's parts would close
+    // them next, so the record counts them.
     const agents = this.#agents.closePage(
       pageId,
       reason === 'page_gone' ? 'page_gone' : 'session_ended',
     );
+    const left = made.filter(
+      (attachment) => this.#store.attachments.get(pageId, attachment.userId) !== undefined,
+    );
+    if (reason !== 'page_gone') {
+      this.#endAttachments(
+        pageId,
+        new Set(left.map((attachment) => attachment.userId)),
+        'revoked',
+        'the time-boxed session you joined by invite has ended',
+      );
+      for (const attachment of left) {
+        this.#auditExpire(page, attachment.userId, 'session_ended', now);
+      }
+      for (const invite of invites) this.#closeInvite(invite, 'session_ended', false);
+    }
     this.#audit({
       v: AUDIT_VERSION,
       type: 'session_end',
@@ -2454,7 +2464,7 @@ export class PageHub {
     this.#parts.policyChanged(pageId);
     if (reason === 'page_gone') return;
     // A member an invite let in may have sponsored invites of their own.
-    this.#loseSponsors(pageId, made);
+    this.#loseSponsors(pageId, left);
     if (!this.#live.has(pageId)) {
       this.#sessionEnds.set(pageId, { sessionId: session.sessionId, reason });
       return;
