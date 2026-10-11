@@ -253,3 +253,82 @@ test('with agent tokens off, the form offers no agent kind and /g/mcp answers 40
   expect(refused).toEqual({ ok: false, reason: 'unavailable' });
   expect(await agentStatus(tabdock.relay.url, `tda_${'A'.repeat(43)}`)).toBe(404);
 });
+
+/** The widget's wait before a box takes a click (widget.ts, ARM_DELAY_MS). */
+const ARM_DELAY_MS = 500;
+
+/** Stops the page's timers; only runFor moves them on from here. */
+async function pauseClock(page: Page): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    const now = await page.evaluate(() => Date.now());
+    try {
+      await page.clock.pauseAt(now + 250);
+      return;
+    } catch (error) {
+      if (attempt === 5 || !String(error).includes('to the past')) throw error;
+    }
+  }
+}
+
+/** Where a button is now, failing the test while it has no box. */
+async function buttonNow(
+  page: Page,
+  action: 'invite-create' | 'agent-done' | 'agent-cancel',
+): Promise<{ armed: boolean; x: number; y: number }> {
+  const found = await widgetButtonNow(page, { action });
+  if (found === null) throw new Error(`no ${action} button`);
+  return found;
+}
+
+test('Done and Cancel take a click only once their box has held still', async ({ page }) => {
+  test.setTimeout(60_000);
+  live = await startAgentTabdock();
+  const tabdock = live;
+  await page.clock.install();
+  await openWithAlice(page, tabdock);
+  await waitForDock(page, (state) => state.agentsOffered?.endpoint === AGENT_URL);
+  await clickInWidget(page, { action: 'invite-open' });
+  await typeInWidget(page, 'invite-label', 'First');
+  await clickInWidget(page, { action: 'invite-kind-agent' });
+  await expect.poll(async () => (await buttonNow(page, 'invite-create')).armed).toBe(true);
+  const create = await buttonNow(page, 'invite-create');
+
+  // From here the page's timers run only when the test says.
+  await pauseClock(page);
+  await page.mouse.click(create.x, create.y);
+  await expect.poll(async () => (await widgetText(page, 'agent-command')) ?? '').not.toBe('');
+  // The command has only just appeared, so Done waits: a click now loses nothing.
+  const done = await buttonNow(page, 'agent-done');
+  expect(done.armed).toBe(false);
+  await page.mouse.click(done.x, done.y);
+  expect(await widgetText(page, 'agent-command')).not.toBe('');
+  await page.clock.runFor(ARM_DELAY_MS);
+  expect((await buttonNow(page, 'agent-done')).armed).toBe(true);
+  await page.mouse.click(done.x, done.y);
+  await expect.poll(() => widgetText(page, 'agent-command')).toBe('');
+
+  // Two tokens listed, then the first goes: the second's row moves up under
+  // the pointer, and its Cancel takes no click until it has held still.
+  const second = await page.evaluate(
+    () => window.__tabdockDock?.agentToken({ label: 'Second' }) ?? null,
+  );
+  if (!second?.ok) throw new Error('no second token');
+  await expect.poll(async () => (await widgetItems(page, 'agent-list')).length).toBe(2);
+  // One tick moves every new box onto its wait, and the wait runs out.
+  await page.clock.runFor(1000 + ARM_DELAY_MS);
+  expect((await buttonNow(page, 'agent-cancel')).armed).toBe(true);
+  const [first] = await widgetItems(page, 'agent-list');
+  const firstId = String(first?.data.tokenId);
+  await page.evaluate((tokenId) => window.__tabdockDock?.cancelAgent(tokenId), firstId);
+  await expect.poll(async () => (await widgetItems(page, 'agent-list')).length).toBe(1);
+  const cancel = await buttonNow(page, 'agent-cancel');
+  expect(cancel.armed).toBe(false);
+  await page.mouse.click(cancel.x, cancel.y);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  expect((await dockState(page))?.agents.map((agent) => agent.tokenId)).toEqual([second.tokenId]);
+  await page.clock.runFor(1000 + ARM_DELAY_MS);
+  const held = await buttonNow(page, 'agent-cancel');
+  expect(held.armed).toBe(true);
+  await page.mouse.click(held.x, held.y);
+  await expect.poll(async () => (await dockState(page))?.agents.length).toBe(0);
+});

@@ -931,16 +931,23 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   });
 
   // Agent tokens (ADR 0044): the command, shown once, and the live tokens.
+  // Done loses the command for good, so its box waits as the others do.
   const commandBox = element('div', 'prompt');
   dom.flag(commandBox, 'hidden', true);
+  const commandView = newBox(commandBox);
+  boxes.add(commandView);
   const commandHeading = element('p');
   const commandText = element('p', 'link-text');
   role(commandText, 'agent-command');
-  const copyCommand = button('Copy', 'agent-copy', () => {
+  const copyCommand = boxButton(commandView, 'Copy', 'agent-copy', () => {
     copyShown(shownCommand?.command, copyCommand, 'Select the command to copy it');
   });
   const commandButtons = element('div', 'buttons');
-  dom.append(commandButtons, copyCommand, button('Done', 'agent-done', hideCommand));
+  dom.append(
+    commandButtons,
+    copyCommand,
+    boxButton(commandView, 'Done', 'agent-done', hideCommand),
+  );
   dom.append(commandBox, commandHeading, commandText, commandButtons);
   /** The command on show and its token, or null; Copy reads it here, never back from the tree. */
   let shownCommand: { readonly tokenId: string; readonly command: string } | null = null;
@@ -1773,10 +1780,13 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   const tickSession = (): void => undefined;
   /** The live agent tokens as last drawn, so a frame that changes nothing redraws nothing. */
   let shownAgents = '';
+  let agentBoxes: ArmedBox[] = [];
   /**
-   * The relay's list of this page's live agent tokens, each with Cancel,
-   * which only takes access away and so is not held back like the boxes. The
-   * label is this page's own words, quoted so it reads as a name.
+   * The relay's list of this page's live agent tokens, each with Cancel in
+   * an armed box: the list is drawn anew on every change, so a row can move
+   * under the pointer as another token goes, and a click meant for one must
+   * never cancel the next. The label is this page's own words, quoted so it
+   * reads as a name.
    */
   function syncAgents(state: DockState): void {
     const live = state.agents;
@@ -1789,21 +1799,28 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const key = JSON.stringify(live);
     if (key === shownAgents) return;
     shownAgents = key;
-    dom.replaceChildren(agentList, live.map(agentRow));
+    agentBoxes.forEach(dropBox);
+    agentBoxes = live.map(agentRow);
+    dom.replaceChildren(
+      agentList,
+      agentBoxes.map((box) => box.element),
+    );
   }
 
-  function agentRow(view: AgentView): HTMLElement {
-    const box = element('li', 'row');
-    dom.attr(box, 'data-token-id', view.tokenId);
+  function agentRow(view: AgentView): ArmedBox {
+    const row = element('li', 'row');
+    const box = newBox(row);
+    boxes.add(box);
+    dom.attr(row, 'data-token-id', view.tokenId);
     const buttons = element('div', 'buttons');
     dom.append(
       buttons,
-      button('Cancel', 'agent-cancel', () => {
+      boxButton(box, 'Cancel', 'agent-cancel', () => {
         dock.cancelAgent(view.tokenId);
       }),
     );
     dom.append(
-      box,
+      row,
       element('p', 'who', `"${view.label}", agent token`),
       element('p', 'muted', `${AGENT_STATES[view.state]}, until ${timeText(view.expiresAt)}`),
       buttons,
