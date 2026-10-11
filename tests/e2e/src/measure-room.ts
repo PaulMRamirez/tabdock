@@ -90,8 +90,13 @@ const frameRepeats = Number(values['frame-repeats'] ?? '1');
 if (!Number.isInteger(frameRepeats) || frameRepeats < 1 || frameRepeats > 10) {
   fail('--frame-repeats takes a whole number from 1 to 10');
 }
+// pnpm runs the script in tests/e2e, so a relative --out is read from where pnpm was run.
 const out =
-  values.out ?? (quick ? join(ROOT, 'tests/e2e/test-results/room-measure.quick.json') : RAW);
+  values.out === undefined
+    ? quick
+      ? join(ROOT, 'tests/e2e/test-results/room-measure.quick.json')
+      : RAW
+    : resolve(process.env.INIT_CWD ?? process.cwd(), values.out);
 
 const say = (line: string): void => {
   process.stdout.write(`${line}\n`);
