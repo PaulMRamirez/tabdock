@@ -159,15 +159,18 @@ const PROPOSALS_STYLE = '';
 const SESSION_STYLE = '';
 /**
  * The roster's Watching section and compact rows (ADR 0044): one line each,
- * at least a finger tall, the name cut short before the short id or the
- * buttons are; the list scrolls inside the panel, under 50vh, so the panel
- * around it, and Revoke all below it, stay where they are.
+ * at least a finger tall, the name cut short before the short id is. A row
+ * too narrow for its buttons beside 4em of name (a control guest's Make
+ * driver at 360 px) puts them on a line below, right-aligned, rather than
+ * past the list's edge. The list scrolls inside the panel, under 50vh, so
+ * the panel around it, and Revoke all below it, stay where they are.
  */
 const ROSTER_STYLE = `
 .compact, .whead { display: flex; align-items: center; gap: 6px; }
-.compact { min-height: 44px; margin: 0 0 4px; padding: 2px 8px; }
+.compact { flex-wrap: wrap; min-height: 44px; margin: 0 0 4px; padding: 2px 8px; }
 .compact > * { flex: none; }
-.compact > .nm { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-weight: 600; }
+.compact > .nm { flex: 1 1 4em; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-weight: 600; }
+.compact > .buttons { margin: 0 0 0 auto; }
 .watch { max-height: 50vh; overflow: auto; }
 .whead { justify-content: space-between; margin: 10px 0 2px; }
 `;
@@ -824,7 +827,9 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   dom.listen(filterInput, 'input', () => {
     render(dock.state);
   });
-  // ADR 0016's "and close this link", once for the section: checked, as on a full row.
+  // ADR 0016's "and close this link", once for the section: checked whenever
+  // it appears and again after each Revoke it served, so unticking it spares
+  // one link once, as a full row's box does.
   const closeAll = element('label', 'check');
   const closeAllInput = element('input');
   dom.attr(closeAllInput, 'type', 'checkbox');
@@ -1228,14 +1233,18 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       askFirst(userId, member(userId), () => {
         if (dom.has(view.closeLink, 'hidden')) dock.revoke(userId);
         else dock.revoke(userId, { closeInvite: dom.checked(choice) });
+        // The section's box is one Revoke's choice, as a row's own box is
+        // that row's: the next Revoke starts from S14's default again.
+        if (compact) dom.setChecked(closeAllInput, true);
       });
     });
+    const buttons = element('div', 'buttons');
+    dom.append(buttons, view.roleSwitch, revoke);
     if (compact) {
-      dom.append(box, view.name, ' ', view.sid, view.badge, view.roleSwitch, revoke);
+      dom.append(box, view.name, ' ', view.sid, view.badge, buttons);
       return view;
     }
-    const buttons = element('div', 'buttons');
-    dom.append(buttons, view.roleSwitch, revoke, view.closeLink);
+    dom.append(buttons, view.closeLink);
     const who = element('p', 'who');
     dom.append(who, view.name, view.badge);
     dom.append(box, who, view.clients, view.expiry, buttons);
@@ -1441,7 +1450,10 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     setText(watchToggle, open ? 'Hide' : 'Show');
     dom.flag(watchList, 'hidden', !open);
     dom.flag(watchFilter, 'hidden', !open || !many);
-    dom.flag(closeAll, 'hidden', !open || !closable);
+    // Ticked whenever it appears, as a row's own box is (updateRow).
+    const showClose = open && closable;
+    if (showClose && dom.has(closeAll, 'hidden')) dom.setChecked(closeAllInput, true);
+    dom.flag(closeAll, 'hidden', !showClose);
     setText(peopleLabel, watchCount > 0 ? 'People' : 'Attached');
     dom.flag(nobody, 'hidden', state.roster.length > 0);
     // Revoke all also closes every live invite, so it stays while any is live.

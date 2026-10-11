@@ -100,6 +100,26 @@ async function watchingView(page: Page): Promise<WatchingView> {
   )) as WatchingView;
 }
 
+/**
+ * Whether the Watching list and each row in it fit their own width, so
+ * nothing in them scrolls sideways, and how wide each row's name shows: the
+ * list scrolls on its own, so the panel's width alone cannot tell.
+ */
+async function watchingFits(page: Page): Promise<{ fits: boolean; names: number[] }> {
+  return (await widgetEvaluate(
+    page,
+    'watching',
+    `function () {
+      const list = this.querySelector('ul');
+      const rows = Array.from(list.children);
+      return {
+        fits: [list, ...rows].every((box) => box.scrollWidth <= box.clientWidth),
+        names: rows.map((row) => row.firstElementChild.getBoundingClientRect().width),
+      };
+    }`,
+  )) as { fits: boolean; names: number[] };
+}
+
 /** Whether the confirm box Revoke opens is on screen, and what it says. */
 async function confirmShown(page: Page): Promise<string | null> {
   const box = await widgetButtonNow(page, { action: 'revoke-anyway' });
@@ -203,6 +223,10 @@ test('forty watchers fit a compact, collapsible, filterable section at 390 px, a
       'function () { const panel = this.closest(".panel"); return panel.scrollWidth <= panel.clientWidth; }',
     ),
   ).toBe(true);
+  // Nor the Watching list, which scrolls on its own, and every name shows.
+  const fits = await watchingFits(page);
+  expect(fits.fits).toBe(true);
+  for (const width of fits.names) expect(width).toBeGreaterThan(40);
 
   // The filter narrows to a short id, and clearing it shows everyone again.
   const sought = watchers[5];
@@ -279,6 +303,8 @@ test('forty watchers fit a compact, collapsible, filterable section at 390 px, a
 
 test("says when the page's people have no seat for a watcher made a driver", async ({ page }) => {
   test.setTimeout(120_000);
+  // The narrowest phone the widget is held to: a control guest's compact row carries Make driver too.
+  await page.setViewportSize({ width: 360, height: 780 });
   room = await startRoomTabdock({ limits: { usersPerPage: 3 } });
   const live = room;
   const url = new URL(live.pageUrl);
@@ -300,6 +326,20 @@ test("says when the page's people have no seat for a watcher made a driver", asy
   await expect
     .poll(async () => (await watchingView(page)).title)
     .toBe('Watching by invite: 1 of 40');
+  // At 360 px the row's buttons go below its name rather than past the list's edge.
+  expect(
+    await widgetEvaluate(
+      page,
+      'watching',
+      'function () { return this.querySelector(\'[data-action="make-driver"]\').getBoundingClientRect().width > 0; }',
+    ),
+  ).toBe(true);
+  const fits = await watchingFits(page);
+  expect(fits.fits).toBe(true);
+  expect(fits.names[0]).toBeGreaterThan(40);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
+    true,
+  );
 
   // Dave takes the last of the three people seats, so Make driver finds none.
   await pairMember(page, live, DAVE, 'observer');
@@ -355,23 +395,63 @@ test("Revoke on a watcher's row closes the link they joined by, unless the secti
       : null,
   );
 
+  /** The Watching section's "Revoke closes their link" box: where it is, and whether it is ticked. */
+  const closeBox = async () =>
+    (await widgetEvaluate(
+      page,
+      'watching',
+      `function () {
+        const input = this.querySelector('[data-action="close-link"]');
+        input.scrollIntoView({ block: 'center' });
+        const at = input.getBoundingClientRect();
+        return { x: at.x + at.width / 2, y: at.y + at.height / 2, checked: input.checked };
+      }`,
+    )) as { x: number; y: number; checked: boolean };
+  const untick = async () => {
+    const box = await closeBox();
+    expect(box.checked).toBe(true);
+    await page.mouse.click(box.x, box.y);
+    expect((await closeBox()).checked).toBe(false);
+  };
+
   // Unticked, Revoke ends the one person only, and the link stays live.
   const second = await joinTwo('Class two', 2);
-  const box = (await widgetEvaluate(
-    page,
-    'watching',
-    `function () {
-      const input = this.querySelector('[data-action="close-link"]');
-      input.scrollIntoView({ block: 'center' });
-      const at = input.getBoundingClientRect();
-      return { x: at.x + at.width / 2, y: at.y + at.height / 2, checked: input.checked };
-    }`,
-  )) as { x: number; y: number; checked: boolean };
-  expect(box.checked).toBe(true);
-  await page.mouse.click(box.x, box.y);
+  await untick();
   await clickInWidget(page, { action: 'revoke', userId: second.ids[0] ?? '' });
   await waitForDock(page, (state) =>
     !state.roster.some((entry) => entry.userId === second.ids[0]) ? true : null,
   );
   expect((await dockState(page))?.invites.map((view) => view.inviteId)).toContain(second.inviteId);
+
+  // That choice was for that Revoke alone: the box is ticked again, so the
+  // next Revoke, on another link, closes its link as a full row's would.
+  expect((await closeBox()).checked).toBe(true);
+  const third = await joinTwo('Class three', 4);
+  await clickInWidget(page, { action: 'revoke', userId: third.ids[0] ?? '' });
+  await waitForDock(page, (state) =>
+    !state.invites.some((view) => view.inviteId === third.inviteId) &&
+    !state.roster.some((entry) => entry.userId === third.ids[0])
+      ? true
+      : null,
+  );
+  expect((await dockState(page))?.invites.map((view) => view.inviteId)).toContain(second.inviteId);
+
+  // So is an untick the box outlived: hidden once no row's link is left to
+  // close (Cancel closes the last), it comes back ticked with the next link.
+  await untick();
+  await clickInWidget(page, { action: 'cancel-invite', inviteId: second.inviteId });
+  await waitForDock(page, (state) =>
+    state.invites.some((view) => view.inviteId === second.inviteId) ? null : true,
+  );
+  await expect
+    .poll(() =>
+      widgetEvaluate(
+        page,
+        'watching',
+        'function () { return this.querySelector(\'[data-action="close-link"]\').parentElement.hidden; }',
+      ),
+    )
+    .toBe(true);
+  await joinTwo('Class four', 6);
+  expect((await closeBox()).checked).toBe(true);
 });
