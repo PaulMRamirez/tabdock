@@ -19,7 +19,7 @@
     "@tabdock/adapter": "workspace:*"
   },
   "devDependencies": {
-    "@mcp-b/webmcp-local-relay": "5.1.0",
+    "@mcp-b/webmcp-local-relay": "6.0.0",
     "esbuild": "0.28.2"
   }
 }
