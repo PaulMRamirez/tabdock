@@ -16,6 +16,7 @@
 // public URL relay and the stand-in provider, each test restarting a real
 // relay on one audit directory; the page is the test's own stand-in.
 
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
@@ -24,6 +25,7 @@ import {
   existsSync,
   linkSync,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
@@ -35,7 +37,7 @@ import {
 } from 'node:fs';
 import * as nodeFs from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import {
   AUDIT_VERSION,
@@ -94,6 +96,8 @@ import { ALICE as DEV_ALICE, FAST_TIMINGS } from './helpers/relay.ts';
 import { PUBLIC_MCP_URL, PUBLIC_ORIGIN, tunnelFetch } from './helpers/tunnel.ts';
 
 const MINUTE = 60_000;
+const POSIX = process.platform !== 'win32';
+const FIFO_PROBE = resolve(import.meta.dirname, 'fixtures/snapshot-fifo-probe.ts');
 const GUEST = 'sub-guest';
 const GUEST_EMAIL = 'guest@example.com';
 const POLICY: PolicyInput = { invites: 'all', maxDrivers: 2, proposals: 'members' };
@@ -685,6 +689,12 @@ async function boundDirectory(): Promise<{ source: string; snapshot: RelaySnapsh
   return { source, snapshot };
 }
 
+/** lstat answering for `path` with another file's stats, as a swap after the loader looked would leave it. */
+function lyingLstat(path: string, stats: nodeFs.Stats): typeof nodeFs.lstatSync {
+  return ((target: nodeFs.PathLike, options?: nodeFs.StatSyncOptions) =>
+    target === path ? stats : nodeFs.lstatSync(target, options)) as typeof nodeFs.lstatSync;
+}
+
 function copyOf(source: string): string {
   const dir = join(privateDir(), 'audit');
   cpSync(source, dir, { recursive: true });
@@ -746,12 +756,23 @@ describe('taking the file (snapshot.ts)', () => {
     const target = join(privateDir(), 'elsewhere.json');
     renameSync(fileOf(linked), target);
     symlinkSync(target, fileOf(linked));
-    expect(take(linked)).toEqual({
-      kind: 'refused',
-      reason: 'cannot open it (ELOOP)',
-      removed: true,
-    });
+    expect(take(linked)).toEqual({ kind: 'refused', reason: 'not a regular file', removed: true });
     expect(() => lstatSync(fileOf(linked))).toThrow();
+    expect(existsSync(target)).toBe(true);
+    // A link swapped in after the lstat looked: the open itself refuses to follow it.
+    const swapped = copyOf(source);
+    const regular = lstatSync(fileOf(swapped));
+    renameSync(fileOf(swapped), target);
+    symlinkSync(target, fileOf(swapped));
+    expect(
+      takeSnapshot({
+        dir: swapped,
+        enabled: true,
+        now: snapshot.writtenAt,
+        mode: 'public',
+        fs: { ...nodeFs, lstatSync: lyingLstat(fileOf(swapped), regular) },
+      }),
+    ).toEqual({ kind: 'refused', reason: 'cannot open it (ELOOP)', removed: true });
     expect(existsSync(target)).toBe(true);
 
     const hard = copyOf(source);
@@ -770,6 +791,47 @@ describe('taking the file (snapshot.ts)', () => {
     });
     expect(existsSync(fileOf(open))).toBe(false);
   });
+
+  it.skipIf(!POSIX || spawnSync('mkfifo', ['--help']).error !== undefined)(
+    'opens nothing but a regular file: a FIFO or a directory at the name is refused without an open, and a FIFO swapped in never holds the start',
+    () => {
+      const dir = privateDir();
+      const opened: string[] = [];
+      const fs: SnapshotFs = {
+        ...nodeFs,
+        openSync: ((path: nodeFs.PathLike, ...rest: [number, number?]) => {
+          opened.push(String(path));
+          return nodeFs.openSync(path, ...rest);
+        }) as typeof nodeFs.openSync,
+      };
+      const take = () => takeSnapshot({ dir, enabled: true, now: Date.now(), mode: 'public', fs });
+      expect(spawnSync('mkfifo', ['-m', '600', fileOf(dir)]).status).toBe(0);
+      expect(take()).toEqual({ kind: 'refused', reason: 'not a regular file', removed: true });
+      expect(existsSync(fileOf(dir))).toBe(false);
+      mkdirSync(fileOf(dir), { mode: 0o700 });
+      expect(take()).toMatchObject({ kind: 'refused', removed: false });
+      expect(opened.filter((path) => path === fileOf(dir))).toEqual([]);
+      rmSync(fileOf(dir), { recursive: true });
+
+      // lstat answering for a regular file, as when a FIFO replaces one after
+      // it looked: the open must not wait for a writer that never comes. In
+      // a process of its own, since a blocked open would hold this one too.
+      const regular = join(dir, 'regular.json');
+      writeFileSync(regular, '{}', { mode: 0o600 });
+      expect(spawnSync('mkfifo', ['-m', '600', fileOf(dir)]).status).toBe(0);
+      const probe = spawnSync(process.execPath, [FIFO_PROBE, dir, regular], {
+        encoding: 'utf8',
+        timeout: 20_000,
+      });
+      expect(probe.signal, 'the probe was still waiting on the FIFO').toBeNull();
+      expect(JSON.parse(probe.stdout)).toEqual({
+        kind: 'refused',
+        reason: 'not a regular file',
+        removed: true,
+      });
+      expect(existsSync(fileOf(dir))).toBe(false);
+    },
+  );
 
   it('binds only a snapshot_written that the last relay_stop is chained to, across a rotation too', () => {
     const dir = privateDir();

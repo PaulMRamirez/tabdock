@@ -4,9 +4,10 @@
 // that is synced and renamed into place, as the owner token is written; the
 // stop then records the file's SHA-256 in a snapshot_written record, and
 // relay_stop follows it at once. The next start, before it writes
-// relay_start, takes the file: it opens it without following a link, reads
-// it, and unlinks it before anything else is decided, so a file is read at
-// most once whatever comes of it, and an unlink that fails means no load.
+// relay_start, takes the file: it opens it, a regular file only, without
+// following a link or waiting on a FIFO, reads it, and unlinks it before
+// anything else is decided, so a file is read at most once whatever comes
+// of it, and an unlink that fails means no load.
 // It then loads only a file the audit log binds to the stop that wrote it:
 // the log's last two lines must be that snapshot_written, naming this file's
 // digest, and the relay_stop chained to it. A file planted, kept from an
@@ -84,6 +85,14 @@ export type SnapshotFs = Pick<
 const windows = process.platform === 'win32';
 /** O_NOFOLLOW where the platform has it: a link at the snapshot's name is refused, never followed. */
 const NO_FOLLOW = windows ? 0 : nodeFs.constants.O_NOFOLLOW;
+/**
+ * How the start opens what it reads: never through a link, and without
+ * waiting, so a FIFO put at the name (or swapped in after the lstat) cannot
+ * hold the open, and the start with it, until a writer comes; the fstat
+ * after the open refuses it. Windows has neither flag.
+ */
+const READ_FLAGS =
+  nodeFs.constants.O_RDONLY | NO_FOLLOW | (windows ? 0 : nodeFs.constants.O_NONBLOCK);
 
 export type WriteOutcome =
   { kind: 'written'; sha256: string } | { kind: 'refused'; reason: string };
@@ -197,7 +206,7 @@ export function writeSnapshot(
 function readOwnFile(path: string, fs: SnapshotFs): Buffer | string {
   let fd: number;
   try {
-    fd = fs.openSync(path, nodeFs.constants.O_RDONLY | NO_FOLLOW);
+    fd = fs.openSync(path, READ_FLAGS);
   } catch (error) {
     return `cannot open it (${codeOf(error)})`;
   }
@@ -237,12 +246,15 @@ function readOwnFile(path: string, fs: SnapshotFs): Buffer | string {
 function fileTail(path: string, fs: SnapshotFs): { lines: string[]; whole: boolean } | null {
   let fd: number;
   try {
-    fd = fs.openSync(path, nodeFs.constants.O_RDONLY | NO_FOLLOW);
+    fd = fs.openSync(path, READ_FLAGS);
   } catch {
     return null;
   }
   try {
-    const { size } = fs.fstatSync(fd);
+    const stat = fs.fstatSync(fd);
+    // listAuditFiles lists regular files only; this holds for one swapped in since.
+    if (!stat.isFile()) return null;
+    const { size } = stat;
     const start = Math.max(0, size - TAIL_BYTES);
     const buffer = Buffer.alloc(size - start);
     let read = 0;
@@ -333,14 +345,18 @@ export function bindingProblem(
 export function takeSnapshot(options: TakeOptions): TakeOutcome {
   const fs = options.fs ?? nodeFs;
   const path = join(options.dir, SNAPSHOT_FILE);
+  // Only a regular file is ever opened: a FIFO, a device, a directory or a
+  // link at the name is refused by what lstat says, before any open.
+  let unreadable: string | null = null;
   try {
-    fs.lstatSync(path);
+    if (!fs.lstatSync(path).isFile()) unreadable = 'not a regular file';
   } catch (error) {
     if (codeOf(error) === 'ENOENT') return { kind: 'none' };
+    unreadable = `cannot inspect it (${codeOf(error)})`;
   }
-  const bytes = options.enabled
-    ? readOwnFile(path, fs)
-    : 'TABDOCK_RESTART_SNAPSHOT is off, so it was removed unread';
+  const bytes = !options.enabled
+    ? 'TABDOCK_RESTART_SNAPSHOT is off, so it was removed unread'
+    : (unreadable ?? readOwnFile(path, fs));
   try {
     fs.unlinkSync(path);
   } catch (error) {
