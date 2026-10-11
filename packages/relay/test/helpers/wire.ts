@@ -26,7 +26,7 @@ export interface WireAnswer {
 let nextId = 5000;
 
 /** The JSON-RPC message with this id in a JSON body or among an event stream's data lines. */
-function answerOf(body: string, id: number): WireAnswer['message'] {
+export function answerOf(body: string, id: number): WireAnswer['message'] {
   const candidates: unknown[] = [];
   const trimmed = body.trim();
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {

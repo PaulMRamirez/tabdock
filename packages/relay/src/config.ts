@@ -1142,14 +1142,6 @@ export function resolveConfig(options: RelayOptions): ResolvedConfig {
       'agentTokens (TABDOCK_AGENT_TOKENS) needs invites (TABDOCK_INVITES): an agent token is minted on a page as an invite is, while a member sponsors it (ADR 0044)',
     );
   }
-  // M6 seam: not built. Nothing serves /g/mcp until ADR 0044's agent tokens
-  // land (W2-D), so a relay asked for them refuses to start rather than run
-  // as if they were on.
-  if (agentTokens) {
-    throw new Error(
-      'agentTokens (TABDOCK_AGENT_TOKENS) is not served by this relay yet; leave it off (ADR 0044)',
-    );
-  }
   const membersFile = resolveMembersFile(options.membersFile, publicUrl);
   // The file replaces a live list the plugin maps subjects through; a plugin
   // with none would go on with its own while the operator edits the file.
@@ -1719,13 +1711,7 @@ function refuseSettingsOutOfMode(
  * started anyway would run as if they were off while its operator, its
  * guide page and `.env.example` expect them on.
  */
-function refuseUnbuiltSettings(flags: { agentTokens: boolean; restartSnapshot: boolean }): void {
-  // M6 seam: not built. W2-D serves /g/mcp (ADR 0044).
-  if (flags.agentTokens) {
-    throw new Error(
-      'TABDOCK_AGENT_TOKENS is not served by this relay yet; leave it off (ADR 0044)',
-    );
-  }
+function refuseUnbuiltSettings(flags: { restartSnapshot: boolean }): void {
   // M6 seam: not built. W3-B writes and loads the snapshot (ADR 0046).
   if (flags.restartSnapshot) {
     throw new Error(
@@ -1894,7 +1880,7 @@ export function loadConfigFromEnv(
   );
   const maxMb = parseCount('TABDOCK_AUDIT_MAX_MB', env.TABDOCK_AUDIT_MAX_MB);
   refuseSettingsOutOfMode(env, relayEnv, { invites, agentTokens, restartSnapshot });
-  refuseUnbuiltSettings({ agentTokens, restartSnapshot });
+  refuseUnbuiltSettings({ restartSnapshot });
 
   // Last, so a mistake in any other setting is reported before local mode draws a token.
   const { auth, publicUrl, pairClient, localMode } = authFromEnv(

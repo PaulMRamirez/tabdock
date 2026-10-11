@@ -58,6 +58,7 @@ import {
   InviteeIdSchema,
   MAX_INVITE_LABEL_CHARS,
   MAX_INVITE_USES,
+  MAX_LIVE_AGENTS_PER_PAGE,
   MAX_LIVE_INVITES_PER_PAGE,
   MAX_SESSION_MS,
   MAX_STATE_BYTES,
@@ -70,6 +71,8 @@ import {
 } from '@tabdock/protocol';
 import type {
   ActivityEntry,
+  AgentLifetime,
+  AgentView,
   Dock,
   DockState,
   InviteJoin,
@@ -199,8 +202,19 @@ const ROSTER_STYLE = `
 
 /** Past this many rows the Watching section starts closed and offers a filter. */
 const COMPACT_ROWS = 8;
-/** Agent tokens in the invite form and list (ADR 0044). */
+/**
+ * Agent tokens in the invite form and list (ADR 0044) need no rules of their
+ * own: the command is shown as the invite link's text is, and the list's
+ * rows are the invite list's.
+ */
 const AGENTS_STYLE = '';
+
+/** What each state of a live agent token means to the operator. */
+const AGENT_STATES = {
+  dormant: 'not used yet',
+  asking: 'asking now',
+  attached: 'attached',
+} as const;
 /** The session record's block and its offer (ADR 0045). */
 const RECORD_STYLE = '';
 
@@ -896,7 +910,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   const linkText = element('p', 'link-text');
   role(linkText, 'invite-link-text');
   const copyLink = button('Copy link', 'invite-copy', () => {
-    copyShownLink();
+    copyShown(shownLink?.link, copyLink, 'Select the link to copy it');
   });
   const doneLink = button('Done', 'invite-done', () => {
     hideLink();
@@ -960,8 +974,15 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     'invite-role-observer',
   );
   const controlChoice = choice('invite-role', 'driver', roleText('driver'), 'invite-role-driver');
+  // An agent token (ADR 0044): watching only, for a client that cannot sign in.
+  const agentChoice = choice(
+    'invite-role',
+    'agent',
+    'Agent (Claude Code, no sign-in)',
+    'invite-kind-agent',
+  );
   dom.setChecked(watchChoice.input, true);
-  dom.append(roleChoices, watchChoice.label, controlChoice.label);
+  dom.append(roleChoices, watchChoice.label, controlChoice.label, agentChoice.label);
 
   const lifetimeChoices = element('div', 'choices');
   dom.attr(lifetimeChoices, 'role', 'radiogroup');
@@ -970,6 +991,20 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const made = choice('invite-lifetime', value, text, `invite-lifetime-${value}`);
     dom.setChecked(made.input, value === '1h');
     dom.append(lifetimeChoices, made.label);
+    return [value, made.input] as const;
+  });
+  const agentLifetimes = element('div', 'choices');
+  dom.attr(agentLifetimes, 'role', 'radiogroup');
+  dom.attr(agentLifetimes, 'aria-label', 'How long the command works');
+  const agentLifetimeInputs = (['1h', '4h', '8h'] as const).map((value) => {
+    const made = choice(
+      'agent-lifetime',
+      value,
+      value === '1h' ? '1 hour' : `${value[0]} hours`,
+      `agent-lifetime-${value}`,
+    );
+    dom.setChecked(made.input, value === '1h');
+    dom.append(agentLifetimes, made.label);
     return [value, made.input] as const;
   });
 
@@ -996,9 +1031,18 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   );
   const formButtons = element('div', 'buttons');
   dom.append(formButtons, createButton);
-  dom.append(formBox, labelField, roleChoices, lifetimeChoices, usesField, formReason, formButtons);
+  dom.append(
+    formBox,
+    labelField,
+    roleChoices,
+    lifetimeChoices,
+    agentLifetimes,
+    usesField,
+    formReason,
+    formButtons,
+  );
 
-  for (const input of [watchChoice.input, controlChoice.input]) {
+  for (const input of [watchChoice.input, controlChoice.input, agentChoice.input]) {
     dom.listen(input, 'change', () => {
       // Create now grants something else, so the form waits again.
       restartArming(formView);
@@ -1008,6 +1052,31 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   dom.listen(labelInput, 'input', () => {
     render(dock.state);
   });
+
+  // Agent tokens (ADR 0044): the command, shown once, and the live tokens.
+  // Done loses the command for good, so its box waits as the others do.
+  const commandBox = element('div', 'prompt');
+  dom.flag(commandBox, 'hidden', true);
+  const commandView = newBox(commandBox);
+  boxes.add(commandView);
+  const commandHeading = element('p');
+  const commandText = element('p', 'link-text');
+  role(commandText, 'agent-command');
+  const copyCommand = boxButton(commandView, 'Copy', 'agent-copy', () => {
+    copyShown(shownCommand?.command, copyCommand, 'Select the command to copy it');
+  });
+  const commandButtons = element('div', 'buttons');
+  dom.append(
+    commandButtons,
+    copyCommand,
+    boxButton(commandView, 'Done', 'agent-done', hideCommand),
+  );
+  dom.append(commandBox, commandHeading, commandText, commandButtons);
+  /** The command on show and its token, or null; Copy reads it here, never back from the tree. */
+  let shownCommand: { readonly tokenId: string; readonly command: string } | null = null;
+  const agentList = element('ul');
+  role(agentList, 'agent-list');
+  dom.append(agentsBlock, commandBox, agentList);
 
   dom.append(
     invitesBlock,
@@ -1116,7 +1185,13 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     if (clientName !== '') dom.attr(box, 'data-client-name', clientName);
     const who = personText(request.user, request.account);
     const line = element('p');
-    if (request.invite !== null) {
+    if (request.agent !== null) {
+      // The page's own words: the id this page derived and checked, and the label the operator gave the token.
+      dom.append(
+        line,
+        `An agent (${shortId(request.user.userId) ?? ''}) wants to watch by your agent token "${request.agent.label}"`,
+      );
+    } else if (request.invite !== null) {
       // The account beside the label the operator gave the invite, which is this page's own text.
       dom.append(line, `${wants(who)} to join by your invite "${request.invite.label}"`);
     } else {
@@ -1125,7 +1200,8 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     }
     dom.append(line, badge(request.invite !== null || request.account.kind === 'invitee'));
     dom.append(box, line);
-    if (!request.account.verified) {
+    // An agent has no account to vouch for, and the line above says what it is.
+    if (!request.account.verified && request.agent === null) {
       dom.append(
         box,
         element('p', 'muted', 'Unverified account: the sign-in provider vouches for no email.'),
@@ -1148,11 +1224,17 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     }
     const view = newPrompt(box, request.expiresAt);
     const buttons = element('div', 'buttons');
+    // An agent token lets its holder watch, never control (ADR 0044).
+    if (request.agent === null) {
+      dom.append(
+        buttons,
+        boxButton(view, 'Allow as driver', 'approve-driver', () => {
+          dock.approve(request.requestId, 'driver');
+        }),
+      );
+    }
     dom.append(
       buttons,
-      boxButton(view, 'Allow as driver', 'approve-driver', () => {
-        dock.approve(request.requestId, 'driver');
-      }),
       boxButton(view, 'Allow as observer', 'approve-observer', () => {
         dock.approve(request.requestId, 'observer');
       }),
@@ -1727,12 +1809,17 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     }
   }
 
-  /** Why Create cannot work now, or null. */
-  function inviteBlocker(state: DockState): string | null {
+  /** Why Create cannot work now, or null; `agent` when the form makes an agent token. */
+  function inviteBlocker(state: DockState, agent: boolean): string | null {
     if (state.link !== 'linked') return REFUSAL_TEXT.link_down;
     if (state.invitesOffered?.linkBase === null) return REFUSAL_TEXT.no_public_url;
     if (!state.roster.some((attachment) => attachment.kind === 'member')) {
       return 'Invites need a member attached to sponsor them. Pair one first.';
+    }
+    if (agent) {
+      return state.agents.length >= MAX_LIVE_AGENTS_PER_PAGE
+        ? `This page already has ${MAX_LIVE_AGENTS_PER_PAGE} live agent tokens. Cancel one first.`
+        : null;
     }
     if (state.invites.length >= MAX_LIVE_INVITES_PER_PAGE) return REFUSAL_TEXT.limit;
     return null;
@@ -1748,6 +1835,11 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
 
   function chosenLifetime(): InviteLifetime {
     for (const [value, input] of lifetimeInputs) if (dom.checked(input)) return value;
+    return '1h';
+  }
+
+  function chosenAgentLifetime(): AgentLifetime {
+    for (const [value, input] of agentLifetimeInputs) if (dom.checked(input)) return value;
     return '1h';
   }
 
@@ -1773,9 +1865,17 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const watchOnly = state.policy.invites !== 'all';
     dom.flag(controlChoice.label, 'hidden', watchOnly);
     if (watchOnly && dom.checked(controlChoice.input)) dom.setChecked(watchChoice.input, true);
-    // A Can control invite always has exactly one use.
-    dom.flag(usesField, 'hidden', chosenRole(state) === 'driver');
-    const blocker = inviteBlocker(state);
+    // The agent kind only where the relay serves agent tokens at a public URL (ADR 0044).
+    const agentsOn = typeof state.agentsOffered?.endpoint === 'string';
+    dom.flag(agentChoice.label, 'hidden', !agentsOn);
+    if (!agentsOn && dom.checked(agentChoice.input)) dom.setChecked(watchChoice.input, true);
+    const agent = dom.checked(agentChoice.input);
+    dom.flag(lifetimeChoices, 'hidden', agent);
+    dom.flag(agentLifetimes, 'hidden', !agent);
+    setText(createButton, agent ? 'Create command' : 'Create link');
+    // A Can control invite always has exactly one use, and an agent token has none to count.
+    dom.flag(usesField, 'hidden', agent || chosenRole(state) === 'driver');
+    const blocker = inviteBlocker(state, agent);
     const reason = creating ? 'Asking the relay for the link' : blocker;
     setText(formReason, reason ?? '');
     dom.flag(formReason, 'hidden', reason === null);
@@ -1798,8 +1898,9 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   async function createInvite(): Promise<void> {
     const state = dock.state;
     const label = dom.value(labelInput).trim();
+    const agent = dom.checked(agentChoice.input);
     const role = chosenRole(state);
-    const uses = role === 'driver' ? 1 : chosenUses();
+    const uses = role === 'driver' || agent ? 1 : chosenUses();
     if (label === '' || uses === null) {
       showInviteError(REFUSAL_TEXT.invalid);
       return;
@@ -1807,14 +1908,17 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     creating = true;
     dom.flag(inviteError, 'hidden', true);
     render(state);
-    const result = await dock.invite({ label, role, lifetime: chosenLifetime(), uses });
+    const result = agent
+      ? await dock.agentToken({ label, lifetime: chosenAgentLifetime() })
+      : await dock.invite({ label, role, lifetime: chosenLifetime(), uses });
     creating = false;
     if (!mounted) return;
     if (result.ok) {
       dom.setValue(labelInput, '');
       dom.setValue(usesInput, '1');
       dom.flag(formBox, 'hidden', true);
-      showLink(result.inviteId, result.link, label);
+      if ('command' in result) showCommand(result.tokenId, result.command, label, result.expiresAt);
+      else showLink(result.inviteId, result.link, label);
     } else {
       showInviteError(REFUSAL_TEXT[result.reason]);
     }
@@ -1849,18 +1953,39 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     dom.flag(linkBox, 'hidden', true);
   }
 
-  function copyShownLink(): void {
+  /** Copies what is on show, an invite link or an agent's command, and says so on its button. */
+  function copyShown(text: string | undefined, node: HTMLElement, fallbackText: string): void {
     const fallback = (): void => {
-      dom.setText(copyLink, 'Select the link to copy it');
+      dom.setText(node, fallbackText);
     };
-    if (shownLink === null || writeClipboard === null) {
+    if (text === undefined || writeClipboard === null) {
       fallback();
       return;
     }
     // Only through the writeText taken at mount; see clipboardWriter.
-    writeClipboard(shownLink.link).then(() => {
-      dom.setText(copyLink, 'Copied');
+    writeClipboard(text).then(() => {
+      dom.setText(node, 'Copied');
     }, fallback);
+  }
+
+  /** The command, once, until Done or until its token is no longer live; the token is never kept. */
+  function showCommand(tokenId: string, command: string, label: string, expiresAt: number): void {
+    shownCommand = { tokenId, command };
+    dom.setText(
+      commandHeading,
+      `Run this in Claude Code for ${label}. It shows only now, and anyone who holds it can ask to watch this page until ${timeText(expiresAt)}.`,
+    );
+    dom.setText(commandText, command);
+    dom.setText(copyCommand, 'Copy');
+    dom.flag(commandBox, 'hidden', false);
+    setOpen(true);
+  }
+
+  function hideCommand(): void {
+    shownCommand = null;
+    // Nothing of the token stays in the tree.
+    dom.setText(commandText, '');
+    dom.flag(commandBox, 'hidden', true);
   }
 
   function updatePause(paused: boolean): void {
@@ -2366,8 +2491,55 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     );
     dom.flag(sWarning, 'hidden', !early);
   }
-  // M6 seam: not built
-  const syncAgents: (state: DockState) => void = () => undefined;
+  /** The live agent tokens as last drawn, so a frame that changes nothing redraws nothing. */
+  let shownAgents = '';
+  let agentBoxes: ArmedBox[] = [];
+  /**
+   * The relay's list of this page's live agent tokens, each with Cancel in
+   * an armed box: the list is drawn anew on every change, so a row can move
+   * under the pointer as another token goes, and a click meant for one must
+   * never cancel the next. The label is this page's own words, quoted so it
+   * reads as a name.
+   */
+  function syncAgents(state: DockState): void {
+    const live = state.agents;
+    // A command whose token the relay no longer lists (burned, cancelled, expired) is dead: it goes.
+    const shown = shownCommand?.tokenId;
+    if (shown && state.agentsOffered !== null && !live.some((view) => view.tokenId === shown)) {
+      hideCommand();
+    }
+    dom.flag(agentsBlock, 'hidden', live.length === 0 && shownCommand === null);
+    const key = JSON.stringify(live);
+    if (key === shownAgents) return;
+    shownAgents = key;
+    agentBoxes.forEach(dropBox);
+    agentBoxes = live.map(agentRow);
+    dom.replaceChildren(
+      agentList,
+      agentBoxes.map((box) => box.element),
+    );
+  }
+
+  function agentRow(view: AgentView): ArmedBox {
+    const row = element('li', 'row');
+    const box = newBox(row);
+    boxes.add(box);
+    dom.attr(row, 'data-token-id', view.tokenId);
+    const buttons = element('div', 'buttons');
+    dom.append(
+      buttons,
+      boxButton(box, 'Cancel', 'agent-cancel', () => {
+        dock.cancelAgent(view.tokenId);
+      }),
+    );
+    dom.append(
+      row,
+      element('p', 'who', `"${view.label}", agent token`),
+      element('p', 'muted', `${AGENT_STATES[view.state]}, until ${timeText(view.expiresAt)}`),
+      buttons,
+    );
+    return box;
+  }
   // M6 seam: not built
   /** Returns whether a session's end offers its record, which opens the panel as a join notice does. */
   const syncRecords: (state: DockState) => boolean = () => false;
@@ -2497,6 +2669,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     win?.removeEventListener('focus', rearmAll);
     for (const box of boxes) timers.cancel(box.timer);
     hideLink();
+    hideCommand();
     dom.remove(host);
   }
 

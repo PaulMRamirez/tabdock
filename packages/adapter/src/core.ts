@@ -6,7 +6,11 @@
 import {
   ACCEPTED_PROPOSAL_RUN_MS,
   type Account,
+  AGENT_BURN_TIMEOUTS,
+  AGENT_TOKEN_BYTES,
+  AGENT_TOKEN_PREFIX,
   agentKeyInput,
+  type AgentListing,
   type AgentState,
   ATTACH_REQUEST_TTL_MS,
   type AttachmentView,
@@ -35,14 +39,17 @@ import {
   type InviteListing,
   type InviteRefusalReason,
   INVITEE_ID_PREFIX,
+  INVITEE_KEY_HEX_CHARS,
   INVITEE_SHORT_ID_CHARS,
   type JsonObject,
   JsonObjectSchema,
+  MAX_AGENT_LIFETIME_MS,
   MAX_FRAME_BYTES,
   MAX_IMAGE_BYTES,
   MAX_IMAGE_TEXT_CHARS,
   MAX_INVITE_LIFETIME_MS,
   MAX_INVITE_USES,
+  MAX_LIVE_AGENTS_PER_PAGE,
   MAX_LIVE_INVITES_PER_PAGE,
   MAX_OBSERVERS_PER_PAGE,
   MAX_PENDING_PROPOSALS_PER_PAGE,
@@ -86,6 +93,8 @@ import {
   SHORT_INVITE_LIFETIME_MS,
   STATE_MIN_INTERVAL_MS,
   StateValueSchema,
+  type StoredAgent,
+  StoredAgentsSchema,
   type StoredGrant,
   StoredGrantSchema,
   type StoredInvite,
@@ -274,6 +283,12 @@ export interface PendingRequest {
    * secret, which stays inside the adapter. null for a code or QR request.
    */
   readonly invite: { readonly inviteId: string; readonly label: string } | null;
+  /**
+   * The agent token whose first request this is (ADR 0044), as the relay
+   * names it; never the token. Its label is checked against this page's own
+   * record before the operator is asked. null for every other request.
+   */
+  readonly agent: { readonly tokenId: string; readonly label: string } | null;
   readonly client: ClientInfo | null;
   /** Local epoch milliseconds at which silence becomes a denial. */
   readonly expiresAt: number;
@@ -3151,6 +3166,11 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         frame.invite === undefined
           ? null
           : Object.freeze({ inviteId: frame.invite.inviteId, label: frame.invite.label }),
+      // Never the token either: checkAgent checks it against this page's own record (ADR 0044).
+      agent:
+        frame.agent === undefined
+          ? null
+          : Object.freeze({ tokenId: frame.agent.tokenId, label: frame.agent.label }),
       client: frame.client,
       expiresAt,
     });
@@ -3159,7 +3179,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       timer: null,
       port: new AbortController(),
       shown: false,
-      secret: frame.invite?.secret ?? null,
+      secret: frame.invite?.secret ?? frame.agent?.secret ?? null,
       verified: false,
     };
     record.timer = timers.setTimeout(
@@ -3170,6 +3190,12 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     );
     requests.set(frame.requestId, record);
     log.info(`attach request from ${logName(frame.user)} via ${frame.via}`);
+    // An agent token is never approved in advance (S4): its request reaches
+    // the operator only once it checks out against this page's own record.
+    if (frame.agent !== undefined) {
+      void checkAgent(record);
+      return;
+    }
     if (frame.invite !== undefined) {
       void checkRedemption(record);
       return;
@@ -3332,7 +3358,19 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     }
     const inviteId = request.invite?.inviteId;
     const invite = inviteId === undefined ? undefined : invites.get(inviteId);
+    const agentId = request.agent?.tokenId;
+    const agent = agentId === undefined ? undefined : agentRecords.get(agentId);
     let granted = role;
+    if (allow && agentId !== undefined) {
+      // S4 and S5: never a token this page has not matched to its record,
+      // never past the record's terms now, and only ever an observer.
+      const problem = record.verified ? agentProblem(request) : 'unchecked';
+      if (problem !== null || !agent) {
+        log.warn(`refused agent token ${agentId}: ${problem ?? 'no record'}`);
+        return decide(record, false, undefined, 'rule');
+      }
+      granted = 'observer';
+    }
     if (allow && inviteId !== undefined) {
       // S14: never a redemption whose secret this page has not matched to its
       // record, whoever approves it, and never past the record's terms now.
@@ -3371,7 +3409,9 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     const keptAttachment = revoked.has(userId)
       ? undefined
       : state.roster.find((attachment) => attachment.userId === userId);
-    if (allow && granted !== undefined && invite && inviteId !== undefined) {
+    if (allow && granted !== undefined && agent) {
+      agentGranted(userId, agent);
+    } else if (allow && granted !== undefined && invite && inviteId !== undefined) {
       // An invite-made grant ends 24 hours after redemption and names the
       // invite's role as its cap (ADR 0017); its use is spent here, on the
       // page's own count, whatever the relay counts.
@@ -3404,6 +3444,9 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     if (!allow && invite && record.shown && (cause === 'operator' || cause === 'timeout')) {
       updateInvite({ ...invite, refusals: Math.min(INVITE_BURN_REFUSALS, invite.refusals + 1) });
     }
+    if (!allow && agent && record.shown && (cause === 'operator' || cause === 'timeout')) {
+      agentRefused(agent, cause);
+    }
     const who = logName(request.user);
     askedDriver.delete(userId);
     if (!allow) {
@@ -3431,7 +3474,11 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     // frame, which went first; a decision would only reach a request already
     // gone there, and count against the page's budget for frames that change
     // nothing (A4.3). While the link is down the relay dropped them anyway.
-    if (cause === 'revoke') return true;
+    // An agent token's silence is the relay's to count: its own timer ends
+    // the request as a timeout, which only the third time burns the token,
+    // whereas a refusal from here reads as the operator's deny and burns it
+    // at once (ADR 0044), whichever clock runs ahead.
+    if (cause === 'revoke' || (cause === 'timeout' && agentId !== undefined)) return true;
     return send({
       t: 'attach_decision',
       requestId,
@@ -4744,16 +4791,389 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     return minted;
   };
 
-  // Agent tokens (ADR 0044)
-  // M6 seam: not built
-  const onAgents: (frame: AgentsFrame) => void = () => undefined;
-  // M6 seam: not built
-  const agentsRevoked: (target: string) => void = () => undefined;
-  // M6 seam: not built
-  const agentToken: Dock['agentToken'] = () =>
-    Promise.resolve<AgentTokenResult>(Object.freeze({ ok: false, reason: 'unavailable' }));
-  // M6 seam: not built
-  const cancelAgent: Dock['cancelAgent'] = () => false;
+  // Agent tokens (ADR 0044). A token is minted here as an invite is: 256
+  // bits from getRandomValues, its SHA-256 kept in this page's own record
+  // and sent to the relay, the token itself only in what agentToken()
+  // resolves with, once. Its first request is honoured only against that
+  // record: the token presented, its label, the agent's id derived from this
+  // page and the token, and its time; then the operator is asked, for
+  // observer only, and a denial or three prompts left to time out burn it.
+
+  /** This page's records of the tokens it minted, by id: hashes, never tokens. */
+  const agentRecords = new Map<string, StoredAgent>();
+  /** The page session the records belong to; they mean nothing on another. */
+  let agentsPage: string | null = null;
+  /** What the relay's last agents frame said of each token the records hold, terms matching. */
+  let agentListings = new Map<string, AgentListing>();
+  /** Tokens sent to the relay that it has neither listed nor refused yet, each with its token until then. */
+  const agentMinting = new Map<
+    string,
+    {
+      readonly token: string;
+      readonly resolve: (result: AgentTokenResult) => void;
+      readonly timer: unknown;
+    }
+  >();
+  /** Tokens closed on this link because this page holds no record of them, so each is closed once. */
+  const agentCancelSent = new Set<string>();
+  /** The agent users this page checked, by user id, so revoking one also cancels its token. */
+  const agentUsers = new Map<string, string>();
+
+  function loadAgents(): void {
+    const text = readStored(agentsKey);
+    const stored = text === null ? null : StoredAgentsSchema.safeParse(parseJson(text));
+    // A strict schema: a record holding a token, or anything malformed, is no record at all.
+    if (stored && !stored.success) log.warn('ignored unparsable stored agent tokens');
+    if (stored?.success && (grantsPage === null || grantsPage === stored.data.pageId)) {
+      agentsPage = stored.data.pageId;
+      for (const agent of stored.data.agents) agentRecords.set(agent.tokenId, agent);
+    }
+  }
+
+  loadAgents();
+
+  /** Every change to the records ends here, so storage and the shown tokens match memory. */
+  function saveAgents(): void {
+    writeStored(
+      agentsKey,
+      agentRecords.size === 0 || agentsPage === null
+        ? null
+        : JSON.stringify({ pageId: agentsPage, agents: [...agentRecords.values()] }),
+      "the page's agent tokens",
+    );
+    const views = agentViews();
+    if (JSON.stringify(views) !== JSON.stringify(state.agents)) setState({ agents: views });
+  }
+
+  /** When a token stops working on this page's clock: its expiry, never past 8 hours from minting. */
+  function agentEnd(agent: StoredAgent): number {
+    return Math.min(agent.expiresAt, agent.createdAt + MAX_AGENT_LIFETIME_MS);
+  }
+
+  /**
+   * Every token this page minted that the relay lists on the very terms it
+   * was minted with, oldest first: the records are kept in minting order.
+   */
+  function agentViews(): AgentView[] {
+    const views: AgentView[] = [];
+    for (const agent of agentRecords.values()) {
+      const listing = agentListings.get(agent.tokenId);
+      if (listing) {
+        views.push(
+          Object.freeze({
+            tokenId: agent.tokenId,
+            label: agent.label,
+            expiresAt: agentEnd(agent),
+            state: listing.state,
+            timeouts: Math.max(listing.timeouts, agent.timeouts),
+            sponsor: Object.freeze(listing.sponsor),
+          }),
+        );
+      }
+    }
+    return views;
+  }
+
+  /**
+   * The page stops honouring a token: its record goes, stored copy too, a
+   * first request of it still being checked or waiting on the operator is
+   * refused, the grant it made goes, and a mint still waiting settles with
+   * `reason`.
+   */
+  function forgetAgent(tokenId: string, reason: InviteRefusal): void {
+    const had = agentRecords.delete(tokenId);
+    agentListings.delete(tokenId);
+    const mint = agentMinting.get(tokenId);
+    if (mint) {
+      agentMinting.delete(tokenId);
+      timers.clearTimeout(mint.timer);
+      mint.resolve(Object.freeze({ ok: false, reason }));
+    }
+    for (const record of [...requests.values()]) {
+      if (record.request.agent?.tokenId === tokenId) decide(record, false, undefined, 'rule');
+    }
+    for (const [userId, ofToken] of [...agentUsers]) {
+      if (ofToken === tokenId) agentUsers.delete(userId);
+    }
+    const holders = [...grants].filter(([, grant]) => grant.inviteId === tokenId);
+    if (holders.length > 0) pruneGrants(holders.map(([userId]) => userId));
+    if (had) saveAgents();
+  }
+
+  /** Closes a token the relay lists that this page holds no record of, once per link. */
+  function closeUnknownAgent(tokenId: string): void {
+    if (agentCancelSent.has(tokenId) || !isLinked()) return;
+    if (send({ t: 'agent_cancel', tokenId })) {
+      agentCancelSent.add(tokenId);
+      log.warn(`closed unknown agent token ${tokenId}`);
+    }
+  }
+
+  /**
+   * The relay's list of this page's live tokens. Only those this page's own
+   * record holds, on the very terms it minted them with, are shown; any
+   * other is closed, since nothing here would honour it. A record the relay
+   * no longer lists was cancelled, burned or expired there and goes, unless
+   * its mint is still waiting for this very answer.
+   */
+  function onAgents(frame: AgentsFrame): void {
+    // The first agents frame of each link follows its welcome (tearDownLink cleared the last).
+    if (state.agentsOffered === null) agentCancelSent.clear();
+    // Records of another page session were never this one's to honour.
+    if (agentsPage !== null && agentsPage !== state.pageId) {
+      for (const tokenId of [...agentRecords.keys()]) forgetAgent(tokenId, 'link_down');
+      agentsPage = null;
+    }
+    const refused = frame.refused;
+    const listed = new Map<string, AgentListing>();
+    for (const listing of frame.agents) {
+      const agent = agentRecords.get(listing.tokenId);
+      const same =
+        agent !== undefined &&
+        agent.label === listing.label &&
+        agent.expiresAt === listing.expiresAt;
+      if (same && listing.tokenId !== refused?.tokenId) {
+        listed.set(listing.tokenId, listing);
+        continue;
+      }
+      if (agent) {
+        log.warn(`agent token ${listing.tokenId} listed on other terms`);
+        forgetAgent(listing.tokenId, 'unavailable');
+      }
+      closeUnknownAgent(listing.tokenId);
+    }
+    if (refused && agentMinting.has(refused.tokenId)) {
+      log.info(`relay refused agent token ${refused.tokenId}: ${refused.reason}`);
+      forgetAgent(refused.tokenId, refused.reason);
+    }
+    for (const tokenId of [...agentRecords.keys()]) {
+      if (!listed.has(tokenId) && !agentMinting.has(tokenId)) forgetAgent(tokenId, 'cancelled');
+    }
+    agentListings = listed;
+    setState({ agentsOffered: Object.freeze({ endpoint: frame.endpoint }), agents: agentViews() });
+    for (const tokenId of [...agentMinting.keys()]) {
+      if (listed.has(tokenId)) answerAgentMint(tokenId, frame.endpoint);
+    }
+  }
+
+  /**
+   * The relay listed a new token: agentToken() resolves with it and the
+   * command that uses it, the only place either ever goes. Every part of the
+   * command is shell-safe by schema: the endpoint passed isAgentEndpoint,
+   * and the token and its id are base64url.
+   */
+  function answerAgentMint(tokenId: string, endpoint: string | null): void {
+    const mint = agentMinting.get(tokenId);
+    const agent = agentRecords.get(tokenId);
+    if (!mint || !agent) return;
+    if (endpoint === null) {
+      // A relay with no public URL mints nothing, so one listing a token anyway gets it closed.
+      forgetAgent(tokenId, 'no_public_url');
+      closeUnknownAgent(tokenId);
+      return;
+    }
+    agentMinting.delete(tokenId);
+    timers.clearTimeout(mint.timer);
+    log.info(`minted agent token ${tokenId}`);
+    mint.resolve(
+      Object.freeze({
+        ok: true,
+        tokenId,
+        token: mint.token,
+        endpoint,
+        command: `claude mcp add --transport http --scope local tabdock-${tokenId.slice(4, 12)} ${endpoint} --header "Authorization: Bearer ${mint.token}"`,
+        expiresAt: agentEnd(agent),
+      }),
+    );
+  }
+
+  /**
+   * Whatever about a token's own record stops its request now, beyond the
+   * token itself, or null. An agent named with an account never gets here:
+   * the frame's schema refuses one.
+   */
+  function agentProblem(request: PendingRequest): string | null {
+    const agent = request.agent && agentRecords.get(request.agent.tokenId);
+    if (!agent) return 'no record';
+    if (agentsPage !== state.pageId) return 'another page session';
+    if (request.agent.label !== agent.label) return 'wrong label';
+    if (clock() >= agentEnd(agent)) return 'expired';
+    if (agent.burned || agent.timeouts >= AGENT_BURN_TIMEOUTS) return 'burned';
+    // The page's policy as it stands now, which a reload may have narrowed since minting.
+    if (policy.invites === 'off') return 'policy';
+    const { userId } = request.user;
+    if (revoked.has(userId)) return 'revoked';
+    return state.roster.some((attachment) => attachment.userId === userId) ? 'attached' : null;
+  }
+
+  /**
+   * S4 for agents: a token's first request reaches the operator only when
+   * the token presented hashes to this page's own record, its label is the
+   * record's, the agent's id is the one this page derives from its own page
+   * id and the token id (so a relay cannot reuse a token for another
+   * account), and the record's terms still hold. Then the operator is asked,
+   * for observer only. Anything else is refused without troubling them: only
+   * a relay's mistake or lie could have sent it.
+   */
+  async function checkAgent(record: RequestRecord): Promise<void> {
+    const { request } = record;
+    const secret = record.secret;
+    record.secret = null;
+    const tokenId = request.agent?.tokenId ?? '';
+    const kept = agentRecords.get(tokenId);
+    const pageId = state.pageId;
+    let matches = false;
+    let derived: string | null = null;
+    if (kept && secret !== null && webCrypto && pageId !== null) {
+      try {
+        // Both sides are digests, so how long the comparison takes says nothing of the token.
+        matches = (await sha256Hex(webCrypto, secret)) === kept.secretHash;
+        const key = await sha256Hex(webCrypto, agentKeyInput(pageId, tokenId));
+        derived = `g_${key.slice(0, INVITEE_KEY_HEX_CHARS)}`;
+      } catch (error) {
+        log.warn(`agent token hash failed: ${describe(error)}`);
+      }
+    }
+    // Answered meanwhile: expired, revoked, the token forgotten, or the link lost.
+    if (requests.get(request.requestId) !== record) return;
+    // Without a record or WebCrypto nothing matches, so nothing is honoured.
+    const problem = !matches
+      ? 'wrong token'
+      : derived !== request.user.userId
+        ? 'wrong agent id'
+        : agentProblem(request);
+    if (problem !== null) {
+      log.warn(`refused agent token ${tokenId}: ${problem}`);
+      decide(record, false, undefined, 'rule');
+      return;
+    }
+    record.verified = true;
+    agentUsers.set(request.user.userId, tokenId);
+    show(record);
+  }
+
+  /** The operator allowed a checked token: an observer, capped as a watch invite's guest, ending with the token. */
+  function agentGranted(userId: string, agent: StoredAgent): void {
+    forgetRevokes([userId]);
+    setGrant(userId, {
+      role: 'observer',
+      inviteId: agent.tokenId,
+      endsAt: agentEnd(agent),
+      inviteRole: 'observer',
+    });
+  }
+
+  /**
+   * The operator denied a token's prompt, which says they do not know the
+   * agent, so the token burns at once; one left to time out counts, and its
+   * third does too (ADR 0044). The relay burns it by the same rules, and is
+   * told to close it whatever it counts.
+   */
+  function agentRefused(agent: StoredAgent, cause: 'operator' | 'timeout'): void {
+    const timeouts = cause === 'timeout' ? agent.timeouts + 1 : agent.timeouts;
+    const burned = cause === 'operator' || timeouts >= AGENT_BURN_TIMEOUTS;
+    agentRecords.set(agent.tokenId, { ...agent, burned, timeouts });
+    if (burned) cancelAgent(agent.tokenId);
+    else saveAgents();
+  }
+
+  /**
+   * Revoke's end: Revoke all forgets every token, which the relay's revoke
+   * '*' closes itself; revoking an agent forgets its token and tells the
+   * relay to close it too (agent_cancel), so no later request is honoured.
+   */
+  function agentsRevoked(target: string): void {
+    if (target === '*') {
+      for (const tokenId of [...agentRecords.keys()]) forgetAgent(tokenId, 'cancelled');
+      return;
+    }
+    const tokenId =
+      agentUsers.get(target) ??
+      state.roster.find((attachment) => attachment.userId === target)?.inviteId;
+    // cancelAgent passes over an id that names no token: an invite's, or none.
+    if (tokenId) cancelAgent(tokenId);
+  }
+
+  /**
+   * Mints an agent token (ADR 0044) once the page's policy, the relay and
+   * this page's own limit allow: its record is stored before agent_create
+   * goes, so a reload while the relay answers still knows the token it may
+   * hold. The token and its command come back once and are kept nowhere.
+   */
+  async function agentToken(request: AgentTokenOptions): Promise<AgentTokenResult> {
+    const refuse = (reason: InviteRefusal): AgentTokenResult =>
+      Object.freeze({ ok: false, reason });
+    const given: unknown = request;
+    if (typeof given !== 'object' || given === null) return refuse('invalid');
+    const lifetime: unknown = request.lifetime ?? '1h';
+    const hours = lifetime === '1h' ? 1 : lifetime === '4h' ? 4 : lifetime === '8h' ? 8 : 0;
+    if (!InviteLabelSchema.safeParse(request.label).success || hours === 0)
+      return refuse('invalid');
+    if (policy.invites === 'off') return refuse('policy');
+    if (!isLinked()) return refuse('link_down');
+    const offered = state.agentsOffered;
+    if (offered === null || !webCrypto) return refuse('unavailable');
+    if (offered.endpoint === null) return refuse('no_public_url');
+    const token = `${AGENT_TOKEN_PREFIX}${randomText(webCrypto, AGENT_TOKEN_BYTES)}`;
+    const tokenId = `agt_${randomText(webCrypto, INVITE_ID_BYTES)}`;
+    let secretHash: string;
+    try {
+      secretHash = await sha256Hex(webCrypto, token);
+    } catch (error) {
+      log.warn(`agent token hash failed: ${describe(error)}`);
+      return refuse('unavailable');
+    }
+    // The link may have dropped, or the page closed, while the hash was made.
+    const pageId = state.pageId;
+    if (!isLinked() || pageId === null) return refuse('link_down');
+    if (agentRecords.size >= MAX_LIVE_AGENTS_PER_PAGE) return refuse('limit');
+    const now = clock();
+    const record: StoredAgent = {
+      tokenId,
+      secretHash,
+      label: request.label,
+      createdAt: now,
+      expiresAt: now + hours * 3_600_000,
+      timeouts: 0,
+      burned: false,
+    };
+    if (agentsPage !== pageId) {
+      for (const stale of [...agentRecords.keys()]) forgetAgent(stale, 'link_down');
+      agentsPage = pageId;
+    }
+    agentRecords.set(tokenId, record);
+    saveAgents();
+    return new Promise<AgentTokenResult>((resolve) => {
+      const timer = timers.setTimeout(() => {
+        if (!agentMinting.has(tokenId)) return;
+        log.warn(`no answer for agent token ${tokenId}`);
+        forgetAgent(tokenId, 'unavailable');
+        closeUnknownAgent(tokenId);
+      }, MINT_ANSWER_MS);
+      agentMinting.set(tokenId, { token, resolve, timer });
+      const sent = send({
+        t: 'agent_create',
+        tokenId,
+        label: record.label,
+        expiresAt: record.expiresAt,
+        secretHash,
+      });
+      if (!sent) forgetAgent(tokenId, 'link_down');
+    });
+  }
+
+  /**
+   * Closes one token (agent_cancel) and forgets its record at once, so this
+   * page honours it no more whatever the relay does; the relay ends what it
+   * let in. False when this page holds no such token.
+   */
+  function cancelAgent(tokenId: string): boolean {
+    if (closed || !agentRecords.has(tokenId)) return false;
+    forgetAgent(tokenId, 'cancelled');
+    log.info(`closed agent token ${tokenId}`);
+    if (isLinked() && send({ t: 'agent_cancel', tokenId })) agentCancelSent.add(tokenId);
+    return true;
+  }
 
   // The session record (ADR 0045)
   // M6 seam: not built

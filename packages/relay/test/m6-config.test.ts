@@ -7,10 +7,10 @@
 // without invites (ADR 0044), the members file in public URL mode (ADR 0043)
 // and the restart snapshot, which needs an audit directory (ADR 0046). Every
 // refusal names its setting and never the value it was given (R1, R2). Until
-// the waves serve them, agent tokens and the snapshot pass their own rules
-// and are then refused at start, so no relay runs as if one were on while
-// nothing honours it. The members file is read (W1-E): its own tests are
-// members.test.ts and members-file.test.ts.
+// W3-B serves it, the snapshot passes its own rules and is then refused at
+// start, so no relay runs as if it were on while nothing honours it. Agent
+// tokens are served (W2-D, agent-tokens.test.ts), and the members file is
+// read (W1-E): its own tests are members.test.ts and members-file.test.ts.
 
 import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -445,22 +445,17 @@ describe('TABDOCK_MAX_USERS_PER_PAGE gains a ceiling (ADR 0044)', () => {
 });
 
 describe('TABDOCK_AGENT_TOKENS (ADR 0044)', () => {
-  it('is off unless set, and refused at start when on until this relay serves /g/mcp', () => {
+  it('is off unless set, and on with invites, production included', () => {
     expect(resolveEnv(DEV_INVITES).agentTokens).toBe(false);
     for (const value of ['0', 'false']) {
       expect(resolveEnv({ ...DEV, TABDOCK_AGENT_TOKENS: value }).agentTokens).toBe(false);
     }
-    // M6 seam: not built. W2-D serves /g/mcp and turns these into relays with tokens on.
     for (const env of [
       { ...DEV_INVITES, TABDOCK_AGENT_TOKENS: '1' },
       { ...DEV_INVITES, TABDOCK_AGENT_TOKENS: 'TRUE' },
       { ...HOSTED, TABDOCK_INVITES: '1', TABDOCK_AGENT_TOKENS: 'true' },
     ]) {
-      refusedWith(
-        env,
-        'TRUE',
-        'TABDOCK_AGENT_TOKENS is not served by this relay yet; leave it off (ADR 0044)',
-      );
+      expect(resolveEnv(env).agentTokens).toBe(true);
     }
   });
 
@@ -483,14 +478,12 @@ describe('TABDOCK_AGENT_TOKENS (ADR 0044)', () => {
     );
   });
 
-  it('takes only true from code, never without invites, and refuses it until built', () => {
+  it('takes only true from code, and never without invites', () => {
     expect(resolveConfig(stray({ invites: true, agentTokens: 'true' })).agentTokens).toBe(false);
     expect(() => resolveConfig({ auth, agentTokens: true })).toThrow(
       'agentTokens (TABDOCK_AGENT_TOKENS) needs invites (TABDOCK_INVITES): an agent token is minted on a page as an invite is, while a member sponsors it (ADR 0044)',
     );
-    expect(thrown(() => resolveConfig({ auth, invites: true, agentTokens: true }))).toBe(
-      'agentTokens (TABDOCK_AGENT_TOKENS) is not served by this relay yet; leave it off (ADR 0044)',
-    );
+    expect(resolveConfig({ auth, invites: true, agentTokens: true }).agentTokens).toBe(true);
   });
 });
 

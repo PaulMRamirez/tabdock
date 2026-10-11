@@ -20,6 +20,8 @@
 // fill that bound waits for room instead (ADR 0024 and its notes).
 
 import {
+  AGENT_BURN_TIMEOUTS,
+  AGENT_PATH,
   type AttachmentView,
   AttachRefusalSchema,
   type AttachVia,
@@ -45,10 +47,12 @@ import {
   type InviteListing,
   type InviteRefusalReason,
   InviteeIdSchema,
+  isAgentEndpoint,
   InviteSecretSchema,
   inviteSecretOf,
   type JsonObject,
   type Limits,
+  MAX_AGENT_LIFETIME_MS,
   MAX_CONFIRMATION_FRAME_BYTES,
   MAX_DESCRIPTION_CHARS,
   MAX_FIRST_CLASS_CHARS_PER_USER,
@@ -56,6 +60,7 @@ import {
   MAX_FIRST_CLASS_TOOLS_PER_USER,
   MAX_FRAME_BYTES,
   MAX_INVITE_LIFETIME_MS,
+  MAX_LIVE_AGENTS_PER_PAGE,
   MAX_LIVE_INVITES_PER_PAGE,
   MAX_MEMBERS,
   MAX_PENDING_PROPOSALS_PER_PAGE,
@@ -101,7 +106,7 @@ import {
   type UncheckedReason,
 } from './argument-checker.ts';
 import { AuditRefusalBudget } from './audit-budget.ts';
-import { foldName, type UserAccount } from './auth.ts';
+import { agentUser, type AuthUser, foldName, type UserAccount } from './auth.ts';
 import { MIN_REQUEST_BYTES, type ResolvedConfig } from './config.ts';
 import {
   argumentsDigest,
@@ -121,7 +126,7 @@ import {
   firstClassName,
   firstClassToolPart,
 } from './first-class.ts';
-import { AgentTokens } from './agents.ts';
+import { type AgentCloseReason, AgentTokens } from './agents.ts';
 import { type HeldTally, holdValue } from './held-tally.ts';
 import type { LogFields, Logger, LogLevel } from './log.ts';
 import type { MemberChange } from './members.ts';
@@ -154,6 +159,7 @@ import {
 import type { CallMarks, SpikeHooks } from './spike.ts';
 import { WaitSlots, waitLimitsOf } from './waits.ts';
 import {
+  type AgentTokenRecord,
   type AttachmentRecord,
   type AttachRequestRecord,
   type AuditOutcome,
@@ -199,6 +205,18 @@ export type BudgetRefusal =
 function lesserRole(a: Role, b: Role): Role {
   return a === 'observer' || b === 'observer' ? 'observer' : 'driver';
 }
+
+/** What a request or an attachment an agent token held hears when the token closes (ADR 0044). */
+const AGENT_CLOSED_MESSAGES: Record<AgentCloseReason, string> = {
+  cancelled: 'the page operator cancelled this agent token',
+  expired: 'this agent token reached the end of its time',
+  revoked: 'the page operator revoked this agent token',
+  denied: 'the page operator denied this agent token, so it no longer works',
+  burned: 'this agent token went unanswered too many times, so it no longer works',
+  sponsor_gone: 'the member who made this agent token is no longer attached, so it closed',
+  page_gone: 'the page closed and did not come back',
+  session_ended: "the page's time-boxed session ended, and every agent token with it",
+};
 
 /** The code a refused pairing or redemption ended with, as its attach_refused record names it. */
 function attachRefusalOf(code: ErrorCode): AttachRefusal {
@@ -329,6 +347,31 @@ type GrantRequest = Pick<
 
 /** A redemption that needs the page's answer, or one settled at once. */
 type Started = PairOutcome | { kind: 'pending'; record: AttachRequestRecord };
+
+/**
+ * What made an invite-made attachment: an invite (ADR 0017), or an agent
+ * token (ADR 0044), whose id then stands where the invite's would, whose
+ * role is observer and whose end is the token's own.
+ */
+type GrantDoor = Pick<InviteRecord, 'inviteId' | 'role' | 'sponsor'> & { readonly endsAt?: number };
+
+/**
+ * What an attach request came through and the page must check against its
+ * own record: an invite being redeemed, or an agent token's first request.
+ * The secret is the one presented, forwarded once and never kept.
+ */
+type Door =
+  | { inviteId: string; secret: string; label: string }
+  | { tokenId: string; secret: string; label: string };
+
+/** Who a live agent token on /g/mcp is (ADR 0044): its agent user, its id and its one page. */
+export interface AgentIdentity {
+  user: AuthUser;
+  tokenId: string;
+  pageId: string;
+  /** Whether the operator has let it in, so its requests raise no prompt and need no client named. */
+  attached: boolean;
+}
 
 /** A page title longer than this is cut before /pair shows it (S10). */
 export const MAX_PAIR_TITLE_CHARS = 120;
@@ -1482,6 +1525,14 @@ export class PageHub {
    * and get_proposal (waits.ts, conflict C2 of the M6 plan).
    */
   readonly #waits: WaitSlots;
+  /** Told the agent user of each token that closes; relay.ts ends its sessions and streams. */
+  #agentListener: ((userId: string) => void) | null = null;
+  /**
+   * Why a dormant token's latest request raised no prompt (the page busy,
+   * full or asleep), by page and token id, so its pair_page can say so; only
+   * live tokens are keys.
+   */
+  readonly #agentRefusals = new Map<string, HubError>();
   /** The M3 spike's pairing milestones (spike.ts), when TABDOCK_SPIKE is on. */
   readonly #spike: SpikeHooks | null;
   #closed = false;
@@ -1574,7 +1625,17 @@ export class PageHub {
       },
       admitted: (record) => this.#stillProposes(record),
     });
-    this.#agents = new AgentTokens();
+    this.#agents = new AgentTokens({
+      store: store.agents,
+      log: this.#log,
+      audit: (event) => {
+        this.#audit(event);
+      },
+      originOf: (pageId) => this.#store.pages.get(pageId)?.origin ?? '',
+      closed: (agent, reason) => {
+        this.#agentClosed(agent, reason);
+      },
+    });
     this.#parts = new PageParts([this.#states, this.#proposals, this.#agents]);
   }
 
@@ -2033,10 +2094,27 @@ export class PageHub {
     return null;
   }
 
-  /** The page minting or cancelling an agent token (ADR 0044); false when nothing changed. */
+  /**
+   * The page minting or cancelling an agent token (ADR 0044). A relay with
+   * agent tokens off mints none and sends no agents frame at all, as for
+   * invites, so a page that sends one anyway is ignored, its token's hash
+   * unlogged. Answers whether it minted or closed a token.
+   */
   #agentFrame(pageId: string, frame: FrameOf<'agent_create' | 'agent_cancel'>): boolean {
-    // M6 seam: not built. Refused by being ignored, so no token is minted.
-    return this.#notActedOn(pageId, frame.t);
+    if (!this.#config.agentTokens) {
+      this.#log.warn('ignored an agent token frame: this relay takes no agent tokens', {
+        pageId,
+        frameType: frame.t,
+      });
+      return false;
+    }
+    if (frame.t === 'agent_cancel') {
+      const agent = this.#store.agents.get(pageId, frame.tokenId);
+      // Closing sends the agents frame; naming none sends it too, so the page reconciles.
+      if (agent === undefined || !this.#agents.end(agent, 'cancelled')) this.#sendAgents(pageId);
+      return agent !== undefined;
+    }
+    return this.#agentCreate(pageId, frame);
   }
 
   /**
@@ -2732,10 +2810,442 @@ export class PageHub {
 
   // Agent tokens (ADR 0044)
 
-  /** The page's agent tokens, after every welcome and on every change, while agent tokens are on. */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- a stub: its body comes with ADR 0044
-  #sendAgents(_pageId: string): void {
-    // M6 seam: not built. No token is ever minted, so the page hears nothing.
+  /**
+   * The page's agent tokens, after every welcome and on every change, while
+   * agent tokens are on; refused answers an agent_create. A relay with them
+   * off sends none, so the widget offers no agent kind.
+   */
+  #sendAgents(pageId: string, refused?: { tokenId: string; reason: InviteRefusalReason }): void {
+    if (!this.#config.agentTokens) return;
+    const conn = this.#live.get(pageId);
+    if (!conn) return;
+    this.#send(conn, {
+      t: 'agents',
+      endpoint: this.#agentEndpoint(),
+      agents: this.#store.agents.listForPage(pageId).map((agent) => this.#agents.listing(agent)),
+      ...(refused === undefined ? {} : { refused }),
+    });
+  }
+
+  /** `<public URL>/g/mcp`, or null where no agent can reach the relay, which then mints no token. */
+  #agentEndpoint(): string | null {
+    const { publicUrl } = this.#config;
+    const endpoint = publicUrl === null ? null : `${publicUrl}${AGENT_PATH}`;
+    // resolveConfig takes only an https public URL; a frame the adapter would refuse ends its link.
+    return endpoint !== null && isAgentEndpoint(endpoint) ? endpoint : null;
+  }
+
+  /**
+   * Mints an agent token as far as the page's policy, its sponsor and the
+   * bounds allow, keeping only its digest, and answers with an agents frame
+   * either way, so the adapter's agentToken() always settles. The checks run
+   * as an invite's do (#inviteCreate), the page's grants counted last, so a
+   * refused mint spends none. The relay judges expiresAt on its own clock and
+   * holds it to MAX_AGENT_LIFETIME_MS. Answers whether it minted one.
+   */
+  #agentCreate(pageId: string, frame: FrameOf<'agent_create'>): boolean {
+    this.#endSessionIfDue(pageId);
+    const page = this.#store.pages.get(pageId);
+    if (!page) return false;
+    const now = Date.now();
+    const refuse = (reason: InviteRefusalReason): false => {
+      this.#log.info('agent token refused', { pageId, tokenId: frame.tokenId, reason });
+      this.#sendAgents(pageId, { tokenId: frame.tokenId, reason });
+      return false;
+    };
+    // A digest is unique across the relay, so a lookup by it finds one token.
+    if (
+      this.#store.agents.get(pageId, frame.tokenId) !== undefined ||
+      this.#store.agents.findBySecretHash(frame.secretHash) !== undefined
+    ) {
+      return refuse('duplicate');
+    }
+    if (page.policy.invites === 'off') return refuse('policy');
+    if (this.#agentEndpoint() === null) return refuse('no_public_url');
+    const sponsor = this.#sponsorOf(pageId);
+    if (sponsor === null) return refuse('no_sponsor');
+    if (frame.expiresAt - now < MIN_INVITE_REMAINING_MS) return refuse('expired');
+    if (
+      this.#store.agents.listForPage(pageId).length >= MAX_LIVE_AGENTS_PER_PAGE ||
+      !this.#grantAllowed(pageId, now)
+    ) {
+      return refuse('limit');
+    }
+    this.#agents.mint({
+      tokenId: frame.tokenId,
+      pageId,
+      label: frame.label,
+      secretHash: frame.secretHash,
+      createdAt: now,
+      expiresAt: Math.min(frame.expiresAt, now + MAX_AGENT_LIFETIME_MS),
+      requestedExpiresAt: frame.expiresAt,
+      sponsor: { userId: sponsor.userId, displayName: sponsor.displayName },
+      state: 'dormant',
+      requestId: null,
+      timeouts: 0,
+      userId: agentUser(pageId, frame.tokenId).userId,
+      client: null,
+    });
+    this.#sendAgents(pageId);
+    return true;
+  }
+
+  /**
+   * Who a token presented on /g/mcp is, or null for a missing, malformed,
+   * unknown, expired or closed one alike, which relay.ts answers 404 before
+   * the body is read (ADR 0044). Found by digest and confirmed in constant
+   * time (S3), within its time, on a page not gone, and only while its
+   * sponsor, and each member above them, is attached and in time: a sponsor
+   * found past their end is ended here as their timer would, which closes
+   * the token (attachmentsEnded), so no request slips into the gap before a
+   * late timer. Asked again once the body is in (relay.ts), with the token
+   * presented, so a request whose token closed meanwhile serves nothing (S8),
+   * as a member list change ends a /mcp request signed in before it.
+   */
+  agentCaller(token: string, now: number): AgentIdentity | null {
+    const agent = this.#agents.byToken(token, now);
+    return agent === null ? null : this.#agentIdentity(agent, now);
+  }
+
+  #agentIdentity(agent: AgentTokenRecord, now: number): AgentIdentity | null {
+    if (!this.#agents.inTime(agent, now)) return null;
+    const page = this.#store.pages.get(agent.pageId);
+    if (page === undefined || page.state === 'gone') return null;
+    if (!this.#chainInTime(agent.pageId, agent.sponsor.userId)) {
+      // A sponsor missing with the token still live would be a relay bug; closed all the same.
+      this.#agents.end(agent, 'sponsor_gone');
+      return null;
+    }
+    if (this.#store.agents.get(agent.pageId, agent.tokenId) !== agent) return null;
+    return {
+      user: agentUser(agent.pageId, agent.tokenId),
+      tokenId: agent.tokenId,
+      pageId: agent.pageId,
+      attached: agent.state === 'attached',
+    };
+  }
+
+  /**
+   * A live token's request arrived with its body (ADR 0044). Never approved
+   * in advance (S4): a dormant token on an awake page raises an ordinary
+   * attach request via agent, carrying the token as presented, which the
+   * relay forwards once and never keeps, so the adapter checks it against
+   * its own record; one asking already has its request, which this client
+   * joins; one attached needs nothing. `client` is what the request named,
+   * remembered so a prompt raised again after a timeout can still name it.
+   */
+  agentArrived(
+    identity: AgentIdentity,
+    token: string,
+    client: ClientInfo | null,
+    now: number,
+  ): void {
+    const agent = this.#store.agents.get(identity.pageId, identity.tokenId);
+    if (agent === undefined) return;
+    if (client !== null) agent.client = client;
+    this.#store.agents.put(agent);
+    if (agent.state === 'attached') return;
+    if (agent.state === 'asking') {
+      const pending =
+        agent.requestId === null ? undefined : this.#store.requests.get(agent.requestId);
+      if (pending !== undefined && client !== null) this.#joinAgent(pending, client);
+      return;
+    }
+    const key = attachmentKey(agent.pageId, agent.tokenId);
+    const asked = this.#agentAsk(agent, identity.user, token, now);
+    if (asked === null) this.#agentRefusals.delete(key);
+    else this.#agentRefusals.set(key, asked);
+  }
+
+  /** A client joining a token's waiting request, named on it as a second device is, with no line each. */
+  #joinAgent(pending: AttachRequestRecord, client: ClientInfo): void {
+    const known = [pending.client, ...pending.joined].some(
+      (seen) => seen !== null && sameClient(seen, client),
+    );
+    if (known || pending.joined.length >= MAX_ROSTER_CLIENTS) return;
+    pending.joined.push(client);
+    this.#store.requests.put(pending);
+  }
+
+  /**
+   * Raises a dormant token's attach request, or says why not: the page
+   * asleep, taking no tokens now, out of seats for one more watcher, or past
+   * its pairing limit, which counts every prompt a token raises (S3) and
+   * nothing a refusal before it, so a token's requests cannot spend the
+   * page's limit while the room is full. Every request a dormant token sends
+   * comes here, so the refusals' lines are debug lines only.
+   */
+  #agentAsk(agent: AgentTokenRecord, user: AuthUser, token: string, now: number): HubError | null {
+    const live = this.#livePage(agent.pageId);
+    if (live === null) {
+      return hubError(
+        'page_asleep',
+        'the page is not connected right now; your agent token asks its operator once it is back',
+      );
+    }
+    const { page, conn } = live;
+    const fields = { pageId: page.pageId, tokenId: agent.tokenId };
+    if (page.policy.invites === 'off') {
+      return hubError(
+        'denied_by_operator',
+        'the page takes no invited guests now, agents included',
+      );
+    }
+    if (
+      this.#agentSeatFull(
+        page.pageId,
+        this.#waitingFor(page.pageId, this.#seatOf('invitee', 'observer')),
+      )
+    ) {
+      this.#log.debug('agent request raised no prompt: no seat left to watch from', fields);
+      return hubError(
+        'page_busy',
+        'the page has no room left for anyone else to watch; its operator can revoke someone to make room',
+      );
+    }
+    if (!this.#pageLimiter.allows(page.pageId, now)) {
+      this.#log.debug('agent request raised no prompt: too many pairings for one page', fields);
+      return hubError(
+        'rate_limited',
+        'too many pairing attempts on this page; wait a minute and try again',
+      );
+    }
+    this.#pageLimiter.record(page.pageId, now);
+    const caller: CallerIdentity = {
+      userId: user.userId,
+      displayName: user.displayName,
+      account: user.account,
+      oauthClientId: null,
+      client: agent.client,
+      agentPageId: agent.pageId,
+    };
+    const record = this.#raiseRequest(
+      caller,
+      page,
+      conn,
+      'agent',
+      { tokenId: agent.tokenId, secret: token, label: agent.label },
+      now,
+    );
+    agent.state = 'asking';
+    agent.requestId = record.requestId;
+    this.#store.agents.put(agent);
+    this.#sendAgents(page.pageId);
+    return null;
+  }
+
+  /**
+   * Whether one more agent, an invitee watching, finds no seat: the
+   * watching seats where the page has them, otherwise the people the
+   * invites may use, members' two kept (ADR 0044, S14).
+   */
+  #agentSeatFull(pageId: string, waiting: number): boolean {
+    return this.#seatOf('invitee', 'observer') === 'watching'
+      ? this.#watchingFull(pageId, waiting)
+      : this.#pageFull(pageId) || this.#inviteSeatsFull(pageId, waiting);
+  }
+
+  /**
+   * The operator allowed a token's first request (ADR 0044): an observer
+   * whatever the answer named, an invite-made attachment whose invite is
+   * the token, ending at the token's end, under its sponsor, so every rule
+   * an invite's guest lives by holds (S14). A token or sponsor past its time
+   * while the operator decided closes now instead, which answers the
+   * request, and a page that filled up meanwhile leaves the token dormant.
+   */
+  #approveAgent(request: AttachRequestRecord): void {
+    const { pageId, userId, requestId } = request;
+    const origin = this.#store.pages.get(pageId)?.origin ?? '';
+    const existing = this.#store.attachments.get(pageId, userId);
+    if (existing) {
+      this.#endRequest(requestId, {
+        kind: 'attached',
+        pageId,
+        origin,
+        role: existing.role,
+        existing: true,
+      });
+      return;
+    }
+    const agent =
+      request.agentTokenId === null
+        ? undefined
+        : this.#store.agents.get(pageId, request.agentTokenId);
+    // Closing a token ends what waits on it, so this is only a guard.
+    if (agent?.requestId !== requestId) {
+      this.#endRequest(
+        requestId,
+        hubError('pairing_expired', 'this agent token is no longer live'),
+      );
+      return;
+    }
+    // A token or sponsor past its time closes here, which answers this request.
+    if (this.#agentIdentity(agent, Date.now()) === null) {
+      if (this.#store.requests.get(requestId) !== undefined) {
+        this.#endRequest(
+          requestId,
+          hubError('pairing_expired', 'this agent token is no longer live'),
+        );
+      }
+      return;
+    }
+    if (this.#agentSeatFull(pageId, 0)) {
+      this.#log.info('approval refused: the page filled up while the operator decided', {
+        pageId,
+        userId,
+      });
+      this.#endRequest(
+        requestId,
+        hubError(
+          'page_busy',
+          'the page has no room left for anyone else to watch; its operator can revoke someone to make room',
+        ),
+      );
+      return;
+    }
+    agent.state = 'attached';
+    agent.requestId = null;
+    this.#store.agents.put(agent);
+    const attachment = this.#grant(request, 'observer', {
+      inviteId: agent.tokenId,
+      role: 'observer',
+      sponsor: agent.sponsor,
+      endsAt: agent.expiresAt,
+    });
+    this.#endRequest(requestId, {
+      kind: 'attached',
+      pageId,
+      origin,
+      role: attachment.role,
+      existing: false,
+      sponsor: agent.sponsor.displayName,
+    });
+    this.#sendAgents(pageId);
+  }
+
+  /**
+   * A token's prompt went unanswered: the token goes back to waiting for its
+   * next request, and its third such prompt burns it (ADR 0044), so a leaked
+   * token cannot bury the operator in prompts.
+   */
+  #agentTimedOut(pageId: string, tokenId: string): void {
+    const agent = this.#store.agents.get(pageId, tokenId);
+    if (agent === undefined) return;
+    agent.timeouts = Math.min(AGENT_BURN_TIMEOUTS, agent.timeouts + 1);
+    if (agent.timeouts >= AGENT_BURN_TIMEOUTS) {
+      this.#agents.end(agent, 'burned');
+      return;
+    }
+    this.#store.agents.put(agent);
+    this.#sendAgents(pageId);
+  }
+
+  /**
+   * After a token's record went (agents.ts): its request still waiting on
+   * the operator ends, its attachment ends with its calls and waits (S8)
+   * under a record of why, unless its page's end takes the attachment
+   * itself, the relay ends its MCP sessions and listen streams, and the page
+   * hears. An attachment already ended (a revoke, its time, its sponsor's
+   * end) needs nothing more here.
+   */
+  #agentClosed(agent: AgentTokenRecord, reason: AgentCloseReason): void {
+    const { pageId, userId } = agent;
+    this.#agentRefusals.delete(attachmentKey(pageId, agent.tokenId));
+    const message = AGENT_CLOSED_MESSAGES[reason];
+    if (agent.requestId !== null && this.#store.requests.get(agent.requestId) !== undefined) {
+      this.#endRequest(agent.requestId, hubError('denied_by_operator', message));
+    }
+    const page = this.#store.pages.get(pageId);
+    if (reason !== 'page_gone' && this.#store.attachments.get(pageId, userId) !== undefined) {
+      this.#endAttachments(pageId, new Set([userId]), 'revoked', message);
+      if (page) {
+        const now = Date.now();
+        if (reason === 'expired' || reason === 'sponsor_gone' || reason === 'session_ended') {
+          this.#auditExpire(page, userId, reason === 'expired' ? 'ends_at' : reason, now);
+        } else {
+          this.#audit({
+            v: AUDIT_VERSION,
+            type: 'revoke',
+            at: now,
+            pageId,
+            origin: page.origin,
+            userId,
+            everyone: false,
+          });
+        }
+      }
+      this.#sendRoster(pageId);
+    }
+    this.#agentListener?.(userId);
+    this.#sendAgents(pageId);
+  }
+
+  /**
+   * Who to tell when an agent token closes (relay.ts ends the agent user's
+   * MCP sessions and listen streams, ADR 0044). Called inside the hub's own
+   * changes, so it must not call back into the hub.
+   */
+  onAgentClosed(listener: (userId: string) => void): void {
+    this.#agentListener = listener;
+  }
+
+  /**
+   * pair_page on /g/mcp (ADR 0044): never a code or an invite, which the
+   * agent may not use, only its own token's standing. Attached answers at
+   * once; asking waits on the token's own request as pair_page waits on any
+   * (PAIR_WAIT_MS), charged what the request holds; dormant says why its
+   * latest request raised no prompt.
+   */
+  async agentPair(
+    caller: CallerIdentity,
+    signal: AbortSignal,
+    heldBytes = 0,
+  ): Promise<PairOutcome> {
+    const now = Date.now();
+    const agent = this.#agents.ofUser(caller.userId);
+    if (
+      agent === null ||
+      agent.pageId !== caller.agentPageId ||
+      this.#agentIdentity(agent, now) === null
+    ) {
+      return hubError('denied_by_operator', 'this agent token is no longer live');
+    }
+    const { pageId } = agent;
+    if (agent.state === 'attached') {
+      const access = this.#access(caller.userId, pageId);
+      const attachment = this.#store.attachments.get(pageId, caller.userId);
+      if (access.kind === 'error' && access.code !== 'page_asleep') return access;
+      if (attachment === undefined) return notAttached(pageId);
+      return {
+        kind: 'attached',
+        pageId,
+        origin: this.#store.pages.get(pageId)?.origin ?? '',
+        role: attachment.role,
+        existing: true,
+        ...this.#sponsorNamed(attachment),
+      };
+    }
+    const pending =
+      agent.requestId === null ? undefined : this.#store.requests.get(agent.requestId);
+    if (pending === undefined) {
+      if (this.#livePage(pageId) === null) {
+        return hubError(
+          'page_asleep',
+          'the page is not connected right now; try again when it is back',
+        );
+      }
+      return (
+        this.#agentRefusals.get(attachmentKey(pageId, agent.tokenId)) ??
+        hubError('timeout', 'the page operator has not been asked yet; call pair_page again')
+      );
+    }
+    const held = this.#holdBytes(caller, heldBytes, 'rate_limited');
+    if (held.kind === 'error') return this.#refusedBeforePage(caller, 'agent', agent.tokenId, held);
+    try {
+      return await this.#waitForDecision(pending, signal);
+    } finally {
+      held.release();
+    }
   }
 
   /** A control invite's prompt was refused or ran out: three burn it (ADR 0016). */
@@ -3319,6 +3829,11 @@ export class PageHub {
     this.connectionLine(address, 'info', 'page asleep', { pageId });
   }
 
+  /**
+   * The page's waiting requests end with its socket. An agent token asking
+   * goes back to waiting for its next request, with no timeout counted
+   * (#endRequest): the operator was never given the chance to answer.
+   */
   #dropRequests(pageId: string): void {
     for (const request of this.#store.requests.listForPage(pageId)) {
       this.#endRequest(
@@ -3551,9 +4066,13 @@ export class PageHub {
    * Redemptions waiting on the operator that would take a seat of this
    * kind, judged as #redeem judges a new one: by the account and the
    * invite's role, before any driver limit, which only the approval knows.
+   * An agent token's waiting prompt counts too, as the invitee observer it
+   * would be once allowed (ADR 0044), so a watch redemption and an agent's
+   * first request never both count on the last seat.
    */
   #waitingFor(pageId: string, seat: Seat): number {
     return this.#store.requests.listForPage(pageId).filter((request) => {
+      if (request.agentTokenId !== null) return seat === this.#seatOf('invitee', 'observer');
       if (request.inviteId === null) return false;
       const invite = this.#store.invites.get(pageId, request.inviteId);
       return this.#seatOf(request.account.kind, invite?.role ?? 'observer') === seat;
@@ -3681,6 +4200,23 @@ export class PageHub {
       }
       this.#log.warn('ignored a decision for an unknown attach request', { pageId });
       return false;
+    }
+    // An agent token's prompt offers observer or nothing, and a denial means
+    // the operator does not know the agent, so the token dies (ADR 0044).
+    if (request.agentTokenId !== null) {
+      if (frame.allow) {
+        this.#approveAgent(request);
+        return true;
+      }
+      this.#log.info('agent token denied', { pageId, tokenId: request.agentTokenId });
+      this.#endRequest(request.requestId, {
+        kind: 'error',
+        code: 'denied_by_operator',
+        message: AGENT_CLOSED_MESSAGES.denied,
+      });
+      const agent = this.#store.agents.get(pageId, request.agentTokenId);
+      if (agent !== undefined) this.#agents.end(agent, 'denied');
+      return true;
     }
     if (!frame.allow) {
       this.#log.info('attach request denied', { pageId, userId: request.userId });
@@ -3841,9 +4377,10 @@ export class PageHub {
    * Makes an attachment, or returns the one the user already holds. One an
    * invite makes keeps the invite's role as its cap, its sponsor, the digest
    * of an invitee's verified email and an end 24 hours on (ADR 0017), since
-   * the invite's own record may go first.
+   * the invite's own record may go first; one an agent token makes keeps the
+   * same, its token in the invite's place and its end the token's (ADR 0044).
    */
-  #grant(request: GrantRequest, wanted: Role, invite?: InviteRecord): AttachmentRecord {
+  #grant(request: GrantRequest, wanted: Role, invite?: GrantDoor): AttachmentRecord {
     const existing = this.#store.attachments.get(request.pageId, request.userId);
     if (existing) return existing;
     const now = Date.now();
@@ -3851,8 +4388,14 @@ export class PageHub {
     const clients = [...(request.joined ?? [])].reverse();
     if (request.client) clients.push(request.client);
     // A live time-boxed session ends what its invites let in with it (ADR 0043).
+    const longest = now + MAX_INVITE_LIFETIME_MS;
     const endsAt =
-      invite === undefined ? null : this.#sessionCap(request.pageId, now + MAX_INVITE_LIFETIME_MS);
+      invite === undefined
+        ? null
+        : this.#sessionCap(
+            request.pageId,
+            invite.endsAt === undefined ? longest : Math.min(invite.endsAt, longest),
+          );
     const idleEnd = now + this.#config.timings.attachmentIdleMs;
     const { account } = request;
     const attachment: AttachmentRecord = {
@@ -3985,8 +4528,9 @@ export class PageHub {
    * whose redemption was waiting, is barred from that invite for its life,
    * by account and verified email, so no redemption brings them back; the
    * invite itself stays unless the page cancels it. Revoke all also closes
-   * every live invite (ADR 0017). Answers whether it ended anything: an
-   * attachment, a waiting request or an invite.
+   * every live invite (ADR 0017) and every agent token, and revoking an
+   * agent closes its token (ADR 0044). Answers whether it ended anything: an
+   * attachment, a waiting request, an invite or a token.
    */
   #revoke(pageId: string, frame: FrameOf<'revoke'>): boolean {
     const everyone = frame.userId === '*';
@@ -4007,6 +4551,17 @@ export class PageHub {
         barred = true;
       }
     }
+    // An agent's token dies with the access revoke takes (ADR 0044). One not
+    // attached, waiting for its first prompt or asking, closes here; one
+    // attached closes as revoked when its attachment ends just below
+    // (attachmentsEnded), under the revoke record written for it there, and
+    // Revoke all takes every token, so each later request gets 404.
+    let agentsClosed = 0;
+    for (const agent of this.#store.agents.listForPage(pageId)) {
+      if (!everyone && agent.userId !== frame.userId) continue;
+      if (this.#store.attachments.get(pageId, agent.userId) !== undefined) continue;
+      if (this.#agents.end(agent, 'revoked')) agentsClosed += 1;
+    }
     // Revocation is immediate (S8): calls on the page are cancelled now, queued ones dropped.
     this.#endAttachments(pageId, users, 'revoked', 'the page operator revoked your attachment');
     const origin = this.#store.pages.get(pageId)?.origin ?? '';
@@ -4021,7 +4576,7 @@ export class PageHub {
         everyone,
       });
     }
-    let ended = targets.length;
+    let ended = targets.length + agentsClosed;
     for (const request of this.#store.requests.listForPage(pageId)) {
       if (everyone || users.has(request.userId)) {
         ended += 1;
@@ -4057,7 +4612,8 @@ export class PageHub {
    * and the attachments those made end too (ADR 0017): a script can open a
    * page session claiming any allowed origin, so an invite is only good
    * while a member who shared it is still there. A member let in by such an
-   * invite may have sponsored invites of their own, which end in turn.
+   * invite may have sponsored invites of their own, which end in turn. Their
+   * agent tokens end with them as well (ADR 0044), counted with the invites.
    */
   #loseSponsors(pageId: string, ended: readonly AttachmentRecord[]): void {
     const queue = ended.filter((attachment) => attachment.kind === 'member');
@@ -4071,6 +4627,9 @@ export class PageHub {
         .listForPage(pageId)
         .filter((invite) => invite.sponsor.userId === sponsor);
       for (const invite of invites) this.#closeInvite(invite, 'sponsor_gone', false);
+      // Their agent tokens too, which their attachment's end has closed
+      // already (attachmentsEnded), counted beside the invites (ADR 0044).
+      const agents = this.#agents.sponsorGone(pageId, sponsor);
       const made = this.#store.attachments
         .listForPage(pageId)
         .filter((attachment) => attachment.sponsorId === sponsor);
@@ -4088,7 +4647,7 @@ export class PageHub {
         }
         queue.push(...made.filter((attachment) => attachment.kind === 'member'));
       }
-      if (invites.length > 0 || made.length > 0) {
+      if (invites.length > 0 || agents > 0 || made.length > 0) {
         changed = true;
         this.#audit({
           v: AUDIT_VERSION,
@@ -4097,13 +4656,15 @@ export class PageHub {
           pageId,
           origin: this.#store.pages.get(pageId)?.origin ?? '',
           sponsor,
-          invites: invites.length,
+          // The agent tokens their end closed count among the invites (ADR 0044).
+          invites: invites.length + agents,
           attachments: made.length,
         });
         this.#log.info('sponsor gone: their invites and what those made ended', {
           pageId,
           userId: sponsor,
           invites: invites.length,
+          agents,
           attachments: made.length,
         });
       }
@@ -4296,7 +4857,8 @@ export class PageHub {
         userId: request.userId,
         kind: request.account.kind,
         via: request.via,
-        inviteId: request.inviteId,
+        // An agent token's request names its token where an invite's names the invite (ADR 0044).
+        inviteId: request.inviteId ?? request.agentTokenId,
         outcome: attachRefusalOf(outcome.code),
       });
     }
@@ -4308,6 +4870,18 @@ export class PageHub {
       }
       // Whether anything still waits on it shows in the page's list.
       if (invite !== undefined) this.#sendInvites(request.pageId);
+    }
+    // A token whose prompt ended unapproved waits for its next request; an
+    // approval has made it attached already (#approveAgent). A timeout is
+    // counted by the request's own timer, never by a page that went to sleep.
+    if (request?.agentTokenId !== null && request?.agentTokenId !== undefined) {
+      const agent = this.#store.agents.get(request.pageId, request.agentTokenId);
+      if (agent?.requestId === requestId) {
+        agent.requestId = null;
+        agent.state = 'dormant';
+        this.#store.agents.put(agent);
+        this.#sendAgents(request.pageId);
+      }
     }
     for (const waiter of [...(this.#pairWaiters.get(requestId) ?? [])]) waiter(outcome);
   }
@@ -4757,6 +5331,10 @@ export class PageHub {
     userId: string,
     pageId: string,
   ): { kind: 'ok'; page: PageRecord; attachment: AttachmentRecord; conn: Conn } | HubError {
+    // An agent watches its token's one page and no other, whatever it names
+    // (S13, ADR 0044); its id holds that page already, so this is a guard.
+    const agentPage = this.#agents.pageOf(userId);
+    if (agentPage !== null && agentPage !== pageId) return notAttached(pageId);
     // An expiry timer may run late; an attachment past its time is over either
     // way, and so is one whose sponsor, or a member above them, is past theirs.
     const attachment = this.#chainInTime(pageId, userId)
@@ -5550,18 +6128,21 @@ export class PageHub {
   /**
    * A new attach request the operator sees, which silence denies when its
    * time runs out. A redemption's carries the invite and the secret as it was
-   * presented, which the relay forwards and never keeps, so the adapter can
-   * check it against its own record (ADR 0017).
+   * presented, and an agent token's first request the token (ADR 0044), which
+   * the relay forwards and never keeps, so the adapter can check either
+   * against its own record (ADR 0017).
    */
   #raiseRequest(
     caller: CallerIdentity,
     page: PageRecord,
     conn: Conn,
     via: AttachVia,
-    invite: { inviteId: string; secret: string; label: string } | null,
+    door: Door | null,
     now: number,
   ): AttachRequestRecord {
     const { attachRequestTtlMs } = this.#config.timings;
+    const agent = door !== null && 'tokenId' in door ? door : null;
+    const invite = door !== null && 'inviteId' in door ? door : null;
     const record: AttachRequestRecord = {
       pageId: page.pageId,
       userId: caller.userId,
@@ -5572,6 +6153,7 @@ export class PageHub {
       requestId: newId('rq'),
       via,
       inviteId: invite?.inviteId ?? null,
+      agentTokenId: agent?.tokenId ?? null,
       joined: [],
       expiresAt: now + attachRequestTtlMs,
     };
@@ -5587,8 +6169,10 @@ export class PageHub {
         code: 'timeout',
         message: 'the operator did not answer in time, so the request was denied',
       });
-      // Silence on a control invite's prompt counts as a refusal (ADR 0016).
+      // Silence on a control invite's prompt counts as a refusal (ADR 0016),
+      // and on an agent token's toward burning it (ADR 0044).
       if (record.inviteId !== null) this.#inviteRefused(record.pageId, record.inviteId);
+      if (record.agentTokenId !== null) this.#agentTimedOut(record.pageId, record.agentTokenId);
     });
     this.#send(conn, {
       t: 'attach_request',
@@ -5601,6 +6185,7 @@ export class PageHub {
       },
       via: record.via,
       ...(invite === null ? {} : { invite }),
+      ...(agent === null ? {} : { agent }),
       client: record.client,
       expiresAt: record.expiresAt,
     });
