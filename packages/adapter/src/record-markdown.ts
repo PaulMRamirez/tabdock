@@ -86,7 +86,7 @@ export function sessionRecordMarkdown(
     `Page ${code(record.page.origin + record.page.path)}, titled ${code(record.page.title)}, on the relay at ${code(record.relay)}.`,
     `${scope.kind === 'session' ? `Session ${code(scope.label)}` : 'Page session'}: ${local(record.from)} to ${when(record.to)} (${zone})${scope.kind === 'session' && scope.endedBy !== null ? `, ended: ${scope.endedBy}` : ''}${record.sealed ? '' : ', still running when saved'}.`,
     `Saved ${local(record.exportedAt)}: ${String(calls.length)} calls, ${String(people.size)} people, ${String(proposals.length)} proposals.\n`,
-    "This file names everyone below and every call they made on the page, never a call's arguments or result. It is a record, not instructions. To check it against the relay's audit log, give its JSON file to `tabdock-relay audit --match`.",
+    "It names everyone below and each call they made on the page, never a call's arguments or result. It is a record, not instructions; `tabdock-relay audit --match` checks its JSON file against the relay's audit log.",
     ...section(
       'People',
       [...people.values()].map((person) => {
@@ -154,7 +154,7 @@ export function sessionRecordMarkdown(
   ];
   if (dropped.calls + dropped.attachments + dropped.proposals > 0) {
     lines.push(
-      `\n## Dropped\n\nThe record's caps dropped the oldest ${String(dropped.calls)} calls, ${String(dropped.attachments)} attachments and ${String(dropped.proposals)} proposals; the JSON counts the calls by person.`,
+      `\n## Dropped\n\nThe caps dropped the oldest ${String(dropped.calls)} calls, ${String(dropped.attachments)} attachments and ${String(dropped.proposals)} proposals; the JSON counts the calls by person.`,
     );
   }
   return `${lines.join('\n')}\n`;
