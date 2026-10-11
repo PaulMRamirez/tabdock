@@ -6,7 +6,9 @@
 // prompts for reset_edits alone on every runtime, MCP-B 6 included, while an
 // empty list still fails safe (S6, ADR 0034), and a write the page refuses
 // ends as a labelled tool_error on each; an observer reads everything and writes
-// nothing (S5); and each first-class entry carries its description whole.
+// nothing (S5); each first-class entry carries its description whole; and the
+// state the page publishes holds what get_view and get_clock answer, read
+// through get_page_state (ADR 0040).
 
 import type { Client } from '@modelcontextprotocol/client';
 import { MAX_FIRST_CLASS_DESCRIPTION_CHARS, untrustedHeader } from '@tabdock/protocol';
@@ -23,11 +25,14 @@ import {
   MAP_EDIT_TOOLS,
   MAP_PROFILE_TOOLS,
   MAP_RESULT_SCHEMAS,
+  type MapPageState,
+  MapPageStateSchema,
   type MapStopView,
   type MapView,
 } from '@tabdock/sim-page/map';
 import { afterEach, describe, expect, it } from 'vitest';
 import { firstClassDescription } from '../../../packages/relay/src/first-class.ts';
+import { readPageState, stateBody, waitPageState } from '../src/state-helpers.ts';
 import {
   attachAs,
   callTool,
@@ -406,8 +411,71 @@ describe('first-class map tools (ADR 0025)', () => {
   );
 });
 
-// M6 seam: not built. W2-E adds test 7 here: world.state().view deep-equals get_view's result
-// and its clock get_clock's, then the same comparison through get_page_state (ADR 0040).
+/**
+ * The page's state as the relay holds it, read with get_page_state and then
+ * waited on until `wanted` holds of it, for up to 5 s: the adapter sends at
+ * most one state frame each 500 ms, so a write's state can trail its result.
+ */
+async function publishedState(
+  client: Client,
+  pageId: string,
+  wanted: (state: MapPageState) => boolean,
+): Promise<{ version: number; state: MapPageState }> {
+  const deadline = Date.now() + 5_000;
+  let body = stateBody(await readPageState(client, pageId));
+  for (;;) {
+    const parsed = MapPageStateSchema.safeParse(body.value);
+    if (parsed.success && wanted(parsed.data)) return { version: body.version, state: parsed.data };
+    const left = deadline - Date.now();
+    if (left <= 0) throw new Error(`the page published no such state; version ${body.version}`);
+    body = stateBody(await waitPageState(client, pageId, body.version, Math.min(left, 2_000)));
+  }
+}
+
+describe('the state a map page publishes (ADR 0040)', () => {
+  it.each(ERAS)(
+    '7. holds the view and clock get_view and get_clock return, read alike through get_page_state (%s)',
+    async (_label, modern) => {
+      world = await startWorld();
+      const { sim, alice, pageId } = await driver(world, modern);
+      // Published as soon as the page links, before any write.
+      const first = await publishedState(alice, pageId, () => true);
+      expect(first.state).toEqual(sim.world.state());
+
+      body(
+        await call(alice, pageId, 'go_to_stop', { walkthroughId: 'flyby', index: 2 }),
+        MAP_RESULT_SCHEMAS.go_to_stop,
+      );
+      const view = body(await call(alice, pageId, 'get_view'), MAP_RESULT_SCHEMAS.get_view);
+      const clock = body(await call(alice, pageId, 'get_clock'), MAP_RESULT_SCHEMAS.get_clock);
+      const state = sim.world.state();
+      expect(state.view).toEqual(view);
+      expect(state.clock).toEqual(clock);
+      expect(state.walkthrough).toEqual({ id: 'flyby', stopIndex: 2 });
+      expect(state.observationId).toBe('obs-3');
+
+      // The same comparison through the relay, in the profile's own shape.
+      const atStop = await publishedState(
+        alice,
+        pageId,
+        (published) => published.walkthrough?.stopIndex === 2,
+      );
+      expect(atStop.version).toBeGreaterThan(first.version);
+      expect(atStop.state.view).toEqual(view);
+      expect(atStop.state.clock).toEqual(clock);
+      expect(atStop.state).toEqual(state);
+
+      // A reload is a new document, which publishes the world again.
+      await sim.reload();
+      await sim.waitFor((dock) => dock.link === 'linked');
+      await waitForTools(alice, pageId, (await sim.context.getTools()).length);
+      const reloaded = await publishedState(alice, pageId, () => true);
+      expect(reloaded.version).toBeGreaterThan(atStop.version);
+      expect(reloaded.state).toEqual(state);
+    },
+    30_000,
+  );
+});
 
 describe('capture_view without a capture function', () => {
   it('answers its text form, as a page that returns no images does', async () => {

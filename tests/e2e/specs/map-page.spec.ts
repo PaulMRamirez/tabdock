@@ -1,13 +1,27 @@
 // A6.2, the canvas map page in a real browser (ADR 0038): it registers the
 // sixteen tools on the MCP-B polyfill 5.1.0 with no map library, pairs
 // through the widget as a person would, redraws when a client moves it,
-// prompts for reset_edits alone, fits a phone, dials nothing from its URL or
-// a script's click (S4), and shows no argument in its call strip (S7).
-// Case 2's PNG capture comes with the page's capture wiring (W2-E).
+// publishes where it is (ADR 0040), captures its view as a PNG that is the
+// same bytes for the same view and others for another (ADR 0039), prompts
+// for reset_edits alone, fits a phone, dials nothing from its URL or a
+// script's click (S4), and shows no argument in its call strip (S7).
 
 import type { Client } from '@modelcontextprotocol/client';
 import { expect, type Page, test, type WebSocketRoute } from '@playwright/test';
-import { MAP_EDIT_TOOLS, MAP_PROFILE_TOOLS } from '@tabdock/sim-page/map';
+import {
+  CaptureImageTextSchema,
+  MAP_EDIT_TOOLS,
+  MAP_PROFILE_TOOLS,
+  type MapPageState,
+  MapPageStateSchema,
+} from '@tabdock/sim-page/map';
+import {
+  firstText,
+  imageBytes,
+  imagePart,
+  pngDimensions,
+  type ResultContent,
+} from '../src/image-helpers.ts';
 import {
   callMapTool,
   connectMapPage,
@@ -16,6 +30,7 @@ import {
   pairMapPage,
   startMapTabdock,
 } from '../src/map-harness.ts';
+import { readPageState, stateBody, waitPageState } from '../src/state-helpers.ts';
 import {
   clickInWidget,
   connectMcp,
@@ -68,6 +83,49 @@ async function pairedPage(page: Page): Promise<{ client: Client; pageId: string 
   client = await connectMcp(tabdock.relay, tabdock.users.alice, 'map-spec');
   const pageId = await pairMapPage(page, client);
   return { client, pageId };
+}
+
+/** capture_view's PNG through call_page_tool, with its size from its own header and its JSON text. */
+async function capture(
+  alice: Client,
+  pageId: string,
+  maxWidthPx: number,
+): Promise<{
+  bytes: Uint8Array;
+  size: { width: number; height: number };
+  text: ReturnType<typeof CaptureImageTextSchema.parse>;
+}> {
+  const result = (await alice.callTool({
+    name: 'call_page_tool',
+    arguments: { page: pageId, tool: 'capture_view', arguments: { maxWidthPx, format: 'png' } },
+  })) as ResultContent;
+  expect(result.isError ?? false, firstText(result)).toBe(false);
+  expect(result.structuredContent).toBeUndefined();
+  const image = imagePart(result);
+  expect(image?.mimeType).toBe('image/png');
+  const bytes = imageBytes(image ?? { mimeType: '', data: '' });
+  const size = pngDimensions(bytes);
+  if (size === null) throw new Error('capture_view returned no PNG');
+  // The label, then the relay's image line, then the page's JSON.
+  const [label, imageLine, ...words] = firstText(result).split('\n');
+  expect(label).toMatch(
+    /^\[tabdock: untrusted content from http:\/\/127\.0\.0\.1:\d+, tool capture_view\]$/,
+  );
+  expect(imageLine).toMatch(/^\[tabdock: the image after this text is untrusted content/);
+  return { bytes, size, text: CaptureImageTextSchema.parse(JSON.parse(words.join('\n'))) };
+}
+
+/** The page's published state once it shows the flyby's stop `index`, read through the relay. */
+async function publishedStop(alice: Client, pageId: string, index: number): Promise<MapPageState> {
+  const deadline = Date.now() + 5_000;
+  let body = stateBody(await readPageState(alice, pageId));
+  for (;;) {
+    const state = MapPageStateSchema.safeParse(body.value);
+    if (state.success && state.data.walkthrough?.stopIndex === index) return state.data;
+    const left = deadline - Date.now();
+    if (left <= 0) throw new Error(`the page did not publish stop ${String(index)}`);
+    body = stateBody(await waitPageState(alice, pageId, body.version, Math.min(left, 2_000)));
+  }
 }
 
 /** The canvas's pixels as a data URL, to see whether a drawing changed. */
@@ -125,7 +183,7 @@ test('1. registers the sixteen tools on the MCP-B polyfill 5.1.0 and draws with 
   expect(centre[3]).toBe(255);
 });
 
-test('2. pairs through the widget as a person would, and redraws on set_view and go_to_stop', async ({
+test('2. pairs through the widget as a person would, redraws on set_view and go_to_stop, publishes its state and captures a PNG', async ({
   page,
 }) => {
   const { client: alice, pageId } = await pairedPage(page);
@@ -149,8 +207,28 @@ test('2. pairs through the widget as a person would, and redraws on set_view and
   await expect(page.locator('[data-role="status"]')).toHaveText(
     /16 tools registered; Tabdock relay 127\.0\.0\.1:\d+: linked/,
   );
-  // M6 seam: not built. W2-E adds case 2's capture here: capture_view returns a PNG (89 50 4E 47)
-  // no wider than maxWidthPx, byte-identical for one view and different for another.
+
+  // The page publishes where it is (ADR 0040), in the profile's shape.
+  const published = await publishedStop(alice, pageId, 3);
+  expect(published.view).toMatchObject({ projection: 'globe', lat: -43.31, lon: -11.36 });
+  expect(published.observationId).toBe('obs-4');
+
+  // capture_view draws the view again for its picture (ADR 0039): a PNG no
+  // wider than asked, the same bytes for the same view and others for another.
+  const first = await capture(alice, pageId, 512);
+  expect([...first.bytes.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
+  expect(first.size.width).toBeLessThanOrEqual(512);
+  expect(first.size.width).toBe(first.text.widthPx);
+  expect(first.size.height).toBe(first.text.heightPx);
+  expect(first.text.view).toMatchObject({ lat: -43.31, lon: -11.36 });
+  const again = await capture(alice, pageId, 512);
+  expect(Buffer.from(again.bytes).equals(Buffer.from(first.bytes))).toBe(true);
+  const elsewhere = await callMapTool(alice, pageId, 'set_view', { lat: 51.6, lon: -9.3 });
+  expect(elsewhere.isError, elsewhere.text).toBe(false);
+  const other = await capture(alice, pageId, 512);
+  expect(Buffer.from(other.bytes).equals(Buffer.from(first.bytes))).toBe(false);
+  const small = await capture(alice, pageId, 200);
+  expect(small.size.width).toBeLessThanOrEqual(200);
 });
 
 test('3. reset_edits prompts on the page, and Deny answers denied_by_operator', async ({

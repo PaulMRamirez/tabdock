@@ -3,6 +3,7 @@
 // outside the page's boot, so it survives reload() as a page's server-side
 // state would, while the tools are registered afresh on every boot.
 
+import type { Dock } from '@tabdock/adapter/core';
 import {
   createMapEditTools,
   createMapTools,
@@ -53,7 +54,33 @@ export async function startMapSimPage(options: MapSimPageOptions): Promise<MapSi
       ...(editTools ? createMapEditTools(world) : []),
     ],
   });
-  // M6 seam: not built. W2-E publishes world.state() through the sim page's handle on each
-  // change, skipping identical states (ADR 0040), for map-profile.test.ts test 7.
-  return Object.assign(sim, { world });
+  // The page's state (ADR 0040): world.state() on each discrete change, as
+  // the canvas page publishes it, skipping a state equal to the last one
+  // this document was handed. A reload or a move is a new document whose
+  // handle holds nothing yet, so it publishes again once it boots.
+  let handedTo: Dock | null = null;
+  let handed: string | null = null;
+  const publish = (): void => {
+    const state = world.state();
+    const text = JSON.stringify(state);
+    if (sim.dock === handedTo && text === handed) return;
+    handedTo = sim.dock;
+    handed = text;
+    sim.publishState(state);
+  };
+  world.subscribe(publish);
+  publish();
+  const reload = sim.reload.bind(sim);
+  const navigate = sim.navigate.bind(sim);
+  return Object.assign(sim, {
+    world,
+    async reload(reloadOptions?: { awayMs?: number }) {
+      await reload(reloadOptions);
+      publish();
+    },
+    async navigate(path: string, navigateOptions?: { awayMs?: number }) {
+      await navigate(path, navigateOptions);
+      publish();
+    },
+  });
 }

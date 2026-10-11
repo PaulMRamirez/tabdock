@@ -1,5 +1,7 @@
 // The canvas map page (ADR 0038): the profile's sixteen tools over a MapWorld,
-// registered through WebMCP and drawn on a plain canvas. It dials a relay only
+// registered through WebMCP and drawn on a plain canvas, with capture_view
+// returning a picture of the view (ADR 0039) and the page's state published
+// on each change once linked (ADR 0040). It dials a relay only
 // on a trusted click on its Connect button, or when page script calls
 // window.__tabdockMapPage.connect(), which Playwright uses; it reads nothing
 // from its URL, so no link can make it dial, and it never puts the Dock on
@@ -7,15 +9,17 @@
 // test page and is never published.
 
 import { initializeWebMCPPolyfill } from '@mcp-b/webmcp-polyfill';
-import { attach, type Dock, type PolicyInput } from '@tabdock/adapter';
+import { attach, DEFAULT_IMAGE_BYTES, type Dock, type PolicyInput } from '@tabdock/adapter';
 import {
   createMapEditTools,
   createMapTools,
   createMapWorld,
   MAP_PAGE_POLICY,
+  type MapCapture,
   type MapToolDefinition,
   type MapViewport,
 } from '@tabdock/sim-page/map';
+import { captureMap } from './capture.ts';
 import { drawMap } from './draw.ts';
 import { panBy, zoomBy } from './gestures.ts';
 import './webmcp.ts';
@@ -70,6 +74,8 @@ const ctx = canvas.getContext('2d');
 if (!ctx) throw new Error('this browser gives the map page no 2D canvas');
 
 const world = createMapWorld({ viewport: VIEWPORT });
+/** The link, once connect() makes one; the page makes at most one. */
+let dock: Dock | null = null;
 
 function redraw(): void {
   if (ctx) drawMap(ctx, world, VIEWPORT);
@@ -81,8 +87,25 @@ function redraw(): void {
     : '';
 }
 world.subscribe(redraw);
-// M6 seam: not built. W2-E publishes world.state() here on each change once linked, skipping
-// identical states (ADR 0040), so a follower sees the view, clock, stop and observation.
+
+/** The state last handed to the link, as JSON, so an unchanged state is never sent again. */
+let published: string | null = null;
+
+/**
+ * Publishes the view, clock, stop and observation (ADR 0040) once linked.
+ * The world calls this on each discrete change, never per animation frame,
+ * and a state equal to the last one is skipped, so a write that changes
+ * nothing spends none of the relay's state budget.
+ */
+function publish(): void {
+  if (!dock) return;
+  const state = world.state();
+  const text = JSON.stringify(state);
+  if (text === published) return;
+  published = text;
+  dock.publishState(state);
+}
+world.subscribe(publish);
 redraw();
 
 /** The strip names the tool and how it ended, never its arguments, which may be anyone's text (S7). */
@@ -134,11 +157,21 @@ canvas.addEventListener(
   { passive: false },
 );
 
+/**
+ * capture_view's picture, drawn afresh from the world in this task and
+ * fitted under the cap the relay's welcome named, or the default before one
+ * has; a relay that takes no images refuses it in the adapter either way.
+ */
+const capture: MapCapture = (request, { signal }) =>
+  Promise.resolve().then(() => {
+    signal?.throwIfAborted();
+    const offered = dock?.state.maxImageBytes ?? null;
+    const cap = offered === null || offered === 0 ? DEFAULT_IMAGE_BYTES : offered;
+    return captureMap(world, VIEWPORT, request, cap, () => document.createElement('canvas'));
+  });
+
 const context = document.modelContext;
-// M6 seam: not built. W2-E adds capture.ts and passes createMapTools(world, { capture }) here, so
-// capture_view returns ADR 0039's envelope; until then it answers its text form, which travels as
-// text although connect() names it an image tool (ADR 0038, decision 24).
-const tools = [...createMapTools(world), ...createMapEditTools(world)].map(logged);
+const tools = [...createMapTools(world, { capture }), ...createMapEditTools(world)].map(logged);
 if (context) {
   // Registration lasts as long as the page; aborting this would remove every tool.
   const registration = new AbortController();
@@ -166,8 +199,6 @@ function relayUrlOf(text: string): string | null {
   return url.href;
 }
 
-let dock: Dock | null = null;
-
 /**
  * Links this page to a relay once. The policy is MAP_PAGE_POLICY with
  * capture_view among the image tools; a caller may raise it, as a test that
@@ -192,6 +223,7 @@ function connect(relayUrl: string, policy: PolicyInput = {}): boolean {
     },
   });
   dock = linked;
+  publish();
   const show = (): void => {
     statusLine.textContent = `${String(tools.length)} tools registered; Tabdock relay ${host}: ${linked.state.link}`;
   };
