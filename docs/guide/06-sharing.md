@@ -31,7 +31,7 @@ Pause answers `page_busy` to every call that has not started, queued ones and th
 
 ## Try sharing on one computer
 
-Dev tokens let you play two people on one machine. Make two tokens with the command in [Run a relay](07-run-a-relay.md#dev-tokens), put `TABDOCK_DEV_TOKENS=alice=<token>,bob=<token>` in the clone's `.env` and restart `pnpm dev`. That turns local mode off, so the `tabdock-local` entry answers 401 meanwhile. Give each person a client of their own: Claude Code in a folder per person, each running the `claude mcp add --transport http tabdock http://127.0.0.1:8787/mcp --header "Authorization: Bearer <token>"` line `pnpm dev` prints, filled in with that person's token, or the program in [Connect clients](05-connect-clients.md#any-mcp-client) with a token file per person.
+Dev tokens let you play two people on one machine. Make two tokens with the command in [Run a relay](07-run-a-relay.md#dev-tokens), put `TABDOCK_DEV_TOKENS=alice=<token>,bob=<token>` in the clone's `.env` and restart `pnpm dev`, which turns local mode off, so the `tabdock-local` entry answers 401 meanwhile. Give each person a client: Claude Code in a folder of their own, running the `claude mcp add --transport http tabdock http://127.0.0.1:8787/mcp --header "Authorization: Bearer <token>"` line `pnpm dev` prints with their token, or the program in [Connect clients](05-connect-clients.md#any-mcp-client) with a token file each.
 
 Connect the board, pair alice with one code and bob with the next, and Allow alice as driver and bob as observer; a write from bob's client gets `role_denied`. Try Make driver on bob's row while alice drives, then Revoke. Remove the `.env` line and restart to go back to local mode.
 
@@ -47,7 +47,7 @@ An invite admits someone off the member list. It needs a relay with a public URL
 | On joining | No prompt; a join notice names them | A prompt naming the account and your label        |
 | Ends early | Cancel, Revoke all                  | Cancel, Revoke all, or three refusals or timeouts |
 
-No invite lasts past 24 hours, and a page holds at most 10 live. The sponsor is the member attached longest at minting; when their attachment ends, so do their invites and every attachment those made. Guests always leave two of the page's seats to members.
+No invite lasts past 24 hours, and a page holds at most 10 live. The sponsor is the member attached longest at minting; when their attachment ends, so do their invites and every attachment those made. Guests watching by invite take a watching seat apart from the page's people, and other guests leave members two of its people seats ([Larger rooms](20-larger-rooms.md#watching-seats)).
 
 ```mermaid
 sequenceDiagram
@@ -70,16 +70,18 @@ At `/i` the guest sees who shared the page, its address and title, your label an
 
 A guest's attachment ends within 24 hours, never gets first-class tools or confirmation in its client, and shows an invited badge, the verified email (or "unverified account") and a short id. Revoking a guest bars their account from that invite, and the "and close this link" box, ticked by default while a multi-use link has uses left, closes the link too. Cancel closes a link but keeps whoever it let in. Invites run with a stand-in provider in `pnpm demo:m4`, not yet with a real one ([the M5 checklist](../checklists/M5.md)).
 
+The form's Agent kind mints a token for Claude Code or a script instead, and a time-boxed session's end closes every invite and token ([Lessons and reviews](19-lessons-and-reviews.md#time-boxed-sessions), [Larger rooms](20-larger-rooms.md#agent-tokens)).
+
 ## Confirmation in a member's own client
 
 With `confirmVia: 'client'` (`data-confirm-via="client"`, or the demo board's `&confirm=client`) under `consequential: 'confirm'`, the default, a consequential call from a member driver whose attachment no invite made, through a client that declares form elicitation, is confirmed in that client. The page runs it without a prompt, and the activity list reads, for example, `confirmed in "claude-code <version>" by You`; everyone else still gets your prompt. A client may answer by itself (Claude Code can, through a hook), so turn this on only for members you trust with their own calls. [Connect clients](05-connect-clients.md#confirming-in-your-own-client) shows the question and what is not yet verified.
 
 ## Adding a member
 
-A member is an entry `sub=userId:Display Name` in `TABDOCK_OAUTH_USERS`, where `sub` is the person's subject at the provider. A change takes a relay restart; unless `TABDOCK_RESTART_SNAPSHOT` is on, that ends every page session, pairing and invite link, and pages pair again, while clients stay signed in.
+A member is an entry `sub=userId:Display Name` in `TABDOCK_OAUTH_USERS`, read at a restart, or in a members file the relay reads again within seconds ([Larger rooms](20-larger-rooms.md#the-members-file), which also says what a restart keeps).
 
 ## The activity log and the audit log
 
-The widget's activity list keeps the page's last 50 calls: time, person, client, tool, outcome and duration, never arguments or results. The relay's audit log keeps every attach, call, detach and invite redemption as hash-chained JSON lines, 30 days or 64 MiB by default, in `audit/` beside the owner token in local mode and in `TABDOCK_AUDIT_DIR` on a host, where production requires it. Read it with `pnpm audit:log` (with filters such as `--user`, `--page` and `--since`) and check the chain with `--verify`; once 0.1.0 is on npm, `npx @tabdock/relay audit` does the same. [Security](10-security.md) covers what the log proves.
+The widget's activity list keeps the page's last 50 calls: time, person, client, tool, outcome and duration, never arguments or results. The relay's audit log keeps every attach, call, detach and invite redemption as hash-chained JSON lines, 30 days or 64 MiB by default; [Run a relay](07-run-a-relay.md#operating-it) says how to read it and check its chain, [Security](10-security.md) what it proves, and [Lessons and reviews](19-lessons-and-reviews.md#the-session-record) how to hold a saved session record to it.
 
 Next: [Run a relay](07-run-a-relay.md).

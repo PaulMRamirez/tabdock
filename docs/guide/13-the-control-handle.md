@@ -52,9 +52,15 @@ The promise resolves once, with `{ ok: true, inviteId, link, expiresAt }`, the l
 
 ## Sessions and agent tokens
 
-`dock.startSession({ label, lengthMinutes, drivers, observers, proposals })` takes whole minutes from 30 to 240, driver seats up to `maxDrivers`, seats by watch invite and who may propose, each no wider than the policy. It resolves with the session's id, its end and the observers' link, shown once, or with a reason: `invalid`, `policy`, `active`, `link_down`, `unavailable`, `unknown`, `length` or `limit`.
+`dock.startSession({ label, lengthMinutes, drivers, observers, proposals })` takes whole minutes from 30 to 240, driver seats up to `maxDrivers`, seats by watch invite and who may propose, each no wider than the policy. It resolves with the session's id, its end and its observers' `links`, one watch invite per 20 observers, shown once and one at a time (`link` is the first), or with a reason: `invalid`, `policy`, `active`, `link_down`, `unavailable`, `unknown`, `length` or `limit`. A session counts as started once the relay lists it; a start it refused or never answered, across a link drop or a reload, changes nothing, and the page ends a session the relay lists that it holds no record of.
 
 `dock.agentToken({ label, lifetime })` takes a lifetime of `'1h'` (the default), `'4h'` or `'8h'` and resolves with the token, its endpoint and a ready `claude mcp add` command, shown once and never stored, or with an invite's reasons. Agent tokens need `TABDOCK_AGENT_TOKENS` on the relay ([Settings for rooms, images and state](14-settings-for-rooms.md)).
+
+## Session records
+
+`dock.sessionRecord('current')` copies the record being kept: the page session's, or a running session's from when the relay listed it (ADR 0045). A session's end seals its record into `'ended'` only when it holds something, so a session nobody used never replaces a lesson's record not yet saved, and nothing is offered. The widget's save box waits to be armed again whenever the record in its slot is replaced, by a session's start or a `discardRecord`, and its warning counts the people the record names by an email address, never an agent or an unverified account.
+
+An End given while the link is down is recorded as on a live link: those an invite or agent token let in leave as the session ends. Only if the next welcome starts a new page session does the record close everyone at the time the link went; a relay that resumed from its snapshot lists the guests until it hears of the End, and the record holds them as unapproved meanwhile.
 
 ## The state
 

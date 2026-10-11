@@ -1,6 +1,6 @@
 # Setup problems and limits
 
-What to do when the relay, a page or a client misbehaves before a call gets anywhere, and the fixed limits behind the codes on [Troubleshooting](11-troubleshooting.md). The relay's log, JSON lines that name each refusal but never a token, code or argument, says most; the widget's notice line says the rest.
+What to do when the relay, a page or a client misbehaves before a call gets anywhere, and the fixed limits behind the codes on [Troubleshooting](11-troubleshooting.md). The relay's log, which names each refusal but never a token, code or argument, says most; the widget's notice line the rest. [Images and state](18-images-and-state.md#when-it-goes-wrong), [lessons](19-lessons-and-reviews.md#when-it-goes-wrong) and [larger rooms](20-larger-rooms.md) have their own.
 
 ## Setup problems
 
@@ -42,7 +42,7 @@ Other refusals name a setting: one outside its mode (`TABDOCK_INVITES does not a
 
 ## Limits
 
-Fixed numbers, each from the named constant; M6's are on [their own page](15-limits-for-rooms.md). Rate limits, users per page, queue depth and the byte budgets are settings, with their defaults in [Relay settings](08-relay-settings.md).
+Fixed numbers, each from the named constant, M6's on [their own page](15-limits-for-rooms.md); rate limits, users per page, queue depth and byte budgets are [settings](08-relay-settings.md).
 
 | Limit                                                          | Value                        | Constant                                                           | In                                                       |
 | -------------------------------------------------------------- | ---------------------------- | ------------------------------------------------------------------ | -------------------------------------------------------- |

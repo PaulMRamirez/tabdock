@@ -2,7 +2,7 @@
 
 The relay is one Node process with two doors: `/mcp`, the URL clients add, and `/page`, the socket pages dial. It never runs a tool, but it sees every call and result in plain text, as does anything that terminates TLS in front of it, so run your own. This page helps you pick a mode and run it; [Relay settings](08-relay-settings.md) lists every setting, and [the reference deployment](../deploy.md) takes hosted mode from accounts to rollback on Fly.io with WorkOS AuthKit and GitHub Actions.
 
-The commands below run in a clone (`git clone`, then `pnpm install`) until 0.1.0 is on npm. Once 0.1.0 is on npm, `npx @tabdock/relay` runs the same command, `tabdock-relay`, on Node 22.18 or later, reading settings from the environment alone, never a `.env` file.
+The commands below run in a clone (`git clone`, then `pnpm install`). Once 0.1.0 is on npm, `npx @tabdock/relay` runs the same command, `tabdock-relay`, on Node 22.18 or later, reading settings from the environment alone, never a `.env` file.
 
 ## Choose a mode
 
@@ -156,7 +156,7 @@ The image caps the heap at 192 MiB, which holds the default byte budgets (`TABDO
 
 ## Operating it
 
-Run one relay per URL; a second one on the same audit directory refuses to start. Stop it with SIGTERM (Ctrl-C, `docker stop`, `systemctl stop`): it closes within about a second and releases its locks. Every restart forgets every pairing code and `/pair` sign-in, and every page, attachment and invite unless `TABDOCK_RESTART_SNAPSHOT` keeps them, so pages reconnect anew and people pair again, while clients stay signed in; only the audit log, that snapshot and local mode's token survive. Settings, members in `TABDOCK_OAUTH_USERS` included, take effect only at a restart.
+Run one relay per URL; a second one on the same audit directory refuses to start. Stop it with SIGTERM (Ctrl-C, `docker stop`, `systemctl stop`): it closes within about a second and releases its locks. Every restart forgets every pairing code and `/pair` sign-in, and every page, attachment and invite unless `TABDOCK_RESTART_SNAPSHOT` keeps them; clients stay signed in, and only the audit log, that snapshot and local mode's token survive. Settings take effect at a restart. See [Larger rooms](20-larger-rooms.md) for a members file and class sizing, and [Check a page from CI](17-check-from-ci.md) for CI.
 
 To upgrade, read the [changelog](../../CHANGELOG.md) (while versions start with 0, a minor version may change settings), then `git pull` and `pnpm install` in the clone, or rebuild the image, and restart.
 

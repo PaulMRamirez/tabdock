@@ -26,7 +26,7 @@ A review queue on the laptop offers `get_progress` (read-only) and `next_item` a
 
 Teammates, each with their own Claude, work an incident console: `list_cards` (read-only), `add_card` and `move_card` (writes), `archive_sprint` (consequential). The page sets `maxDrivers: 3`, since with the default of 1 later approvals are seated as observers. The roster shows each person and their clients with a role switch and Revoke; writes run in arrival order, `archive_sprint` asks first, Pause stops new calls, and the audit log records who did what.
 
-**Works today** in code (acceptance tests A2.1 to A2.5). Teammates on other machines **need settings**: public URL mode with each in `TABDOCK_OAUTH_USERS` and the tab on the relay's machine, or hosted mode. Adding a member means a restart, which ends every pairing unless `TABDOCK_RESTART_SNAPSHOT` is on. A page holds 10 people by default.
+**Works today** in code (acceptance tests A2.1 to A2.5). Teammates on other machines **need settings**: public URL mode with each in `TABDOCK_OAUTH_USERS` and the tab on the relay's machine, or hosted mode. A members file adds someone without a restart. A page holds 10 people by default.
 
 ## A watch-only guest
 
@@ -46,6 +46,12 @@ A wall-screen dashboard registers only read-only tools and sets `autoApprove: 'o
 
 **Works today** for clients on the screen's machine; the QR code and other machines **need settings**. The tab must stay awake, which is unmeasured, and a relay restart means pairing again.
 
+## A class following one map
+
+A teacher projects a page that follows the [map profile](16-map-pages.md), starts a time-boxed session and hands out its watch link; each student's Claude reads and captures the view, waits on its state and proposes stops, which the teacher accepts.
+
+**Needs settings; not yet run live with a class.** Public URL mode with invites; [Lessons and reviews](19-lessons-and-reviews.md) has the recipe.
+
 ## Page tools as the client's own tools
 
 With `TABDOCK_FIRST_CLASS_TOOLS=1`, Claude Code lists a page's tools by name, such as `pg_0123456789__add_item`, beside its own and calls them through the same checks, queue and prompts as `call_page_tool`. Observers see the read-only ones, invitees none.
@@ -64,6 +70,6 @@ MCP-B's local relay suits one person on one machine with a stdio client: the cli
 
 ## Not yet
 
-Unattended agents and CI against a public relay, such as a nightly job reading a dashboard with nobody to sign in, are not supported: a public relay needs an interactive sign-in, and page-scoped observer tokens on `/g/mcp` (ADR 0016) are a backlog item for after M5. Only local mode's owner token or dev tokens work without a person, on the relay's machine. Nor do pairings survive a restart: a restart or deploy ends every page session, pairing and invite, and a snapshot to carry them across a planned restart is a later item (`docs/plans/backlog.md`). Stock connectors allow no end-to-end encryption, so the relay always sees calls in plain text.
+Agents that drive a page with nobody present are not supported on a public relay: an agent token reads one page as an observer once its first request is allowed (ADR 0044), and only local mode's owner token or dev tokens drive unattended, on the relay's machine, as [a CI check](17-check-from-ci.md) does (ADR 0041). A crash or an unplanned restart still ends every page session, pairing and invite; `TABDOCK_RESTART_SNAPSHOT` carries them only across a graceful stop of under 10 minutes. Stock connectors allow no end-to-end encryption, so the relay always sees calls in plain text.
 
 Next: [Security](10-security.md).
