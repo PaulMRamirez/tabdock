@@ -514,9 +514,8 @@ describe('seats (S14)', () => {
     expect(relay.store.attachments.listForPage(page.pageId)).toHaveLength(4);
   });
 
-  // Needs W2-C's #pageFull, which counts the people alone: until W2-C merges,
-  // every attachment counts toward the people limit, watchers included, so
-  // this one fails on W2-D's branch by itself (docs/plans/M6.md, W2-D).
+  // W2-C's #pageFull counts the people alone, so watching agents leave the
+  // people's seats to members (this case failed on W2-D's branch alone).
   it("watching agents never take a member's seat among the people", async () => {
     const { relay, page } = await room({ limits: { usersPerPage: 3, observersPerPage: 5 } });
     await attachedAgent(relay, page, 'One');

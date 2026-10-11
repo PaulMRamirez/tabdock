@@ -20,6 +20,7 @@ import {
   startInviteRelay,
 } from './helpers/invites.ts';
 import { AgentTokens } from '../src/agents.ts';
+import { mintAgent } from './helpers/agents.ts';
 import { OPERATOR_GRANTS_PER_PAGE } from '../src/hub.ts';
 import { PageParts } from '../src/page-parts.ts';
 import { connectPage, type TestPage } from './helpers/page-client.ts';
@@ -446,14 +447,16 @@ describe('a session across the page link', () => {
   });
 
   it('ends as page_gone once its page is gone, once, before the attachments go', async () => {
-    const relay = await setup({ timings: { resumeWindowMs: 300 } });
+    const relay = await setup({ timings: { resumeWindowMs: 300 }, agentTokens: true });
     const page = await relay.page({ policy: { invites: 'watch' } });
     await attachMember(await relay.claude('sub-alice'), page);
     await start(page, 'ses_gone', { maxDrivers: 1, proposals: 'off' });
     const minted = await mintOk(page, { uses: 5 });
     const { userId } = await letGuestIn(relay, page, minted.secret);
+    // A real token (W2-D's), closed once whichever of the session's end and
+    // the page's parts reaches it first.
+    const token = await mintAgent(page);
     const endsAt = relay.store.pages.get(page.pageId)?.timedSession?.endsAt ?? 0;
-    const closes = watchTokenCloses(relay, userId, 1);
     page.ws.terminate();
     await page.closed;
     await vi.waitFor(() => {
@@ -462,7 +465,16 @@ describe('a session across the page link', () => {
     expect(events(relay, 'session_end')).toEqual([
       expect.objectContaining({ reason: 'page_gone', attachments: 1, invites: 1, agents: 1 }),
     ]);
-    expect(closes).toEqual([{ pageId: page.pageId, reason: 'page_gone', guestAttached: true }]);
+    expect(events(relay, 'agent_closed')).toEqual([
+      expect.objectContaining({ tokenId: token.tokenId, reason: 'page_gone' }),
+    ]);
+    // The token closed while the guest was still attached: before the page's
+    // own end took the attachments.
+    const types = relay.relay.audit.events().map((event) => event.type);
+    const guestExpire = relay.relay.audit
+      .events()
+      .findIndex((event) => event.type === 'expire' && event.userId === userId);
+    expect(types.indexOf('agent_closed')).toBeLessThan(guestExpire);
     expect(events(relay, 'expire').map((event) => event.reason)).toEqual([
       'page_gone',
       'page_gone',
