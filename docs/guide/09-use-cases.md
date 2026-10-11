@@ -26,7 +26,7 @@ A review queue on the laptop offers `get_progress` (read-only) and `next_item` a
 
 Teammates, each with their own Claude, work an incident console: `list_cards` (read-only), `add_card` and `move_card` (writes), `archive_sprint` (consequential). The page sets `maxDrivers: 3`, since with the default of 1 later approvals are seated as observers. The roster shows each person and their clients with a role switch and Revoke; writes run in arrival order, `archive_sprint` asks first, Pause stops new calls, and the audit log records who did what.
 
-**Works today** in code (acceptance tests A2.1 to A2.5). Teammates on other machines **need settings**: public URL mode with each in `TABDOCK_OAUTH_USERS` and the tab on the relay's machine, or hosted mode. Adding a member means a restart, which ends every pairing. A page holds 10 people by default.
+**Works today** in code (acceptance tests A2.1 to A2.5). Teammates on other machines **need settings**: public URL mode with each in `TABDOCK_OAUTH_USERS` and the tab on the relay's machine, or hosted mode. Adding a member means a restart, which ends every pairing unless `TABDOCK_RESTART_SNAPSHOT` is on. A page holds 10 people by default.
 
 ## A watch-only guest
 

@@ -77,7 +77,7 @@ stateDiagram-v2
   gone --> [*]
 ```
 
-When the socket drops (a reload, a closed tab, a lost network) the page is asleep, and its attachments wait 10 minutes for it to resume in the same tab under the same id. The resume token and grants live in the tab's `sessionStorage`, keyed by relay URL, origin and path, so a fresh tab or another path is a new page needing its own approval. Attachments end after 8 hours unused, invite-made ones within 24 hours or with the page session. A relay restart forgets every page, attachment, code and invite (only the audit log on disk and local mode's token survive), and pages pair again under new ids.
+When the socket drops (a reload, a closed tab, a lost network) the page is asleep, and its attachments wait 10 minutes for it to resume in the same tab under the same id. The resume token and grants live in the tab's `sessionStorage`, keyed by relay URL, origin and path, so a fresh tab or another path is a new page needing its own approval. Attachments end after 8 hours unused, invite-made ones within 24 hours or with the page session. A relay restart forgets every page, attachment, code and invite (only the audit log on disk and local mode's token survive), and pages pair again under new ids, unless `TABDOCK_RESTART_SNAPSHOT` carries them across a graceful one.
 
 ## Three dials
 

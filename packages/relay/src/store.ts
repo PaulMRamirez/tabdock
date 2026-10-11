@@ -1,5 +1,6 @@
 // Relay state behind small interfaces (SPEC section 4). Everything but the
-// audit log lives in memory, and a restart ends it all (ADR 0019); the
+// audit log lives in memory, and a restart ends it all (ADR 0019) unless a
+// graceful stop saved it in the restart snapshot (snapshot.ts, ADR 0046); the
 // persistent audit log (FileAuditLog, audit-file.ts) sits behind the same
 // AuditLog, and live invites behind InviteStore. Interfaces are
 // synchronous on purpose: a persistent audit log can write behind, and the hub
@@ -161,8 +162,9 @@ export interface AttachRequestRecord {
 /**
  * A live invite as the relay keeps it (ADR 0017): its terms, who sponsors it
  * and what is pending on it, but only the digest of its secret, which the
- * adapter alone ever held. An invite lives only in memory, so a restart ends
- * it like everything else (ADR 0019).
+ * adapter alone ever held. An invite lives in memory, so a restart ends it
+ * like everything else (ADR 0019), unless the restart snapshot carries it
+ * across a graceful stop (ADR 0046).
  */
 export interface InviteRecord {
   /** Drawn by the adapter; unique within its page only, so every lookup names the page too. */
@@ -209,7 +211,8 @@ export interface InviteRecord {
  * invite, since an invite's secret is spent at redemption while a token
  * authenticates every request for hours. Only the digest of the token is
  * kept, and the record goes when the token closes, after which /g/mcp
- * answers it 404. In memory only, so a restart ends it (ADR 0019).
+ * answers it 404. In memory, so a restart ends it (ADR 0019), unless the
+ * restart snapshot carries it across a graceful stop (ADR 0046).
  */
 export interface AgentTokenRecord {
   /** Drawn by the adapter; unique across the relay, as is the digest. */
