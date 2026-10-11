@@ -3,8 +3,8 @@
 // operator's Save from the widget's record box or from a session's offer,
 // each a trusted click on an armed box, read back as the file the browser
 // downloaded; and `pnpm audit:log --match` on that file, run as the owner
-// runs it. Shared by specs/session-record.spec.ts, later-scripts.spec.ts and
-// the demo's record leg.
+// runs it. Shared by specs/session-record.spec.ts, specs/later-scripts.spec.ts
+// and test/session-record.test.ts.
 
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
