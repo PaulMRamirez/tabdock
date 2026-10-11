@@ -1266,6 +1266,16 @@ function seatLimitsOf(limits: WelcomeFrame['limits']): SeatLimits | null {
   });
 }
 
+/**
+ * How many may watch by a session's invites (conflict C12): the relay's
+ * watching seats, or its people less the members' two where it has none,
+ * or one invite's uses from a relay that names no seats (0.1.0).
+ */
+export function sessionSeats(seats: SeatLimits | null): number {
+  if (seats === null) return MAX_INVITE_USES;
+  return seats.observersPerPage || Math.max(0, seats.usersPerPage - MEMBER_RESERVED_SEATS);
+}
+
 /** Each UTF-16 code unit becomes at most 3 UTF-8 bytes, so only longer strings need counting. */
 function overByteLimit(text: string, limit: number): boolean {
   if (text.length > limit) return true;
@@ -4005,19 +4015,6 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     return narrowPolicy(policy, session?.policy ?? null);
   }
 
-  /**
-   * How many may watch by a session's invites (conflict C12): the relay's
-   * watching seats, or its people less the members' two where it has none,
-   * or one invite's uses from a relay that names no seats.
-   */
-  function observerSeats(): number {
-    const seats = state.seatLimits;
-    if (seats === null) return MAX_INVITE_USES;
-    return seats.observersPerPage > 0
-      ? seats.observersPerPage
-      : Math.max(0, seats.usersPerPage - MEMBER_RESERVED_SEATS);
-  }
-
   function sessionView(): SessionView | null {
     if (session === null) return null;
     // The sponsor the relay named for its invites, fixed at minting (ADR 0017).
@@ -4040,15 +4037,6 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   function showSession(): void {
     writeStored(sessionKey, session && JSON.stringify(session), "the page's session");
     setState({ session: sessionView(), records: recorder.views() });
-  }
-
-  /** The recorder is told after each decision, and a fault in it never changes one (ADR 0045). */
-  function tellRecorder(tell: () => void): void {
-    try {
-      tell();
-    } catch (error) {
-      log.warn(`the session record stopped: ${describe(error)}`);
-    }
   }
 
   function armSessionEnd(): void {
@@ -4123,11 +4111,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       armSessionEnd();
       demoteBeyond(effective().maxDrivers);
       const view = sessionView();
-      if (view !== null) {
-        tellRecorder(() => {
-          recorder.sessionStarted(view);
-        });
-      }
+      // Told after each decision, through the seam W3-A guards (ADR 0045, decision 22).
+      if (view !== null) recorder.sessionStarted(view);
       showSession();
       return;
     }
@@ -4185,9 +4170,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       reason,
       time: clock(),
     });
-    tellRecorder(() => {
-      recorder.sessionEnded(end);
-    });
+    recorder.sessionEnded(end);
     setState({ sessionEnded: end });
     showSession();
     log.info(`session ${ended.sessionId} ended (${reason})`);
@@ -4248,7 +4231,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       !SessionLengthSchema.safeParse(lengthMs).success ||
       !Number.isInteger(observers) ||
       observers < 0 ||
-      observers > observerSeats()
+      observers > sessionSeats(state.seatLimits)
     ) {
       return refuse('invalid');
     }
@@ -4316,7 +4299,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         inviteRefusal = minted.reason;
         break;
       }
-      links.push(Object.freeze({ inviteId: minted.inviteId, link: minted.link }));
+      links.push({ inviteId: minted.inviteId, link: minted.link });
       runs(sessionId)?.inviteIds.push(minted.inviteId);
       showSession();
     }

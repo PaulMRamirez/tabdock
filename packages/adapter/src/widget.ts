@@ -59,9 +59,13 @@ import {
   MAX_INVITE_LABEL_CHARS,
   MAX_INVITE_USES,
   MAX_LIVE_INVITES_PER_PAGE,
+  MAX_SESSION_MS,
   MAX_STATE_BYTES,
   plainLine,
+  PROPOSALS_ORDER,
   type Role,
+  SESSION_EXTEND_MS,
+  SESSION_WARNINGS_MS,
   UNVERIFIED_ACCOUNT_NAME,
 } from '@tabdock/protocol';
 import type {
@@ -76,7 +80,9 @@ import type {
   PageRole,
   PendingConfirm,
   PendingRequest,
+  SessionLink,
 } from './core.ts';
+import { sessionSeats } from './core.ts';
 import { type BoxRect, takeDom } from './dom.ts';
 import { createQrView, inviteQrUrl, QR_SIDE_PX } from './qr.ts';
 import { apply, taken } from './taken.ts';
@@ -1649,10 +1655,288 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   const syncProposals: (state: DockState) => void = () => undefined;
   // M6 seam: not built
   const tickProposals = (): void => undefined;
-  // M6 seam: not built
-  const syncSession: (state: DockState) => void = () => undefined;
-  // M6 seam: not built
-  const tickSession = (): void => undefined;
+  // Time-boxed sessions (ADR 0043): the form, and the running session's
+  // countdown, links and controls. Start, Extend, New link and End sit in
+  // armed boxes, as Create link does: the first three grant access, and End
+  // sends a whole room away. The links live here in memory only, the first
+  // still open shown as a QR to project, never stored (ADR 0017).
+  const sessionForm = element('div', 'row');
+  dom.flag(sessionForm, 'hidden', true);
+  const formSession = newBox(sessionForm);
+  boxes.add(formSession);
+  const sessionToggle = button('Start a session', 'session-open', () => {
+    sessionError = null;
+    dom.flag(sessionForm, 'hidden', !dom.has(sessionForm, 'hidden'));
+    render(dock.state);
+  });
+  /** A field of the form; a change restarts its wait, since Start then does something else. */
+  function sessionField(text: string, action: WidgetAction, value: string, type = 'number') {
+    const label = element('label', 'field', text);
+    const input = element('input');
+    dom.attr(input, 'type', type);
+    dom.setValue(input, value);
+    setAction(input, action);
+    dom.append(label, input);
+    dom.append(sessionForm, label);
+    dom.listen(input, 'input', () => {
+      sessionError = null;
+      restartArming(formSession);
+      render(dock.state);
+    });
+    return { label, input };
+  }
+  const sLabel = sessionField('Label', 'session-label', '', 'text');
+  dom.attr(sLabel.input, 'maxlength', String(MAX_INVITE_LABEL_CHARS));
+  const sLength = sessionField('Minutes, 30 to 240', 'session-length', '60');
+  const sDrivers = sessionField('Driver seats', 'session-drivers', '1');
+  const sObservers = sessionField('Observers by invite', 'session-observers', '0');
+  const sProposals = element('div', 'choices', 'Proposals:');
+  const proposalChoices = PROPOSALS_ORDER.map((value) => {
+    const made = choice('session-proposals', value, value, 'session-proposals');
+    dom.setChecked(made.input, value === dock.state.policy.proposals);
+    dom.listen(made.input, 'change', () => {
+      restartArming(formSession);
+    });
+    dom.append(sProposals, made.label);
+    return [value, made] as const;
+  });
+  const sReason = element('p', 'muted');
+  role(sReason, 'session-reason');
+  const sEffects = element('p', 'muted');
+  role(sEffects, 'session-effects');
+  const startButton = boxButton(
+    formSession,
+    'Start',
+    'session-start',
+    () => {
+      void beginSession();
+    },
+    true,
+  );
+  dom.append(sessionForm, sProposals, sReason, sEffects, startButton);
+
+  const running = element('div', 'row');
+  const runningBox = newBox(running);
+  boxes.add(runningBox);
+  const sCountdown = element('p', 'who');
+  role(sCountdown, 'session-countdown');
+  // Five minutes and one minute left, told once each, and a link that did not come.
+  const sAlert = element('p', 'notice');
+  dom.attr(sAlert, 'aria-live', 'polite');
+  const sSponsor = element('p', 'muted');
+  role(sSponsor, 'session-sponsor');
+  const sWarning = element('p', 'notice');
+  role(sWarning, 'session-sponsor-warning');
+  const sQr = createQrView(doc, { accept: inviteQrUrl, label: 'Session QR code: scan to join' });
+  const sQrBox = element('div', 'qr');
+  dom.append(sQrBox, sQr.element);
+  const sLinkText = element('p', 'link-text');
+  const qrToggle = button('Show QR', 'session-qr', () => {
+    qrOpen = !qrOpen;
+    render(dock.state);
+  });
+  const renew = boxButton(runningBox, 'New link', 'session-renew', () => {
+    void renewLink();
+  });
+  const extend = boxButton(runningBox, 'Extend 15 min', 'session-extend', () => {
+    dock.extendSession(SESSION_EXTEND_MS / 60_000);
+  });
+  const end = boxButton(runningBox, 'End session', 'session-end', () => {
+    ending = true;
+    render(dock.state);
+  });
+  const endRow = element('div', 'buttons');
+  const endText = element('span');
+  dom.append(
+    endRow,
+    endText,
+    boxButton(
+      runningBox,
+      'End now',
+      'session-end-yes',
+      () => {
+        ending = false;
+        dock.endSession();
+      },
+      true,
+    ),
+    button('Keep it', 'session-end-no', () => {
+      ending = false;
+      render(dock.state);
+    }),
+  );
+  const runningButtons = element('div', 'buttons');
+  dom.append(runningButtons, qrToggle, renew, extend, end);
+  dom.append(
+    running,
+    sCountdown,
+    sAlert,
+    sSponsor,
+    sWarning,
+    sQrBox,
+    sLinkText,
+    runningButtons,
+    endRow,
+  );
+  const sHeading = element('div', 'label');
+  const sEnded = element('p', 'muted');
+  role(sEnded, 'session-ended');
+  dom.append(sessionBlock, sHeading, sEnded, running, sessionForm, sessionToggle);
+
+  /** This session's links in the order minted, held here alone; see the block's comment. */
+  let sessionLinks: readonly SessionLink[] = [];
+  let qrOpen = false;
+  let ending = false;
+  let sessionStarting = false;
+  let sessionError: string | null = null;
+  /** How many of SESSION_WARNINGS_MS have been told. */
+  let warned = 0;
+
+  function counted(n: number, one: string, many: string): string {
+    return `${String(n)} ${n === 1 ? one : many}`;
+  }
+
+  function syncSession(state: DockState): void {
+    const live = state.session;
+    const ended = state.sessionEnded;
+    const guests = state.roster.filter((entry) => entry.inviteId !== null).length;
+    dom.flag(sessionBlock, 'hidden', !state.sessionsOffered && live === null && ended === null);
+    dom.flag(running, 'hidden', live === null);
+    dom.flag(sessionToggle, 'hidden', live !== null || !state.sessionsOffered);
+    dom.flag(sEnded, 'hidden', ended === null || live !== null);
+    // The label is the page's own words, quoted so it reads as a name (S10).
+    setText(sHeading, live === null ? 'Session' : `Session "${live.label}"`);
+    if (ended !== null) setText(sEnded, `Session "${ended.label}" ended (${ended.reason}).`);
+    if (live === null) {
+      sessionLinks = [];
+      qrOpen = false;
+      ending = false;
+      syncSessionForm(state, guests);
+      return;
+    }
+    dom.flag(sessionForm, 'hidden', true);
+    setText(
+      sSponsor,
+      live.sponsor === null ? '' : `Invites shared by ${plainLine(live.sponsor.displayName)}`,
+    );
+    // One QR at a time: the first link whose invite still has a use left (C12).
+    const shown = sessionLinks.find((entry) =>
+      state.invites.some((view) => view.inviteId === entry.inviteId && view.usesLeft > 0),
+    );
+    dom.flag(sQrBox, 'hidden', !qrOpen || !sQr.show(shown?.link));
+    setText(sLinkText, qrOpen && shown !== undefined ? shown.link : '');
+    dom.flag(qrToggle, 'hidden', shown === undefined);
+    setText(qrToggle, qrOpen ? 'Hide QR' : 'Show QR');
+    dom.flag(renew, 'hidden', shown !== undefined || live.observers === 0);
+    dom.flag(endRow, 'hidden', !ending);
+    setText(endText, `End now? ${counted(guests, 'guest leaves.', 'guests leave.')} `);
+  }
+
+  function syncSessionForm(state: DockState, guests: number): void {
+    const { policy, roster } = state;
+    dom.flag(sDrivers.label, 'hidden', policy.maxDrivers < 2);
+    dom.attr(sDrivers.input, 'max', String(policy.maxDrivers));
+    dom.flag(
+      sObservers.label,
+      'hidden',
+      policy.invites === 'off' || (state.invitesOffered?.linkBase ?? null) === null,
+    );
+    dom.attr(sObservers.input, 'max', String(sessionSeats(state.seatLimits)));
+    dom.flag(sProposals, 'hidden', policy.proposals === 'off');
+    for (const [value, made] of proposalChoices) {
+      dom.flag(
+        made.label,
+        'hidden',
+        PROPOSALS_ORDER.indexOf(value) > PROPOSALS_ORDER.indexOf(policy.proposals),
+      );
+    }
+    const blocker =
+      state.link !== 'linked'
+        ? REFUSAL_TEXT.link_down
+        : Number(dom.value(sObservers.input)) > 0 &&
+            !roster.some((entry) => entry.kind === 'member')
+          ? REFUSAL_TEXT.no_sponsor
+          : null;
+    const reason = blocker ?? (sessionStarting ? 'Starting' : sessionError);
+    setText(sReason, reason ?? '');
+    dom.flag(sReason, 'hidden', reason === null);
+    // Whom Start makes observers: the drivers past its seats, newest first, as both layers pick them.
+    const demoted = roster
+      .filter((entry) => entry.role === 'driver')
+      .sort((a, b) => a.grantedAt - b.grantedAt)
+      .slice(Number(dom.value(sDrivers.input)) || 1)
+      .map((entry) => personText(entry));
+    setText(
+      sEffects,
+      `At its end ${counted(guests, 'guest leaves', 'guests leave')} and ${counted(state.invites.length, 'link closes', 'links close')}.${demoted.length > 0 ? ` Start makes ${demoted.join(', ')} observers.` : ''}`,
+    );
+    dom.flag(
+      startButton,
+      'disabled',
+      blocker !== null || sessionStarting || dom.value(sLabel.input).trim() === '',
+    );
+    setText(sessionToggle, dom.has(sessionForm, 'hidden') ? 'Start a session' : 'Close the form');
+  }
+
+  async function beginSession(): Promise<void> {
+    sessionStarting = true;
+    render(dock.state);
+    const hidden = (field: { label: HTMLElement }): boolean => dom.has(field.label, 'hidden');
+    const result = await dock.startSession({
+      label: dom.value(sLabel.input).trim(),
+      lengthMinutes: Number(dom.value(sLength.input)),
+      drivers: hidden(sDrivers) ? 1 : Number(dom.value(sDrivers.input)),
+      observers: hidden(sObservers) ? 0 : Number(dom.value(sObservers.input)),
+      proposals: proposalChoices.find(([, made]) => dom.checked(made.input))?.[0] ?? 'off',
+    });
+    sessionStarting = false;
+    if (!mounted) return;
+    if (result.ok) {
+      sessionLinks = result.links;
+      qrOpen = sessionLinks.length > 0;
+      warned = 0;
+      dom.setValue(sLabel.input, '');
+      setText(sAlert, result.inviteRefusal === undefined ? '' : REFUSAL_TEXT[result.inviteRefusal]);
+    } else {
+      sessionError = `The session did not start (${result.reason}).`;
+    }
+    render(dock.state);
+  }
+
+  async function renewLink(): Promise<void> {
+    const result = await dock.renewSessionLink();
+    if (!mounted) return;
+    if (result.ok) {
+      sessionLinks = [{ inviteId: result.inviteId, link: result.link }];
+      qrOpen = true;
+    } else {
+      setText(sAlert, REFUSAL_TEXT[result.reason]);
+    }
+    render(dock.state);
+  }
+
+  /** Every second: the countdown, the badge's minutes, the two warnings and the sponsor's. */
+  function tickSession(): void {
+    const live = dock.state.session;
+    dom.flag(sessionTag, 'hidden', live === null);
+    if (live === null) return;
+    const left = Math.max(0, live.endsAt - Date.now());
+    setText(sCountdown, `Ends in ${clockText(Math.ceil(left / 1000))}`);
+    setText(sessionTag, `${String(Math.ceil(left / 60_000))} min`);
+    const due = SESSION_WARNINGS_MS.filter((at) => left <= at).length;
+    // An extension takes a told warning back.
+    if (due > warned) setText(sAlert, `${String(Math.ceil(left / 60_000))} min left.`);
+    warned = due;
+    dom.flag(extend, 'disabled', live.lengthMinutes * 60_000 + SESSION_EXTEND_MS > MAX_SESSION_MS);
+    // The sponsor's attachment ending first, if unused, ends everyone their invites let in.
+    const held = dock.state.roster.find((entry) => entry.userId === live.sponsor?.userId);
+    const early = held?.expiresAt != null && held.expiresAt < live.endsAt;
+    setText(
+      sWarning,
+      early ? `${personText(held)} may time out first, and their guests with them.` : '',
+    );
+    dom.flag(sWarning, 'hidden', !early);
+  }
   // M6 seam: not built
   const syncAgents: (state: DockState) => void = () => undefined;
   // M6 seam: not built
