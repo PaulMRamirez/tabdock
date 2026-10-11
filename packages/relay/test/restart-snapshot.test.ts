@@ -43,12 +43,14 @@ import {
   AUDIT_VERSION,
   type AuditLine,
   INVITEE_ID_PREFIX,
+  MAX_SNAPSHOT_BYTES,
   type PolicyInput,
   PolicySchema,
   type RelaySnapshot,
   RelaySnapshotSchema,
   RESUME_WINDOW_MS,
   SNAPSHOT_VERSION,
+  type SnapshotPage,
 } from '@tabdock/protocol';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { resolveConfig } from '../src/config.ts';
@@ -689,6 +691,27 @@ async function boundDirectory(): Promise<{ source: string; snapshot: RelaySnapsh
   return { source, snapshot };
 }
 
+/** A page session as a snapshot saves it, asleep with no session. */
+function savedPageOf(
+  pageId: string,
+  now: number,
+  overrides: Partial<SnapshotPage> = {},
+): SnapshotPage {
+  return {
+    pageId,
+    origin: PAGE_ORIGIN,
+    title: 'Board',
+    url: `${PAGE_ORIGIN}/`,
+    adapterVersion: 'test',
+    connectedAt: now - MINUTE,
+    ceiling: PolicySchema.parse({ maxDrivers: 2, proposals: 'members' }),
+    timedSession: null,
+    sessionEnded: null,
+    resumeTokenHash: 'a'.repeat(64),
+    ...overrides,
+  };
+}
+
 /** lstat answering for `path` with another file's stats, as a swap after the loader looked would leave it. */
 function lyingLstat(path: string, stats: nodeFs.Stats): typeof nodeFs.lstatSync {
   return ((target: nodeFs.PathLike, options?: nodeFs.StatSyncOptions) =>
@@ -832,6 +855,79 @@ describe('taking the file (snapshot.ts)', () => {
       expect(existsSync(fileOf(dir))).toBe(false);
     },
   );
+
+  it("refuses a file larger than MAX_SNAPSHOT_BYTES, one that grows while read, and another account's, before trusting any of it", async () => {
+    const { source, snapshot } = await boundDirectory();
+    const uid = process.getuid?.();
+    /** fstat answering for the snapshot's descriptor with these facts, every other one as it is. */
+    const take = (facts: Partial<Pick<nodeFs.Stats, 'size' | 'uid'>>) => {
+      const dir = copyOf(source);
+      const descriptors = new Set<number>();
+      const fs: SnapshotFs = {
+        ...nodeFs,
+        openSync: ((path: nodeFs.PathLike, ...rest: [number, number?]) => {
+          const fd = nodeFs.openSync(path, ...rest);
+          if (path === fileOf(dir)) descriptors.add(fd);
+          return fd;
+        }) as typeof nodeFs.openSync,
+        fstatSync: ((fd: number, options?: nodeFs.StatOptions) => {
+          const stats = nodeFs.fstatSync(fd, options);
+          return descriptors.has(fd) && stats !== undefined ? Object.assign(stats, facts) : stats;
+        }) as typeof nodeFs.fstatSync,
+      };
+      return takeSnapshot({ dir, enabled: true, now: snapshot.writtenAt, mode: 'public', fs });
+    };
+    // As written, the copy loads: each refusal below is the one fact changed.
+    expect(take({})).toMatchObject({ kind: 'loaded' });
+    expect(take({ size: MAX_SNAPSHOT_BYTES + 1 })).toEqual({
+      kind: 'refused',
+      reason: 'larger than MAX_SNAPSHOT_BYTES',
+      removed: true,
+    });
+    // Ten bytes at the fstat and more by the read: what was checked is not what is read.
+    expect(take({ size: 10 })).toEqual({
+      kind: 'refused',
+      reason: 'it changed while read',
+      removed: true,
+    });
+    if (uid !== undefined) {
+      expect(take({ uid: uid + 1 })).toEqual({
+        kind: 'refused',
+        reason: "another account's file",
+        removed: true,
+      });
+    }
+  });
+
+  it('writes nothing past MAX_SNAPSHOT_BYTES, leaving no file behind', () => {
+    const dir = privateDir();
+    const now = Date.now();
+    // Pages at their longest addresses and titles, enough of them to pass the bound.
+    const pages = Array.from({ length: 4_000 }, (_, index) =>
+      savedPageOf(`pg_${String(index)}`, now, {
+        origin: `https://${'o'.repeat(2_030)}.example`,
+        url: `https://${'u'.repeat(2_030)}.example/`,
+        title: 't'.repeat(300),
+        resumeTokenHash: createHash('sha256').update(String(index)).digest('hex'),
+      }),
+    );
+    const large: RelaySnapshot = {
+      v: SNAPSHOT_VERSION,
+      writtenAt: now,
+      mode: 'public',
+      pages,
+      attachments: [],
+      invites: [],
+      agents: [],
+    };
+    expect(RelaySnapshotSchema.safeParse(large).success).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(large))).toBeGreaterThan(MAX_SNAPSHOT_BYTES);
+    expect(writeSnapshot(dir, large)).toEqual({
+      kind: 'refused',
+      reason: 'larger than MAX_SNAPSHOT_BYTES',
+    });
+    expect(nodeFs.readdirSync(dir)).toEqual([]);
+  });
 
   it('binds only a snapshot_written that the last relay_stop is chained to, across a rotation too', () => {
     const dir = privateDir();
