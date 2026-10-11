@@ -130,7 +130,7 @@ export const RESPONSE_CEILING_MEMBERS_LINE =
 /** An answer handed on in slices, and what it has read and not yet handed on. */
 export interface Slices {
   readonly response: Response;
-  /** Bytes read from the answer's body that the Node adapter has not yet taken. */
+  /** Bytes of the answer's chunks the slicer still holds, each whole until its last slice is taken. */
   readonly queuedBytes: () => number;
 }
 
@@ -143,15 +143,21 @@ const NOTHING_QUEUED = (): number => 0;
  * size queuedBytes() reports and `queued` hears of each time it grows, so
  * that what an unread answer holds is counted where it waits (ADR 0044).
  * Reading ahead holds nothing the SDK did not already hold: its streams
- * enqueue whatever they are given, read or not. The slices are views of the
- * chunk they came from, so nothing is copied; a client that goes cancels
- * the body underneath, and what was queued is let go.
+ * enqueue whatever they are given, read or not. A chunk larger than a slice
+ * is handed on as copies of its slices and counted whole until its last
+ * slice goes, since a chunk lives while any view of it does: views in
+ * Node's buffer would keep an answer of 0.72 MB alive while counting only
+ * themselves, so a client that read all but its tail would hold it nearly
+ * uncounted. A client that goes cancels the body underneath, and what was
+ * queued is let go.
  */
 export function inSlices(response: Response, queued?: () => void): Slices {
   const source = response.body;
   if (source === null) return { response, queuedBytes: NOTHING_QUEUED };
   const reader: ReadableStreamDefaultReader<Uint8Array> = source.getReader();
   const chunks: Uint8Array[] = [];
+  /** Bytes of the first chunk already handed on. */
+  let handed = 0;
   let bytes = 0;
   let ended = false;
   let stopped = false;
@@ -180,6 +186,7 @@ export function inSlices(response: Response, queued?: () => void): Slices {
             // As the pipe did: the client sees the body fail, and nothing stays queued.
             stopped = true;
             chunks.length = 0;
+            handed = 0;
             bytes = 0;
             controller.error(error);
           }
@@ -199,19 +206,27 @@ export function inSlices(response: Response, queued?: () => void): Slices {
           });
           head = chunks[0];
         }
-        if (head.byteLength <= RESPONSE_SLICE_BYTES) {
+        if (handed === 0 && head.byteLength <= RESPONSE_SLICE_BYTES) {
           chunks.shift();
           bytes -= head.byteLength;
           controller.enqueue(head);
           return;
         }
-        chunks[0] = head.subarray(RESPONSE_SLICE_BYTES);
-        bytes -= RESPONSE_SLICE_BYTES;
-        controller.enqueue(head.subarray(0, RESPONSE_SLICE_BYTES));
+        const end = Math.min(handed + RESPONSE_SLICE_BYTES, head.byteLength);
+        const slice = head.slice(handed, end);
+        if (end < head.byteLength) {
+          handed = end;
+        } else {
+          chunks.shift();
+          handed = 0;
+          bytes -= head.byteLength;
+        }
+        controller.enqueue(slice);
       },
       async cancel(reason) {
         stopped = true;
         chunks.length = 0;
+        handed = 0;
         bytes = 0;
         wake();
         await reader.cancel(reason);

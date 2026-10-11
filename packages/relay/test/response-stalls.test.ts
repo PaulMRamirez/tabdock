@@ -165,8 +165,11 @@ class FakeBody {
     });
   }
 
-  push(bytes: number): void {
-    this.#controller?.enqueue(new Uint8Array(bytes));
+  /** Enqueues a chunk of `bytes`, and returns it. */
+  push(bytes: number): Uint8Array {
+    const chunk = new Uint8Array(bytes);
+    this.#controller?.enqueue(chunk);
+    return chunk;
   }
 
   end(): void {
@@ -763,7 +766,7 @@ describe('the relay-wide ceiling on what responses hold (S9, ADR 0044)', () => {
 });
 
 describe('inSlices', () => {
-  it('cuts each chunk into views of at most RESPONSE_SLICE_BYTES, keeping status, headers and every byte', async () => {
+  it('cuts each chunk into slices of at most RESPONSE_SLICE_BYTES, keeping status, headers and every byte', async () => {
     const source = new Uint8Array(3 * RESPONSE_SLICE_BYTES + 5).map((_, n) => n % 251);
     const original = new Response(source, { status: 202, headers: { 'x-kept': 'yes' } });
     const sliced = inSlices(original).response;
@@ -791,14 +794,14 @@ describe('inSlices', () => {
     expect(sliced.queuedBytes()).toBe(0);
   });
 
-  it('reads the answer as it comes, before anyone asks, and counts what it holds down as each slice is taken (ADR 0044)', async () => {
+  it('reads the answer as it comes, before anyone asks, and counts each chunk whole until its last slice is taken (ADR 0044)', async () => {
     const source = new FakeBody();
     let heard = 0;
     const sliced = inSlices(new Response(source.stream), () => {
       heard += 1;
     });
-    source.push(2 * RESPONSE_SLICE_BYTES + 100);
-    source.push(300);
+    const large = source.push(2 * RESPONSE_SLICE_BYTES + 100);
+    const small = source.push(300);
     await settle();
     // Nobody has read a byte, and both chunks are held where they can be counted.
     expect(sliced.queuedBytes()).toBe(2 * RESPONSE_SLICE_BYTES + 400);
@@ -806,18 +809,28 @@ describe('inSlices', () => {
     const reader: ReadableStreamDefaultReader<Uint8Array> | undefined =
       sliced.response.body?.getReader();
     if (reader === undefined) throw new Error('no body');
-    const sizes: number[] = [];
+    const taken: Uint8Array[] = [];
     const left: number[] = [];
     for (;;) {
       const next = await reader.read();
       if (next.done) break;
-      sizes.push(next.value.byteLength);
+      taken.push(next.value);
       left.push(sliced.queuedBytes());
       // The last slice is taken only once the source has ended.
       if (left.length === 4) source.end();
     }
-    expect(sizes).toEqual([RESPONSE_SLICE_BYTES, RESPONSE_SLICE_BYTES, 100, 300]);
-    expect(left).toEqual([RESPONSE_SLICE_BYTES + 400, 400, 300, 0]);
+    expect(taken.map((slice) => slice.byteLength)).toEqual([
+      RESPONSE_SLICE_BYTES,
+      RESPONSE_SLICE_BYTES,
+      100,
+      300,
+    ]);
+    // A chunk lives while any slice of it does, so it counts whole until its last is taken.
+    expect(left).toEqual([2 * RESPONSE_SLICE_BYTES + 400, 2 * RESPONSE_SLICE_BYTES + 400, 300, 0]);
+    // Its slices are copies, so what Node holds of them unsent keeps none of it alive.
+    expect(taken.slice(0, 3).some((slice) => slice.buffer === large.buffer)).toBe(false);
+    // One no larger than a slice goes on as it came.
+    expect(taken[3]?.buffer).toBe(small.buffer);
   });
 
   it('cancels the answer underneath as its client goes, and lets go of what it held', async () => {
