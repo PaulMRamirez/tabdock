@@ -281,8 +281,8 @@ describe('the seams the Wave 3 gate sees (docs/plans/M6.md)', () => {
    * closing brace at its own indent, so a helper built and called nowhere
    * cannot pass the gate with no marker in it (ADR 0044's #watchingFull).
    */
-  function unusedMembers(): { at: string; body: string }[] {
-    return sources().flatMap(([name, lines]) =>
+  function unusedMembers(files = sources()): { at: string; body: string }[] {
+    return files.flatMap(([name, lines]) =>
       lines.flatMap((line, index) => {
         if (!/eslint-disable-next-line\s+\S*no-unused/.test(line)) return [];
         const indent = /^\s*/.exec(line)?.[0] ?? '';
@@ -297,12 +297,36 @@ describe('the seams the Wave 3 gate sees (docs/plans/M6.md)', () => {
     );
   }
 
-  it('marks every member the lint is told nothing calls yet', () => {
-    const members = unusedMembers();
-    expect(members.length).toBeGreaterThan(0);
-    const unmarked = members
+  /** The members of `files` the lint is told nothing calls and that carry no marker. */
+  function unmarkedMembers(files?: [string, string[]][]): string[] {
+    return unusedMembers(files)
       .filter(({ body }) => !body.includes('// M6 seam: not built'))
       .map(({ at }) => at);
-    expect(unmarked).toEqual([]);
+  }
+
+  it('finds a member the lint is told nothing calls, and whether it carries the marker', () => {
+    // Wave 2 built every such member the relay had, so the scan is shown on a
+    // sample here: a gate that found nothing to check would pass anything.
+    const sample = (marker: string): [string, string[]][] => [
+      [
+        'sample.ts',
+        [
+          'export class Sample {',
+          '  // eslint-disable-next-line no-unused-private-class-members -- not called yet',
+          '  #helper(): number {',
+          ...(marker === '' ? [] : [`    ${marker}`]),
+          '    return 0;',
+          '  }',
+          '}',
+        ],
+      ],
+    ];
+    expect(unusedMembers(sample(''))).toHaveLength(1);
+    expect(unmarkedMembers(sample(''))).toEqual(['sample.ts:2']);
+    expect(unmarkedMembers(sample('// M6 seam: not built'))).toEqual([]);
+  });
+
+  it('marks every member the lint is told nothing calls yet', () => {
+    expect(unmarkedMembers()).toEqual([]);
   });
 });

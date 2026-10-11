@@ -439,9 +439,16 @@ describe('what invitees together may hold while their requests wait (S9, ADRs 00
   it('refuses a guest past a quarter of the total, a call page_busy and a redemption rate_limited, and still holds a member', async () => {
     // Shares of 8 MiB and a total of 32 MiB, so invitees may hold 8 MiB
     // together, twice what the least setting allows, so the quarter, not
-    // the floor, is what binds, and each invitee 4 MiB of it.
+    // the floor, is what binds, and each invitee 4 MiB of it. The guests
+    // watch, so the watchers' share of calls running at once (4 by default,
+    // ADR 0044, tested in watching-calls.test.ts) is raised past the six
+    // here, leaving the bytes as what refuses.
     const relay = await startInviteRelay({
-      limits: { requestBytesPerUser: 2 * MIN_REQUEST_BYTES, requestBytes: 8 * MIN_REQUEST_BYTES },
+      limits: {
+        requestBytesPerUser: 2 * MIN_REQUEST_BYTES,
+        requestBytes: 8 * MIN_REQUEST_BYTES,
+        watchingCallsInFlight: 8,
+      },
       timings: { callDeadlineMs: 20_000 },
     });
     inviteRelay = relay;
