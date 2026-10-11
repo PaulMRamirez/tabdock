@@ -2427,7 +2427,7 @@ export class PageHub {
       }
       for (const invite of invites) this.#closeInvite(invite, 'session_ended', false);
     }
-    const agents = this.#agents.closeAll(
+    const agents = this.#agents.closePage(
       pageId,
       reason === 'page_gone' ? 'page_gone' : 'session_ended',
     );
