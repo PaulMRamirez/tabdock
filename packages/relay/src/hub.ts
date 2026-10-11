@@ -1484,6 +1484,8 @@ export class PageHub {
    * page sends for one is expected, since the page may not yet know (#decision).
    */
   readonly #endedRequests = new Map<string, { pageId: string; until: number }>();
+  /** Settled proposals a decision has already crossed the end of: only one is expected (#proposalDecision). */
+  readonly #lateDecisions = new WeakSet<ProposalRecord>();
   /**
    * Redemptions of one invite, whoever makes them (ADR 0017), keyed by page
    * and invite id, so only live invites, which a page holds ten of at most,
@@ -1974,9 +1976,12 @@ export class PageHub {
 
   /**
    * The operator's answer to a proposal, or the page's own refusal of it
-   * (ADR 0042); false when it named none of the page's. A decision for one
-   * that already ended (it expired, was withdrawn or was cancelled while the
-   * operator looked) is expected, as for attach requests (#justEnded). An
+   * (ADR 0042); false when it named none of the page's. One decision for a
+   * proposal that ended within ENDED_REQUEST_GRACE_MS (it expired, was
+   * withdrawn or was cancelled while the operator looked) is expected, as
+   * for attach requests (#justEnded); the page decides each proposal once,
+   * so any other for one no longer pending changes nothing and spends the
+   * budget for such frames (ADR 0023), however long its outcome is kept. An
    * Accept runs the proposer's call through the write queue now, so accepted
    * proposals enter it in the order the operator accepts them (decision 20).
    */
@@ -1993,8 +1998,13 @@ export class PageHub {
     }
     const fields = { pageId, userId: record.proposer.userId, proposalId, tool };
     if (record.status !== 'pending') {
+      const crossed =
+        record.settledAt !== null &&
+        Date.now() - record.settledAt <= ENDED_REQUEST_GRACE_MS &&
+        !this.#lateDecisions.has(record);
+      this.#lateDecisions.add(record);
       this.#log.debug('decision for a proposal that already ended', fields);
-      return true;
+      return crossed;
     }
     if (frame.accept) {
       this.#log.info('proposal accepted on the page', fields);

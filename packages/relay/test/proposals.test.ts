@@ -487,6 +487,36 @@ describe('the operator decides (A6.11)', () => {
     });
   });
 
+  it('takes one decision crossing its end as expected, and counts every replay after it as a frame that changes nothing', async () => {
+    const relay = await setup({
+      rateLimits: { ignoredFramesPerSocket: 2, ignoredFramesPerAddress: 10_000 },
+    });
+    const opened = await page();
+    const bob = await observer(opened);
+    const proposalId = proposalIdOf(await propose(bob, opened.pageId));
+    await nextProposal(opened);
+    await decide(opened, proposalId, false);
+    const replays = 30;
+    for (let i = 0; i < replays; i += 1) {
+      opened.send({ t: 'proposal_decision', proposalId, accept: true });
+    }
+    await opened.sync();
+    expect(opened.ws.readyState).toBe(opened.ws.OPEN);
+    expect(opened.all('invoke')).toEqual([]);
+    const written = relay.lines.filter((line) =>
+      line.includes('decision for a proposal that already ended'),
+    ).length;
+    await relay.close();
+    const held = relay.lines
+      .map((line) => JSON.parse(line) as { msg: string; frames?: Record<string, number> })
+      .filter((entry) => entry.msg === 'page frames that changed nothing went unlogged')
+      .reduce((sum, entry) => sum + (entry.frames?.proposal_decision ?? 0), 0);
+    // One crossing its end, then the socket's budget of 2 (twice should a
+    // window turn mid-flood); every other replay is counted, unlogged.
+    expect(written).toBeLessThanOrEqual(5);
+    expect(written + held).toBe(replays);
+  });
+
   it('ignores a decision from another page for the proposal, as a frame that changes nothing', async () => {
     const relay = await setup();
     const opened = await page();
