@@ -212,4 +212,4 @@ The profile's names, schemas and limits are in `packages/sim-page/src/map/profil
 
 To teach a client the profile, one line will do: "this page follows the Tabdock map profile, `tabdock.map.v1`", with this page beside it. An observation's source URL is page text too, so a client should not fetch it on a page's say-so alone.
 
-Back to [the guide's index](README.md).
+Next: [Check a page from CI](17-check-from-ci.md).

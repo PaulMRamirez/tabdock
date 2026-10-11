@@ -15,6 +15,7 @@ Tabdock 0.1.0 is prepared but not yet on npm, so every page leads with the path 
 | Let other people use a page you operate             | [Sharing](06-sharing.md)                                                                                                                                               |
 | Run a relay for yourself or a team                  | [Run a relay](07-run-a-relay.md), [Relay settings](08-relay-settings.md), [Settings for rooms, images and state](14-settings-for-rooms.md), [Security](10-security.md) |
 | Build a map or globe page every client drives alike | [Map and globe pages](16-map-pages.md)                                                                                                                                 |
+| Check a page on every change                        | [Check a page from CI](17-check-from-ci.md)                                                                                                                            |
 | Find out why something failed                       | [Troubleshooting](11-troubleshooting.md) for a call, [Setup problems and limits](12-setup-and-limits.md) for setup                                                     |
 
 Whatever your role, read [Concepts](01-concepts.md) first: every other page uses its words (operator, member, invitee, driver, observer, consequential) in exactly its sense.
@@ -37,6 +38,7 @@ Whatever your role, read [Concepts](01-concepts.md) first: every other page uses
 14. [Settings for rooms, images and state](14-settings-for-rooms.md): the settings for images, page state, proposals, watching seats, the members file, agent tokens and the restart snapshot.
 15. [Limits for rooms, images and state](15-limits-for-rooms.md): the fixed numbers behind those, each with its constant.
 16. [Map and globe pages](16-map-pages.md): the shared tool profile for map and globe pages, its units and shapes, and its worked examples.
+17. [Check a page from CI](17-check-from-ci.md): a check that walks a map page's every stop in local mode on a CI runner, and the testing helper it pairs with.
 
 For the design itself, `SPEC.md` is the source of truth, `docs/adr/` holds the decisions and `docs/threat-model.md` maps each boundary to its tests. `docs/develop.md` is for contributors.
 
