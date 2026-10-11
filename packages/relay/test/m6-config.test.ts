@@ -7,11 +7,12 @@
 // without invites (ADR 0044), the members file in public URL mode (ADR 0043)
 // and the restart snapshot, which needs an audit directory (ADR 0046). Every
 // refusal names its setting and never the value it was given (R1, R2). Until
-// the waves serve them, agent tokens, the members file and the snapshot pass
-// their own rules and are then refused at start, so no relay runs as if one
-// were on while nothing honours it.
+// the waves serve them, agent tokens and the snapshot pass their own rules
+// and are then refused at start, so no relay runs as if one were on while
+// nothing honours it. The members file is read (W1-E): its own tests are
+// members.test.ts and members-file.test.ts.
 
-import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -40,7 +41,7 @@ import {
   resolveConfig,
   STATE_BYTES,
 } from '../src/config.ts';
-import { createDevTokenAuth, loadConfigFromEnv } from '../src/index.ts';
+import { createDevTokenAuth, createOAuthAuth, loadConfigFromEnv } from '../src/index.ts';
 import { PAGE_ORIGIN } from './helpers/page-client.ts';
 import { PAIR_CLIENT } from './helpers/provider.ts';
 import { ALICE } from './helpers/relay.ts';
@@ -531,15 +532,25 @@ describe('TABDOCK_MEMBERS_FILE (ADR 0043)', () => {
     }
   });
 
-  it('is refused at start until this relay reads it, rather than run with no members', () => {
+  it('is read at start: a file that is not there refuses to start, and one that is lists the members', () => {
     refusedWith(
       withFile(SECRETISH),
       SECRETISH,
-      'TABDOCK_MEMBERS_FILE is not read by this relay yet; list the members in TABDOCK_OAUTH_USERS (ADR 0043)',
+      'TABDOCK_MEMBERS_FILE names a file that does not exist (ADR 0043)',
     );
+    const file = join(scratch(), 'members.txt');
+    writeFileSync(file, 'user_01ABC=alice:Alice\nuser_02DEF=bob:Bob, the second\n', {
+      mode: 0o600,
+    });
+    const config = resolveEnv(withFile(file));
+    expect(config.membersFile).toBe(file);
+    expect(loadConfigFromEnv(withFile(file)).auth.members?.names()).toEqual([
+      'Alice',
+      'Bob, the second',
+    ]);
   });
 
-  it('holds options given in code to public URL mode and an absolute path, then refuses it until read', () => {
+  it('holds options given in code to public URL mode, an absolute path and a plugin with a member list', () => {
     const publicOptions = loadConfigFromEnv(OAUTH);
     expect(resolveConfig(publicOptions).membersFile).toBeNull();
     const relative = thrown(() =>
@@ -551,12 +562,25 @@ describe('TABDOCK_MEMBERS_FILE (ADR 0043)', () => {
       'membersFile (TABDOCK_MEMBERS_FILE) lists the members OAuth signs in, which only public URL mode does (TABDOCK_PUBLIC_URL) (ADR 0043)',
     );
     expect(local).not.toContain(SECRETISH);
-    // M6 seam: not built. W1-E reads the file and turns this into a relay that does.
-    const unread = thrown(() => resolveConfig({ ...publicOptions, membersFile: SECRETISH }));
-    expect(unread).toBe(
-      "membersFile (TABDOCK_MEMBERS_FILE) is not read by this relay yet; give the members to the OAuth plugin's users (ADR 0043)",
+    // The OAuth plugin keeps a live list the file replaces; a plugin with none is refused.
+    expect(resolveConfig({ ...publicOptions, membersFile: SECRETISH }).membersFile).toBe(SECRETISH);
+    const listless = thrown(() =>
+      resolveConfig({
+        ...publicOptions,
+        auth: { ...publicOptions.auth, members: undefined },
+        membersFile: SECRETISH,
+      }),
     );
-    expect(unread).not.toContain(SECRETISH);
+    expect(listless).toBe(
+      'membersFile (TABDOCK_MEMBERS_FILE) replaces the member list of the OAuth plugin, and this auth plugin keeps none (ADR 0043)',
+    );
+    expect(listless).not.toContain(SECRETISH);
+    const oauth = createOAuthAuth({
+      issuer: 'https://idp.example',
+      resource: `${PUBLIC_ORIGIN}/mcp`,
+      users: [{ sub: 'user_01ABC', userId: 'alice', displayName: 'Alice' }],
+    });
+    expect(oauth.members?.userIds()).toEqual(new Set(['alice']));
   });
 });
 

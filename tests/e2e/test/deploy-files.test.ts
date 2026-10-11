@@ -476,6 +476,23 @@ describe('the image and the workflows, as they run (comments left out)', () => {
     expect(stepsOf(deploy).at(-1)).toBe(live);
   });
 
+  it('stages the members from exactly one place: the secret, or the variable naming a file (ADR 0043)', () => {
+    const deploy = jobsOf(read(`${dir}/deploy.yml`)).get('deploy') ?? '';
+    const stage = stepWith(deploy, 'flyctl secrets import');
+    expect(stage).toContain('TABDOCK_OAUTH_USERS: ${{ secrets.TABDOCK_OAUTH_USERS }}');
+    // A path is no secret, and a file on the volume holds subjects and names, never a token.
+    expect(stage).toContain('TABDOCK_MEMBERS_FILE: ${{ vars.TABDOCK_MEMBERS_FILE }}');
+    expect(stage).not.toContain('secrets.TABDOCK_MEMBERS_FILE');
+    expect(stage).toMatch(
+      /if \[\[ -n "\$TABDOCK_MEMBERS_FILE" \]\]; then\n\s+if \[\[ -n "\$TABDOCK_OAUTH_USERS" \]\]; then\n[^\n]*\n\s+exit 1\n\s+fi\n\s+names\+=\(TABDOCK_MEMBERS_FILE\)\n\s+unused=TABDOCK_OAUTH_USERS\n\s+else\n\s+names\+=\(TABDOCK_OAUTH_USERS\)\n\s+unused=TABDOCK_MEMBERS_FILE\n\s+fi\n/,
+    );
+    // Fly keeps a secret until it is unset, so the one not in use is unset
+    // after the import, by name alone: a move either way never leaves both.
+    expect(hashCode(stage)).toMatch(
+      /flyctl secrets import --stage --app "\$FLY_APP"\n\s+flyctl secrets unset --stage --app "\$FLY_APP" "\$unused"$/m,
+    );
+  });
+
   it('publishes the site from main only: a build that can only read, then a deploy that runs only deploy-pages (ADR 0029)', () => {
     const raw = read(`${dir}/pages.yml`);
     const pages = hashCode(raw);

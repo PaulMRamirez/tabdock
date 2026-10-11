@@ -95,6 +95,14 @@ import { EMPTY_FIRST_CLASS, PageHub } from './hub.ts';
 import { ListenStreams } from './listen-streams.ts';
 import { createLogger, type Logger } from './log.ts';
 import {
+  loadMembersFile,
+  type MemberChange,
+  type MembersReload,
+  type MembersWatch,
+  settlingMembers,
+  watchMembersFile,
+} from './members.ts';
+import {
   type AuthExtra,
   AuthExtraSchema,
   BUDGET_CODE,
@@ -118,6 +126,15 @@ import { createSignInGate } from './sign-in-gate.ts';
 import { Spike, type SpikeControl } from './spike.ts';
 import { type AuditLog, callRecords, createMemoryStore, recordAudit } from './store.ts';
 
+/**
+ * The longest a 2025-era session a member list change ended stays open to
+ * finish answering, so the answers the hub just gave its calls are written
+ * (ADR 0043). One with nothing open closes at once, and one answering
+ * closes when its last response is done; this bounds a client's listening
+ * GET stream, which never ends on its own. It serves no new request meanwhile.
+ */
+export const MEMBER_SESSIONS_CLOSE_MS = 1000;
+
 export interface Relay {
   /** http://127.0.0.1:<port> */
   readonly url: string;
@@ -136,6 +153,13 @@ export interface Relay {
    * from the relay's own process only (main.ts reads it from stdin).
    */
   readonly spike: SpikeControl | null;
+  /**
+   * Reads the members file now, without waiting for the poll to see it
+   * settle, and applies it if its text changed (ADR 0043): 'refused' keeps
+   * the list in force. Without a members file there is nothing to read, and
+   * it answers 'unchanged'.
+   */
+  reloadMembers(): Promise<MembersReload>;
   close(): Promise<void>;
 }
 
@@ -513,6 +537,15 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     ...(options.logLevel ? { level: options.logLevel } : {}),
   });
   const auth = options.auth;
+  // The members file, read before anything starts, so a file the relay cannot
+  // use stops it, naming a line at most, and the list in force from the first
+  // request is the file's (ADR 0043). resolveConfig refused a file beside a
+  // plugin that keeps no member list.
+  const members = config.membersFile === null ? null : (auth.members ?? null);
+  if (config.membersFile !== null && members !== null) {
+    const { entries, digest } = loadMembersFile(config.membersFile, options.membersSystem);
+    if (digest !== members.digest) members.replace(entries, digest);
+  }
   // Before the plugin starts, so a directory the relay cannot use sets nothing going.
   const fileAudit = openAudit(config, options, log);
   // Then, before anything else exists: a plugin that cannot work (an identity
@@ -675,6 +708,49 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     lines: mcpLines,
     createHandler: strictHandler,
   });
+  /**
+   * Ends what a member list change took away (ADR 0043), the new list being
+   * in force for the next request already. Whatever is held under a user id
+   * the change ended ends now, every way in (S8): attachments, requests and
+   * invites in the hub, /pair sign-ins, listen streams, and the 2025-era
+   * sessions held now, each serving nothing more and closing once its
+   * answers are out. Every step runs even if one before it throws; a fault
+   * then leaves the change owed, settled again with the next apply
+   * (settlingMembers). The line names user ids and counts, never a sub or a
+   * name.
+   */
+  const settleMembers = (change: MemberChange): void => {
+    const faults: unknown[] = [];
+    const step = <T>(run: () => T, otherwise: T): T => {
+      try {
+        return run();
+      } catch (error) {
+        faults.push(error);
+        return otherwise;
+      }
+    };
+    const { attachments } = step(() => hub.membershipChanged(change), { attachments: 0 });
+    const signIns = step(() => pair?.membersChanged(change) ?? 0, 0);
+    log.info('members reloaded', {
+      members: change.total,
+      added: change.added,
+      removed: change.removed,
+      renamed: change.renamed.size,
+      attachments,
+      signIns,
+    });
+    // Only those held now: the change may give an id to someone new, whose
+    // session or stream opened a moment later is theirs. A call or a
+    // pair_page the hub just ended answers not_attached or pairing_expired on
+    // the session it came in on, which closes once that answer is written.
+    const mcpSessions = step(() => sessions.endUsers(change.ended, MEMBER_SESSIONS_CLOSE_MS), 0);
+    const streams = step(() => listens.endUsers(change.ended), 0);
+    if (mcpSessions + streams > 0) {
+      log.info('sessions closed for a member list change', { mcpSessions, streams });
+    }
+    if (faults.length > 0) throw faults[0];
+  };
+  const applyMembers = members === null ? null : settlingMembers(members, settleMembers);
   // The marker concerns every member, who all list it (spike.ts).
   spike?.setNotifier(() => {
     listens.notifyAll();
@@ -1176,6 +1252,18 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     );
   }
 
+  // Polled from here on; a relay that never listened has nothing to stop.
+  const membersWatch: MembersWatch | null =
+    config.membersFile === null || members === null || applyMembers === null
+      ? null
+      : watchMembersFile({
+          path: config.membersFile,
+          system: options.membersSystem,
+          intervalMs: config.timings.membersPollMs,
+          applied: members.digest,
+          apply: applyMembers,
+          log,
+        });
   let closing: Promise<void> | null = null;
   return {
     url,
@@ -1188,8 +1276,17 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       events: () => store.audit.records(),
     },
     spike,
+    reloadMembers() {
+      // A throw from the read or the hub rejects, as from an async function.
+      return new Promise<MembersReload>((resolveReload) => {
+        resolveReload(
+          closing !== null || membersWatch === null ? 'unchanged' : membersWatch.reloadNow(),
+        );
+      });
+    },
     close() {
       closing ??= (async () => {
+        membersWatch?.stop();
         pair?.close();
         await hub.shutdown();
         // After the hub, whose shutdown audits the calls it fails (ADR 0019).

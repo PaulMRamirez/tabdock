@@ -142,6 +142,26 @@ export class ListenStreams {
     this.#handlers.get(userId)?.handler.notify.toolsChanged();
   }
 
+  /**
+   * Ends, at once, the streams held now under user ids a member list change
+   * ended (ADR 0043, S8), and those still being answered: each user's handler
+   * closes with their last, and a listen being answered answers nothing.
+   * Nothing gives way any more to a listen of theirs. A stream carries only
+   * notifications, never a call's answer, so nothing is cut short; and only
+   * those held now end, since the change can give an id to someone new.
+   */
+  endUsers(userIds: ReadonlySet<string>): number {
+    const own = [...this.#held].filter((held) => userIds.has(held.userId));
+    for (const held of this.#held) {
+      if (held.givingWayTo !== null && own.includes(held.givingWayTo)) held.givingWayTo = null;
+    }
+    for (const held of own) {
+      held.close?.();
+      this.#forget(held);
+    }
+    return own.length;
+  }
+
   /** Tells every stream; the spike's marker concerns every member. */
   notifyAll(): void {
     for (const { handler } of this.#handlers.values()) handler.notify.toolsChanged();
@@ -183,8 +203,10 @@ export class ListenStreams {
       this.#release(held, givingWay);
       throw error;
     }
-    // A refusal, a listen sent as a notification, or a client already gone: nobody gives way.
-    if (!isStream(response) || signal.aborted) {
+    // A refusal, a listen sent as a notification, a client already gone, or a
+    // user whose id a member list change ended while it was answered
+    // (endUsers): nobody gives way.
+    if (!isStream(response) || signal.aborted || !this.#held.has(held)) {
       this.#release(held, givingWay);
       if (isStream(response)) await response.body?.cancel().catch(() => undefined);
       return response;

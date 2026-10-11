@@ -92,11 +92,26 @@ jobs:
           TABDOCK_ALLOWED_ORIGINS: ${{ secrets.TABDOCK_ALLOWED_ORIGINS }}
           TABDOCK_OAUTH_ISSUER: ${{ secrets.TABDOCK_OAUTH_ISSUER }}
           TABDOCK_OAUTH_USERS: ${{ secrets.TABDOCK_OAUTH_USERS }}
+          # The members can live in a file on the volume instead, read again
+          # whenever it changes (ADR 0043): a path, so a variable, not a secret.
+          TABDOCK_MEMBERS_FILE: ${{ vars.TABDOCK_MEMBERS_FILE }}
           TABDOCK_PAIR_CLIENT_ID: ${{ secrets.TABDOCK_PAIR_CLIENT_ID }}
           TABDOCK_PAIR_CLIENT_SECRET: ${{ secrets.TABDOCK_PAIR_CLIENT_SECRET }}
         run: |
           set -euo pipefail
-          names=(TABDOCK_PUBLIC_URL TABDOCK_ALLOWED_ORIGINS TABDOCK_OAUTH_ISSUER TABDOCK_OAUTH_USERS TABDOCK_PAIR_CLIENT_ID TABDOCK_PAIR_CLIENT_SECRET)
+          names=(TABDOCK_PUBLIC_URL TABDOCK_ALLOWED_ORIGINS TABDOCK_OAUTH_ISSUER TABDOCK_PAIR_CLIENT_ID TABDOCK_PAIR_CLIENT_SECRET)
+          # Exactly one place lists the members; the relay refuses to start with both.
+          if [[ -n "$TABDOCK_MEMBERS_FILE" ]]; then
+            if [[ -n "$TABDOCK_OAUTH_USERS" ]]; then
+              echo "::error::the production environment sets both the secret TABDOCK_OAUTH_USERS and the variable TABDOCK_MEMBERS_FILE; keep one"
+              exit 1
+            fi
+            names+=(TABDOCK_MEMBERS_FILE)
+            unused=TABDOCK_OAUTH_USERS
+          else
+            names+=(TABDOCK_OAUTH_USERS)
+            unused=TABDOCK_MEMBERS_FILE
+          fi
           # Checked before anything is staged, so a missing secret stages nothing.
           for name in FLY_API_TOKEN FLY_APP "${names[@]}"; do
             if [[ -z "${!name}" ]]; then
@@ -111,6 +126,10 @@ jobs:
           # printf is a shell builtin: no value reaches a process's arguments.
           for name in "${names[@]}"; do printf '%s=%s\n' "$name" "${!name}"; done |
             flyctl secrets import --stage --app "$FLY_APP"
+          # Fly keeps a secret until it is unset, so the one not in use goes:
+          # a move between the secret and the file, either way, never leaves
+          # both set. Unsetting one that is not set is no error (docs/notes/verified.md).
+          flyctl secrets unset --stage --app "$FLY_APP" "$unused"
       - name: Deploy the image
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
