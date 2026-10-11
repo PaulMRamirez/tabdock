@@ -24,7 +24,8 @@
     "demo:m3": "node src/demo-m3.ts",
     "demo:m4": "node src/demo-m4.ts",
     "demo:m5": "node src/demo-m5.ts",
-    "check:claude-code:agent": "node src/claude-code-check-agent.ts"
+    "check:claude-code:agent": "node src/claude-code-check-agent.ts",
+    "measure:room": "node src/measure-room.ts"
   },
   "devDependencies": {
     "@mcp-b/webmcp-local-relay": "5.1.0",

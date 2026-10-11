@@ -37,6 +37,7 @@ pnpm release:check # check those tarballs file by file (add --tag v0.1.0 to matc
 pnpm pack:install  # install those tarballs in a scratch directory and run tabdock-relay as A5.5 asks
 pnpm spike:latency # the M3 spike's call timings against a running relay
 pnpm spike:soak    # the M3 spike's long run with a busy page
+pnpm measure:room  # ADR 0044's room measurement: 40 and 80 watchers on a relay in a 512 MiB group, by hand
 ```
 
 `pnpm conformance` is what CI runs after the tests: it starts a relay of its own behind a loopback proxy that adds a token drawn for the run, and holds each requirement set to its checked-in baseline in `tests/e2e/conformance`. The three release commands are what CI's `pack-install` job and `publish.yml` run; `docs/release.md` says how a release is made. `pnpm --filter @tabdock/e2e <script>` runs the end-to-end package's own scripts: `baseline` re-measures the M0 baseline, and the `check:claude-code` scripts drive a real Claude Code against a relay in the sandbox. One Playwright spec runs alone with `pnpm --filter @tabdock/e2e exec playwright test specs/<name>.spec.ts`; specs take free ports, so several can run at once.
