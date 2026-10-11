@@ -2733,7 +2733,7 @@ export class PageHub {
     this.#failPageCalls(pageId, conn, outcome);
     this.#live.delete(pageId);
     if (this.#closed) return;
-    this.#sleep(pageId, conn.address);
+    this.#sleep(pageId, conn.address, detached);
     // A deliberate detach will not come back, so skip the resume window.
     if (detached) {
       this.connectionLine(conn.address, 'info', 'page detached', { pageId });
@@ -2741,7 +2741,8 @@ export class PageHub {
     }
   }
 
-  #sleep(pageId: string, address: string): void {
+  /** `detaching`: the page detached on purpose, and #gone follows at once. */
+  #sleep(pageId: string, address: string, detaching: boolean): void {
     const page = this.#store.pages.get(pageId);
     if (!page) return;
     page.state = 'asleep';
@@ -2759,8 +2760,10 @@ export class PageHub {
     // The welcome on resume carries the roster as it is by then.
     this.#clearTimer(this.#rosterTimers, pageId);
     this.#dropRequests(pageId);
-    // Nothing reaches a sleeping page, so what waits on it ends too (page-parts.ts).
-    this.#parts.sleep(pageId);
+    // Nothing reaches a sleeping page, so what waits on it ends too
+    // (page-parts.ts). A detach is told to the parts only as their page's
+    // end, so a waiter hears page_gone, never that the page may come back.
+    if (!detaching) this.#parts.sleep(pageId);
     this.#setTimer(this.#lifecycleTimers, pageId, this.#config.timings.resumeWindowMs, () => {
       this.#gone(pageId);
     });

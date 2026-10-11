@@ -10,7 +10,12 @@
 // slot and its charge.
 
 import type { Client, FetchLike } from '@modelcontextprotocol/client';
-import { MAX_WAIT_MS, MAX_WAITS_PER_USER, MEMBER_RESERVED_SEATS } from '@tabdock/protocol';
+import {
+  CLOSE_DETACH,
+  MAX_WAIT_MS,
+  MAX_WAITS_PER_USER,
+  MEMBER_RESERVED_SEATS,
+} from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
 import { MIN_REQUEST_BYTES } from '../src/config.ts';
 import {
@@ -488,6 +493,21 @@ describe('what ends a waiting wait at once (S8, S14)', () => {
     // A reload that replaces the live socket.
     await page({ resumeToken: back.welcome?.resumeToken ?? '' });
     expect((await reloaded).text).toMatch(/^page_asleep: the page reloaded while you waited/);
+    expect(Date.now() - startedAt).toBeLessThan(1500);
+  });
+
+  it('ends it with page_gone when the page detaches, as it does the calls in flight', async () => {
+    const relay = await setup();
+    const opened = await page();
+    const alice = await client();
+    await pairAndApprove(alice, opened);
+    await publish(opened, { stop: 1 });
+    const pending = waitState(alice, opened.pageId, 1, 2500);
+    await started(relay, 1);
+    const startedAt = Date.now();
+    // A deliberate detach will not come back, so nothing may tell the waiter it might.
+    opened.ws.close(CLOSE_DETACH, 'detach');
+    expect((await pending).text).toMatch(/^page_gone: /);
     expect(Date.now() - startedAt).toBeLessThan(1500);
   });
 

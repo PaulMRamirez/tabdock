@@ -13,7 +13,7 @@ export interface PagePart {
   sleep(pageId: string): void;
   /** A resume replaced a live socket: the reloaded page knows nothing it held before. */
   resumed(pageId: string): void;
-  /** The page is gone for good: forget it. */
+  /** The page is gone for good: forget it. A page that detached on purpose goes with no sleep first. */
   gone(pageId: string): void;
   /** These users' attachments to the page ended; whatever they hold there answers `outcome` now (S8). */
   attachmentsEnded(pageId: string, users: ReadonlySet<string>, outcome: HubError): void;
