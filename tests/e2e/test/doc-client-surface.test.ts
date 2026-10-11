@@ -7,7 +7,14 @@
 // of the relay's tools/list holds them; and the untrusted label the guide
 // quotes is the one the relay writes.
 
-import { ERROR_CODES, PAGE_ERROR_CODES, untrustedHeader } from '@tabdock/protocol';
+import {
+  AGENT_PATH,
+  AttachAgentSchema,
+  AttachInviteSchema,
+  ERROR_CODES,
+  PAGE_ERROR_CODES,
+  untrustedHeader,
+} from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
 import { markdownIn, readRepo, type Table, tables, withoutCodeBlocks } from '../src/doc-files.ts';
 
@@ -114,5 +121,45 @@ describe('the untrusted label', () => {
       return shown === null || label !== untrustedHeader(shown[1] ?? '', shown[2] ?? '');
     });
     expect(wrong).toEqual([]);
+  });
+});
+
+// Where a credential travels and what guards the routes that take one, as
+// SPEC says it (ADR 0044's notes): the attach_request row names every field
+// of an invite's and an agent's part of the frame, the secret each carries to
+// the page included, S11 says the relay passes an agent token on to its page
+// once, and S12 holds /g/mcp to the Host and Origin checks /mcp has.
+describe('credentials on the page link and the MCP routes', () => {
+  const spec = readRepo('SPEC.md');
+
+  it("SPEC's attach_request row names every field the invite and agent parts carry", () => {
+    const row = tables(spec)
+      .flatMap((table) => table.rows)
+      .find((candidate) => candidate.values[1] === '`attach_request`');
+    if (row === undefined) throw new Error('SPEC.md has no attach_request row');
+    const payload = row.values[2] ?? '';
+    for (const [part, schema] of [
+      ['invite', AttachInviteSchema],
+      ['agent', AttachAgentSchema],
+    ] as const) {
+      const fields = Object.keys(schema.shape)
+        .map((key) => `\`${key}\``)
+        .join(', ');
+      expect(payload, part).toContain(`\`${part}?\` (${fields})`);
+    }
+  });
+
+  it('S11 says the relay passes an agent token to its page once, and S12 guards /g/mcp as /mcp', () => {
+    const rule = (name: string): string => {
+      const line = spec.split('\n').find((text) => text.includes(` ${name}. `));
+      if (line === undefined) throw new Error(`SPEC.md has no ${name}`);
+      return line;
+    };
+    expect(rule('S11')).toContain(
+      "sent only in an `Authorization` header, and once by the relay to the page that minted it, inside the first request's `attach_request`",
+    );
+    const s12 = rule('S12');
+    expect(s12).toContain(`\`/mcp\`, \`${AGENT_PATH}\`, \`/pair\``);
+    expect(s12).toContain(`\`/mcp\` and \`${AGENT_PATH}\` answer 403`);
   });
 });
