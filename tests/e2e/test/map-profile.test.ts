@@ -281,11 +281,29 @@ describe('the map page policy on every runtime (S6, ADR 0034)', () => {
         policy: { consequentialTools: [] },
       });
       expect(empty.sim.state.notice).not.toBeNull();
-      const pending = call(empty.alice, empty.pageId, 'set_view');
-      const state = await empty.sim.waitFor((s) => s.pendingConfirms.length > 0);
-      expect(state.pendingConfirms[0]?.tool).toBe('set_view');
-      expect(empty.sim.dock.confirm(state.pendingConfirms[0]?.callId ?? '', false)).toBe(true);
-      expect(errorCode(await pending)).toBe('denied_by_operator');
+      // Every write, the profile's five and both editing tools, so a fallback narrowed to some writes fails here.
+      const everyWrite = [...PROFILE_WRITES, 'edit_stop', 'reset_edits'];
+      for (const name of everyWrite) {
+        const pending = call(empty.alice, empty.pageId, name);
+        // Whichever comes first: a write that runs unprompted answers before any prompt shows.
+        const first = await Promise.race([
+          pending.then(() => 'answered' as const),
+          empty.sim
+            .waitFor((s) => s.pendingConfirms.some((asked) => asked.tool === name))
+            .then(
+              () => 'prompted' as const,
+              () => 'answered' as const,
+            ),
+        ]);
+        expect(first, `${name} prompts before it runs`).toBe('prompted');
+        const prompt = empty.sim.state.pendingConfirms.find((asked) => asked.tool === name);
+        expect(empty.sim.dock.confirm(prompt?.callId ?? '', false), name).toBe(true);
+        const denied = await pending;
+        expect(errorCode(denied), `${name}: ${denied.text}`).toBe('denied_by_operator');
+      }
+      expect(empty.sim.prompts.map((asked) => asked.tool)).toEqual(everyWrite);
+      // No denied write reached the page's handlers.
+      expect(empty.sim.world.calls).toEqual([]);
       await empty.sim.close();
 
       const allow = await world.mapPage({
