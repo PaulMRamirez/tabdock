@@ -12,7 +12,7 @@
 
 import { writeFileSync } from 'node:fs';
 import { cpus, release, totalmem } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { RESPONSE_CEILING_LINE } from '../../../packages/relay/src/response-stalls.ts';
 import { confine, pinHarness, relayCpu } from './measure-room/confine.ts';
@@ -311,7 +311,7 @@ writeFileSync(
     2,
   )}\n`,
 );
-say(`figures written to ${out.startsWith(ROOT) ? out.slice(ROOT.length) : out}`);
+say(`figures written to ${out.startsWith(ROOT) ? relative(ROOT, out) : out}`);
 const failed = failures.length > 0 || rooms.some(({ bars }) => bars.some((bar) => !bar.pass));
 if (failures.length > 0) for (const failure of failures) say(`FAILED ${failure}`);
 // The SDK clients and the provider may leave a keep-alive timer behind; the run is over.
