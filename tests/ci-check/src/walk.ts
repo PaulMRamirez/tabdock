@@ -52,6 +52,14 @@ export interface WalkOptions {
   readonly stateTimeoutMs?: number;
   /** The largest image a capture may be, in bytes: 65,536, the relay's default, unless set. */
   readonly maxImageBytes?: number;
+  /**
+   * Tools the page must list beside the four every walk needs, each one
+   * missing a 'tools' finding. Unnamed, the clock, capture and observation
+   * groups are checked only where the page lists them, so a page that has
+   * them names them here, and a page that stops registering one fails the
+   * check rather than skipping it.
+   */
+  readonly requireTools?: readonly string[];
 }
 
 /** Angles within this many degrees, and metres within this fraction, count as the same (ADR 0041, decision 14). */
@@ -67,6 +75,12 @@ const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 const REQUIRED_TOOLS = ['get_view', 'list_walkthroughs', 'get_stop', 'go_to_stop'] as const;
 /** Each optional group is checked when the page registers it whole (ADR 0038, decision 2). */
 const OBSERVATION_TOOLS = ['list_observations', 'get_observation', 'view_from_observation'];
+/** Every tool of a group the walk checks only where the page lists it, unless requireTools names it. */
+export const OPTIONAL_TOOLS: readonly string[] = [
+  'get_clock',
+  'capture_view',
+  ...OBSERVATION_TOOLS,
+];
 
 /** list_pages after the label: the walk needs only the page's id and the caller's role. */
 const PagesSchema = z.object({
@@ -289,7 +303,8 @@ export async function walkPage(
     findings.push({ walkthrough: null, stop: null, observation: null, ...error.finding });
     return findings;
   }
-  const missing = REQUIRED_TOOLS.filter((name) => !tools.has(name));
+  const required = new Set<string>([...REQUIRED_TOOLS, ...(options.requireTools ?? [])]);
+  const missing = [...required].filter((name) => !tools.has(name));
   for (const name of missing) {
     findings.push({
       walkthrough: null,

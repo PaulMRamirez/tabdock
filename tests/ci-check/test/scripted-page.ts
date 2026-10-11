@@ -32,6 +32,8 @@ export interface Faults {
   captureBytes?: number;
   /** The caller is attached as observer. */
   observer?: boolean;
+  /** list_page_tools leaves these tools out, as a page that stopped registering them would. */
+  unlisted?: readonly string[];
 }
 
 const FLAT = {
@@ -275,7 +277,9 @@ export function scriptedPage(faults: Faults = {}): { call: Caller; calls: string
                 'list_observations',
                 'get_observation',
                 'view_from_observation',
-              ].map((name) => ({ name })),
+              ]
+                .filter((name) => !faults.unlisted?.includes(name))
+                .map((name) => ({ name })),
             },
           )}`,
         );

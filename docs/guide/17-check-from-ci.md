@@ -25,7 +25,7 @@ From a clone, `pnpm ci-check` runs the example in `tests/ci-check` against the c
 npm install --save-dev --save-exact @tabdock/relay@0.1.0 @tabdock/adapter@0.1.0 @playwright/test@1.56.1 @modelcontextprotocol/client@2.3.1 zod@4.6.5
 ```
 
-Copy the `tests/ci-check` directory and change three things: `connectPage()` in `tests/ci-check/src/tabdock.ts`, the command that serves your page (`CI_CHECK_PAGE_COMMAND`) and its address on loopback (`CI_CHECK_PAGE_URL`). The canvas page links when its own script asks, never from its URL, so the fixture calls that script:
+Copy the `tests/ci-check` directory and change four things: `connectPage()` in `tests/ci-check/src/tabdock.ts`, the command that serves your page (`CI_CHECK_PAGE_COMMAND`), its address on loopback (`CI_CHECK_PAGE_URL`), and the optional tools your page has (`REQUIRE_TOOLS` in `specs/walk.spec.ts`). The canvas page links when its own script asks, never from its URL, so the fixture calls that script:
 
 ```ts
 import type { Page } from '@playwright/test';
@@ -78,6 +78,8 @@ On a self-hosted runner, follow the same steps under its own `RUNNER_TEMP`, with
 ## What the walk checks
 
 The walk, `walkPage()` in `tests/ci-check/src/walk.ts`, first checks that `list_pages` shows the page with the role driver. For every stop it calls `go_to_stop`, `get_stop`, `get_view` and `get_clock`: the view must match the stop's, angles within 1e-6 degrees and metres within a relative 1e-6, and a paused clock its time. It reads the state the page publishes with `get_page_state`, waits with `wait_for_page_state` until the state names the stop, and holds its view and clock to what the tools said. `capture_view` must return one PNG within the image cap. For every observation, `view_from_observation` must land on its viewpoint and the state must follow.
+
+The clock, capture and observation checks run only where the page lists those tools. The spec names the ones its page has in `REQUIRE_TOOLS`, which it passes to `walkPage()` as `requireTools`, so a page that stops registering one fails the walk instead of skipping its checks.
 
 Every result is read from after the relay's label, with copies of the profile's schemas in `tests/ci-check/src/profile.ts`, and a result with no label is a finding. Findings hold ids and numbers only, never page text, and one bad stop never hides the rest. The spec prints `ci-check: <n> page calls`, and this repository's runner then verifies the audit chain and requires that many call records, every one ok, from `you` through `tabdock-ci-check`. It fails if its output holds the token or an unmasked pairing code.
 

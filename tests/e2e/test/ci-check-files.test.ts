@@ -27,6 +27,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import * as copied from '@tabdock/ci-check/profile';
+import { OPTIONAL_TOOLS } from '@tabdock/ci-check/walk';
 import * as map from '@tabdock/sim-page/map';
 import { describe, expect, it } from 'vitest';
 import config from '../../ci-check/playwright.config.ts';
@@ -148,6 +149,14 @@ describe('tests/ci-check, as a copier takes it', () => {
     expect(projects).toEqual(['chromium', 'advisory']);
     // The check runs the page on the polyfill it loads, with no flag turning native WebMCP on.
     expect(readRepo('tests/ci-check/playwright.config.ts')).not.toContain('WebMCPTesting');
+  });
+
+  it("walks this repository's page requiring every group the walker would otherwise skip", () => {
+    const spec = readRepo('tests/ci-check/specs/walk.spec.ts');
+    const list = /const REQUIRE_TOOLS = \[([^\]]*)\]/.exec(spec)?.[1] ?? '';
+    const named = [...list.matchAll(/'([a-z_]+)'/g)].map((match) => match[1]);
+    expect([...named].sort()).toEqual([...OPTIONAL_TOOLS].sort());
+    expect(spec).toContain('requireTools: REQUIRE_TOOLS');
   });
 
   it('connects the page through its connect hook in one replaceable function, never its URL (C3)', () => {

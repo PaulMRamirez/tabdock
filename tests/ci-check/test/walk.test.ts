@@ -145,6 +145,29 @@ describe('walkPage', () => {
     expect(await walkPage(at.call, PAGE_ID, { ...OPTIONS, maxImageBytes: 64 })).toEqual([]);
   });
 
+  it('skips a group the page does not list, unless the walk requires it', async () => {
+    const unlisted = ['capture_view', 'list_observations'];
+    const skipped = await walk({ unlisted });
+    expect(skipped.findings).toEqual([]);
+    expect(skipped.calls).not.toContain('call_page_tool capture_view');
+    const { call, calls } = scriptedPage({ unlisted });
+    const required = await walkPage(call, PAGE_ID, {
+      ...OPTIONS,
+      requireTools: ['get_clock', 'capture_view', 'list_observations'],
+    });
+    expect(required).toEqual(
+      unlisted.map((name) => ({
+        walkthrough: null,
+        stop: null,
+        observation: null,
+        check: 'tools',
+        expected: name,
+        got: 'not listed',
+      })),
+    );
+    expect(calls).toEqual(['list_pages', 'list_page_tools']);
+  });
+
   it('finds a capture that carries no image, and a caller that is no driver', async () => {
     const noImage = await walk({ noImage: true });
     expect(noImage.findings.map(({ stop, check, got }) => [stop, check, got])).toEqual([

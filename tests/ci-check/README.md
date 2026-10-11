@@ -6,11 +6,12 @@ In this repository `pnpm ci-check` runs it against the canvas map page in `tests
 
 ## Copying it
 
-Copy this directory and change three things.
+Copy this directory and change four things.
 
 1. `connectPage()` in `src/tabdock.ts`: how your page links to a relay when its own script asks. Never give a page a way to link from its URL.
 2. `CI_CHECK_PAGE_COMMAND` and `CI_CHECK_PAGE_URL`: the command that serves your page, and its address on 127.0.0.1 or localhost.
 3. `CI_CHECK_RELAY_COMMAND`, which is `npx --no-install tabdock-relay` unless set, once `@tabdock/relay` is installed beside it.
+4. `REQUIRE_TOOLS` in `specs/walk.spec.ts`: the clock, capture and observation tools your page registers. The walk checks those groups only where the page lists them, so naming them makes a page that stops registering one fail rather than skip its checks.
 
 `TABDOCK_HOME` must be set to a fresh absolute directory outside every repository, which the relay keeps its owner token and audit log in; on a hosted runner, `$RUNNER_TEMP/tabdock-ci-check`, written to `$GITHUB_ENV` by a step and deleted by a last step that always runs. `TABDOCK_PORT` is 8787 unless set. Set no other relay setting: local mode's defaults are what make the check safe to run with no secret. The files import only `@playwright/test`, `@modelcontextprotocol/client`, `@tabdock/adapter/testing`, `zod` and `node:` modules; `src/profile.ts` copies the profile's result schemas, which this repository holds equal to the originals.
 
