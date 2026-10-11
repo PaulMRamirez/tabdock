@@ -3,13 +3,20 @@
 // parses with its schema, never structured content (S10); walking every
 // stop and observation lands where each says; arguments outside the
 // profile's bounds are refused before the page sees them; MAP_PAGE_POLICY
-// prompts for reset_edits alone on every runtime while an empty list still
-// fails safe (S6, ADR 0034); an observer reads everything and writes
+// prompts for reset_edits alone on every runtime, MCP-B 6 included, while an
+// empty list still fails safe (S6, ADR 0034), and a write the page refuses
+// ends as a labelled tool_error on each; an observer reads everything and writes
 // nothing (S5); and each first-class entry carries its description whole.
 
 import type { Client } from '@modelcontextprotocol/client';
 import { MAX_FIRST_CLASS_DESCRIPTION_CHARS, untrustedHeader } from '@tabdock/protocol';
-import { DEFAULT_SIM_ORIGIN, type MapSimPage, RUNTIME_PROFILES } from '@tabdock/sim-page';
+import {
+  ALL_RUNTIME_PROFILES,
+  DEFAULT_SIM_ORIGIN,
+  HANDLER_FAILED_TEXT,
+  MCPB6_FAILED_TEXT,
+  type MapSimPage,
+} from '@tabdock/sim-page';
 import {
   CaptureTextSchema,
   GLOBE,
@@ -243,8 +250,10 @@ describe('a member driver on a map page', () => {
 describe('the map page policy on every runtime (S6, ADR 0034)', () => {
   const writes = [...PROFILE_WRITES, 'edit_stop'];
 
+  // MCP-B 6 included: npm's latest since 8 October, which a copier of the
+  // map page or of guide page 16 installs (ADR 0047).
   it.each(
-    RUNTIME_PROFILES.flatMap((profile) =>
+    ALL_RUNTIME_PROFILES.flatMap((profile) =>
       ERAS.map(([label, modern]) => [profile, label, modern] as const),
     ),
   )(
@@ -256,6 +265,17 @@ describe('the map page policy on every runtime (S6, ADR 0034)', () => {
         const outcome = await call(alice, pageId, name);
         expect(outcome.isError, `${name}: ${outcome.text}`).toBe(false);
       }
+      // A write the page's handler refuses, which the relay's advisory check
+      // lets through, ends as a tool_error behind the label on every runtime;
+      // only the polyfill 5.1 passes the handler's words on (guide page 16).
+      const refused = await call(alice, pageId, 'set_clock', { time: '2026-01-01T06:00:00' });
+      expect(refused.isError, refused.text).toBe(true);
+      const [label, ...words] = refused.text.split('\n');
+      expect(label).toBe(untrustedHeader(DEFAULT_SIM_ORIGIN, 'set_clock'));
+      expect(words.join('\n')).toContain(
+        profile === 'mcpb-6' ? MCPB6_FAILED_TEXT : HANDLER_FAILED_TEXT,
+      );
+      expect(refused.text.includes('refused its arguments')).toBe(profile === 'polyfill-5.1');
       expect(sim.prompts).toEqual([]);
       expect(sim.state.notice).toBeNull();
 

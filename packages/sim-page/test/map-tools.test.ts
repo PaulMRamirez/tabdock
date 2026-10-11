@@ -49,7 +49,13 @@ import {
   toInputSchema,
   widthFromAltitude,
 } from '../src/map/index.ts';
-import { FakeModelContext, RUNTIME_PROFILES, type RuntimeProfile } from '../src/index.ts';
+import {
+  ALL_RUNTIME_PROFILES,
+  FakeModelContext,
+  HANDLER_FAILED_TEXT,
+  MCPB6_FAILED_TEXT,
+  type RuntimeProfile,
+} from '../src/index.ts';
 
 const STOPS = { maria: 3, flyby: 4 };
 const OBSERVATIONS = ['obs-1', 'obs-2', 'obs-3', 'obs-4'];
@@ -91,6 +97,7 @@ function call(tools: MapToolDefinition[], name: string, args: unknown): Promise<
 }
 
 /** The input form each runtime takes: a JSON string on the polyfill 5.1 and Chrome 154, an object elsewhere. */
+/** A JSON string where the runtime takes one, and an object on Chrome 156 and MCP-B 6. */
 function inputFor(profile: RuntimeProfile, args: Record<string, unknown>): unknown {
   return profile === 'polyfill-5.1' || profile === 'chrome-154' ? JSON.stringify(args) : args;
 }
@@ -212,7 +219,8 @@ describe('the tools a map page registers', () => {
   });
 });
 
-describe.each(RUNTIME_PROFILES)('(c) every tool through executeTool on %s', (profile) => {
+// MCP-B 6 included: npm's latest since 8 October, which a copier of the map page installs (ADR 0047).
+describe.each(ALL_RUNTIME_PROFILES)('(c) every tool through executeTool on %s', (profile) => {
   it('returns the string a runtime returns, which parses with its result schema', async () => {
     const world = createMapWorld();
     const context = new FakeModelContext({ profile });
@@ -227,6 +235,30 @@ describe.each(RUNTIME_PROFILES)('(c) every tool through executeTool on %s', (pro
       const parsed = schema.safeParse(JSON.parse(text));
       expect(parsed.error?.issues ?? [], name).toEqual([]);
     }
+  });
+
+  it("rejects a write its handler refuses, in the runtime's own words", async () => {
+    const world = createMapWorld();
+    const context = new FakeModelContext({ profile });
+    for (const tool of toolsOf(world)) await context.registerTool(tool);
+    const entry = (await context.getTools()).find((tool) => tool.name === 'set_clock');
+    if (!entry) throw new Error(`set_clock is not listed on ${profile}`);
+    const before = JSON.stringify(world.state());
+    // A time without Z, which the relay's advisory check lets through to the page.
+    const refused = context.executeTool(entry, inputFor(profile, { time: '2026-01-01T06:00:00' }));
+    // Only the polyfill 5.1 passes the handler's words on; native WebMCP
+    // drops them, and MCP-B 6 says the same opaque words for every failure.
+    const words =
+      profile === 'polyfill-5.1'
+        ? `${HANDLER_FAILED_TEXT}: set_clock refused its arguments`
+        : profile === 'mcpb-6'
+          ? MCPB6_FAILED_TEXT
+          : HANDLER_FAILED_TEXT;
+    await expect(refused).rejects.toThrow(words);
+    if (profile !== 'polyfill-5.1') {
+      await expect(refused).rejects.not.toThrow('refused its arguments');
+    }
+    expect(JSON.stringify(world.state())).toBe(before);
   });
 });
 

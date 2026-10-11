@@ -31,6 +31,8 @@ A view's bounds are `west`, `south`, `east` and `north`, with west greater than 
 
 Every result is JSON text behind the relay's label, never structured content. A handler refuses by throwing, so the call ends as `tool_error`, and the schemas carry every fixed bound, so the relay names most mistakes itself as `invalid_arguments` before the page sees them. Rules that depend on state, such as an index past `stopCount` or a time outside the clock's start and end, are in the descriptions and readable from `list_walkthroughs` and `get_clock`. Each write resolves with the state it produced, and `get_view` reports the target view at once, even while the page still animates toward it. `go_to_stop` takes an index only, so a call repeated, or two accepted proposals, land on the same stop.
 
+Only MCP-B 5.1 passes a handler's words on, after its own sentence. Native WebMCP keeps only that sentence, and MCP-B 6 answers `Tool execution failed` to every refusal (page 03), so there a client learns why from the descriptions and from the relay's `invalid_arguments`, which names a broken bound before the page sees the call.
+
 ## Shapes
 
 ```ts
