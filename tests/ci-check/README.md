@@ -18,4 +18,4 @@ The walk paces itself under the relay's default rates, at most 100 page calls an
 
 ## The advisory walk
 
-`pnpm ci-check --advisory` runs `specs/advisory.spec.ts` instead: headless Claude Code, given the four Tabdock tools a walk needs and nothing else, looks at each stop's picture and gives a verdict. It gates nothing, skips when `claude` is not on the PATH, and never runs in this repository's CI.
+`pnpm ci-check --advisory` runs `specs/advisory.spec.ts` instead: headless Claude Code, given the four Tabdock tools a walk needs and nothing else, looks at each stop's picture and gives a verdict. `src/advisory.ts` holds it there: no built-in tool (`--tools ""`), no other server, none of your settings files (`--setting-sources project`) and no prompt, and the run stops the moment Claude Code's init event lists any other tool. It gates nothing, skips when `claude` is not on the PATH, and never runs in this repository's CI.

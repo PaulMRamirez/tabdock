@@ -91,7 +91,9 @@ A page can attach with `ui: false` and answer prompts through its own handle (pa
 
 ## The advisory walk
 
-`pnpm ci-check --advisory` runs headless Claude Code against the same setup: it looks at each stop's picture and gives a verdict, and gates nothing. It never runs in this repository's CI. In a repository of your own, give it a job of its own with `continue-on-error`, `ANTHROPIC_API_KEY` set on its one step, and a condition that keeps it off pull requests from forks; never use `pull_request_target`. Claude Code gets the four Tabdock tools a walk needs and nothing else: `--strict-mcp-config`, `--allowedTools`, `--permission-mode dontAsk` and `--max-turns`, with its token from local mode's `claude-headers`.
+`pnpm ci-check --advisory` runs headless Claude Code against the same setup: it looks at each stop's picture and gives a verdict, and gates nothing. It never runs in this repository's CI. In a repository of your own, give it a job of its own with `continue-on-error`, `ANTHROPIC_API_KEY` set on its one step, and a condition that keeps it off pull requests from forks; never use `pull_request_target`.
+
+The model reads untrusted page text and images, so Claude Code gets the four Tabdock tools a walk needs and nothing else. `--tools ""` removes every built-in tool, so it has no shell and no files; `--strict-mcp-config` drops every other server; `--setting-sources project`, from an empty scratch directory, leaves out your own settings files with their allow rules, hooks and plugins, while your sign-in still works; and `--permission-mode dontAsk` denies whatever `--allowedTools` does not name. `--max-turns` bounds the run. The spec stops the run at once if Claude Code's init event lists any other tool, and ends it when the test ends. Its token comes from local mode's `claude-headers`.
 
 ## Windows
 
