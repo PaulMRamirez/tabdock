@@ -3247,6 +3247,10 @@ export class PageHub {
     // The role first, as the driver limit leaves it, since the role says
     // which seats it takes: an invitee kept an observer watches (ADR 0044).
     const role = this.#cappedRole(pageId, userId, lesserRole(invite.role, decided));
+    // #cappedRole first ends a time-boxed session past its end (ADR 0043),
+    // which closes its invites and ends what waits on them: then this
+    // request has had its answer, and nothing is granted under it.
+    if (this.#store.requests.get(request.requestId) === undefined) return;
     const watching = this.#seatOf(request.account.kind, role) === 'watching';
     const full = watching
       ? this.#watchingFull(pageId, 0)
