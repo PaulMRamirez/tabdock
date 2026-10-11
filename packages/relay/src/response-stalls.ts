@@ -463,10 +463,12 @@ export class ResponseStalls {
         if (!this.#watched.has(response)) continue;
         const held = this.#held(response, watched);
         if (held <= 0 || this.#rankOf(watched.userId) !== rank) continue;
-        const queuedBehind = response.socket === null;
         this.#cut(response, RESPONSE_CEILING_LINE);
-        // A queued one takes its connection, and all queued there, with it.
-        total = queuedBehind ? this.#heldInAll() : total - held;
+        // Counted again, not less this one: cutting a response ends its
+        // connection, the socket it holds or the one it is queued on, and
+        // with it every response queued there, each of which now holds
+        // nothing (#held) though its 'close' comes a tick later.
+        total = this.#heldInAll();
       }
     }
     if (total > this.#ceilingBytes) this.#lines.write('warn', RESPONSE_CEILING_MEMBERS_LINE);

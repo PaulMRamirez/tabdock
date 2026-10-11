@@ -71,6 +71,8 @@ class StandIn extends EventEmitter {
   destroyed = false;
   /** False for a response still waiting behind another on its connection. */
   connected = true;
+  /** The connection trackOn watched it on. */
+  connection: Connection | null = null;
 
   get writableLength(): number {
     return this.queued;
@@ -94,12 +96,15 @@ class StandIn extends EventEmitter {
   }
 
   /**
-   * As node's: a response with its socket closes with it, while one still
-   * queued behind another on its connection only marks itself destroyed.
+   * As node's: a response with its socket destroys that socket, and so its
+   * connection, and closes with it, while one still queued behind another on
+   * its connection only marks itself destroyed.
    */
   destroy(): void {
     this.destroyed = true;
-    if (this.connected) this.emit('close');
+    if (!this.connected) return;
+    this.emit('close');
+    this.connection?.destroy();
   }
 }
 
@@ -135,6 +140,7 @@ function trackOn(
   userId: string,
   on: Connection = new Connection(),
 ): Connection {
+  response.connection = on;
   stalls.track(response, userId, on);
   return on;
 }
@@ -664,6 +670,30 @@ describe('the relay-wide ceiling on what responses hold (S9, ADR 0044)', () => {
     expect(queued.every(({ response }) => response.destroyed)).toBe(true);
     expect(elsewhere.response.destroyed).toBe(false);
     close();
+  });
+
+  it('counts all queued behind a response it cuts as let go, since cutting that one ends their connection too', async () => {
+    const { stalls, lines, close } = watchCeiling(10 * MB);
+    // Node destroys a response's socket with it; the socket's 'close' comes a tick later.
+    const connection = new Connection(true);
+    const head = holding(stalls, 'guest-a', 1 * MB, connection);
+    const behind = holding(stalls, 'guest-a', 4 * MB, connection);
+    behind.response.connected = false;
+    const elsewhere = holding(stalls, 'guest-b', 3 * MB);
+    const member = holding(stalls, 'alice', 3.5 * MB);
+    stalls.answering('alice');
+    // 11.5 MB: the oldest guest's goes and takes its connection, so the 4 MB
+    // queued behind it goes too and 6.5 MB is left; the newer guest stays.
+    expect([head.response.destroyed, connection.destroyed]).toEqual([true, true]);
+    expect([elsewhere.response.destroyed, member.response.destroyed]).toEqual([false, false]);
+    await new Promise((resolve) => {
+      process.nextTick(resolve);
+    });
+    expect(behind.response.destroyed).toBe(true);
+    expect(elsewhere.response.destroyed).toBe(false);
+    close();
+    expect(named(lines, RESPONSE_CEILING_LINE)).toEqual(['guest-a']);
+    expect(lines.filter((line) => line.msg === `${RESPONSE_CEILING_LINE}, repeated`)).toEqual([]);
   });
 
   it('cuts nothing when given no ceiling', () => {
