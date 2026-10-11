@@ -117,7 +117,8 @@ function barsOf(room: RoomResult): Bar[] {
   const guest503 =
     room.join.sessionRefusals +
     room.phases.reduce((sum, phase) => sum + (phase.statuses['http 503'] ?? 0), 0);
-  const teacherFailed = room.phases.reduce((sum, phase) => {
+  // At the baseline quota the relay is meant to fall behind, so only burst phases hold the teacher to an answer.
+  const teacherFailed = burst.reduce((sum, phase) => {
     const outcomes = phase.calls['teacher set_view']?.outcomes ?? {};
     return (
       sum +
@@ -161,7 +162,7 @@ function barsOf(room: RoomResult): Bar[] {
     },
     { name: 'no guest 503', value: String(guest503), pass: guest503 === 0 },
     {
-      name: 'no member cut and every teacher call answered',
+      name: 'no member cut, and every teacher call answered at the burst quota',
       value: `${String(memberCuts)} cut, ${String(teacherFailed)} failed`,
       pass: memberCuts === 0 && teacherFailed === 0,
     },
@@ -260,7 +261,7 @@ if (!skip.has('nat')) {
 if (!skip.has('frames')) {
   say("frames on the canvas map page under watchers' calls");
   try {
-    frames = await measureFrames(quick ? 5 : 20, say);
+    frames = await measureFrames(quick ? 5 : 40, say);
   } catch (error) {
     failures.push(`frames: ${error instanceof Error ? error.message : String(error)}`);
   }

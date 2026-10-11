@@ -17,10 +17,12 @@
 // every student's agent loop wait_for_page_state at its 60-a-minute budget,
 // at the burst quota and then at Fly's 6.25% baseline. stalled (P3) has a
 // quarter of the class leave a 0.72 MB answer and an image unread until the
-// relay cuts them. ceiling has every student read two 0.72 MB answers a KiB
-// every 5 s, so unread bytes pile up past TABDOCK_MAX_RESPONSE_BYTES where
+// relay cuts them. ceiling has every student read two 0.72 MB answers 16 KiB
+// every 4 s, so unread bytes pile up past TABDOCK_MAX_RESPONSE_BYTES where
 // the class is large enough and the relay must cut guests' answers, never
-// the teacher's. No token, secret, code or invite link is ever printed.
+// the teacher's. Those two phases run with TCP buffers narrowed, so the
+// relay rather than loopback's kernel holds what nobody reads (sockets.ts).
+// No token, secret, code or invite link is ever printed.
 
 import { type ChildProcess, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -56,6 +58,7 @@ import {
   StudentBrowser,
   type PageEdge,
 } from './edge.ts';
+import { narrowSocketBuffers } from './sockets.ts';
 import { CallBook, CallLog, mib, round, sleep, Tally } from './stats.ts';
 
 const ROOT = resolve(import.meta.dirname, '../../../..');
@@ -165,6 +168,8 @@ export interface RoomResult {
   rosterFrameMaxBytes: number;
   join: JoinResult;
   phases: PhaseResult[];
+  /** How the unread phases narrowed TCP buffers, or why they could not (sockets.ts). */
+  socketBuffers: string;
   relayExit: string;
 }
 
@@ -291,7 +296,11 @@ async function startRelay(
           const msg = typeof parsed.msg === 'string' ? parsed.msg : '?';
           // A line about the teacher is told apart, so a member's cut can never hide among guests'.
           const who = parsed.userId === 'teacher' ? ' (teacher)' : '';
-          if (level !== 'debug') sink.add(`${level} ${msg}${who}`);
+          // A window's summary of a repeated line counts as the lines it stands for.
+          const repeated = msg.endsWith(', repeated') ? num(parsed.repeated) : null;
+          const key = repeated === null ? msg : msg.slice(0, -', repeated'.length);
+          if (level !== 'debug') sink.add(`${level} ${key}${who}`, repeated ?? 1);
+          if (level === 'warn' || level === 'error') debug(`relay: ${line.slice(0, 400)}`);
         } catch {
           // A torn line; the next one is whole.
         }
@@ -381,12 +390,13 @@ function errorOf(data: Record<string, unknown>): string {
 function thrownOutcome(error: unknown): string {
   if (error instanceof Error) {
     const code = record(error).code;
-    return `thrown ${error.name}${typeof code === 'number' ? ` ${String(code)}` : ''}`;
+    const named = typeof code === 'number' || typeof code === 'string' ? ` ${String(code)}` : '';
+    return `thrown ${error.name}${named}`;
   }
   return 'thrown';
 }
 
-/** One held answer: a call whose client reads its first KiB, then a KiB every 5 s or nothing more. */
+/** One held answer: a call whose client reads its first KiB, then 16 KiB every 4 s or nothing more. */
 interface Held {
   /** pending or held while open, ended, cut, or the code a refusal began with. */
   outcome: string;
@@ -449,6 +459,7 @@ export async function measureRoom(
   const sink: StatusSink = { current: () => phase.statuses };
   const phases: PhaseResult[] = [];
   let relayExit = 'never started';
+  let socketBuffers = 'not narrowed: no phase left answers unread';
   let result: RoomResult | null = null;
   try {
     const provider: TestProvider = await startProvider();
@@ -1048,7 +1059,15 @@ export async function measureRoom(
     confinement.setQuota(BURST_QUOTA_US);
     await sleep(5000);
 
-    // P3: a quarter of the class leaves a large answer and an image unread.
+    // P3: a quarter of the class leaves a large answer and an image unread,
+    // through an edge that buffers little (sockets.ts).
+    const narrowed = narrowSocketBuffers();
+    socketBuffers = narrowed.note;
+    say(`  ${narrowed.note}`);
+    cleanups.push(() => {
+      narrowed.restore();
+      return Promise.resolve();
+    });
     await beginPhase('stalled', BURST_QUOTA_US);
     load = classLoad({ pageCalls: true });
     const quarter = attached.filter((student) => student.index % 4 === 0);
@@ -1069,7 +1088,7 @@ export async function measureRoom(
     for (const held of phase.held) held.close();
     await endPhase();
 
-    // Unread bytes past the ceiling: every student reads two of the largest answers a KiB every 5 s.
+    // Unread bytes past the ceiling: every student reads two of the largest answers 16 KiB every 4 s.
     await beginPhase('ceiling', BURST_QUOTA_US);
     load = classLoad({ pageCalls: false });
     const fillEnds = performance.now() + plan.phaseMs.ceiling;
@@ -1078,7 +1097,7 @@ export async function measureRoom(
       if (performance.now() > fillEnds) break;
       const sessionId = sessionOf(student.chatB);
       if (sessionId === null) continue;
-      // Just under the page's watching share of 120 calls a minute.
+      // Just under the page's watching share of calls a minute.
       phase.held.push(
         heldCall(relay.url, student, sessionId, pageId, 'read_notes', 'trickle', phase, sink),
       );
@@ -1088,6 +1107,7 @@ export async function measureRoom(
     await load.stop();
     for (const held of phase.held) held.close();
     await endPhase();
+    narrowed.restore();
 
     flags.operating = false;
     flags.teaching = false;
@@ -1104,6 +1124,7 @@ export async function measureRoom(
         rosterFrameMaxBytes,
         join: joinResult,
         phases,
+        socketBuffers,
         relayExit: 'running',
       };
     }
@@ -1183,7 +1204,7 @@ let heldIds = 1000;
 
 /**
  * A tools/call on a student's 2025-11-25 session whose answer the client
- * reads only its first KiB of, then nothing ('stall') or a KiB every 5 s
+ * reads only its first KiB of, then nothing ('stall') or 16 KiB every 4 s
  * ('trickle'), on a connection of its own. Its outcome is held while open,
  * ended if the relay finished it, cut if the relay closed it first, or the
  * refusal's code if the relay refused the call.
@@ -1242,9 +1263,12 @@ function heldCall(
         }
         held.outcome = 'pending';
         if (mode === 'trickle') {
+          // Enough each time to reopen a narrowed window, so the relay sees progress at every
+          // check, and little enough that an answer lasts the phase: about 4 KB a second.
+          // read(n) takes nothing while fewer than n bytes wait, so it asks for what is there.
           timer = setInterval(() => {
-            res.read(1024);
-          }, 5000);
+            res.read(Math.min(16_384, res.readableLength));
+          }, 4000);
         }
       });
       res.on('end', () => {

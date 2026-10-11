@@ -92,6 +92,7 @@ export async function measureFrames(
       { tool: 'capture_view', rate: 1 },
       { tool: 'capture_view', rate: 2 },
       { tool: 'capture_view', rate: 4 },
+      { tool: 'get_view', rate: 1 },
       { tool: 'get_view', rate: 2 },
       { tool: 'get_view', rate: 4 },
       { tool: 'get_view', rate: 20 },
