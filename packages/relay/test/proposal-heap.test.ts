@@ -1,10 +1,11 @@
 // The proposal budget against the heap it stands for (S9, ADR 0042). A
 // proposal outlives the request that made it by up to ten minutes, outside
 // any request's charge, so limits.proposalBytes is what bounds the heap
-// proposals and their kept results hold. For every shape of arguments that
-// holds the most per byte, per value or per key, at ADR 0042's caps, and for
-// a kept result at its cut, each charge is at least the heap the proposal
-// really holds, measured in a process that can collect garbage on demand.
+// proposals and their kept outcomes hold. For every shape of arguments that
+// holds the most per byte, per value or per key, at ADR 0042's caps, for an
+// outcome kept with no result, and for a kept result at its cut, each charge
+// is at least the heap the proposal really holds, measured in a process that
+// can collect garbage on demand.
 
 import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
@@ -17,6 +18,7 @@ const SHAPES = [
   'nodes',
   'keys',
   'tiny',
+  'outcome',
   'resultAscii',
   'resultTwoByte',
 ] as const;

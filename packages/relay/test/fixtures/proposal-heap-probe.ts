@@ -1,7 +1,8 @@
 // node --expose-gc proposal-heap-probe.ts <shape> <count>: keeps that many
 // proposals of one shape in a PageProposals, each with arguments parsed from
 // JSON as the relay's request parsing makes them (or, for the result shapes,
-// an accepted run's text as a result frame's parsing makes it), and prints
+// an accepted run's text as a result frame's parsing makes it, or an outcome
+// kept with no result), and prints
 // as one JSON line the heap each holds beside what it was charged against
 // limits.proposalBytes. proposal-heap.test.ts runs it, since only a process
 // started with --expose-gc can collect garbage on demand and measure what
@@ -34,6 +35,8 @@ const SHAPES: Record<string, (n: number) => string> = {
   },
   /** Next to nothing: what a proposal costs besides its values. */
   tiny: (n) => JSON.stringify({ label: String(n) }),
+  /** Dismissed at once: what a kept outcome with no result costs until it is forgotten. */
+  outcome: (n) => JSON.stringify({ label: String(n) }),
 };
 
 /** Result texts at the cut, kept for a proposer once its run settled. */
@@ -96,6 +99,7 @@ function keep(n: number, argsText: string): void {
     args,
     createdAt: Date.now(),
   });
+  if (shape === 'outcome') proposals.end(record, 'dismissed', null);
   if (makeResult !== undefined) {
     proposals.accept(record);
     proposals.settleRun(record, 'ok', {

@@ -7,13 +7,15 @@
 //
 // A proposal outlives the request that made it, by up to ten minutes, so
 // what it holds is charged here rather than to any request: its arguments
-// while it may still run, then its run's text, cut, for its proposer to read
-// (S9). A new proposal or a new result makes room by dropping the oldest
-// results the relay holds, never a pending proposal's arguments; past that a
-// new proposal is refused, and a result that still does not fit is dropped,
-// its outcome kept. Settled proposals stay readable for
-// PROPOSAL_OUTCOME_KEEP_MS, at most MAX_SETTLED_PROPOSALS_PER_PAGE a page,
-// and every one ends with its page (decision 12).
+// while it may still run, then its kept outcome, with its run's text cut,
+// for its proposer to read (S9). A new result makes room by dropping the
+// oldest results the relay holds; a new proposal by dropping those and then
+// the oldest kept outcomes; never a pending proposal's arguments. Past that
+// a new proposal is refused, dropping nothing, and a result that still does
+// not fit is dropped, its outcome kept. A settled proposal stays readable
+// for PROPOSAL_OUTCOME_KEEP_MS on its own timer, whether or not anyone looks,
+// at most MAX_SETTLED_PROPOSALS_PER_PAGE a page, and every one ends with its
+// page (decision 12).
 
 import { createHash } from 'node:crypto';
 import {
@@ -53,9 +55,16 @@ export function proposalCharge(args: JsonObject): number {
   return PROPOSAL_HEAP_BYTES + tally.nodes * PROPOSAL_NODE_HEAP_BYTES + 2 * tally.chars;
 }
 
-/** What a kept result is charged. */
+/**
+ * What a kept outcome is charged until it is forgotten: its record, which
+ * holds as much heap as a pending proposal's beside its values. Without it
+ * forty outcomes a page stayed uncharged on every page nobody looked at.
+ */
+const OUTCOME_CHARGE = PROPOSAL_HEAP_BYTES;
+
+/** What a kept result adds to its outcome's charge. */
 function resultCharge(text: string): number {
-  return PROPOSAL_HEAP_BYTES + 2 * text.length;
+  return 2 * text.length;
 }
 
 /** How an accepted proposal stands: running, or how its run ended. */
@@ -121,8 +130,12 @@ type Held = { -readonly [K in keyof ProposalRecord]: ProposalRecord[K] };
 
 interface Entry {
   record: Held;
-  /** What it is charged against the budget now. */
+  /**
+   * What it is charged against the budget now: its arguments while it may
+   * still run, then its kept outcome, with its result's text while held.
+   */
   charge: number;
+  /** Its expiry while pending, then the end of its outcome's keeping. */
   timer: NodeJS.Timeout | null;
   waiters: Set<(why: ProposalWaitEnd) => void>;
 }
@@ -137,7 +150,7 @@ export interface ProposalReservation {
 export interface ProposalHooks {
   /** timings.proposalTtlMs: how long a proposal waits for the operator. */
   ttlMs: number;
-  /** limits.proposalBytes: what every proposal and kept result may cost together. */
+  /** limits.proposalBytes: what every proposal and kept outcome may cost together. */
   budgetBytes: number;
   /**
    * A pending proposal ended unaccepted: the hub tells the page `frame` when
@@ -172,15 +185,21 @@ export class PageProposals implements PagePart {
   readonly #byId = new Map<string, Entry>();
   readonly #pages = new Map<string, Set<Entry>>();
   readonly #reserved = new Set<ProposalReservation>();
-  /** Settled entries holding a result, oldest first: what makes room first. */
+  /** Settled entries still kept, oldest first: what makes room for a new proposal after results. */
+  readonly #kept = new Set<Entry>();
+  /** Kept entries holding a result, oldest first: what makes room first. */
   readonly #results = new Set<Entry>();
   #held = 0;
+  /** What #kept is charged together, results included: what dropping every one of them would free. */
+  #keptBytes = 0;
+  /** What kept results add together: what dropping every result would free. */
+  #resultBytes = 0;
 
   constructor(hooks: ProposalHooks) {
     this.#hooks = hooks;
   }
 
-  /** What every proposal and kept result is charged together. */
+  /** What every proposal and kept outcome is charged together. */
   get held(): number {
     return this.#held;
   }
@@ -211,7 +230,7 @@ export class PageProposals implements PagePart {
     for (const held of this.#reserved) if (held.pageId === pageId) count(held.userId);
     if (mine >= MAX_PENDING_PROPOSALS_PER_USER) return 'user';
     if (page >= MAX_PENDING_PROPOSALS_PER_PAGE) return 'page';
-    if (!this.#room(charge)) return 'relay';
+    if (!this.#room(charge, true)) return 'relay';
     const reservation: ProposalReservation = { pageId, userId, charge };
     this.#reserved.add(reservation);
     this.#held += charge;
@@ -312,17 +331,18 @@ export class PageProposals implements PagePart {
     // Forgotten with its page meanwhile: nothing is kept, and nobody waits.
     if (entry?.record.status !== 'accepted' || entry.record.outcome !== 'running') return;
     const held = entry.record;
-    this.#free(entry);
+    this.#keep(entry);
     held.outcome = outcome;
-    held.settledAt = Date.now();
     held.image = result?.image ?? false;
     if (result !== null) {
       const cut = truncate(result.text, MAX_PROPOSAL_RESULT_CHARS);
       const charge = resultCharge(cut.text);
-      if (this.#room(charge)) {
+      if (this.#room(charge, false)) {
         held.result = { text: cut.text, cut: cut.truncated };
-        entry.charge = charge;
+        entry.charge += charge;
         this.#held += charge;
+        this.#keptBytes += charge;
+        this.#resultBytes += charge;
         this.#results.add(entry);
       } else {
         held.dropped = true;
@@ -365,23 +385,68 @@ export class PageProposals implements PagePart {
     return entry?.record === record ? entry : undefined;
   }
 
-  /** Makes room for `charge` by dropping the oldest kept results; false when it still does not fit. */
-  #room(charge: number): boolean {
+  /**
+   * Makes room for `charge` by dropping the oldest kept results, then, for a
+   * new proposal (`outcomes`), the oldest kept outcomes; false, dropping
+   * nothing, when even all of them would not make room.
+   */
+  #room(charge: number, outcomes: boolean): boolean {
+    const budget = this.#hooks.budgetBytes;
+    const fits = (): boolean => this.#held + charge <= budget;
+    if (fits()) return true;
+    const freeable = outcomes ? this.#keptBytes : this.#resultBytes;
+    if (this.#held - freeable + charge > budget) return false;
     for (const entry of this.#results) {
-      if (this.#held + charge <= this.#hooks.budgetBytes) break;
-      this.#free(entry);
-      entry.record.result = null;
-      entry.record.dropped = true;
+      if (fits()) return true;
+      this.#dropResult(entry);
     }
-    return this.#held + charge <= this.#hooks.budgetBytes;
+    if (outcomes) {
+      for (const entry of this.#kept) {
+        if (fits()) return true;
+        this.#forget(entry);
+      }
+    }
+    return fits();
   }
 
-  /** Whatever the entry holds stops being charged: its arguments, or its kept result. */
-  #free(entry: Entry): void {
+  /** A kept result goes to make room; its outcome stays, marked dropped. */
+  #dropResult(entry: Entry): void {
+    if (!this.#results.delete(entry)) return;
+    const charge = resultCharge(entry.record.result?.text ?? '');
+    entry.charge -= charge;
+    this.#held -= charge;
+    this.#keptBytes -= charge;
+    this.#resultBytes -= charge;
+    entry.record.result = null;
+    entry.record.dropped = true;
+  }
+
+  /** What it held while it might still run stops being charged: its arguments. */
+  #dropArgs(entry: Entry): void {
+    if (entry.record.args === null) return;
     this.#held -= entry.charge;
     entry.charge = 0;
     entry.record.args = null;
-    this.#results.delete(entry);
+  }
+
+  /**
+   * It settled: its arguments go, and its outcome is kept, charged, until
+   * its own timer forgets it PROPOSAL_OUTCOME_KEEP_MS from now, so what
+   * nobody reads is freed without anyone looking at its page.
+   */
+  #keep(entry: Entry): void {
+    this.#clearTimer(entry);
+    this.#dropArgs(entry);
+    entry.record.settledAt = Date.now();
+    entry.charge = OUTCOME_CHARGE;
+    this.#held += OUTCOME_CHARGE;
+    this.#keptBytes += OUTCOME_CHARGE;
+    this.#kept.add(entry);
+    entry.timer = setTimeout(() => {
+      entry.timer = null;
+      this.#forget(entry);
+    }, PROPOSAL_OUTCOME_KEEP_MS);
+    entry.timer.unref();
   }
 
   #clearTimer(entry: Entry): void {
@@ -392,10 +457,8 @@ export class PageProposals implements PagePart {
   #end(entry: Entry, reason: ProposalCloseReason, frame: ProposalEndReason | null): boolean {
     const held = entry.record;
     if (held.status !== 'pending') return false;
-    this.#clearTimer(entry);
-    this.#free(entry);
+    this.#keep(entry);
     held.status = reason;
-    held.settledAt = Date.now();
     this.#hooks.ended(held, reason, frame);
     this.#settled(entry);
     return true;
@@ -422,14 +485,20 @@ export class PageProposals implements PagePart {
 
   #forget(entry: Entry): void {
     this.#clearTimer(entry);
-    this.#free(entry);
+    this.#dropArgs(entry);
+    this.#dropResult(entry);
+    if (this.#kept.delete(entry)) {
+      this.#held -= entry.charge;
+      this.#keptBytes -= entry.charge;
+      entry.charge = 0;
+    }
     this.#byId.delete(entry.record.proposalId);
     const page = this.#pages.get(entry.record.pageId);
     page?.delete(entry);
     if (page?.size === 0) this.#pages.delete(entry.record.pageId);
   }
 
-  /** Outcomes past PROPOSAL_OUTCOME_KEEP_MS go when the page is next looked at. */
+  /** Outcomes past PROPOSAL_OUTCOME_KEEP_MS on the caller's clock go now, as their timers would. */
   #prune(pageId: string, now: number): void {
     for (const entry of [...(this.#pages.get(pageId) ?? [])]) {
       const { settledAt } = entry.record;

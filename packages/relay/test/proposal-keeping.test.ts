@@ -1,9 +1,10 @@
 // What the relay keeps of proposals (ADR 0042, S9), tested on PageProposals
 // itself: a narrowed policy cancels what it no longer admits and tells the
-// page why; settled outcomes stay readable ten minutes, forty a page at
-// most; and kept results give way, oldest first, to new proposals and new
-// results, never a pending proposal's arguments, past which a new proposal
-// is refused.
+// page why; settled outcomes stay readable ten minutes, on their own timer,
+// forty a page at most, each charged until forgotten; kept results give
+// way, oldest first, to new proposals and new results, and kept outcomes to
+// new proposals, never a pending proposal's arguments, past which a new
+// proposal is refused.
 
 import {
   type JsonObject,
@@ -11,16 +12,21 @@ import {
   MAX_SETTLED_PROPOSALS_PER_PAGE,
   PROPOSAL_OUTCOME_KEEP_MS,
 } from '@tabdock/protocol';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CallerIdentity } from '../src/hub.ts';
 import {
   PageProposals,
+  PROPOSAL_HEAP_BYTES,
   proposalCharge,
   type ProposalRecord,
   type ProposalReservation,
 } from '../src/proposals.ts';
 import { PAGE_ORIGIN } from './helpers/page-client.ts';
 import { ARGS } from './helpers/proposals.ts';
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 function caller(userId: string): CallerIdentity {
   return {
@@ -78,7 +84,8 @@ describe('PageProposals', () => {
     expect(ended).toEqual([[record.proposalId, 'cancelled', 'policy']]);
     expect(record.status).toBe('cancelled');
     expect(record.args).toBeNull();
-    expect(proposals.held).toBe(0);
+    // Its arguments went; its outcome is kept, and charged, for its proposer.
+    expect(proposals.held).toBe(PROPOSAL_HEAP_BYTES);
     proposals.close();
   });
 
@@ -115,6 +122,52 @@ describe('PageProposals', () => {
     expect(
       proposals.find('pg_1', record.proposalId, settled + PROPOSAL_OUTCOME_KEEP_MS + 1),
     ).toBeUndefined();
+    proposals.close();
+  });
+
+  it('charges a kept outcome until it is forgotten, so the budget bounds outcomes too (S9)', () => {
+    const { proposals, made } = held();
+    const record = made('pg_1', 'bob');
+    expect(proposals.held).toBe(proposalCharge(ARGS));
+    proposals.end(record, 'dismissed', null);
+    expect(proposals.held).toBe(PROPOSAL_HEAP_BYTES);
+    proposals.gone('pg_1');
+    expect(proposals.held).toBe(0);
+    proposals.close();
+  });
+
+  it('forgets an outcome on its own timer 10 minutes after it settled, though nobody looks', () => {
+    vi.useFakeTimers();
+    const { proposals, made } = held();
+    const record = made('pg_1', 'bob');
+    proposals.end(record, 'withdrawn', 'withdrawn');
+    vi.advanceTimersByTime(PROPOSAL_OUTCOME_KEEP_MS - 1);
+    expect(proposals.byId(record.proposalId)).toBe(record);
+    vi.advanceTimersByTime(1);
+    expect(proposals.byId(record.proposalId)).toBeUndefined();
+    expect(proposals.held).toBe(0);
+    proposals.close();
+  });
+
+  it('makes room for a new proposal by forgetting the oldest kept outcomes, and drops none when that would not do', () => {
+    const outcomes = 3 * PROPOSAL_HEAP_BYTES;
+    const medium = { label: 'x'.repeat(1000) };
+    // Three outcomes and one medium proposal do not fit together; two outcomes and one do.
+    const budget = outcomes + proposalCharge(medium) - 1;
+    const { proposals, make, made } = held(budget);
+    const settled = ['a', 'b', 'c'].map((userId) => made('pg_1', userId));
+    for (const record of settled) proposals.end(record, 'dismissed', null);
+    expect(proposals.held).toBe(outcomes);
+    made('pg_2', 'd', medium);
+    expect(settled.map((record) => proposals.byId(record.proposalId))).toEqual([
+      undefined,
+      settled[1],
+      settled[2],
+    ]);
+    // Larger than the whole budget less what is pending: refused, and the kept two stay.
+    expect(make('pg_2', 'e', { label: 'x'.repeat(5000) })).toBe('relay');
+    expect(proposals.byId(settled[1]?.proposalId ?? '')).toBe(settled[1]);
+    expect(proposals.byId(settled[2]?.proposalId ?? '')).toBe(settled[2]);
     proposals.close();
   });
 
