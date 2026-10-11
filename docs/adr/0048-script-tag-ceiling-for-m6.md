@@ -8,7 +8,7 @@ ADR 0028 holds the script-tag build, `dist/tabdock-adapter.js`, under 150,000 by
 
 ## Decision
 
-The ceiling rises from 150,000 to 200,000 bytes, minified, measured as ADR 0028 measures it. Each wave's merge records the size in `docs/plans/M6.md` against a checkpoint: at most 145,000 bytes after Wave 1, 180,000 after Wave 2 and 195,000 after Wave 3. A missed checkpoint is met by trimming CSS and strings first, never by moving a check to the relay. The session record's modules (ADR 0045) keep their own budget of 7,000 bytes, held by an esbuild metafile test, so one feature cannot spend another's share unseen. The constant in `scripts/release-check.ts` (`SCRIPT_TAG_LIMIT_BYTES`) and the size test move to 200,000 within M6, before any wave's build passes the old ceiling.
+The ceiling rises from 150,000 to 200,000 bytes, minified, measured as ADR 0028 measures it. Each wave's merge records the size in `docs/plans/M6.md` against a checkpoint: at most 145,000 bytes after Wave 1, 180,000 after Wave 2 and 195,000 after Wave 3. A missed checkpoint is met by trimming CSS and strings first, never by moving a check to the relay. The session record's modules (ADR 0045) keep their own budget of 13,000 bytes, held by an esbuild metafile test, so one feature cannot spend another's share unseen. The constant in `scripts/release-check.ts` (`SCRIPT_TAG_LIMIT_BYTES`) and the size test move to 200,000 within M6, before any wave's build passes the old ceiling.
 
 ## Consequences
 
@@ -22,4 +22,4 @@ Later the same day the protocol's `package.json` named `zod-config` as its only 
 
 ## Notes from ADR 0045 (10 October 2026)
 
-Built in full the session record's modules measure 12,375 bytes, nearly all of it the strict schema a record is checked by and the logic ADR 0045's decisions ask for, so ADR 0045's notes propose a budget of 13,000 rather than 7,000. Until the owner confirms it, ADR 0045's decision 23 and the decision above keep 7,000. The ceiling and the checkpoints above are unchanged either way.
+Built in full the session record's modules measure 12,375 bytes, nearly all of it the strict schema a record is checked by and the logic ADR 0045's decisions ask for, so on 11 October 2026, under the owner's standing instruction, ADR 0045's decision 23 and the decision above were raised from 7,000 to 13,000. The ceiling and the checkpoints above are unchanged either way.

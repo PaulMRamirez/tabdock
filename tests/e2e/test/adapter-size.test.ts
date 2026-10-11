@@ -22,9 +22,9 @@ describe('the adapter script-tag build', () => {
     expect(bytes).toBeGreaterThan(50_000);
   }, 60_000);
 
-  // The session record's modules keep a budget of their own, which W3-A's
-  // metafile check holds; ADR 0045's decision is the one in force, so SPEC
-  // and ADR 0048 name the same number until a decision changes it.
+  // The session record's modules keep a budget of their own, 13,000 bytes
+  // since 11 October, which W3-A's metafile check holds; ADR 0045's decision
+  // is the one in force, so SPEC and ADR 0048 name the same number.
   it("names one budget for the session record's modules", async () => {
     const read = (path: string): Promise<string> =>
       readFile(new URL(`../../../${path}`, import.meta.url), 'utf8');
@@ -33,7 +33,7 @@ describe('the adapter script-tag build', () => {
       await read('docs/adr/0045-session-record-for-the-operator.md'),
       /^23\. \*\*Budget:\*\* at most ([\d,]+) bytes/m,
     );
-    expect(decided).toMatch(/^[\d,]+$/);
+    expect(decided).toBe('13,000');
     expect(bound(await read('SPEC.md'), /the record's modules under ([\d,]+)/)).toBe(decided);
     expect(
       bound(
