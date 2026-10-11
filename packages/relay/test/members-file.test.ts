@@ -3,12 +3,13 @@
 // is read at start, and again on a change without a restart; an added
 // member pairs while everyone else keeps what they had; a removed member,
 // or an account whose user id moves, loses every attachment (in-flight
-// calls cancelled), pending request, invite it sponsored, /pair sign-in,
-// 2025-era session and listen stream held under the old id at once (S8),
-// and an id handed to someone else shows them none of its former holder's
-// pages (S13). A file that is malformed, empty, missing or that another
-// account could change keeps the list in force, and every refusal names a
-// line by number, never its text or the file's path (S11).
+// calls cancelled, page state waits answered), pending request, invite it
+// sponsored, /pair sign-in, 2025-era session and listen stream held under
+// the old id at once (S8), and an id handed to someone else shows them none
+// of its former holder's pages (S13). A file that is malformed, empty,
+// missing or that another account could change keeps the list in force,
+// and every refusal names a line by number, never its text or the file's
+// path (S11).
 
 import {
   chmodSync,
@@ -57,8 +58,9 @@ import { PAGE_ORIGIN, type TestPage } from './helpers/page-client.ts';
 import { Phone } from './helpers/phone.ts';
 import { PAIR_CLIENT, startProvider } from './helpers/provider.ts';
 import { openListen } from './helpers/raw-mcp.ts';
-import { eventually } from './helpers/relay.ts';
+import { delay, eventually } from './helpers/relay.ts';
 import { leakIn } from './helpers/secrecy.ts';
+import { waitState } from './helpers/state.ts';
 import { PUBLIC_MCP_URL, PUBLIC_ORIGIN } from './helpers/tunnel.ts';
 
 const ALICE = 'sub-alice=alice:Alice';
@@ -418,6 +420,43 @@ describe('a member removed from the file (S8)', () => {
       (await call(alice, 'call_page_tool', { page: page.pageId, tool: 'get_view' })).isError,
     ).toBe(false);
   });
+
+  // W1-C's waits meet W1-E's reload here: S8 says a member's removal ends a
+  // waiting wait_for_page_state as a revoke does, not at its timeout.
+  it(
+    'loses a waiting wait_for_page_state at once, while a kept member waits on',
+    { timeout: 15_000 },
+    async () => {
+      const { relay, save: saveMembers } = await membersRelay([ALICE, BOB], { invites: false });
+      const page = await relay.page();
+      const alice = await relay.claude('sub-alice');
+      const bob = await relay.claude('sub-bob');
+      await attachMember(alice, page);
+      await attachMember(bob, page);
+      const waitsStarted = (): number =>
+        relay.lines.filter((line) => line.includes('"msg":"page state wait started"')).length;
+      const startedAt = Date.now();
+      const bobWaits = waitState(bob, page.pageId, 0, 4000);
+      // A wait the change missed may never answer; this test reports that itself.
+      bobWaits.catch(() => undefined);
+      await eventually(() => waitsStarted() === 1);
+      const aliceWaits = waitState(alice, page.pageId, 0, 1500);
+      await eventually(() => waitsStarted() === 2);
+      saveMembers([ALICE]);
+      expect(await relay.relay.reloadMembers()).toBe('applied');
+      // Well before its own 4 s timeout, and before the reload closes Bob's
+      // session, which would leave a wait the change missed unanswered.
+      const bobs = await Promise.race([bobWaits, delay(2000).then(() => null)]);
+      if (bobs === null) throw new Error("Bob's wait still waits 2 s after the change");
+      expect(bobs.isError).toBe(true);
+      expect(bobs.text).toMatch(/^not_attached: your membership on this relay changed/);
+      expect(Date.now() - startedAt).toBeLessThan(3000);
+      // Alice's wait runs to its own timeout and answers with no change.
+      const alices = await aliceWaits;
+      expect(alices.isError, alices.text).toBe(false);
+      expect(alices.body).toMatchObject({ page: page.pageId, version: 0, changed: false });
+    },
+  );
 
   it('with invites on, sees no page, and loses a request waiting on the operator', async () => {
     const { relay, save: saveMembers } = await membersRelay([ALICE, BOB]);
