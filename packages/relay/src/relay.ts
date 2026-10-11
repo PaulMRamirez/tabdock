@@ -31,7 +31,9 @@
 // within its address's budget (hub.ts). Every 2026-07-28 request spends the
 // caller's request budget once, and an /mcp response its client leaves unread
 // is cut off once it stops moving, or once its user has more such responses
-// than they may (response-stalls.ts, ADRs 0030 and 0032).
+// than they may, or, an invited account's, once all the responses waiting
+// hold more than the relay lets them (response-stalls.ts, ADRs 0030, 0032
+// and 0044).
 // The client address that /page and /pair count by, and that /mcp's refusal
 // line names, comes from one place (client-address.ts), which answers 400 on
 // a route that counts by address when a host edge names no client (ADR 0018).
@@ -121,7 +123,7 @@ import { createPairFlow, PAIR_ROUTES, type PairFlow } from './pair.ts';
 import { createRepeatedLog, errorKind } from './repeated-lines.ts';
 import { requestHeapBytes } from './request-heap.ts';
 import { inSlices, ResponseStalls } from './response-stalls.ts';
-import { type InviteeSessionOptions, McpSessions } from './sessions.ts';
+import { type InviteeSessionOptions, McpSessions, rankOf } from './sessions.ts';
 import { createSignInGate } from './sign-in-gate.ts';
 import { Spike, type SpikeControl } from './spike.ts';
 import { type AuditLog, callRecords, createMemoryStore, recordAudit } from './store.ts';
@@ -627,12 +629,30 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   const clientLines = createClientLines(log);
   // Refused Origins on /mcp, a few named in full each window apart from the lines above (ADR 0027).
   const originRefusals = new OriginRefusals(log, config.rateLimits.windowMs);
+  // The invitee tier (ADRs 0016 and 0017), for 2025-era sessions and listen
+  // streams alike, and for who gives way to the response ceiling below.
+  const invitees: InviteeSessionOptions = {
+    pool: config.limits.inviteeSessions,
+    perInvitee: config.limits.sessionsPerInvitee,
+    isInvitee: (userId) => InviteeIdSchema.safeParse(userId).success,
+    holds: (userId) => hub.holds(userId),
+  };
   // Responses a client leaves unread are cut off once they stop moving, and a
   // user's oldest once more of theirs wait than they may, an invitee a
   // quarter as many as a member (responsesWaitingFor, ADR 0030 and its notes).
-  // M6 seam: not built. W1-F gives it config.limits.responseBytes as a
-  // relay-wide ceiling (S9, ADR 0044); until then only those two bounds hold.
-  const stalls = new ResponseStalls({ lines: mcpLines });
+  // Past the bytes they may hold together, invited accounts' answers waiting
+  // to be read give way, strangers' oldest first, then guests', ranked as
+  // sessions are; a member's never does, so members' alone may pass it (S9,
+  // ADR 0044).
+  const stalls = new ResponseStalls({
+    lines: mcpLines,
+    ceilingBytes: config.limits.responseBytes,
+    rankOf: (userId) => rankOf(userId, invitees),
+  });
+  // The Node response each /mcp request is answered on, keyed by the
+  // request's own auth object as below, so the slicer that writes its answer
+  // can tell the check what it holds (ADR 0044).
+  const nodeResponses = new WeakMap<AuthInfo, ServerResponse>();
   // What each /mcp request's body holds on the heap, measured before either
   // leg reads it, so a call or pairing that waits on a page is charged it
   // (request-heap.ts, ADR 0018's notes). Keyed by the request's own auth
@@ -676,13 +696,6 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       },
     });
   const mcp = strictHandler();
-  // The invitee tier (ADRs 0016 and 0017), for 2025-era sessions and listen streams alike.
-  const invitees: InviteeSessionOptions = {
-    pool: config.limits.inviteeSessions,
-    perInvitee: config.limits.sessionsPerInvitee,
-    isInvitee: (userId) => InviteeIdSchema.safeParse(userId).success,
-    holds: (userId) => hub.holds(userId),
-  };
   const sessions = new McpSessions({
     createServer: (authInfo, request) => factory({ era: 'legacy', authInfo, requestInfo: request }),
     ownerOf: userIdOf,
@@ -894,13 +907,21 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   // one shows progress as each slice is written (response-stalls.ts, ADR 0032).
   // Before it is written its user's oldest responses waiting past their cap
   // go, so answers that arrive between two checks cannot pile up unread
-  // (ADR 0030's notes).
+  // (ADR 0030's notes). What the slicer has read of it and not handed on
+  // counts toward the relay-wide ceiling, which is held again each time that
+  // grows (ADR 0044).
   const sliced = {
     fetch: async (request: Request, options?: McpHandlerRequestOptions): Promise<Response> => {
       const answer = await legs.fetch(request, options);
       const userId = userIdOf(options?.authInfo);
       if (userId !== null) stalls.answering(userId);
-      return inSlices(answer);
+      const slices = inSlices(answer, () => {
+        stalls.chunkQueued();
+      });
+      const written =
+        options?.authInfo === undefined ? undefined : nodeResponses.get(options.authInfo);
+      if (written !== undefined) stalls.measure(written, slices.queuedBytes);
+      return slices.response;
     },
   };
   const mcpNode = toNodeHandler(sliced, {
@@ -1045,6 +1066,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     // under exactOptionalPropertyTypes (method is string | undefined there).
     const withAuth = request as IncomingMessage & { auth?: AuthInfo };
     withAuth.auth = authInfo;
+    nodeResponses.set(authInfo, response);
     // Until it finishes or closes: one the client leaves unread is cut off
     // (ADR 0030), and one queued on a connection that closes is ended with it.
     stalls.track(response, outcome.user.userId, request.socket);

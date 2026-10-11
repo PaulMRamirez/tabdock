@@ -336,9 +336,10 @@ export interface RelayLimits {
    */
   proposalBytes: number;
   /**
-   * Bytes all /mcp answers still waiting to be read may hold together (ADR
-   * 0044); past it strangers' answers are cut first, then guests', oldest
-   * first, and never a member's. At least MIN_RESPONSE_BYTES, in every mode.
+   * Bytes /mcp answers waiting to be read may hold together before invited
+   * accounts' give way (ADR 0044): past it strangers' are cut first, then
+   * guests', oldest first, and never a member's, so members' alone may pass
+   * it. At least MIN_RESPONSE_BYTES, in every mode.
    */
   responseBytes: number;
   /**
@@ -628,7 +629,7 @@ export const DEFAULT_LIMITS: RelayLimits = {
   imageBytes: DEFAULT_IMAGE_BYTES,
   stateBytes: STATE_BYTES,
   proposalBytes: PROPOSAL_BYTES, // M6 seam: not built. W2-A's proposals.ts charges against it.
-  responseBytes: RESPONSE_BYTES, // M6 seam: not built. W1-F's ResponseStalls ceiling reads it.
+  responseBytes: RESPONSE_BYTES,
   observersPerPage: OBSERVERS_PER_PAGE,
   watchingCallsInFlight: 4, // M6 seam: not built. W2-C's #watchingShareRefusal reads it.
 };
