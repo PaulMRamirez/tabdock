@@ -52,6 +52,11 @@ export type {
 } from './core.ts';
 export { INVITE_LIFETIMES, STATE_EVENT } from './core.ts';
 export type { RecordView, RecordWhich, SessionRecord } from './record.ts';
+export {
+  sessionRecordFileName,
+  sessionRecordJson,
+  sessionRecordMarkdown,
+} from './record-markdown.ts';
 export type {
   Account,
   AttachmentView,

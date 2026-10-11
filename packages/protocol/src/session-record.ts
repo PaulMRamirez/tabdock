@@ -270,31 +270,38 @@ export type SessionRecord = z.infer<typeof SessionRecordSchema>;
 const parseJson = JSON.parse;
 const stringifyJson = JSON.stringify;
 
+let segments: ReadonlySet<string> | undefined;
+
 /**
  * Field names the record's schemas know, and outcome names a count may be
  * keyed by. A path segment outside them is a key the file wrote, so a reason
- * never repeats it.
+ * never repeats it. Built on first use, so a bundle that never reads a record
+ * (the adapter's, which only writes one) drops it with the reader.
  */
-const KNOWN_SEGMENTS: ReadonlySet<string> = new Set([
-  ...Object.keys(SessionRecordSchema.shape),
-  ...Object.keys(SessionRecordSchema.shape.page.shape),
-  ...Object.keys(PolicySchema.shape),
-  ...Object.keys(RecordCallSchema.shape),
-  ...Object.keys(RecordPersonSchema.shape),
-  ...Object.keys(RecordAttachmentSchema.shape),
-  ...Object.keys(RecordRoleSchema.shape),
-  ...Object.keys(RecordProposalSchema.shape),
-  ...Object.keys(SessionScopeSchema.shape),
-  ...Object.keys(RecordDroppedSchema.shape),
-  'user',
-  'counts',
-  ...RecordOutcomeSchema.options,
-]);
+function knownSegments(): ReadonlySet<string> {
+  segments ??= new Set([
+    ...Object.keys(SessionRecordSchema.shape),
+    ...Object.keys(SessionRecordSchema.shape.page.shape),
+    ...Object.keys(PolicySchema.shape),
+    ...Object.keys(RecordCallSchema.shape),
+    ...Object.keys(RecordPersonSchema.shape),
+    ...Object.keys(RecordAttachmentSchema.shape),
+    ...Object.keys(RecordRoleSchema.shape),
+    ...Object.keys(RecordProposalSchema.shape),
+    ...Object.keys(SessionScopeSchema.shape),
+    ...Object.keys(RecordDroppedSchema.shape),
+    'user',
+    'counts',
+    ...RecordOutcomeSchema.options,
+  ]);
+  return segments;
+}
 
 function issueText(issue: z.core.$ZodIssue): string {
+  const known = knownSegments();
   const path = issue.path
     .map((segment) =>
-      typeof segment === 'number' || KNOWN_SEGMENTS.has(String(segment)) ? String(segment) : '?',
+      typeof segment === 'number' || known.has(String(segment)) ? String(segment) : '?',
     )
     .join('.');
   const message =

@@ -1,13 +1,36 @@
-// The session record's seam (ADR 0045): what the core tells a recorder and
-// what it reads back. The record is advisory, so the core holds a recorder
-// through this interface alone and tells it of each change only after making
-// its own decision: nothing a recorder returns or throws decides how a call
-// runs (S5 and S6 never read it). A record holds names the operator's own
-// screen already showed, in memory only, and never arguments, results,
-// images, page state or secrets. NOOP_RECORDER keeps nothing;
-// CoreOptions.recorder lets a test hand the core a recorder of its own.
+// The session record (ADR 0045): what the core tells a recorder and what it
+// reads back, and createRecorder, which keeps the record. The record is
+// advisory, so the core holds a recorder through this interface alone and
+// tells it of each change only after making its own decision: nothing a
+// recorder returns or throws decides how a call runs (S5 and S6 never read
+// it). A record holds names the operator's own screen already showed, in
+// memory only, and never arguments, results, images, page state or secrets:
+// each hook copies named fields, never a frame or an entry whole, so nothing
+// added to those later reaches a record unnoticed. NOOP_RECORDER keeps
+// nothing; CoreOptions.recorder lets a test hand the core a recorder of its own.
 
-import type { AttachmentView, Policy, RecordAttachment, SessionRecord } from '@tabdock/protocol';
+import {
+  type AttachmentView,
+  INVITEE_SHORT_ID_CHARS,
+  InviteeIdSchema,
+  plainLine,
+  type Policy,
+  type RecordAttachment,
+  type RecordCall,
+  type RecordOutcome,
+  type RecordPerson,
+  type RecordProposal,
+  type RecordScope,
+  SESSION_RECORD_MAX_ATTACHMENTS,
+  SESSION_RECORD_MAX_CALLS,
+  SESSION_RECORD_MAX_DROPPED_USERS,
+  SESSION_RECORD_MAX_PAGE_IDS,
+  SESSION_RECORD_MAX_PROPOSALS,
+  SESSION_RECORD_MAX_ROLE_CHANGES,
+  SESSION_RECORD_VERSION,
+  type SessionRecord,
+  SessionRecordSchema,
+} from '@tabdock/protocol';
 import type {
   ActivityEntry,
   PageRole,
@@ -105,7 +128,11 @@ export interface Recorder {
   proposal(proposal: PendingProposal, pageId: string): void;
   /** How a proposal ended, and the call that ran it when one did. */
   proposalSettled(entry: ProposalLogEntry): void;
-  /** A time-boxed session began (ADR 0043): the page-scope record is sealed and a session record starts. */
+  /**
+   * A time-boxed session began (ADR 0043): the page-scope record is sealed
+   * and a session record starts. Told again of the same session, as when the
+   * operator extends it, it takes the session's new end and settings.
+   */
   sessionStarted(session: SessionView): void;
   /** It ended: its record is sealed into `ended` and a page-scope record starts again. */
   sessionEnded(ended: SessionEnded): void;
@@ -139,3 +166,487 @@ export const NOOP_RECORDER: Recorder = Object.freeze({
   discard: () => false,
   dropAll: () => undefined,
 });
+
+/** One record as it is kept: its entries already in the schema's shapes, so a snapshot only checks and copies. */
+interface Kept {
+  scope: RecordScope;
+  pageIds: string[];
+  from: number;
+  /** When it was sealed; null while it is kept. */
+  to: number | null;
+  spans: RecordAttachment[];
+  calls: RecordCall[];
+  proposals: RecordProposal[];
+  dropped: Omit<SessionRecord['dropped'], 'byUser'>;
+  byUser: Map<string, Partial<Record<RecordOutcome, number>>>;
+  /** The open spans by user id: who the record says is here now. */
+  open: Map<string, RecordAttachment>;
+  /**
+   * The handle of calls[0]. Handles count every call kept, from 0, so each
+   * record covers one run of them and a handle finds its call in whichever
+   * record holds it, sealed or not.
+   */
+  base: number;
+  /** Everyone this record names, for the counts the widget's warning gives. */
+  seen: Set<RecordPerson>;
+  /** The next roster's new spans were there before the record began: a reload resumed the page session. */
+  carry: boolean;
+}
+
+/**
+ * The recorder ADR 0045 describes: a record of the current page session, or
+ * of a time-boxed session while one runs, and the last of each kind sealed.
+ * Its views always say failed: false, since a fault is caught by the core's
+ * guard around every hook (decision 22), which stops the record there.
+ */
+export function createRecorder(): Recorder {
+  let current: Kept | null = null;
+  let previous: Kept | null = null;
+  let ended: Kept | null = null;
+  /** The page session the link is in now: the page new entries belong to. */
+  let live = '';
+  /** When the link went, which is when a new page session ended the spans still open. */
+  let lostAt: number | null = null;
+  let next = 0;
+  let shown = NO_VIEWS;
+  /** Users the operator revoked whose spans have not closed yet. */
+  const revoked = new Set<string>();
+  /**
+   * How the records name each user, shared by all three so an invitee's
+   * short id, and the ~n that keeps two apart, never differ between them,
+   * and pruned to the people they name whenever one is replaced, so the
+   * tab keeps no one its records no longer hold.
+   */
+  const people = new Map<string, RecordPerson>();
+  /** The ids `people` hands out, so a clash is found without a scan. */
+  const ids = new Set<string>();
+
+  const slots = (): [RecordWhich, Kept | null][] => [
+    ['current', current],
+    ['previous', previous],
+    ['ended', ended],
+  ];
+
+  function prune(): void {
+    const named = new Set(slots().flatMap(([, kept]) => [...(kept?.seen ?? [])]));
+    for (const [userId, held] of people) {
+      if (!named.has(held)) {
+        people.delete(userId);
+        ids.delete(held.id);
+      }
+    }
+  }
+
+  /** The record kept from now on, after whatever it replaced has gone. */
+  function start(kept: Kept): void {
+    current = kept;
+    prune();
+  }
+
+  /**
+   * A user as the widget names them: a member by id and plain-line name, an
+   * invitee by `g_` and the short id the widget shows, never the full account
+   * key, which is an unkeyed digest of the provider's subject.
+   */
+  function person(kept: Kept, userId: string, displayName: string): RecordPerson {
+    let named = people.get(userId);
+    if (named === undefined) {
+      const invitee = InviteeIdSchema.safeParse(userId).success;
+      const short = invitee ? userId.slice(0, 2 + INVITEE_SHORT_ID_CHARS) : userId;
+      let id = short;
+      for (let n = 2; invitee && ids.has(id); n++) id = `${short}~${String(n)}`;
+      named = { id, name: plainLine(displayName) || id, kind: invitee ? 'invitee' : 'member' };
+      people.set(userId, named);
+      ids.add(id);
+    }
+    kept.seen.add(named);
+    return named;
+  }
+
+  /** A new record from `from`; whoever `carry` still holds open, and what waits there, was there from the start. */
+  function begin(scope: RecordScope, from: number, carry?: Kept): Kept {
+    const kept: Kept = {
+      scope,
+      pageIds: [live],
+      from,
+      to: null,
+      spans: [],
+      calls: [],
+      proposals: [],
+      dropped: {
+        calls: 0,
+        attachments: 0,
+        proposals: 0,
+        firstAt: null,
+        lastAt: null,
+        otherCalls: 0,
+      },
+      byUser: new Map(),
+      open: new Map(),
+      base: next,
+      seen: new Set(),
+      carry: false,
+    };
+    for (const [userId, span] of carry?.open ?? []) {
+      kept.seen.add(span.user);
+      open(kept, userId, {
+        ...span,
+        before: true,
+        joinedAt: from,
+        roles: [{ at: from, role: span.roles.at(-1)?.role ?? null }],
+        rolesDropped: 0,
+      });
+    }
+    for (const proposal of carry?.proposals ?? []) {
+      if (proposal.status === 'pending' && proposal.pageId === live) {
+        kept.seen.add(proposal.user);
+        kept.proposals.push({ ...proposal });
+      }
+    }
+    return kept;
+  }
+
+  function open(kept: Kept, userId: string, span: RecordAttachment): void {
+    if (kept.spans.length >= SESSION_RECORD_MAX_ATTACHMENTS) {
+      // The oldest span that ended goes, as the oldest call does; open ones never come near the cap.
+      const index = kept.spans.findIndex((old) => old.leftAt !== null);
+      if (index < 0) return;
+      kept.spans.splice(index, 1);
+      kept.dropped.attachments++;
+    }
+    kept.spans.push(span);
+    kept.open.set(userId, span);
+  }
+
+  /** Closes the open spans `why` names a reason for, at `at`. */
+  function close(
+    kept: Kept,
+    at: number,
+    why: (userId: string, span: RecordAttachment) => RecordAttachment['ended'],
+  ): void {
+    for (const [userId, span] of kept.open) {
+      span.ended = why(userId, span);
+      if (span.ended === null) continue;
+      // A span that began after the link went (a record restarted offline) ends as it began.
+      span.leftAt = Math.max(at, span.joinedAt);
+      kept.open.delete(userId);
+    }
+  }
+
+  /**
+   * Seals a record that holds anything into its slot, so an empty one never
+   * replaces a kept one. It ends no earlier than it began or than anything
+   * it holds was decided, so every time it holds lies within its span.
+   */
+  function seal(kept: Kept, at: number): void {
+    if (kept.spans.length + kept.calls.length + kept.proposals.length + kept.dropped.calls === 0) {
+      return;
+    }
+    kept.to = Math.max(at, kept.from, ...kept.proposals.map((proposal) => proposal.decidedAt ?? 0));
+    if (kept.scope.kind === 'page') previous = kept;
+    else ended = kept;
+  }
+
+  /**
+   * A call the cap, or a page the record cannot name, pushed out: counted,
+   * so the record never passes for whole. Only the cap's drops set the
+   * dropped span, which is then older than every call kept.
+   */
+  function drop(kept: Kept, call: RecordCall): void {
+    const { dropped, byUser } = kept;
+    dropped.calls++;
+    const counts =
+      byUser.get(call.user.id) ??
+      (byUser.size < SESSION_RECORD_MAX_DROPPED_USERS
+        ? byUser.set(call.user.id, {}).get(call.user.id)
+        : undefined);
+    if (counts === undefined) dropped.otherCalls++;
+    else counts[call.outcome] = (counts[call.outcome] ?? 0) + 1;
+  }
+
+  function find(handle: RecordHandle): RecordCall | undefined {
+    for (const [, kept] of slots()) {
+      const call = handle === null ? undefined : kept?.calls[handle - kept.base];
+      if (call !== undefined) return call;
+    }
+    return undefined;
+  }
+
+  return {
+    pageSession(pageId, resumed, at) {
+      const kept = current;
+      const same = resumed && pageId === live;
+      // When the link went; close and seal keep a record restarted since within its own span.
+      const end = lostAt ?? at;
+      lostAt = null;
+      live = pageId;
+      if (kept === null) {
+        const first = begin({ kind: 'page' }, at);
+        first.carry = resumed;
+        start(first);
+        return;
+      }
+      if (same) return;
+      // A new page session ended every attachment of the one before (ADR 0019).
+      close(kept, end, () => 'page_session_ended');
+      if (kept.scope.kind === 'page') {
+        seal(kept, end);
+        start(begin(kept.scope, at));
+      } else if (
+        !kept.pageIds.includes(pageId) &&
+        kept.pageIds.length < SESSION_RECORD_MAX_PAGE_IDS
+      ) {
+        // A lesson a deploy interrupted stays one record (ADR 0045's notes from ADR 0043).
+        kept.pageIds.push(pageId);
+      }
+    },
+
+    linkLost(at) {
+      lostAt ??= at;
+    },
+
+    roster(attachments, roles, wayIn, at) {
+      const kept = current;
+      if (kept === null || !kept.pageIds.includes(live)) return;
+      const listed = new Set<string>();
+      for (const { userId, displayName, role: listedRole } of attachments) {
+        listed.add(userId);
+        const pageRole = roles.find((entry) => entry.userId === userId);
+        const role = pageRole === undefined ? listedRole : pageRole.role;
+        const span = kept.open.get(userId);
+        if (span === undefined) {
+          revoked.delete(userId);
+          const joinedAt = kept.carry ? kept.from : at;
+          open(kept, userId, {
+            user: person(kept, userId, displayName),
+            pageId: live,
+            ...wayIn(userId),
+            before: kept.carry,
+            joinedAt,
+            leftAt: null,
+            ended: null,
+            roles: [{ at: joinedAt, role }],
+            rolesDropped: 0,
+          });
+        } else if (span.roles.at(-1)?.role !== role) {
+          // Past the cap the newest replaces the one before it, so the first and the latest stay.
+          if (span.roles.length >= SESSION_RECORD_MAX_ROLE_CHANGES) {
+            span.roles.pop();
+            span.rolesDropped++;
+          }
+          span.roles.push({ at, role });
+        }
+      }
+      kept.carry = false;
+      close(kept, at, (userId) =>
+        listed.has(userId) ? null : revoked.delete(userId) ? 'revoked' : 'left',
+      );
+    },
+
+    revoking(target) {
+      for (const userId of target === '*' ? (current?.open.keys() ?? []) : [target]) {
+        revoked.add(userId);
+      }
+    },
+
+    call(entry, pageId) {
+      const kept = current;
+      if (kept === null) return null;
+      const client = entry.client && plainLine(`${entry.client.name} ${entry.client.version}`);
+      const call: RecordCall = {
+        callId: entry.callId,
+        pageId,
+        at: entry.time,
+        user: person(kept, entry.user.userId, entry.user.displayName),
+        client: client || null,
+        tool: entry.tool,
+        outcome: entry.outcome,
+        durationMs: entry.durationMs,
+        confirmedBy: entry.confirmedBy,
+        proposalId: entry.proposalId,
+      };
+      if (!kept.pageIds.includes(pageId)) {
+        drop(kept, call);
+        return null;
+      }
+      if (kept.calls.length >= SESSION_RECORD_MAX_CALLS) {
+        // The oldest goes first, so the span runs from the first dropped to the latest.
+        const oldest = kept.calls.shift() ?? call;
+        drop(kept, oldest);
+        kept.dropped.firstAt ??= oldest.at;
+        kept.dropped.lastAt = oldest.at;
+        kept.base++;
+      }
+      kept.calls.push(call);
+      return next++;
+    },
+
+    update(handle, entry) {
+      const call = find(handle);
+      if (call === undefined) return;
+      call.outcome = entry.outcome;
+      call.durationMs = entry.durationMs;
+      // 'page' stays once the operator allowed it: an entry only ever says 'client' or nothing.
+      call.confirmedBy = entry.confirmedBy ?? call.confirmedBy;
+      call.proposalId = entry.proposalId ?? call.proposalId;
+    },
+
+    confirmedOnPage(handle) {
+      const call = find(handle);
+      if (call !== undefined) call.confirmedBy = 'page';
+    },
+
+    proposal(proposal, pageId) {
+      const kept = current;
+      if (kept === null || !kept.pageIds.includes(pageId)) return;
+      if (kept.proposals.length >= SESSION_RECORD_MAX_PROPOSALS) {
+        const index = kept.proposals.findIndex((old) => old.status !== 'pending');
+        if (index < 0) return;
+        kept.proposals.splice(index, 1);
+        kept.dropped.proposals++;
+      }
+      // Its id, proposer, tool and time: never the arguments the queue shows (ADR 0045, decision 25).
+      const { proposer } = proposal;
+      kept.proposals.push({
+        proposalId: proposal.proposalId,
+        pageId,
+        at: proposal.receivedAt,
+        user: person(kept, proposer.userId, proposer.displayName),
+        tool: proposal.tool,
+        status: 'pending',
+        decidedAt: null,
+        callId: null,
+      });
+    },
+
+    proposalSettled(entry) {
+      for (const [, kept] of slots()) {
+        const proposal = kept?.proposals.find(
+          (held) => held.proposalId === entry.proposalId && held.status === 'pending',
+        );
+        if (proposal === undefined) continue;
+        proposal.status = entry.outcome;
+        proposal.decidedAt = entry.time;
+        proposal.callId = entry.outcome === 'accepted' ? entry.callId : null;
+        return;
+      }
+    },
+
+    sessionStarted(session) {
+      const kept = current;
+      if (kept === null) return;
+      const scope: RecordScope = {
+        kind: 'session',
+        sessionId: session.sessionId,
+        label: session.label,
+        startedAt: session.startedAt,
+        endsAt: session.endsAt,
+        endedAt: null,
+        endedBy: null,
+        maxDrivers: session.policy.maxDrivers,
+        proposals: session.policy.proposals,
+        observers: session.observers,
+        invites: session.inviteIds.length,
+      };
+      if (kept.scope.kind === 'session' && kept.scope.sessionId === session.sessionId) {
+        kept.scope = scope;
+        return;
+      }
+      seal(kept, session.startedAt);
+      start(begin(scope, session.startedAt, kept));
+    },
+
+    sessionEnded(end) {
+      const kept = current;
+      if (kept?.scope.kind !== 'session' || kept.scope.sessionId !== end.sessionId) return;
+      kept.scope = { ...kept.scope, endedAt: end.time, endedBy: end.reason };
+      if (lostAt === null) {
+        // The session's end closes every attachment an invite or agent token made (ADR 0043).
+        close(kept, end.time, (_userId, span) => (span.inviteId === null ? null : 'session_ended'));
+      } else {
+        // Told while the link is down (a relay restart), the page session ended
+        // first and with it everyone, so no one carries into the page record.
+        close(kept, lostAt, () => 'page_session_ended');
+      }
+      kept.to = Math.max(end.time, kept.from);
+      ended = kept;
+      start(begin({ kind: 'page' }, kept.to, kept));
+    },
+
+    views() {
+      const list: RecordView[] = [];
+      for (const [which, kept] of slots()) {
+        if (kept === null) continue;
+        const { scope, dropped } = kept;
+        list.push({
+          which,
+          scope: scope.kind,
+          label: scope.kind === 'session' ? scope.label : null,
+          from: kept.from,
+          to: kept.to,
+          calls: kept.calls.length,
+          people: kept.seen.size,
+          invitees: [...kept.seen].filter((named) => named.kind === 'invitee').length,
+          proposals: kept.proposals.length,
+          dropped: dropped.calls + dropped.attachments + dropped.proposals,
+          failed: false,
+        });
+      }
+      const key = (views: readonly RecordView[]): string =>
+        views.map((view) => Object.values(view).join()).join(';');
+      if (key(list) !== key(shown)) shown = Object.freeze(list.map((view) => Object.freeze(view)));
+      return shown;
+    },
+
+    snapshot(which, context, at) {
+      const kept = { current, previous, ended }[which];
+      if (kept === null) return null;
+      // Checked by the protocol's strict schema before it leaves (ADR 0045, decision 19).
+      return Object.freeze(
+        SessionRecordSchema.parse({
+          format: 'tabdock.session-record',
+          v: SESSION_RECORD_VERSION,
+          adapterVersion: context.adapterVersion,
+          exportedAt: at,
+          page: {
+            origin: context.origin.slice(0, 2048),
+            path: context.path.slice(0, 2048),
+            title: plainLine(context.title).slice(0, 300),
+          },
+          relay: context.relay,
+          policy: context.policy,
+          pageIds: kept.pageIds,
+          scope: kept.scope,
+          from: kept.from,
+          to: kept.to ?? Math.max(at, kept.from),
+          sealed: kept.to !== null,
+          attachments: kept.spans,
+          calls: kept.calls,
+          proposals: kept.proposals,
+          dropped: {
+            ...kept.dropped,
+            byUser: [...kept.byUser].map(([user, counts]) => ({ user, counts })),
+          },
+        }),
+      );
+    },
+
+    discard(which, at) {
+      const had = { current, previous, ended }[which] !== null;
+      if (which === 'previous') previous = null;
+      else if (which === 'ended') ended = null;
+      else if (current !== null) current = begin(current.scope, at, current);
+      prune();
+      return had;
+    },
+
+    dropAll() {
+      current = previous = ended = null;
+      lostAt = null;
+      live = '';
+      revoked.clear();
+      people.clear();
+      ids.clear();
+    },
+  };
+}

@@ -13,12 +13,24 @@
 // stdout only; it never changes the log. The published command runs it as
 // `tabdock-relay audit` (cli.ts, ADR 0028), its usage naming that command, and
 // there it reads no .env file: settings come from the environment alone.
+// From M6 it also finds a call by the invoke's callId (--call) and holds a
+// session record saved from the widget to the log (--match, audit-match.ts,
+// ADR 0045), naming the file only by the option that gave it.
 
-import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseArgs, type ParseArgsOptionsConfig } from 'node:util';
-import { AUDIT_EVENT_TYPES, type AuditLine } from '@tabdock/protocol';
+import {
+  AUDIT_EVENT_TYPES,
+  type AuditLine,
+  parseSessionRecord,
+  SESSION_RECORD_MAX_BYTES,
+  SESSION_RECORD_VERSION,
+  type SessionRecord,
+} from '@tabdock/protocol';
 import { namedArgument } from './argument-names.ts';
+import { type MatchReport, matchSessionRecord } from './audit-match.ts';
 import {
   type AuditCheckpoint,
   readAuditLines,
@@ -47,6 +59,7 @@ Reads the relay's audit log (ADR 0019) and prints its records, oldest first.
   --page <id>          records about this page
   --type <type>        records of this type; repeat or separate with commas
   --outcome <outcome>  records with this outcome
+  --call <id>          call records with this callId; repeat or separate with commas
   --since <time>       records at or after this time (ISO 8601, or 15m, 24h, 7d ago)
   --until <time>       records before this time
   --json               print each record as one JSON line
@@ -55,6 +68,10 @@ Reads the relay's audit log (ADR 0019) and prints its records, oldest first.
                        with --verify, also check the line with that seq against the
                        newest checkpoint in the platform's logs, and that the log
                        still starts at its first (which may be left off)
+  --match <file>       check a session record saved from the widget (ADR 0045)
+                       against the log, call by call; exit 1 on a call added,
+                       removed or changed. Takes only --dir, --verify,
+                       --checkpoint and --json beside it
   --help               this text`;
 
 /**
@@ -79,6 +96,8 @@ export interface AuditFilter {
   pages: string[];
   types: string[];
   outcomes: string[];
+  /** Call records by the invoke's id (ADR 0045); a filter on calls, so any other type is left out. */
+  calls: string[];
   since: number | null;
   until: number | null;
 }
@@ -108,6 +127,10 @@ export function matches(record: AuditLine, filter: AuditFilter): boolean {
   if (filter.outcomes.length > 0) {
     const outcome = 'outcome' in record ? record.outcome : null;
     if (outcome === null || !filter.outcomes.includes(outcome)) return false;
+  }
+  if (filter.calls.length > 0) {
+    const callId = record.type === 'call' ? record.callId : undefined;
+    if (callId === undefined || !filter.calls.includes(callId)) return false;
   }
   if (filter.since !== null && record.at < filter.since) return false;
   if (filter.until !== null && record.at >= filter.until) return false;
@@ -191,13 +214,18 @@ const AUDIT_OPTIONS = {
   page: { type: 'string', multiple: true },
   type: { type: 'string', multiple: true },
   outcome: { type: 'string', multiple: true },
+  call: { type: 'string', multiple: true },
   since: { type: 'string' },
   until: { type: 'string' },
   json: { type: 'boolean' },
   verify: { type: 'boolean' },
   checkpoint: { type: 'string' },
+  match: { type: 'string' },
   help: { type: 'boolean' },
 } as const satisfies ParseArgsOptionsConfig;
+
+/** The options --match leaves out: it checks the whole log, so a filter would only hide lines. */
+const FILTERS = ['user', 'page', 'type', 'outcome', 'call', 'since', 'until'] as const;
 
 /**
  * Why the arguments are refused, or null when node's strict parse will take
@@ -247,7 +275,8 @@ export interface CliIo {
 
 /**
  * Runs the reader with these arguments; returns the exit code (0 fine, 1 a
- * broken log, 2 a usage error). `command` is what the usage calls it.
+ * broken log or a session record the log does not bear out, 2 a usage
+ * error). `command` is what the usage calls it.
  */
 export function runAuditCli(
   argv: readonly string[],
@@ -286,6 +315,11 @@ export function runAuditCli(
   let checkpoint: AuditCheckpoint | undefined;
   let dir: AuditDir;
   try {
+    if (values.match !== undefined && FILTERS.some((name) => values[name] !== undefined)) {
+      throw new UsageError(
+        'with --match the reader takes only --dir, --verify, --checkpoint and --json',
+      );
+    }
     const types = list(values.type);
     const unknown = types.find((type) => !(AUDIT_EVENT_TYPES as readonly string[]).includes(type));
     if (unknown !== undefined) {
@@ -296,6 +330,7 @@ export function runAuditCli(
       pages: list(values.page),
       types,
       outcomes: list(values.outcome),
+      calls: list(values.call),
       since: values.since === undefined ? null : parseTime(values.since, now),
       until: values.until === undefined ? null : parseTime(values.until, now),
     };
@@ -317,6 +352,16 @@ export function runAuditCli(
     io.err(escapeForTerminal(error instanceof Error ? error.message : String(error)));
     return 2;
   }
+  // The record before the log: a file that is no record is a usage error whatever the log holds.
+  let saved: SavedRecord | undefined;
+  if (values.match !== undefined) {
+    const read = readSessionRecord(values.match);
+    if (!read.ok) {
+      io.err(escapeForTerminal(read.reason));
+      return 2;
+    }
+    saved = read;
+  }
   if (!existsSync(dir.path)) {
     io.err(escapeForTerminal(`no audit directory at ${dir.named}; ${dir.hint}`));
     return 2;
@@ -326,9 +371,9 @@ export function runAuditCli(
   try {
     for (const line of readAuditLines(dir.path)) lines.push(line);
   } catch (error) {
-    const code =
-      typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : 'error';
-    io.err(escapeForTerminal(`cannot read the audit directory at ${dir.named} (${code})`));
+    io.err(
+      escapeForTerminal(`cannot read the audit directory at ${dir.named} (${errorCode(error)})`),
+    );
     return 2;
   }
 
@@ -342,7 +387,8 @@ export function runAuditCli(
       );
       continue;
     }
-    if (!matches(line.record, filter)) continue;
+    // With --match the findings are the output, not the records.
+    if (saved !== undefined || !matches(line.record, filter)) continue;
     io.out(
       values.json === true
         ? escapeForTerminal(JSON.stringify(line.record))
@@ -350,7 +396,24 @@ export function runAuditCli(
     );
   }
 
-  if (values.verify !== true) return 0;
+  let code = 0;
+  if (values.verify === true && !verifyLog(lines, checkpoint, io)) code = 1;
+  if (saved !== undefined && !printMatch(saved, lines, values.json === true, io)) code = 1;
+  return code;
+}
+
+function errorCode(error: unknown): string {
+  return typeof error === 'object' && error !== null && 'code' in error
+    ? String(error.code)
+    : 'error';
+}
+
+/** Checks the chain, prints what it found on stderr, and says whether it holds. */
+function verifyLog(
+  lines: readonly ReadLine[],
+  checkpoint: AuditCheckpoint | undefined,
+  io: CliIo,
+): boolean {
   const report = verifyAuditLines(lines, checkpoint);
   for (const problem of report.problems) {
     io.err(
@@ -393,10 +456,108 @@ export function runAuditCli(
     .join(', ');
   if (report.problems.length > 0) {
     io.err(`verify: BROKEN, ${String(report.problems.length)} problems; ${summary}`);
-    return 1;
+    return false;
   }
   io.err(`verify: chain intact; ${summary}`);
-  return 0;
+  return true;
+}
+
+interface SavedRecord {
+  ok: true;
+  record: SessionRecord;
+  /** Of the file's bytes, so a ticket can cite which file was checked. */
+  sha256: string;
+}
+
+/** How every refusal about the record names it: the value after --match may be a token pasted there (ADR 0028). */
+const MATCH_FILE = 'the file --match gives';
+
+/**
+ * The session record --match names, refused before a byte is read when it
+ * is larger than any record, and when it is no record with the reason's
+ * field paths only, never a value it holds (parseSessionRecord): the file
+ * names people and may have been edited by anyone.
+ */
+function readSessionRecord(given: string): SavedRecord | { ok: false; reason: string } {
+  let bytes: Buffer;
+  try {
+    const stat = statSync(given);
+    if (!stat.isFile()) return { ok: false, reason: `${MATCH_FILE} is not a file` };
+    if (stat.size > SESSION_RECORD_MAX_BYTES) {
+      return {
+        ok: false,
+        reason: `${MATCH_FILE} is larger than any session record (${String(SESSION_RECORD_MAX_BYTES)} bytes)`,
+      };
+    }
+    bytes = readFileSync(given);
+  } catch (error) {
+    return { ok: false, reason: `cannot read ${MATCH_FILE} (${errorCode(error)})` };
+  }
+  const text = bytes.toString('utf8');
+  const parsed = parseSessionRecord(text);
+  if (!parsed.ok) {
+    return {
+      ok: false,
+      reason: anotherVersion(text)
+        ? `${MATCH_FILE} is a session record of another version; this reader takes version ${String(SESSION_RECORD_VERSION)}`
+        : `${MATCH_FILE} is not a Tabdock session record (${parsed.reason})`,
+    };
+  }
+  return {
+    ok: true,
+    record: parsed.record,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+  };
+}
+
+/** A session record by its format whose version this reader does not take. */
+function anotherVersion(text: string): boolean {
+  try {
+    const value: unknown = JSON.parse(text);
+    return (
+      typeof value === 'object' &&
+      value !== null &&
+      'format' in value &&
+      value.format === 'tabdock.session-record' &&
+      'v' in value &&
+      value.v !== SESSION_RECORD_VERSION
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Prints each finding on stdout and the file's digest and the summary on stderr; true when it matched. */
+function printMatch(
+  saved: SavedRecord,
+  lines: readonly ReadLine[],
+  json: boolean,
+  io: CliIo,
+): boolean {
+  const report = matchSessionRecord(
+    saved.record,
+    lines.flatMap((line) => (line.record === null ? [] : [line.record])),
+  );
+  for (const finding of report.findings) {
+    io.out(
+      escapeForTerminal(
+        json
+          ? JSON.stringify(finding)
+          : `${finding.level === 'fail' ? 'FAIL' : 'note'} ${finding.kind}: ${finding.text}`,
+      ),
+    );
+  }
+  io.err(`record sha256 ${saved.sha256}`);
+  io.err(matchSummary(report));
+  return !report.failed;
+}
+
+function matchSummary(report: MatchReport): string {
+  const skew =
+    report.skewMs === null
+      ? 'no call matched, so no clock skew'
+      : `median skew ${(report.skewMs / 1000).toFixed(1)} s`;
+  return `match: ${report.failed ? 'FAILED' : 'agrees with the log'}; ${String(report.matched)} calls matched, ${String(report.missing)} missing, ${String(report.conflicts)} conflicts, ${String(report.unrecorded)} unrecorded (and ${String(report.withinDropped)} within the record's dropped span, ${String(report.unreached)} that may never have reached the page, ${String(report.unplaced)} that cannot be placed), ${skew}`;
 }
 
 // Run as a script in a checkout: the root .env, when there is one, may name

@@ -464,6 +464,9 @@ describe.each(ERAS)('confirmation in the client (%s)', (_label, modern) => {
     expect(records).toEqual([
       expect.objectContaining({ tool: 'wipe', outcome: 'ok', confirmedBy: 'client' }),
     ]);
+    // It names the invoke the page got (ADR 0045): on a 2025-era session the
+    // relay mints a second id once the question is answered, and that is the one.
+    expect(records[0]?.callId).toBe(invokes[0]?.callId);
   });
 
   it("asks in the relay's own words, never the page's title or a tool's description", async () => {

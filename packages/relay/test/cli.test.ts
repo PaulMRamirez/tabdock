@@ -225,6 +225,9 @@ describe('the usage, the version and the audit subcommand', () => {
     const packaged = context({}, true);
     expect(await runCommand(['audit', '--help'], packaged)).toBe(0);
     expect(packaged.printed[0]?.split('\n')[0]).toBe('Usage: tabdock-relay audit [options]');
+    // ADR 0045: a call line by the invoke's id, and a saved session record held to the log.
+    expect(packaged.printed[0]).toMatch(/^ {2}--call <id> +call records with this callId/m);
+    expect(packaged.printed[0]).toMatch(/^ {2}--match <file> +check a session record saved/m);
     const checkout = context({});
     expect(await runCommand(['audit', '--nope'], checkout)).toBe(2);
     expect(checkout.errors.join('\n')).toContain('Usage: pnpm audit:log [options]');
