@@ -3224,9 +3224,9 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     if (allow && agentId !== undefined) {
       // S4 and S5: never a token this page has not matched to its record,
       // never past the record's terms now, and only ever an observer.
-      const problem = record.verified ? agentProblem(request) : 'its token has not been checked';
+      const problem = record.verified ? agentProblem(request) : 'unchecked';
       if (problem !== null || !agent) {
-        log.warn(`refused agent token ${agentId}: ${problem ?? 'this page holds no record of it'}`);
+        log.warn(`refused agent token ${agentId}: ${problem ?? 'no record'}`);
         return decide(record, false, undefined, 'rule');
       }
       granted = 'observer';
@@ -4021,7 +4021,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     const text = readStored(agentsKey);
     const stored = text === null ? null : StoredAgentsSchema.safeParse(parseJson(text));
     // A strict schema: a record holding a token, or anything malformed, is no record at all.
-    if (stored && !stored.success) log.warn('ignored stored agent tokens that did not parse');
+    if (stored && !stored.success) log.warn('ignored unparsable stored agent tokens');
     if (stored?.success && (grantsPage === null || grantsPage === stored.data.pageId)) {
       agentsPage = stored.data.pageId;
       for (const agent of stored.data.agents) agentRecords.set(agent.tokenId, agent);
@@ -4048,23 +4048,26 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     return Math.min(agent.expiresAt, agent.createdAt + MAX_AGENT_LIFETIME_MS);
   }
 
-  /** Every token this page minted that the relay lists on the very terms it was minted with, oldest first. */
+  /**
+   * Every token this page minted that the relay lists on the very terms it
+   * was minted with, oldest first: the records are kept in minting order.
+   */
   function agentViews(): AgentView[] {
     const views: AgentView[] = [];
-    const oldestFirst = [...agentRecords.values()].sort((a, b) => a.createdAt - b.createdAt);
-    for (const agent of oldestFirst) {
+    for (const agent of agentRecords.values()) {
       const listing = agentListings.get(agent.tokenId);
-      if (!listing) continue;
-      views.push(
-        Object.freeze({
-          tokenId: agent.tokenId,
-          label: agent.label,
-          expiresAt: agentEnd(agent),
-          state: listing.state,
-          timeouts: Math.max(listing.timeouts, agent.timeouts),
-          sponsor: Object.freeze({ ...listing.sponsor }),
-        }),
-      );
+      if (listing) {
+        views.push(
+          Object.freeze({
+            tokenId: agent.tokenId,
+            label: agent.label,
+            expiresAt: agentEnd(agent),
+            state: listing.state,
+            timeouts: Math.max(listing.timeouts, agent.timeouts),
+            sponsor: Object.freeze(listing.sponsor),
+          }),
+        );
+      }
     }
     return views;
   }
@@ -4100,7 +4103,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     if (agentCancelSent.has(tokenId) || !isLinked()) return;
     if (send({ t: 'agent_cancel', tokenId })) {
       agentCancelSent.add(tokenId);
-      log.warn(`closed agent token ${tokenId}, which this page holds no record of`);
+      log.warn(`closed unknown agent token ${tokenId}`);
     }
   }
 
@@ -4119,7 +4122,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       for (const tokenId of [...agentRecords.keys()]) forgetAgent(tokenId, 'link_down');
       agentsPage = null;
     }
-    const refused = frame.refused?.tokenId;
+    const refused = frame.refused;
     const listed = new Map<string, AgentListing>();
     for (const listing of frame.agents) {
       const agent = agentRecords.get(listing.tokenId);
@@ -4127,19 +4130,19 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         agent !== undefined &&
         agent.label === listing.label &&
         agent.expiresAt === listing.expiresAt;
-      if (same && listing.tokenId !== refused) {
+      if (same && listing.tokenId !== refused?.tokenId) {
         listed.set(listing.tokenId, listing);
         continue;
       }
       if (agent) {
-        log.warn(`the relay listed agent token ${listing.tokenId} on terms this page never set`);
+        log.warn(`agent token ${listing.tokenId} listed on other terms`);
         forgetAgent(listing.tokenId, 'unavailable');
       }
       closeUnknownAgent(listing.tokenId);
     }
-    if (frame.refused !== undefined && agentMinting.has(frame.refused.tokenId)) {
-      log.info(`the relay refused agent token ${frame.refused.tokenId}: ${frame.refused.reason}`);
-      forgetAgent(frame.refused.tokenId, frame.refused.reason);
+    if (refused && agentMinting.has(refused.tokenId)) {
+      log.info(`relay refused agent token ${refused.tokenId}: ${refused.reason}`);
+      forgetAgent(refused.tokenId, refused.reason);
     }
     for (const tokenId of [...agentRecords.keys()]) {
       if (!listed.has(tokenId) && !agentMinting.has(tokenId)) forgetAgent(tokenId, 'cancelled');
@@ -4182,26 +4185,23 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     );
   }
 
-  /** Whatever about a token's own record stops its request now, beyond the token itself, or null. */
+  /**
+   * Whatever about a token's own record stops its request now, beyond the
+   * token itself, or null. An agent named with an account never gets here:
+   * the frame's schema refuses one.
+   */
   function agentProblem(request: PendingRequest): string | null {
-    const agent = request.agent === null ? undefined : agentRecords.get(request.agent.tokenId);
-    if (!agent || request.agent === null) return 'this page holds no record of it';
-    if (agentsPage !== state.pageId) return 'it was minted on another page session';
-    if (request.agent.label !== agent.label) return 'the relay named it by a label it never had';
-    // The relay's frame says as much (its schema), and this page checks again.
-    if (request.account.kind !== 'invitee' || request.account.verified) {
-      return 'the relay named an account for it, and an agent has none';
-    }
-    if (clock() >= agentEnd(agent)) return 'it has expired';
-    if (agent.burned || agent.timeouts >= AGENT_BURN_TIMEOUTS) return 'it is burned';
+    const agent = request.agent && agentRecords.get(request.agent.tokenId);
+    if (!agent) return 'no record';
+    if (agentsPage !== state.pageId) return 'another page session';
+    if (request.agent.label !== agent.label) return 'wrong label';
+    if (clock() >= agentEnd(agent)) return 'expired';
+    if (agent.burned || agent.timeouts >= AGENT_BURN_TIMEOUTS) return 'burned';
     // The page's policy as it stands now, which a reload may have narrowed since minting.
-    if (policy.invites === 'off') return "the page's policy no longer allows it";
+    if (policy.invites === 'off') return 'policy';
     const { userId } = request.user;
-    if (revoked.has(userId)) return 'the operator revoked this agent';
-    if (state.roster.some((attachment) => attachment.userId === userId)) {
-      return 'the agent is already attached';
-    }
-    return null;
+    if (revoked.has(userId)) return 'revoked';
+    return state.roster.some((attachment) => attachment.userId === userId) ? 'attached' : null;
   }
 
   /**
@@ -4229,22 +4229,19 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         const key = await sha256Hex(webCrypto, agentKeyInput(pageId, tokenId));
         derived = `g_${key.slice(0, INVITEE_KEY_HEX_CHARS)}`;
       } catch (error) {
-        log.warn(`could not hash a presented agent token: ${describe(error)}`);
+        log.warn(`agent token hash failed: ${describe(error)}`);
       }
     }
     // Answered meanwhile: expired, revoked, the token forgotten, or the link lost.
     if (requests.get(request.requestId) !== record) return;
-    const problem = !kept
-      ? 'this page holds no record of it'
-      : !webCrypto
-        ? 'this page has no WebCrypto to check its token'
-        : !matches
-          ? "the token presented is not the one this page's record was made from"
-          : derived !== request.user.userId
-            ? 'the relay named it by an id that is not its own'
-            : agentProblem(request);
+    // Without a record or WebCrypto nothing matches, so nothing is honoured.
+    const problem = !matches
+      ? 'wrong token'
+      : derived !== request.user.userId
+        ? 'wrong agent id'
+        : agentProblem(request);
     if (problem !== null) {
-      log.warn(`refused agent token ${tokenId} from ${logName(request.user)}: ${problem}`);
+      log.warn(`refused agent token ${tokenId}: ${problem}`);
       decide(record, false, undefined, 'rule');
       return;
     }
@@ -4272,13 +4269,10 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    */
   function agentRefused(agent: StoredAgent, cause: 'operator' | 'timeout'): void {
     const timeouts = cause === 'timeout' ? agent.timeouts + 1 : agent.timeouts;
-    if (cause === 'operator' || timeouts >= AGENT_BURN_TIMEOUTS) {
-      agentRecords.set(agent.tokenId, { ...agent, burned: true, timeouts });
-      cancelAgent(agent.tokenId);
-      return;
-    }
-    agentRecords.set(agent.tokenId, { ...agent, timeouts });
-    saveAgents();
+    const burned = cause === 'operator' || timeouts >= AGENT_BURN_TIMEOUTS;
+    agentRecords.set(agent.tokenId, { ...agent, burned, timeouts });
+    if (burned) cancelAgent(agent.tokenId);
+    else saveAgents();
   }
 
   /**
@@ -4291,10 +4285,11 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       for (const tokenId of [...agentRecords.keys()]) forgetAgent(tokenId, 'cancelled');
       return;
     }
-    const listed = state.roster.find((attachment) => attachment.userId === target)?.inviteId;
     const tokenId =
-      agentUsers.get(target) ?? (listed !== null && listed !== undefined ? listed : undefined);
-    if (tokenId !== undefined && agentRecords.has(tokenId)) cancelAgent(tokenId);
+      agentUsers.get(target) ??
+      state.roster.find((attachment) => attachment.userId === target)?.inviteId;
+    // cancelAgent passes over an id that names no token: an invite's, or none.
+    if (tokenId) cancelAgent(tokenId);
   }
 
   /**
@@ -4317,14 +4312,13 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     const offered = state.agentsOffered;
     if (offered === null || !webCrypto) return refuse('unavailable');
     if (offered.endpoint === null) return refuse('no_public_url');
-    if (agentRecords.size >= MAX_LIVE_AGENTS_PER_PAGE) return refuse('limit');
     const token = `${AGENT_TOKEN_PREFIX}${randomText(webCrypto, AGENT_TOKEN_BYTES)}`;
     const tokenId = `agt_${randomText(webCrypto, INVITE_ID_BYTES)}`;
     let secretHash: string;
     try {
       secretHash = await sha256Hex(webCrypto, token);
     } catch (error) {
-      log.warn(`could not hash a new agent token: ${describe(error)}`);
+      log.warn(`agent token hash failed: ${describe(error)}`);
       return refuse('unavailable');
     }
     // The link may have dropped, or the page closed, while the hash was made.
@@ -4350,7 +4344,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     return new Promise<AgentTokenResult>((resolve) => {
       const timer = timers.setTimeout(() => {
         if (!agentMinting.has(tokenId)) return;
-        log.warn(`the relay never answered agent token ${tokenId}; closing it`);
+        log.warn(`no answer for agent token ${tokenId}`);
         forgetAgent(tokenId, 'unavailable');
         closeUnknownAgent(tokenId);
       }, MINT_ANSWER_MS);

@@ -317,7 +317,7 @@ describe("a token's first request (S4)", () => {
     });
   }
 
-  it("is refused once the token has expired on the page's clock, or the page takes no invites now", async () => {
+  it("is refused once the token has expired on the page's clock", async () => {
     const { h, socket, listed } = await offering();
     const minted = await mintAgent(h, socket, listed);
     // Past its end on this page's clock, with no timer run, as a relay whose clock lags would see it.
@@ -328,6 +328,31 @@ describe("a token's first request (S4)", () => {
     expect(h.dock.state.pendingRequests).toEqual([]);
     expect(socket.framesOf('attach_decision').at(-1)).toMatchObject({
       requestId: 'late',
+      allow: false,
+    });
+  });
+
+  it('is refused once a reload leaves the page taking no invites', async () => {
+    const storage = new MapStorage();
+    const first = setup({ storage, core: { policy: { invites: 'all' } } });
+    const socket = await link(first);
+    socket.deliver(agentsFrame([]));
+    await flush();
+    const minted = await mintAgent(first, socket, []);
+    const reloaded = setup({ storage, core: { policy: { invites: 'off' } } });
+    const again = await link(
+      reloaded,
+      { resumed: true, roster: [attachment('alice', 'driver')] },
+      {},
+    );
+    again.deliver(agentsFrame([listingOf(minted.create)]));
+    await flush();
+    const frame = agentRequest(reloaded, minted, { requestId: 'after-reload' });
+    again.deliver(frame);
+    await checked(reloaded, 'after-reload');
+    expect(reloaded.dock.state.pendingRequests).toEqual([]);
+    expect(again.framesOf('attach_decision').at(-1)).toMatchObject({
+      requestId: 'after-reload',
       allow: false,
     });
   });
