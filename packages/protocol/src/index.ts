@@ -8,3 +8,4 @@ export * from './page-link.ts';
 export * from './session-record.ts';
 export * from './sessions.ts';
 export * from './storage.ts';
+export * from './snapshot.ts';
