@@ -107,8 +107,10 @@ jobs:
               exit 1
             fi
             names+=(TABDOCK_MEMBERS_FILE)
+            unused=TABDOCK_OAUTH_USERS
           else
             names+=(TABDOCK_OAUTH_USERS)
+            unused=TABDOCK_MEMBERS_FILE
           fi
           # Checked before anything is staged, so a missing secret stages nothing.
           for name in FLY_API_TOKEN FLY_APP "${names[@]}"; do
@@ -124,6 +126,10 @@ jobs:
           # printf is a shell builtin: no value reaches a process's arguments.
           for name in "${names[@]}"; do printf '%s=%s\n' "$name" "${!name}"; done |
             flyctl secrets import --stage --app "$FLY_APP"
+          # Fly keeps a secret until it is unset, so the one not in use goes:
+          # a move between the secret and the file, either way, never leaves
+          # both set. Unsetting one that is not set is no error (docs/notes/verified.md).
+          flyctl secrets unset --stage --app "$FLY_APP" "$unused"
       - name: Deploy the image
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

@@ -484,7 +484,12 @@ describe('the image and the workflows, as they run (comments left out)', () => {
     expect(stage).toContain('TABDOCK_MEMBERS_FILE: ${{ vars.TABDOCK_MEMBERS_FILE }}');
     expect(stage).not.toContain('secrets.TABDOCK_MEMBERS_FILE');
     expect(stage).toMatch(
-      /if \[\[ -n "\$TABDOCK_MEMBERS_FILE" \]\]; then\n\s+if \[\[ -n "\$TABDOCK_OAUTH_USERS" \]\]; then\n[^\n]*\n\s+exit 1\n\s+fi\n\s+names\+=\(TABDOCK_MEMBERS_FILE\)\n\s+else\n\s+names\+=\(TABDOCK_OAUTH_USERS\)\n\s+fi\n/,
+      /if \[\[ -n "\$TABDOCK_MEMBERS_FILE" \]\]; then\n\s+if \[\[ -n "\$TABDOCK_OAUTH_USERS" \]\]; then\n[^\n]*\n\s+exit 1\n\s+fi\n\s+names\+=\(TABDOCK_MEMBERS_FILE\)\n\s+unused=TABDOCK_OAUTH_USERS\n\s+else\n\s+names\+=\(TABDOCK_OAUTH_USERS\)\n\s+unused=TABDOCK_MEMBERS_FILE\n\s+fi\n/,
+    );
+    // Fly keeps a secret until it is unset, so the one not in use is unset
+    // after the import, by name alone: a move either way never leaves both.
+    expect(hashCode(stage)).toMatch(
+      /flyctl secrets import --stage --app "\$FLY_APP"\n\s+flyctl secrets unset --stage --app "\$FLY_APP" "\$unused"$/m,
     );
   });
 
