@@ -627,6 +627,60 @@ describe('the relay-wide ceiling on what responses hold (S9, ADR 0044)', () => {
     expect(named(lines, RESPONSE_CEILING_LINE)).toEqual([]);
   });
 
+  it("never cuts an older invited stream for what is being written to its client, and cuts a newer guest's unread answer instead", () => {
+    const { stalls, lines, close } = watchCeiling(10 * MB);
+    // A watcher's stream, the oldest response, read as fast as it comes: a
+    // keep-alive just queued, and Node at its high-water mark from the last
+    // push, as with any response being written.
+    const reading = holding(stalls, 'guest-1', 13);
+    reading.response.write(65_536 + RESPONSE_SLICE_BYTES + 16);
+    const unread = [holding(stalls, 'guest-2', 4 * MB), holding(stalls, 'guest-3', 4 * MB)];
+    holding(stalls, 'alice', 2.09 * MB);
+    stalls.chunkQueued();
+    // 10.17 MB: the older unread answer goes, and the rest fit.
+    expect(reading.response.destroyed).toBe(false);
+    expect(unread.map(({ response }) => response.destroyed)).toEqual([true, false]);
+    close();
+    expect(named(lines, RESPONSE_CEILING_LINE)).toEqual(['guest-2']);
+  });
+
+  it("cuts an invited account's small response past the ceiling once a check finds its client took none of it", () => {
+    const { stalls, close } = watchCeiling(10 * MB);
+    const small = holding(stalls, 'guest-1', 0);
+    small.response.write(50_000);
+    holding(stalls, 'alice', 9.99 * MB);
+    stalls.chunkQueued();
+    // In transit as far as anyone can tell yet, and then first seen waiting.
+    stalls.check();
+    expect(small.response.destroyed).toBe(false);
+    // No more sent since: its client is not reading.
+    stalls.check();
+    expect(small.response.destroyed).toBe(true);
+    close();
+  });
+
+  it("cuts no invited account's response while members' alone pass the ceiling, since that could not bring them under", () => {
+    const { stalls, lines, close } = watchCeiling(10 * MB);
+    const older = holding(stalls, 'guest-1', 3 * MB);
+    holding(stalls, 'alice', 6 * MB);
+    const bob = holding(stalls, 'bob', 5 * MB);
+    // A stranger's answer and a guest's arrive, each read into its slicer.
+    const arriving = [holding(stalls, 'stranger-1', 720_000), holding(stalls, 'guest-2', 2000)];
+    stalls.chunkQueued();
+    stalls.check();
+    expect([older, ...arriving].some(({ response }) => response.destroyed)).toBe(false);
+    // Once members' fit again, invited accounts give way as before.
+    bob.response.emit('finish');
+    holding(stalls, 'carol', 0.9 * MB);
+    stalls.answering('carol');
+    // 10.62 MB with members at 6.9 MB: the stranger's goes, and the rest fit.
+    expect(arriving.map(({ response }) => response.destroyed)).toEqual([true, false]);
+    expect(older.response.destroyed).toBe(false);
+    close();
+    expect(named(lines, RESPONSE_CEILING_MEMBERS_LINE)).toEqual([undefined]);
+    expect(named(lines, RESPONSE_CEILING_LINE)).toEqual(['stranger-1']);
+  });
+
   it('holds the ceiling as a slicer queues a chunk and at every check, before any answer is handed over', () => {
     const { stalls, close } = watchCeiling(10 * MB);
     const first = holding(stalls, 'guest-1', 5 * MB);

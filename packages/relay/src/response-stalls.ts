@@ -49,15 +49,22 @@
 // Those bound each user, not the relay: some 40 members, or 110 invitees
 // holding pages, all leaving answers unread at once would fill what the
 // reference host leaves beside its heap, and image answers (ADR 0039) are
-// larger than the counts assumed. So the relay also caps the bytes every
-// watched response holds together (TABDOCK_MAX_RESPONSE_BYTES, ADR 0044).
-// What a response holds is what inSlices has read of its answer and not yet
-// handed on, plus what Node holds of it unsent; inSlices reads the SDK's
-// body as it comes, so an unread answer's bytes sit in a queue it can count
-// rather than in the SDK's stream, where they sat before uncounted. Past the
-// cap, strangers' responses go first, then guests', each oldest first, as
-// sessions give way (sessions.ts); a member's never does, since members are
-// the owner's own and each is bounded by the count above.
+// larger than the counts assumed. So the relay also caps what invited
+// accounts' answers waiting to be read may add to all that watched responses
+// hold (TABDOCK_MAX_RESPONSE_BYTES, ADR 0044). What a response holds is what
+// inSlices has read of its answer and not yet handed on, plus what Node
+// holds of it unsent; inSlices reads the SDK's body as it comes, so an
+// unread answer's bytes sit in a queue it can count rather than in the SDK's
+// stream, where they sat before uncounted. Past the total, strangers'
+// responses waiting to be read go first, then guests', each oldest first, as
+// sessions give way (sessions.ts), until the rest fit. A member's never
+// does, since members are the owner's own and each is bounded by the count
+// above, so members' alone may still pass the total, the 40 above remaining
+// their bound; then nothing is cut, since no cut could bring it under, and a
+// line says so. A response holding no more than one being written holds
+// (RESPONSE_IN_TRANSIT_BYTES) is taken as waiting only once a check finds
+// its client took none of it, so a watcher's stream read as fast as it
+// comes is never cut for the keep-alive that set the check off.
 
 import { InviteeIdSchema } from '@tabdock/protocol';
 import type { RepeatedLog } from './repeated-lines.ts';
@@ -101,6 +108,16 @@ export function responsesWaitingFor(userId: string): number {
  * for 'drain' between them, and each finished write shows as progress.
  */
 export const RESPONSE_SLICE_BYTES = 16_384;
+
+/**
+ * What a response holds while it is being written, read or not: Node's
+ * high-water mark (64 KiB on Node 22), the slice whose write passed it, and
+ * a slice more just read from its answer. A stream read as fast as it comes
+ * holds that much the moment a keep-alive or a push arrives, so the ceiling
+ * takes a response as waiting to be read only past it, or once a check has
+ * found its client took none of it.
+ */
+export const RESPONSE_IN_TRANSIT_BYTES = 65_536 + 2 * RESPONSE_SLICE_BYTES;
 
 /** The line a cut past the relay-wide ceiling writes, once a window and counted after. */
 export const RESPONSE_CEILING_LINE =
@@ -447,22 +464,45 @@ export class ResponseStalls {
     return total;
   }
 
+  #heldByMembers(): number {
+    let total = 0;
+    for (const [response, watched] of this.#watched) {
+      if (this.#rankOf(watched.userId) === MEMBER) total += this.#held(response, watched);
+    }
+    return total;
+  }
+
   /**
-   * Past the ceiling, cuts strangers' responses holding bytes, oldest first,
-   * then guests', until the rest fit; a member's never. When members'
-   * alone pass it, nothing is cut and a line says so.
+   * Waiting to be read: holding more than any response being written holds,
+   * or anything at all once a check has found its client took none of it.
+   * The chunk that set off the check, and a reader's stream at its
+   * high-water mark, are not.
+   */
+  #waiting(response: WatchedResponse, watched: Watched): boolean {
+    const held = this.#held(response, watched);
+    return held > RESPONSE_IN_TRANSIT_BYTES || (held > 0 && watched.stalls > 0);
+  }
+
+  /**
+   * Past the ceiling, cuts strangers' responses waiting to be read, oldest
+   * first, then guests', until the rest fit; a member's never. When
+   * members' alone pass it, nothing is cut, since no cut could bring the
+   * total under, and a line says so.
    */
   #ceiling(): void {
     if (this.#ceilingBytes === Number.POSITIVE_INFINITY) return;
     let total = this.#heldInAll();
     if (total <= this.#ceilingBytes) return;
+    if (this.#heldByMembers() > this.#ceilingBytes) {
+      this.#lines.write('warn', RESPONSE_CEILING_MEMBERS_LINE);
+      return;
+    }
     for (const rank of GIVES_WAY) {
       for (const [response, watched] of [...this.#watched]) {
         if (total <= this.#ceilingBytes) return;
         // Gone with an earlier cut's connection.
         if (!this.#watched.has(response)) continue;
-        const held = this.#held(response, watched);
-        if (held <= 0 || this.#rankOf(watched.userId) !== rank) continue;
+        if (this.#rankOf(watched.userId) !== rank || !this.#waiting(response, watched)) continue;
         this.#cut(response, RESPONSE_CEILING_LINE);
         // Counted again, not less this one: cutting a response ends its
         // connection, the socket it holds or the one it is queued on, and
@@ -471,7 +511,8 @@ export class ResponseStalls {
         total = this.#heldInAll();
       }
     }
-    if (total > this.#ceilingBytes) this.#lines.write('warn', RESPONSE_CEILING_MEMBERS_LINE);
+    // What is left over is being written to invited accounts' clients; the
+    // stall rule ends any of it a client stops reading.
   }
 
   #cut(response: WatchedResponse, line: string): void {
