@@ -1952,9 +1952,23 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    * `listed`. An invite-made grant gives nothing past its end, and never
    * more than its invite's role (S14). autoApprove lets in members only: an
    * invitee comes in through an invite this page honoured, or not at all,
-   * whatever the relay says (ADR 0017's notes).
+   * whatever the relay says (ADR 0017's notes). A running session's seats
+   * hold here too, whatever the relay lists (S5; ADR 0043, decision 13): of
+   * the drivers this page would run, only the oldest grants by the roster's
+   * order drive, as the relay demotes the newest first.
    */
   function pageRole(userId: string, listed: Role): Role | null {
+    const role = grantedRole(userId, listed);
+    if (role !== 'driver' || session === null) return role;
+    const seated = state.roster
+      .filter((entry) => grantedRole(entry.userId, entry.role) === 'driver')
+      .sort((a, b) => a.grantedAt - b.grantedAt)
+      .slice(0, effective().maxDrivers);
+    return seated.some((entry) => entry.userId === userId) ? 'driver' : 'observer';
+  }
+
+  /** pageRole before a running session's seats. */
+  function grantedRole(userId: string, listed: Role): Role | null {
     if (revoked.has(userId)) return null;
     const grant = grants.get(userId);
     let granted: Role;

@@ -17,6 +17,7 @@ import type { CoreOptions, CryptoLike } from '../src/core.ts';
 import type { Harness } from './harness.ts';
 import {
   attachment,
+  attachRequest,
   FakeSocket,
   flush,
   GUEST,
@@ -193,6 +194,32 @@ describe('S5: a session is never wider than attach()', () => {
     expect(start.policy).toEqual({ maxDrivers: 1, proposals: 'off' });
     socket.deliver(listed(start));
     expect((await pending).ok).toBe(true);
+  });
+
+  it('runs no write by a driver past its seats, whatever the relay lists, the oldest grants driving', async () => {
+    // Two seats in attach(), one in the session: Bob, allowed as a driver once
+    // it runs, is one an honest relay seats as an observer; this one lists him
+    // as a driver all the same.
+    const { h, socket } = await offering({ invites: 'watch', maxDrivers: 2 });
+    await started(h, socket, { label: 'Class', lengthMinutes: 30, drivers: 1 });
+    socket.deliver(attachRequest(h.clock, 'req-bob'));
+    expect(h.dock.approve('req-bob', 'driver')).toBe(true);
+    socket.deliver({
+      t: 'roster',
+      attachments: [attachment('alice', 'driver', 1), attachment('bob', 'driver', 2)],
+    });
+    const bob = { userId: 'bob', displayName: 'Bob', client: null, role: 'driver' as const };
+    socket.deliver(invoke('set_value', { callId: 'bob-write', caller: bob }));
+    await flush();
+    socket.deliver(invoke('set_value', { callId: 'alice-write' }));
+    await flush();
+    expect(codes(socket)).toEqual(['role_denied', 'ok']);
+    expect(h.dock.state.pageRoles.find((role) => role.userId === 'bob')?.role).toBe('observer');
+    // Its end gives the page's own two seats back.
+    expect(h.dock.endSession()).toBe(true);
+    socket.deliver(invoke('set_value', { callId: 'bob-after', caller: bob }));
+    await flush();
+    expect(codes(socket)).toEqual(['role_denied', 'ok', 'ok']);
   });
 
   it('narrows only maxDrivers and proposals, leaving every other field as attach() set it', async () => {
