@@ -6,13 +6,15 @@
 //
 // It approves nothing a person could not: it clicks only a button whose box
 // has held still (data-armed, the widget's 500 ms wait) and that a hit test
-// says a click at its centre would reach, it checks both again just before
-// the press, and it approves an attach request only when exactly one waiting
-// request carries the client name or request id it was given. It reads only
-// the closed shadow root of the one tabdock-dock host in the main document,
-// never light DOM or a frame, so a page's own element named like the
-// widget's cannot pass for it. No setting or hook approves without the click
-// (S4; option C stays rejected).
+// says a click at its centre would reach, and checks both again just before
+// the press. It presses nothing when more than one button matches what it was
+// asked for, so a click naming no request never approves whichever of two
+// prompts comes first, and allowAttach approves an attach request only when
+// exactly one waiting request carries the client name or request id it was
+// given. It reads only the closed shadow root of the one tabdock-dock host in
+// the main document, never light DOM or a frame, so a page's own element
+// named like the widget's cannot pass for it. No setting or hook approves
+// without the click (S4; option C stays rejected).
 //
 // It runs nothing in the page. It reads the widget from the tree
 // DOM.getDocument sends, text included, and presses with trusted input, so a
@@ -71,7 +73,10 @@ export interface WaitOptions {
   timeoutMs?: number;
 }
 
-/** A widget button, by its data-action, optionally inside one box. */
+/**
+ * A widget button, by its data-action, optionally inside one box. The helper
+ * presses only a button the target matches alone.
+ */
 export interface WidgetTarget {
   action: WidgetAction;
   /** Inside the prompt for one attach request. */
@@ -275,6 +280,12 @@ export async function waitingPrompts(cdp: DevToolsSession): Promise<WaitingPromp
   return { attach: attachPrompts(widget), confirm };
 }
 
+/**
+ * The target's button, or null while there is none. Throws, so nothing is
+ * pressed, when more than one carries the action where the target looks: a
+ * target naming no box, with two attach prompts waiting, must not approve
+ * whichever comes first (allowAttach's rule, for every click).
+ */
 function findButton(widget: DevToolsNode, target: WidgetTarget): DevToolsNode | null {
   const scoped: [string, string | undefined][] = [
     ['data-request-id', target.requestId],
@@ -284,7 +295,16 @@ function findButton(widget: DevToolsNode, target: WidgetTarget): DevToolsNode | 
   ];
   const [name, value] = scoped.find(([, id]) => id !== undefined) ?? [null, undefined];
   const scope = name === null ? widget : find(widget, (n) => attribute(n, name) === value);
-  return scope && find(scope, (n) => attribute(n, 'data-action') === target.action);
+  if (scope === null) return null;
+  const found = [...widgetNodes(scope)].filter(
+    (n) => attribute(n, 'data-action') === target.action,
+  );
+  if (found.length > 1) {
+    throw new WidgetTestError(
+      `${String(found.length)} ${target.action} buttons match, so none is pressed`,
+    );
+  }
+  return found[0] ?? null;
 }
 
 function contains(node: DevToolsNode, backendNodeId: number): boolean {

@@ -546,6 +546,26 @@ describe('arming and the hit test', () => {
     expect(cdp.presses()).toBe(1);
   });
 
+  it('refuses to choose when a target naming no box matches more than one button, pressing nothing', async () => {
+    const cdp = new FakeSession(
+      documentOf(dock([prompt('req-1', CI, 0), prompt('req-2', 'someone-else', 100)])),
+    );
+    for (const action of ['approve-driver', 'approve-observer', 'deny'] as const) {
+      await expect(clickInWidget(cdp, { action })).rejects.toThrow(
+        new WidgetTestError(`2 ${action} buttons match, so none is pressed`),
+      );
+      await expect(widgetButton(cdp, { action })).rejects.toThrow(WidgetTestError);
+    }
+    expect(cdp.mouse()).toEqual([]);
+
+    // One prompt, or a box named: the one button is pressed.
+    const one = new FakeSession(documentOf(dock([prompt('req-1', CI, 0)])));
+    await clickInWidget(one, { action: 'approve-driver' });
+    expect(one.presses()).toBe(1);
+    await clickInWidget(cdp, { action: 'deny', requestId: 'req-2' });
+    expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: 260, y: 150 });
+  });
+
   it('refuses an action the widget does not have', async () => {
     const cdp = new FakeSession(documentOf(dock([])));
     const target = { action: 'approve-everyone' } as unknown as Parameters<typeof clickInWidget>[1];
