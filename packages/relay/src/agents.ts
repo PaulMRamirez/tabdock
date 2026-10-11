@@ -3,11 +3,25 @@
 // closed with the page, their sponsor or a time-boxed session's end. Neither
 // a token nor its digest ever reaches a line or a record.
 
+import type { AuditEventOf } from '@tabdock/protocol';
 import type { PagePart } from './page-parts.ts';
+
+/** Why a token stopped being live, as its agent_closed record says. */
+export type AgentCloseReason = AuditEventOf<'agent_closed'>['reason'];
 
 export class AgentTokens implements PagePart {
   // M6 seam: not built. It holds nothing yet, so no change to a page has
   // anything here to end; the PagePart methods take no arguments until then.
+
+  /**
+   * Closes every live token on the page for `reason`, as a time-boxed
+   * session's end does (C11, ADR 0043), answering how many it closed.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- holds nothing to close until ADR 0044's tokens
+  closeAll(_pageId: string, _reason: AgentCloseReason): number {
+    return 0;
+  }
+
   sleep(): void {
     // Nothing held.
   }
