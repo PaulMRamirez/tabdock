@@ -84,3 +84,7 @@ Conflicts between the M6 records, settled by the plan, that touch this one:
 **From ADR 0046.** The restart snapshot is its own record, off by default and bound to the audit chain (C15), so a deploy during a lesson keeps the room only where the operator chose it.
 
 **Open questions.** Settled under Decisions: the file's format (1) and stat polling (2), presets in the widget and `dock.startSession()` only (7), extension by the operator alone (8), and a time box only in local mode (9).
+
+## Notes from the build (10 October 2026)
+
+**At once, for an MCP session.** A member list change ends every 2025-era MCP session held under a user id it ended at the moment it applies: from then on the session answers every request 404, as an unknown one does. A session with nothing open closes then; one still writing an answer, such as the `not_attached` the change gave a call in flight, closes when its last response is done, and after `MEMBER_SESSIONS_CLOSE_MS` (1 s) at the latest, since a client's listening GET stream never ends on its own. Listen streams close at once, since they carry no answers. Only the sessions and streams held when the change applies end, so a member the change adds, or the new holder of an id it moved, keeps one opened a moment later. This is how S8's "at once" and A6.14 hold for sessions.

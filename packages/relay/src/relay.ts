@@ -126,9 +126,11 @@ import { Spike, type SpikeControl } from './spike.ts';
 import { type AuditLog, callRecords, createMemoryStore, recordAudit } from './store.ts';
 
 /**
- * How long after a member list change the sessions of the ids it ended
- * close: long enough for the answers the hub just gave their calls to be
- * written (ADR 0043).
+ * The longest a 2025-era session a member list change ended stays open to
+ * finish answering, so the answers the hub just gave its calls are written
+ * (ADR 0043). One with nothing open closes at once, and one answering
+ * closes when its last response is done; this bounds a client's listening
+ * GET stream, which never ends on its own. It serves no new request meanwhile.
  */
 export const MEMBER_SESSIONS_CLOSE_MS = 1000;
 
@@ -705,15 +707,13 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     lines: mcpLines,
     createHandler: strictHandler,
   });
-  /** Session closes a member list change set going, cleared when the relay closes. */
-  const memberCloses = new Set<NodeJS.Timeout>();
   /**
    * A new member list from the file (ADR 0043), in force for the next
-   * request at once. Whatever an account held under a user id the change
-   * took from it ends now, every way in (S8): attachments, requests and
-   * invites in the hub, then /pair sign-ins, and a moment later 2025-era
-   * sessions and listen streams. The line names user ids and counts, never a
-   * sub or a name.
+   * request at once. Whatever is held under a user id the change ended ends
+   * now, every way in (S8): attachments, requests and invites in the hub,
+   * /pair sign-ins, listen streams, and the 2025-era sessions held now, each
+   * serving nothing more and closing once its answers are out. The line
+   * names user ids and counts, never a sub or a name.
    */
   const applyMembers = (entries: MemberEntry[], digest: string): void => {
     if (members === null) return;
@@ -728,26 +728,15 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       attachments,
       signIns,
     });
-    // A call or a pair_page the hub just ended answers not_attached or
-    // pairing_expired on the session it came in on, so the session closes
-    // once that answer is written. Meanwhile it serves nothing more under the
-    // old id: every request maps its token through the new list, and a
-    // session answers 404 to any other user than its own (sessions.ts).
-    const ended = [...change.ended];
-    const timer = setTimeout(() => {
-      memberCloses.delete(timer);
-      let mcpSessions = 0;
-      let streams = 0;
-      for (const userId of ended) {
-        mcpSessions += sessions.closeUser(userId);
-        streams += listens.closeUser(userId);
-      }
-      if (mcpSessions + streams > 0) {
-        log.info('sessions closed for a member list change', { mcpSessions, streams });
-      }
-    }, MEMBER_SESSIONS_CLOSE_MS);
-    timer.unref();
-    memberCloses.add(timer);
+    // Only those held now: the change may give an id to someone new, whose
+    // session or stream opened a moment later is theirs. A call or a
+    // pair_page the hub just ended answers not_attached or pairing_expired on
+    // the session it came in on, which closes once that answer is written.
+    const mcpSessions = sessions.endUsers(change.ended, MEMBER_SESSIONS_CLOSE_MS);
+    const streams = listens.endUsers(change.ended);
+    if (mcpSessions + streams > 0) {
+      log.info('sessions closed for a member list change', { mcpSessions, streams });
+    }
   };
   // The marker concerns every member, who all list it (spike.ts).
   spike?.setNotifier(() => {
@@ -1285,7 +1274,6 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     close() {
       closing ??= (async () => {
         membersWatch?.stop();
-        for (const timer of memberCloses) clearTimeout(timer);
         pair?.close();
         await hub.shutdown();
         // After the hub, whose shutdown audits the calls it fails (ADR 0019).

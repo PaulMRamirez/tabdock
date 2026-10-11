@@ -143,13 +143,15 @@ export class ListenStreams {
   }
 
   /**
-   * Ends every stream of a user whose account a member list change moved to
-   * another id (ADR 0043, S8), and one still being answered with them: its
-   * user's handler closes with the last, and the listen answers nothing.
-   * Nothing gives way any more to a listen of theirs.
+   * Ends, at once, the streams held now under user ids a member list change
+   * ended (ADR 0043, S8), and those still being answered: each user's handler
+   * closes with their last, and a listen being answered answers nothing.
+   * Nothing gives way any more to a listen of theirs. A stream carries only
+   * notifications, never a call's answer, so nothing is cut short; and only
+   * those held now end, since the change can give an id to someone new.
    */
-  closeUser(userId: string): number {
-    const own = [...this.#held].filter((held) => held.userId === userId);
+  endUsers(userIds: ReadonlySet<string>): number {
+    const own = [...this.#held].filter((held) => userIds.has(held.userId));
     for (const held of this.#held) {
       if (held.givingWayTo !== null && own.includes(held.givingWayTo)) held.givingWayTo = null;
     }
@@ -202,7 +204,8 @@ export class ListenStreams {
       throw error;
     }
     // A refusal, a listen sent as a notification, a client already gone, or a
-    // user whose membership changed while it was answered (closeUser): nobody gives way.
+    // user whose id a member list change ended while it was answered
+    // (endUsers): nobody gives way.
     if (!isStream(response) || signal.aborted || !this.#held.has(held)) {
       this.#release(held, givingWay);
       if (isStream(response)) await response.body?.cancel().catch(() => undefined);

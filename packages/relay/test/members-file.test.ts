@@ -34,6 +34,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { startRelay as startFromEnv } from '../src/cli.ts';
 import { resolveConfig } from '../src/config.ts';
 import { type DevTokenUser, inviteeKeyOf, loadConfigFromEnv } from '../src/index.ts';
+import { MEMBER_SESSIONS_CLOSE_MS } from '../src/relay.ts';
 import {
   attachMember,
   call,
@@ -506,6 +507,78 @@ describe('a user id the file moves (S13)', () => {
     const other = await relay.claude('sub-other');
     expect((await call(other, 'list_pages')).structured).toEqual({ pages: [] });
     expect((await latest(live, 'roster')).attachments).toEqual([]);
+  });
+});
+
+describe('what a reload leaves alone (ADR 0043)', () => {
+  const pause = (ms: number): Promise<void> =>
+    new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  /** Whether a listen stream is still open after `ms`. */
+  async function openAfter(listen: { ended: Promise<void> }, ms: number): Promise<boolean> {
+    return Promise.race([listen.ended.then(() => false), pause(ms).then(() => true)]);
+  }
+
+  it('keeps the session and listen stream a member added by it opens at once', async () => {
+    const { relay, save: saveMembers } = await membersRelay([ALICE], { invites: false });
+    const page = await relay.page();
+    saveMembers([ALICE, BOB]);
+    expect(await relay.relay.reloadMembers()).toBe('applied');
+    // In the first moment after the change, as a member who kept retrying would.
+    const bob = await relay.claude('sub-bob');
+    await attachMember(bob, page);
+    const token = await relay.provider.token({ sub: 'sub-bob', aud: PUBLIC_MCP_URL });
+    const listen = await openListen(relay.relay, { userId: 'bob', displayName: 'Bob', token });
+    expect(listen.streaming).toBe(true);
+    expect(await openAfter(listen, MEMBER_SESSIONS_CLOSE_MS + 500)).toBe(true);
+    expect(
+      (await call(bob, 'call_page_tool', { page: page.pageId, tool: 'get_view' })).isError,
+    ).toBe(false);
+    expect(linesOf(relay)).not.toContain('membership changed');
+    listen.close();
+  });
+
+  it("ends the former holder's session of a reused id, and keeps the new holder's", async () => {
+    const { relay, save: saveMembers } = await membersRelay([ALICE, BOB]);
+    const page = await relay.page();
+    const former = await relay.claude('sub-bob');
+    expect((await call(former, 'list_pages')).isError).toBe(false);
+    // Another subject now takes the id bob.
+    saveMembers([ALICE, 'sub-other=bob:Bob']);
+    expect(await relay.relay.reloadMembers()).toBe('applied');
+    const holder = await relay.claude('sub-other');
+    await attachMember(holder, page);
+    await pause(MEMBER_SESSIONS_CLOSE_MS + 500);
+    expect(
+      (await call(holder, 'call_page_tool', { page: page.pageId, tool: 'get_view' })).isError,
+    ).toBe(false);
+    expect(await rejection(call(former, 'list_pages'))).toMatch(/404|not found/i);
+    const closed = relay
+      .events()
+      .filter((line) => line.msg === 'MCP session closed' && line.reason === 'membership changed');
+    expect(closed).toHaveLength(1);
+  });
+
+  it('lets the answer it gave a call in flight reach that call, then ends the session', async () => {
+    const { relay, save: saveMembers } = await membersRelay([ALICE, BOB]);
+    const page = await relay.page({
+      onInvoke: (frame) =>
+        frame.caller.userId === 'bob' ? undefined : { ok: true, content: '{}' },
+    });
+    const bob = await relay.claude('sub-bob');
+    await attachMember(bob, page);
+    const held = await heldCall(bob, page);
+    saveMembers([ALICE]);
+    expect(await relay.relay.reloadMembers()).toBe('applied');
+    // The answer the change gave the call in flight still reaches it on its session.
+    expect((await held.answer).text).toMatch(/^not_attached: /);
+    await eventually(() =>
+      relay
+        .events()
+        .some((line) => line.msg === 'MCP session closed' && line.reason === 'membership changed'),
+    );
+    expect(await rejection(call(bob, 'list_pages'))).toMatch(/404|not found/i);
   });
 });
 
