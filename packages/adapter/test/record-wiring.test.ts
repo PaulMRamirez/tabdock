@@ -35,6 +35,7 @@ import {
   invitesFrame,
   invoke,
   link,
+  MapStorage,
   mint,
   redemption,
   results,
@@ -384,8 +385,8 @@ describe('a time-boxed session in the record (ADR 0043)', () => {
     },
   });
 
-  async function offering() {
-    const h = setup({ core: { policy: { invites: 'watch', maxDrivers: 2 } } });
+  async function offering(storage = new MapStorage()) {
+    const h = setup({ core: { policy: { invites: 'watch', maxDrivers: 2 } }, storage });
     const limits = { ...welcome(h.clock).limits, usersPerPage: 10, observersPerPage: 40 };
     const socket = await link(h, { limits }, {});
     const roster: AttachmentView[] = [];
@@ -447,6 +448,46 @@ describe('a time-boxed session in the record (ADR 0043)', () => {
       ['previous', 'page', null, 1],
       ['ended', 'session', 'Period 3', 1],
     ]);
+  });
+
+  it('goes on in a record of its own after a reload, everyone listed there from its start', async () => {
+    const storage = new MapStorage();
+    const first = await offering(storage);
+    const pending = first.h.dock.startSession({ label: 'Period 3', lengthMinutes: 30 });
+    await until(() => first.socket.framesOf('session_start').length === 1, 'a session_start');
+    const [start] = first.socket.framesOf('session_start');
+    if (start === undefined) throw new Error('no session_start');
+    first.socket.deliver(listed(start));
+    expect((await pending).ok).toBe(true);
+    first.h.core.close('unload');
+
+    // The reload: the same tab's storage, a resumed page session, then the relay's session frame.
+    const h = setup({ core: { policy: { invites: 'watch', maxDrivers: 2 } }, storage });
+    h.clock.now = first.h.clock.now + 2_000;
+    h.core.start();
+    const socket = h.socket();
+    socket.accept();
+    socket.deliver(
+      welcome(h.clock, {
+        resumed: true,
+        roster: [attachment('alice', 'driver'), attachment('carol', 'driver')],
+      }),
+    );
+    h.clock.now += 50;
+    socket.deliver(listed(start));
+    await flush();
+    expect(h.dock.state.records.map((view) => [view.which, view.scope, view.label])).toEqual([
+      ['current', 'session', 'Period 3'],
+    ]);
+    const lesson = saved(h);
+    whole(lesson);
+    expect(lesson.attachments.map((span) => [span.user.id, span.before])).toEqual([
+      ['alice', true],
+      ['carol', true],
+    ]);
+    // Its end on this page offers it, as any session's does.
+    expect(h.dock.endSession()).toBe(true);
+    expect(saved(h, 'ended').scope).toMatchObject({ label: 'Period 3', endedBy: 'operator' });
   });
 });
 
@@ -554,7 +595,14 @@ describe('a recorder fault (ADR 0045, decision 22)', () => {
     return { h, frames: socket.frames() };
   }
 
-  for (const hook of ['call', 'pageSession', 'roster', 'update', 'confirmedOnPage'] as const) {
+  for (const hook of [
+    'views',
+    'call',
+    'pageSession',
+    'roster',
+    'update',
+    'confirmedOnPage',
+  ] as const) {
     it(`stops the record when ${hook} throws, and every call runs and is answered as without it`, async () => {
       const clean = await run();
       const broken = await run(failing(hook));

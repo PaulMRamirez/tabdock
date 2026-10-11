@@ -289,7 +289,8 @@ export function createRecorder(): Recorder {
       open: new Map(),
       base: next,
       seen: new Set(),
-      carry: false,
+      // A session a reload resumed takes over before the first roster, so who is listed was here before.
+      carry: carry?.carry === true,
     };
     for (const [userId, span] of carry?.open ?? []) {
       kept.seen.add(span.user);

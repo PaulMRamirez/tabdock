@@ -1631,8 +1631,11 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       ]),
     ) as unknown as Recorder,
   );
-  /** The records as DockState shows them: the failed one once a fault stopped them. */
-  const recordViews = (): readonly RecordView[] => recordStopped ?? recorder.views();
+  /** The records as DockState shows them: the failed one once a fault, even in views, stopped them. */
+  const recordViews = (): readonly RecordView[] => {
+    const views = recorder.views();
+    return recordStopped ?? views;
+  };
 
   let state: DockState = Object.freeze({
     link: 'idle',
@@ -2296,6 +2299,10 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     log.info(frame.resumed ? `resumed page ${frame.pageId}` : `linked as page ${frame.pageId}`);
     // A new page session seals the page record and a resumed one keeps it (ADR 0045, decision 5).
     recorder.pageSession(frame.pageId, frame.resumed, clock());
+    // A session this page still runs after a reload goes on in a record of
+    // its own from here, with everyone listed now there from its start.
+    const running = sessionView();
+    if (running !== null) recorder.sessionStarted(running);
     recordRoster(frame.roster);
     for (const userId of revoked) send({ t: 'revoke', userId });
     takeLock(frame.pageId);
