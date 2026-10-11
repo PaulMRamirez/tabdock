@@ -10,7 +10,8 @@
 // Beside the stall rule, a user may have only a few responses with bytes
 // waiting, and a response queued behind another on a connection that closes
 // goes with it (ADR 0030's notes from the A5.6 review): each on stand-ins,
-// on a real socket and through the relay.
+// on a real socket and through the relay. So is the relay-wide ceiling on
+// what invited accounts' unread answers may add (ADR 0044).
 
 import { EventEmitter } from 'node:events';
 import { createServer, type IncomingMessage, ServerResponse } from 'node:http';
@@ -916,11 +917,14 @@ async function serveAll(stalls: ResponseStalls, answerAfterMs = 0): Promise<Answ
   const answeredOn = new WeakMap<AuthInfo, ServerResponse>();
   let answered = 0;
   const handler = toNodeHandler({
-    fetch: async (_request, options) => {
+    fetch: async (request, options) => {
       if (answerAfterMs > 0) await new Promise((resolve) => setTimeout(resolve, answerAfterMs));
       const auth = options?.authInfo;
       stalls.answering(auth?.clientId ?? 'alice');
-      const slices = inSlices(Response.json(RESULT), () => {
+      // RESULT, or a text of the length the request names in its query.
+      const chars = Number(new URL(request.url).searchParams.get('chars') ?? 0);
+      const answer = chars > 0 ? { text: 'x'.repeat(chars) } : RESULT;
+      const slices = inSlices(Response.json(answer), () => {
         stalls.chunkQueued();
       });
       const written = auth === undefined ? undefined : answeredOn.get(auth);
@@ -966,9 +970,10 @@ async function serveAll(stalls: ResponseStalls, answerAfterMs = 0): Promise<Answ
 /** One GET for an answer, the connection closed after it. */
 const ONE_REQUEST = 'GET /mcp HTTP/1.1\r\nHost: relay.invalid\r\nConnection: close\r\n\r\n';
 
-/** ONE_REQUEST, made as `userId`. */
-function requestAs(userId: string): string {
-  return ONE_REQUEST.replace('/mcp', `/mcp?user=${userId}`);
+/** ONE_REQUEST, made as `userId`, for an answer of `chars` characters when given. */
+function requestAs(userId: string, chars?: number): string {
+  const query = chars === undefined ? '' : `&chars=${String(chars)}`;
+  return ONE_REQUEST.replace('/mcp', `/mcp?user=${userId}${query}`);
 }
 
 interface Reader {
@@ -1216,6 +1221,108 @@ describe.skipIf(process.platform === 'win32')(
       expect(guest).toBe('open');
       expect(named(lines, RESPONSE_CEILING_LINE)).toEqual([]);
     }, 20_000);
+
+    /** As large on the wire as the largest answer: MAX_RESULT_CHARS characters at six bytes each. */
+    const ANSWER_CHARS = MAX_RESULT_CHARS * 6;
+    /**
+     * Each unread answer holds about 0.79 MB: its whole chunk, while the
+     * kernel has taken some of its slices, and Node's high-water mark. So
+     * the member's eight fit with seven of the guests', and the guests'
+     * eighth pushes the total over.
+     */
+    const ROOM_CEILING = 12_000_000;
+    /** Who asks, in order: the member first, so hers are the oldest, and the stranger last. */
+    const ROOM = [
+      ...Array<string>(RESPONSES_WAITING_PER_USER).fill('alice'),
+      ...['guest-1', 'guest-2', 'guest-3', 'guest-4', 'guest-5', 'guest-6'].flatMap((guest) => [
+        guest,
+        guest,
+      ]),
+      'stranger-1',
+      'stranger-1',
+    ];
+
+    /** Polls until what `stalls` counts stops moving, the kernel and Node full of the newest answer. */
+    async function heldSettles(stalls: ResponseStalls): Promise<void> {
+      let last = -1;
+      while (stalls.heldBytes !== last) {
+        last = stalls.heldBytes;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+
+    /**
+     * A member leaves eight of the largest answers unread, then six guests
+     * two each and a stranger two, each on a connection of its own, as
+     * relay.ts writes them, under `ceilingBytes` with the stall rule held
+     * off: how each answer stands, in the order they were asked for, and
+     * what all of them hold at the end.
+     */
+    async function roomLeavesAnswersUnread(ceilingBytes: number | undefined): Promise<{
+      outcomes: ('finished' | 'closed' | 'open')[];
+      held: number;
+      lines: Record<string, unknown>[];
+    }> {
+      const { stalls, lines } = realStalls({
+        checkMs: 60_000,
+        rankOf: rankByName,
+        ...(ceilingBytes === undefined ? {} : { ceilingBytes }),
+      });
+      const server = await serveAll(stalls);
+      const readers: Reader[] = [];
+      try {
+        for (const [n, user] of ROOM.entries()) {
+          readers.push(readFrom(server.path, 0, 0, requestAs(user, ANSWER_CHARS)));
+          await answersHanded(server, n + 1);
+          await heldSettles(stalls);
+        }
+        const outcomes = await Promise.all(
+          server.outcomes.map((outcome) =>
+            Promise.race([
+              outcome,
+              new Promise<'open'>((resolve) => setImmediate(resolve, 'open')),
+            ]),
+          ),
+        );
+        return { outcomes, held: stalls.heldBytes, lines };
+      } finally {
+        stalls.close();
+        for (const reader of readers) reader.close();
+        await server.close();
+      }
+    }
+
+    it("cuts a room's unread answers past the ceiling, the oldest guests' until the rest fit and a newer stranger's before any more, and none of the member's eight though older (A6.20)", async () => {
+      const { outcomes, held, lines } = await roomLeavesAnswersUnread(ROOM_CEILING);
+      expect(outcomes.slice(0, RESPONSES_WAITING_PER_USER)).toEqual(
+        Array<string>(RESPONSES_WAITING_PER_USER).fill('open'),
+      );
+      const guests = outcomes.slice(RESPONSES_WAITING_PER_USER, -2);
+      // Oldest first: every guest's answer cut is older than every one kept.
+      const kept = guests.indexOf('open');
+      expect(kept).toBeGreaterThan(0);
+      expect(guests).toEqual([
+        ...Array<string>(kept).fill('closed'),
+        ...Array<string>(guests.length - kept).fill('open'),
+      ]);
+      // The stranger's, newer than every guest's, went in their place.
+      expect(outcomes.slice(-2)).toEqual(['closed', 'closed']);
+      // Until the rest fit, and no further: they would not fit with one more answer.
+      expect(held).toBeLessThanOrEqual(ROOM_CEILING);
+      expect(held + ANSWER_CHARS).toBeGreaterThan(ROOM_CEILING);
+      expect(named(lines, RESPONSE_CEILING_LINE)).toEqual(['guest-1']);
+      expect(named(lines, RESPONSE_CEILING_MEMBERS_LINE)).toEqual([]);
+      expect(
+        lines.filter((line) => line.msg === RESPONSE_CUT_LINE || line.msg === RESPONSE_CAP_LINE),
+      ).toEqual([]);
+    }, 30_000);
+
+    it("holds every one of the room's unread answers without a ceiling, past what the ceiling allows", async () => {
+      const { outcomes, held, lines } = await roomLeavesAnswersUnread(undefined);
+      expect(outcomes).toEqual(Array<string>(ROOM.length).fill('open'));
+      expect(held).toBeGreaterThan(ROOM_CEILING);
+      expect(named(lines, RESPONSE_CEILING_LINE)).toEqual([]);
+    }, 30_000);
   },
 );
 

@@ -332,6 +332,11 @@ export class ResponseStalls {
     return this.#watched.size;
   }
 
+  /** What every watched response holds now, as the ceiling counts it. */
+  get heldBytes(): number {
+    return this.#heldInAll();
+  }
+
   /** Watches a response for `userId`, on `connection`, until it finishes or closes. */
   track(response: WatchedResponse, userId: string, connection: WatchedConnection): void {
     if (this.#watched.has(response)) return;
