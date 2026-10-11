@@ -1,7 +1,8 @@
 // Each page's agent tokens (ADR 0044): bearer credentials for /g/mcp that
 // watch one page while a member sponsors them, kept only as digests and
-// closed with the page, their sponsor or a time-boxed session's end. Neither
-// a token nor its digest ever reaches a line or a record.
+// closed with the page, their sponsor or a time-boxed session's end, which
+// W2-B's session code closes through closePage. Neither a token nor its
+// digest ever reaches a line or a record.
 //
 // This part keeps the records' lifecycle (their expiry timers, the digest
 // lookup and the one agent_closed record each token gets) and hears of the
@@ -144,8 +145,8 @@ export class AgentTokens implements PagePart {
 
   /**
    * Closes every live token of the page for one reason, as a page's end,
-   * Revoke all or a time-boxed session's end does (ADR 0043's C11), and
-   * says how many.
+   * Revoke all or a time-boxed session's end does (ADR 0043's C11, called
+   * from W2-B's session end), and says how many.
    */
   closePage(pageId: string, reason: AgentCloseReason): number {
     let closed = 0;
