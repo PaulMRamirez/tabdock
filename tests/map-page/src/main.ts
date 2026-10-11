@@ -17,6 +17,7 @@ import {
   type MapViewport,
 } from '@tabdock/sim-page/map';
 import { drawMap } from './draw.ts';
+import { panBy, zoomBy } from './gestures.ts';
 import './webmcp.ts';
 
 declare global {
@@ -120,26 +121,13 @@ canvas.addEventListener('pointerup', (event) => {
   const dx = (event.clientX - dragFrom.x) * scale;
   const dy = (event.clientY - dragFrom.y) * scale;
   dragFrom = null;
-  if (dx === 0 && dy === 0) return;
-  const view = world.view();
-  const metresPerPx = view.widthM / VIEWPORT.widthPx;
-  const heading = (view.headingDeg * Math.PI) / 180;
-  // The ground moves with the pointer, so the centre moves the other way.
-  const east = -(dx * Math.cos(heading) - dy * Math.sin(heading)) * metresPerPx;
-  const north = (dx * Math.sin(heading) + dy * Math.cos(heading)) * metresPerPx;
-  const metresPerDegree = (world.radiusM * Math.PI) / 180;
-  const lat = Math.max(-90, Math.min(90, view.lat + north / metresPerDegree));
-  const cosLat = Math.max(Math.cos((view.lat * Math.PI) / 180), 1e-6);
-  const lon = ((((view.lon + east / (metresPerDegree * cosLat) + 180) % 360) + 360) % 360) - 180;
-  world.setView({ lon, lat });
+  panBy(world, VIEWPORT.widthPx, dx, dy);
 });
 canvas.addEventListener(
   'wheel',
   (event) => {
     event.preventDefault();
-    const view = world.view();
-    const widthM = Math.min(1e10, Math.max(1, view.widthM * (event.deltaY > 0 ? 1.25 : 0.8)));
-    world.setView({ widthM });
+    zoomBy(world, event.deltaY > 0);
   },
   { passive: false },
 );
