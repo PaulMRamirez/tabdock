@@ -530,8 +530,10 @@ function seatProblem(
  * subject now, so an id removed or handed to someone else while the relay was
  * down restores nothing, as a live list change ends it (S8, S13). An invitee
  * whose subject the list now names as a member signs in as that member, so
- * what it held as an invitee goes too. A relay with no list, dev tokens or
- * local mode, binds nothing: its members come back as they were.
+ * what it held as an invitee goes too. Those who stay are named as the list
+ * names them now, as a live rename would name them (ADR 0017). A relay with
+ * no list, dev tokens or local mode, binds and renames nothing: its members
+ * come back as they were.
  */
 export interface SnapshotAccounts {
   /** The key a member's attachment is saved with: null with no list, or for an id the list no longer names. */
@@ -542,6 +544,10 @@ export interface SnapshotAccounts {
     kind: UserKind;
     memberKey: string | null;
   }) => boolean;
+  /** The name the list in force gives a member's user id, or undefined with no list or for an id it does not name. */
+  readonly nameOf: (userId: string) => string | undefined;
+  /** Every member's name in force, against which an invitee's name is checked (ADR 0017). */
+  readonly memberNames: readonly string[];
 }
 
 export function snapshotAccounts(members: MemberList | null): SnapshotAccounts {
@@ -549,9 +555,12 @@ export function snapshotAccounts(members: MemberList | null): SnapshotAccounts {
     return {
       memberKey: () => null,
       stillHolds: (account) => account.kind === 'invitee' || account.memberKey === null,
+      nameOf: () => undefined,
+      memberNames: [],
     };
   }
   const entries = members.entries();
+  const nameOf = new Map(entries.map((entry) => [entry.userId, entry.displayName]));
   const subOf = new Map(entries.map((entry) => [entry.userId, entry.sub]));
   const asInvitees = new Set(
     entries.map((entry) => `${INVITEE_ID_PREFIX}${inviteeKeyOf(entry.sub)}`),
@@ -570,6 +579,8 @@ export function snapshotAccounts(members: MemberList | null): SnapshotAccounts {
       account.kind === 'invitee'
         ? !asInvitees.has(account.userId)
         : account.memberKey !== null && account.memberKey === memberKey(account.userId),
+    nameOf: (userId) => nameOf.get(userId),
+    memberNames: members.names(),
   };
 }
 

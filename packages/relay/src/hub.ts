@@ -8067,10 +8067,11 @@ export class PageHub {
    * worked out again from its ceiling and session. Then, as a member list
    * change would, an account the list in force no longer gives to the same
    * person loses what it held, and what it sponsored goes with it, each with
-   * its records (S8, S13, S14); a session past its end ends with reason
-   * time; and an attachment, invite or token past its time ends, the rest
-   * timed again from their stored ends. snapshot_loaded counts what is live
-   * after all that, with the attachments the member list dropped.
+   * its records (S8, S13, S14), and those who stay take the names the list
+   * gives them (ADR 0017); a session past its end ends with reason time;
+   * and an attachment, invite or token past its time ends, the rest timed
+   * again from their stored ends. snapshot_loaded counts what is live after
+   * all that, with the attachments the member list dropped.
    */
   restoreSnapshot(
     snapshot: RelaySnapshot,
@@ -8130,6 +8131,31 @@ export class PageHub {
       this.#loseSponsors(pageId, targets);
     }
     const dropped = before - held();
+    // Those who stay are named as the list in force names them, as a live
+    // rename would (membershipChanged): a member by the name the list gives
+    // their id, and an invitee whose name now folds to a member's by its
+    // short id, so nobody is shown under a member's name (ADR 0017).
+    const renames = new Map<string, string>();
+    for (const saved of snapshot.attachments) {
+      const listed = saved.kind === 'member' ? options.accounts.nameOf(saved.userId) : undefined;
+      if (listed !== undefined) renames.set(saved.userId, listed);
+    }
+    const memberNames = new Set(options.accounts.memberNames.map(foldName));
+    let renamed = 0;
+    for (const pageId of pageIds) {
+      for (const attachment of this.#store.attachments.listForPage(pageId)) {
+        const name = this.#renamed(attachment.userId, attachment.displayName, renames, memberNames);
+        if (name === null) continue;
+        attachment.displayName = name;
+        this.#store.attachments.put(attachment);
+        renamed += 1;
+      }
+    }
+    if (renamed > 0) {
+      this.#log.info('restart snapshot renamed attachments as the member list names them', {
+        attachments: renamed,
+      });
+    }
     // What ran out while the relay was down ends now, as each timer would end it.
     for (const pageId of pageIds) {
       this.#endSessionIfDue(pageId);

@@ -543,6 +543,42 @@ describe('a graceful restart with TABDOCK_RESTART_SNAPSHOT on (A6.18)', () => {
     expect((await call(bobAgain, 'call_page_tool', getView(page.pageId))).isError).toBe(true);
   });
 
+  it('names everyone as the member list in force names them, as a live change would (ADR 0017)', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const members = join(privateDir(), 'members.txt');
+    const save = (lines: string[]): void => {
+      writeFileSync(`${members}.new`, `${lines.join('\n')}\n`, { mode: 0o600 });
+      renameSync(`${members}.new`, members);
+    };
+    save(['sub-alice=alice:Alice', 'sub-bob=bob:Bob']);
+    const first = await startRun(dir, idp, { membersFile: members });
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    await attachMember(await first.claude('sub-bob'), page, 'observer');
+    const invite = await mintOk(page, { role: 'observer', uses: 1 });
+    const joined = await redeem(await first.claude(GUEST, GUEST_EMAIL), page, invite.link);
+    expect(joined.outcome.isError, joined.outcome.text).toBe(false);
+    const guestId = inviteeId(GUEST);
+    const namesOf = (shown: TestPage): Record<string, string> =>
+      Object.fromEntries(
+        (shown.all('roster').at(-1)?.attachments ?? shown.welcome?.roster ?? []).map(
+          (attachment) => [attachment.userId, attachment.displayName],
+        ),
+      );
+    expect(namesOf(page)).toEqual({ alice: 'Alice', bob: 'Bob', [guestId]: GUEST_EMAIL });
+    await first.close();
+
+    // While the relay is down, Alice is renamed and a new member takes the guest's name.
+    save(['sub-alice=alice:Alicia', 'sub-bob=bob:Bob', `sub-gina=gina:${GUEST_EMAIL}`]);
+    const second = await startRun(dir, idp, { membersFile: members });
+    expect(recordsOf(dir, 'snapshot_loaded')[0]).toMatchObject({ attachments: 3, dropped: 0 });
+    const back = await resumeOn(second, page);
+    expect(back.welcome?.resumed).toBe(true);
+    const short = guestId.slice(INVITEE_ID_PREFIX.length, INVITEE_ID_PREFIX.length + 8);
+    expect(namesOf(back)).toEqual({ alice: 'Alicia', bob: 'Bob', [guestId]: `invitee ${short}` });
+  });
+
   it('drops a member whose user id the list now gives someone else, and an invitee now a member', async () => {
     const idp = await provider();
     const dir = auditDir();
