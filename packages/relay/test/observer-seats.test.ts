@@ -97,6 +97,26 @@ describe('watching seats beside the people (ADR 0044, A6.19)', () => {
     expect(await seats(page)).toEqual({ people: 3, watching: 40 });
   }, 60_000);
 
+  it('serve a seated room on the default invitee pool: forty guests, two sessions each, every one reading the page (A6.20)', async () => {
+    const relay = await setup();
+    const page = await relay.page({ policy: { invites: 'all' } });
+    await attachMember(await relay.claude('sub-alice'), page);
+    const { guests } = await fillRoom(relay, page, 40);
+    const reads: boolean[] = [];
+    for (const guest of guests) {
+      for (let session = 0; session < 2; session += 1) {
+        const claude = await relay.claude(guest.sub, guest.email);
+        const listed = await call(claude, 'list_pages');
+        reads.push(
+          JSON.stringify(listed.structured).includes(page.pageId) &&
+            !(await call(claude, 'call_page_tool', { page: page.pageId, tool: 'get_view' }))
+              .isError,
+        );
+      }
+    }
+    expect(reads).toEqual(Array<boolean>(80).fill(true));
+  }, 120_000);
+
   it('refuse a watcher past the seats with page_busy and its attach_refused record, while a member still pairs', async () => {
     const relay = await setup({ limits: { usersPerPage: 4, observersPerPage: 5 } });
     const page = await relay.page({ policy: { invites: 'all' } });
