@@ -7770,6 +7770,9 @@ export class PageHub {
   }
 
   detachPage(userId: string, pageId: string): DetachOutcome {
+    // A stopping relay takes no work, a detach included: a restart snapshot
+    // read after this would otherwise put the attachment back (ADR 0046).
+    if (this.#closed) return hubError('page_asleep', 'the relay is shutting down');
     // One past its time, or below a member past theirs, ends as it would have, not as a detach.
     this.#chainInTime(pageId, userId);
     const attachment = this.#store.attachments.get(pageId, userId);
