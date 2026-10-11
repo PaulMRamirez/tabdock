@@ -6,8 +6,9 @@
 // it). A record holds names the operator's own screen already showed, in
 // memory only, and never arguments, results, images, page state or secrets:
 // each hook copies named fields, never a frame or an entry whole, so nothing
-// added to those later reaches a record unnoticed. NOOP_RECORDER keeps
-// nothing; CoreOptions.recorder lets a test hand the core a recorder of its own.
+// added to those later reaches a record unnoticed. The core keeps one made
+// by createRecorder and stops it for NOOP_RECORDER, which keeps nothing, at
+// the first fault; CoreOptions.recorder lets a test hand it one of its own.
 
 import {
   type AttachmentView,
@@ -148,7 +149,10 @@ export interface Recorder {
 
 const NO_VIEWS: readonly RecordView[] = Object.freeze([]);
 
-/** A recorder that keeps nothing, so a record is never more than ADR 0045's own recorder makes it. */
+/**
+ * A recorder that keeps nothing: what the core asks once a fault stopped the
+ * record (decision 22), and the list of hooks its guard wraps.
+ */
 export const NOOP_RECORDER: Recorder = Object.freeze({
   pageSession: () => undefined,
   linkLost: () => undefined,
@@ -334,15 +338,36 @@ export function createRecorder(): Recorder {
   }
 
   /**
+   * The latest time a record holds. The core tells of a session only once
+   * the relay lists it, after a round trip in which calls, role changes and
+   * decisions may land, so a record sealed then ends after them, never at
+   * the session's start before them.
+   */
+  function latest(kept: Kept): number {
+    let at = kept.from;
+    const see = (time: number | null): void => {
+      if (time !== null && time > at) at = time;
+    };
+    for (const call of kept.calls) see(call.at);
+    for (const span of kept.spans) {
+      see(span.joinedAt);
+      see(span.leftAt);
+      for (const role of span.roles) see(role.at);
+    }
+    for (const proposal of kept.proposals) see(proposal.decidedAt);
+    return at;
+  }
+
+  /**
    * Seals a record that holds anything into its slot, so an empty one never
-   * replaces a kept one. It ends no earlier than it began or than anything
-   * it holds was decided, so every time it holds lies within its span.
+   * replaces a kept one. It ends no earlier than anything it holds, so every
+   * time it holds lies within its span.
    */
   function seal(kept: Kept, at: number): void {
     if (kept.spans.length + kept.calls.length + kept.proposals.length + kept.dropped.calls === 0) {
       return;
     }
-    kept.to = Math.max(at, kept.from, ...kept.proposals.map((proposal) => proposal.decidedAt ?? 0));
+    kept.to = Math.max(at, latest(kept));
     if (kept.scope.kind === 'page') previous = kept;
     else ended = kept;
   }
@@ -552,8 +577,10 @@ export function createRecorder(): Recorder {
         kept.scope = scope;
         return;
       }
-      seal(kept, session.startedAt);
-      start(begin(scope, session.startedAt, kept));
+      // From its start, or after whatever the page record took in before the relay listed it.
+      const at = Math.max(session.startedAt, latest(kept));
+      seal(kept, at);
+      start(begin(scope, at, kept));
     },
 
     sessionEnded(end) {
@@ -568,7 +595,7 @@ export function createRecorder(): Recorder {
         // first and with it everyone, so no one carries into the page record.
         close(kept, lostAt, () => 'page_session_ended');
       }
-      kept.to = Math.max(end.time, kept.from);
+      kept.to = Math.max(end.time, latest(kept));
       ended = kept;
       start(begin({ kind: 'page' }, kept.to, kept));
     },

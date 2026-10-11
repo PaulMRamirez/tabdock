@@ -460,7 +460,8 @@ describe('the recorder (ADR 0045)', () => {
     const recorder = createRecorder();
     recorder.pageSession('pg_1', false, 100);
     roster(recorder, 200, view(alice));
-    recorder.call(entry('c_1'), 'pg_1');
+    // Before the link went, as every call is: a seal never ends a record before what it holds.
+    recorder.call(entry('c_1', alice, { time: 250 }), 'pg_1');
     recorder.linkLost(300);
     recorder.pageSession('pg_1', true, 400);
     roster(recorder, 410, view(alice));
