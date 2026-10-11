@@ -14,9 +14,10 @@
 //
 // With --live it runs against the signed-in Claude Code instead and asks the
 // model which digit a 64 KiB PNG shows, which proves the model sees the
-// picture rather than only receiving it. That spends the owner's own usage,
-// so only the owner runs it, from the M6 checklist; a failure there lowers
-// DEFAULT_IMAGE_BYTES in 8 KiB steps (ADR 0039, decision 2).
+// picture rather than only receiving it. It spends the signed-in account's
+// usage, and a cloud session's own `claude` is that session's harness rather
+// than an owner's sign-in, so the owner runs it from the M6 checklist; a
+// failure there lowers DEFAULT_IMAGE_BYTES in 8 KiB steps (ADR 0039, decision 2).
 
 import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes, randomInt } from 'node:crypto';
