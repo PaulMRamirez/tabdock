@@ -4000,6 +4000,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   let relayLists: string | null = null;
   /** The last session this page ended itself; the relay hears of it while it still lists it. */
   let endedHere: string | null = null;
+  /** The session this page last asked the relay to end on this link, so it asks once. */
+  let endSent: string | null = null;
   /** The longest the operator asked the session to run, which no relay can pass. */
   let askedMs = 0;
   let sessionTimer: unknown = null;
@@ -4065,15 +4067,21 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     for (const entry of drivers.slice(seats)) setRole(entry.userId, 'observer');
   }
 
+  /** Asks the relay to end a session it lists, once per link. */
+  function endListed(sessionId: string): void {
+    if (endSent !== sessionId && isLinked() && send({ t: 'session_end', sessionId })) {
+      endSent = sessionId;
+    }
+  }
+
   /** The relay hears of an end this page made only while it still lists that session. */
   function tellEnd(): void {
-    if (endedHere !== null && relayLists === endedHere && isLinked()) {
-      send({ t: 'session_end', sessionId: endedHere });
-    }
+    if (endedHere !== null && relayLists === endedHere) endListed(endedHere);
   }
 
   const sessionWelcome = (frame: WelcomeFrame): void => {
     relayLists = null;
+    endSent = null;
     if (session === null) {
       const text = readStored(sessionKey);
       const stored = text === null ? null : StoredSessionSchema.safeParse(parseJson(text));
@@ -4116,16 +4124,25 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       showSession();
       return;
     }
-    if (live !== null) {
-      if (live.sessionId !== endedHere) {
-        log.warn(`ignored session ${live.sessionId}, which this page did not start`);
-      } else if (graceTimer === null) {
-        tellEnd();
-      }
-    }
     // The relay holds none of this page's: it ended there, unless a start still waits.
     if (kept !== null && starting?.sessionId !== kept.sessionId) {
       finishSession(ended?.sessionId === kept.sessionId ? ended.reason : 'relay');
+    }
+    // One the relay lists while this page holds none is never adopted, and is
+    // ended there, as an unknown invite is closed: whether this page ended it
+    // while the relay could not hear and a reload lost that, or never started
+    // it. An end only takes access away, and without one the relay would keep
+    // the seats narrowed and refuse every start until its own clock ran out.
+    // One this page ended on its own clock waits out the grace first.
+    if (live !== null && session === null) {
+      if (live.sessionId !== endedHere) {
+        if (endSent !== live.sessionId) {
+          log.warn(`ended session ${live.sessionId}, which this page holds no record of`);
+        }
+        endListed(live.sessionId);
+      } else if (graceTimer === null) {
+        tellEnd();
+      }
     }
   };
 

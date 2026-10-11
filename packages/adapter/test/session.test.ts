@@ -231,7 +231,7 @@ describe('S5: a session is never wider than attach()', () => {
     expect(h.dock.state.session?.policy).toMatchObject({ maxDrivers: 1, proposals: 'off' });
   });
 
-  it('adopts only a session it started: a relay cannot impose one', async () => {
+  it('adopts only a session it started, and ends one it holds no record of: a relay cannot impose one', async () => {
     const { h, socket } = await offering();
     socket.deliver({
       t: 'session',
@@ -244,8 +244,10 @@ describe('S5: a session is never wider than attach()', () => {
     });
     await flush();
     expect(h.dock.state.session).toBeNull();
-    expect(h.logs).toContain('warn ignored session ses_foreign, which this page did not start');
-    expect(socket.framesOf('session_end')).toEqual([]);
+    expect(h.logs).toContain('warn ended session ses_foreign, which this page holds no record of');
+    expect(socket.framesOf('session_end')).toEqual([
+      { t: 'session_end', sessionId: 'ses_foreign' },
+    ]);
     // Nor swap its own for another: a relay that holds some other session holds none of this page's.
     const { start } = await started(h, socket, { label: 'Class', lengthMinutes: 30 });
     socket.deliver({
@@ -263,6 +265,43 @@ describe('S5: a session is never wider than attach()', () => {
       sessionId: start.sessionId,
       reason: 'relay',
     });
+    // Asked once on this link, however often the relay lists it.
+    expect(socket.framesOf('session_end')).toEqual([
+      { t: 'session_end', sessionId: 'ses_foreign' },
+    ]);
+  });
+
+  it('ends one the relay still holds after a reload lost the end made here, so the next can start', async () => {
+    const storage = new MapStorage();
+    const first = await offering(undefined, undefined, undefined, storage);
+    const { start } = await started(first.h, first.socket, { label: 'Class', lengthMinutes: 30 });
+    // The operator ends it while the relay cannot hear, then the tab reloads.
+    first.socket.drop();
+    expect(first.h.dock.endSession()).toBe(true);
+    expect(first.socket.framesOf('session_end')).toEqual([]);
+    first.h.core.close('unload');
+
+    const h = setup({ core: { policy: { invites: 'watch' } }, storage });
+    h.core.start();
+    const socket = h.socket();
+    socket.accept();
+    socket.deliver(welcome(h.clock, { resumed: true, roster: [attachment('alice', 'driver')] }));
+    socket.deliver(invitesFrame([]));
+    socket.deliver(listed(start, 20 * MINUTE));
+    socket.deliver(listed(start, 20 * MINUTE));
+    await flush();
+    expect(h.dock.state.session).toBeNull();
+    expect(socket.framesOf('session_end')).toEqual([
+      { t: 'session_end', sessionId: start.sessionId },
+    ]);
+    socket.deliver({
+      t: 'session',
+      session: null,
+      ended: { sessionId: start.sessionId, reason: 'operator' },
+    });
+    const next = await started(h, socket, { label: 'Next class', lengthMinutes: 30 });
+    expect(next.result.ok).toBe(true);
+    expect(h.dock.state.session).toMatchObject({ label: 'Next class' });
   });
 
   it('leaves nothing behind when the relay refuses the start', async () => {
