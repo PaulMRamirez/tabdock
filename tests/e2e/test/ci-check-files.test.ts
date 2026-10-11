@@ -9,11 +9,21 @@
 // TABDOCK_HOME under RUNNER_TEMP through GITHUB_ENV, deletes it whatever
 // happens, and caches and uploads nothing; no job runs Claude Code or names
 // its key (decision 1). The runner refuses a TABDOCK_HOME in use, withholds
-// output holding the token or an unmasked code, and holds the audit log to
-// the walk (S7, S11).
+// output holding the token or an unmasked code, holds the audit log to the
+// walk (S7, S11), and when interrupted stops everything it started and still
+// deletes the home it made, owner token and all.
 
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import * as copied from '@tabdock/ci-check/profile';
@@ -397,6 +407,68 @@ describe("the repository's runner, scripts/ci-check.ts", () => {
       rmSync(scratch, { recursive: true, force: true });
     }
   });
+});
+
+describe('the runner, interrupted', () => {
+  /** Whether a process still runs. */
+  function alive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // A terminal's Ctrl-C reaches the runner but not the process group it puts
+  // Playwright in, so only the runner is signalled here, as only it would be.
+  it.skipIf(process.platform === 'win32')(
+    'stops everything it started and deletes the home it made on Ctrl-C or SIGTERM',
+    async () => {
+      for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+        const scratch = mkdtempSync(join(tmpdir(), 'ci-check-signal-'));
+        const report = join(scratch, 'stand-in.json');
+        const env: NodeJS.ProcessEnv = {
+          ...process.env,
+          npm_execpath: join(ROOT, 'tests/e2e/test/pnpm-stand-in.ts'),
+          CI_CHECK_STAND_IN: report,
+        };
+        delete env.TABDOCK_HOME;
+        const runner = spawn(process.execPath, [join(ROOT, 'scripts/ci-check.ts')], {
+          cwd: ROOT,
+          env,
+          stdio: ['ignore', 'ignore', 'pipe'],
+        });
+        const ended = new Promise<{ code: number | null; signal: string | null }>((resolve) => {
+          runner.on('close', (code, by) => {
+            resolve({ code, signal: by });
+          });
+        });
+        let started: { pid: number; home: string } | null = null;
+        try {
+          const deadline = Date.now() + 15_000;
+          while (!existsSync(report) && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+          started = JSON.parse(readFileSync(report, 'utf8')) as { pid: number; home: string };
+          expect(alive(started.pid)).toBe(true);
+          expect(existsSync(started.home)).toBe(true);
+          runner.kill(signal);
+          expect(await ended).toEqual({ code: signal === 'SIGINT' ? 130 : 143, signal: null });
+          expect(alive(started.pid)).toBe(false);
+          expect(existsSync(started.home)).toBe(false);
+        } finally {
+          runner.kill('SIGKILL');
+          if (started !== null) {
+            if (alive(started.pid)) process.kill(-started.pid, 'SIGKILL');
+            rmSync(started.home, { recursive: true, force: true });
+          }
+          rmSync(scratch, { recursive: true, force: true });
+        }
+      }
+    },
+    40_000,
+  );
 });
 
 describe('guide page 17', () => {

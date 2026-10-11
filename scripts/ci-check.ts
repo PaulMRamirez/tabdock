@@ -13,7 +13,8 @@
 // owner token or an unmasked pairing code fails the run and withholds the
 // output (S11). Then, with the relay stopped, it verifies the audit chain and
 // holds its call records to the walk: every one ok, from `you` through
-// tabdock-ci-check, as many as the page calls the walk printed (S7).
+// tabdock-ci-check, as many as the page calls the walk printed (S7). Ctrl-C
+// or SIGTERM stops everything it started and still deletes the home it made.
 
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
@@ -22,7 +23,7 @@ import { fileURLToPath } from 'node:url';
 import { AuditLineSchema } from '../packages/protocol/src/index.ts';
 import { privateTempRoot } from '../packages/relay/test/helpers/private-tmp.ts';
 import { leakIn } from '../packages/relay/test/helpers/secrecy.ts';
-import { blankEnv, runPnpm } from '../tests/e2e/src/local-harness.ts';
+import { blankEnv, type Run, runPnpm } from '../tests/e2e/src/local-harness.ts';
 
 const ROOT = resolve(import.meta.dirname, '..');
 export const CLIENT_NAME = 'tabdock-ci-check';
@@ -131,6 +132,18 @@ async function main(args: readonly string[], env: Env): Promise<number> {
   const relayPort = port(env, 'TABDOCK_PORT', 8787);
   const pagePort = port(env, 'CI_CHECK_PAGE_PORT', 5180);
   const { home, made } = homeFor(env);
+  // Playwright runs in a process group of its own, which a terminal's Ctrl-C
+  // never reaches, and a signal's default action would end this process
+  // before its finally. So a signal here stops the whole group, relay, page
+  // server and browser, waits for it, and lets the finally delete the home
+  // and the owner token in it; a second signal waits with the first.
+  const stopped: { run: Run | null; by: NodeJS.Signals | null } = { run: null, by: null };
+  const onSignal = (signal: NodeJS.Signals): void => {
+    stopped.by ??= signal;
+    void stopped.run?.stop();
+  };
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
   try {
     const run = runPnpm(
       ['--filter', '@tabdock/ci-check', advisory ? 'advisory' : 'check', ...forPlaywright],
@@ -143,7 +156,13 @@ async function main(args: readonly string[], env: Env): Promise<number> {
         CI_CHECK_PAGE_URL: `http://127.0.0.1:${String(pagePort)}/`,
       },
     );
+    stopped.run = run;
     const code = await run.exited;
+    if (stopped.by !== null) {
+      // Its output is not scanned, so it is not printed.
+      console.error(`ci-check: stopped by ${stopped.by}, with everything it started`);
+      return stopped.by === 'SIGINT' ? 130 : 143;
+    }
     const output = `${run.stdout()}${run.stderr()}`;
     const tokenFile = join(home, 'owner-token');
     const token = existsSync(tokenFile) ? readFileSync(tokenFile, 'latin1').trim() : '';
@@ -182,6 +201,8 @@ async function main(args: readonly string[], env: Env): Promise<number> {
     );
     return audit.problems.length === 0 ? 0 : 1;
   } finally {
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
     if (made) rmSync(home, { recursive: true, force: true });
   }
 }
