@@ -150,6 +150,8 @@ interface Session {
    * its grace runs out, whichever comes first.
    */
   ending: NodeJS.Timeout | null;
+  /** Why it is ending, for its close line: a member list change, or its agent token's close (ADR 0044). */
+  endingReason: string;
 }
 
 function jsonRpcError(status: number, code: number, message: string): Response {
@@ -343,6 +345,7 @@ export class McpSessions {
       idleTimer: null,
       closed: false,
       ending: null,
+      endingReason: 'membership changed',
     };
     // Counted from now, so initializes that overlap cannot overshoot a cap together.
     this.#sessions.set(id, session);
@@ -493,7 +496,7 @@ export class McpSessions {
     session.lastActive = Date.now();
     if (session.open > 0 || session.closed) return;
     if (session.ending !== null) {
-      void this.#close(session, 'membership changed');
+      void this.#close(session, session.endingReason);
       return;
     }
     session.idleTimer = setTimeout(() => {
@@ -550,21 +553,24 @@ export class McpSessions {
    * open closes at once; one still answering closes when its last response
    * is done, so the not_attached or pairing_expired the hub just gave a call
    * reaches it, and after `graceMs` at the latest, since a client's listening
-   * GET stream never ends on its own. Returns how many it ends.
+   * GET stream never ends on its own. Returns how many it ends. A closed
+   * agent token's user goes the same way (ADR 0044), its line naming
+   * `reason` instead.
    */
-  endUsers(userIds: ReadonlySet<string>, graceMs: number): number {
+  endUsers(userIds: ReadonlySet<string>, graceMs: number, reason = 'membership changed'): number {
     const held = [...this.#sessions.values()].filter(
       (session) => userIds.has(session.userId) && !session.closed && session.ending === null,
     );
     for (const session of held) {
       if (session.open === 0) {
-        void this.#close(session, 'membership changed');
+        void this.#close(session, reason);
         continue;
       }
       if (session.idleTimer) clearTimeout(session.idleTimer);
       session.idleTimer = null;
+      session.endingReason = reason;
       session.ending = setTimeout(() => {
-        void this.#close(session, 'membership changed');
+        void this.#close(session, reason);
       }, graceMs);
       session.ending.unref();
     }
