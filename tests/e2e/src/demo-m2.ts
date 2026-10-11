@@ -236,7 +236,7 @@ try {
       `   ${entry.displayName.padEnd(6)} ${entry.role.padEnd(9)} clients: ${names}; ${idleHours === null ? 'never expires' : `expires after ${String(idleHours)} h without a call`}`,
     );
   }
-  // Tools reach the relay right after the link comes up; wait until all six are listed.
+  // Tools reach the relay right after the link comes up; wait until all seven are listed.
   let toolCount = 0;
   for (let i = 0; i < 100 && toolCount !== 7; i += 1) {
     if (i > 0) await new Promise((resolve) => setTimeout(resolve, 50));
