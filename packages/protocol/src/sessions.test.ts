@@ -117,6 +117,12 @@ describe('the stored session', () => {
 
   it('reads back as written', () => {
     expect(StoredSessionSchema.parse(stored)).toEqual(stored);
+    // Whether the relay has listed it is a flag, never anything else.
+    expect(StoredSessionSchema.parse({ ...stored, listed: true })).toEqual({
+      ...stored,
+      listed: true,
+    });
+    expect(StoredSessionSchema.safeParse({ ...stored, listed: 'yes' }).success).toBe(false);
   });
 
   it('is no record when it holds a link, a secret or anything else', () => {
