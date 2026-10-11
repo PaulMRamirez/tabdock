@@ -6,6 +6,7 @@
 
 import {
   ATTACH_REQUEST_TTL_MS,
+  PROPOSAL_TTL_MS,
   encodeFrame,
   IDLE_TIMEOUT_MS,
   MAX_DESCRIPTION_CHARS,
@@ -22,6 +23,7 @@ import {
 import { type WebSocket, WebSocketServer } from 'ws';
 
 export type PageFrameOf<T extends PageFrame['t']> = Extract<PageFrame, { t: T }>;
+type ProposalFrame = Extract<RelayFrame, { t: 'proposal' }>;
 
 export interface StandInRelay {
   /** ws://127.0.0.1:<port>/page */
@@ -30,6 +32,8 @@ export interface StandInRelay {
   readonly received: readonly PageFrame[];
   /** Sends a frame to the page, checked against the protocol schema first. */
   send(frame: RelayFrame): void;
+  /** Puts an observer's proposal before the page (ADR 0042), ending PROPOSAL_TTL_MS from now unless set. */
+  sendProposal(fields: Omit<ProposalFrame, 't' | 'expiresAt'> & { expiresAt?: number }): void;
   /** Resolves with the first frame of this type, already received or still to come, that matches. */
   next<T extends PageFrame['t']>(
     type: T,
@@ -84,12 +88,17 @@ export async function startStandInRelay(): Promise<StandInRelay> {
     ws.on('error', () => undefined);
   });
 
+  const send = (frame: RelayFrame): void => {
+    if (!socket) throw new Error('no page is connected to the stand-in relay');
+    socket.send(encodeFrame(RelayFrameSchema.parse(frame)));
+  };
+
   return {
     url: `ws://127.0.0.1:${String(address.port)}/page`,
     received,
-    send(frame) {
-      if (!socket) throw new Error('no page is connected to the stand-in relay');
-      socket.send(encodeFrame(RelayFrameSchema.parse(frame)));
+    send,
+    sendProposal(fields) {
+      send({ t: 'proposal', expiresAt: Date.now() + PROPOSAL_TTL_MS, ...fields });
     },
     next(type, match = () => true, timeoutMs = 5000) {
       type Frame = PageFrameOf<typeof type>;
