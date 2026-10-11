@@ -4,13 +4,16 @@
 // (ADR 0039, decision 25, A6.5). This measures the HTTP body of each, as a
 // client receives it, on the 2025-11-25 leg (an event stream on a session)
 // and the 2026-07-28 leg (JSON), with an image at MAX_IMAGE_BYTES beside
-// MAX_IMAGE_TEXT_CHARS of the characters JSON escapes longest: should either
-// constant grow past that sizing, this fails before the memory bound moves.
+// MAX_IMAGE_TEXT_CHARS of the characters JSON escapes longest, and past them
+// as much more text as the frame holds, so the relay's truncation marker, with
+// the most digits it can carry, is in the answer too: should either constant
+// or the marker grow past that sizing, this fails before the memory bound moves.
 // The figures are in docs/notes/m6/image-answers.md.
 
 import type { Client } from '@modelcontextprotocol/client';
 import {
   base64Chars,
+  MAX_FRAME_BYTES,
   MAX_IMAGE_BYTES,
   MAX_IMAGE_TEXT_CHARS,
   MAX_RESULT_CHARS,
@@ -62,11 +65,24 @@ describe('an image answer on the wire (ADR 0030 re-measured for ADR 0039)', () =
     const image = padTo(pngHeader(2048, 2048), MAX_IMAGE_BYTES);
     const data = base64(image);
     expect(data.length).toBe(base64Chars(MAX_IMAGE_BYTES));
-    const answer = answerWithImage(
-      page,
-      { mimeType: 'image/png', data },
-      WORST.repeat(MAX_IMAGE_TEXT_CHARS),
-    );
+    // The kept characters at their longest, then plain text filling the frame
+    // (a callId of 64 characters leaves room for any the relay mints), so the
+    // marker names the largest counts a page can make it name.
+    const kept = WORST.repeat(MAX_IMAGE_TEXT_CHARS);
+    const room = (content: string): number =>
+      MAX_FRAME_BYTES -
+      Buffer.byteLength(
+        JSON.stringify({
+          t: 'result',
+          callId: 'c'.repeat(64),
+          ok: true,
+          content,
+          image: { mimeType: 'image/png', data },
+        }),
+      );
+    const words = kept + 'a'.repeat(room(kept));
+    expect(room(words)).toBeGreaterThanOrEqual(0);
+    const answer = answerWithImage(page, { mimeType: 'image/png', data }, words);
     const capture = { page: page.pageId, tool: CAPTURE_TOOL.name, arguments: {} };
     const text = { page: page.pageId, tool: READ_TOOL.name, arguments: {} };
     const sessionId = await openSession(relay.relay, ALICE);
@@ -84,9 +100,15 @@ describe('an image answer on the wire (ADR 0030 re-measured for ADR 0039)', () =
       arguments: text,
     });
 
-    // Each answer is what it claims: the image whole, the text uncut.
-    expect(legacyImage.body).toContain(data);
-    expect(modernImage.body).toContain(data);
+    // Each answer is what it claims: the image whole beside the cut words
+    // and their marker, the text uncut.
+    const marker = `[tabdock: truncated, ${String(words.length - MAX_IMAGE_TEXT_CHARS)} of ${String(words.length)} characters removed]`;
+    expect(String(words.length - MAX_IMAGE_TEXT_CHARS)).toHaveLength(6);
+    for (const body of [legacyImage.body, modernImage.body]) {
+      expect(body).toContain(data);
+      expect(body).toContain(marker);
+      expect(body).not.toContain('a'.repeat(32));
+    }
     expect(legacyText.result?.isError).toBeFalsy();
     expect(modernText.message?.result?.isError).toBeFalsy();
     expect(legacyText.body).not.toContain('[tabdock: truncated');
