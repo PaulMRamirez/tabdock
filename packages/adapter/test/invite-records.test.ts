@@ -456,6 +456,21 @@ describe('the live list (ADR 0017)', () => {
       { t: 'invite_cancel', inviteId: other.inviteId },
     ]);
   });
+
+  it('Cancel while a redemption waits on the operator sends the cancel alone, which ends it there, never a refusal', async () => {
+    const { h, socket, listed } = await offering();
+    const minted = await mint(h, socket, { label: 'Friends', role: 'driver' }, listed);
+    await redeem(h, socket, redemption(h.clock, minted));
+    expect(h.dock.state.pendingRequests).toHaveLength(1);
+    expect(h.dock.cancelInvite(minted.inviteId)).toBe(true);
+    expect(h.dock.state.pendingRequests).toEqual([]);
+    // A deny would read on the relay as the operator's, counting toward burning the invite.
+    const asked = `redeem-${minted.inviteId}`;
+    expect(decisions(socket).filter((sent) => sent.requestId === asked)).toEqual([]);
+    expect(socket.framesOf('invite_cancel')).toEqual([
+      { t: 'invite_cancel', inviteId: minted.inviteId },
+    ]);
+  });
 });
 
 function welcomeAgain(h: Harness) {

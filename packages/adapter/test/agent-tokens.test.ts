@@ -375,7 +375,18 @@ describe('every way the page ends a token', () => {
     socket.deliver(frame);
     await checked(h, frame.requestId);
     expect(h.dock.deny(frame.requestId)).toBe(true);
-    expect(socket.framesOf('agent_cancel')).toEqual([
+    // The deny first, which the relay closes the token on as denied (S7); the
+    // cancel after it changes nothing there unless the deny crossed the prompt's end.
+    expect(
+      socket
+        .frames()
+        .filter(
+          (sent) =>
+            (sent.t === 'attach_decision' && sent.requestId === frame.requestId) ||
+            sent.t === 'agent_cancel',
+        ),
+    ).toEqual([
+      { t: 'attach_decision', requestId: frame.requestId, allow: false },
       { t: 'agent_cancel', tokenId: minted.tokenId },
     ]);
     expect(h.storage.getItem(AGENTS_KEY)).toBeNull();
@@ -468,6 +479,23 @@ describe('every way the page ends a token', () => {
     await flush();
     expect(h.dock.state.agents).toEqual([]);
     expect(h.storage.getItem(AGENTS_KEY)).toBeNull();
+  });
+
+  it('Cancel while its prompt shows sends the cancel alone, never a deny the relay would close it on', async () => {
+    const { h, socket, listed } = await offering();
+    const minted = await mintAgent(h, socket, listed);
+    const frame = agentRequest(h, minted);
+    socket.deliver(frame);
+    await checked(h, frame.requestId);
+    expect(h.dock.state.pendingRequests).toHaveLength(1);
+    expect(h.dock.cancelAgent(minted.tokenId)).toBe(true);
+    expect(h.dock.state.pendingRequests).toEqual([]);
+    expect(
+      socket.framesOf('attach_decision').filter((sent) => sent.requestId === frame.requestId),
+    ).toEqual([]);
+    expect(socket.framesOf('agent_cancel')).toEqual([
+      { t: 'agent_cancel', tokenId: minted.tokenId },
+    ]);
   });
 
   it('keeps its records across a reload of the same page session, and none for another', async () => {

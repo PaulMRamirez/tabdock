@@ -1110,9 +1110,11 @@ interface RequestRecord {
 /**
  * Why a request was answered, which decides whether a control invite counts
  * a refusal: only the operator's Deny and a prompt left to time out do,
- * since three of those burn it (ADR 0017).
+ * since three of those burn it (ADR 0017). 'closing' is a request the relay
+ * ends itself, as it applies the session_end, invite_cancel or agent_cancel
+ * this page sends with it, or its own session's end.
  */
-type DecisionCause = 'operator' | 'timeout' | 'rule' | 'invite' | 'revoke' | 'detach';
+type DecisionCause = 'operator' | 'timeout' | 'rule' | 'invite' | 'revoke' | 'detach' | 'closing';
 
 interface MintInFlight {
   /** Only until the relay answers; then it goes into the link, and from here nowhere. */
@@ -3444,9 +3446,10 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     if (!allow && invite && record.shown && (cause === 'operator' || cause === 'timeout')) {
       updateInvite({ ...invite, refusals: Math.min(INVITE_BURN_REFUSALS, invite.refusals + 1) });
     }
-    if (!allow && agent && record.shown && (cause === 'operator' || cause === 'timeout')) {
-      agentRefused(agent, cause);
-    }
+    const burned =
+      !allow && agent !== undefined && record.shown && (cause === 'operator' || cause === 'timeout')
+        ? agentRefused(agent, cause)
+        : false;
     const who = logName(request.user);
     askedDriver.delete(userId);
     if (!allow) {
@@ -3477,14 +3480,25 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     // An agent token's silence is the relay's to count: its own timer ends
     // the request as a timeout, which only the third time burns the token,
     // whereas a refusal from here reads as the operator's deny and burns it
-    // at once (ADR 0044), whichever clock runs ahead.
-    if (cause === 'revoke' || (cause === 'timeout' && agentId !== undefined)) return true;
-    return send({
-      t: 'attach_decision',
-      requestId,
-      allow,
-      ...(allow && granted !== undefined ? { role: granted } : {}),
-    });
+    // at once (ADR 0044), whichever clock runs ahead. A request the relay
+    // ends itself with a frame this page sends beside it, or with its own
+    // session's end, gets none either, which would read there as the
+    // operator's deny and close a token as denied rather than as ended or
+    // cancelled (S7).
+    const sent =
+      cause === 'revoke' || cause === 'closing' || (cause === 'timeout' && agentId !== undefined)
+        ? true
+        : send({
+            t: 'attach_decision',
+            requestId,
+            allow,
+            ...(allow && granted !== undefined ? { role: granted } : {}),
+          });
+    // After the deny that burned it, which the relay closes the token on as
+    // denied; agent_cancel then closes it too should that deny have crossed
+    // the prompt's end there, and changes nothing otherwise.
+    if (burned && agent) cancelAgent(agent.tokenId);
+    return sent;
   }
 
   // Invites (ADR 0017)
@@ -3522,9 +3536,13 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   /**
    * The page stops honouring an invite: its record goes, stored copy too, a
    * redemption of it still being checked or waiting on the operator is
-   * refused, and a mint still waiting on the relay settles with `reason`.
+   * refused (`cause`), and a mint still waiting on the relay settles with `reason`.
    */
-  function forgetInvite(inviteId: string, reason: InviteRefusal): void {
+  function forgetInvite(
+    inviteId: string,
+    reason: InviteRefusal,
+    cause: DecisionCause = 'rule',
+  ): void {
     const had = invites.delete(inviteId);
     listings.delete(inviteId);
     const mint = minting.get(inviteId);
@@ -3534,9 +3552,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       mint.resolve(Object.freeze({ ok: false, reason }));
     }
     for (const record of [...requests.values()]) {
-      if (record.request.invite?.inviteId === inviteId) {
-        decide(record, false, undefined, 'rule');
-      }
+      if (record.request.invite?.inviteId === inviteId) decide(record, false, undefined, cause);
     }
     if (had) saveGrants();
   }
@@ -3884,9 +3900,11 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    */
   function cancelInvite(inviteId: string): boolean {
     if (closed || !invites.has(inviteId)) return false;
-    forgetInvite(inviteId, 'cancelled');
-    log.info(`closed invite ${inviteId}`);
+    // The cancel first: the relay ends a redemption waiting on it as it
+    // closes the invite, never as a refusal that counts toward burning it.
     if (isLinked() && send({ t: 'invite_cancel', inviteId })) cancelSent.add(inviteId);
+    forgetInvite(inviteId, 'cancelled', 'closing');
+    log.info(`closed invite ${inviteId}`);
     return true;
   }
 
@@ -4584,7 +4602,9 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       // Refused here until the relay drops them, and revoked there should a later link find them.
       if (listed.has(userId)) revoked.add(userId);
     }
-    for (const inviteId of [...invites.keys()]) forgetInvite(inviteId, 'cancelled');
+    // The relay ends what waits on them with the session (its session_end,
+    // or its own end), so nothing here answers it as a refusal (S7).
+    for (const inviteId of [...invites.keys()]) forgetInvite(inviteId, 'cancelled', 'closing');
     saveGrants();
     for (const call of [...calls.values()]) {
       if (!gone.includes(call.frame.caller.userId)) continue;
@@ -4596,7 +4616,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       });
     }
     for (const userId of gone) proposalsRevoked(userId);
-    agentsRevoked('*');
+    for (const tokenId of [...agentRecords.keys()]) forgetAgent(tokenId, 'cancelled', 'closing');
     const end: SessionEnded = Object.freeze({
       sessionId: ended.sessionId,
       label: ended.label,
@@ -4880,10 +4900,14 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   /**
    * The page stops honouring a token: its record goes, stored copy too, a
    * first request of it still being checked or waiting on the operator is
-   * refused, the grant it made goes, and a mint still waiting settles with
-   * `reason`.
+   * refused (`cause`), the grant it made goes, and a mint still waiting
+   * settles with `reason`.
    */
-  function forgetAgent(tokenId: string, reason: InviteRefusal): void {
+  function forgetAgent(
+    tokenId: string,
+    reason: InviteRefusal,
+    cause: DecisionCause = 'rule',
+  ): void {
     const had = agentRecords.delete(tokenId);
     agentListings.delete(tokenId);
     const mint = agentMinting.get(tokenId);
@@ -4893,7 +4917,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       mint.resolve(Object.freeze({ ok: false, reason }));
     }
     for (const record of [...requests.values()]) {
-      if (record.request.agent?.tokenId === tokenId) decide(record, false, undefined, 'rule');
+      if (record.request.agent?.tokenId === tokenId) decide(record, false, undefined, cause);
     }
     for (const [userId, ofToken] of [...agentUsers]) {
       if (ofToken === tokenId) agentUsers.delete(userId);
@@ -5070,14 +5094,15 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    * The operator denied a token's prompt, which says they do not know the
    * agent, so the token burns at once; one left to time out counts, and its
    * third does too (ADR 0044). The relay burns it by the same rules, and is
-   * told to close it whatever it counts.
+   * told to close it whatever it counts: true when it burned, for decide to
+   * close once its own answer has gone.
    */
-  function agentRefused(agent: StoredAgent, cause: 'operator' | 'timeout'): void {
+  function agentRefused(agent: StoredAgent, cause: 'operator' | 'timeout'): boolean {
     const timeouts = cause === 'timeout' ? agent.timeouts + 1 : agent.timeouts;
     const burned = cause === 'operator' || timeouts >= AGENT_BURN_TIMEOUTS;
     agentRecords.set(agent.tokenId, { ...agent, burned, timeouts });
-    if (burned) cancelAgent(agent.tokenId);
-    else saveAgents();
+    if (!burned) saveAgents();
+    return burned;
   }
 
   /**
@@ -5172,9 +5197,11 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    */
   function cancelAgent(tokenId: string): boolean {
     if (closed || !agentRecords.has(tokenId)) return false;
-    forgetAgent(tokenId, 'cancelled');
-    log.info(`closed agent token ${tokenId}`);
+    // The cancel first: the relay ends a prompt of it still waiting as it
+    // closes the token, as cancelled, never as the operator's deny.
     if (isLinked() && send({ t: 'agent_cancel', tokenId })) agentCancelSent.add(tokenId);
+    forgetAgent(tokenId, 'cancelled', 'closing');
+    log.info(`closed agent token ${tokenId}`);
     return true;
   }
 

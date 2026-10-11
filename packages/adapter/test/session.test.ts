@@ -27,6 +27,7 @@ import {
   link,
   listingOf,
   MapStorage,
+  mint,
   redemption,
   results,
   setup,
@@ -618,6 +619,29 @@ describe("the session's end on the page's own clock (A6.17)", () => {
     expect(h.dock.state.sessionEnded).toMatchObject({ reason: 'operator' });
     expect(h.dock.endSession()).toBe(false);
   });
+});
+
+describe("a prompt the session's end takes (ADR 0044's notes)", () => {
+  for (const how of ['End', 'its clock'] as const) {
+    it(`answers no redemption waiting on the operator at ${how}, which the relay ends with the session`, async () => {
+      const { h, socket } = await offering({ invites: 'all' });
+      const { start } = await started(h, socket, { label: 'Class', lengthMinutes: 30 }, 10_000);
+      const minted = await mint(h, socket, { label: 'Lab', role: 'driver' });
+      socket.deliver(redemption(h.clock, minted));
+      await until(() => h.dock.state.pendingRequests.length === 1, 'the prompt');
+      if (how === 'End') expect(h.dock.endSession()).toBe(true);
+      else await h.clock.advance(10_000 + SESSION_END_GRACE_MS);
+      expect(h.dock.state.pendingRequests).toEqual([]);
+      // A deny would read on the relay as the operator's own, before the session's end.
+      const asked = `redeem-${minted.inviteId}`;
+      expect(socket.framesOf('attach_decision').filter((sent) => sent.requestId === asked)).toEqual(
+        [],
+      );
+      expect(socket.framesOf('session_end')).toEqual([
+        { t: 'session_end', sessionId: start.sessionId },
+      ]);
+    });
+  }
 });
 
 describe('a session across page sessions', () => {
