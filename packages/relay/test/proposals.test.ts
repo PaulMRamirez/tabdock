@@ -259,6 +259,28 @@ describe('an observer proposes (A6.10)', () => {
     await opened.sync();
     expect(opened.all('proposal')).toEqual([]);
   });
+
+  it('runs nothing under deny for a tool the page re-lists as consequential after the proposal', async () => {
+    const relay = await setup();
+    const opened = await page({ proposals: 'members', consequential: 'deny' });
+    const bob = await observer(opened);
+    const proposalId = proposalIdOf(await propose(bob, opened.pageId));
+    await nextProposal(opened);
+    opened.send({ t: 'tools', tools: [READ_TOOL, { ...WRITE_TOOL, consequential: true }] });
+    await opened.sync();
+    await decide(opened, proposalId, true);
+    expect(await opened.next('proposal_end')).toEqual({
+      t: 'proposal_end',
+      proposalId,
+      reason: 'not_run',
+    });
+    expect(opened.all('invoke')).toEqual([]);
+    await eventually(() => proposalCalls(events(relay), proposalId).length === 2);
+    expect(proposalCalls(events(relay), proposalId)[1]).toMatchObject({
+      acceptedOnPage: true,
+      outcome: 'denied_by_operator',
+    });
+  });
 });
 
 describe('the operator decides (A6.11)', () => {

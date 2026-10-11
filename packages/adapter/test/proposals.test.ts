@@ -24,6 +24,7 @@ import {
   type Harness,
   invoke,
   link,
+  MapStorage,
   results,
   runtimeTool,
   setup,
@@ -146,24 +147,62 @@ describe('taking a proposal (A6.10)', () => {
 
   it("refuses an invitee under 'members' and an agent token's caller even under 'all' (C13)", async () => {
     const tokenId = 'agt_0123456789';
-    const hash = await sha256Hex(agentKeyInput('page-1', tokenId));
-    const agent = `${INVITEE_ID_PREFIX}${hash.slice(0, 32)}`;
+    const agent = `${INVITEE_ID_PREFIX}${(await sha256Hex(agentKeyInput('page-1', tokenId))).slice(0, 32)}`;
+    const guest = `${INVITEE_ID_PREFIX}${(await sha256Hex('a guest')).slice(0, 32)}`;
     const endsAt = Date.UTC(2026, 9, 2, 20, 0, 0);
-    const stored = (role: string) => ({ role, inviteId: tokenId, endsAt, inviteRole: 'observer' });
+    const made = { agent: tokenId, guest: 'inv_0123456789' };
+    const stored = (inviteId: string) => ({
+      role: 'observer',
+      inviteId,
+      endsAt,
+      inviteRole: 'observer',
+    });
     for (const proposals of ['members', 'all'] as const) {
-      const h = setup({ core: { policy: { proposals } } });
-      // ADR 0044's grant for an agent token, as its approval stores it, on a resumed page session.
-      h.storage.setItem(
+      // An agent token's grant (ADR 0044) and an invite's, as their approvals
+      // store them, read back on a reload into the same page session: both
+      // listed observers, told apart only by how the page derives the agent's id.
+      const storage = new MapStorage();
+      storage.setItem(
         GRANTS_KEY,
-        JSON.stringify({ pageId: 'page-1', grants: { [agent]: stored('observer') } }),
+        JSON.stringify({
+          pageId: 'page-1',
+          grants: { [agent]: stored(made.agent), [guest]: stored(made.guest) },
+        }),
       );
+      const h = setup({ storage, core: { policy: { proposals } } });
       const roster = [
-        { ...attachment(agent, 'observer'), kind: 'invitee' as const, inviteId: tokenId, endsAt },
+        {
+          ...attachment(agent, 'observer'),
+          kind: 'invitee' as const,
+          inviteId: made.agent,
+          endsAt,
+        },
+        {
+          ...attachment(guest, 'observer'),
+          kind: 'invitee' as const,
+          inviteId: made.guest,
+          endsAt,
+        },
       ];
       await link(h, { resumed: true, roster }, {});
-      await propose(h, proposal(h, { proposer: { ...BOB, userId: agent, displayName: 'agent' } }));
-      expect(decisions(h)[0]?.refused, proposals).toBe(proposals === 'all' ? 'role' : 'policy');
-      expect(h.dock.state.proposals).toEqual([]);
+      expect(h.dock.state.pageRoles.map((role) => role.role)).toEqual(['observer', 'observer']);
+      const proposer = (userId: string) => ({ ...BOB, userId, displayName: userId.slice(0, 8) });
+      await propose(h, proposal(h, { proposalId: 'pr_agent', proposer: proposer(agent) }));
+      await propose(h, proposal(h, { proposalId: 'pr_guest', proposer: proposer(guest) }));
+      expect(
+        decisions(h).map((sent) => [sent.proposalId, sent.refused]),
+        proposals,
+      ).toEqual(
+        proposals === 'all'
+          ? [['pr_agent', 'role']]
+          : [
+              ['pr_agent', 'role'],
+              ['pr_guest', 'policy'],
+            ],
+      );
+      expect(h.dock.state.proposals.map((held) => held.proposalId)).toEqual(
+        proposals === 'all' ? ['pr_guest'] : [],
+      );
     }
   });
 });
@@ -342,6 +381,14 @@ describe('crafted invokes (A6.13, S5)', () => {
     await refusedUnrun(h, invoke('set_value', right));
     await propose(h, proposal(h));
     await refusedUnrun(h, invoke('set_value', { ...right, callId: 'call-2' }));
+    // Not even for a driver, who could run the write without one: the claim itself is refused.
+    const alice = { userId: 'alice', displayName: 'Alice', client: null, role: 'driver' } as const;
+    await refusedUnrun(h, invoke('set_value', { ...right, callId: 'call-3', caller: alice }));
+    expect(results(h.socket()).map((sent) => sent.error?.message)).toEqual([
+      'the page holds no accepted proposal for this call',
+      'the page holds no accepted proposal for this call',
+      'the page holds no accepted proposal for this call',
+    ]);
   });
 
   it('refuses changed arguments, another caller and another tool', async () => {
@@ -370,6 +417,13 @@ describe('crafted invokes (A6.13, S5)', () => {
   it('refuses one past ACCEPTED_PROPOSAL_RUN_MS after the Accept', async () => {
     const { h } = await accepted();
     await linkedFor(h, ACCEPTED_PROPOSAL_RUN_MS + 1000);
+    await refusedUnrun(h, invoke('set_value', right));
+  });
+
+  it('refuses one past the window even before a throttled timer ends the Accept', async () => {
+    // A background tab may run its timers late; the clock still says the window closed.
+    const { h } = await accepted();
+    h.clock.now += ACCEPTED_PROPOSAL_RUN_MS + 1;
     await refusedUnrun(h, invoke('set_value', right));
   });
 

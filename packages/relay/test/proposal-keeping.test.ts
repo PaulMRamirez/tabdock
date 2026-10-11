@@ -144,6 +144,21 @@ describe('PageProposals', () => {
     proposals.close();
   });
 
+  it("wakes a wait on an ended attachment's accepted run at once, with why, and no one else's (S8)", async () => {
+    const { proposals, made } = held();
+    const bobs = made('pg_1', 'bob');
+    const carols = made('pg_1', 'carol');
+    expect(proposals.accept(bobs) && proposals.accept(carols)).toBe(true);
+    const never = new AbortController().signal;
+    const bobWaits = proposals.wait(bobs, 60_000, never);
+    const carolWaits = proposals.wait(carols, 50, never);
+    const why = { kind: 'error', code: 'not_attached', message: 'revoked' } as const;
+    proposals.attachmentsEnded('pg_1', new Set(['bob']), why);
+    expect(await bobWaits).toEqual(why);
+    expect(await carolWaits).toEqual({ kind: 'timeout' });
+    proposals.close();
+  });
+
   it('forgets every proposal of a page that is gone, pending or kept', () => {
     const { proposals, ended, made } = held();
     const pending = made('pg_1', 'bob');
