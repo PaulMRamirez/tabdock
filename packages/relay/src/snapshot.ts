@@ -28,6 +28,7 @@ import * as nodeFs from 'node:fs';
 import { join } from 'node:path';
 import {
   INVITEE_ID_PREFIX,
+  MAX_ROSTER_CLIENTS_PER_INVITEE,
   MAX_SNAPSHOT_BYTES,
   MEMBER_RESERVED_SEATS,
   narrowPolicy,
@@ -651,7 +652,12 @@ export function savedAttachment(
     grantedAt: attachment.grantedAt,
     lastUsedAt: attachment.lastUsedAt,
     expiresAt: attachment.expiresAt,
-    clients: attachment.clients.map((client) => ({ ...client })),
+    // An invitee's newest few, all its roster row ever shows (hub.ts, #roster):
+    // guests name their clients on every call, and forty watchers each
+    // keeping twenty would be most of a hosted relay's file.
+    clients: attachment.clients
+      .slice(0, attachment.kind === 'invitee' ? MAX_ROSTER_CLIENTS_PER_INVITEE : undefined)
+      .map((client) => ({ ...client })),
     inviteId: attachment.inviteId,
     endsAt: attachment.endsAt,
     inviteRole: attachment.inviteRole,

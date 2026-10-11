@@ -8,6 +8,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   MAX_LIVE_INVITES_PER_PAGE,
+  MAX_ROSTER_CLIENTS_PER_INVITEE,
   PolicySchema,
   type RelaySnapshot,
   RelaySnapshotSchema,
@@ -229,6 +230,35 @@ describe('a restart snapshot (ADR 0046)', () => {
         attachments: [alice, { ...guest, role: 'driver' }, snapshot.attachments[2]],
       }),
     ).toBe('a watch invite never made a driver');
+    // An invitee keeps the clients its roster row shows; a member keeps up to twenty.
+    const clients = (count: number) =>
+      Array.from({ length: count }, (_, index) => ({ name: `c${String(index)}`, version: '1' }));
+    expect(
+      refusal({
+        ...snapshot,
+        attachments: [
+          alice,
+          { ...guest, clients: clients(MAX_ROSTER_CLIENTS_PER_INVITEE) },
+          snapshot.attachments[2],
+        ],
+      }),
+    ).toBeNull();
+    expect(
+      refusal({
+        ...snapshot,
+        attachments: [
+          alice,
+          { ...guest, clients: clients(MAX_ROSTER_CLIENTS_PER_INVITEE + 1) },
+          snapshot.attachments[2],
+        ],
+      }),
+    ).toBe('an invitee keeps only its newest few clients');
+    expect(
+      refusal({
+        ...snapshot,
+        attachments: [{ ...alice, clients: clients(20) }, ...snapshot.attachments.slice(1)],
+      }),
+    ).toBeNull();
     expect(
       refusal({
         ...snapshot,

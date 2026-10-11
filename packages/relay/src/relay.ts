@@ -751,7 +751,9 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       return;
     }
     if (outcome.kind === 'refused') {
-      log.warn('restart snapshot not written', { reason: outcome.reason });
+      // An error, not a warning: the operator turned the setting on, and the
+      // next start will end every attachment instead of resuming them.
+      log.error('restart snapshot not written', { reason: outcome.reason });
       return;
     }
     recordAudit(store.audit, log, {

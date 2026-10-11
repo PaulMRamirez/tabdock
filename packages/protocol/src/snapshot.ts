@@ -29,6 +29,7 @@ import {
   MAX_INVITE_USES,
   MAX_LIVE_AGENTS_PER_PAGE,
   MAX_LIVE_INVITES_PER_PAGE,
+  MAX_ROSTER_CLIENTS_PER_INVITEE,
   SNAPSHOT_VERSION,
 } from './constants.ts';
 import {
@@ -51,9 +52,12 @@ import { withinCeiling } from './sessions.ts';
 
 /**
  * The largest snapshot a relay writes or reads. It bounds every list in the
- * file at once, and with it what a start parses before it listens: a hosted
- * relay's 100 page sessions, each with its people and 40 watchers, need well
- * under a quarter of it. A stop whose snapshot would be larger writes none.
+ * file at once, and with it what a start parses before it listens. A hosted
+ * relay at its defaults, 100 page sessions each with 10 people of 20
+ * clients, 40 watchers, 10 live invites and 10 agent tokens, every name at
+ * its longest, needs about 12.1 MB, since an invitee keeps only the clients
+ * its roster row shows (restart-snapshot.test.ts measures it). A stop whose
+ * snapshot would be larger writes none, and logs that as an error.
  */
 export const MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024;
 
@@ -166,6 +170,13 @@ const SnapshotAttachmentSchema = z
       {
         message: 'a watch invite never made a driver',
       },
+    ),
+    // All an invitee's roster row ever shows (ADR 0044), and all a stop saves of it.
+    z.refine(
+      (attachment) =>
+        attachment.kind !== 'invitee' ||
+        attachment.clients.length <= MAX_ROSTER_CLIENTS_PER_INVITEE,
+      { message: 'an invitee keeps only its newest few clients' },
     ),
   );
 

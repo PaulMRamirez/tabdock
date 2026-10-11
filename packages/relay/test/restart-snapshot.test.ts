@@ -43,6 +43,7 @@ import {
   AUDIT_VERSION,
   type AuditLine,
   INVITEE_ID_PREFIX,
+  MAX_ROSTER_CLIENTS_PER_INVITEE,
   MAX_SNAPSHOT_BYTES,
   type PolicyInput,
   PolicySchema,
@@ -50,7 +51,9 @@ import {
   RelaySnapshotSchema,
   RESUME_WINDOW_MS,
   SNAPSHOT_VERSION,
+  type SnapshotAgent,
   type SnapshotAttachment,
+  type SnapshotInvite,
   type SnapshotPage,
 } from '@tabdock/protocol';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -74,6 +77,8 @@ import {
   bindingProblem,
   fitProblem,
   removeTemporaryFiles,
+  restoredAttachment,
+  savedAttachment,
   SNAPSHOT_FILE,
   type SnapshotFs,
   snapshotAccounts,
@@ -1063,6 +1068,125 @@ describe('taking the file (snapshot.ts)', () => {
       [...others, `.${SNAPSHOT_FILE}.00000000000000ff.tmp`].sort(),
     );
     expect(removeTemporaryFiles(join(dir, 'missing'))).toBe(0);
+  });
+
+  it("fits a hosted relay's fullest store, every seat taken and every name at its longest, within MAX_SNAPSHOT_BYTES", () => {
+    const dir = privateDir();
+    const now = Date.now();
+    const text = (char: string, length: number): string => char.repeat(length);
+    const digestOf = (value: string): string => createHash('sha256').update(value).digest('hex');
+    const id = (prefix: string, value: number): string =>
+      `${prefix}${String(value)}`.padEnd(64, 'x');
+    const guestId = (value: number): string =>
+      `${INVITEE_ID_PREFIX}${value.toString(16).padStart(32, '0')}`;
+    // Twenty clients on every account, as the store keeps them, each name and version at its longest.
+    const clients = Array.from({ length: 20 }, (_, index) => ({
+      name: `${String(index)}${text('n', 98)}`,
+      version: text('v', 50),
+    }));
+    const accounts = snapshotAccounts(null);
+    const pages: SnapshotPage[] = [];
+    const attachments: SnapshotAttachment[] = [];
+    const invites: SnapshotInvite[] = [];
+    const agents: SnapshotAgent[] = [];
+    let guests = 0;
+    for (let page = 0; page < 100; page += 1) {
+      const pageId = id('pg_', page);
+      pages.push(
+        savedPageOf(pageId, now, {
+          origin: `https://${text('o', 2_030)}.example`,
+          url: `https://${text('u', 2_030)}.example/`,
+          title: text('t', 300),
+          adapterVersion: text('a', 50),
+          resumeTokenHash: digestOf(pageId),
+        }),
+      );
+      const sponsor = { userId: id('member_0_', page), displayName: text('S', 100) };
+      const store = (saved: SnapshotAttachment) =>
+        savedAttachment(
+          { ...restoredAttachment(saved), clients },
+          accounts.memberKey(saved.userId),
+        );
+      for (let member = 0; member < 10; member += 1) {
+        attachments.push(
+          store(
+            savedAttachmentOf(pageId, id(`member_${String(member)}_`, page), {
+              displayName: text('M', 100),
+              lastUsedAt: now,
+              expiresAt: now,
+            }),
+          ),
+        );
+      }
+      for (let watcher = 0; watcher < 40; watcher += 1) {
+        guests += 1;
+        attachments.push(
+          store(
+            savedAttachmentOf(pageId, guestId(guests), {
+              displayName: text('G', 100),
+              kind: 'invitee',
+              lastUsedAt: now,
+              expiresAt: now,
+              inviteId: id('inv_', page),
+              endsAt: now,
+              inviteRole: 'observer',
+              sponsorId: sponsor.userId,
+              emailHash: digestOf(`email ${String(guests)}`),
+            }),
+          ),
+        );
+      }
+      for (let index = 0; index < 10; index += 1) {
+        invites.push({
+          inviteId: id(`inv_${String(index)}_`, page),
+          pageId,
+          role: 'observer',
+          label: text('L', 60),
+          uses: 20,
+          usesLeft: 0,
+          createdAt: now,
+          requestedExpiresAt: now,
+          expiresAt: now,
+          ownExpiresAt: now,
+          secretHash: digestOf(`invite ${String(page)} ${String(index)}`),
+          sponsor,
+          refusals: 0,
+          barredUserIds: Array.from({ length: 20 }, (_, bar) => guestId(1_000_000 + bar)),
+          barredEmailHashes: Array.from({ length: 20 }, (_, bar) => digestOf(`bar ${String(bar)}`)),
+        });
+        agents.push({
+          tokenId: id(`agt_${String(index)}_`, page),
+          pageId,
+          label: text('A', 60),
+          secretHash: digestOf(`agent ${String(page)} ${String(index)}`),
+          createdAt: now,
+          expiresAt: now,
+          requestedExpiresAt: now,
+          sponsor,
+          state: 'dormant',
+          timeouts: 0,
+          userId: guestId(2_000_000 + page * 10 + index),
+          client: clients[0] ?? null,
+        });
+      }
+    }
+    const fullest: RelaySnapshot = {
+      v: SNAPSHOT_VERSION,
+      writtenAt: now,
+      mode: 'public',
+      pages,
+      attachments,
+      invites,
+      agents,
+    };
+    const written = writeSnapshot(dir, fullest);
+    expect(written).toMatchObject({ kind: 'written' });
+    // About 12.1 MB (11 October 2026). Each guest keeps the clients its
+    // roster row shows; with all twenty, the file would pass 24 MB and the
+    // stop would write none, so every page would pair again after a deploy.
+    expect(statSync(fileOf(dir)).size).toBeLessThan(MAX_SNAPSHOT_BYTES);
+    const watcher = attachments.find((attachment) => attachment.kind === 'invitee');
+    expect(watcher?.clients).toHaveLength(MAX_ROSTER_CLIENTS_PER_INVITEE);
   });
 
   it('writes nothing past MAX_SNAPSHOT_BYTES, leaving no file behind', () => {
