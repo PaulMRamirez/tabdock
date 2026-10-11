@@ -717,6 +717,12 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     }
   }
   /**
+   * Whether a member list change is in force that settleMembers has not
+   * finished ending (members.ts, settlingMembers keeps it owed): set when a
+   * settle begins, cleared only when one finishes with every step done.
+   */
+  let membersUnsettled = false;
+  /**
    * At a graceful stop with the setting on (ADR 0046): the hub's store, once
    * it takes no more work, into the snapshot file, and its digest into the
    * log, which relay_stop follows at once. Anything that goes wrong writes no
@@ -725,6 +731,16 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
    */
   const writeRestartSnapshot = (): void => {
     if (!config.restartSnapshot || fileAudit === null) return;
+    if (membersUnsettled) {
+      // The list in force has not yet ended what it took away (settleMembers
+      // threw part way, so the change is owed): keyed to that list, the file
+      // would hand a moved id's attachments to whoever the id names now
+      // (S8, S13). With none written, the next start ends everything.
+      log.error('restart snapshot not written', {
+        reason: 'a member list change is still unsettled',
+      });
+      return;
+    }
     let outcome: ReturnType<typeof writeSnapshot>;
     let snapshot: ReturnType<typeof hub.exportSnapshot>;
     try {
@@ -915,6 +931,8 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
    * name.
    */
   const settleMembers = (change: MemberChange): void => {
+    // Each settle carries every change still owed, so one that finishes settles them all.
+    membersUnsettled = true;
     const faults: unknown[] = [];
     const step = <T>(run: () => T, otherwise: T): T => {
       try {
@@ -944,6 +962,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       log.info('sessions closed for a member list change', { mcpSessions, streams });
     }
     if (faults.length > 0) throw faults[0];
+    membersUnsettled = false;
   };
   const applyMembers = members === null ? null : settlingMembers(members, settleMembers);
   // A closed agent token's user holds nothing more (ADR 0044): its 2025-era

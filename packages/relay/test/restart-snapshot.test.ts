@@ -613,6 +613,50 @@ describe('a graceful restart with TABDOCK_RESTART_SNAPSHOT on (A6.18)', () => {
     expect((await call(carol, 'call_page_tool', getView(page.pageId))).isError).toBe(true);
   });
 
+  it('writes no snapshot while a member list change is still owed, so what it ends never comes back (S8, S13)', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const members = join(privateDir(), 'members.txt');
+    const save = (lines: string[]): void => {
+      writeFileSync(`${members}.new`, `${lines.join('\n')}\n`, { mode: 0o600 });
+      renameSync(`${members}.new`, members);
+    };
+    save(['sub-alice=alice:Alice', 'sub-bob=bob:Bob']);
+    const first = await startRun(dir, idp, { membersFile: members });
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    await attachMember(await first.claude('sub-bob'), page, 'observer');
+    // Bob's id goes to Carol, and the hub's step of settling that fails:
+    // the new list is in force, and Bob's attachment has not ended yet.
+    save(['sub-alice=alice:Alice', 'sub-carol=bob:Bob']);
+    const fault = vi.spyOn(PageHub.prototype, 'membershipChanged').mockImplementation(() => {
+      throw new Error('a settle step failed');
+    });
+    try {
+      await expect(first.relay.reloadMembers()).rejects.toThrow('a settle step failed');
+      await first.close();
+    } finally {
+      fault.mockRestore();
+    }
+    expect(recordsOf(dir, 'snapshot_written')).toEqual([]);
+    expect(
+      first.lines.some(
+        (line) =>
+          line.includes('restart snapshot not written') &&
+          line.includes('a member list change is still unsettled'),
+      ),
+    ).toBe(true);
+    expect(existsSync(fileOf(dir))).toBe(false);
+
+    // So the next start is fresh, and Carol, who signs in as bob now, holds none of the page.
+    const second = await startRun(dir, idp, { membersFile: members });
+    expect(recordsOf(dir, 'snapshot_loaded')).toEqual([]);
+    const back = await resumeOn(second, page);
+    expect(rosterIds(back)).not.toContain('bob');
+    const carol = await second.claude('sub-carol');
+    expect((await call(carol, 'call_page_tool', getView(back.pageId))).isError).toBe(true);
+  });
+
   it('ends a session whose end passed while the relay was down, with reason time', async () => {
     vi.useFakeTimers({ toFake: ['Date'], shouldAdvanceTime: true });
     const idp = await provider();
