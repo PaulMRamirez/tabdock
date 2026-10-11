@@ -2563,6 +2563,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     // The log's outcomes are the page's own, and from here the call was cancelled.
     settleEntry(call, 'cancelled');
     release(call);
+    // As in finish: a lost link must not leave the gate to the hold timer.
+    freeImageSlot(call.executing ? null : call);
   }
 
   function finish(call: CallRecord, outcome: Outcome): void {
@@ -2713,52 +2715,41 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     if (snapshot) await proceed(call, checked.tool, snapshot);
   }
 
-  /** Consequential policy and the operator's confirmation, then the handler. */
+  /** Consequential policy and the operator's confirmation, the image gate, then the handler. */
   async function proceed(
     call: CallRecord,
     tool: NormalisedTool,
     snapshot: ToolSnapshot,
   ): Promise<void> {
     const { frame } = call;
-    // ADR 0039: a tool the page declares an image tool waits for the image
-    // gate first, so nothing below awaits anything between its checks and
-    // the handler but the operator's own prompt, as before.
+    const rule = isConsequential(tool.page, snapshot.hintSupport, policy) && policy.consequential;
+    if (rule === 'deny') {
+      finish(call, {
+        ok: false,
+        code: 'denied_by_operator',
+        message: 'this page does not run consequential tools',
+      });
+      return;
+    }
+    let byClient = rule === 'confirm' && takesClientConfirmation(call);
+    // ADR 0039: the operator answers before an image call waits at the gate,
+    // so a prompt left open holds no other capture back.
+    if (rule === 'confirm' && !byClient && !(await operatorAllows(call, snapshot))) return;
     const imageTool = policy.imageTools.includes(tool.page.name);
-    if (imageTool && !(await takeImageSlot(call, snapshot))) return;
-    if (isConsequential(tool.page, snapshot.hintSupport, policy)) {
-      if (policy.consequential === 'deny') {
-        finish(call, {
-          ok: false,
-          code: 'denied_by_operator',
-          message: 'this page does not run consequential tools',
-        });
-        return;
+    if (imageTool) {
+      if (!(await takeImageSlot(call, snapshot))) return;
+      // Only a change made during the wait can end what let the client
+      // confirm; the page then asks, holding the gate.
+      if (byClient && !takesClientConfirmation(call)) {
+        byClient = false;
+        if (!(await operatorAllows(call, snapshot))) return;
       }
-      if (policy.consequential === 'confirm') {
-        if (takesClientConfirmation(call)) {
-          // Nothing is awaited between check() and the handler, so the
-          // grant, roster and role this read are the ones the call runs under.
-          logCall(call, 'confirmed in their client, so the page did not ask');
-          updateEntry(call, { confirmedBy: 'client' });
-        } else {
-          const allowed = await askConfirm(call);
-          if (isDone(call)) return;
-          if (!allowed) {
-            finish(call, {
-              ok: false,
-              code: 'denied_by_operator',
-              message: 'the operator denied this call',
-            });
-            return;
-          }
-          // The operator may have lowered this caller's role while the prompt was up.
-          const again = check(frame, snapshot);
-          if (!again.ok) {
-            finish(call, again.refusal);
-            return;
-          }
-        }
-      }
+    }
+    if (byClient) {
+      // Nothing is awaited between check() and the handler, so the grant,
+      // roster and role this read are the ones the call runs under.
+      logCall(call, 'confirmed in their client, so the page did not ask');
+      updateEntry(call, { confirmedBy: 'client' });
     }
     call.stage = 'running';
     call.executing = true;
@@ -2914,6 +2905,28 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     }
     if (callerRole(frame.caller) !== 'driver') return 'the caller is not a driver here';
     return null;
+  }
+
+  /** The operator's prompt; false when they deny it or the call ended meanwhile. */
+  async function operatorAllows(call: CallRecord, snapshot: ToolSnapshot): Promise<boolean> {
+    const allowed = await askConfirm(call);
+    if (!allowed && !isDone(call)) {
+      finish(call, {
+        ok: false,
+        code: 'denied_by_operator',
+        message: 'the operator denied this call',
+      });
+    }
+    // The operator may have lowered this caller's role while the prompt was up.
+    return allowed && checkedAgain(call, snapshot);
+  }
+
+  /** check() once more after an await, since the roster, grants and tools may have changed. */
+  function checkedAgain(call: CallRecord, snapshot: ToolSnapshot): boolean {
+    if (isDone(call)) return false;
+    const again = check(call.frame, snapshot);
+    if (!again.ok) finish(call, again.refusal);
+    return again.ok;
   }
 
   function askConfirm(call: CallRecord): Promise<boolean> {
@@ -3759,10 +3772,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       imageWaiting.push({ call, go });
       pumpImages();
     });
-    if (isDone(call)) return false;
-    const again = check(call.frame, snapshot);
-    if (!again.ok) finish(call, again.refusal);
-    return again.ok;
+    return checkedAgain(call, snapshot);
   }
 
   /** Drops waiters already answered, then starts the next once the gate is free and the spacing passed. */

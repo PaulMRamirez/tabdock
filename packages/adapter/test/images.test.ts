@@ -22,6 +22,7 @@ import {
   UNWATCHED_HANDLER_GRACE_MS,
 } from '../src/core.ts';
 import {
+  attachment,
   type FakeSocket,
   flush,
   type Harness,
@@ -396,5 +397,91 @@ describe('the image gate (A6.4)', () => {
     expect(starts).toHaveLength(1);
     await h.clock.advance(1);
     expect(starts).toEqual([start, start + 1_000 + UNWATCHED_HANDLER_GRACE_MS]);
+  });
+
+  /**
+   * A page with the read-only capture and `snap`, a read-only image tool the
+   * page names consequential, on a page that takes a driver's confirmation
+   * from their client (ADR 0026).
+   */
+  async function promptingPage(): Promise<{ h: Harness; socket: FakeSocket }> {
+    const h = setup({
+      tools: [CAPTURE, runtimeTool('snap', { readOnlyHint: true, untrustedContentHint: false })],
+      core: {
+        policy: {
+          imageTools: ['capture', 'snap'],
+          consequentialTools: ['snap'],
+          confirmVia: 'client',
+        },
+      },
+    });
+    const socket = await link(h, {
+      limits: { ...welcome(h.clock).limits, maxImageBytes: DEFAULT_IMAGE_BYTES },
+    });
+    return { h, socket };
+  }
+
+  it("lets other captures through while the operator's prompt for one is open", async () => {
+    const { h, socket } = await promptingPage();
+    const runs = slowCaptures(h);
+    h.context.handlers.set('snap', () => ENVELOPE);
+    socket.deliver(invoke('snap', { callId: 'snap-1' }));
+    await h.clock.advance(0);
+    expect(h.dock.state.pendingConfirms.map((pending) => pending.callId)).toEqual(['snap-1']);
+    socket.deliver(invoke('capture', { callId: 'img-1' }));
+    await h.clock.advance(0);
+    expect(runs.starts).toHaveLength(1);
+    // Once allowed, snap still waits its turn at the gate.
+    expect(h.dock.confirm('snap-1', true)).toBe(true);
+    await h.clock.advance(IMAGE_CALL_SPACING_MS);
+    expect(results(socket).map((frame) => frame.callId)).toEqual([]);
+    runs.finishAll();
+    await h.clock.advance(IMAGE_CALL_SPACING_MS);
+    expect(results(socket).map((frame) => [frame.callId, frame.ok])).toEqual([
+      ['img-1', true],
+      ['snap-1', true],
+    ]);
+  });
+
+  it('frees the gate when the link drops while the call holding it waits on a prompt', async () => {
+    const { h, socket } = await promptingPage();
+    const runs = slowCaptures(h);
+    h.context.handlers.set('snap', () => ENVELOPE);
+    socket.deliver(invoke('capture', { callId: 'img-1' }));
+    await h.clock.advance(0);
+    // Alice confirmed in her client, so snap asks nobody on arrival and waits at the gate.
+    const client = { name: 'claude-code', version: '2.1.296' };
+    socket.deliver(
+      invoke('snap', {
+        callId: 'snap-1',
+        caller: { userId: 'alice', displayName: 'Alice', client, role: 'driver' },
+        confirmation: { by: 'client', confirmationId: 'cf_1', at: h.clock.now },
+      }),
+    );
+    await h.clock.advance(0);
+    expect(h.dock.state.pendingConfirms).toEqual([]);
+    // The operator lowers her meanwhile, so her client's word no longer
+    // stands and the page asks once snap holds the gate.
+    expect(h.dock.setRole('alice', 'observer')).toBe(true);
+    runs.finishAll();
+    await h.clock.advance(IMAGE_CALL_SPACING_MS);
+    expect(h.dock.state.pendingConfirms.map((pending) => pending.callId)).toEqual(['snap-1']);
+    socket.drop(1006);
+    await h.clock.advance(500);
+    const again = h.socket();
+    again.accept();
+    again.deliver(
+      welcome(h.clock, {
+        resumed: true,
+        roster: [attachment('alice', 'observer')],
+        limits: { ...welcome(h.clock).limits, maxImageBytes: DEFAULT_IMAGE_BYTES },
+      }),
+    );
+    await flush();
+    const relinked = h.clock.now;
+    again.deliver(invoke('capture', { callId: 'img-2' }));
+    await h.clock.advance(IMAGE_CALL_SPACING_MS);
+    expect(runs.starts.at(-1)).toBeLessThanOrEqual(relinked + IMAGE_CALL_SPACING_MS);
+    expect(runs.starts).toHaveLength(2);
   });
 });
