@@ -557,7 +557,7 @@ function matchSummary(report: MatchReport): string {
     report.skewMs === null
       ? 'no call matched, so no clock skew'
       : `median skew ${(report.skewMs / 1000).toFixed(1)} s`;
-  return `match: ${report.failed ? 'FAILED' : 'agrees with the log'}; ${String(report.matched)} calls matched, ${String(report.missing)} missing, ${String(report.conflicts)} conflicts, ${String(report.unrecorded)} unrecorded (and ${String(report.withinDropped)} within the record's dropped span, ${String(report.unreached)} that may never have reached the page), ${skew}`;
+  return `match: ${report.failed ? 'FAILED' : 'agrees with the log'}; ${String(report.matched)} calls matched, ${String(report.missing)} missing, ${String(report.conflicts)} conflicts, ${String(report.unrecorded)} unrecorded (and ${String(report.withinDropped)} within the record's dropped span, ${String(report.unreached)} that may never have reached the page, ${String(report.unplaced)} that cannot be placed), ${skew}`;
 }
 
 // Run as a script in a checkout: the root .env, when there is one, may name

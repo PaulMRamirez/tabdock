@@ -26,14 +26,17 @@ import type { Client } from '@modelcontextprotocol/client';
 import {
   AUDIT_VERSION,
   type AuditEvent,
+  type AuditLine,
   encodeSessionRecord,
   plainLine,
   SESSION_RECORD_MAX_BYTES,
+  SESSION_RECORD_MAX_CALLS,
   type SessionRecord,
   SessionRecordSchema,
 } from '@tabdock/protocol';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runAuditCli } from '../src/audit-cli.ts';
+import { readAuditLines } from '../src/audit-file.ts';
 import { matchSessionRecord } from '../src/audit-match.ts';
 import { createLogger, FileAuditLog } from '../src/index.ts';
 import { connectPage, type InvokeFrame, type TestPage, TOOLS } from './helpers/page-client.ts';
@@ -110,19 +113,21 @@ const EMPTY_DROPPED: SessionRecord['dropped'] = {
   otherCalls: 0,
 };
 
+/** A record still being kept, saved at its `to` as the recorder saves one, unless `more` says otherwise. */
 function sessionRecord(more: Partial<SessionRecord>): SessionRecord {
+  const to = more.to ?? 1;
   return {
     format: 'tabdock.session-record',
     v: 1,
     adapterVersion: '0.1.0',
-    exportedAt: 1,
+    exportedAt: to,
     page: { origin: 'http://localhost:5173', path: '/', title: 'Test page' },
     relay: '127.0.0.1',
     policy: SessionRecordSchema.shape.policy.parse({}),
     pageIds: ['pg_1'],
     scope: { kind: 'page' },
     from: 0,
-    to: 1,
+    to,
     sealed: false,
     attachments: [],
     calls: [],
@@ -210,7 +215,6 @@ async function realRun(): Promise<{ dir: string; record: SessionRecord }> {
     page: { origin: 'http://localhost:5173', path: '/', title: 'Test page' },
     from,
     to: Date.now() + PAGE_AHEAD_MS + 60_000,
-    exportedAt: Date.now() + PAGE_AHEAD_MS + 60_000,
     attachments: joined.map(({ user, at }) => ({
       user,
       pageId,
@@ -239,7 +243,7 @@ describe('audit --match against a real run', () => {
     const digest = createHash('sha256').update(readFileSync(file)).digest('hex');
     expect(result.err).toContain(`record sha256 ${digest}`);
     expect(result.err.at(-1)).toMatch(
-      /^match: agrees with the log; 5 calls matched, 0 missing, 0 conflicts, 0 unrecorded \(and 0 within the record's dropped span, 0 that may never have reached the page\), median skew 9\d\.\d s$/,
+      /^match: agrees with the log; 5 calls matched, 0 missing, 0 conflicts, 0 unrecorded \(and 0 within the record's dropped span, 0 that may never have reached the page, 0 that cannot be placed\), median skew 9\d\.\d s$/,
     );
     expect(result.err.some((line) => line.startsWith('verify: chain intact'))).toBe(true);
   }, 30_000);
@@ -323,11 +327,18 @@ async function writeLog(events: AuditEvent[]): Promise<string> {
   return dir;
 }
 
+/** The log's records as the reader reads them, for calling the matcher without a file. */
+function logLines(dir: string): AuditLine[] {
+  return [...readAuditLines(dir)].flatMap((line) => (line.record === null ? [] : [line.record]));
+}
+
 const GUEST_ID = `g_0123abcd${'e'.repeat(24)}`;
 const guest: Person = { id: 'g_0123abcd', name: 'guest@example.com', kind: 'invitee' };
 const alice: Person = { id: 'alice', name: 'Alice', kind: 'member' };
 
 type CallEvent = Extract<AuditEvent, { type: 'call' }>;
+type ClosedEvent = Extract<AuditEvent, { type: 'proposal_closed' }>;
+type Proposal = SessionRecord['proposals'][number];
 
 /** A call line, carrying the callId c_<n> unless `callId` says none went out. */
 function callLine(
@@ -392,23 +403,180 @@ describe('audit --match against logs written line by line', () => {
     ]);
   });
 
-  it('takes a call the record lacks within the span its cap dropped, and fails one outside it', async () => {
-    const dir = await writeLog(sixty());
-    const dropped = {
-      ...EMPTY_DROPPED,
-      calls: 10,
-      firstAt: 1_000_000 + 20,
-      lastAt: 1_000_000 + 9_000 + 20,
-      byUser: [{ user: 'alice', counts: { ok: 10 } }],
-    };
-    const capped = match(recordOf([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], { dropped }), dir);
+  it('takes the calls a full record dropped, as its counts give them, and nothing more', async () => {
+    // A full ring of SESSION_RECORD_MAX_CALLS after its oldest ten went: c_0 to c_4 the relay
+    // answered timeout while the page saw ok, and c_5 to c_9 the page answered tool_error.
+    const total = SESSION_RECORD_MAX_CALLS + 10;
+    const dir = await writeLog(
+      Array.from({ length: total }, (_, n) =>
+        callLine(n, n < 5 ? { outcome: 'timeout' } : n < 10 ? { outcome: 'tool_error' } : {}),
+      ),
+    );
+    const lines = logLines(dir);
+    const ring = (more: Partial<SessionRecord> = {}): SessionRecord =>
+      sessionRecord({
+        from: 1_000_000 - 60_000,
+        to: 1_000_000 + total * 1_000 + 60_000,
+        calls: Array.from({ length: SESSION_RECORD_MAX_CALLS }, (_, n) => recordCall(n + 10)),
+        dropped: {
+          ...EMPTY_DROPPED,
+          calls: 10,
+          firstAt: 1_000_000 + 20,
+          lastAt: 1_000_000 + 9_000 + 20,
+          // Listed first, so a line the relay answered would take these if it went first.
+          byUser: [{ user: 'alice', counts: { tool_error: 5, ok: 5 } }],
+        },
+        ...more,
+      });
+    const capped = match(ring(), dir);
     expect(capped.code, capped.out.join('\n')).toBe(0);
     expect(capped.out).toHaveLength(10);
     expect(capped.out[0]).toMatch(
       /^note explained: call c_0 .* falls within the calls the record's cap dropped$/,
     );
     expect(capped.err.at(-1)).toContain("0 unrecorded (and 10 within the record's dropped span");
-    expect(match(recordOf([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 40], { dropped }), dir).code).toBe(1);
+
+    const failsWith = (record: SessionRecord, unrecorded: number): void => {
+      const report = matchSessionRecord(SessionRecordSchema.parse(record), lines);
+      expect(report.failed).toBe(true);
+      expect(report.unrecorded).toBe(unrecorded);
+    };
+    const dropped = ring().dropped;
+    // A record short of the cap dropped nothing from its ring, whatever its counts say.
+    failsWith(ring({ calls: ring().calls.filter((call) => call.callId !== 'c_40') }), 11);
+    // Dropped calls are older than every call the ring kept.
+    failsWith(ring({ dropped: { ...dropped, lastAt: 1_000_000 + 10_000 + 21 } }), 10);
+    // The counts by user and outcome cover no more lines than they count.
+    failsWith(
+      ring({ dropped: { ...dropped, byUser: [{ user: 'alice', counts: { ok: 10 } }] } }),
+      5,
+    );
+    failsWith(
+      ring({
+        dropped: { ...dropped, byUser: [{ user: 'alice', counts: { tool_error: 5, ok: 4 } }] },
+      }),
+      1,
+    );
+    failsWith(ring({ dropped: { ...dropped, byUser: [{ user: 'bob', counts: { ok: 10 } }] } }), 10);
+    // A call still running when dropped fits any outcome, and users past the
+    // byUser cap are counted together.
+    for (const more of [
+      { byUser: [{ user: 'alice', counts: { running: 10 } }] },
+      { byUser: [], otherCalls: 10 },
+    ]) {
+      expect(matchSessionRecord(ring({ dropped: { ...dropped, ...more } }), lines).failed).toBe(
+        false,
+      );
+    }
+  }, 30_000);
+
+  it('fails a record with a call removed and a dropped span written over it', async () => {
+    const dir = await writeLog(sixty());
+    const widened = match(
+      recordOf([30], {
+        dropped: {
+          ...EMPTY_DROPPED,
+          calls: 1,
+          firstAt: 950_000,
+          lastAt: 1_110_000,
+          byUser: [{ user: 'alice', counts: { ok: 1 } }],
+        },
+      }),
+      dir,
+    );
+    expect(widened.code).toBe(1);
+    expect(widened.out).toEqual([expect.stringMatching(/^FAIL unrecorded: call c_30 /)]);
+  });
+
+  it('fails a record whose span was narrowed to leave a removed call out', async () => {
+    const dir = await writeLog(sixty());
+    const narrowed = match(recordOf([30], { from: 1, to: 1 }), dir);
+    expect(narrowed.code).toBe(1);
+    expect(narrowed.out.filter((line) => line.startsWith('FAIL window: call '))).toHaveLength(59);
+    expect(narrowed.out).toContainEqual(expect.stringMatching(/^FAIL unrecorded: call c_30 /));
+    // Moving the kept calls' own times so the span can start after the removed one
+    // changes nothing: between two calls the record holds, the relay's order decides.
+    const shifted = recordOf([3], {
+      from: 1_000_000 + 8_100,
+      calls: recordOf([3]).calls.map((call, n) =>
+        n < 8 ? { ...call, at: 1_000_000 + 8_100 + n } : call,
+      ),
+    });
+    const moved = match(shifted, dir);
+    expect(moved.code).toBe(1);
+    expect(moved.out).toEqual([expect.stringMatching(/^FAIL unrecorded: call c_3 /)]);
+    // A sealed record cannot end after it was saved, and a kept one ends when it was saved.
+    expect(match(recordOf([], { sealed: true, exportedAt: 1_000_000 }), dir).out).toEqual([
+      "FAIL window: the record's span does not end where its export says it does",
+    ]);
+    expect(match(recordOf([], { exportedAt: 1_200_000 }), dir).code).toBe(1);
+    expect(match(recordOf([], { sealed: true, exportedAt: 1_200_000 }), dir).code).toBe(0);
+  });
+
+  it('fails a record whose spans, proposals or dropped calls lie outside its own span', async () => {
+    const lines = logLines(await writeLog(sixty()));
+    const span: SessionRecord['attachments'][number] = {
+      user: alice,
+      pageId: 'pg_1',
+      how: 'approved',
+      inviteId: null,
+      before: false,
+      joinedAt: 1_000_000,
+      leftAt: 1_050_000,
+      ended: 'left',
+      roles: [{ at: 1_000_000, role: 'driver' }],
+      rolesDropped: 0,
+    };
+    const findings = (more: Partial<SessionRecord>): string[] =>
+      matchSessionRecord(SessionRecordSchema.parse(recordOf([], more)), lines)
+        .findings.filter((finding) => finding.kind === 'window')
+        .map((finding) => finding.text);
+    expect(findings({ attachments: [span] })).toEqual([]);
+    for (const changed of [
+      { ...span, joinedAt: 900_000, roles: [{ at: 900_000, role: 'driver' as const }] },
+      { ...span, leftAt: 990_000 },
+      { ...span, leftAt: 1_200_000 },
+      { ...span, roles: [...span.roles, { at: 1_200_000, role: 'observer' as const }] },
+    ]) {
+      expect(findings({ attachments: [changed] })).toEqual([
+        'Alice (alice), who joined at 1970-01-01T00:' +
+          (changed.joinedAt === 900_000 ? '15:00.000Z' : '16:40.000Z') +
+          ", has times outside the record's span",
+      ]);
+    }
+    const proposal: Proposal = {
+      proposalId: 'pr_1',
+      pageId: 'pg_1',
+      at: 1_000_000,
+      user: alice,
+      tool: 'set_view',
+      status: 'dismissed',
+      decidedAt: 1_200_000,
+      callId: null,
+    };
+    expect(findings({ proposals: [proposal] })).toEqual([
+      "proposal pr_1 at 1970-01-01T00:16:40.000Z has times outside the record's span",
+    ]);
+    expect(
+      findings({ proposals: [{ ...proposal, at: 1_200_000, decidedAt: null, status: 'pending' }] }),
+    ).toHaveLength(1);
+    // A proposal still pending when the record began was made before it.
+    expect(findings({ proposals: [{ ...proposal, at: 900_000, decidedAt: 1_010_000 }] })).toEqual(
+      [],
+    );
+    expect(
+      findings({ dropped: { ...EMPTY_DROPPED, calls: 1, firstAt: 900_000, lastAt: 900_000 } }),
+    ).toEqual(["the calls the record's cap dropped have times outside its span"]);
+  });
+
+  it('fails a record that lists a call or a proposal twice', async () => {
+    const dir = await writeLog(sixty());
+    const base = recordOf([]);
+    const [, , , , , , , , , , tenth] = base.calls;
+    if (tenth === undefined) throw new Error('no call');
+    const twice = match({ ...base, calls: [...base.calls, tenth] }, dir);
+    expect(twice.code).toBe(1);
+    expect(twice.out).toEqual(['FAIL repeated: call c_10 is listed more than once in the record']);
   });
 
   it('notes a call the record lacks whose invoke may never have arrived, and one at its edge', async () => {
@@ -511,7 +679,12 @@ describe('audit --match against logs written line by line', () => {
     );
     expect(otherTool.code).toBe(1);
     expect(otherTool.out).toEqual([
-      expect.stringMatching(/^FAIL conflict: proposal pr_1 .*names another page, tool or user$/),
+      expect.stringMatching(
+        /^FAIL conflict: proposal pr_1 .*: the line that made it names another page, tool or user$/,
+      ),
+      expect.stringMatching(
+        /^FAIL conflict: proposal pr_1 .*: the line that ended it names another page, tool or user$/,
+      ),
     ]);
     const invented = match(
       {
@@ -522,6 +695,112 @@ describe('audit --match against logs written line by line', () => {
     );
     expect(invented.code).toBe(1);
     expect(invented.out).toContainEqual(expect.stringMatching(/^FAIL missing: proposal pr_9 /));
+  });
+
+  it('fails a proposal whose end the record changed, or that it left out', async () => {
+    const proposed = (n: number, id: string): CallEvent =>
+      callLine(
+        n,
+        { outcome: 'proposed', proposalId: id, tool: 'go_to_stop', userId: GUEST_ID },
+        null,
+      );
+    const closedLine = (n: number, id: string, reason: ClosedEvent['reason']): ClosedEvent => ({
+      v: AUDIT_VERSION,
+      type: 'proposal_closed',
+      at: 1_000_000 + n * 1_000,
+      pageId: 'pg_1',
+      origin: 'http://localhost:5173',
+      proposalId: id,
+      userId: GUEST_ID,
+      tool: 'go_to_stop',
+      reason,
+    });
+    const ran = callLine(71, {
+      proposalId: 'pr_1',
+      acceptedOnPage: true,
+      tool: 'go_to_stop',
+      userId: GUEST_ID,
+    });
+    const dir = await writeLog([
+      ...sixty(),
+      proposed(70, 'pr_1'),
+      ran,
+      proposed(72, 'pr_2'),
+      closedLine(73, 'pr_2', 'dismissed'),
+      proposed(74, 'pr_3'),
+      closedLine(75, 'pr_3', 'expired'),
+      proposed(76, 'pr_4'),
+      closedLine(77, 'pr_4', 'refused'),
+    ]);
+    const made = (n: number, id: string, more: Partial<Proposal>): Proposal => ({
+      proposalId: id,
+      pageId: 'pg_1',
+      at: 1_000_000 + n * 1_000 + 20,
+      user: guest,
+      tool: 'go_to_stop',
+      status: 'dismissed',
+      decidedAt: 1_000_000 + (n + 1) * 1_000,
+      callId: null,
+      ...more,
+    });
+    const accepted = made(70, 'pr_1', { status: 'accepted', callId: 'c_71' });
+    const dismissed = made(72, 'pr_2', {});
+    // The relay expired it as the operator dismissed it: a race, so a note.
+    const raced = made(74, 'pr_3', {});
+    const run71 = recordCall(71, {
+      user: guest,
+      tool: 'go_to_stop',
+      proposalId: 'pr_1',
+      confirmedBy: 'page',
+    });
+    const base = recordOf([]);
+    const record = (proposals: Proposal[]): SessionRecord => ({
+      ...base,
+      calls: [...base.calls, run71],
+      proposals,
+    });
+    // The page refused pr_4 as it arrived, so a record may lack it.
+    const genuine = match(record([accepted, dismissed, raced]), dir);
+    expect(genuine.code, genuine.out.join('\n')).toBe(0);
+    expect(genuine.out).toEqual([
+      expect.stringMatching(
+        /^note outcome: proposal pr_3 .*: the page saw dismissed, the relay closed it as expired$/,
+      ),
+      expect.stringMatching(
+        /^note explained: proposal pr_4 .* was refused by the page as it arrived$/,
+      ),
+    ]);
+
+    const fails = (proposals: Proposal[], ...expected: RegExp[]): void => {
+      const result = match(record(proposals), dir);
+      expect(result.code).toBe(1);
+      for (const line of expected) expect(result.out).toContainEqual(expect.stringMatching(line));
+    };
+    fails(
+      [{ ...accepted, status: 'dismissed', callId: null }, dismissed, raced],
+      /^FAIL conflict: proposal pr_1 .*: the record has it dismissed, and the log ran it$/,
+      /^FAIL conflict: call c_71 ran proposal pr_1, which the record has dismissed$/,
+    );
+    fails(
+      [{ ...accepted, callId: null }, dismissed, raced],
+      /^FAIL conflict: proposal pr_1 .*: the line that ran it carries another callId than the record's$/,
+    );
+    fails(
+      [accepted, { ...dismissed, status: 'accepted' }, raced],
+      /^FAIL conflict: proposal pr_2 .*: the record has it accepted, and the log closed it as dismissed$/,
+    );
+    fails(
+      [accepted, { ...dismissed, status: 'expired' }, raced],
+      /^FAIL conflict: proposal pr_2 .*: the record has it expired, and the log closed it as dismissed$/,
+    );
+    fails(
+      [accepted, raced],
+      /^FAIL unrecorded: proposal pr_2 .* is in the log within the record's span, and not in the record$/,
+    );
+    fails(
+      [accepted, dismissed, raced, dismissed],
+      /^FAIL repeated: proposal pr_2 is listed more than once in the record$/,
+    );
   });
 
   it('notes a join with no attach line, and prints what the file wrote escaped', async () => {
@@ -559,14 +838,98 @@ describe('audit --match against logs written line by line', () => {
     });
   });
 
-  it('says so when no call matched, rather than placing lines on a clock it cannot know', async () => {
+  it('fails a record with no call the log can place, rather than calling it a match', async () => {
     const dir = await writeLog(sixty());
     const result = match(sessionRecord({ from: 0, to: 5_000_000 }), dir);
-    expect(result.code).toBe(0);
+    expect(result.code).toBe(1);
     expect(result.out).toEqual([
-      "note unplaced: no call in the record has a line, so 60 call lines for its pages cannot be placed on the page's clock",
+      "FAIL unplaced: no call or proposal in the record has a line, so 60 lines for its pages cannot be placed on the page's clock, and the record cannot be shown to hold them",
     ]);
-    expect(result.err.at(-1)).toContain('no call matched, so no clock skew');
+    expect(result.err.at(-1)).toMatch(
+      /^match: FAILED; .*60 that cannot be placed\), no call matched/,
+    );
+    // A record of another page's session says nothing of this one's lines.
+    expect(match(sessionRecord({ pageIds: ['pg_2'], from: 0, to: 5_000_000 }), dir).code).toBe(0);
+  });
+
+  it('fails a running call with no line once the log goes on past its deadline', async () => {
+    const dir = await writeLog(sixty());
+    const base = recordOf([]);
+    const running = (n: number): SessionRecord => ({
+      ...base,
+      calls: [
+        ...base.calls,
+        recordCall(n, { callId: 'c_forged', outcome: 'running', durationMs: null }),
+      ],
+    });
+    // Saved as it began, a second before the log's last line: its line may come yet.
+    const late = match(running(58), dir);
+    expect(late.code, late.out.join('\n')).toBe(0);
+    expect(late.out).toEqual([
+      expect.stringMatching(/^note running: call c_forged .* has no line yet$/),
+    ]);
+    // Begun a minute before the log's last line, which the relay wrote after it must have answered.
+    const forged = match(running(0), dir);
+    expect(forged.code).toBe(1);
+    expect(forged.out).toEqual([
+      expect.stringMatching(
+        /^FAIL missing: call c_forged .* although the log goes on past when the relay must have answered it$/,
+      ),
+    ]);
+  });
+
+  it('never explains a call before the log began when the record says it was outside its own span', async () => {
+    const dir = await writeLog(sixty().slice(5));
+    const base = recordOf([0, 1, 2, 3, 4]);
+    const early = match(
+      { ...base, calls: [recordCall(0, { callId: 'c_early', at: 1_000 }), ...base.calls] },
+      dir,
+    );
+    expect(early.code).toBe(1);
+    expect(early.out).toContainEqual(
+      expect.stringMatching(/^FAIL window: call c_early at .* lies outside the record's span$/),
+    );
+    // A proposal still pending when a record began may predate it, but a record
+    // that began after the log did cannot blame the log for missing its line.
+    const later = recordOf([0, 1, 2, 3, 4, 5], {
+      from: 1_006_000,
+      proposals: [
+        {
+          proposalId: 'pr_old',
+          pageId: 'pg_1',
+          at: 1_001_020,
+          user: guest,
+          tool: 'go_to_stop',
+          status: 'pending',
+          decidedAt: null,
+          callId: null,
+        },
+      ],
+    });
+    const blamed = match(later, dir);
+    expect(blamed.code).toBe(1);
+    expect(blamed.out).toContainEqual(
+      expect.stringMatching(
+        /^FAIL missing: proposal pr_old .* is in the record, and no line made it$/,
+      ),
+    );
+  });
+
+  it('prints a time past what a date holds as a number, never throwing', async () => {
+    const dir = await writeLog(sixty());
+    const far = 9_000_000_000_000_000;
+    const result = match(
+      sessionRecord({ from: 0, to: far, calls: [recordCall(0, { callId: 'c_far', at: far })] }),
+      dir,
+    );
+    expect(result.code).toBe(1);
+    expect(result.out).toContainEqual(
+      expect.stringMatching(
+        new RegExp(
+          `^FAIL missing: call c_far \\(set_view by Alice \\(alice\\) at ${String(far)} ms\\)`,
+        ),
+      ),
+    );
   });
 });
 
