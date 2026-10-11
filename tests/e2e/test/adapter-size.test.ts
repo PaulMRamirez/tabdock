@@ -22,6 +22,27 @@ describe('the adapter script-tag build', () => {
     expect(bytes).toBeGreaterThan(50_000);
   }, 60_000);
 
+  // The session record's modules keep a budget of their own, which W3-A's
+  // metafile check holds; ADR 0045's decision is the one in force, so SPEC
+  // and ADR 0048 name the same number until a decision changes it.
+  it("names one budget for the session record's modules", async () => {
+    const read = (path: string): Promise<string> =>
+      readFile(new URL(`../../../${path}`, import.meta.url), 'utf8');
+    const bound = (text: string, pattern: RegExp): string | undefined => pattern.exec(text)?.[1];
+    const decided = bound(
+      await read('docs/adr/0045-session-record-for-the-operator.md'),
+      /^23\. \*\*Budget:\*\* at most ([\d,]+) bytes/m,
+    );
+    expect(decided).toMatch(/^[\d,]+$/);
+    expect(bound(await read('SPEC.md'), /the record's modules under ([\d,]+)/)).toBe(decided);
+    expect(
+      bound(
+        await read('docs/adr/0048-script-tag-ceiling-for-m6.md'),
+        /The session record's modules \(ADR 0045\) keep their own budget of ([\d,]+) bytes/,
+      ),
+    ).toBe(decided);
+  });
+
   // Importing any schema must still run zod-config.ts, in the workspace's
   // sources and in the published dist alike; every other protocol module is
   // pure, so the build may drop those a page never imports (ADR 0048's notes).

@@ -22,4 +22,4 @@ Later the same day the protocol's `package.json` named `zod-config` as its only 
 
 ## Notes from ADR 0045 (10 October 2026)
 
-The session record's modules keep their own metafile budget, now 13,000 bytes rather than 7,000: built in full they measure 12,375, nearly all of it the strict schema a record is checked by and the logic ADR 0045's decisions ask for, as its notes record. The ceiling and the checkpoints above are unchanged.
+Built in full the session record's modules measure 12,375 bytes, nearly all of it the strict schema a record is checked by and the logic ADR 0045's decisions ask for, so ADR 0045's notes propose a budget of 13,000 rather than 7,000. Until the owner confirms it, ADR 0045's decision 23 and the decision above keep 7,000. The ceiling and the checkpoints above are unchanged either way.
