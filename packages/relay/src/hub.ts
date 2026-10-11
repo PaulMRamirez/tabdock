@@ -2118,17 +2118,6 @@ export class PageHub {
   }
 
   /**
-   * A frame the protocol knows from M6 that this relay does not act on yet:
-   * its line, held by #mayChangeNothing, is written only within ADR 0023's
-   * budget, and it changed nothing.
-   */
-  #notActedOn(pageId: string, frameType: string): false {
-    // M6 seam: not built. Goes with the last of the stubs above.
-    this.#log.warn('ignored a frame this relay does not act on yet', { pageId, frameType });
-    return false;
-  }
-
-  /**
    * A page minting or cancelling an invite (ADR 0017). A relay with invites
    * off mints none and sends no invites frame at all (ADR 0017's notes), so a
    * page that sends one anyway is ignored, its secret's hash unlogged.

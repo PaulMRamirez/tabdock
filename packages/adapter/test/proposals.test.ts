@@ -463,7 +463,7 @@ describe('under a time-boxed session (ADR 0042 meeting ADR 0043)', () => {
     if (start === undefined) throw new Error('no session_start');
     return {
       start,
-      async listed(): Promise<void> {
+      listed: async (): Promise<void> => {
         socket.deliver({
           t: 'session',
           session: {
