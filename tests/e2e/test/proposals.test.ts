@@ -2,14 +2,14 @@
 // adapter core on a sim page and an SDK client on each revision. An
 // observer's write answers proposed and the page lists it; the operator's
 // Accept runs it once, and the proposer's get_proposal, waiting, answers the
-// labelled result; the run's audit line names the proposer, accepted on the
+// Accept and then the labelled result; the run's audit line names the proposer, accepted on the
 // page, with the very call id the page's activity log shows; an accepted
 // consequential call raises no second prompt; and under deny a proposal for
 // a consequential tool is refused at once, the page never hearing of it.
 
 import { untrustedHeader } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
-import { getProposal, propose } from '../src/proposal-helpers.ts';
+import { getProposal, propose, settledProposal } from '../src/proposal-helpers.ts';
 import {
   attachAs,
   callTool,
@@ -63,7 +63,10 @@ describe('A6.10 and A6.11: a proposal from an observer, accepted on the page', (
 
       const waiting = getProposal(bob, pageId, proposalId, 30_000);
       expect(page.acceptProposal(proposalId)).toBe(true);
-      const read = await waiting;
+      // A wait answers each change: the Accept, or the run's end where the
+      // Accept reached the relay before the wait did.
+      expect((await waiting).head).toBe('accepted');
+      const read = await settledProposal(bob, pageId, proposalId);
       expect(read.isError, read.text).toBe(false);
       expect(read.text.split('\n').slice(0, 2)).toEqual([
         `accepted: the operator accepted proposal ${proposalId} for tool set_value, and the page ran it.`,
@@ -101,7 +104,7 @@ describe('A6.10 and A6.11: a proposal from an observer, accepted on the page', (
     const shown = await page.waitFor((s) => s.proposals.length === 1);
     expect(shown.proposals[0]?.consequential).toBe(true);
     expect(page.acceptProposal(proposalId)).toBe(true);
-    const read = await getProposal(bob, pageId, proposalId, 30_000);
+    const read = await settledProposal(bob, pageId, proposalId);
     expect(read.head).toBe('accepted');
     expect(page.store.calls.map((call) => call.tool)).toEqual(['wipe']);
     expect(page.prompts).toEqual([]);

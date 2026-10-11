@@ -159,6 +159,48 @@ describe('PageProposals', () => {
     proposals.close();
   });
 
+  it('wakes a wait when its proposal leaves pending, and a later one when the run settles', async () => {
+    const { proposals, made } = held();
+    const record = made('pg_1', 'bob');
+    const never = new AbortController().signal;
+    const first = proposals.wait(record, 60_000, never);
+    expect(proposals.accept(record)).toBe(true);
+    expect(await first).toEqual({ kind: 'changed' });
+    const second = proposals.wait(record, 60_000, never);
+    proposals.settleRun(record, 'ok', { text: 'done', image: false });
+    expect(await second).toEqual({ kind: 'changed' });
+    proposals.close();
+  });
+
+  it.each([
+    ['sleeps', 'sleep', 'page_asleep', /^the page disconnected while you waited/],
+    ['reloads', 'resumed', 'page_asleep', /^the page reloaded while you waited/],
+    ['goes', 'gone', 'page_gone', /^the page closed and did not come back/],
+  ] as const)(
+    'answers every wait on the page at once when it %s, pending or running, and cancels what is pending',
+    async (_, how, code, message) => {
+      const { proposals, ended, made } = held();
+      const pending = made('pg_1', 'bob');
+      const running = made('pg_1', 'carol');
+      const elsewhere = made('pg_2', 'bob');
+      proposals.accept(running);
+      const never = new AbortController().signal;
+      const waits = [pending, running].map((record) => proposals.wait(record, 60_000, never));
+      const other = proposals.wait(elsewhere, 50, never);
+      proposals[how]('pg_1');
+      for (const woken of await Promise.all(waits)) {
+        expect(woken).toEqual({
+          kind: 'error',
+          code,
+          message: expect.stringMatching(message) as unknown,
+        });
+      }
+      expect(await other).toEqual({ kind: 'timeout' });
+      expect(ended).toEqual([[pending.proposalId, 'cancelled', null]]);
+      proposals.close();
+    },
+  );
+
   it('forgets every proposal of a page that is gone, pending or kept', () => {
     const { proposals, ended, made } = held();
     const pending = made('pg_1', 'bob');

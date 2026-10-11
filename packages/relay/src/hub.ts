@@ -4402,14 +4402,15 @@ export class PageHub {
 
   /**
    * get_proposal (ADR 0042): the caller's own proposal on the page, at once,
-   * or once it settles (a decision, an end, or its run's end) when `waitMs`
-   * asks to wait, never past MAX_WAIT_MS or the call deadline. A wait holds
-   * one of the user's wait slots, shared with wait_for_page_state, and one
-   * of the page's (waits.ts, conflict C2), and its request's charge
-   * (#holdBytes); refused past either, it answers rate_limited with a
-   * request_refused record within the refusal budget (S7, S9). Whatever ends
-   * the proposer's attachment answers a wait at once (S8), and access is
-   * checked again after it.
+   * or once it changes when `waitMs` asks to wait (a pending one leaves
+   * pending by a decision or an end, an accepted one's run settles), never
+   * past MAX_WAIT_MS or the call deadline. A wait holds one of the user's
+   * wait slots, shared with wait_for_page_state, and one of the page's
+   * (waits.ts, conflict C2), and its request's charge (#holdBytes); refused
+   * past either, it answers rate_limited with a request_refused record
+   * within the refusal budget (S7, S9). Whatever ends the proposer's
+   * attachment answers a wait at once (S8), as the page's sleep, reload or
+   * end does (SPEC section 7), and access is checked again after it.
    */
   async getProposal(
     caller: CallerIdentity,

@@ -46,7 +46,7 @@ export async function propose(
   return { answer, proposalId: typeof proposal === 'string' ? proposal : null };
 }
 
-/** get_proposal, waiting up to waitMs for the proposal to settle when given. */
+/** get_proposal, waiting up to waitMs for the proposal to change when given. */
 export function getProposal(
   client: Client,
   page: string,
@@ -58,6 +58,30 @@ export function getProposal(
     proposal,
     ...(waitMs === undefined ? {} : { waitMs }),
   });
+}
+
+/** The most one get_proposal may wait (MAX_WAIT_MS). */
+const WAIT_CAP_MS = 40_000;
+
+/**
+ * get_proposal as a looping agent calls it until the outcome is final: a
+ * wait answers each change (SPEC section 7), so the Accept answers
+ * 'accepted' while the page still runs it, and a second wait answers the
+ * run's end. Gives the last answer once `withinMs` has passed.
+ */
+export async function settledProposal(
+  client: Client,
+  page: string,
+  proposal: string,
+  withinMs = 30_000,
+): Promise<ProposalAnswer> {
+  const deadline = Date.now() + withinMs;
+  for (;;) {
+    const left = Math.min(WAIT_CAP_MS, deadline - Date.now());
+    const read = await getProposal(client, page, proposal, Math.max(0, left));
+    const open = read.head === 'pending' || read.text.includes('and the page is running it');
+    if (!open || Date.now() >= deadline) return read;
+  }
 }
 
 export function withdrawProposal(

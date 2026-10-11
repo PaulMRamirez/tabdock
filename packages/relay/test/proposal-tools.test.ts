@@ -1,8 +1,10 @@
 // get_proposal and withdraw_proposal (ADR 0042, A6.11 and A6.12) as clients
 // meet them: a proposal id is a name, never a capability, so an unknown id
 // and another user's answer proposal_not_found in the same words (S13); a
-// wait shares the user's two wait slots with wait_for_page_state and wakes
-// when the operator decides; both tools spend the request budget and are
+// wait shares the user's two wait slots with wait_for_page_state, wakes when
+// the operator decides and again when an accepted run settles, and answers
+// page_asleep when the page sleeps (SPEC section 7); both tools spend the
+// request budget and are
 // refused past it with a request_refused record; list_page_tools marks what
 // an observer may propose; and an accepted run's result reaches its
 // proposer as cut, labelled text only, never an image (S10, decision 15).
@@ -12,6 +14,7 @@ import { MAX_PROPOSAL_RESULT_CHARS, untrustedHeader } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   connectPage,
+  type InvokeReply,
   PAGE_ORIGIN,
   type PageOptions,
   type TestPage,
@@ -139,7 +142,43 @@ describe('a proposal id is a name (S13, A6.12)', () => {
 });
 
 describe('waiting on a proposal (ADR 0042, decision 4)', () => {
-  it('answers once the operator accepts and the run settles, well before its time', async () => {
+  it('answers as the operator accepts, a change, and a second wait once the run settles', async () => {
+    const relay = await setup();
+    let finish: ((reply: InvokeReply) => void) | undefined;
+    const opened = await page(undefined, {
+      onInvoke: () =>
+        new Promise<InvokeReply>((resolve) => {
+          finish = resolve;
+        }),
+    });
+    const bob = await attached(opened, BOB, 'observer');
+    const proposalId = proposalIdOf(await propose(bob, opened.pageId));
+    const started = Date.now();
+    const waiting = getProposal(bob, opened.pageId, proposalId, 2800);
+    await eventually(() => relay.lines.some((line) => line.includes('proposal wait started')));
+    await decide(opened, proposalId, true);
+    // Leaving pending is the change SPEC section 7's waitMs waits for.
+    const accepted = await waiting;
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(accepted.text).toBe(
+      `accepted: the operator accepted proposal ${proposalId} for tool add_item, and the page is running it; call get_proposal again for its result.`,
+    );
+    expect(accepted.structuredContent).toMatchObject({ status: 'accepted', outcome: 'running' });
+    await opened.next('invoke');
+    const again = getProposal(bob, opened.pageId, proposalId, 2800);
+    await eventually(
+      () => relay.lines.filter((line) => line.includes('proposal wait started')).length === 2,
+    );
+    finish?.({ ok: true, content: 'done' });
+    const read = await again;
+    expect(read.text.split('\n')).toEqual([
+      `accepted: the operator accepted proposal ${proposalId} for tool add_item, and the page ran it.`,
+      untrustedHeader(PAGE_ORIGIN, 'add_item'),
+      'done',
+    ]);
+  });
+
+  it('answers page_asleep at once when the page sleeps, and the proposal then reads cancelled', async () => {
     const relay = await setup();
     const opened = await page();
     const bob = await attached(opened, BOB, 'observer');
@@ -147,14 +186,13 @@ describe('waiting on a proposal (ADR 0042, decision 4)', () => {
     const started = Date.now();
     const waiting = getProposal(bob, opened.pageId, proposalId, 2800);
     await eventually(() => relay.lines.some((line) => line.includes('proposal wait started')));
-    await decide(opened, proposalId, true);
-    const read = await waiting;
+    opened.ws.terminate();
+    const woken = await waiting;
     expect(Date.now() - started).toBeLessThan(2000);
-    expect(read.text.split('\n')).toEqual([
-      `accepted: the operator accepted proposal ${proposalId} for tool add_item, and the page ran it.`,
-      untrustedHeader(PAGE_ORIGIN, 'add_item'),
-      'done',
-    ]);
+    expect(woken.text).toBe(
+      'page_asleep: the page disconnected while you waited; its proposals end with the link, so read this one again for how it ended',
+    );
+    expect((await getProposal(bob, opened.pageId, proposalId)).head).toBe('cancelled');
   });
 
   it('answers it as it stands once its time is up', async () => {

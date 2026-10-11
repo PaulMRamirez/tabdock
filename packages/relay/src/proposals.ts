@@ -108,9 +108,13 @@ export interface ProposalRecord {
   readonly settledAt: number | null;
 }
 
-/** Why a wait on a proposal ended: it settled, its time ran out, its request was cancelled, or the hub ended it. */
+/**
+ * Why a wait on a proposal ended: it changed (it left pending, or its run
+ * settled), its time ran out, its request was cancelled, or the hub or the
+ * page's life ended it with an error (SPEC section 7).
+ */
 export type ProposalWaitEnd =
-  { kind: 'settled' } | { kind: 'timeout' } | { kind: 'cancelled' } | HubError;
+  { kind: 'changed' } | { kind: 'timeout' } | { kind: 'cancelled' } | HubError;
 
 /** A record as this module changes it; everyone else reads it as ProposalRecord. */
 type Held = { -readonly [K in keyof ProposalRecord]: ProposalRecord[K] };
@@ -152,6 +156,14 @@ function error(code: ErrorCode, message: string): HubError {
   return { kind: 'error', code, message };
 }
 
+const ASLEEP = error(
+  'page_asleep',
+  'the page disconnected while you waited; its proposals end with the link, so read this one again for how it ended',
+);
+const RELOADED = error(
+  'page_asleep',
+  'the page reloaded while you waited; its proposals end with the link, so read this one again for how it ended',
+);
 const GONE = error('page_gone', 'the page closed and did not come back; its attachments are gone');
 const SHUTTING_DOWN = error('page_asleep', 'the relay is shutting down');
 
@@ -271,13 +283,19 @@ export class PageProposals implements PagePart {
     return entry !== undefined && this.#end(entry, reason, frame);
   }
 
-  /** The operator accepted it: it runs now, its arguments held until the run settles. False when it was not pending. */
+  /**
+   * The operator accepted it: it runs now, its arguments held until the run
+   * settles. It left pending, which is a change a wait answers (SPEC section
+   * 7), so its proposer hears 'accepted' and may wait again for the run.
+   * False when it was not pending.
+   */
   accept(record: ProposalRecord): boolean {
     const entry = this.#entryOf(record);
     if (entry?.record.status !== 'pending') return false;
     this.#clearTimer(entry);
     entry.record.status = 'accepted';
     entry.record.outcome = 'running';
+    this.#wake(entry, { kind: 'changed' });
     return true;
   }
 
@@ -314,13 +332,14 @@ export class PageProposals implements PagePart {
   }
 
   /**
-   * Waits for a proposal to settle, at most `timeoutMs`; a cancelled request
-   * ends it at once. The caller holds a wait slot (waits.ts) and its
+   * Waits for a proposal to change, at most `timeoutMs`: a pending one until
+   * it leaves pending, an accepted one until its run settles. A cancelled
+   * request ends it at once. The caller holds a wait slot (waits.ts) and its
    * request's charge, and checks access again once this resolves.
    */
   wait(record: ProposalRecord, timeoutMs: number, signal: AbortSignal): Promise<ProposalWaitEnd> {
     const entry = this.#entryOf(record);
-    if (entry === undefined) return Promise.resolve({ kind: 'settled' });
+    if (entry === undefined) return Promise.resolve({ kind: 'changed' });
     if (signal.aborted) return Promise.resolve({ kind: 'cancelled' });
     return new Promise((resolve) => {
       const end = (why: ProposalWaitEnd): void => {
@@ -384,7 +403,7 @@ export class PageProposals implements PagePart {
 
   /** It settled: whoever waits on it hears so, and the page keeps no more than its share of outcomes. */
   #settled(entry: Entry): void {
-    this.#wake(entry, { kind: 'settled' });
+    this.#wake(entry, { kind: 'changed' });
     const page = this.#pages.get(entry.record.pageId);
     if (!page) return;
     const settled = [...page].filter((each) => each.record.settledAt !== null);
@@ -436,21 +455,29 @@ export class PageProposals implements PagePart {
   // that sleeps, reloads or goes held them in memory only, and one shown on
   // one page load must never be accepted on another (decision 12).
 
-  sleep(pageId: string): void {
+  /**
+   * The link ended: every wait on the page's proposals answers `why` at
+   * once, as SPEC section 7 says a wait ends when the page sleeps, reloads
+   * or goes, and every pending proposal is cancelled. A run already
+   * accepted settles as its call does.
+   */
+  #linkEnded(pageId: string, why: HubError): void {
+    for (const entry of this.#pages.get(pageId) ?? []) this.#wake(entry, why);
     for (const entry of this.#pending(pageId)) this.#end(entry, 'cancelled', null);
   }
 
+  sleep(pageId: string): void {
+    this.#linkEnded(pageId, ASLEEP);
+  }
+
   resumed(pageId: string): void {
-    this.sleep(pageId);
+    this.#linkEnded(pageId, RELOADED);
   }
 
   gone(pageId: string): void {
     // A detach reaches here with no sleep first.
-    this.sleep(pageId);
-    for (const entry of [...(this.#pages.get(pageId) ?? [])]) {
-      this.#wake(entry, GONE);
-      this.#forget(entry);
-    }
+    this.#linkEnded(pageId, GONE);
+    for (const entry of [...(this.#pages.get(pageId) ?? [])]) this.#forget(entry);
   }
 
   attachmentsEnded(pageId: string, users: ReadonlySet<string>, outcome: HubError): void {
