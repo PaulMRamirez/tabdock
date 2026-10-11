@@ -132,7 +132,13 @@ import { requestHeapBytes } from './request-heap.ts';
 import { inSlices, ResponseStalls } from './response-stalls.ts';
 import { type InviteeSessionOptions, McpSessions, rankOf } from './sessions.ts';
 import { createSignInGate } from './sign-in-gate.ts';
-import { fitProblem, snapshotAccounts, takeSnapshot, writeSnapshot } from './snapshot.ts';
+import {
+  fitProblem,
+  removeTemporaryFiles,
+  snapshotAccounts,
+  takeSnapshot,
+  writeSnapshot,
+} from './snapshot.ts';
 import { Spike, type SpikeControl } from './spike.ts';
 import { type AuditLog, callRecords, createMemoryStore, recordAudit } from './store.ts';
 
@@ -637,7 +643,12 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   // the log is open, so its lock is held and its last line whole, and before
   // relay_start, whose line ends the binding to the stop that wrote it.
   // Taken whatever the setting, so a file an earlier run left never waits
-  // on disk; it is applied below, once the hub exists.
+  // on disk; it is applied below, once the hub exists. A temporary file a
+  // stop cut short left goes first, unread, for the same reason.
+  const leftover = fileAudit === null ? 0 : removeTemporaryFiles(fileAudit.dir);
+  if (leftover > 0) {
+    log.warn('removed restart snapshot files a stop cut short left, unread', { files: leftover });
+  }
   const taken =
     fileAudit === null
       ? null

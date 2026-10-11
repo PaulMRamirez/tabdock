@@ -61,6 +61,23 @@ export const SNAPSHOT_FILE = 'relay-snapshot.json';
 const SNAPSHOT_MODE = 0o600;
 
 /**
+ * The temporary file a stop writes before renaming it into place is
+ * `.relay-snapshot.json.<16 hex characters>.tmp`: a name no audit file and no
+ * snapshot can have, so a start can tell one a stop cut short left behind.
+ */
+const TEMPORARY_PREFIX = `.${SNAPSHOT_FILE}.`;
+const TEMPORARY_SUFFIX = '.tmp';
+const TEMPORARY_ID = /^[0-9a-f]{16}$/;
+
+function isTemporaryName(name: string): boolean {
+  return (
+    name.startsWith(TEMPORARY_PREFIX) &&
+    name.endsWith(TEMPORARY_SUFFIX) &&
+    TEMPORARY_ID.test(name.slice(TEMPORARY_PREFIX.length, -TEMPORARY_SUFFIX.length))
+  );
+}
+
+/**
  * How much of each audit file's end the binding check reads: the two lines
  * it needs are a few hundred bytes, and a line longer than this cannot be
  * one of them, so a file whose end holds fewer whole lines refuses.
@@ -150,11 +167,42 @@ function removeQuietly(path: string, fs: SnapshotFs): void {
 }
 
 /**
+ * Removes, unread, every temporary file a stop cut short left in `dir` (a
+ * kill between writeSnapshot's open and its rename), and answers how many.
+ * A start calls it whatever the setting, since such a file holds a whole
+ * snapshot, emails and page titles included, and nothing else would ever
+ * remove it. unlink never follows a link, and a directory under such a name
+ * is left as it is.
+ */
+export function removeTemporaryFiles(dir: string, fs: SnapshotFs = nodeFs): number {
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const name of names) {
+    if (!isTemporaryName(name)) continue;
+    try {
+      fs.unlinkSync(join(dir, name));
+      removed += 1;
+    } catch {
+      // A directory, or gone already: nothing a snapshot wrote.
+    }
+  }
+  if (removed > 0) syncDirectory(dir, fs);
+  return removed;
+}
+
+/**
  * Writes the snapshot into `dir` as SNAPSHOT_FILE, after checking it against
  * the schema a start reads it with, so a stop never leaves a file a start
  * would refuse. Answers its SHA-256, which the snapshot_written record
- * carries, or why nothing was written; it never throws, and never leaves a
- * temporary file behind.
+ * carries, or why nothing was written; it never throws, and removes its
+ * temporary file on every failure it sees. A process killed between the
+ * open and the rename leaves the file, which the next start removes unread
+ * (removeTemporaryFiles).
  */
 export function writeSnapshot(
   dir: string,
@@ -167,7 +215,7 @@ export function writeSnapshot(
   if (bytes.length > MAX_SNAPSHOT_BYTES) {
     return { kind: 'refused', reason: 'larger than MAX_SNAPSHOT_BYTES' };
   }
-  const temp = join(dir, `.${SNAPSHOT_FILE}.${randomBytes(8).toString('hex')}.tmp`);
+  const temp = join(dir, `${TEMPORARY_PREFIX}${randomBytes(8).toString('hex')}${TEMPORARY_SUFFIX}`);
   let fd: number;
   try {
     fd = fs.openSync(

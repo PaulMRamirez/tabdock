@@ -73,6 +73,7 @@ import {
 import {
   bindingProblem,
   fitProblem,
+  removeTemporaryFiles,
   SNAPSHOT_FILE,
   type SnapshotFs,
   snapshotAccounts,
@@ -249,6 +250,22 @@ function sinceStart(dir: string): AuditLine[] {
 
 function fileOf(dir: string): string {
   return join(dir, SNAPSHOT_FILE);
+}
+
+/**
+ * The temporary file a stop killed between writeSnapshot's open and its
+ * rename leaves, holding `from`'s bytes or an invitee's email.
+ */
+function plantTemporary(dir: string, from?: string): string {
+  const path = join(dir, `.${SNAPSHOT_FILE}.0123456789abcdef.tmp`);
+  writeFileSync(
+    path,
+    from === undefined ? `{"displayName":"${GUEST_EMAIL}"}` : readFileSync(from),
+    {
+      mode: 0o600,
+    },
+  );
+  return path;
 }
 
 function sha256(bytes: Buffer): string {
@@ -440,9 +457,12 @@ describe('a graceful restart with TABDOCK_RESTART_SNAPSHOT on (A6.18)', () => {
     await first.close();
     const kept = join(privateDir(), 'kept.json');
     copyFileSync(fileOf(dir), kept);
+    // And what an earlier stop killed before its rename left: removed unread, the snapshot still taken.
+    const cutShort = plantTemporary(dir, kept);
 
     const second = await startRun(dir, idp);
     expect(existsSync(fileOf(dir))).toBe(false);
+    expect(existsSync(cutShort)).toBe(false);
     expect(recordsOf(dir, 'snapshot_loaded')).toHaveLength(1);
     const back = await resumeOn(second, page);
     expect(back.welcome?.resumed).toBe(true);
@@ -657,7 +677,15 @@ describe('a graceful restart with TABDOCK_RESTART_SNAPSHOT on (A6.18)', () => {
     expect(records(dir).at(-1)?.type).toBe('relay_stop');
     expect(recordsOf(dir, 'snapshot_written')).toHaveLength(1);
 
+    // A stop with the setting on, killed before its rename, left this behind: gone whatever the setting.
+    const cutShort = plantTemporary(dir);
     const again = await startRun(dir, idp, { restartSnapshot: false });
+    expect(existsSync(cutShort)).toBe(false);
+    expect(
+      again.lines.some((line) =>
+        line.includes('removed restart snapshot files a stop cut short left, unread'),
+      ),
+    ).toBe(true);
     expect((await resumeOn(again, fresh)).welcome?.resumed).toBe(false);
   });
 
@@ -926,6 +954,35 @@ describe('taking the file (snapshot.ts)', () => {
         removed: true,
       });
     }
+  });
+
+  it('removes only the temporary files a stop cut short leaves, never following a link', () => {
+    const dir = privateDir();
+    const cutShort = plantTemporary(dir);
+    const outside = join(privateDir(), 'outside.json');
+    writeFileSync(outside, '{}', { mode: 0o600 });
+    const linked = join(dir, `.${SNAPSHOT_FILE}.fedcba9876543210.tmp`);
+    symlinkSync(outside, linked);
+    const directory = join(dir, `.${SNAPSHOT_FILE}.00000000000000ff.tmp`);
+    mkdirSync(directory, { mode: 0o700 });
+    // Names a stop never writes, and the snapshot itself, which only a start's take removes.
+    const others = [
+      `.${SNAPSHOT_FILE}.0123456789ABCDEF.tmp`,
+      `.${SNAPSHOT_FILE}.0123.tmp`,
+      `${SNAPSHOT_FILE}.0123456789abcdef.tmp`,
+      'notes.tmp',
+      SNAPSHOT_FILE,
+    ];
+    for (const name of others) writeFileSync(join(dir, name), '{}', { mode: 0o600 });
+    expect(removeTemporaryFiles(dir)).toBe(2);
+    expect(existsSync(cutShort)).toBe(false);
+    expect(() => lstatSync(linked)).toThrow();
+    expect(existsSync(outside)).toBe(true);
+    expect(statSync(directory).isDirectory()).toBe(true);
+    expect(nodeFs.readdirSync(dir).sort()).toEqual(
+      [...others, `.${SNAPSHOT_FILE}.00000000000000ff.tmp`].sort(),
+    );
+    expect(removeTemporaryFiles(join(dir, 'missing'))).toBe(0);
   });
 
   it('writes nothing past MAX_SNAPSHOT_BYTES, leaving no file behind', () => {
