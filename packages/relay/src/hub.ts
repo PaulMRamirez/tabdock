@@ -2988,6 +2988,8 @@ export class PageHub {
    */
   // eslint-disable-next-line no-unused-private-class-members -- the watching seats' redemption checks call it (ADR 0044)
   #watchingFull(pageId: string, waiting: number): boolean {
+    // M6 seam: not built. W2-C's redemption checks call it (A6.19); until
+    // then every watcher sits among the people, under #pageFull.
     return this.#seated(pageId, 'watching') + waiting >= this.#watchingSeats();
   }
 

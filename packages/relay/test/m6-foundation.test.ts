@@ -268,3 +268,43 @@ describe('what SPEC says ahead of the code (docs/plans/M6.md)', () => {
     expect(before).not.toContain('M6 seam');
   });
 });
+
+describe('the seams the Wave 3 gate sees (docs/plans/M6.md)', () => {
+  /** Each relay source file's lines, by path. */
+  function sources(): [string, string[]][] {
+    const dir = join(import.meta.dirname, '..', 'src');
+    return readdirSync(dir)
+      .filter((name) => name.endsWith('.ts'))
+      .map((name) => [name, readFileSync(join(dir, name), 'utf8').split('\n')]);
+  }
+
+  /**
+   * Each member a lint rule is told is unused, from that line to the member's
+   * closing brace at its own indent, so a helper built and called nowhere
+   * cannot pass the gate with no marker in it (ADR 0044's #watchingFull).
+   */
+  function unusedMembers(): { at: string; body: string }[] {
+    return sources().flatMap(([name, lines]) =>
+      lines.flatMap((line, index) => {
+        if (!/eslint-disable-next-line\s+\S*no-unused/.test(line)) return [];
+        const indent = /^\s*/.exec(line)?.[0] ?? '';
+        const end = lines.findIndex((next, at) => at > index && next === `${indent}}`);
+        return [
+          {
+            at: `${name}:${String(index + 1)}`,
+            body: lines.slice(index, end === -1 ? undefined : end + 1).join('\n'),
+          },
+        ];
+      }),
+    );
+  }
+
+  it('marks every member the lint is told nothing calls yet', () => {
+    const members = unusedMembers();
+    expect(members.length).toBeGreaterThan(0);
+    const unmarked = members
+      .filter(({ body }) => !body.includes('// M6 seam: not built'))
+      .map(({ at }) => at);
+    expect(unmarked).toEqual([]);
+  });
+});
