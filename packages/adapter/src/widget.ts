@@ -2581,9 +2581,9 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   const recordCounts = (view: RecordView): string =>
     `${counted(view.calls, 'call', 'calls')}, ${counted(view.people, 'person', 'people')}`;
 
-  /** Whom a record names, said before any Save: everyone in it, invitees by email (ADR 0017). */
+  /** Whom a record names, said before any Save: everyone in it, and how many by an email address (ADR 0017). */
   function warning(view: RecordView): string {
-    return `This record names ${counted(view.people, 'person', 'people')}${view.invitees > 0 ? `, ${String(view.invitees)} of them by email address,` : ''} and every call they made on this page, never its arguments or result. Anyone you share the file with can read it.`;
+    return `This record names ${counted(view.people, 'person', 'people')}${view.emails > 0 ? `, ${String(view.emails)} of them by email address,` : ''} and every call they made on this page, never its arguments or result. Anyone you share the file with can read it.`;
   }
 
   /** Saves one record as JSON or as its Markdown summary; the object URL goes a minute later. */

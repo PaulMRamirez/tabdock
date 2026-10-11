@@ -315,7 +315,30 @@ describe('the recorder (ADR 0045)', () => {
       { id: 'dave', name: 'Dave Jones', kind: 'member' },
       { id: 'g_0123abcd', name: 'guest@example.com', kind: 'invitee' },
     ]);
-    expect(recorder.views()[0]).toMatchObject({ people: 4, invitees: 2 });
+    expect(recorder.views()[0]).toMatchObject({ people: 4, emails: 2 });
+  });
+
+  it('counts, for the warning before a save, only the names that hold an email address', () => {
+    const recorder = createRecorder();
+    recorder.pageSession('pg_1', false, 100);
+    // Invitees all, by their ids, yet only one is named by an email (ADR 0017, ADR 0044).
+    const unverified: User = { userId: `g_${'1'.repeat(32)}`, displayName: 'unverified account' };
+    const clash: User = { userId: `g_${'2'.repeat(32)}`, displayName: 'invitee 22222222' };
+    const agent: User = { userId: `g_${'3'.repeat(32)}`, displayName: 'agent "Nightly checker"' };
+    // A member whose name is an address is named by it as well.
+    const member: User = { userId: 'erin', displayName: 'erin@example.org' };
+    for (const [n, user] of [guest, unverified, clash, agent, member, alice].entries()) {
+      recorder.call(entry(`c_${String(n)}`, user), 'pg_1');
+    }
+    expect(snap(recorder).calls.map((call) => call.user.kind)).toEqual([
+      'invitee',
+      'invitee',
+      'invitee',
+      'invitee',
+      'member',
+      'member',
+    ]);
+    expect(recorder.views()[0]).toMatchObject({ people: 6, emails: 2 });
   });
 
   it('opens a span per attachment with how it came in, follows its role, and closes it as left or revoked', () => {
@@ -581,7 +604,7 @@ describe('the recorder (ADR 0045)', () => {
         to: null,
         calls: 1,
         people: 1,
-        invitees: 0,
+        emails: 0,
         proposals: 0,
         dropped: 0,
         failed: false,

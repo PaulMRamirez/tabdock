@@ -1618,7 +1618,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
                 to: null,
                 calls: 0,
                 people: 0,
-                invitees: 0,
+                emails: 0,
                 proposals: 0,
                 dropped: 0,
                 failed: true,

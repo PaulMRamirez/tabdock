@@ -208,12 +208,26 @@ test('fits a phone with the record box open, its warning and buttons wrapping wi
   page,
 }) => {
   await page.setViewportSize({ width: 390, height: 844 });
+  /** An invitee the relay lists, named as it names one (ADR 0017). */
+  const invitee = (hex: string, displayName: string) => ({
+    ...memberEntry(`g_${hex.repeat(4)}`, displayName, 'observer'),
+    kind: 'invitee' as const,
+  });
   const relay = await openWithSessionRelay(page, demo, {
-    roster: [memberEntry('alice', 'Alice'), memberEntry('bob', 'Bob', 'observer')],
+    roster: [
+      memberEntry('alice', 'Alice'),
+      memberEntry('bob', 'Bob', 'observer'),
+      invitee('1a2b3c4d', 'guest@example.com'),
+      invitee('5e6f7a8b', 'unverified account'),
+    ],
   });
   expect(relay.frames.length).toBeGreaterThan(0);
   await openRecordBox(page);
   await expect.poll(() => widgetVisible(page, 'record-warning')).toBe(true);
+  // Two invitees, and only the one the relay named by a verified email counts as named by one.
+  expect(await widgetText(page, 'record-warning')).toBe(
+    'This record names 4 people, 1 of them by email address, and every call they made on this page, never its arguments or result. Anyone you share the file with can read it.',
+  );
   const overflow = await widgetEvaluate(
     page,
     'record-box',

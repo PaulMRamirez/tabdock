@@ -76,8 +76,14 @@ export interface RecordView {
   readonly to: number | null;
   readonly calls: number;
   readonly people: number;
-  /** How many of those people are invitees, whose names are emails (ADR 0017). */
-  readonly invitees: number;
+  /**
+   * How many of those people it names by an email address: an invitee's
+   * verified email (ADR 0017), or any name holding one. Not every invitee:
+   * an unverified one, one renamed `invitee <short id>` and an agent
+   * (ADR 0044) carry none. Told by the '@' every address holds, which a
+   * name cut short past the name cap keeps.
+   */
+  readonly emails: number;
   readonly proposals: number;
   /** Calls, spans and proposals the caps pushed out, so a capped record never passes for a whole one. */
   readonly dropped: number;
@@ -615,7 +621,7 @@ export function createRecorder(): Recorder {
           to: kept.to,
           calls: kept.calls.length,
           people: kept.seen.size,
-          invitees: [...kept.seen].filter((named) => named.kind === 'invitee').length,
+          emails: [...kept.seen].filter((named) => named.name.includes('@')).length,
           proposals: kept.proposals.length,
           dropped: dropped.calls + dropped.attachments + dropped.proposals,
           failed: false,
