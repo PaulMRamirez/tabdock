@@ -2630,8 +2630,8 @@ export class PageHub {
    * Caps every live invite and invite-made attachment at the live session's
    * end, on the relay's clock (S14). `before` is the end an extension moved
    * from: an attachment the old end capped moves with the session, within its
-   * own 24 hours, and one that ends sooner for another reason keeps its end.
-   * An invite keeps its own expiry apart (ownExpiresAt) for the same reason.
+   * own end (#ownEnd), and one that ends sooner for another reason keeps its
+   * end. An invite keeps its own expiry apart (ownExpiresAt) for the same reason.
    */
   #capToSession(pageId: string, before: number | null): void {
     const session = this.#store.pages.get(pageId)?.timedSession;
@@ -2641,7 +2641,7 @@ export class PageHub {
       if (attachment.inviteId === null || attachment.endsAt === null) continue;
       const endsAt =
         attachment.endsAt === before
-          ? Math.min(attachment.grantedAt + MAX_INVITE_LIFETIME_MS, session.endsAt)
+          ? Math.min(this.#ownEnd(attachment), session.endsAt)
           : Math.min(attachment.endsAt, session.endsAt);
       if (endsAt === attachment.endsAt) continue;
       attachment.endsAt = endsAt;
@@ -2657,6 +2657,22 @@ export class PageHub {
       this.#store.invites.put(invite);
       this.#armInviteExpiry(invite);
     }
+  }
+
+  /**
+   * An invite-made attachment's end with no session to cap it: 24 hours
+   * from its grant (ADR 0017), and no later than the end of the agent token
+   * that made one (ADR 0044), whose record a live attachment always has,
+   * since the token's close ends it. The token is matched by its agent's id
+   * too, so an invite a page named like one of its tokens finds nothing.
+   */
+  #ownEnd(attachment: AttachmentRecord): number {
+    const longest = attachment.grantedAt + MAX_INVITE_LIFETIME_MS;
+    const agent =
+      attachment.inviteId === null
+        ? undefined
+        : this.#store.agents.get(attachment.pageId, attachment.inviteId);
+    return agent?.userId === attachment.userId ? Math.min(agent.expiresAt, longest) : longest;
   }
 
   /**

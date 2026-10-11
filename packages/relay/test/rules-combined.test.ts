@@ -232,6 +232,28 @@ describe("a session's end against agent tokens and proposals (C11, C13)", () => 
   });
 });
 
+describe("a session's extension against an agent's attachment (ADR 0043 meeting ADR 0044)", () => {
+  it("moves the attachment's end with the session only as far as its token's own end", async () => {
+    const { relay, page } = await classroom();
+    await start(page, 'ses_short', { maxDrivers: 1, proposals: 'all' });
+    // A one hour token under a 30 minute session: the session's end caps it.
+    const { tokenId, userId } = await attachedAgent(relay, page);
+    const token = relay.store.agents.get(page.pageId, tokenId);
+    if (token === undefined) throw new Error('no token record');
+    const sessionEnd = relay.store.pages.get(page.pageId)?.timedSession?.endsAt;
+    expect(relay.store.attachments.get(page.pageId, userId)?.endsAt).toBe(sessionEnd);
+    page.send({ t: 'session_extend', sessionId: 'ses_short', lengthMs: 240 * MINUTE });
+    expect((await latest(page, 'session')).session?.lengthMs).toBe(240 * MINUTE);
+    const attachment = relay.store.attachments.get(page.pageId, userId);
+    expect(attachment?.endsAt).toBe(token.expiresAt);
+    expect(attachment?.expiresAt).toBeLessThanOrEqual(token.expiresAt);
+    const listed = (await latest(page, 'roster')).attachments.find(
+      (entry) => entry.userId === userId,
+    );
+    expect(listed?.endsAt).toBe(token.expiresAt);
+  });
+});
+
 describe("a session's narrowing against pending proposals (ADR 0042 meeting ADR 0043)", () => {
   it('ends a pending proposal as cancelled when a session starts that takes none', async () => {
     const { relay, page, bob } = await classroom({}, { proposals: 'members' });
