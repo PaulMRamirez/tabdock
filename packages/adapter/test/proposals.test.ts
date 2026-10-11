@@ -447,3 +447,97 @@ describe('crafted invokes (A6.13, S5)', () => {
     await refusedUnrun(h, invoke('set_value', right), 'denied_by_operator');
   });
 });
+
+describe('under a time-boxed session (ADR 0042 meeting ADR 0043)', () => {
+  /**
+   * Starts a session that takes no proposals, as the widget's form would,
+   * and returns before the relay hears more than its session_start: the
+   * narrowing holds on the page first, as its demotions do (S5).
+   */
+  async function narrowing(h: Harness) {
+    const socket = h.socket();
+    socket.deliver({ t: 'session', session: null });
+    await flush();
+    const pending = h.dock.startSession({ label: 'Class', lengthMinutes: 30, proposals: 'off' });
+    const [start] = socket.framesOf('session_start');
+    if (start === undefined) throw new Error('no session_start');
+    return {
+      start,
+      async listed(): Promise<void> {
+        socket.deliver({
+          t: 'session',
+          session: {
+            sessionId: start.sessionId,
+            lengthMs: start.lengthMs,
+            remainingMs: start.lengthMs,
+            policy: start.policy,
+          },
+        });
+        expect((await pending).ok).toBe(true);
+      },
+    };
+  }
+
+  it('cancels the pending proposals it no longer takes at its start, before the relay says', async () => {
+    const { h, socket } = await page();
+    await propose(h, proposal(h));
+    const { start, listed } = await narrowing(h);
+    expect(start.policy.proposals).toBe('off');
+    expect(h.dock.state.proposals).toEqual([]);
+    expect(h.dock.state.proposalLog[0]).toMatchObject({ proposalId: 'pr_1', outcome: 'cancelled' });
+    // Nothing is left to accept, and the relay's proposal_end later changes nothing.
+    expect(h.dock.acceptProposal('pr_1')).toBe(false);
+    await listed();
+    socket.deliver({ t: 'proposal_end', proposalId: 'pr_1', reason: 'policy' });
+    await flush();
+    expect(h.dock.state.proposalLog).toHaveLength(1);
+    expect(decisions(h)).toEqual([]);
+  });
+
+  it('cancels them too when the relay lists the session narrower than the page asked', async () => {
+    const { h, socket } = await page();
+    await propose(h, proposal(h));
+    socket.deliver({ t: 'session', session: null });
+    await flush();
+    const pending = h.dock.startSession({ label: 'Class', lengthMinutes: 30 });
+    const [start] = socket.framesOf('session_start');
+    if (start === undefined) throw new Error('no session_start');
+    expect(start.policy.proposals).toBe('members');
+    expect(h.dock.state.proposals).toHaveLength(1);
+    socket.deliver({
+      t: 'session',
+      session: {
+        sessionId: start.sessionId,
+        lengthMs: start.lengthMs,
+        remainingMs: start.lengthMs,
+        policy: { ...start.policy, proposals: 'off' },
+      },
+    });
+    expect((await pending).ok).toBe(true);
+    expect(h.dock.state.proposals).toEqual([]);
+    expect(h.dock.state.proposalLog[0]).toMatchObject({ proposalId: 'pr_1', outcome: 'cancelled' });
+  });
+
+  it('refuses an invoke bound to an Accept made before a session narrowed proposals, its handler never run', async () => {
+    const { h, socket } = await page();
+    await propose(h, proposal(h));
+    expect(h.dock.acceptProposal('pr_1')).toBe(true);
+    const { listed } = await narrowing(h);
+    await listed();
+    const before = results(socket).length;
+    socket.deliver(
+      invoke('set_value', {
+        callId: 'call-1',
+        caller: BOB,
+        arguments: { value: 3, note: 'move to stop 3' },
+        proposal: { proposalId: 'pr_1' },
+      }),
+    );
+    await until(() => results(socket).length > before, 'an answer');
+    expect(results(socket).at(-1)).toMatchObject({
+      ok: false,
+      error: { code: 'role_denied', message: 'the page holds no accepted proposal for this call' },
+    });
+    expect(h.context.runs).toEqual([]);
+  });
+});

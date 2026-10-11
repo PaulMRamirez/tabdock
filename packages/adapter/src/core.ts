@@ -4533,6 +4533,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       if (starting?.sessionId === kept.sessionId) starting.answer(null);
       armSessionEnd();
       demoteBeyond(effective().maxDrivers);
+      proposalsPolicyChanged();
       const view = sessionView();
       // Told after each decision, through the seam W3-A guards (ADR 0045, decision 22).
       if (view !== null) recorder.sessionStarted(view);
@@ -4699,6 +4700,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     };
     askedMs = lengthMs;
     armSessionEnd();
+    // Proposals the narrowed policy no longer takes end here first, as its drivers were demoted.
+    proposalsPolicyChanged();
     showSession();
     if (!send({ t: 'session_start', sessionId, lengthMs, policy: wanted.data })) {
       dropStart(sessionId);
