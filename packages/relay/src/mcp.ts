@@ -950,13 +950,18 @@ export function createMcpFactory(
         });
       }
       if (!shaped.ok) return invalidArguments(shaped);
+      // On /g/mcp an agent pairs only through its own token (ADR 0044): a
+      // code or an invite it names is never looked at, so a token cannot
+      // spend a code or redeem a link for another page.
+      const agent = who.agentPageId !== null;
       const input = PairPageInputSchema.safeParse(shaped.args);
-      if (!input.success) {
+      if (!agent && !input.success) {
         return errorResult('invalid_arguments', 'give exactly one of code and invite');
       }
-      const { code, invite } = input.data;
-      const outcome: PairOutcome =
-        code !== undefined
+      const { code, invite } = input.success ? input.data : {};
+      const outcome: PairOutcome = agent
+        ? await hub.agentPair(who, ctx.mcpReq.signal, heldBytes(ctx))
+        : code !== undefined
           ? await hub.pairPage(who, code, ctx.mcpReq.signal, heldBytes(ctx))
           : await hub.redeemInvite(who, invite ?? '', ctx.mcpReq.signal, heldBytes(ctx));
       if (outcome.kind === 'error') return errorResult(outcome.code, outcome.message);

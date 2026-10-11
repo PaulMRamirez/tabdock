@@ -63,9 +63,11 @@ import {
   readRequestBody,
 } from '@modelcontextprotocol/server';
 import {
+  AGENT_PATH,
   AUDIT_VERSION,
   type AuditCallEvent,
   type AuditEvent,
+  type ClientInfo,
   InviteeIdSchema,
   MAX_FRAME_BYTES,
   SUBPROTOCOL,
@@ -74,6 +76,7 @@ import { WebSocketServer } from 'ws';
 import { auditDirByPath, FileAuditLog } from './audit-file.ts';
 import { createAuthRefusalLog } from './auth-log.ts';
 import {
+  agentUser,
   type AuthOutcome,
   AuthOutcomeSchema,
   type AuthRefusal,
@@ -114,6 +117,7 @@ import {
   createRequestBudget,
   envelopeOf,
   FIXED_TOOL_NAMES,
+  parseClientInfo,
   RELAY_VERSION,
   userIdOf,
 } from './mcp.ts';
@@ -446,9 +450,45 @@ const ORIGIN_REFUSAL = JSON.stringify({
   id: null,
 });
 
-/** Paths the relay answers whatever its mode; any other is logged as OTHER_ROUTE. */
+/**
+ * Paths the relay answers whatever its mode; any other is logged as
+ * OTHER_ROUTE. /g/mcp joins them only while agent tokens are on (ADR 0044),
+ * and is otherwise a path like any other the relay does not serve.
+ */
 const FIXED_ROUTES: readonly string[] = ['/healthz', '/mcp', '/page', ...PAIR_ROUTES];
+const AGENT_ROUTES: readonly string[] = [AGENT_PATH];
 const OTHER_ROUTE = '(other)';
+
+/**
+ * /g/mcp's one answer to a missing, malformed, unknown, expired or closed
+ * token, alike (ADR 0044): never 401, which would start a sign-in in some
+ * clients, nor 403, with no challenge and no resource metadata, and before
+ * the body is read. The connection closes after it, so a body the client
+ * still sends is never read either.
+ */
+const AGENT_NOT_FOUND = JSON.stringify({
+  jsonrpc: '2.0',
+  error: { code: -32001, message: 'Not found' },
+  id: null,
+});
+
+/** The bearer token an Authorization header carries, or null; checked against AgentTokenSchema later. */
+function bearerOf(header: string | undefined): string | null {
+  const match = /^Bearer ([\x21-\x7e]{1,128})$/.exec(header ?? '');
+  return match?.[1] ?? null;
+}
+
+/**
+ * The client a /g/mcp request names: initialize's clientInfo on a 2025-era
+ * session, the envelope's on 2026-07-28; null when it names none. Self-declared,
+ * so capped and made plain (parseClientInfo); for the prompt, never a check.
+ */
+function agentClientOf(message: unknown): ClientInfo | null {
+  const first: unknown = Array.isArray(message) ? (message as unknown[])[0] : message;
+  if (!isJSONRPCRequest(first)) return null;
+  if (first.method === 'initialize') return parseClientInfo(recordAt(first.params, 'clientInfo'));
+  return envelopeOf(first)?.client ?? null;
+}
 
 function pathOf(rawUrl: string | undefined): string | null {
   const raw = rawUrl ?? '/';
@@ -578,9 +618,8 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   // Only a log that outlives the process marks its starts and stops; a memory
   // ring forgets everything at a restart anyway.
   if (fileAudit !== null) {
-    // M6 seam: not built. relay_start gains agentTokens (W2-D) and
-    // restartSnapshot (W3-B) once each is served; until then config.ts
-    // refuses to start with either on, so the record would say false.
+    // M6 seam: not built. relay_start gains restartSnapshot (W3-B) once it
+    // is served; until then config.ts refuses to start with it on.
     recordAudit(fileAudit, log, {
       v: AUDIT_VERSION,
       type: 'relay_start',
@@ -589,6 +628,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       env: config.env,
       mode: config.mode,
       invites: config.invites,
+      agentTokens: config.agentTokens,
     });
     // Production serves no one until its first record is on disk (ADR 0019).
     if (!fileAudit.sync() && config.env === 'production') {
@@ -808,6 +848,14 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     if (faults.length > 0) throw faults[0];
   };
   const applyMembers = members === null ? null : settlingMembers(members, settleMembers);
+  // A closed agent token's user holds nothing more (ADR 0044): its 2025-era
+  // sessions close as a member list change closes them, once their answers
+  // are out, and its listen streams end, so every later request is a 404.
+  hub.onAgentClosed((userId) => {
+    const ended = new Set([userId]);
+    sessions.endUsers(ended, MEMBER_SESSIONS_CLOSE_MS, 'agent token closed');
+    listens.endUsers(ended);
+  });
   // The marker concerns every member, who all list it (spike.ts).
   spike?.setNotifier(() => {
     listens.notifyAll();
@@ -986,6 +1034,73 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     },
   });
   /**
+   * The token each /g/mcp request presented, by the request's own auth
+   * object, from its arrival until its body is in and its first prompt, if
+   * any, has carried it to the page (ADR 0044); never past that request.
+   */
+  const agentTokens = new WeakMap<AuthInfo, string>();
+  /**
+   * /g/mcp ahead of the same legs as /mcp (ADR 0044), so sessions, listen
+   * streams, budgets, the dispatcher and the response ceiling are shared.
+   * Its body read, the token is asked about again, as a member list change
+   * is for /mcp (S8): one closed while the client held its body back gets
+   * the same 404. Then its arrival can prompt the operator, naming the
+   * client the body names.
+   */
+  const agentSliced = {
+    fetch: async (request: Request, options?: McpHandlerRequestOptions): Promise<Response> => {
+      const authInfo = options?.authInfo;
+      const agent = AuthExtraSchema.safeParse(authInfo?.extra);
+      const token = authInfo === undefined ? undefined : agentTokens.get(authInfo);
+      if (authInfo !== undefined) agentTokens.delete(authInfo);
+      if (!agent.success || agent.data.agent === undefined || token === undefined) {
+        // handleAgentMcp sets both for every request it hands on; nothing else gets here.
+        await request.body?.cancel().catch(() => undefined);
+        return new Response(AGENT_NOT_FOUND, { status: 404 });
+      }
+      const { pageId, tokenId } = agent.data.agent;
+      let message: unknown = undefined;
+      if (request.method === 'POST') {
+        const text = await request
+          .clone()
+          .text()
+          .catch(() => null);
+        try {
+          message = text === null ? undefined : (JSON.parse(text) as unknown);
+        } catch {
+          // Not JSON: the leg answers it, and it names no client.
+        }
+      }
+      const now = Date.now();
+      if (!hub.agentLive(pageId, tokenId, now)) {
+        await request.body?.cancel().catch(() => undefined);
+        mcpLines.write('info', 'agent request refused: its token closed while the body arrived', {
+          tokenId,
+        });
+        return new Response(AGENT_NOT_FOUND, {
+          status: 404,
+          headers: { 'Content-Type': 'application/json', Connection: 'close' },
+        });
+      }
+      if (request.method === 'POST') {
+        hub.agentArrived(
+          { user: agentUser(pageId, tokenId), tokenId, pageId },
+          token,
+          agentClientOf(message),
+          now,
+        );
+      }
+      return sliced.fetch(request, options);
+    },
+  };
+  const agentNode = toNodeHandler(agentSliced, {
+    maxRequestBodySize: MAX_MCP_BODY_BYTES,
+    onerror: (error) => {
+      const kind = errorClass(error);
+      mcpLines.write('error', 'mcp adapter error', { errorClass: kind }, kind);
+    },
+  });
+  /**
    * The DNS rebinding guard: a loopback relay only answers Host names that
    * mean loopback, plus the public host in public URL mode, each exactly as
    * written. The answer keeps the shape of the SDK's own guard.
@@ -1006,7 +1121,11 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     return false;
   };
   const authRoutes: ReadonlyMap<string, AuthRoute> = auth.routes ?? new Map();
-  const knownRoutes = new Set([...FIXED_ROUTES, ...authRoutes.keys()]);
+  const knownRoutes = new Set([
+    ...FIXED_ROUTES,
+    ...(config.agentTokens ? AGENT_ROUTES : []),
+    ...authRoutes.keys(),
+  ]);
   /**
    * The name a request is logged under: a route the relay knows, or one word
    * for anything else, so a secret someone puts in a path or query (a nonce
@@ -1131,6 +1250,68 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     await mcpNode(withAuth as NodeIncomingMessageLike, response);
   }
 
+  /**
+   * /g/mcp (ADR 0044), served only while agent tokens are on: the Host check
+   * and the Origin 403 first, as for /mcp (S12), and on a relay without a
+   * public URL only requests made on this machine. Then the bearer token,
+   * and every miss is one 404 before the body is read, its line naming the
+   * address and never the header. A live token's request goes on as its
+   * agent user, an invitee by id, with the one page it watches, to the same
+   * legs /mcp uses, its response watched as every /mcp response is.
+   */
+  async function handleAgentMcp(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const receivedAt = performance.now();
+    if (!validateHost(request, response)) return;
+    const client = addresses.of(request);
+    const origin = request.headers.origin;
+    if (origin !== undefined && !config.isMcpOriginAllowed(origin)) {
+      originRefusals.refused(origin, loggedAddress(client));
+      send(response, 403, ORIGIN_REFUSAL, { 'Content-Type': 'application/json' });
+      return;
+    }
+    if (config.publicUrl === null && !madeLocally(request)) {
+      mcpLines.write('info', 'mcp request refused: not made on this machine', {
+        address: loggedAddress(client),
+      });
+      send(response, 403, 'This relay serves only clients on its own machine');
+      return;
+    }
+    const token = bearerOf(request.headers.authorization);
+    const identity = token === null ? null : hub.agentCaller(token, Date.now());
+    if (token === null || identity === null) {
+      mcpLines.write('info', 'agent request refused: no live agent token', {
+        address: loggedAddress(client),
+      });
+      send(response, 404, AGENT_NOT_FOUND, {
+        'Content-Type': 'application/json',
+        Connection: 'close',
+      });
+      return;
+    }
+    const extra: AuthExtra = {
+      userId: identity.user.userId,
+      displayName: identity.user.displayName,
+      kind: identity.user.account.kind,
+      email: identity.user.account.email,
+      oauthClientId: null,
+      agent: { tokenId: identity.tokenId, pageId: identity.pageId },
+    };
+    // The SDK requires a token field; the real one stays out of everything downstream.
+    const authInfo: AuthInfo = {
+      token: '',
+      clientId: identity.user.userId,
+      scopes: [],
+      extra: { ...extra, ...(spike ? { receivedAt } : {}) },
+    };
+    const withAuth = request as IncomingMessage & { auth?: AuthInfo };
+    withAuth.auth = authInfo;
+    agentTokens.set(authInfo, token);
+    // Before the leg, so the slicer can tell the response ceiling what an agent's answer holds (ADR 0044).
+    nodeResponses.set(authInfo, response);
+    stalls.track(response, identity.user.userId, request.socket);
+    await agentNode(withAuth as NodeIncomingMessageLike, response);
+  }
+
   /** A plugin's GET route, such as its metadata document, behind the same Host check as /mcp. */
   async function handleAuthRoute(
     handler: AuthRoute,
@@ -1163,6 +1344,8 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         else send(response, 405, 'Method not allowed');
       } else if (path === '/mcp') {
         await handleMcp(request, response);
+      } else if (path === AGENT_PATH && config.agentTokens) {
+        await handleAgentMcp(request, response);
       } else if (path === '/page') {
         send(response, 426, 'Upgrade required', { Upgrade: 'websocket' });
       } else if (authRoute !== undefined) {

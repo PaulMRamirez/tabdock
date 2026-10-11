@@ -15,9 +15,11 @@
 
 import type { IncomingMessage } from 'node:http';
 import {
+  agentKeyInput,
   EmailSchema,
   IdSchema,
   INVITEE_ID_PREFIX,
+  INVITEE_KEY_HEX_CHARS,
   INVITEE_SHORT_ID_CHARS,
   InviteeIdSchema,
   MAX_DISPLAY_NAME_CHARS,
@@ -31,7 +33,7 @@ import {
 import { z } from 'zod';
 import type { Logger } from './log.ts';
 import type { MemberList } from './members.ts';
-import { digest, sameDigest } from './secrets.ts';
+import { digest, digestHex, sameDigest } from './secrets.ts';
 
 export interface AuthRefusal {
   kind: 'refused';
@@ -154,6 +156,23 @@ export function inviteeUser(
     userId: `${INVITEE_ID_PREFIX}${key}`,
     displayName,
     account: { kind: 'invitee', email: verified },
+  };
+}
+
+/**
+ * The user an agent token's requests come from (ADR 0044): an invitee by its
+ * id, so every bound on invitees holds for it with no kind of its own, the
+ * id being g_ and the first 32 hex characters of SHA-256 over
+ * agentKeyInput, which takes in the page, so no two pages share an agent
+ * and none is a signed-in account (S13). The relay names it `agent <short
+ * id>`, never by its label, which is page text (S10); it has no email.
+ */
+export function agentUser(pageId: string, tokenId: string): AuthUser {
+  const key = digestHex(agentKeyInput(pageId, tokenId)).slice(0, INVITEE_KEY_HEX_CHARS);
+  return {
+    userId: `${INVITEE_ID_PREFIX}${key}`,
+    displayName: `agent ${key.slice(0, INVITEE_SHORT_ID_CHARS)}`,
+    account: { kind: 'invitee', email: null },
   };
 }
 

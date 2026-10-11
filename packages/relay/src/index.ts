@@ -187,6 +187,9 @@ export {
   type SingleUseTicketStore,
   type TicketStore,
   type TimedSession,
+  type AgentStore,
+  type AgentTokenRecord,
+  MemoryAgentStore,
 } from './store.ts';
 export {
   defaultMembersSystem,
