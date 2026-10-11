@@ -53,5 +53,7 @@ export async function startMapSimPage(options: MapSimPageOptions): Promise<MapSi
       ...(editTools ? createMapEditTools(world) : []),
     ],
   });
+  // M6 seam: not built. W2-E publishes world.state() through the sim page's handle on each
+  // change, skipping identical states (ADR 0040), for map-profile.test.ts test 7.
   return Object.assign(sim, { world });
 }

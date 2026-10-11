@@ -386,6 +386,9 @@ describe('first-class map tools (ADR 0025)', () => {
   );
 });
 
+// M6 seam: not built. W2-E adds test 7 here: world.state().view deep-equals get_view's result
+// and its clock get_clock's, then the same comparison through get_page_state (ADR 0040).
+
 describe('capture_view without a capture function', () => {
   it('answers its text form, as a page that returns no images does', async () => {
     world = await startWorld();

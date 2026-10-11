@@ -149,6 +149,8 @@ test('2. pairs through the widget as a person would, and redraws on set_view and
   await expect(page.locator('[data-role="status"]')).toHaveText(
     /16 tools registered; Tabdock relay 127\.0\.0\.1:\d+: linked/,
   );
+  // M6 seam: not built. W2-E adds case 2's capture here: capture_view returns a PNG (89 50 4E 47)
+  // no wider than maxWidthPx, byte-identical for one view and different for another.
 });
 
 test('3. reset_edits prompts on the page, and Deny answers denied_by_operator', async ({

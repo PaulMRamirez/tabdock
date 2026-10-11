@@ -81,6 +81,8 @@ function redraw(): void {
     : '';
 }
 world.subscribe(redraw);
+// M6 seam: not built. W2-E publishes world.state() here on each change once linked, skipping
+// identical states (ADR 0040), so a follower sees the view, clock, stop and observation.
 redraw();
 
 /** The strip names the tool and how it ended, never its arguments, which may be anyone's text (S7). */
@@ -133,6 +135,9 @@ canvas.addEventListener(
 );
 
 const context = document.modelContext;
+// M6 seam: not built. W2-E adds capture.ts and passes createMapTools(world, { capture }) here, so
+// capture_view returns ADR 0039's envelope; until then it answers its text form, which travels as
+// text although connect() names it an image tool (ADR 0038, decision 24).
 const tools = [...createMapTools(world), ...createMapEditTools(world)].map(logged);
 if (context) {
   // Registration lasts as long as the page; aborting this would remove every tool.
