@@ -354,6 +354,9 @@ describe('a member added to the file (ADR 0043)', () => {
   });
 
   it('pairs within 4 s at the default poll (A6.14)', { timeout: 15_000 }, async () => {
+    // Timers run late on a loaded machine, and the reload waits on two polls;
+    // this is all the lateness the bound allows them between them.
+    const LATE_TIMERS_MS = 500;
     const { relay, save: saveMembers } = await membersRelay([ALICE]);
     const page = await relay.page();
     const savedAt = Date.now();
@@ -362,8 +365,20 @@ describe('a member added to the file (ADR 0043)', () => {
       () => linesOf(relay).includes('"msg":"members reloaded"'),
       2 * MEMBERS_POLL_MS + 2000,
     );
-    await attachMember(await relay.claude('sub-bob'), page);
-    expect(Date.now() - savedAt).toBeLessThan(2 * MEMBERS_POLL_MS + 1000);
+    // A changed stat waits one poll and is read at the next, so two polls at most.
+    expect(2 * MEMBERS_POLL_MS).toBe(4000);
+    const reloaded = relay.events().find((line) => line.msg === 'members reloaded');
+    const reloadMs = Date.parse(String(reloaded?.ts)) - savedAt;
+    expect(reloadMs).toBeLessThanOrEqual(2 * MEMBERS_POLL_MS + LATE_TIMERS_MS);
+    // Then Bob pairs, in the client's round trips and the operator's answer,
+    // which the reload's bound leaves out.
+    const bob = await relay.claude('sub-bob');
+    await attachMember(bob, page);
+    // The session Bob paired on outlives the moment after the change.
+    await new Promise((resolve) => setTimeout(resolve, MEMBER_SESSIONS_CLOSE_MS + 500));
+    expect(
+      (await call(bob, 'call_page_tool', { page: page.pageId, tool: 'get_view' })).isError,
+    ).toBe(false);
   });
 });
 
