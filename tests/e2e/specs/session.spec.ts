@@ -30,9 +30,11 @@ import {
   clickInWidget,
   dockState,
   errorCode,
+  mintInWidget,
   typeInWidget,
   waitForDock,
   waitForLink,
+  widgetBoxText,
   widgetButtonCentre,
   widgetButtonNow,
   widgetEvaluate,
@@ -210,6 +212,25 @@ test('the countdown warns at five minutes, and at its end on the page clock the 
   expect(relay.framesOf('session_end')).toEqual([]);
   await page.clock.fastForward(5000);
   await expect.poll(() => relay.framesOf('session_end')).toHaveLength(1);
+});
+
+test("a Can control prompt during a session counts the session's driver seats, not attach()'s", async ({
+  page,
+}) => {
+  const relay = await openWithSessionRelay(page, demo, { query: 'invites=all' });
+  // Two seats on the board, one in the session, and Alice already drives.
+  await startSessionInWidget(page, { label: 'Seats', minutes: 30, drivers: 1 });
+  const control = await mintInWidget(page, { label: 'Help', role: 'driver' });
+  relay.send(
+    sessionRedemption('seats', { inviteId: control.inviteId, label: 'Help' }, control.link, {
+      userId: GUEST,
+      displayName: 'guest@example.com',
+    }),
+  );
+  await waitForDock(page, (state) => state.pendingRequests.length === 1);
+  expect(await widgetBoxText(page, { requestId: 'seats' })).toContain(
+    'The driver seats are full, so they join as observer for now.',
+  );
 });
 
 test('Extend lengthens it through the relay, and End asks once before the room leaves', async ({

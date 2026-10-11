@@ -1015,7 +1015,8 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       );
     }
     const drivers = state.roster.filter((attachment) => attachment.role === 'driver').length;
-    if (request.invite !== null && drivers >= state.policy.maxDrivers) {
+    // A running session's seats, which may be fewer than attach()'s (ADR 0043).
+    if (request.invite !== null && drivers >= (state.session?.policy ?? state.policy).maxDrivers) {
       // ADR 0017: the relay seats them as observer; Make driver works once a seat is free.
       dom.append(
         box,
