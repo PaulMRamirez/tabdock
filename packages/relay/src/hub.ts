@@ -87,9 +87,11 @@ import {
   type ProposalEndReason,
   proposalsAdmit,
   type RelayFrame,
+  type RelaySnapshot,
   type Role,
   type SessionEndReason,
   type SessionRefusalReason,
+  SNAPSHOT_VERSION,
   type ToolAnnotations,
   truncate,
   UNVERIFIED_EMAIL,
@@ -156,6 +158,17 @@ import {
   sameDigest,
   SINGLE_USE_SECRET_PATTERN,
 } from './secrets.ts';
+import {
+  restoredAgent,
+  restoredAttachment,
+  restoredInvite,
+  restoredPage,
+  savedAgent,
+  savedAttachment,
+  savedInvite,
+  savedPage,
+  type SnapshotAccounts,
+} from './snapshot.ts';
 import type { CallMarks, SpikeHooks } from './spike.ts';
 import { WaitSlots, waitLimitsOf } from './waits.ts';
 import {
@@ -808,6 +821,13 @@ interface AddressSessions {
   /** Those asleep, oldest asleep first: a page joins at the end when it falls asleep. */
   asleep: Set<string>;
 }
+
+/**
+ * Where page sessions a restart snapshot put back are counted (ADR 0046): a
+ * snapshot names no client address, and no address a socket arrives from is
+ * written this way, so no page from a real address is ever charged for them.
+ */
+const RESTORED_ADDRESS = '(restored from a snapshot)';
 
 function firstOf(set: ReadonlySet<string> | undefined): string | undefined {
   return set?.values().next().value;
@@ -7995,5 +8015,142 @@ export class PageHub {
     await Promise.all([...closing, checkerClosed]);
     // Once every socket has closed, so the lines their closes counted go out too.
     this.#connectionLines.flush();
+  }
+
+  // Restart snapshot (ADR 0046)
+
+  /**
+   * The store as a restart snapshot keeps it, read once the hub has stopped
+   * taking work (shutdown), when no page socket is left and no frame can
+   * change it: every page session not yet gone, with its attachments, live
+   * invites and live agent tokens, digests and all, and any session that
+   * ended while its page slept, which the page has yet to hear of.
+   * `memberKey` binds each member's attachment to who its id stands for now
+   * (snapshot.ts, snapshotAccounts).
+   */
+  exportSnapshot(writtenAt: number, memberKey: (userId: string) => string | null): RelaySnapshot {
+    if (!this.#closed) {
+      throw new Error(
+        'a restart snapshot is taken only once the hub has stopped taking work (ADR 0046)',
+      );
+    }
+    const pages = this.#store.pages.all().filter((page) => page.state !== 'gone');
+    const each = <T>(list: (pageId: string) => T[]): T[] =>
+      pages.flatMap((page) => list(page.pageId));
+    return {
+      v: SNAPSHOT_VERSION,
+      writtenAt,
+      mode: this.#config.mode,
+      pages: pages.map((page) => savedPage(page, this.#sessionEnds.get(page.pageId) ?? null)),
+      attachments: each((pageId) =>
+        this.#store.attachments
+          .listForPage(pageId)
+          .map((attachment) => savedAttachment(attachment, memberKey(attachment.userId))),
+      ),
+      invites: each((pageId) => this.#store.invites.listForPage(pageId).map(savedInvite)),
+      agents: each((pageId) => this.#store.agents.listForPage(pageId).map(savedAgent)),
+    };
+  }
+
+  /**
+   * Puts a restart snapshot back into a hub that holds nothing yet, before
+   * the relay listens (ADR 0046). Every page returns asleep with a fresh
+   * resume window, so its tab resumes as after a dropped link, counted under
+   * one stand-in address, since a snapshot names no client's; its policy is
+   * worked out again from its ceiling and session. Then, as a member list
+   * change would, an account the list in force no longer gives to the same
+   * person loses what it held, and what it sponsored goes with it, each with
+   * its records (S8, S13, S14); a session past its end ends with reason
+   * time; and an attachment, invite or token past its time ends, the rest
+   * timed again from their stored ends. snapshot_loaded counts what is live
+   * after all that, with the attachments the member list dropped.
+   */
+  restoreSnapshot(
+    snapshot: RelaySnapshot,
+    options: { ageMs: number; accounts: SnapshotAccounts },
+  ): AuditEventOf<'snapshot_loaded'> {
+    if (this.#closed || this.#store.pages.all().length > 0) {
+      throw new Error(
+        'a restart snapshot is put back only into a new hub, before the relay listens (ADR 0046)',
+      );
+    }
+    const now = Date.now();
+    const pageIds = snapshot.pages.map((saved) => saved.pageId);
+    const restored: AddressSessions = { pages: new Set(), asleep: new Set() };
+    this.#sessionsByAddress.set(RESTORED_ADDRESS, restored);
+    for (const saved of snapshot.pages) {
+      const { pageId } = saved;
+      this.#store.pages.put(restoredPage(saved, now));
+      this.#pageAddress.set(pageId, RESTORED_ADDRESS);
+      restored.pages.add(pageId);
+      restored.asleep.add(pageId);
+      this.#asleep.add(pageId);
+      if (saved.sessionEnded !== null) this.#sessionEnds.set(pageId, { ...saved.sessionEnded });
+      this.#setTimer(this.#lifecycleTimers, pageId, this.#config.timings.resumeWindowMs, () => {
+        this.#gone(pageId);
+      });
+    }
+    if (restored.pages.size === 0) this.#sessionsByAddress.delete(RESTORED_ADDRESS);
+    for (const saved of snapshot.attachments) {
+      this.#store.attachments.put(restoredAttachment(saved));
+    }
+    for (const saved of snapshot.invites) this.#store.invites.put(restoredInvite(saved));
+    for (const saved of snapshot.agents) this.#agents.restore(restoredAgent(saved));
+    const held = (): number =>
+      pageIds.reduce((sum, pageId) => sum + this.#store.attachments.listForPage(pageId).length, 0);
+    const before = held();
+    for (const pageId of pageIds) {
+      const page = this.#store.pages.get(pageId);
+      const targets = snapshot.attachments
+        .filter((saved) => saved.pageId === pageId && !options.accounts.stillHolds(saved))
+        .map((saved) => this.#store.attachments.get(pageId, saved.userId))
+        .filter((attachment) => attachment !== undefined);
+      if (page === undefined || targets.length === 0) continue;
+      this.#endAttachments(
+        pageId,
+        new Set(targets.map((attachment) => attachment.userId)),
+        'revoked',
+        'your membership on this relay changed while it restarted, so this attachment ended; sign in and pair again',
+      );
+      for (const target of targets) {
+        this.#auditExpire(page, target.userId, 'membership_changed', now);
+      }
+      this.#log.info('restart snapshot dropped attachments the member list no longer holds', {
+        pageId,
+        attachments: targets.length,
+      });
+      // Their invites close, and what those let in ends, as when a sponsor detaches (S14).
+      this.#loseSponsors(pageId, targets);
+    }
+    const dropped = before - held();
+    // What ran out while the relay was down ends now, as each timer would end it.
+    for (const pageId of pageIds) {
+      this.#endSessionIfDue(pageId);
+      for (const attachment of this.#store.attachments.listForPage(pageId)) {
+        this.#expireIfDue(pageId, attachment.userId);
+      }
+      for (const invite of this.#store.invites.listForPage(pageId)) {
+        if (invite.expiresAt <= now) this.#closeInvite(invite, 'expired', false);
+        else this.#armInviteExpiry(invite);
+      }
+      for (const agent of this.#store.agents.listForPage(pageId)) this.#agents.inTime(agent, now);
+    }
+    const loaded: AuditEventOf<'snapshot_loaded'> = {
+      v: AUDIT_VERSION,
+      type: 'snapshot_loaded',
+      at: now,
+      ageMs: options.ageMs,
+      pages: pageIds.length,
+      attachments: held(),
+      invites: pageIds.reduce(
+        (sum, pageId) => sum + this.#store.invites.listForPage(pageId).length,
+        0,
+      ),
+      sessions: pageIds.filter((pageId) => this.#store.pages.get(pageId)?.timedSession != null)
+        .length,
+      dropped,
+    };
+    this.#audit(loaded);
+    return loaded;
   }
 }
