@@ -22,6 +22,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -698,25 +699,35 @@ describe('a sign-in a change ends while its request is on the way (S8)', () => {
   });
 });
 
+/** The plugin's line for a token session it has not seen before, written as it checks the token. */
+const FIRST_SIGHTING = '"msg":"oauth token shape, first sighting of its session"';
+
 /**
  * A fetch for a 2026-07-28 client that sends the next tools/call naming
  * `tool` with its headers at once and its body only when `send` is called,
  * as a client on a slow link may: the relay signs /mcp requests in from the
  * headers, before it reads the body. Every other request passes untouched.
+ * The held request carries a token of its own, for `sub` with a session id
+ * no other has, so `signedIn` resolves once the plugin's first sighting of
+ * it shows the relay has checked it and mapped `sub` as the list said then.
  */
 function heldMcp(
-  relayUrl: string,
+  relay: InviteRelay,
+  sub: string,
   tool: string,
 ): { wrap: (base: FetchLike) => FetchLike; signedIn: Promise<void>; send: () => void } {
-  let send!: () => void;
+  const sightings = (): number =>
+    relay.lines.filter((line) => line.includes(FIRST_SIGHTING)).length;
+  let release!: () => void;
   const released = new Promise<void>((resolve) => {
-    send = resolve;
+    release = resolve;
   });
   let sent!: () => void;
   const headersSent = new Promise<void>((resolve) => {
     sent = resolve;
   });
   let armed = true;
+  let seen = 0;
   const wrap =
     (base: FetchLike): FetchLike =>
     (input, init) => {
@@ -728,41 +739,49 @@ function heldMcp(
       const url = new URL(String(input));
       const headers = Object.fromEntries(new Headers(init?.headers).entries());
       return new Promise<Response>((resolve, reject) => {
-        const req = httpRequest(
-          new URL(`${url.pathname}${url.search}`, relayUrl),
-          {
-            method: 'POST',
-            headers: {
-              ...headers,
-              host: new URL(PUBLIC_ORIGIN).host,
-              'content-length': String(Buffer.byteLength(body)),
+        const send = (token: string): void => {
+          const req = httpRequest(
+            new URL(`${url.pathname}${url.search}`, relay.relay.url),
+            {
+              method: 'POST',
+              headers: {
+                ...headers,
+                authorization: `Bearer ${token}`,
+                host: new URL(PUBLIC_ORIGIN).host,
+                'content-length': String(Buffer.byteLength(body)),
+              },
             },
-          },
-          (res) => {
-            resolve(
-              new Response(Readable.toWeb(res) as ReadableStream<Uint8Array>, {
-                status: res.statusCode ?? 0,
-                headers: Object.entries(res.headers).flatMap(([name, value]) =>
-                  value === undefined
-                    ? []
-                    : (Array.isArray(value) ? value : [value]).map((each): [string, string] => [
-                        name,
-                        each,
-                      ]),
-                ),
-              }),
-            );
-          },
-        );
-        req.on('error', reject);
-        req.flushHeaders();
-        sent();
-        void released.then(() => req.end(body));
+            (res) => {
+              resolve(
+                new Response(Readable.toWeb(res) as ReadableStream<Uint8Array>, {
+                  status: res.statusCode ?? 0,
+                  headers: Object.entries(res.headers).flatMap(([name, value]) =>
+                    value === undefined
+                      ? []
+                      : (Array.isArray(value) ? value : [value]).map((each): [string, string] => [
+                          name,
+                          each,
+                        ]),
+                  ),
+                }),
+              );
+            },
+          );
+          req.on('error', reject);
+          req.flushHeaders();
+          sent();
+          void released.then(() => req.end(body));
+        };
+        relay.provider
+          .token({ sub, aud: PUBLIC_MCP_URL, sid: `held-${randomUUID()}` })
+          .then((token) => {
+            seen = sightings();
+            send(token);
+          }, reject);
       });
     };
-  // Long enough for the relay to take the headers and sign the request in.
-  const signedIn = headersSent.then(() => delay(300));
-  return { wrap, signedIn, send };
+  const signedIn = headersSent.then(() => eventually(() => sightings() > seen, 5000));
+  return { wrap, signedIn, send: release };
 }
 
 /** A call's answer, or its rejection's message, whichever it comes to. */
@@ -780,7 +799,7 @@ describe('a /mcp request a change ends while its body is on the way (S8, S13)', 
   it('raises no pairing request under a removed member, by code', async () => {
     const { relay, save: saveMembers } = await membersRelay([ALICE, BOB]);
     const page = await relay.page();
-    const held = heldMcp(relay.relay.url, 'pair_page');
+    const held = heldMcp(relay, 'sub-alice', 'pair_page');
     const alice = await relay.claude('sub-alice', null, true, held.wrap, true);
     const pending = settled(call(alice, 'pair_page', { code: page.code }));
     await held.signedIn;
@@ -805,7 +824,7 @@ describe('a /mcp request a change ends while its body is on the way (S8, S13)', 
     const bob = await relay.claude('sub-bob');
     await attachMember(bob, page);
     const invite = await mintOk(page, { role: 'observer', uses: 1 });
-    const held = heldMcp(relay.relay.url, 'pair_page');
+    const held = heldMcp(relay, 'sub-alice', 'pair_page');
     const alice = await relay.claude('sub-alice', null, true, held.wrap, true);
     const pending = settled(call(alice, 'pair_page', { invite: invite.link }));
     await held.signedIn;
@@ -823,7 +842,7 @@ describe('a /mcp request a change ends while its body is on the way (S8, S13)', 
   it('runs no call under an id the file gave someone else, who attached under it meanwhile', async () => {
     const { relay, save: saveMembers } = await membersRelay([ALICE, BOB]);
     const page = await relay.page();
-    const held = heldMcp(relay.relay.url, 'call_page_tool');
+    const held = heldMcp(relay, 'sub-alice', 'call_page_tool');
     const alice = await relay.claude('sub-alice', null, true, held.wrap, true);
     await attachMember(alice, page);
     const pending = settled(call(alice, 'call_page_tool', { page: page.pageId, tool: 'get_view' }));
