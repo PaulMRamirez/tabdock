@@ -11,6 +11,7 @@ import type { Client } from '@modelcontextprotocol/client';
 import { attachMember, call, type InviteRelay, startInviteRelay } from './helpers/invites.ts';
 import type { InvokeFrame, InvokeReply, TestPage } from './helpers/page-client.ts';
 import { fillRoom, type Guest, roomLimits } from './helpers/room.ts';
+import { DEFAULT_RATE_LIMITS } from '../src/config.ts';
 
 let current: InviteRelay | undefined;
 
@@ -83,6 +84,30 @@ describe("the watchers' share of a page's calls (ADR 0044, A6.21)", () => {
     await page.sync();
     for (let i = 0; i < 5; i += 1) expect((await getView(alice, page)).isError).toBe(false);
   });
+
+  it("on the shipped share, leaves room after three watchers each spend all of their own (the room measurement's note)", async () => {
+    const { watchingCallsPerPage, watchingCallsPerUserPerPage } = DEFAULT_RATE_LIMITS;
+    const { page, watchers } = await room(4);
+    const [fourth, ...three] = watchers.reverse();
+    if (fourth === undefined || three.length !== 3) throw new Error('four watchers expected');
+    // Each takes calls until refused: their own share, never the page's.
+    for (const watcher of three) {
+      let passed = 0;
+      for (;;) {
+        const result = await getView(watcher, page);
+        if (result.isError) {
+          expect(result.text).toMatch(/^rate_limited: a watcher may make /);
+          break;
+        }
+        passed += 1;
+      }
+      expect(passed).toBe(watchingCallsPerUserPerPage);
+    }
+    // So a fourth still reaches the page: two or three watchers looping an
+    // image call cannot keep the rest of the room out for the window.
+    expect((await getView(fourth, page)).isError).toBe(false);
+    expect(4 * watchingCallsPerUserPerPage).toBeLessThanOrEqual(watchingCallsPerPage);
+  }, 60_000);
 
   it("shares the page's rate among its watchers", async () => {
     const { relay, page, guests, watchers } = await room(3, {

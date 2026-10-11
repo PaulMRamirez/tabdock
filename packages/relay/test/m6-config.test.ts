@@ -144,9 +144,9 @@ describe('defaults (docs/plans/M6.md, section 2.5)', () => {
       stateFramesPerSocket: 40,
       stateFramesPerAddress: 200,
       stateFramesWindowMs: 10_000,
-      // Lowered from ADR 0044's 120 by the room measurement (its notes).
+      // Lowered from ADR 0044's 120 and 30 by the room measurement (its notes).
       watchingCallsPerPage: 60,
-      watchingCallsPerUserPerPage: 30,
+      watchingCallsPerUserPerPage: 15,
     });
     expect(DEFAULT_TIMINGS).toMatchObject({
       proposalTtlMs: PROPOSAL_TTL_MS,

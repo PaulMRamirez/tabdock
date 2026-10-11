@@ -570,9 +570,10 @@ export const DEFAULT_RATE_LIMITS: RelayRateLimits = {
   // ADR 0044, as the room measurement left it: watchers share one call a
   // second of the operator's tab, the most at which the canvas map page kept
   // its 99th percentile frame on time; at two a second it missed frames
-  // (docs/notes/m6/room-measure.md). Each watcher has 30 of them.
+  // (docs/notes/m6/room-measure.md). Each watcher has a quarter of it, as in
+  // decision 12, so no fewer than four watchers can spend a window's share.
   watchingCallsPerPage: 60,
-  watchingCallsPerUserPerPage: 30,
+  watchingCallsPerUserPerPage: 15,
   ignoredFramesPerSocket: 20,
   ignoredFramesPerAddress: 60,
   connectionLinesPerAddress: 60,
@@ -592,8 +593,9 @@ export const STATE_BYTES = 4 * 1024 * 1024;
 /** limits.proposalBytes by default (ADR 0042). */
 export const PROPOSAL_BYTES = 16 * 1024 * 1024;
 /**
- * limits.responseBytes by default (ADR 0044, provisional until the room
- * measurement): inside the reference host's 512 MB beside its 192 MiB heap.
+ * limits.responseBytes by default (ADR 0044), kept by the room measurement
+ * (docs/notes/m6/room-measure.md): inside the reference host's 512 MB beside
+ * its 192 MiB heap.
  */
 export const RESPONSE_BYTES = 96 * 1024 * 1024;
 /** The least limits.responseBytes may be: room for a few full answers. */
