@@ -59,6 +59,7 @@ import {
   MAX_LIVE_INVITES_PER_PAGE,
   MAX_MEMBERS,
   MAX_RESULT_CHARS,
+  MAX_ROSTER_CLIENTS_PER_INVITEE,
   MAX_STATE_BYTES,
   MAX_STATE_FRAME_BYTES,
   MAX_WAIT_MS,
@@ -1311,6 +1312,17 @@ export class PageHub {
   readonly #pageLimiter: SlidingWindowLimiter;
   readonly #callLimiter: SlidingWindowLimiter;
   /**
+   * The watchers' share of a page's calls (ADR 0044, #watchingShareRefusal):
+   * a rate for the page's watchers together, keyed by page, and one for each
+   * watcher, keyed by page and user; the watchers' calls running on each
+   * page; and the calls already counted, so a call passing the checks twice
+   * is counted once.
+   */
+  readonly #watchingPageCalls: SlidingWindowLimiter;
+  readonly #watchingUserCalls: SlidingWindowLimiter;
+  readonly #watchingRunning = new Map<string, number>();
+  readonly #watchingCharged = new WeakSet<CallTrace>();
+  /**
    * What the /mcp requests waiting on a page hold on the heap, by user, in
    * all, and for invitees together, each charged what request-heap.ts
    * measures its body to hold, from when it may start waiting until it is
@@ -1408,6 +1420,9 @@ export class PageHub {
     this.#userLimiter = new SlidingWindowLimiter(pairAttemptsPerUser, windowMs);
     this.#pageLimiter = new SlidingWindowLimiter(pairAttemptsPerPage, windowMs);
     this.#callLimiter = new SlidingWindowLimiter(callsPerUserPerPage, windowMs);
+    const { watchingCallsPerPage, watchingCallsPerUserPerPage } = config.rateLimits;
+    this.#watchingPageCalls = new SlidingWindowLimiter(watchingCallsPerPage, windowMs);
+    this.#watchingUserCalls = new SlidingWindowLimiter(watchingCallsPerUserPerPage, windowMs);
     this.#toolsFrameLimiter = new SlidingWindowLimiter(toolsFramesPerAddress, toolsFramesWindowMs);
     this.#stateFrameLimiter = new SlidingWindowLimiter(stateFramesPerAddress, stateFramesWindowMs);
     this.#ignoredLines = new RepeatedLines({
@@ -2102,11 +2117,20 @@ export class PageHub {
     );
   }
 
-  /** Invite-made attachments may hold every seat but MEMBER_RESERVED_SEATS (S14). */
+  /**
+   * Invite-made attachments among the page's people may hold every seat
+   * but MEMBER_RESERVED_SEATS (S14); invitees watching by invite sit in
+   * seats of their own, which keep no reserve, since no member sits there
+   * (ADR 0044).
+   */
   #inviteSeatsFull(pageId: string, waiting: number): boolean {
     const made = this.#store.attachments
       .listForPage(pageId)
-      .filter((attachment) => attachment.inviteId !== null).length;
+      .filter(
+        (attachment) =>
+          attachment.inviteId !== null &&
+          this.#seatOf(attachment.kind, attachment.role) === 'people',
+      ).length;
     return made + waiting >= this.#config.limits.usersPerPage - MEMBER_RESERVED_SEATS;
   }
 
@@ -2946,9 +2970,13 @@ export class PageHub {
 
   // Attachments
 
-  /** Whether the page already holds as many users as it may (S9). */
+  /**
+   * Whether the page already holds as many people as it may (S9): everyone
+   * but the invitees watching by invite, who sit in seats of their own
+   * (ADR 0044), so a room of watchers never takes a member's place.
+   */
   #pageFull(pageId: string): boolean {
-    return this.#store.attachments.listForPage(pageId).length >= this.#config.limits.usersPerPage;
+    return this.#seated(pageId, 'people') >= this.#config.limits.usersPerPage;
   }
 
   #pageFullError(when: string): HubError {
@@ -2984,26 +3012,119 @@ export class PageHub {
 
   /**
    * Whether the page's watching seats are full, counting `waiting` requests
-   * that would take one; a page with none is always full (ADR 0044).
+   * that would take one; a page with none is always full (ADR 0044). A
+   * demotion may leave more watchers than seats until someone leaves, and
+   * every watch redemption is refused meanwhile.
    */
-  // eslint-disable-next-line no-unused-private-class-members -- the watching seats' redemption checks call it (ADR 0044)
   #watchingFull(pageId: string, waiting: number): boolean {
-    // M6 seam: not built. W2-C's redemption checks call it (A6.19); until
-    // then every watcher sits among the people, under #pageFull.
     return this.#seated(pageId, 'watching') + waiting >= this.#watchingSeats();
+  }
+
+  #watchingFullError(): HubError {
+    return hubError(
+      'page_busy',
+      'the page has no room left for anyone else to watch by invite; its operator can revoke someone to make room',
+    );
+  }
+
+  /**
+   * Redemptions waiting on the operator that would take a seat of this
+   * kind, judged as #redeem judges a new one: by the account and the
+   * invite's role, before any driver limit, which only the approval knows.
+   */
+  #waitingFor(pageId: string, seat: Seat): number {
+    return this.#store.requests.listForPage(pageId).filter((request) => {
+      if (request.inviteId === null) return false;
+      const invite = this.#store.invites.get(pageId, request.inviteId);
+      return this.#seatOf(request.account.kind, invite?.role ?? 'observer') === seat;
+    }).length;
+  }
+
+  /**
+   * Whether an attachment of this kind, moving from `from` to `to`, finds
+   * no room in the seats it moves into (ADR 0044): only a watcher made a
+   * driver moves into the people, and an invite-made one there also leaves
+   * members their reserve (S14). Taking a role away never needs a seat.
+   */
+  #noSeatFor(attachment: AttachmentRecord, to: Role): boolean {
+    if (this.#seatOf(attachment.kind, attachment.role) !== 'watching') return false;
+    if (this.#seatOf(attachment.kind, to) !== 'people') return false;
+    return (
+      this.#pageFull(attachment.pageId) ||
+      (attachment.inviteId !== null && this.#inviteSeatsFull(attachment.pageId, 0))
+    );
   }
 
   /**
    * A watcher's call past the page's share of its calls, or null to go on
-   * (ADR 0044); members and the page's people are never held to it.
+   * (ADR 0044); members and the page's people are never held to it. Forty
+   * watchers each at their own rate would run a handler in the operator's
+   * tab many times a second, so they share a rate per page, each has a
+   * smaller one of their own, and only a few of their calls run at once.
+   * Only a call that passes is counted, and its place among those running
+   * is given back with the rest of what the call holds (`trace.release`),
+   * however it ends. A refusal is a call record within the refusal budget,
+   * written as every refused call's is (S7).
    */
   #watchingShareRefusal(
-    _pageId: string,
+    pageId: string,
     attachment: AttachmentRecord,
-    _trace: CallTrace,
+    trace: CallTrace,
   ): HubError | null {
     if (this.#seatOf(attachment.kind, attachment.role) !== 'watching') return null;
-    // M6 seam: not built. Every watcher's call goes on, as before the share.
+    // A 2025-era call confirmed inside its request passes every check twice, and is one call.
+    if (this.#watchingCharged.has(trace)) return null;
+    const now = Date.now();
+    const { userId } = attachment;
+    const userKey = attachmentKey(pageId, userId);
+    const { watchingCallsPerPage, watchingCallsPerUserPerPage, windowMs } = this.#config.rateLimits;
+    const window = formatDuration(windowMs);
+    if (!this.#watchingUserCalls.allows(userKey, now)) {
+      this.#log.debug("call refused: past a watcher's share of the page's calls", {
+        pageId,
+        userId,
+      });
+      return hubError(
+        'rate_limited',
+        `a watcher may make ${String(watchingCallsPerUserPerPage)} calls to this page in ${window}, and you have; wait, or read its published state with get_page_state instead`,
+      );
+    }
+    if (!this.#watchingPageCalls.allows(pageId, now)) {
+      this.#log.debug("call refused: past the watchers' share of the page's calls", {
+        pageId,
+        userId,
+      });
+      return hubError(
+        'rate_limited',
+        `this page's watchers have made the ${String(watchingCallsPerPage)} calls they share in ${window}; wait, or read its published state with get_page_state instead`,
+      );
+    }
+    const running = this.#watchingRunning.get(pageId) ?? 0;
+    const inFlight = this.#config.limits.watchingCallsInFlight;
+    if (running >= inFlight) {
+      this.#log.debug("call refused: the watchers' calls already running on the page", {
+        pageId,
+        userId,
+      });
+      return hubError(
+        'page_busy',
+        `${String(inFlight)} calls from this page's watchers are already running; try again shortly`,
+      );
+    }
+    this.#watchingUserCalls.record(userKey, now);
+    this.#watchingPageCalls.record(pageId, now);
+    this.#watchingRunning.set(pageId, running + 1);
+    this.#watchingCharged.add(trace);
+    const bytes = trace.release;
+    let released = false;
+    trace.release = () => {
+      if (released) return;
+      released = true;
+      bytes?.();
+      const left = (this.#watchingRunning.get(pageId) ?? 1) - 1;
+      if (left > 0) this.#watchingRunning.set(pageId, left);
+      else this.#watchingRunning.delete(pageId);
+    };
     return null;
   }
 
@@ -3123,15 +3244,25 @@ export class PageHub {
       }
       return;
     }
-    if (this.#pageFull(pageId) || this.#inviteSeatsFull(pageId, 0)) {
+    // The role first, as the driver limit leaves it, since the role says
+    // which seats it takes: an invitee kept an observer watches (ADR 0044).
+    const role = this.#cappedRole(pageId, userId, lesserRole(invite.role, decided));
+    const watching = this.#seatOf(request.account.kind, role) === 'watching';
+    const full = watching
+      ? this.#watchingFull(pageId, 0)
+      : this.#pageFull(pageId) || this.#inviteSeatsFull(pageId, 0);
+    if (full) {
       this.#log.info('approval refused: the page filled up while the operator decided', {
         pageId,
         userId,
       });
-      this.#endRequest(request.requestId, this.#pageFullError('filled up meanwhile and has'));
+      this.#endRequest(
+        request.requestId,
+        watching ? this.#watchingFullError() : this.#pageFullError('filled up meanwhile and has'),
+      );
       return;
     }
-    const attachment = this.#grant(request, lesserRole(invite.role, decided), invite);
+    const attachment = this.#grant(request, role, invite);
     invite.usesLeft -= 1;
     this.#audit({
       v: AUDIT_VERSION,
@@ -3269,7 +3400,17 @@ export class PageHub {
         userId: frame.userId,
       });
     }
-    const capped = this.#cappedRole(pageId, frame.userId, wanted);
+    let capped = this.#cappedRole(pageId, frame.userId, wanted);
+    // A watcher made a driver moves among the people, so it needs a seat
+    // there, as a grant does; a demotion into full watching seats is never
+    // refused, since it only takes access away (ADR 0044).
+    if (capped !== attachment.role && this.#noSeatFor(attachment, capped)) {
+      this.#log.info("set_role refused: no seat left among the page's people", {
+        pageId,
+        userId: frame.userId,
+      });
+      capped = attachment.role;
+    }
     // A promotion gives access, so it counts against the page's grants; a
     // demotion only takes access away and never waits on them.
     const role =
@@ -3529,6 +3670,13 @@ export class PageHub {
     return true;
   }
 
+  /**
+   * The page's roster, an invitee's row listing only its newest
+   * MAX_ROSTER_CLIENTS_PER_INVITEE clients (ADR 0044): clients name
+   * themselves on every call, so a room of guests each rotating names would
+   * otherwise pass the frame cap, and the adapter, refusing the welcome,
+   * would reconnect into the same welcome again and again.
+   */
   #roster(pageId: string): AttachmentView[] {
     return this.#store.attachments.listForPage(pageId).map((attachment) => ({
       userId: attachment.userId,
@@ -3538,7 +3686,10 @@ export class PageHub {
       grantedAt: attachment.grantedAt,
       lastUsedAt: attachment.lastUsedAt,
       expiresAt: attachment.expiresAt,
-      clients: attachment.clients.slice(0, MAX_ROSTER_CLIENTS),
+      clients: attachment.clients.slice(
+        0,
+        attachment.kind === 'invitee' ? MAX_ROSTER_CLIENTS_PER_INVITEE : MAX_ROSTER_CLIENTS,
+      ),
       inviteId: attachment.inviteId,
       endsAt: attachment.endsAt,
     }));
@@ -4422,8 +4573,10 @@ export class PageHub {
    * bars, a linked page, the page's pairing limit, and the invite still live
    * once the caller's own lapsed attachment has ended; then the caller is
    * already attached, joins the request they have waiting, is refused while
-   * the invite's one prompt or its last uses are taken or the seats invites
-   * may use are full, or raises a new request. Never autoApprove: the
+   * the invite's one prompt or its last uses are taken or the seats it would
+   * take are full (an invitee watching takes a watching seat, anyone else
+   * one of the people's that invites may use; ADR 0044), or raises a new
+   * request. Never autoApprove: the
    * adapter honours an invite only against its own record and the presented
    * secret (ADR 0017's notes).
    */
@@ -4542,10 +4695,21 @@ export class PageHub {
         ),
       );
     }
-    const waitingOnInvites = this.#store.requests
-      .listForPage(page.pageId)
-      .filter((request) => request.inviteId !== null).length;
-    if (this.#pageFull(page.pageId) || this.#inviteSeatsFull(page.pageId, waitingOnInvites)) {
+    // The seats it would take, and only the waiting redemptions bound for
+    // the same seats (ADR 0044): watching by invite, or among the people.
+    const seat = this.#seatOf(caller.account.kind, invite.role);
+    const waitingHere = this.#waitingFor(page.pageId, seat);
+    if (seat === 'watching' && this.#watchingFull(page.pageId, waitingHere)) {
+      this.#log.info('redemption refused: the watching seats are taken', {
+        pageId: page.pageId,
+        userId: caller.userId,
+      });
+      return refuse(this.#watchingFullError());
+    }
+    if (
+      seat === 'people' &&
+      (this.#pageFull(page.pageId) || this.#inviteSeatsFull(page.pageId, waitingHere))
+    ) {
       this.#log.info('redemption refused: the seats invites may use are taken', {
         pageId: page.pageId,
         userId: caller.userId,
