@@ -69,8 +69,21 @@ export interface DevToolsSession {
 }
 
 export interface WaitOptions {
-  /** How long to wait before giving up, in milliseconds. */
+  /** How long to wait before giving up, in milliseconds: finite, and 0 or more. */
   timeoutMs?: number;
+}
+
+/**
+ * The wait the options name, or the default. Throws for a wait that is not a
+ * finite count of milliseconds, 0 or more: one of NaN, as Number() gives for
+ * an unset variable, would never end, since no time is at or past NaN.
+ */
+function waitOf(options: WaitOptions, fallback: number): number {
+  const timeoutMs: unknown = options.timeoutMs ?? fallback;
+  if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs < 0) {
+    throw new TypeError('timeoutMs must be a finite number of milliseconds, 0 or more');
+  }
+  return timeoutMs;
 }
 
 /**
@@ -241,7 +254,7 @@ export async function readPairingCode(
   cdp: DevToolsSession,
   options: WaitOptions = {},
 ): Promise<string> {
-  const timeoutMs = options.timeoutMs ?? READ_CODE_TIMEOUT_MS;
+  const timeoutMs = waitOf(options, READ_CODE_TIMEOUT_MS);
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const code = PairingCodeSchema.safeParse(await widgetText(cdp, 'pairing-code'));
@@ -367,7 +380,7 @@ export async function widgetButton(
   options: WaitOptions = {},
 ): Promise<ButtonAt> {
   checkTarget(target);
-  const timeoutMs = options.timeoutMs ?? BUTTON_TIMEOUT_MS;
+  const timeoutMs = waitOf(options, BUTTON_TIMEOUT_MS);
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const found = await clickable(cdp, target);
@@ -439,7 +452,7 @@ export async function clickInWidget(
   options: WaitOptions = {},
 ): Promise<void> {
   checkTarget(target);
-  await press(cdp, target, options.timeoutMs ?? BUTTON_TIMEOUT_MS);
+  await press(cdp, target, waitOf(options, BUTTON_TIMEOUT_MS));
 }
 
 /**
@@ -459,6 +472,7 @@ export async function allowAttach(
     throw new TypeError('allowAttach takes a client name or a request id, and not both');
   }
   if (client === '' || wanted === '') throw new TypeError('the client name or request id is empty');
+  const timeoutMs = waitOf(options, ALLOW_TIMEOUT_MS);
   /** The one matching request's id, null for none; throws for more than one. */
   const unique = (widget: DevToolsNode): string | null => {
     const found = attachPrompts(widget).filter((prompt) =>
@@ -471,7 +485,6 @@ export async function allowAttach(
     }
     return found[0]?.requestId ?? null;
   };
-  const timeoutMs = options.timeoutMs ?? ALLOW_TIMEOUT_MS;
   const deadline = Date.now() + timeoutMs;
   const requestId = await (async (): Promise<string> => {
     for (;;) {

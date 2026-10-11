@@ -574,6 +574,42 @@ describe('arming and the hit test', () => {
   });
 });
 
+describe('timeoutMs', () => {
+  // A wait of NaN never ends: Date.now() >= NaN is false for ever, so a CI
+  // script passing Number() of an unset variable would hang to the job's end.
+  const entries: [string, (cdp: FakeSession, timeoutMs: number) => Promise<unknown>][] = [
+    ['readPairingCode', (cdp, timeoutMs) => readPairingCode(cdp, { timeoutMs })],
+    [
+      'widgetButton',
+      (cdp, timeoutMs) => widgetButton(cdp, { action: 'deny', requestId: 'req-1' }, { timeoutMs }),
+    ],
+    [
+      'clickInWidget',
+      (cdp, timeoutMs) => clickInWidget(cdp, { action: 'deny', requestId: 'req-1' }, { timeoutMs }),
+    ],
+    ['allowAttach', (cdp, timeoutMs) => allowAttach(cdp, { as: 'driver', client: CI, timeoutMs })],
+  ];
+  for (const [name, call] of entries) {
+    it(`${name} refuses a wait that is not a finite count of milliseconds, sending nothing`, async () => {
+      for (const timeoutMs of [Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+        // Nothing here ever resolves: no code, and an unarmed prompt from another client.
+        const cdp = new FakeSession(
+          documentOf(dock([code(''), prompt('req-1', 'other', 100, false)])),
+        );
+        await expect(call(cdp, timeoutMs)).rejects.toThrow(
+          new TypeError('timeoutMs must be a finite number of milliseconds, 0 or more'),
+        );
+        expect(cdp.sent).toEqual([]);
+      }
+      // 0 looks once, then gives up.
+      const once = new FakeSession(
+        documentOf(dock([code(''), prompt('req-1', 'other', 100, false)])),
+      );
+      await expect(call(once, 0)).rejects.toThrow(WidgetTestError);
+    });
+  }
+});
+
 describe('what it sends', () => {
   // Only DevTools' own view of the DOM and trusted input: no function runs in
   // the page, whose own world a script loaded after attach() may have patched,
