@@ -1,6 +1,6 @@
 // pnpm measure:room: ADR 0044's room measurement (A6.22), run by hand and
 // kept out of CI. It needs root (for its cgroups and its own network
-// namespace), Playwright's Chromium, and about an hour. It starts main.ts as
+// namespace), Playwright's Chromium, and about 75 minutes. It starts main.ts as
 // the container image does, under the image's heap flag, inside a 512 MiB
 // group held to one CPU (cgroup v1 where it can, decision 31, then cgroup
 // v2, a systemd user scope, or the heap flag alone with RSS measured),
@@ -49,7 +49,7 @@ const RAW = join(ROOT, 'docs/notes/m6/room-measure.raw.json');
 const USAGE = `pnpm measure:room [options]
 
 Needs root, for its cgroups and a network namespace of its own, Playwright's
-Chromium for the frames, and about an hour as it stands.
+Chromium for the frames, and about 75 minutes, 7 more for each frame repeat.
 
   --sizes <list>       classes to run, comma separated: n for a class of n on one
                        page, or PxN for P classes of N on P pages (default 40,80,2x40)
