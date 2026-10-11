@@ -12,10 +12,26 @@ import { scriptTagFile } from '../../../packages/adapter/scripts/script-tag-buil
 
 const ADAPTER_SRC = join(import.meta.dirname, '../../../packages/adapter/src');
 
-/** Every specifier a module imports or re-exports. */
+/** Imports and re-exports with `from`. */
+const FROM = /^\s*(?:import|export)\b[^;]*?\bfrom\s+(['"])([^'"]+)\1/gm;
+/** Imports for their side effects alone, such as `import './zod-config.ts'`. */
+const BARE = /^\s*import\s+(['"])([^'"]+)\1/gm;
+/** import() of a plain string. */
+const DYNAMIC = /\bimport\s*\(\s*(['"])([^'"]+)\1\s*\)/g;
+
+/**
+ * Every specifier a module imports or re-exports, in every form, so a module
+ * pulled in for its side effects alone, or loaded later, is in the graph too.
+ * Throws for an import() of anything but a plain string, which no reading of
+ * the source can follow.
+ */
 function importsOf(source: string): string[] {
-  return [...source.matchAll(/^\s*(?:import|export)\b[^;]*?\bfrom\s+'([^']+)'/gm)].map(
-    (match) => match[1] ?? '',
+  const dynamic = [...source.matchAll(DYNAMIC)];
+  if (dynamic.length < (source.match(/\bimport\s*\(/g)?.length ?? 0)) {
+    throw new Error('an import whose specifier is not a plain string');
+  }
+  return [...source.matchAll(FROM), ...source.matchAll(BARE), ...dynamic].map(
+    (match) => match[2] ?? '',
   );
 }
 
@@ -34,6 +50,39 @@ async function reach(entry: string): Promise<{ modules: Set<string>; packages: S
   }
   return { modules, packages };
 }
+
+describe('the import reader the graph checks stand on', () => {
+  it('names every form of import and re-export, side effects and dynamic ones too', () => {
+    const source = [
+      "import './zod-config.ts';",
+      "import { a } from './a.ts';",
+      'import type { B } from "./b.ts";',
+      "export * from './c.ts';",
+      "export { d } from './d.ts';",
+      'import {',
+      '  e,',
+      "} from '@tabdock/protocol';",
+      "const f = await import('./f.ts');",
+      'const g = await import("./g.ts");',
+    ].join('\n');
+    expect(importsOf(source).sort()).toEqual([
+      './a.ts',
+      './b.ts',
+      './c.ts',
+      './d.ts',
+      './f.ts',
+      './g.ts',
+      './zod-config.ts',
+      '@tabdock/protocol',
+    ]);
+  });
+
+  it('refuses an import it cannot name, rather than leave it out of the graph', () => {
+    expect(() => importsOf('const h = await import(`./${name}.ts`);')).toThrow(
+      'an import whose specifier is not a plain string',
+    );
+  });
+});
 
 describe('the testing helper', () => {
   it('is in no script-tag build', async () => {
