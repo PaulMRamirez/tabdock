@@ -4,6 +4,7 @@ import {
   allowAttach,
   readPairingCode,
   waitingPrompts,
+  widgetText,
   WidgetTestError,
 } from '@tabdock/adapter/testing';
 import { startDemoServer, type DemoServer } from '@tabdock/demo/server';
@@ -111,6 +112,90 @@ test.describe('at phone width', () => {
   }) => {
     await pairsAsDriver(page);
   });
+});
+
+/**
+ * A script loaded after attach(), as later-scripts.spec.ts plays one: it
+ * wraps the DOM getters and methods a read of the widget would go through and
+ * notes each one handed a node of a closed shadow root, which is the widget's.
+ */
+function installLaterScript(): void {
+  const rootOf = Node.prototype.getRootNode;
+  const handed: string[] = [];
+  Object.assign(window, { __handed: handed });
+  const wrap = (proto: object, name: string): void => {
+    const own = Object.getOwnPropertyDescriptor(proto, name);
+    if (own === undefined) return;
+    const note = (self: unknown): void => {
+      if (!(self instanceof Node)) return;
+      const root = rootOf.call(self);
+      if (root instanceof ShadowRoot && root.mode === 'closed') handed.push(name);
+    };
+    const { get, value } = own;
+    if (get !== undefined) {
+      Object.defineProperty(proto, name, {
+        ...own,
+        get(this: unknown) {
+          note(this);
+          return get.call(this) as unknown;
+        },
+      });
+    } else if (typeof value === 'function') {
+      const method = value as (...args: unknown[]) => unknown;
+      Object.defineProperty(proto, name, {
+        ...own,
+        value(this: unknown, ...args: unknown[]) {
+          note(this);
+          return method.apply(this, args);
+        },
+      });
+    }
+  };
+  for (const name of ['textContent', 'nodeValue']) wrap(Node.prototype, name);
+  for (const name of ['getAttribute', 'getBoundingClientRect']) wrap(Element.prototype, name);
+  for (const name of ['innerText', 'click']) wrap(HTMLElement.prototype, name);
+}
+
+async function handed(page: Page): Promise<unknown> {
+  return page.evaluate(() => (window as { __handed?: unknown }).__handed);
+}
+
+test('runs nothing in the page, so a script that patched the DOM after attach() is handed no widget node', async ({
+  page,
+}) => {
+  const { code, cdp } = await openBoard(page);
+  await page.evaluate(installLaterScript);
+  const client = await connectMcp(tabdock.relay, tabdock.users.alice, CI);
+  try {
+    expect(await readPairingCode(cdp)).toBe(code);
+    const pending = callTool(client, 'pair_page', { code });
+    await expect.poll(async () => (await waitingPrompts(cdp)).attach.length).toBe(1);
+    await allowAttach(cdp, { as: 'driver', client: CI });
+    expect((await pending).structured).toMatchObject({ role: 'driver' });
+    expect(await widgetText(cdp, 'roster')).not.toBeNull();
+    expect(await handed(page)).toEqual([]);
+
+    // The spy works: a function run on a widget node in the page's own world,
+    // as the helper once read text, hands that node straight to it.
+    const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
+    type DomNode = typeof root;
+    const hostIn = (node: DomNode): DomNode | undefined =>
+      node.localName === 'tabdock-dock'
+        ? node
+        : (node.children ?? []).map(hostIn).find((found) => found !== undefined);
+    const inside = hostIn(root)?.shadowRoots?.[0]?.children?.[0];
+    if (inside === undefined) throw new Error('no node inside the widget');
+    const { object } = await cdp.send('DOM.resolveNode', { backendNodeId: inside.backendNodeId });
+    await cdp.send('Runtime.callFunctionOn', {
+      objectId: object.objectId ?? '',
+      functionDeclaration: 'function () { return this.textContent; }',
+      returnByValue: true,
+    });
+    expect(await handed(page)).toEqual(['textContent']);
+  } finally {
+    await client.close();
+    await cdp.detach();
+  }
 });
 
 test('refuses to choose between two requests from clients of one name, and approves only the one it names', async ({

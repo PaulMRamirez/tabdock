@@ -152,10 +152,6 @@ function* everyNode(node: FakeNode): Generator<FakeNode> {
   if (node.contentDocument) yield* everyNode(node.contentDocument);
 }
 
-function textOf(node: FakeNode): string {
-  return node.nodeType === 3 ? (node.nodeValue ?? '') : node.children.map(textOf).join('');
-}
-
 function inside(box: Box, x: number, y: number): boolean {
   return x >= box.x && x <= box.x + box.width && y >= box.y && y <= box.y + box.height;
 }
@@ -203,7 +199,6 @@ class FakeSession implements DevToolsSession {
       case 'DOM.getDocument':
         return Promise.resolve({ root: structuredClone(this.root) });
       case 'DOM.scrollIntoViewIfNeeded':
-      case 'Runtime.releaseObject':
       case 'Input.dispatchMouseEvent':
         return Promise.resolve({});
       case 'DOM.getBoxModel': {
@@ -217,16 +212,6 @@ class FakeSession implements DevToolsSession {
         const id = this.hit(Number(p.x), Number(p.y));
         if (id === null) return Promise.reject(new Error('No node found at given location'));
         return Promise.resolve({ backendNodeId: id, frameId: 'main' });
-      }
-      case 'DOM.resolveNode': {
-        const id = Number(p.backendNodeId);
-        if (!this.node(id)) return Promise.reject(new Error('No node with given id found'));
-        return Promise.resolve({ object: { type: 'object', objectId: `node-${String(id)}` } });
-      }
-      case 'Runtime.callFunctionOn': {
-        const id = Number(String(p.objectId).slice('node-'.length));
-        const node = this.node(id);
-        return Promise.resolve({ result: { type: 'string', value: node ? textOf(node) : null } });
       }
       default:
         return Promise.reject(new Error(`unexpected ${method}`));
@@ -377,12 +362,12 @@ describe('replies in the wrong shape', () => {
     });
   }
 
-  it('stops a text read whose call reply is malformed', async () => {
-    const cdp = new FakeSession(documentOf(dock([code('ABCDE-FGHJK')])));
-    cdp.answer = (method) =>
-      method === 'Runtime.callFunctionOn' ? { value: 'ABCDE-FGHJK' } : undefined;
+  it('stops a text read whose text value is malformed', async () => {
+    const shown = code('');
+    shown.children.push({ ...text(''), nodeValue: 42 as unknown as string });
+    const cdp = new FakeSession(documentOf(dock([shown])));
     await expect(widgetText(cdp, 'pairing-code')).rejects.toThrow(
-      'the DevTools protocol answered Runtime.callFunctionOn in an unexpected shape',
+      'the DevTools protocol answered DOM.getDocument in an unexpected shape',
     );
   });
 });
@@ -566,6 +551,46 @@ describe('arming and the hit test', () => {
     const target = { action: 'approve-everyone' } as unknown as Parameters<typeof clickInWidget>[1];
     await expect(clickInWidget(cdp, target)).rejects.toThrow(TypeError);
     expect(cdp.sent).toEqual([]);
+  });
+});
+
+describe('what it sends', () => {
+  // Only DevTools' own view of the DOM and trusted input: no function runs in
+  // the page, whose own world a script loaded after attach() may have patched,
+  // so such a script is handed none of the widget's nodes.
+  const PAGE_FREE = new Set([
+    'DOM.getDocument',
+    'DOM.scrollIntoViewIfNeeded',
+    'DOM.getBoxModel',
+    'DOM.getNodeForLocation',
+    'Input.dispatchMouseEvent',
+  ]);
+
+  it('is DOM reads and trusted input alone, from every export', async () => {
+    const shown = code('ABCDE-FGHJK');
+    const cdp = new FakeSession(documentOf(dock([shown, prompt('req-1', CI, 100)])));
+    approvesOnRelease(cdp);
+    await readPairingCode(cdp);
+    await widgetText(cdp, 'pairing-code');
+    await waitingPrompts(cdp);
+    await widgetButton(cdp, { action: 'deny', requestId: 'req-1' });
+    await allowAttach(cdp, { as: 'driver', client: CI });
+    const second = new FakeSession(documentOf(dock([prompt('req-2', CI, 0)])));
+    await clickInWidget(second, { action: 'deny', requestId: 'req-2' });
+    const sent = [...cdp.sent, ...second.sent].map((s) => s.method);
+    expect(sent).toContain('Input.dispatchMouseEvent');
+    expect(sent.filter((method) => !PAGE_FREE.has(method))).toEqual([]);
+  });
+
+  it('reads text from the tree DevTools sends, in document order, leaving out comments', async () => {
+    const line = el('div', { 'data-role': 'activity' }, [
+      el('span', { class: 'time' }, [text('12:00:01')]),
+      text(' '),
+      el('span', {}, [text('Alice'), { ...text('a note'), nodeType: 8 }, text(': get_view')]),
+    ]);
+    const cdp = new FakeSession(documentOf(dock([line])));
+    expect(await widgetText(cdp, 'activity')).toBe('12:00:01 Alice: get_view');
+    expect(await widgetText(cdp, 'roster')).toBeNull();
   });
 });
 

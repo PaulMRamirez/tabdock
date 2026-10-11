@@ -14,6 +14,14 @@
 // widget's cannot pass for it. No setting or hook approves without the click
 // (S4; option C stays rejected).
 //
+// It runs nothing in the page. It reads the widget from the tree
+// DOM.getDocument sends, text included, and presses with trusted input, so a
+// script loaded after attach() that patched a DOM prototype is handed none of
+// the widget's nodes, as the widget itself takes care of (widget.ts): a
+// function run on a node through Runtime.callFunctionOn runs in the page's
+// own world and would hand that script the node, and through it the closed
+// shadow root.
+//
 // It takes any DevTools session through a structural type, so Playwright,
 // Puppeteer or a plain socket wrapper all fit and none is a dependency, and it
 // checks every reply it acts on with @tabdock/protocol/devtools. It never
@@ -25,11 +33,9 @@
 import { PairingCodeSchema, type Role, RoleSchema } from '@tabdock/protocol';
 import {
   DevToolsBoxModelSchema,
-  DevToolsCallResultSchema,
   DevToolsDocumentSchema,
   type DevToolsNode,
   DevToolsNodeAtSchema,
-  DevToolsRemoteObjectSchema,
 } from '@tabdock/protocol/devtools';
 import { HOST_TAG, WIDGET_ACTIONS, type WidgetAction, type WidgetRole } from './widget-names.ts';
 
@@ -198,41 +204,28 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** What a function returns, by value, run with `this` as the node; null when the node is gone. */
-async function valueOf(
-  cdp: DevToolsSession,
-  node: DevToolsNode,
-  functionDeclaration: string,
-): Promise<unknown> {
-  const resolved = await askOrNull(
-    cdp,
-    'DOM.resolveNode',
-    { backendNodeId: node.backendNodeId },
-    DevToolsRemoteObjectSchema,
-  );
-  const objectId = resolved?.object.objectId;
-  if (objectId === undefined) return null;
-  try {
-    const { result, exceptionDetails } = await ask(
-      cdp,
-      'Runtime.callFunctionOn',
-      { objectId, functionDeclaration, returnByValue: true },
-      DevToolsCallResultSchema,
-    );
-    if (exceptionDetails !== undefined) throw new WidgetTestError('reading the widget threw');
-    return result.value;
-  } finally {
-    await cdp.send('Runtime.releaseObject', { objectId }).catch(() => undefined);
+/** The DOM's numbers for a text node and a CDATA section, the nodes whose value is text. */
+const TEXT_NODES: readonly (number | undefined)[] = [3, 4];
+
+/** The text under a node, in document order, as textContent joins it, from values DevTools already sent. */
+function textUnder(node: DevToolsNode): string {
+  let text = '';
+  for (const inner of widgetNodes(node)) {
+    if (TEXT_NODES.includes(inner.nodeType)) text += inner.nodeValue ?? '';
   }
+  return text;
 }
 
-/** The text of the widget node with this data-role, or null while the widget or the node is absent. */
+/**
+ * The text of the widget node with this data-role, or null while the widget
+ * or the node is absent. DevTools leaves text nodes of whitespace alone out of
+ * its tree and cuts one at 10,000 characters, so two runs the widget sets
+ * apart with a lone space read joined; the pairing code is one text node.
+ */
 export async function widgetText(cdp: DevToolsSession, role: WidgetRole): Promise<string | null> {
   const widget = await widgetRoot(cdp);
   const node = widget && find(widget, (n) => attribute(n, 'data-role') === role);
-  if (node === null) return null;
-  const value = await valueOf(cdp, node, 'function () { return this.textContent; }');
-  return typeof value === 'string' ? value : null;
+  return node === null ? null : textUnder(node);
 }
 
 /**
