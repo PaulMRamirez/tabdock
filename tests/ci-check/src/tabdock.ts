@@ -150,9 +150,13 @@ export const test = base.extend<object, { tabdock: Tabdock }>({
               );
               return;
             }
-            setTimeout(() => void look(), PROMPT_CHECK_MS);
+            setTimeout(next, PROMPT_CHECK_MS);
           };
-          setTimeout(() => void look(), PROMPT_CHECK_MS);
+          // A look that fails, such as one that finds two widgets, fails the call it watched.
+          const next = (): void => {
+            look().catch(reject);
+          };
+          setTimeout(next, PROMPT_CHECK_MS);
         });
         return Promise.race([pending, watch]);
       };
