@@ -49,6 +49,7 @@ export type {
   SessionOptions,
   SessionResult,
   SessionView,
+  SessionLink,
 } from './core.ts';
 export { INVITE_LIFETIMES, STATE_EVENT } from './core.ts';
 export type { RecordView, RecordWhich, SessionRecord } from './record.ts';
