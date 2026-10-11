@@ -340,9 +340,9 @@ export function createRecorder(): Recorder {
 
   /**
    * The latest time a record holds. The core tells of a session only once
-   * the relay lists it, after a round trip in which calls, role changes and
-   * decisions may land, so a record sealed then ends after them, never at
-   * the session's start before them.
+   * the relay has listed it (on this link, or on one before a reload), after
+   * a round trip in which calls, role changes and decisions may land, so a
+   * record sealed then ends after them, never at the session's start before them.
    */
   function latest(kept: Kept): number {
     let at = kept.from;

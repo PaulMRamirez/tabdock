@@ -21,7 +21,7 @@ import {
   SessionRecordSchema,
 } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
-import { ACTIVITY_LIMIT } from '../src/core.ts';
+import { ACTIVITY_LIMIT, MINT_ANSWER_MS } from '../src/core.ts';
 import { sessionRecordJson, sessionRecordMarkdown } from '../src/record-markdown.ts';
 import { createRecorder, type Recorder } from '../src/record.ts';
 import {
@@ -488,6 +488,104 @@ describe('a time-boxed session in the record (ADR 0043)', () => {
     // Its end on this page offers it, as any session's does.
     expect(h.dock.endSession()).toBe(true);
     expect(saved(h, 'ended').scope).toMatchObject({ label: 'Period 3', endedBy: 'operator' });
+  });
+
+  /**
+   * A start whose session_start went out just before the link dropped, and
+   * a link that resumed the page session before the relay answered it: the
+   * welcome must not take a session the relay never listed for one it runs.
+   */
+  async function startAcrossDrop() {
+    const { h, socket } = await offering();
+    socket.deliver(invoke('get_value', { callId: 'before' }));
+    await until(() => results(socket).length === 1, 'the first result');
+    const pending = h.dock.startSession({ label: 'Phantom', lengthMinutes: 30 });
+    await until(() => socket.framesOf('session_start').length === 1, 'a session_start');
+    const [start] = socket.framesOf('session_start');
+    if (start === undefined) throw new Error('no session_start');
+    socket.drop(1006);
+    await h.clock.advance(1_000);
+    const again = h.socket();
+    again.accept();
+    again.deliver(
+      welcome(h.clock, {
+        resumed: true,
+        roster: [attachment('alice', 'driver'), attachment('carol', 'observer')],
+      }),
+    );
+    await flush();
+    return { h, again, pending, start };
+  }
+
+  /** Nothing of the start reached a record: the page record goes on, sealed by nothing. */
+  function stillPageRecord(h: Harness): void {
+    expect(h.dock.state.session).toBeNull();
+    expect(h.dock.state.records.map((view) => [view.which, view.scope, view.label])).toEqual([
+      ['current', 'page', null],
+    ]);
+    expect(saved(h).calls.map((call) => call.callId)).toEqual(['before']);
+  }
+
+  it('keeps a start the relay refused after a link drop out of the record', async () => {
+    const { h, again, pending, start } = await startAcrossDrop();
+    again.deliver({
+      t: 'session',
+      session: null,
+      refused: { sessionId: start.sessionId, reason: 'limit' },
+    });
+    expect(await pending).toEqual({ ok: false, reason: 'limit' });
+    stillPageRecord(h);
+
+    // A new page session later seals a page session's record, never a session's.
+    again.drop(1006);
+    await h.clock.advance(1_000);
+    const third = h.socket();
+    third.accept();
+    third.deliver(welcome(h.clock, { pageId: 'page-2', resumed: false }));
+    await flush();
+    expect(saved(h, 'previous').scope).toEqual({ kind: 'page' });
+    expect(saved(h).scope).toEqual({ kind: 'page' });
+    expect(h.dock.state.records.some((view) => view.which === 'ended')).toBe(false);
+  });
+
+  it('keeps a start the relay never answered after a link drop out of the record', async () => {
+    const { h, again, pending } = await startAcrossDrop();
+    // The session_start was lost with the link: the relay lists nothing, and the start times out.
+    again.deliver({ t: 'session', session: null });
+    await h.clock.advance(MINT_ANSWER_MS);
+    expect(await pending).toEqual({ ok: false, reason: 'unavailable' });
+    stillPageRecord(h);
+  });
+
+  it('offers no record after a reload for a stored start the relay never listed', async () => {
+    const storage = new MapStorage();
+    const first = await offering(storage);
+    first.socket.deliver(invoke('get_value', { callId: 'before' }));
+    await until(() => results(first.socket).length === 1, 'the first result');
+    void first.h.dock.startSession({ label: 'Phantom', lengthMinutes: 30 });
+    await until(() => first.socket.framesOf('session_start').length === 1, 'a session_start');
+    first.h.core.close('unload');
+
+    // The reload keeps the stored start; the relay never got it, so it lists none.
+    const h = setup({ core: { policy: { invites: 'watch', maxDrivers: 2 } }, storage });
+    h.clock.now = first.h.clock.now + 2_000;
+    h.core.start();
+    const socket = h.socket();
+    socket.accept();
+    socket.deliver(
+      welcome(h.clock, {
+        resumed: true,
+        roster: [attachment('alice', 'driver'), attachment('carol', 'driver')],
+      }),
+    );
+    expect(h.dock.state.session).toMatchObject({ label: 'Phantom' });
+    h.clock.now += 50;
+    socket.deliver({ t: 'session', session: null });
+    await flush();
+    expect(h.dock.state.session).toBeNull();
+    expect(h.dock.state.records.map((view) => [view.which, view.scope])).toEqual([
+      ['current', 'page'],
+    ]);
   });
 });
 

@@ -2299,10 +2299,12 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     log.info(frame.resumed ? `resumed page ${frame.pageId}` : `linked as page ${frame.pageId}`);
     // A new page session seals the page record and a resumed one keeps it (ADR 0045, decision 5).
     recorder.pageSession(frame.pageId, frame.resumed, clock());
-    // A session this page still runs after a reload goes on in a record of
-    // its own from here, with everyone listed now there from its start.
+    // A session the relay has listed, which a reload or a resumed link left
+    // running, goes on in a record of its own from here, with everyone
+    // listed now there from its start. A start the relay has not answered
+    // waits for its session frame: refused, or never heard, it never ran.
     const running = sessionView();
-    if (running !== null) recorder.sessionStarted(running);
+    if (running !== null && session?.listed === true) recorder.sessionStarted(running);
     recordRoster(frame.roster);
     for (const userId of revoked) send({ t: 'revoke', userId });
     takeLock(frame.pageId);
@@ -4695,6 +4697,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       kept.lengthMs = lengthMs;
       kept.endsAt = Math.min(clock() + live.remainingMs, kept.startedAt + lengthMs);
       if (withinCeiling(effective(), live.policy)) kept.policy = { ...live.policy };
+      kept.listed = true;
       if (starting?.sessionId === kept.sessionId) starting.answer(null);
       armSessionEnd();
       demoteBeyond(effective().maxDrivers);
