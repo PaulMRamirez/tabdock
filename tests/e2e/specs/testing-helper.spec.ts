@@ -120,40 +120,39 @@ test.describe('at phone width', () => {
  * notes each one handed a node of a closed shadow root, which is the widget's.
  */
 function installLaterScript(): void {
-  const rootOf = Node.prototype.getRootNode;
+  const rootOf: unknown = Reflect.get(Node.prototype, 'getRootNode');
+  if (typeof rootOf !== 'function') throw new Error('no getRootNode');
   const handed: string[] = [];
   Object.assign(window, { __handed: handed });
-  const wrap = (proto: object, name: string): void => {
-    const own = Object.getOwnPropertyDescriptor(proto, name);
-    if (own === undefined) return;
-    const note = (self: unknown): void => {
-      if (!(self instanceof Node)) return;
-      const root = rootOf.call(self);
-      if (root instanceof ShadowRoot && root.mode === 'closed') handed.push(name);
-    };
-    const { get, value } = own;
-    if (get !== undefined) {
-      Object.defineProperty(proto, name, {
-        ...own,
-        get(this: unknown) {
-          note(this);
-          return get.call(this) as unknown;
-        },
-      });
-    } else if (typeof value === 'function') {
-      const method = value as (...args: unknown[]) => unknown;
-      Object.defineProperty(proto, name, {
-        ...own,
-        value(this: unknown, ...args: unknown[]) {
-          note(this);
-          return method.apply(this, args);
-        },
-      });
-    }
+  const note = (name: string, self: unknown): void => {
+    if (!(self instanceof Node)) return;
+    const root: unknown = Reflect.apply(rootOf, self, []);
+    if (root instanceof ShadowRoot && root.mode === 'closed') handed.push(name);
   };
-  for (const name of ['textContent', 'nodeValue']) wrap(Node.prototype, name);
-  for (const name of ['getAttribute', 'getBoundingClientRect']) wrap(Element.prototype, name);
-  for (const name of ['innerText', 'click']) wrap(HTMLElement.prototype, name);
+  const wrap = (proto: object, name: string): void => {
+    const own = Reflect.getOwnPropertyDescriptor(proto, name);
+    if (own === undefined) return;
+    const get: unknown = Reflect.get(own, 'get');
+    const value: unknown = Reflect.get(own, 'value');
+    const patched: PropertyDescriptor = { ...own };
+    if (typeof get === 'function') {
+      patched.get = function (this: unknown): unknown {
+        note(name, this);
+        return Reflect.apply(get, this, []) as unknown;
+      };
+    } else if (typeof value === 'function') {
+      patched.value = function (this: unknown, ...args: unknown[]): unknown {
+        note(name, this);
+        return Reflect.apply(value, this, args) as unknown;
+      };
+    }
+    Reflect.defineProperty(proto, name, patched);
+  };
+  for (const name of ['textContent', 'nodeValue', 'childNodes']) wrap(Node.prototype, name);
+  for (const name of ['getAttribute', 'getBoundingClientRect', 'innerHTML']) {
+    wrap(Element.prototype, name);
+  }
+  for (const name of ['innerText', 'click', 'dataset']) wrap(HTMLElement.prototype, name);
 }
 
 async function handed(page: Page): Promise<unknown> {
