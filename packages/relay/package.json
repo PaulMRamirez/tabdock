@@ -20,7 +20,8 @@
     "./test/provider": "./test/helpers/provider.ts",
     "./test/results": "./test/helpers/results.ts",
     "./test/secrecy": "./test/helpers/secrecy.ts",
-    "./test/tunnel": "./test/helpers/tunnel.ts"
+    "./test/tunnel": "./test/helpers/tunnel.ts",
+    "./test/phone": "./test/helpers/phone.ts"
   },
   "files": [
     "dist",

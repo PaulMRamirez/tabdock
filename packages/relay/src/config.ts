@@ -351,6 +351,11 @@ export interface RelayLimits {
   observersPerPage: number;
   /** Calls from a page's watchers that may be on the page at once (ADR 0044); no setting. */
   watchingCallsInFlight: number;
+  /**
+   * Of those, the calls one watcher may have running at once, so one
+   * watcher's slow calls never hold every place (ADR 0044's notes); no setting.
+   */
+  watchingCallsInFlightPerUser: number;
 }
 
 /**
@@ -564,8 +569,8 @@ export const DEFAULT_RATE_LIMITS: RelayRateLimits = {
   stateFramesWindowMs: 10_000,
   // ADR 0044, provisional until the room measurement: forty watchers share
   // two calls a second of the operator's tab, one of them a call every 2 s.
-  watchingCallsPerPage: 120, // M6 seam: not built. W2-C's #watchingShareRefusal reads it.
-  watchingCallsPerUserPerPage: 30, // M6 seam: not built. W2-C's #watchingShareRefusal reads it.
+  watchingCallsPerPage: 120,
+  watchingCallsPerUserPerPage: 30,
   ignoredFramesPerSocket: 20,
   ignoredFramesPerAddress: 60,
   connectionLinesPerAddress: 60,
@@ -631,7 +636,8 @@ export const DEFAULT_LIMITS: RelayLimits = {
   proposalBytes: PROPOSAL_BYTES,
   responseBytes: RESPONSE_BYTES,
   observersPerPage: OBSERVERS_PER_PAGE,
-  watchingCallsInFlight: 4, // M6 seam: not built. W2-C's #watchingShareRefusal reads it.
+  watchingCallsInFlight: 4,
+  watchingCallsInFlightPerUser: 2,
 };
 
 /**

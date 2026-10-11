@@ -100,3 +100,9 @@ Conflicts between the M6 records, settled by the plan, that touch this one:
 **From ADR 0045.** The session record lists agents by their label, with how they came in as `agent`.
 
 **Open questions.** Settled under Decisions: the numbers are provisional until the room measurement (1), there is no bulk mint per session (2), and the two member seats stay for the people limit only (3).
+
+## Notes from the build (11 October 2026)
+
+**One watcher's share of the running calls.** Decision 12's four watching calls in flight are a page's; a watcher whose read-only tool runs slowly could hold all four for the call deadline and refill them within their 30 a minute, keeping every other watcher out. Each watcher may therefore hold at most 2 of them (`watchingCallsInFlightPerUser`, an option like the other three, not a setting); past it their call answers `rate_limited` with its call record, as a watcher's own rate does, while the page's four stay `page_busy`. Members are never held to either (`watching-calls.test.ts`).
+
+**A class joining at once.** S14's page pairing limit, 30 a minute (`pairAttemptsPerPage`), counts every redemption that lands on the page, the members' own pairings included, and stays as it is. A class of 40 joining within one minute therefore sees about the 30th and later answered `rate_limited` at `/i` until the minute turns, and then joins, as `observer-seats.test.ts` shows on the shipped limits. The class guidance and the room measurement (A6.22) must say so; a teacher can hand out the link a few minutes before class.

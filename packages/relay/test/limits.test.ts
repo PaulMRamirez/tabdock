@@ -127,6 +127,7 @@ describe('ADR 0009 defaults', () => {
       responseBytes: 96 * 1024 * 1024,
       observersPerPage: 40,
       watchingCallsInFlight: 4,
+      watchingCallsInFlightPerUser: 2,
     });
     expect(DEFAULT_RATE_LIMITS.callsPerUserPerPage).toBe(120);
     // Pairing counts per user and per page, never per address (S3, ADR 0016).

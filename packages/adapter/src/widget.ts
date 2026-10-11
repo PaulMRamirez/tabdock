@@ -179,8 +179,26 @@ const PROPOSALS_STYLE = `
 const ARGS_SHOWN = 160;
 /** The time-boxed session's form, countdown and badge (ADR 0043). */
 const SESSION_STYLE = '';
-/** The roster's Watching section and compact rows (ADR 0044). */
-const ROSTER_STYLE = '';
+/**
+ * The roster's Watching section and compact rows (ADR 0044): one line each,
+ * at least a finger tall, the name cut short before the short id is. A row
+ * too narrow for its buttons beside 4em of name (a control guest's Make
+ * driver at 360 px) puts them on a line below, right-aligned, rather than
+ * past the list's edge. The list scrolls inside the panel, under 50vh, so
+ * the panel around it, and Revoke all below it, stay where they are.
+ */
+const ROSTER_STYLE = `
+.compact, .whead { display: flex; align-items: center; gap: 6px; }
+.compact { flex-wrap: wrap; min-height: 44px; margin: 0 0 4px; padding: 2px 8px; }
+.compact > * { flex: none; }
+.compact > .nm { flex: 1 1 4em; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-weight: 600; }
+.compact > .buttons { margin: 0 0 0 auto; }
+.watch { max-height: 50vh; overflow: auto; }
+.whead { justify-content: space-between; margin: 10px 0 2px; }
+`;
+
+/** Past this many rows the Watching section starts closed and offers a filter. */
+const COMPACT_ROWS = 8;
 /** Agent tokens in the invite form and list (ADR 0044). */
 const AGENTS_STYLE = '';
 /** The session record's block and its offer (ADR 0045). */
@@ -306,7 +324,11 @@ interface PromptView extends ArmedBox {
 }
 
 interface RowView extends ArmedBox {
+  /** A one-line row in the Watching section (ADR 0044): name, short id, badge and buttons only. */
+  readonly compact: boolean;
   readonly name: HTMLElement;
+  /** A compact row's short id, apart from the name, so cutting a long name never cuts it. */
+  readonly sid: HTMLElement;
   readonly badge: HTMLElement;
   readonly clients: HTMLElement;
   readonly expiry: HTMLElement;
@@ -778,12 +800,82 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   const roster = element('ul');
   role(roster, 'roster');
   const nobody = element('p', 'muted', 'Nobody yet');
-  // Revoking only takes access away, so it is not held back like the boxes.
+  // Revoking only takes access away, so it is not held back like the boxes,
+  // though it asks first while invites let people in (askFirst).
   const revokeAll = button('Revoke all', 'revoke-all', () => {
-    dock.revoke('*');
+    askFirst('*', true, () => dock.revoke('*'));
   });
+  const peopleLabel = element('div', 'label');
+
+  // Plan C21: Revoke on a sponsor's row, and Revoke all, ask first while
+  // anyone that sponsor's invites let in is still attached, since their
+  // access ends with it (ADR 0017's sponsor rule). One box for either, armed,
+  // so the click that asked can never also answer.
+  const confirmBox = element('div', 'prompt');
+  dom.flag(confirmBox, 'hidden', true);
+  const revokeView = newBox(confirmBox);
+  boxes.add(revokeView);
+  const confirmText = element('p');
+  /** What Revoke anyway does, and whose row asked; null while nothing is asked. */
+  let asking: { userId: string; go: () => void } | null = null;
+  const confirmButtons = element('div', 'buttons');
+  dom.append(
+    confirmButtons,
+    boxButton(revokeView, 'Revoke anyway', 'revoke-anyway', () => {
+      const go = asking?.go;
+      unask();
+      go?.();
+    }),
+    button('Keep', 'revoke-keep', unask),
+  );
+  dom.append(confirmBox, confirmText, confirmButtons);
+
+  // ADR 0044: invitees watching by invite, in a compact section of their own
+  // under the people, collapsed past COMPACT_ROWS rows behind an armed
+  // toggle, filterable, and scrolling inside the panel, so prompts and Revoke
+  // all stay in reach with a class attached.
+  const watching = hiddenBlock('div');
+  role(watching, 'watching');
+  const watchHead = element('div', 'whead');
+  const watchTitle = element('span');
+  const watchView = newBox(watchHead);
+  boxes.add(watchView);
+  /** The operator's choice for a section past COMPACT_ROWS rows; closed until they open it. */
+  let watchOpen = false;
+  const watchToggle = boxButton(watchView, '', 'watching-toggle', () => {
+    watchOpen = !watchOpen;
+    // Show turned into Hide, so the box waits again.
+    restartArming(watchView);
+    render(dock.state);
+  });
+  dom.append(watchHead, watchTitle, watchToggle);
+  const watchFilter = element('label', 'field', 'Find a name or short id');
+  role(watchFilter, 'watching-filter');
+  const filterInput = element('input');
+  dom.attr(filterInput, 'autocomplete', 'off');
+  setAction(filterInput, 'watching-filter');
+  dom.append(watchFilter, filterInput);
+  dom.listen(filterInput, 'input', () => {
+    render(dock.state);
+  });
+  // ADR 0016's "and close this link", once for the section: checked whenever
+  // it appears and again after each Revoke it served, so unticking it spares
+  // one link once, as a full row's box does.
+  const closeAll = element('label', 'check');
+  const closeAllInput = element('input');
+  dom.attr(closeAllInput, 'type', 'checkbox');
+  setAction(closeAllInput, 'close-link');
+  dom.setChecked(closeAllInput, true);
+  dom.append(closeAll, closeAllInput, 'Revoke closes their link');
+  const watchList = element('ul', 'watch');
+  // A scrolled list, or panel, moves every box in it, so each waits again at
+  // once rather than at the next tick: a long roster scrolls at phone width.
+  dom.listen(watchList, 'scroll', checkMoves);
+  dom.listen(panel, 'scroll', checkMoves);
+  dom.append(watching, watchHead, watchFilter, closeAll, watchList);
+
   const rosterBlock = element('div');
-  dom.append(rosterBlock, element('div', 'label', 'Attached'), roster, nobody, revokeAll);
+  dom.append(rosterBlock, peopleLabel, roster, nobody, confirmBox, watching, revokeAll);
 
   // Invites (ADR 0017): the link shown once, the live list, and the form.
   const invitesBlock = element('div');
@@ -1137,8 +1229,8 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     return added;
   }
 
-  function rowView(userId: string): RowView {
-    const box = element('li', 'row');
+  function rowView(userId: string, compact: boolean): RowView {
+    const box = element('li', compact ? 'row compact' : 'row');
     dom.attr(box, 'data-user-id', userId);
     const closeLink = element('label', 'check');
     const closeInput = element('input');
@@ -1148,7 +1240,9 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     dom.flag(closeLink, 'hidden', true);
     const view: RowView = {
       ...newBox(box),
-      name: element('span'),
+      compact,
+      name: element('span', compact ? 'nm' : ''),
+      sid: element('span', 'muted'),
       badge: badge(false),
       clients: element('p', 'muted clients'),
       expiry: element('p', 'muted'),
@@ -1163,22 +1257,89 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       // view.role is what the button says, since both change together in updateRow.
       dock.setRole(userId, view.role === 'driver' ? 'observer' : 'driver');
     });
-    const buttons = element('div', 'buttons');
-    dom.append(
-      buttons,
-      view.roleSwitch,
-      boxButton(view, 'Revoke', 'revoke', () => {
-        // The box's own choice when it shows, which starts checked; the
-        // adapter's default otherwise, which closes a multi-use link (ADR 0016).
+    const revoke = boxButton(view, 'Revoke', 'revoke', () => {
+      // The row's own choice when it shows, which starts checked, or the
+      // Watching section's for a compact row; the adapter's default
+      // otherwise, which closes a multi-use link (ADR 0016).
+      const choice = compact ? closeAllInput : view.closeInput;
+      askFirst(userId, member(userId), () => {
         if (dom.has(view.closeLink, 'hidden')) dock.revoke(userId);
-        else dock.revoke(userId, { closeInvite: dom.checked(view.closeInput) });
-      }),
-      view.closeLink,
-    );
+        else dock.revoke(userId, { closeInvite: dom.checked(choice) });
+        // The section's box is one Revoke's choice, as a row's own box is
+        // that row's: the next Revoke starts from S14's default again.
+        if (compact) dom.setChecked(closeAllInput, true);
+      });
+    });
+    const buttons = element('div', 'buttons');
+    dom.append(buttons, view.roleSwitch, revoke);
+    if (compact) {
+      dom.append(box, view.name, ' ', view.sid, view.badge, buttons);
+      return view;
+    }
+    dom.append(buttons, view.closeLink);
     const who = element('p', 'who');
     dom.append(who, view.name, view.badge);
     dom.append(box, who, view.clients, view.expiry, buttons);
     return view;
+  }
+
+  /** Whether the roster lists this user as a member: only a member sponsors invites (ADR 0017). */
+  function member(userId: string): boolean {
+    return dock.state.roster.some((entry) => entry.userId === userId && entry.kind === 'member');
+  }
+
+  /**
+   * Who sponsored each invite and agent token the page lists, kept while
+   * anyone still listed came in by it, so Revoke can say whose access ends
+   * with a sponsor's (plan C21). Only ids the page names now are kept.
+   */
+  const sponsors = new Map<string, string>();
+  function learnSponsors(state: DockState): void {
+    for (const view of state.invites) sponsors.set(view.inviteId, view.sponsor.userId);
+    for (const view of state.agents) sponsors.set(view.tokenId, view.sponsor.userId);
+    const named = new Set<string | null>([
+      ...state.roster.map((entry) => entry.inviteId),
+      ...state.invites.map((view) => view.inviteId),
+      ...state.agents.map((view) => view.tokenId),
+    ]);
+    for (const id of sponsors.keys()) if (!named.has(id)) sponsors.delete(id);
+  }
+
+  /**
+   * Runs `go` at once, or first asks in the confirm box when it would end
+   * access for people invites let in: everyone's, for Revoke all ('*'), or
+   * a member's sponsored ones. An invite this page no longer lists (used up
+   * before a reload, say) has no sponsor known here, so its people are
+   * counted for any member, as the relay may end them with that member;
+   * hence "up to" for a member.
+   */
+  function askFirst(userId: string, sponsor: boolean, go: () => void): void {
+    const count = dock.state.roster.filter((entry) => {
+      const by = sponsors.get(entry.inviteId ?? '');
+      return (
+        sponsor &&
+        entry.inviteId !== null &&
+        entry.userId !== userId &&
+        (userId === '*' || by === userId || by === undefined)
+      );
+    }).length;
+    if (count === 0) {
+      go();
+      return;
+    }
+    const row = dock.state.roster.find((entry) => entry.userId === userId);
+    setText(
+      confirmText,
+      `${row ? `Revoking ${personText(row)} also ends access for up to` : 'Revoke all also ends access for'} ${String(count)} ${count === 1 ? 'person' : 'people'} invites let in.`,
+    );
+    asking = { userId, go };
+    dom.flag(confirmBox, 'hidden', false);
+    restartArming(revokeView);
+  }
+
+  function unask(): void {
+    asking = null;
+    dom.flag(confirmBox, 'hidden', true);
   }
 
   function setText(node: HTMLElement, text: string): void {
@@ -1196,6 +1357,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     attachment: AttachmentView,
     access: PageRole | undefined,
     invite: InviteView | undefined,
+    agent: string | undefined,
   ): void {
     view.expiresAt =
       attachment.endsAt === null
@@ -1204,8 +1366,17 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const role = access?.role ?? null;
     const revoking = access?.revoked === true;
     const status = role ?? (revoking ? 'revoke pending' : 'not approved on this page');
-    setText(view.name, `${personText(attachment)} (${status})`);
-    setText(view.badge, invited(attachment) ? 'invited' : '');
+    if (view.compact) {
+      // An agent by the label this page gave its token, from its own record
+      // (ADR 0044); anyone else by their name, the short id beside it.
+      const name = agent === undefined ? plainLine(attachment.displayName) : `agent "${agent}"`;
+      setText(view.name, role === 'observer' ? name : `${name} (${status})`);
+      setText(view.sid, `(${shortId(attachment.userId) ?? ''})`);
+      setText(view.badge, agent === undefined ? 'invited' : 'agent');
+    } else {
+      setText(view.name, `${personText(attachment)} (${status})`);
+      setText(view.badge, invited(attachment) ? 'invited' : '');
+    }
     const clients = attachment.clients
       .map(clientText)
       .filter((text) => text !== '')
@@ -1232,38 +1403,90 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     if (!isNew) restartArming(view);
   }
 
-  /** The rows in the roster list and the rows in the invite list, in order, as last put there. */
+  /** The rows in the roster lists and the rows in the invite list, in order, as last put there. */
   let rosterShown: readonly HTMLElement[] = [];
+  let watchShown: readonly HTMLElement[] = [];
   let inviteListShown: readonly HTMLElement[] = [];
+  /** Rows in the Watching section as syncRows last listed them, for the badge. */
+  let watchCount = 0;
 
-  /** Rows are kept by user id and only reordered when the relay's order changes, like prompts. */
+  /**
+   * Rows are kept by user id and only reordered when the relay's order
+   * changes, like prompts. The relay lists attachments in the order they
+   * were granted, so someone joining appends a row and never moves the rows
+   * above it. With watching seats (ADR 0044) an invitee observer's row is a
+   * compact one in the Watching section; a row changing sections is made anew.
+   */
   function syncRows(state: DockState): void {
+    learnSponsors(state);
     const access = new Map(state.pageRoles.map((entry) => [entry.userId, entry]));
     const invites = new Map(state.invites.map((view) => [view.inviteId, view]));
-    const live = new Set(state.roster.map((attachment) => attachment.userId));
+    const agents = new Map(state.agents.map((view) => [view.tokenId, view.label]));
+    const seats = state.seatLimits?.observersPerPage ?? 0;
+    const watches = (entry: AttachmentView): boolean =>
+      seats > 0 && entry.kind === 'invitee' && entry.role === 'observer';
+    const listed = new Map(state.roster.map((entry) => [entry.userId, entry]));
     for (const [userId, view] of rowViews) {
-      if (!live.has(userId)) {
+      const entry = listed.get(userId);
+      if (entry === undefined || view.compact !== watches(entry)) {
         dropBox(view);
         rowViews.delete(userId);
       }
     }
-    const ordered = state.roster.map((attachment) => {
+    if (asking !== null && asking.userId !== '*' && !listed.has(asking.userId)) unask();
+    const find = dom.value(filterInput).trim().toLowerCase();
+    const people: HTMLElement[] = [];
+    const watchers: HTMLElement[] = [];
+    let closable = false;
+    for (const attachment of state.roster) {
+      const compact = watches(attachment);
       let view = rowViews.get(attachment.userId);
       if (!view) {
-        view = rowView(attachment.userId);
+        view = rowView(attachment.userId, compact);
         rowViews.set(attachment.userId, view);
         boxes.add(view);
       }
-      const invite = attachment.inviteId === null ? undefined : invites.get(attachment.inviteId);
-      updateRow(view, attachment, access.get(attachment.userId), invite);
+      const inviteId = attachment.inviteId ?? '';
+      updateRow(
+        view,
+        attachment,
+        access.get(attachment.userId),
+        invites.get(inviteId),
+        agents.get(inviteId),
+      );
       // Role changes need the relay; revoking works offline and is sent on resume.
       dom.flag(view.roleSwitch, 'disabled', state.link !== 'linked');
-      return view.element;
-    });
-    if (!sameNodes(rosterShown, ordered)) {
-      dom.replaceChildren(roster, ordered);
-      rosterShown = ordered;
+      if (!compact) {
+        people.push(view.element);
+        continue;
+      }
+      closable ||= !dom.has(view.closeLink, 'hidden');
+      const text = `${dom.text(view.name)} ${dom.text(view.sid)}`.toLowerCase();
+      dom.flag(view.element, 'hidden', find !== '' && !text.includes(find));
+      watchers.push(view.element);
     }
+    if (!sameNodes(rosterShown, people)) {
+      dom.replaceChildren(roster, people);
+      rosterShown = people;
+    }
+    if (!sameNodes(watchShown, watchers)) {
+      dom.replaceChildren(watchList, watchers);
+      watchShown = watchers;
+    }
+    watchCount = watchers.length;
+    const many = watchCount > COMPACT_ROWS;
+    const open = watchOpen || !many;
+    dom.flag(watching, 'hidden', watchCount === 0);
+    setText(watchTitle, `Watching by invite: ${String(watchCount)} of ${String(seats)}`);
+    dom.flag(watchToggle, 'hidden', !many);
+    setText(watchToggle, open ? 'Hide' : 'Show');
+    dom.flag(watchList, 'hidden', !open);
+    dom.flag(watchFilter, 'hidden', !open || !many);
+    // Ticked whenever it appears, as a row's own box is (updateRow).
+    const showClose = open && closable;
+    if (showClose && dom.has(closeAll, 'hidden')) dom.setChecked(closeAllInput, true);
+    dom.flag(closeAll, 'hidden', !showClose);
+    setText(peopleLabel, watchCount > 0 ? 'People' : 'Attached');
     dom.flag(nobody, 'hidden', state.roster.length > 0);
     // Revoke all also closes every live invite, so it stays while any is live.
     dom.flag(revokeAll, 'hidden', state.roster.length === 0 && state.invites.length === 0);
@@ -1304,18 +1527,56 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       const role = access.get(join.user.userId);
       if (role === undefined || role.role === null || role.inviteRole === null) continue;
       waitingJoins.delete(seq);
-      const line = element(
-        'p',
-        'join',
-        `${personText(join.user, join.account)} joined by your invite "${join.label}" as ${role.role}`,
-      );
-      // Not data-user-id, which names roster rows.
-      dom.attr(line, 'data-joined', join.user.userId);
-      dom.prepend(joins, line);
-      joinLines.push({ element: line, shownMs: 0, since: null, seen: false });
+      showJoin(join, role.role);
       added = true;
     }
     return added;
+  }
+
+  /**
+   * Each invite's join notices still on screen, by invite (ADR 0044): a room
+   * joining by one invite gets one line, not one each, once three are told
+   * of while the first is still there. The roster lists every one of them.
+   */
+  const joinGroups = new Map<string, { lines: JoinLine[]; names: string[] }>();
+
+  function showJoin(join: InviteJoin, role: Role): void {
+    let group = joinGroups.get(join.inviteId);
+    if (!group?.lines.some((line) => joinLines.includes(line))) {
+      group = { lines: [], names: [] };
+      joinGroups.set(join.inviteId, group);
+    }
+    const who = personText(join.user, join.account);
+    group.names.push(who);
+    const count = group.names.length;
+    const said = `joined by your invite "${join.label}" as ${role}`;
+    const newest = group.names.slice(-3).reverse().join(', ');
+    const line = element(
+      'p',
+      'join',
+      count < 3
+        ? `${who} ${said}`
+        : `${String(count)} ${said}: ${newest}${count > 3 ? ` and ${String(count - 3)} more` : ''}`,
+    );
+    if (count < 3) {
+      // Not data-user-id, which names roster rows.
+      dom.attr(line, 'data-joined', join.user.userId);
+    } else {
+      dom.attr(line, 'data-joined-batch', join.inviteId);
+      // One line in place of the group's, on screen afresh for the newest.
+      for (const old of group.lines.splice(0)) {
+        dom.remove(old.element);
+        const at = joinLines.indexOf(old);
+        if (at !== -1) joinLines.splice(at, 1);
+      }
+    }
+    dom.prepend(joins, line);
+    const shown: JoinLine = { element: line, shownMs: 0, since: null, seen: false };
+    joinLines.push(shown);
+    group.lines.push(shown);
+    for (const [inviteId, { lines }] of joinGroups) {
+      if (!lines.some((old) => joinLines.includes(old))) joinGroups.delete(inviteId);
+    }
   }
 
   /** The seq of the newest observer seat already dealt with; null before the first render. */
@@ -1342,10 +1603,13 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     lastSeat = Math.max(lastSeat, newest);
     for (const seat of [...fresh].reverse()) {
       const who = personText(seat.user, seat.account ?? undefined);
+      // ADR 0044: a watcher kept for want of a seat among the people, not by the driver limit.
       const line = element(
         'p',
         'join',
-        `The page already has its maximum drivers, so ${who} ${seat.asked === 'allow' ? 'joined as observer' : 'is still an observer'}.`,
+        seat.heldBy === 'people'
+          ? `The page has no seat left among its ${String(state.seatLimits?.usersPerPage)} people, so ${who} is still an observer.`
+          : `The page already has its maximum drivers, so ${who} ${seat.asked === 'allow' ? 'joined as observer' : 'is still an observer'}.`,
       );
       // Not data-user-id, which names roster rows.
       dom.attr(line, 'data-seated', seat.user.userId);
@@ -2141,7 +2405,6 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       'title',
       `Tabdock: ${LINK_LABELS[state.link]}${state.paused ? ', paused' : ''}`,
     );
-    dom.setText(count, String(state.roster.length));
     dom.setText(errorLine, state.error ?? '');
     dom.flag(errorLine, 'hidden', state.error === null);
     dom.setText(noticeLine, state.notice ?? '');
@@ -2155,6 +2418,13 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
 
     syncInvites(state);
     syncRows(state);
+    // Everyone attached, and how many of them watch, in its title (ADR 0044).
+    dom.setText(count, String(state.roster.length));
+    dom.attr(
+      count,
+      'title',
+      `${String(state.roster.length - watchCount)} people, ${String(watchCount)} watching`,
+    );
     const joined = noticeJoins(state);
     const seated = noticeSeats(state);
     updateForm(state);

@@ -503,6 +503,8 @@ try {
 
   say('\n11. The operator clicks Revoke all.');
   await clickInWidget(board.page, { action: 'revoke-all' });
+  say('   Invites let people in, so the widget asks first; the operator clicks Revoke anyway.');
+  await clickInWidget(board.page, { action: 'revoke-anyway' });
   await waitForDock(board.page, (state) => state.roster.length === 0 && state.invites.length === 0);
   say('   Every attachment ends, and so does every live invite.');
   say('tools/call call_page_tool { tool: "get_view" } from claude-bob');

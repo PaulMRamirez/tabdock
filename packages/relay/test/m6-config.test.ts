@@ -131,6 +131,7 @@ describe('defaults (docs/plans/M6.md, section 2.5)', () => {
       inviteeSessions: INVITEE_SESSIONS,
       usersPerPage: 10,
       watchingCallsInFlight: 4,
+      watchingCallsInFlightPerUser: 2,
     });
     expect(DEFAULT_IMAGE_BYTES).toBe(65_536);
     expect(STATE_BYTES).toBe(4_194_304);
@@ -646,7 +647,7 @@ describe('options with no environment variable', () => {
         watchingCallsPerPage: 6,
         watchingCallsPerUserPerPage: 2,
       },
-      limits: { watchingCallsInFlight: 1 },
+      limits: { watchingCallsInFlight: 1, watchingCallsInFlightPerUser: 1 },
     });
     expect(config.rateLimits).toMatchObject({
       stateFramesPerSocket: 3,
@@ -656,6 +657,7 @@ describe('options with no environment variable', () => {
       watchingCallsPerUserPerPage: 2,
     });
     expect(config.limits.watchingCallsInFlight).toBe(1);
+    expect(config.limits.watchingCallsInFlightPerUser).toBe(1);
     expect(() => resolveConfig({ auth, rateLimits: { stateFramesPerSocket: 0 } })).toThrow(
       'stateFramesPerSocket must be a positive integer',
     );
