@@ -351,6 +351,11 @@ export interface RelayLimits {
   observersPerPage: number;
   /** Calls from a page's watchers that may be on the page at once (ADR 0044); no setting. */
   watchingCallsInFlight: number;
+  /**
+   * Of those, the calls one watcher may have running at once, so one
+   * watcher's slow calls never hold every place (ADR 0044's notes); no setting.
+   */
+  watchingCallsInFlightPerUser: number;
 }
 
 /**
@@ -632,6 +637,7 @@ export const DEFAULT_LIMITS: RelayLimits = {
   responseBytes: RESPONSE_BYTES,
   observersPerPage: OBSERVERS_PER_PAGE,
   watchingCallsInFlight: 4,
+  watchingCallsInFlightPerUser: 2,
 };
 
 /**

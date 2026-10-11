@@ -978,6 +978,13 @@ function notAttached(pageId: string): HubError {
   return hubError('not_attached', `you are not attached to page ${pageId}`);
 }
 
+/** Gives one place back to a count, dropping the key at 0 so a count of nothing holds no memory. */
+function giveBack(counts: Map<string, number>, key: string): void {
+  const left = (counts.get(key) ?? 1) - 1;
+  if (left > 0) counts.set(key, left);
+  else counts.delete(key);
+}
+
 /** "8 hours", "30 minutes", "300 ms": the unit that divides evenly, for messages. */
 export function formatDuration(ms: number): string {
   for (const [size, unit] of [
@@ -1315,12 +1322,13 @@ export class PageHub {
    * The watchers' share of a page's calls (ADR 0044, #watchingShareRefusal):
    * a rate for the page's watchers together, keyed by page, and one for each
    * watcher, keyed by page and user; the watchers' calls running on each
-   * page; and the calls already counted, so a call passing the checks twice
-   * is counted once.
+   * page, and each watcher's among them, keyed by page and user; and the
+   * calls already counted, so a call passing the checks twice is counted once.
    */
   readonly #watchingPageCalls: SlidingWindowLimiter;
   readonly #watchingUserCalls: SlidingWindowLimiter;
   readonly #watchingRunning = new Map<string, number>();
+  readonly #watcherRunning = new Map<string, number>();
   readonly #watchingCharged = new WeakSet<CallTrace>();
   /**
    * What the /mcp requests waiting on a page hold on the heap, by user, in
@@ -3060,11 +3068,14 @@ export class PageHub {
    * (ADR 0044); members and the page's people are never held to it. Forty
    * watchers each at their own rate would run a handler in the operator's
    * tab many times a second, so they share a rate per page, each has a
-   * smaller one of their own, and only a few of their calls run at once.
-   * Only a call that passes is counted, and its place among those running
-   * is given back with the rest of what the call holds (`trace.release`),
-   * however it ends. A refusal is a call record within the refusal budget,
-   * written as every refused call's is (S7).
+   * smaller one of their own, and only a few of their calls run at once,
+   * of which one watcher may hold only some: a slow read-only tool may run
+   * for the whole call deadline, and one watcher refilling every place
+   * would keep the rest of the room out. Only a call that passes is
+   * counted, and its places among those running are given back with the
+   * rest of what the call holds (`trace.release`), however it ends. A
+   * refusal is a call record within the refusal budget, written as every
+   * refused call's is (S7).
    */
   #watchingShareRefusal(
     pageId: string,
@@ -3099,8 +3110,20 @@ export class PageHub {
         `this page's watchers have made the ${String(watchingCallsPerPage)} calls they share in ${window}; wait, or read its published state with get_page_state instead`,
       );
     }
+    const { watchingCallsInFlight: inFlight, watchingCallsInFlightPerUser: inFlightEach } =
+      this.#config.limits;
+    const mine = this.#watcherRunning.get(userKey) ?? 0;
+    if (mine >= inFlightEach) {
+      this.#log.debug("call refused: past a watcher's share of the page's calls running", {
+        pageId,
+        userId,
+      });
+      return hubError(
+        'rate_limited',
+        `a watcher may have ${String(inFlightEach)} calls running on this page at once, and you have; let one end first, or read its published state with get_page_state instead`,
+      );
+    }
     const running = this.#watchingRunning.get(pageId) ?? 0;
-    const inFlight = this.#config.limits.watchingCallsInFlight;
     if (running >= inFlight) {
       this.#log.debug("call refused: the watchers' calls already running on the page", {
         pageId,
@@ -3114,6 +3137,7 @@ export class PageHub {
     this.#watchingUserCalls.record(userKey, now);
     this.#watchingPageCalls.record(pageId, now);
     this.#watchingRunning.set(pageId, running + 1);
+    this.#watcherRunning.set(userKey, mine + 1);
     this.#watchingCharged.add(trace);
     const bytes = trace.release;
     let released = false;
@@ -3121,9 +3145,8 @@ export class PageHub {
       if (released) return;
       released = true;
       bytes?.();
-      const left = (this.#watchingRunning.get(pageId) ?? 1) - 1;
-      if (left > 0) this.#watchingRunning.set(pageId, left);
-      else this.#watchingRunning.delete(pageId);
+      giveBack(this.#watchingRunning, pageId);
+      giveBack(this.#watcherRunning, userKey);
     };
     return null;
   }

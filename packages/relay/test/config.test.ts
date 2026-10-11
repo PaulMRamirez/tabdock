@@ -219,6 +219,7 @@ describe('origin policy (S1, S2)', () => {
       responseBytes: 96 * 1024 * 1024,
       observersPerPage: 40,
       watchingCallsInFlight: 4,
+      watchingCallsInFlightPerUser: 2,
     });
     expect(rateLimits.callsPerUserPerPage).toBe(120);
     expect(rateLimits.pairSignIns).toBe(60);
@@ -348,6 +349,7 @@ describe('loadConfigFromEnv', () => {
       responseBytes: 96 * 1024 * 1024,
       observersPerPage: 40,
       watchingCallsInFlight: 4,
+      watchingCallsInFlightPerUser: 2,
     });
     expect(config.rateLimits.callsPerUserPerPage).toBe(60);
     expect(config.rateLimits.pairSignIns).toBe(20);

@@ -1,9 +1,10 @@
 // ADR 0044, A6.21: the invitees watching a page by invite share a part of its
 // calls, so a room of them cannot make the operator's tab stutter. Past a
-// watcher's own rate or the watchers' rate on the page a call answers
-// rate_limited, and past the watchers' calls already running page_busy, each
-// with its call record within the refusal budget (S7). Members, in any role,
-// are never held to it. The rates are options only, lowered here.
+// watcher's own rate, the watchers' rate on the page or the watcher's own
+// calls already running a call answers rate_limited, and past the watchers'
+// calls already running page_busy, each with its call record within the
+// refusal budget (S7). Members, in any role, are never held to it. The rates
+// are options only, lowered here.
 
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Client } from '@modelcontextprotocol/client';
@@ -129,6 +130,44 @@ describe("the watchers' share of a page's calls (ADR 0044, A6.21)", () => {
     }
     // Their places are given back.
     const again = getView(fifth, page);
+    await expect.poll(() => held.length).toBe(1);
+    held.shift()?.();
+    expect((await again).isError).toBe(false);
+  });
+
+  it('lets one watcher hold only 2 of the calls running, so slow calls of theirs never keep the room out', async () => {
+    const held: (() => void)[] = [];
+    const { relay, page, guests, watchers } = await room(
+      2,
+      {},
+      (frame) =>
+        new Promise<InvokeReply>((resolve) => {
+          held.push(() => {
+            resolve({ ok: true, content: JSON.stringify({ tool: frame.tool }) });
+          });
+        }),
+    );
+    const [first, second] = watchers;
+    if (first === undefined || second === undefined) throw new Error('two watchers expected');
+    // Three at once from one watcher, on a page whose four places are all free.
+    const three = [getView(first, page), getView(first, page), getView(first, page)];
+    await expect.poll(() => held.length).toBe(2);
+    const refused = (await Promise.race(three)).text;
+    expect(refused).toMatch(
+      /^rate_limited: a watcher may have 2 calls running on this page at once, and you have; /,
+    );
+    expect(refused).toContain('get_page_state');
+    expect(outcomes(relay, guests[0]?.userId ?? '')).toEqual(['rate_limited']);
+    // Another watcher's call still reaches the page.
+    const others = getView(second, page);
+    await expect.poll(() => held.length).toBe(3);
+    await page.sync();
+    expect(page.all('invoke')).toHaveLength(3);
+    for (const release of held.splice(0)) release();
+    const results = [...(await Promise.all(three)), await others];
+    expect(results.filter((result) => result.isError)).toHaveLength(1);
+    // Their places are given back as their calls end.
+    const again = getView(first, page);
     await expect.poll(() => held.length).toBe(1);
     held.shift()?.();
     expect((await again).isError).toBe(false);
