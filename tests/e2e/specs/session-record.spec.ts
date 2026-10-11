@@ -29,6 +29,7 @@ import {
 import {
   memberEntry,
   openWithSessionRelay,
+  pauseClock,
   sidewaysScroll,
   startSessionInWidget,
 } from '../src/session-helpers.ts';
@@ -299,6 +300,57 @@ test("keeps offering the last lesson's record when a session nobody joined ends"
   if (!parsed.ok) throw new Error(parsed.reason);
   expect(parsed.record.scope).toMatchObject({ kind: 'session', label: 'Period 3' });
   expect(parsed.record.attachments.map((span) => span.user.id)).toEqual(['alice']);
+});
+
+test('waits again before Save when the chosen record is replaced, though the box never moved', async ({
+  page,
+}) => {
+  // Tall enough that the panel never scrolls, so nothing but the record moves the box.
+  await page.setViewportSize({ width: 1280, height: 1600 });
+  await openWithSessionRelay(page, demo);
+  /** Whether the box's Save JSON takes a click now, read without scrolling anything. */
+  const armedNow = (): Promise<unknown> =>
+    widgetEvaluate(
+      page,
+      'record-box',
+      'function () { return this.querySelector(\'[data-action="record-save-json"]\').getAttribute("data-armed"); }',
+    );
+  /** What the page's own script may do while the box is open. */
+  const viaPage = (step: 'clear' | 'start'): Promise<void> =>
+    page.evaluate((given) => {
+      const dock = window.__tabdockDock;
+      if (dock === undefined) throw new Error('no dock');
+      if (given === 'clear') dock.discardRecord('current');
+      else void dock.startSession({ label: 'Period 4', lengthMinutes: 30 });
+    }, step);
+  const currentFrom = async (): Promise<number> =>
+    (await waitForDock(page, (state) => state.records.find((view) => view.which === 'current')))
+      .from;
+
+  await openRecordBox(page);
+  await expect.poll(armedNow).toBe('true');
+  const before = await currentFrom();
+  // The page's timers stand still from here, so the box is read before any wait could run out.
+  await pauseClock(page);
+  // Cleared, the current record holds what it held (no call, Alice), so the box keeps its size.
+  await viaPage('clear');
+  await expect.poll(currentFrom).toBeGreaterThan(before);
+  expect(await armedNow()).toBe('false');
+  await page.clock.resume();
+  await expect.poll(armedNow).toBe('true');
+
+  // A session's start puts another record in the same slot, and the box waits again too.
+  await pauseClock(page);
+  await viaPage('start');
+  await waitForDock(page, (state) =>
+    state.records.some((view) => view.which === 'current' && view.label === 'Period 4'),
+  );
+  expect(await armedNow()).toBe('false');
+  await page.clock.resume();
+  const saved = await saveRecordFromWidget(page, 'json', 'current');
+  const parsed = parseSessionRecord(saved.text);
+  if (!parsed.ok) throw new Error(parsed.reason);
+  expect(parsed.record.scope).toMatchObject({ kind: 'session', label: 'Period 4' });
 });
 
 test('saves from the static build under its own Content Security Policy', async ({ page }) => {

@@ -2562,8 +2562,11 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     render(dock.state);
   });
   dom.append(recordBlock, element('div', 'label', 'Session record'), recordSummary, recordOpen);
-  /** The box while it is open, the record chosen in it, and its parts that change. */
-  let recordBox: (ArmedBox & { which: RecordWhich }) | null = null;
+  /**
+   * The box while it is open, the record chosen in it, that record's own
+   * identity (its slot, kind and start), and its parts that change.
+   */
+  let recordBox: (ArmedBox & { which: RecordWhich; chosen: string }) | null = null;
   const recordChoices = element('div', 'choices col');
   dom.attr(recordChoices, 'role', 'radiogroup');
   let shownChoices = '';
@@ -2623,7 +2626,11 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     recordBox = null;
     if (!open) return;
     closeOffer();
-    const box = { ...newBox(element('div', 'prompt')), which: 'current' as RecordWhich };
+    const box = {
+      ...newBox(element('div', 'prompt')),
+      which: 'current' as RecordWhich,
+      chosen: '',
+    };
     role(box.element, 'record-box');
     boxes.add(box);
     recordBox = box;
@@ -2711,8 +2718,13 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     const box = recordBox;
     if (box !== null) {
       const chosen = held.find((view) => view.which === box.which) ?? held[0];
-      if (chosen !== undefined && chosen.which !== box.which) {
+      // Another record in the chosen slot is another file to save, so the box
+      // waits again whether or not it moved: a session's start, a new page
+      // session or a page script's discardRecord replaces a slot's record in place.
+      const identity = chosen && `${chosen.which} ${chosen.scope} ${String(chosen.from)}`;
+      if (chosen !== undefined && identity !== box.chosen) {
         box.which = chosen.which;
+        box.chosen = identity ?? '';
         restartArming(box);
       }
       const names = held.map(recordName);
