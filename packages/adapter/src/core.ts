@@ -2264,8 +2264,9 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       if (!samePage || !listed.has(userId)) revoked.delete(userId);
     }
     // Invites belong to their page session too: a relay that did not resume it
-    // holds none of them (a restart ends every invite, ADR 0019), and the
-    // invites frame that follows a resumed welcome prunes what it ended.
+    // holds none of them (a restart without its snapshot ends every invite,
+    // ADRs 0019 and 0046), and the invites frame that follows a resumed
+    // welcome, after a dropped link or a restart from the snapshot, prunes what it ended.
     if (!samePage) {
       for (const inviteId of [...invites.keys()]) forgetInvite(inviteId, 'link_down');
     }
