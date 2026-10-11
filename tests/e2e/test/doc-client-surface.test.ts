@@ -128,7 +128,8 @@ describe('the untrusted label', () => {
 // SPEC says it (ADR 0044's notes): the attach_request row names every field
 // of an invite's and an agent's part of the frame, the secret each carries to
 // the page included, S11 says the relay passes an agent token on to its page
-// once, and S12 holds /g/mcp to the Host and Origin checks /mcp has.
+// once, S12 holds /g/mcp to the Host and Origin checks /mcp has, and
+// section 7's 404 for a token that closes mid-body comes after the body.
 describe('credentials on the page link and the MCP routes', () => {
   const spec = readRepo('SPEC.md');
 
@@ -161,5 +162,11 @@ describe('credentials on the page link and the MCP routes', () => {
     const s12 = rule('S12');
     expect(s12).toContain(`\`/mcp\`, \`${AGENT_PATH}\`, \`/pair\``);
     expect(s12).toContain(`\`/mcp\` and \`${AGENT_PATH}\` answer 403`);
+  });
+
+  it('section 7 answers a token that closes while its body arrives after the body, as the relay does', () => {
+    expect(spec).toContain(
+      'gets 404 before the body is read, or after it for a token that closes while its body arrives',
+    );
   });
 });
