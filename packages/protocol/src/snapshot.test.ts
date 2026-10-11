@@ -25,6 +25,7 @@ function sample(): RelaySnapshot {
     v: SNAPSHOT_VERSION,
     writtenAt: 1_000,
     mode: 'public',
+    credentials: HEX('9'),
     pages: [
       {
         pageId: 'pg_A',

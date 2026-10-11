@@ -8033,9 +8033,14 @@ export class PageHub {
    * invites and live agent tokens, digests and all, and any session that
    * ended while its page slept, which the page has yet to hear of.
    * `memberKey` binds each member's attachment to who its id stands for now
-   * (snapshot.ts, snapshotAccounts).
+   * (snapshot.ts, snapshotAccounts), and `credentials` the whole file to the
+   * credentials the relay signed people in with (credentialsDigest).
    */
-  exportSnapshot(writtenAt: number, memberKey: (userId: string) => string | null): RelaySnapshot {
+  exportSnapshot(
+    writtenAt: number,
+    memberKey: (userId: string) => string | null,
+    credentials: string | null,
+  ): RelaySnapshot {
     if (!this.#closed) {
       throw new Error(
         'a restart snapshot is taken only once the hub has stopped taking work (ADR 0046)',
@@ -8048,6 +8053,7 @@ export class PageHub {
       v: SNAPSHOT_VERSION,
       writtenAt,
       mode: this.#config.mode,
+      credentials,
       pages: pages.map((page) => savedPage(page, this.#sessionEnds.get(page.pageId) ?? null)),
       attachments: each((pageId) =>
         this.#store.attachments

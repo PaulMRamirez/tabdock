@@ -75,6 +75,7 @@ import {
 } from '../src/index.ts';
 import {
   bindingProblem,
+  credentialsDigest,
   fitProblem,
   removeTemporaryFiles,
   restoredAttachment,
@@ -109,6 +110,8 @@ import { PUBLIC_MCP_URL, PUBLIC_ORIGIN, tunnelFetch } from './helpers/tunnel.ts'
 const MINUTE = 60_000;
 const POSIX = process.platform !== 'win32';
 const FIFO_PROBE = resolve(import.meta.dirname, 'fixtures/snapshot-fifo-probe.ts');
+/** What a snapshot the stand-in /pair client's relay wrote is bound to. */
+const PAIR_CREDENTIALS = credentialsDigest(PAIR_CLIENT);
 const GUEST = 'sub-guest';
 const GUEST_EMAIL = 'guest@example.com';
 const POLICY: PolicyInput = { invites: 'all', maxDrivers: 2, proposals: 'members' };
@@ -356,11 +359,19 @@ describe('a graceful restart with TABDOCK_RESTART_SNAPSHOT on (A6.18)', () => {
       sha256: sha256(bytes),
     });
     // Digests only: never a resume token, an invite secret, the agent's
-    // token, the pairing code or a subject, though their digests are there.
+    // token, the /pair client's secret, the pairing code or a subject,
+    // though their digests are there.
     const text = bytes.toString('utf8');
-    for (const secret of [resumeToken, used.secret, live.secret, minted.token]) {
+    for (const secret of [
+      resumeToken,
+      used.secret,
+      live.secret,
+      minted.token,
+      PAIR_CLIENT.clientSecret,
+    ]) {
       expect(holdsRaw(text, secret)).toBe(false);
     }
+    expect(JSON.parse(text)).toMatchObject({ credentials: PAIR_CREDENTIALS });
     expect(text).not.toContain(page.code);
     expect(text).not.toContain(page.code.replace(/\W/g, ''));
     for (const sub of ['sub-alice', GUEST]) expect(text).not.toContain(sub);
@@ -483,6 +494,24 @@ describe('a graceful restart with TABDOCK_RESTART_SNAPSHOT on (A6.18)', () => {
     const fresh = await resumeOn(third, back);
     expect(fresh.welcome?.resumed).toBe(false);
     expect(fresh.pageId).not.toBe(page.pageId);
+  });
+
+  it('refuses a snapshot after the /pair client secret is rotated, so the rotation ends everything with the setting left on', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const first = await startRun(dir, idp);
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    await first.close();
+    expect(recordsOf(dir, 'snapshot_written')).toHaveLength(1);
+    // docs/deploy.md's rotation: a new secret, the same client, then a deploy.
+    const second = await startRun(dir, idp, {
+      pairClient: { ...PAIR_CLIENT, clientSecret: 'pair-client-secret-rotated-0001' },
+    });
+    expect(refusalOf(second)).toBe('it was written under credentials since rotated');
+    expect(existsSync(fileOf(dir))).toBe(false);
+    expect(recordsOf(dir, 'snapshot_loaded')).toEqual([]);
+    expect((await resumeOn(second, page)).welcome?.resumed).toBe(false);
   });
 
   it('refuses a snapshot older than the resume window, and removes it', async () => {
@@ -872,7 +901,13 @@ describe('taking the file (snapshot.ts)', () => {
     const { source, snapshot } = await boundDirectory();
     const at = snapshot.writtenAt;
     const take = (now: number, mode: 'public' | 'dev_tokens' = 'public') =>
-      takeSnapshot({ dir: copyOf(source), enabled: true, now, mode });
+      takeSnapshot({
+        dir: copyOf(source),
+        enabled: true,
+        now,
+        mode,
+        credentials: PAIR_CREDENTIALS,
+      });
     expect(take(at + RESUME_WINDOW_MS - 1)).toMatchObject({
       kind: 'loaded',
       ageMs: RESUME_WINDOW_MS - 1,
@@ -892,6 +927,20 @@ describe('taking the file (snapshot.ts)', () => {
       reason: 'it was written in another mode',
       removed: true,
     });
+    // A /pair client rotated since, or none now: the file names other credentials.
+    const rotated = credentialsDigest({
+      ...PAIR_CLIENT,
+      clientSecret: 'pair-client-secret-rotated-0001',
+    });
+    for (const credentials of [rotated, null]) {
+      expect(
+        takeSnapshot({ dir: copyOf(source), enabled: true, now: at, mode: 'public', credentials }),
+      ).toEqual({
+        kind: 'refused',
+        reason: 'it was written under credentials since rotated',
+        removed: true,
+      });
+    }
   });
 
   it('loads nothing when the file cannot be removed first', async () => {
@@ -904,7 +953,14 @@ describe('taking the file (snapshot.ts)', () => {
       },
     };
     expect(
-      takeSnapshot({ dir, enabled: true, now: snapshot.writtenAt, mode: 'public', fs }),
+      takeSnapshot({
+        dir,
+        enabled: true,
+        now: snapshot.writtenAt,
+        mode: 'public',
+        credentials: PAIR_CREDENTIALS,
+        fs,
+      }),
     ).toEqual({
       kind: 'refused',
       reason: 'it could not be removed (EROFS)',
@@ -915,7 +971,13 @@ describe('taking the file (snapshot.ts)', () => {
   it('refuses a file reached through a link, or with another link, or open to other accounts, and removes the name', async () => {
     const { source, snapshot } = await boundDirectory();
     const take = (dir: string) =>
-      takeSnapshot({ dir, enabled: true, now: snapshot.writtenAt, mode: 'public' });
+      takeSnapshot({
+        dir,
+        enabled: true,
+        now: snapshot.writtenAt,
+        mode: 'public',
+        credentials: PAIR_CREDENTIALS,
+      });
 
     const linked = copyOf(source);
     const target = join(privateDir(), 'elsewhere.json');
@@ -935,6 +997,7 @@ describe('taking the file (snapshot.ts)', () => {
         enabled: true,
         now: snapshot.writtenAt,
         mode: 'public',
+        credentials: PAIR_CREDENTIALS,
         fs: { ...nodeFs, lstatSync: lyingLstat(fileOf(swapped), regular) },
       }),
     ).toEqual({ kind: 'refused', reason: 'cannot open it (ELOOP)', removed: true });
@@ -969,7 +1032,15 @@ describe('taking the file (snapshot.ts)', () => {
           return nodeFs.openSync(path, ...rest);
         }) as typeof nodeFs.openSync,
       };
-      const take = () => takeSnapshot({ dir, enabled: true, now: Date.now(), mode: 'public', fs });
+      const take = () =>
+        takeSnapshot({
+          dir,
+          enabled: true,
+          now: Date.now(),
+          mode: 'public',
+          credentials: null,
+          fs,
+        });
       expect(spawnSync('mkfifo', ['-m', '600', fileOf(dir)]).status).toBe(0);
       expect(take()).toEqual({ kind: 'refused', reason: 'not a regular file', removed: true });
       expect(existsSync(fileOf(dir))).toBe(false);
@@ -1017,7 +1088,14 @@ describe('taking the file (snapshot.ts)', () => {
           return descriptors.has(fd) && stats !== undefined ? Object.assign(stats, facts) : stats;
         }) as typeof nodeFs.fstatSync,
       };
-      return takeSnapshot({ dir, enabled: true, now: snapshot.writtenAt, mode: 'public', fs });
+      return takeSnapshot({
+        dir,
+        enabled: true,
+        now: snapshot.writtenAt,
+        mode: 'public',
+        credentials: PAIR_CREDENTIALS,
+        fs,
+      });
     };
     // As written, the copy loads: each refusal below is the one fact changed.
     expect(take({})).toMatchObject({ kind: 'loaded' });
@@ -1174,6 +1252,7 @@ describe('taking the file (snapshot.ts)', () => {
       v: SNAPSHOT_VERSION,
       writtenAt: now,
       mode: 'public',
+      credentials: null,
       pages,
       attachments,
       invites,
@@ -1205,6 +1284,7 @@ describe('taking the file (snapshot.ts)', () => {
       v: SNAPSHOT_VERSION,
       writtenAt: now,
       mode: 'public',
+      credentials: null,
       pages,
       attachments: [],
       invites: [],
@@ -1267,6 +1347,7 @@ describe('taking the file (snapshot.ts)', () => {
       v: SNAPSHOT_VERSION,
       writtenAt: 1,
       mode: 'public',
+      credentials: null,
       pages: [],
       attachments: [],
       invites: [],
@@ -1314,6 +1395,7 @@ describe("fitting this relay's settings (snapshot.ts, fitProblem)", () => {
     v: SNAPSHOT_VERSION,
     writtenAt: now,
     mode: 'dev_tokens',
+    credentials: null,
     pages,
     attachments,
     invites: [],
@@ -1397,6 +1479,7 @@ describe('the hub around a snapshot (hub.ts)', () => {
       v: SNAPSHOT_VERSION,
       writtenAt: now,
       mode: 'dev_tokens',
+      credentials: null,
       pages: [
         {
           pageId: 'pg_restored',
@@ -1435,13 +1518,14 @@ describe('the hub around a snapshot (hub.ts)', () => {
   it('takes one only once it has stopped taking work, and then refuses a detach', async () => {
     const hub = hubOf();
     const accounts = snapshotAccounts(null);
-    expect(() => hub.exportSnapshot(Date.now(), accounts.memberKey)).toThrow(
+    expect(() => hub.exportSnapshot(Date.now(), accounts.memberKey, null)).toThrow(
       /only once the hub has stopped taking work/,
     );
     await hub.shutdown();
-    expect(hub.exportSnapshot(5, accounts.memberKey)).toMatchObject({
+    expect(hub.exportSnapshot(5, accounts.memberKey, 'c'.repeat(64))).toMatchObject({
       v: 1,
       writtenAt: 5,
+      credentials: 'c'.repeat(64),
       pages: [],
     });
     expect(hub.detachPage('alice', 'pg_any')).toEqual({
@@ -1457,6 +1541,7 @@ describe('the hub around a snapshot (hub.ts)', () => {
       v: SNAPSHOT_VERSION,
       writtenAt: 1,
       mode: 'dev_tokens',
+      credentials: null,
       pages: [],
       attachments: [],
       invites: [],

@@ -316,13 +316,19 @@ function referenceProblem(snapshot: SnapshotBody): string | null {
 /**
  * The whole file: its version, when the stopping relay wrote it, which mode
  * that relay ran in (a user id means one person only within one mode's
- * accounts), and its records.
+ * accounts), the digest of its credentials, and its records.
  */
 export const RelaySnapshotSchema = z
   .strictObject({
     v: z.literal(SNAPSHOT_VERSION),
     writtenAt: EpochMsSchema,
     mode: RelayModeSchema,
+    /**
+     * A digest of the credentials the stopping relay signed people in with
+     * (its /pair client), or null with none, so a start after they were
+     * rotated refuses the file and ends everything, as a rotation means to.
+     */
+    credentials: z.nullable(DigestSchema),
     pages: z.array(SnapshotPageSchema),
     attachments: z.array(SnapshotAttachmentSchema),
     invites: z.array(SnapshotInviteSchema),

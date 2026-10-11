@@ -23,6 +23,7 @@ const outcome = takeSnapshot({
   enabled: true,
   now: Date.now(),
   mode: 'public',
+  credentials: null,
   fs: { ...nodeFs, lstatSync },
 });
 process.stdout.write(`${JSON.stringify(outcome)}\n`);

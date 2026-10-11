@@ -45,7 +45,7 @@ import {
   type UserKind,
 } from '@tabdock/protocol';
 import { lineHash, listAuditFiles, readLine } from './audit-file.ts';
-import { NO_ORIGIN, type ResolvedConfig } from './config.ts';
+import { NO_ORIGIN, type PairClientOptions, type ResolvedConfig } from './config.ts';
 import { inviteeKeyOf, type MemberList } from './members.ts';
 import type {
   AgentTokenRecord,
@@ -130,6 +130,8 @@ export interface TakeOptions {
   now: number;
   /** The mode this relay runs in; a snapshot from another mode names other people's accounts. */
   mode: RelayMode;
+  /** credentialsDigest of this relay's /pair client; a snapshot written under another is refused. */
+  credentials: string | null;
   fs?: SnapshotFs | undefined;
 }
 
@@ -443,7 +445,39 @@ export function takeSnapshot(options: TakeOptions): TakeOutcome {
   if (snapshot.mode !== options.mode) {
     return { kind: 'refused', reason: 'it was written in another mode', removed: true };
   }
+  if (snapshot.credentials !== options.credentials) {
+    return {
+      kind: 'refused',
+      reason: 'it was written under credentials since rotated',
+      removed: true,
+    };
+  }
   return { kind: 'loaded', snapshot, ageMs };
+}
+
+/**
+ * What binds a snapshot to the credentials its relay signed people in with:
+ * a domain-separated SHA-256 of the /pair client, or null without one (dev
+ * tokens, local mode). docs/deploy.md's rotation after a suspected leak
+ * replaces that secret and relies on the restart to end every attachment,
+ * so a start whose /pair client differs refuses the file, and the rotation
+ * ends everything even with the setting left on. The digest is of a secret
+ * the identity provider issued, as the store's digests are of tokens the
+ * relay drew, never the secret itself.
+ */
+export function credentialsDigest(pairClient: PairClientOptions | undefined): string | null {
+  return pairClient === undefined
+    ? null
+    : createHash('sha256')
+        .update(
+          JSON.stringify([
+            'tabdock restart snapshot credentials',
+            pairClient.clientId,
+            pairClient.clientSecret,
+          ]),
+          'utf8',
+        )
+        .digest('hex');
 }
 
 /**

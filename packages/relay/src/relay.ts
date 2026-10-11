@@ -133,6 +133,7 @@ import { inSlices, ResponseStalls } from './response-stalls.ts';
 import { type InviteeSessionOptions, McpSessions, rankOf } from './sessions.ts';
 import { createSignInGate } from './sign-in-gate.ts';
 import {
+  credentialsDigest,
   fitProblem,
   removeTemporaryFiles,
   snapshotAccounts,
@@ -649,6 +650,8 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   if (leftover > 0) {
     log.warn('removed restart snapshot files a stop cut short left, unread', { files: leftover });
   }
+  // A rotated /pair client refuses a snapshot written under the old one.
+  const snapshotCredentials = credentialsDigest(options.pairClient);
   const taken =
     fileAudit === null
       ? null
@@ -657,6 +660,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
           enabled: config.restartSnapshot,
           now: Date.now(),
           mode: config.mode,
+          credentials: snapshotCredentials,
         });
   if (taken?.kind === 'refused') {
     // Fixed words only: never a value from the file.
@@ -744,7 +748,11 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     let outcome: ReturnType<typeof writeSnapshot>;
     let snapshot: ReturnType<typeof hub.exportSnapshot>;
     try {
-      snapshot = hub.exportSnapshot(Date.now(), snapshotAccounts(auth.members ?? null).memberKey);
+      snapshot = hub.exportSnapshot(
+        Date.now(),
+        snapshotAccounts(auth.members ?? null).memberKey,
+        snapshotCredentials,
+      );
       outcome = writeSnapshot(fileAudit.dir, snapshot);
     } catch (error) {
       log.error('restart snapshot not written', { reason: errorKind(error) });
