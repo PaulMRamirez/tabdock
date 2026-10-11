@@ -11,12 +11,15 @@ import { INVITEE_ID_PREFIX, MAX_MEMBERS, MAX_MEMBERS_FILE_BYTES } from '@tabdock
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   inviteeKeyOf,
+  joinChanges,
+  type MemberChange,
   type MemberFileStat,
   MemberList,
   MembersError,
   membersDigest,
   parseMembersFile,
   readMembersFile,
+  settlingMembers,
   watchMembersFile,
 } from '../src/members.ts';
 import { parseOAuthUsers } from '../src/oauth.ts';
@@ -185,6 +188,55 @@ describe('MemberList.replace (ADR 0043, S8, S13)', () => {
     const change = list.replace([BOB, ALICE], 'd2');
     expect(change.ended.size).toBe(0);
     expect(change.renamed.size).toBe(0);
+  });
+});
+
+describe('settlingMembers (ADR 0043, S8)', () => {
+  const ALICE = { sub: 's-alice', userId: 'alice', displayName: 'Alice' };
+  const BOB = { sub: 's-bob', userId: 'bob', displayName: 'Bob' };
+  const CAROL = { sub: 's-carol', userId: 'carol', displayName: 'Carol' };
+
+  it('settles a change whose settling failed again with the next, so no ended id is forgotten', () => {
+    const list = new MemberList([ALICE, BOB]);
+    const settled: MemberChange[] = [];
+    let fail = true;
+    const apply = settlingMembers(list, (change) => {
+      settled.push(change);
+      if (fail) {
+        fail = false;
+        throw new Error('a step failed');
+      }
+    });
+    expect(() => {
+      apply([ALICE], 'd1');
+    }).toThrow('a step failed');
+    // The list is in force already, so the next request maps as it says.
+    expect(list.bySub('s-bob')).toBeUndefined();
+    // The same text applied again: compared with itself it changes nothing,
+    // yet Bob's id is settled once more.
+    apply([ALICE], 'd1');
+    expect(settled).toHaveLength(2);
+    expect(settled[1]?.ended).toEqual(new Set(['bob']));
+    expect(settled[1]?.removed).toEqual(['bob']);
+    // Settled, it is owed no longer.
+    apply([ALICE], 'd1');
+    expect(settled[2]?.ended.size).toBe(0);
+  });
+
+  it('joins two changes as the second made on top of the first', () => {
+    const list = new MemberList([ALICE, BOB]);
+    const first = list.replace([{ ...ALICE, displayName: 'Ally' }, CAROL], null);
+    const second = list.replace([{ ...ALICE, displayName: 'Ally' }, BOB], null);
+    const joined = joinChanges(first, second);
+    expect(joined.ended).toEqual(
+      new Set(['bob', inviteeId('s-bob'), 'carol', inviteeId('s-carol')]),
+    );
+    expect(joined.renamed).toEqual(new Map([['alice', 'Ally']]));
+    // Bob left and came back, Carol came and left: neither is added or removed in all.
+    expect(joined.added).toEqual([]);
+    expect(joined.removed).toEqual([]);
+    expect(joined.total).toBe(2);
+    expect(joined.memberNames).toEqual(['Ally', 'Bob']);
   });
 });
 

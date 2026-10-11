@@ -34,7 +34,12 @@ import {
 import { afterEach, describe, expect, it } from 'vitest';
 import { startRelay as startFromEnv } from '../src/cli.ts';
 import { resolveConfig } from '../src/config.ts';
-import { type DevTokenUser, inviteeKeyOf, loadConfigFromEnv } from '../src/index.ts';
+import {
+  createMemoryStore,
+  type DevTokenUser,
+  inviteeKeyOf,
+  loadConfigFromEnv,
+} from '../src/index.ts';
 import { MEMBER_SESSIONS_CLOSE_MS } from '../src/relay.ts';
 import {
   attachMember,
@@ -542,6 +547,54 @@ async function heldPost(
     },
   };
 }
+
+describe('a change whose settling fails part way (S8)', () => {
+  it('still runs every other step, and settles the change again with the next read', async () => {
+    // An audit log that fails on the reload's record, which the hub writes last.
+    const store = createMemoryStore();
+    const audit = store.audit;
+    let failing = true;
+    store.audit = {
+      append: (event) => {
+        if (event.type === 'members_reloaded' && failing) {
+          failing = false;
+          throw new Error('the audit disk is gone');
+        }
+        return audit.append(event);
+      },
+      records: () => audit.records(),
+    };
+    const { relay, save: saveMembers } = await membersRelay([ALICE, BOB], {
+      store,
+      timings: { membersPollMs: 60_000 },
+    });
+    const page = await relay.page();
+    relay.provider.signInSubject = 'sub-bob';
+    const phone = new Phone(relay.relay.url);
+    try {
+      await phone.signIn();
+    } finally {
+      relay.provider.signInSubject = null;
+    }
+    const bob = await relay.claude('sub-bob');
+    await attachMember(bob, page);
+    saveMembers([ALICE]);
+    expect(await rejection(relay.relay.reloadMembers())).toBe('the audit disk is gone');
+    // The steps after the hub's ran: the sign-in and the session ended.
+    expect((await phone.preview(page.nonce)).data.account).toEqual({ signedIn: false });
+    await eventually(() =>
+      relay
+        .events()
+        .some((line) => line.msg === 'MCP session closed' && line.reason === 'membership changed'),
+    );
+    // The same text read again settles what the failed one owed.
+    expect(await relay.relay.reloadMembers()).toBe('applied');
+    expect(relay.relay.audit.events()).toContainEqual(
+      expect.objectContaining({ type: 'members_reloaded', removed: ['bob'], attachments: 0 }),
+    );
+    expect(await relay.relay.reloadMembers()).toBe('unchanged');
+  });
+});
 
 describe('a sign-in a change ends while its request is on the way (S8)', () => {
   it('refuses the claim or status whose body arrives after the change, at /pair and /i', async () => {

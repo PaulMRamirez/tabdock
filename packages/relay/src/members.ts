@@ -312,6 +312,55 @@ export class MemberList {
   }
 }
 
+/**
+ * Two changes as one, the second made on top of the first: every id either
+ * ended, and the names, members and counts the second leaves. An id the
+ * first added and the second removed again, or the reverse, is neither.
+ */
+export function joinChanges(first: MemberChange, second: MemberChange): MemberChange {
+  const ended = new Set([...first.ended, ...second.ended]);
+  const renamed = new Map([...first.renamed, ...second.renamed]);
+  for (const id of ended) renamed.delete(id);
+  return {
+    ended,
+    renamed,
+    added: [
+      ...first.added.filter((id) => !second.removed.includes(id)),
+      ...second.added.filter((id) => !first.removed.includes(id)),
+    ],
+    removed: [
+      ...first.removed.filter((id) => !second.added.includes(id)),
+      ...second.removed.filter((id) => !first.added.includes(id)),
+    ],
+    total: second.total,
+    memberNames: second.memberNames,
+  };
+}
+
+/**
+ * Puts each new list in force and has `settle` end what it changed (the
+ * relay hands it the hub, the pair flow and the sessions). The list maps the
+ * next request at once, so a change whose settling throws part way stays
+ * owed and is settled again with the next one: from the file that is the
+ * same text once more, since the watcher applies a text until an apply
+ * returns. Without this, the retry would compare the list with itself, find
+ * nothing ended, and leave an id the change took away holding what it held
+ * (S8).
+ */
+export function settlingMembers(
+  list: MemberList,
+  settle: (change: MemberChange) => void,
+): (entries: readonly MemberEntry[], digest: string | null) => void {
+  let owed: MemberChange | null = null;
+  return (entries, digest) => {
+    const fresh = list.replace(entries, digest);
+    const change = owed === null ? fresh : joinChanges(owed, fresh);
+    owed = change;
+    settle(change);
+    owed = null;
+  };
+}
+
 // Reading the file
 
 /** What the poll compares: a write, a rename over the file or a chmod each changes it. */

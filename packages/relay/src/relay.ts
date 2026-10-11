@@ -66,7 +66,6 @@ import {
   type AuditEvent,
   InviteeIdSchema,
   MAX_FRAME_BYTES,
-  type MemberEntry,
   SUBPROTOCOL,
 } from '@tabdock/protocol';
 import { WebSocketServer } from 'ws';
@@ -97,8 +96,10 @@ import { ListenStreams } from './listen-streams.ts';
 import { createLogger, type Logger } from './log.ts';
 import {
   loadMembersFile,
+  type MemberChange,
   type MembersReload,
   type MembersWatch,
+  settlingMembers,
   watchMembersFile,
 } from './members.ts';
 import {
@@ -708,18 +709,28 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     createHandler: strictHandler,
   });
   /**
-   * A new member list from the file (ADR 0043), in force for the next
-   * request at once. Whatever is held under a user id the change ended ends
-   * now, every way in (S8): attachments, requests and invites in the hub,
-   * /pair sign-ins, listen streams, and the 2025-era sessions held now, each
-   * serving nothing more and closing once its answers are out. The line
-   * names user ids and counts, never a sub or a name.
+   * Ends what a member list change took away (ADR 0043), the new list being
+   * in force for the next request already. Whatever is held under a user id
+   * the change ended ends now, every way in (S8): attachments, requests and
+   * invites in the hub, /pair sign-ins, listen streams, and the 2025-era
+   * sessions held now, each serving nothing more and closing once its
+   * answers are out. Every step runs even if one before it throws; a fault
+   * then leaves the change owed, settled again with the next apply
+   * (settlingMembers). The line names user ids and counts, never a sub or a
+   * name.
    */
-  const applyMembers = (entries: MemberEntry[], digest: string): void => {
-    if (members === null) return;
-    const change = members.replace(entries, digest);
-    const { attachments } = hub.membershipChanged(change);
-    const signIns = pair?.membersChanged(change) ?? 0;
+  const settleMembers = (change: MemberChange): void => {
+    const faults: unknown[] = [];
+    const step = <T>(run: () => T, otherwise: T): T => {
+      try {
+        return run();
+      } catch (error) {
+        faults.push(error);
+        return otherwise;
+      }
+    };
+    const { attachments } = step(() => hub.membershipChanged(change), { attachments: 0 });
+    const signIns = step(() => pair?.membersChanged(change) ?? 0, 0);
     log.info('members reloaded', {
       members: change.total,
       added: change.added,
@@ -732,12 +743,14 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     // session or stream opened a moment later is theirs. A call or a
     // pair_page the hub just ended answers not_attached or pairing_expired on
     // the session it came in on, which closes once that answer is written.
-    const mcpSessions = sessions.endUsers(change.ended, MEMBER_SESSIONS_CLOSE_MS);
-    const streams = listens.endUsers(change.ended);
+    const mcpSessions = step(() => sessions.endUsers(change.ended, MEMBER_SESSIONS_CLOSE_MS), 0);
+    const streams = step(() => listens.endUsers(change.ended), 0);
     if (mcpSessions + streams > 0) {
       log.info('sessions closed for a member list change', { mcpSessions, streams });
     }
+    if (faults.length > 0) throw faults[0];
   };
+  const applyMembers = members === null ? null : settlingMembers(members, settleMembers);
   // The marker concerns every member, who all list it (spike.ts).
   spike?.setNotifier(() => {
     listens.notifyAll();
@@ -1241,7 +1254,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
 
   // Polled from here on; a relay that never listened has nothing to stop.
   const membersWatch: MembersWatch | null =
-    config.membersFile === null || members === null
+    config.membersFile === null || members === null || applyMembers === null
       ? null
       : watchMembersFile({
           path: config.membersFile,
