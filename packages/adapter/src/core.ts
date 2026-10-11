@@ -1253,24 +1253,22 @@ function seatLimitsOf(limits: WelcomeFrame['limits']): SeatLimits | null {
 /**
  * Whether the roster shows `entry`, an invitee watching by invite, kept out
  * of the people's seats (ADR 0044): the people fill the people limit, or
- * those an invite let in leave members no more than their reserve. For the
- * widget's words only, as seatLimitsOf is.
+ * those an invite let in leave members no more than their reserve (every
+ * watcher came in by an invite or an agent token). For the widget's words
+ * only, as seatLimitsOf is.
  */
 function noPeopleSeat(
   limits: SeatLimits | null,
   roster: readonly AttachmentView[],
   entry: AttachmentView,
 ): boolean {
-  if (limits === null || limits.observersPerPage === 0) return false;
   const watching = (row: AttachmentView): boolean =>
     row.kind === 'invitee' && row.role === 'observer';
-  if (!watching(entry)) return false;
+  if (!limits?.observersPerPage || !watching(entry)) return false;
   const people = roster.filter((row) => !watching(row));
   return (
     people.length >= limits.usersPerPage ||
-    (entry.inviteId !== null &&
-      people.filter((row) => row.inviteId !== null).length >=
-        limits.usersPerPage - MEMBER_RESERVED_SEATS)
+    people.filter((row) => row.inviteId).length >= limits.usersPerPage - MEMBER_RESERVED_SEATS
   );
 }
 
@@ -2214,7 +2212,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
           asked.saidObserver = true;
           // ADR 0044: a watcher the people had no seat for is told of, as the driver limit is.
           if (noPeopleSeat(state.seatLimits, attachments, entry)) {
-            log.info(`${who} is still an observer: the page has no seat left among its people`);
+            log.info(`${who} is still an observer: no seat left among the people`);
             seatSeq += 1;
             seats.push(
               Object.freeze({

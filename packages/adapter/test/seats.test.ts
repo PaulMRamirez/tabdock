@@ -50,9 +50,7 @@ describe('a promotion the people have no seat for (ADR 0044)', () => {
       { user: { userId: GUEST }, account: null, asked: 'promote', heldBy: 'people' },
     ]);
     expect(
-      h.logs.some((line) =>
-        line.endsWith('is still an observer: the page has no seat left among its people'),
-      ),
+      h.logs.some((line) => line.endsWith('is still an observer: no seat left among the people')),
     ).toBe(true);
   });
 
