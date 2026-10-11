@@ -18,7 +18,7 @@ import {
   pageStateHeader,
 } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
-import { type AttachmentRecord, createDevTokenAuth, createMemoryStore } from '../src/index.ts';
+import { createDevTokenAuth, createMemoryStore } from '../src/index.ts';
 import {
   connectPage,
   PAGE_ORIGIN,
@@ -41,12 +41,13 @@ import {
   type TestRelay,
 } from './helpers/relay.ts';
 import { stateCharge } from '../src/page-state.ts';
-import { publish, readState } from './helpers/state.ts';
+import { guest, invitedBy, publish, readState } from './helpers/state.ts';
 
 let current: TestRelay | undefined;
 const pages: TestPage[] = [];
 const clients: Client[] = [];
 const fence = new TestFence();
+const GUEST = guest(1);
 
 afterEach(async () => {
   fence.end();
@@ -154,39 +155,29 @@ describe('reading what a page published (ADR 0040)', () => {
     },
   );
 
-  it('lets an invitee holding the page read it, and a page id grants nothing to anyone else (S13, S14)', async () => {
-    const guest = {
-      userId: `g_${'0'.repeat(31)}1`,
-      displayName: 'ignored',
-      token: 'guest-1-dev-token-5a8c1e7f2b9d4063',
-      kind: 'invitee' as const,
-    };
-    const store = createMemoryStore();
-    await setup({ auth: createDevTokenAuth([ALICE, BOB, guest]), invites: true, store });
+  it.each(LEGS)(
+    'lets an invitee holding the page read it on the %s leg, behind its label with no structured copy (S14)',
+    async (_, modern) => {
+      const store = createMemoryStore();
+      await setup({ auth: createDevTokenAuth([ALICE, GUEST]), invites: true, store });
+      const opened = await page();
+      await pairAndApprove(await client(ALICE), opened);
+      invitedBy(store, GUEST, opened.pageId);
+      await publish(opened, { stop: 2 });
+      const read = await readState(await client(GUEST, { modern }), opened.pageId);
+      expect(read.isError, read.text).toBe(false);
+      expect(read.label).toBe(pageStateHeader(PAGE_ORIGIN));
+      expect(read.types).toEqual(['text']);
+      expect(read.structuredContent).toBeUndefined();
+      expect(read.body).toMatchObject({ page: opened.pageId, version: 1, value: { stop: 2 } });
+    },
+  );
+
+  it('grants nothing for a page id to anyone not attached (S13)', async () => {
+    await setup();
     const opened = await page();
     await pairAndApprove(await client(ALICE), opened);
-    const held: AttachmentRecord = {
-      pageId: opened.pageId,
-      userId: guest.userId,
-      displayName: 'unverified account',
-      kind: 'invitee',
-      role: 'observer',
-      grantedAt: Date.now(),
-      lastUsedAt: null,
-      expiresAt: null,
-      clients: [],
-      inviteId: 'inv_held',
-      endsAt: Date.now() + 60 * 60_000,
-      inviteRole: 'observer',
-      sponsorId: 'alice',
-      emailHash: null,
-    };
-    store.attachments.put(held);
     await publish(opened, { stop: 2 });
-    const read = await readState(await client(guest), opened.pageId);
-    expect(read.isError, read.text).toBe(false);
-    expect(read.body?.value).toEqual({ stop: 2 });
-
     // Bob is attached to nothing: a real page id and an unknown one answer alike.
     const bob = await client(BOB);
     const real = await readState(bob, opened.pageId);

@@ -15,17 +15,18 @@ import {
   MAX_WAIT_MS,
   MAX_WAITS_PER_USER,
   MEMBER_RESERVED_SEATS,
+  pageStateHeader,
 } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
 import { MIN_REQUEST_BYTES } from '../src/config.ts';
+import { createDevTokenAuth, createMemoryStore } from '../src/index.ts';
 import {
-  type AttachmentRecord,
-  createDevTokenAuth,
-  createMemoryStore,
-  type DevTokenUser,
-  type RelayStore,
-} from '../src/index.ts';
-import { connectPage, type PageOptions, type TestPage, TOOLS } from './helpers/page-client.ts';
+  connectPage,
+  PAGE_ORIGIN,
+  type PageOptions,
+  type TestPage,
+  TOOLS,
+} from './helpers/page-client.ts';
 import {
   ALICE,
   BOB,
@@ -38,12 +39,14 @@ import {
   TestFence,
   type TestRelay,
 } from './helpers/relay.ts';
-import { publish, readState, waitState } from './helpers/state.ts';
+import { guest, invitedBy, publish, readState, waitState } from './helpers/state.ts';
 
 let current: TestRelay | undefined;
 const pages: TestPage[] = [];
 const clients: Client[] = [];
 const fence = new TestFence();
+const G1 = guest(1);
+const G2 = guest(2);
 
 afterEach(async () => {
   fence.end();
@@ -56,17 +59,6 @@ afterEach(async () => {
     await ending?.close();
   }
 });
-
-function guest(n: number): DevTokenUser {
-  return {
-    userId: `g_${n.toString(16).padStart(32, '0')}`,
-    displayName: 'ignored',
-    token: `guest-${String(n)}-dev-token-5a8c1e7f2b9d4063`,
-    kind: 'invitee',
-  };
-}
-const G1 = guest(1);
-const G2 = guest(2);
 
 async function setup(options: Parameters<typeof startRelay>[0] = {}): Promise<TestRelay> {
   current = await fence.keep(startRelay(options), (late) => late.close());
@@ -96,32 +88,6 @@ async function client(user = ALICE, options: ClientOptions = {}): Promise<Client
   );
   clients.push(connected);
   return connected;
-}
-
-/** An attachment as an invite makes it, sponsored by Alice, put straight into the store. */
-function invitedBy(
-  store: RelayStore,
-  user: DevTokenUser,
-  pageId: string,
-  endsAt = Date.now() + 60 * 60_000,
-): void {
-  const attachment: AttachmentRecord = {
-    pageId,
-    userId: user.userId,
-    displayName: 'unverified account',
-    kind: 'invitee',
-    role: 'observer',
-    grantedAt: Date.now(),
-    lastUsedAt: null,
-    expiresAt: null,
-    clients: [],
-    inviteId: 'inv_held',
-    endsAt,
-    inviteRole: 'observer',
-    sponsorId: 'alice',
-    emailHash: null,
-  };
-  store.attachments.put(attachment);
 }
 
 /** Resolves once the relay has started `count` waits in all, so a test can act while they wait. */
@@ -163,6 +129,27 @@ describe('when a wait answers (ADR 0040)', () => {
       expect(answer.structuredContent).toBeUndefined();
       expect(answer.body).toMatchObject({ version: 1, value: { stop: 1 }, changed: true });
       expect(tookMs).toBeLessThan(1000);
+    },
+  );
+
+  it.each(LEGS)(
+    'answers an invitee on the %s leg behind its label, with no structured copy (S14)',
+    async (_, modern) => {
+      const store = createMemoryStore();
+      const relay = await setup({ auth: createDevTokenAuth([ALICE, G1]), invites: true, store });
+      const opened = await page();
+      await pairAndApprove(await client(), opened);
+      invitedBy(store, G1, opened.pageId);
+      const g1 = await client(G1, { modern });
+      const pending = waitState(g1, opened.pageId, 0, 2500);
+      await started(relay, 1);
+      await publish(opened, { stop: 1 });
+      const answer = await pending;
+      expect(answer.isError, answer.text).toBe(false);
+      expect(answer.label).toBe(pageStateHeader(PAGE_ORIGIN));
+      expect(answer.types).toEqual(['text']);
+      expect(answer.structuredContent).toBeUndefined();
+      expect(answer.body).toMatchObject({ version: 1, value: { stop: 1 }, changed: true });
     },
   );
 

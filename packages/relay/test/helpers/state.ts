@@ -1,9 +1,11 @@
 // What the page state tests share (ADR 0040): reading get_page_state and
 // wait_for_page_state as a client receives them, the label line and the
-// JSON body after it checked apart, and a page publishing a value.
+// JSON body after it checked apart, a page publishing a value, and an
+// invited account holding a page.
 
 import type { Client } from '@modelcontextprotocol/client';
 import { type PageStateResult, PageStateResultSchema } from '@tabdock/protocol';
+import type { AttachmentRecord, DevTokenUser, RelayStore } from '../../src/index.ts';
 import type { TestPage } from './page-client.ts';
 
 export interface StateAnswer {
@@ -67,4 +69,40 @@ export async function waitState(
 export async function publish(page: TestPage, value: unknown): Promise<void> {
   page.send({ t: 'state', value });
   await page.sync();
+}
+
+/** An invited account with a dev token, numbered so a test can hold several. */
+export function guest(n: number): DevTokenUser {
+  return {
+    userId: `g_${n.toString(16).padStart(32, '0')}`,
+    displayName: 'ignored',
+    token: `guest-${String(n)}-dev-token-5a8c1e7f2b9d4063`,
+    kind: 'invitee',
+  };
+}
+
+/** An attachment as an invite makes it, sponsored by Alice, put straight into the store. */
+export function invitedBy(
+  store: RelayStore,
+  user: DevTokenUser,
+  pageId: string,
+  endsAt = Date.now() + 60 * 60_000,
+): void {
+  const attachment: AttachmentRecord = {
+    pageId,
+    userId: user.userId,
+    displayName: 'unverified account',
+    kind: 'invitee',
+    role: 'observer',
+    grantedAt: Date.now(),
+    lastUsedAt: null,
+    expiresAt: null,
+    clients: [],
+    inviteId: 'inv_held',
+    endsAt,
+    inviteRole: 'observer',
+    sponsorId: 'alice',
+    emailHash: null,
+  };
+  store.attachments.put(attachment);
 }
