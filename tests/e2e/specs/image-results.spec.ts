@@ -6,6 +6,7 @@ import {
   firstText,
   imageBytes,
   imagePart,
+  leakedSlices,
   pngDimensions,
   type ResultContent,
 } from '../src/image-helpers.ts';
@@ -33,6 +34,10 @@ let demo: DemoServer;
 let tabdock: Tabdock;
 let client: Client;
 let consoleLines: string[];
+/** Every console message the page wrote, the adapter's info lines about each call included. */
+let everyLine: string[];
+/** The base64 of each picture a test received. */
+let captured: string[];
 
 /** Long enough to wrap the activity line at phone width, as a real client's name might. */
 const LONG_CLIENT = 'a-classroom-laptop-client-with-a-very-long-name-indeed';
@@ -47,7 +52,10 @@ test.beforeEach(async ({ page }) => {
   tabdock = await startTabdock({ demo });
   client = await connectMcp(tabdock.relay, tabdock.users.alice, LONG_CLIENT);
   consoleLines = [];
+  everyLine = [];
+  captured = [];
   page.on('console', (message) => {
+    everyLine.push(message.text());
     if (message.type() === 'error') consoleLines.push(message.text());
   });
   page.on('pageerror', (error) => consoleLines.push(error.message));
@@ -55,8 +63,14 @@ test.beforeEach(async ({ page }) => {
 test.afterEach(async () => {
   await client.close();
   await tabdock.close();
-  // No page error, and the adapter's log lines never hold the picture's data.
+  // No page error.
   expect(consoleLines.filter((line) => !line.startsWith('Failed to load resource'))).toEqual([]);
+  // The adapter logged each picture by type and size, and no console line holds any of its data.
+  if (captured.length > 0) {
+    expect(everyLine.some((line) => /\bok, an image\/\w+ of \d+ bytes/.test(line))).toBe(true);
+  }
+  const logs = everyLine.join('\n');
+  for (const data of captured) expect(leakedSlices(data, logs)).toEqual([]);
 });
 
 async function openAndPair(page: Page): Promise<string> {
@@ -72,10 +86,13 @@ async function openAndPair(page: Page): Promise<string> {
 }
 
 async function capture(pageId: string, args: Record<string, unknown>): Promise<ResultContent> {
-  return (await client.callTool({
+  const result = (await client.callTool({
     name: 'call_page_tool',
     arguments: { page: pageId, tool: 'capture_board', arguments: args },
   })) as ResultContent;
+  const image = imagePart(result);
+  if (image !== null) captured.push(image.data);
+  return result;
 }
 
 test('capture_board returns the board drawn on its own canvas, as a PNG of the size asked for, behind its label', async ({

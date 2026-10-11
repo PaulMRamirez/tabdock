@@ -37,6 +37,19 @@ export function imageBytes(image: ImagePart): Uint8Array {
   return new Uint8Array(bytes);
 }
 
+/**
+ * Every 32-character slice of `data`, taken every `step` characters, that
+ * `text` holds: empty when no log line carries any of a picture (S7, A6.5).
+ */
+export function leakedSlices(data: string, text: string, step = 101): string[] {
+  const found: string[] = [];
+  for (let offset = 0; offset + 32 <= data.length; offset += step) {
+    const slice = data.slice(offset, offset + 32);
+    if (text.includes(slice)) found.push(slice);
+  }
+  return found;
+}
+
 /** Width and height from a PNG's IHDR chunk, or null for anything that is not a PNG. */
 export function pngDimensions(bytes: Uint8Array): { width: number; height: number } | null {
   const signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
