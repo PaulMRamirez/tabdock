@@ -29,6 +29,7 @@ import { join } from 'node:path';
 import {
   INVITEE_ID_PREFIX,
   MAX_SNAPSHOT_BYTES,
+  MEMBER_RESERVED_SEATS,
   narrowPolicy,
   type RelayMode,
   type RelaySnapshot,
@@ -43,7 +44,7 @@ import {
   type UserKind,
 } from '@tabdock/protocol';
 import { lineHash, listAuditFiles, readLine } from './audit-file.ts';
-import type { ResolvedConfig } from './config.ts';
+import { NO_ORIGIN, type ResolvedConfig } from './config.ts';
 import { inviteeKeyOf, type MemberList } from './members.ts';
 import type {
   AgentTokenRecord,
@@ -398,26 +399,78 @@ export function takeSnapshot(options: TakeOptions): TakeOutcome {
 
 /**
  * Why this relay cannot take the snapshot as it is configured now, or null:
- * more page sessions than it holds, a page with more people than its seats,
- * invites or invitees with invites off, agent tokens with them off. Each
- * would put back what this relay could not have let in, so the whole
- * snapshot is refused rather than cut.
+ * more page sessions than it holds, a page from an origin it no longer lets
+ * attach, invites or invitees with invites off, agent tokens with them off,
+ * or a page whose attachments its seats could never have let in. Each would
+ * put back what this relay could not have let in, so the whole snapshot is
+ * refused rather than cut.
  */
 export function fitProblem(snapshot: RelaySnapshot, config: ResolvedConfig): string | null {
   const { limits, invites, agentTokens } = config;
   if (snapshot.pages.length > limits.pageSessions)
     return 'more page sessions than this relay holds';
+  // Its tab could never resume through the origin check (S2), and its
+  // people, invites and tokens would sit listed for the whole resume window.
+  const allowed = (origin: string): boolean =>
+    origin === NO_ORIGIN ? config.allowMissingOrigin : config.isOriginAllowed(origin);
+  if (!snapshot.pages.every((page) => allowed(page.origin))) {
+    return 'a page from an origin this relay does not allow';
+  }
   if (!invites && snapshot.invites.length > 0) return 'live invites, and invites are off';
   if (!invites && snapshot.attachments.some((attachment) => attachment.kind === 'invitee')) {
     return 'invited accounts, and invites are off';
   }
   if (!agentTokens && snapshot.agents.length > 0) return 'agent tokens, and they are off';
-  const seats = limits.usersPerPage + (invites ? limits.observersPerPage : 0);
-  const perPage = new Map<string, number>();
-  for (const attachment of snapshot.attachments) {
-    const count = (perPage.get(attachment.pageId) ?? 0) + 1;
-    if (count > seats) return 'a page with more attachments than its seats';
-    perPage.set(attachment.pageId, count);
+  return seatProblem(snapshot.attachments, config);
+}
+
+/**
+ * Why a page's attachments could not all have been let in under this
+ * relay's seats, or null. Seats are counted as the hub counts them (hub.ts,
+ * #seatOf): an invitee's observer watches while there are watching seats,
+ * and everyone else is among the page's people. Only what the hub holds to
+ * at every moment is asked of the file, so a snapshot of a state the hub
+ * allows always fits: the people never pass usersPerPage (#pageFull), those
+ * an invite let in among them leave members their reserve
+ * (#inviteSeatsFull), and the watchers a watch invite or an agent token let
+ * in never pass the watching seats (#watchingFull). A watcher an operator
+ * moved down from the people takes no seat to move (#noSeatFor), so the
+ * watchers in all may pass their seats until someone leaves, and are not
+ * counted against them here. With a limit lowered while the relay was down,
+ * the start refuses what the lower limit would have kept out (S9).
+ */
+function seatProblem(
+  attachments: readonly SnapshotAttachment[],
+  config: ResolvedConfig,
+): string | null {
+  const { usersPerPage, observersPerPage } = config.limits;
+  const watchingSeats = config.invites ? observersPerPage : 0;
+  const people = new Map<string, number>();
+  const invitedPeople = new Map<string, number>();
+  const invitedWatchers = new Map<string, number>();
+  const add = (counts: Map<string, number>, pageId: string): number => {
+    const count = (counts.get(pageId) ?? 0) + 1;
+    counts.set(pageId, count);
+    return count;
+  };
+  for (const attachment of attachments) {
+    const { pageId } = attachment;
+    const watching =
+      watchingSeats > 0 && attachment.kind === 'invitee' && attachment.role === 'observer';
+    if (watching) {
+      // A watch invite never made a driver, and an agent token's invite is a watch one.
+      if (attachment.inviteRole === 'observer' && add(invitedWatchers, pageId) > watchingSeats) {
+        return 'a page with more watchers by invite than its watching seats';
+      }
+      continue;
+    }
+    if (add(people, pageId) > usersPerPage) return 'a page with more people than its seats';
+    if (
+      attachment.inviteId !== null &&
+      add(invitedPeople, pageId) > usersPerPage - MEMBER_RESERVED_SEATS
+    ) {
+      return "a page whose invited people take its members' reserved seats";
+    }
   }
   return null;
 }

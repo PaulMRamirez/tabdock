@@ -50,6 +50,7 @@ import {
   RelaySnapshotSchema,
   RESUME_WINDOW_MS,
   SNAPSHOT_VERSION,
+  type SnapshotAttachment,
   type SnapshotPage,
 } from '@tabdock/protocol';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -63,6 +64,7 @@ import {
   createRelay,
   inviteeKeyOf,
   lineHash,
+  NO_ORIGIN,
   type OAuthUser,
   readAuditLines,
   type Relay,
@@ -70,6 +72,7 @@ import {
 } from '../src/index.ts';
 import {
   bindingProblem,
+  fitProblem,
   SNAPSHOT_FILE,
   type SnapshotFs,
   snapshotAccounts,
@@ -712,6 +715,32 @@ function savedPageOf(
   };
 }
 
+/** A member's attachment as a snapshot saves it, made by code. */
+function savedAttachmentOf(
+  pageId: string,
+  userId: string,
+  overrides: Partial<SnapshotAttachment> = {},
+): SnapshotAttachment {
+  return {
+    pageId,
+    userId,
+    displayName: userId,
+    kind: 'member',
+    role: 'observer',
+    grantedAt: 1,
+    lastUsedAt: null,
+    expiresAt: null,
+    clients: [],
+    inviteId: null,
+    endsAt: null,
+    inviteRole: null,
+    sponsorId: null,
+    emailHash: null,
+    memberKey: null,
+    ...overrides,
+  };
+}
+
 /** lstat answering for `path` with another file's stats, as a swap after the loader looked would leave it. */
 function lyingLstat(path: string, stats: nodeFs.Stats): typeof nodeFs.lstatSync {
   return ((target: nodeFs.PathLike, options?: nodeFs.StatSyncOptions) =>
@@ -1003,6 +1032,93 @@ describe('taking the file (snapshot.ts)', () => {
     expect(writeSnapshot(dir, empty)).toMatchObject({ kind: 'written' });
     expect(nodeFs.readdirSync(dir)).toEqual([SNAPSHOT_FILE]);
     expect(statSync(join(dir, SNAPSHOT_FILE)).mode & 0o777).toBe(0o600);
+  });
+});
+
+describe("fitting this relay's settings (snapshot.ts, fitProblem)", () => {
+  const now = Date.now();
+  const config = (options: Partial<RelayOptions> = {}) =>
+    resolveConfig({
+      auth: createDevTokenAuth([DEV_ALICE]),
+      allowedOrigins: [PAGE_ORIGIN],
+      invites: true,
+      agentTokens: true,
+      limits: { usersPerPage: 4, observersPerPage: 3 },
+      ...options,
+    });
+  const snapshotOf = (
+    attachments: SnapshotAttachment[],
+    pages: SnapshotPage[] = [savedPageOf('pg_1', now)],
+  ): RelaySnapshot => ({
+    v: SNAPSHOT_VERSION,
+    writtenAt: now,
+    mode: 'dev_tokens',
+    pages,
+    attachments,
+    invites: [],
+    agents: [],
+  });
+  const members = (count: number): SnapshotAttachment[] =>
+    Array.from({ length: count }, (_, index) =>
+      savedAttachmentOf('pg_1', `member${String(index)}`),
+    );
+  /** A guest a watch invite let in, unless `overrides` says otherwise. */
+  const guest = (index: number, overrides: Partial<SnapshotAttachment> = {}): SnapshotAttachment =>
+    savedAttachmentOf('pg_1', `${INVITEE_ID_PREFIX}${index.toString(16).padStart(32, '0')}`, {
+      kind: 'invitee',
+      inviteId: 'inv_1',
+      endsAt: now + MINUTE,
+      inviteRole: 'observer',
+      sponsorId: 'member0',
+      ...overrides,
+    });
+
+  it('counts the people and the watchers each in their own seats, as the hub does (S9)', () => {
+    expect(fitProblem(snapshotOf(members(4)), config())).toBeNull();
+    expect(fitProblem(snapshotOf(members(5)), config())).toBe(
+      'a page with more people than its seats',
+    );
+    // A people limit lowered while the relay was down refuses what it would have kept out.
+    expect(
+      fitProblem(
+        snapshotOf(members(4)),
+        config({ limits: { usersPerPage: 3, observersPerPage: 3 } }),
+      ),
+    ).toBe('a page with more people than its seats');
+    // Three watchers by invite fill the watching seats, and a fourth could never have come in.
+    const watchers = [1, 2, 3].map((index) => guest(index));
+    expect(fitProblem(snapshotOf([...members(4), ...watchers]), config())).toBeNull();
+    expect(fitProblem(snapshotOf([...members(4), ...watchers, guest(4)]), config())).toBe(
+      'a page with more watchers by invite than its watching seats',
+    );
+    // A driver invite's guests moved down from the people watch past the
+    // seats, which the hub allows until someone leaves, so they still fit.
+    const movedDown = [5, 6].map((index) => guest(index, { inviteRole: 'driver' }));
+    expect(fitProblem(snapshotOf([...members(4), ...watchers, ...movedDown]), config())).toBeNull();
+    // What invites let in among the people leaves members their two seats (S14).
+    const drivers = [7, 8, 9].map((index) =>
+      guest(index, { role: 'driver', inviteRole: 'driver' }),
+    );
+    expect(fitProblem(snapshotOf([...members(1), ...drivers.slice(0, 2)]), config())).toBeNull();
+    expect(fitProblem(snapshotOf([...members(1), ...drivers]), config())).toBe(
+      "a page whose invited people take its members' reserved seats",
+    );
+  });
+
+  it('refuses a page from an origin this relay does not allow (S2)', () => {
+    const elsewhere = savedPageOf('pg_2', now, {
+      origin: 'https://elsewhere.example',
+      url: 'https://elsewhere.example/',
+      resumeTokenHash: 'b'.repeat(64),
+    });
+    expect(fitProblem(snapshotOf([], [savedPageOf('pg_1', now), elsewhere]), config())).toBe(
+      'a page from an origin this relay does not allow',
+    );
+    const unnamed = savedPageOf('pg_3', now, { origin: NO_ORIGIN });
+    expect(fitProblem(snapshotOf([], [unnamed]), config())).toBe(
+      'a page from an origin this relay does not allow',
+    );
+    expect(fitProblem(snapshotOf([], [unnamed]), config({ allowMissingOrigin: true }))).toBeNull();
   });
 });
 
