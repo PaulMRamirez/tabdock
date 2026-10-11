@@ -12,7 +12,11 @@
 // own and are taken too. So are the getters that read a box's place off the
 // rectangle getBoundingClientRect returns, as the widget's hold-still rule
 // trusts them: a later script that made them answer a fixed place would keep
-// a box that moved armed. What this leaves open is in widget.ts's header.
+// a box that moved armed. A saved session record (ADR 0045) leaves the same
+// way: the Blob constructor, URL.createObjectURL and revokeObjectURL, and the
+// click that starts the download, are taken here too, so a script that
+// replaced them later is never handed the record. What this leaves open is
+// in widget.ts's header.
 
 import { apply, taken } from './taken.ts';
 
@@ -42,6 +46,12 @@ export interface Dom {
   setValue(input: HTMLInputElement, value: string): void;
   checked(input: HTMLInputElement): boolean;
   setChecked(input: HTMLInputElement, checked: boolean): void;
+  /**
+   * Saves `text` as a file named `name` through an anchor placed in `parent`
+   * and clicked at once, which a trusted click lets download; returns what
+   * revokes its object URL, which the widget calls once the browser has it.
+   */
+  save(parent: Element, name: string, type: string, text: string): () => void;
 }
 
 /** Takes the DOM members the widget uses from `doc` and its prototypes, as they are now. */
@@ -71,6 +81,12 @@ export function takeDom(doc: Document): Dom {
   const setValue = taken(probe, 'value', 'set');
   const getChecked = taken(probe, 'checked', 'get');
   const setChecked = taken(probe, 'checked', 'set');
+  const click = taken(probe, 'click', 'value');
+  const scope = doc.defaultView ?? globalThis;
+  const MakeBlob = scope.Blob;
+  const Url = scope.URL;
+  const createUrl = taken(Url, 'createObjectURL', 'value');
+  const revokeUrl = taken(Url, 'revokeObjectURL', 'value');
   return Object.freeze({
     create: <K extends keyof HTMLElementTagNameMap>(tag: K) =>
       apply(createElement, doc, [tag]) as HTMLElementTagNameMap[K],
@@ -117,6 +133,19 @@ export function takeDom(doc: Document): Dom {
     checked: (input: HTMLInputElement) => apply(getChecked, input, []) as boolean,
     setChecked: (input: HTMLInputElement, checked: boolean) => {
       apply(setChecked, input, [checked]);
+    },
+    save: (parent: Element, name: string, type: string, text: string) => {
+      const url = apply(createUrl, Url, [new MakeBlob([text], { type })]) as string;
+      const anchor = apply(createElement, doc, ['a']) as HTMLAnchorElement;
+      apply(setAttribute, anchor, ['href', url]);
+      apply(setAttribute, anchor, ['download', name]);
+      apply(setAttribute, anchor, ['rel', 'noreferrer']);
+      apply(append, parent, [anchor]);
+      apply(click, anchor, []);
+      apply(remove, anchor, []);
+      return () => {
+        apply(revokeUrl, Url, [url]);
+      };
     },
   });
 }

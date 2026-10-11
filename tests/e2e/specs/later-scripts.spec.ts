@@ -21,6 +21,7 @@ import {
   widgetButtonNow,
   widgetVisible,
 } from '../src/tabdock-harness.ts';
+import { saveRecordFromWidget } from '../src/record-helpers.ts';
 
 // What a page script that runs after attach() can catch or change by
 // patching the browser's built-ins (threat model B5, S4, S11 and S14),
@@ -36,7 +37,10 @@ import {
 // never the closed shadow root that getRootNode() on one would return; and
 // it times and measures its boxes the same way, so patching setTimeout,
 // clearTimeout or DOMRect's getters afterwards arms no box early and keeps
-// no moved box armed. What stays open (the page's other JavaScript built-ins, any toJSON,
+// no moved box armed. A session record the operator saves leaves through
+// the Blob, object URL and click the widget took at mount, so replacing
+// those afterwards hands such a script no record. What stays open (the
+// page's other JavaScript built-ins, any toJSON,
 // and covering the widget with a look-alike) is the trusted page's, as
 // docs/threat-model.md says.
 
@@ -684,4 +688,64 @@ test("a script that patches DOMRect's getters after attach() keeps no box that m
   await expect
     .poll(() => decisions(relay))
     .toEqual([{ t: 'attach_decision', requestId: 'req-1', allow: true, role: 'driver' }]);
+});
+
+test('a script that replaces Blob, URL.createObjectURL and click after attach() is never handed a saved record', async ({
+  page,
+}) => {
+  const relay = await openWithFakeRelay(page);
+  // Someone the record names, so there is a record to save.
+  relay.send({
+    t: 'roster',
+    attachments: [
+      {
+        ...BOB,
+        kind: 'member',
+        role: 'observer',
+        grantedAt: Date.now(),
+        lastUsedAt: null,
+        expiresAt: null,
+        clients: [],
+        inviteId: null,
+        endsAt: null,
+      },
+    ],
+  });
+  await waitForDock(page, (state) => state.records[0]?.people === 1);
+
+  // A script that runs after attach(): the ways a file leaves a page, each
+  // replaced with one that notes what it was handed and passes it on.
+  await page.evaluate(() => {
+    const seen: string[] = [];
+    window.__laterSeen = seen;
+    const note = (what: string, value: unknown): void => {
+      seen.push(`${what}: ${String(value)}`);
+    };
+    const RealBlob = Blob;
+    const create: unknown = Reflect.get(URL, 'createObjectURL');
+    const click: unknown = Reflect.get(HTMLElement.prototype, 'click');
+    if (typeof create !== 'function' || typeof click !== 'function')
+      throw new Error('no built-ins');
+    Reflect.set(window, 'Blob', function Blob(parts: BlobPart[], options?: BlobPropertyBag): Blob {
+      note('Blob', parts.filter((part) => typeof part === 'string').join(''));
+      return new RealBlob(parts, options);
+    });
+    Reflect.set(URL, 'createObjectURL', (blob: Blob): string => {
+      note('createObjectURL', blob.size);
+      return Reflect.apply(create, URL, [blob]) as string;
+    });
+    Reflect.defineProperty(HTMLElement.prototype, 'click', {
+      configurable: true,
+      writable: true,
+      value(this: HTMLElement): void {
+        note('click', this.getAttribute('href'));
+        Reflect.apply(click, this, []);
+      },
+    });
+  });
+
+  const saved = await saveRecordFromWidget(page, 'json');
+  expect(saved.name).toMatch(/^tabdock-record-\d{8}-\d{4}\.json$/);
+  expect(saved.text).toContain('"name": "Bob"');
+  expect(await page.evaluate(() => window.__laterSeen ?? [])).toEqual([]);
 });
