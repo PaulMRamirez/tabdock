@@ -29,6 +29,7 @@ pnpm demo:m2       # two users and three clients share the board: roles, the wri
 pnpm demo:m3       # sign-in, pairing by code and by the widget's QR code from a phone-sized browser
 pnpm demo:m4       # local mode, then a page shared by watch and control invites, and the audit log
 pnpm demo:m5       # first-class page tools on both MCP revisions, and a call confirmed in the client
+pnpm demo:m6       # a class on one map tab: state, a capture, a proposal, members, a session, 40 watchers, an agent, a restart, the record
 
 pnpm site:build    # the Pages site into apps/site/dist: the demo at /, docs/tour at /tour/, docs/guide at /guide/
 
