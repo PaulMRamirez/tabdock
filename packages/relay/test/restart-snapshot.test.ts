@@ -803,6 +803,33 @@ describe('a graceful restart with TABDOCK_RESTART_SNAPSHOT on (A6.18)', () => {
     expect((await resumeOn(again, fresh)).welcome?.resumed).toBe(false);
   });
 
+  it('warns, whichever way the setting is, when a snapshot an earlier run left cannot be removed', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    // A first run makes the audit directory; a directory then takes the
+    // snapshot's name, which no unlink removes (EISDIR), as a read-only
+    // mount or a changed owner would leave a real file in place.
+    await (await startRun(dir, idp, { restartSnapshot: false })).close();
+    mkdirSync(fileOf(dir));
+    for (const restartSnapshot of [false, true]) {
+      const run = await startRun(dir, idp, { restartSnapshot });
+      const entries = run.lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(
+        entries.filter((entry) => String(entry.msg).includes('restart snapshot')),
+        `restartSnapshot ${String(restartSnapshot)}`,
+      ).toEqual([
+        expect.objectContaining({
+          level: 'warn',
+          msg: 'restart snapshot left on disk and not loaded; remove it by hand',
+          reason: 'it could not be removed (EISDIR)',
+          removed: false,
+        }),
+      ]);
+      await run.close();
+      expect(existsSync(fileOf(dir))).toBe(true);
+    }
+  });
+
   it('refuses a snapshot this relay could not have taken, with invites now off', async () => {
     const idp = await provider();
     const dir = auditDir();

@@ -665,8 +665,16 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   if (taken?.kind === 'refused') {
     // Fixed words only: never a value from the file.
     const fields = { reason: taken.reason, removed: taken.removed };
-    if (config.restartSnapshot) log.warn('restart snapshot not loaded; starting fresh', fields);
-    else log.info('removed a restart snapshot an earlier run left, unread', fields);
+    // A file still on disk holds names and titles whichever way the setting
+    // is, and "off means gone" (ADR 0046's notes) has failed, so the
+    // operator is warned to remove it, never told it went.
+    if (!taken.removed) {
+      log.warn('restart snapshot left on disk and not loaded; remove it by hand', fields);
+    } else if (config.restartSnapshot) {
+      log.warn('restart snapshot not loaded; starting fresh', fields);
+    } else {
+      log.info('removed a restart snapshot an earlier run left, unread', fields);
+    }
   }
   // Only a log that outlives the process marks its starts and stops; a memory
   // ring forgets everything at a restart anyway.
