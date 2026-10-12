@@ -22,6 +22,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { RUNTIME_DEPENDENCIES } from '../../../scripts/release-check.ts';
+import { markdownIn, packageReadmes } from '../src/doc-files.ts';
 
 const ROOT = resolve(import.meta.dirname, '../../..');
 const read = (path: string): string => readFileSync(join(ROOT, path), 'utf8');
@@ -511,6 +512,36 @@ describe('the image and the workflows, as they run (comments left out)', () => {
     expect(hashCode(stage)).toMatch(
       /flyctl secrets import --stage --app "\$FLY_APP"\n\s+flyctl secrets unset --stage --app "\$FLY_APP" "\$unused"$/m,
     );
+  });
+
+  // vars.TABDOCK_MEMBERS_FILE reads a repository variable as well as one of
+  // the production environment, but docs/deploy.md and the M6 checklist set
+  // it on the environment, beside the secrets its approval guards, so no doc
+  // may send a reader to the repository's variables instead.
+  it('is set, as every doc says, as a variable of the production environment the deploy job reads it in', () => {
+    const deploy = jobsOf(hashCode(read(`${dir}/deploy.yml`))).get('deploy') ?? '';
+    expect(deploy).toMatch(/^ {4}environment: production$/m);
+    expect(deploy).toContain('TABDOCK_MEMBERS_FILE: ${{ vars.TABDOCK_MEMBERS_FILE }}');
+    expect(read('docs/deploy.md')).toContain(
+      'It is a variable of the `production` environment (Environment variables, not secrets)',
+    );
+    const docs = [
+      'README.md',
+      'CHANGELOG.md',
+      'SPEC.md',
+      ...markdownIn('docs'),
+      ...markdownIn('docs/guide'),
+      ...markdownIn('docs/checklists'),
+      ...packageReadmes(),
+    ];
+    const elsewhere = docs.flatMap((path) =>
+      read(path)
+        .split(/(?<=[.!?])\s+/)
+        .filter((line) => line.includes('TABDOCK_MEMBERS_FILE'))
+        .filter((line) => /\b(?:repository|repo|organi[sz]ation) variables?\b/i.test(line))
+        .map((line) => `${path}: ${line}`),
+    );
+    expect(elsewhere).toEqual([]);
   });
 
   it('publishes the site from main only: a build that can only read, then a deploy that runs only deploy-pages (ADR 0029)', () => {
