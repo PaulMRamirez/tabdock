@@ -70,6 +70,41 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * A call a leg leaves running while it takes a step that may throw, such as
+ * a click in the widget. If that step throws, the demo's cleanup closes the
+ * clients, which rejects the call; with nothing yet awaiting it, Node would
+ * end the process on that unhandled rejection before the cleanup removed
+ * the run's private directory. The quiet handler marks it handled, and the
+ * leg still awaits the promise returned and sees its error as before.
+ */
+export function inFlight<T>(promise: Promise<T>): Promise<T> {
+  void promise.catch(() => undefined);
+  return promise;
+}
+
+/**
+ * Waits on the page's state from `first` until `test` passes, each wait at
+ * most 5 s, and fails with `what` past the deadline rather than looping for
+ * as long as a page that never publishes what the leg expects keeps quiet.
+ */
+export async function stateWhere(
+  first: PageStateResult,
+  next: (after: number, waitMs: number) => Promise<PageStateResult>,
+  test: (body: PageStateResult) => boolean,
+  what: string,
+  timeoutMs = 15_000,
+): Promise<PageStateResult> {
+  const deadline = Date.now() + timeoutMs;
+  let body = first;
+  while (!test(body)) {
+    const left = deadline - Date.now();
+    if (left <= 0) throw new Error(`timed out waiting for ${what}`);
+    body = await next(body.version, Math.min(5_000, left));
+  }
+  return body;
+}
+
 /** say and check as plain functions, so a leg reads as narration. */
 export function bind(narrator: Narrator): {
   say: (text: string) => void;

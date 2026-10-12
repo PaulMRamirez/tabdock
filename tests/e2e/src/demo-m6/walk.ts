@@ -9,7 +9,7 @@ import { callMapTool } from '../map-harness.ts';
 import { labelledAlone, readPageState, stateBody, waitPageState } from '../state-helpers.ts';
 import { callTool } from '../tabdock-harness.ts';
 import { ALICE } from './classroom.ts';
-import { bind, centre, type Lesson, mapState, type Stage } from './lesson.ts';
+import { bind, centre, inFlight, type Lesson, mapState, type Stage, stateWhere } from './lesson.ts';
 import { maskCode } from './narrator.ts';
 import { allowIn, openOperatorTab } from './operator.ts';
 
@@ -31,7 +31,7 @@ export async function walk(stage: Stage): Promise<Lesson> {
   const alice = await room.claude('claude-alice', ALICE.sub);
   const code = await operator.freshCode();
   say(`tools/call pair_page { code: "${maskCode(code)}" } from claude-alice (Alice, a member)`);
-  const pairing = callTool(alice, 'pair_page', { code });
+  const pairing = inFlight(callTool(alice, 'pair_page', { code }));
   await allowIn(operator.page, 'claude-alice', 'driver');
   const paired = await pairing;
   operator.usedUp(code);
@@ -52,10 +52,12 @@ export async function walk(stage: Stage): Promise<Lesson> {
     const stop = await callMapTool(alice, pageId, 'go_to_stop', { walkthroughId: 'flyby', index });
     check(!stop.isError, `go_to_stop ${String(index)} should run: ${stop.text.slice(0, 120)}`);
     // The page publishes at most twice a second, so its state may trail the call by a moment.
-    let body = stateBody(await readPageState(alice, pageId));
-    while (mapState(body)?.walkthrough?.stopIndex !== index) {
-      body = stateBody(await waitPageState(alice, pageId, body.version, 5_000));
-    }
+    const body = await stateWhere(
+      stateBody(await readPageState(alice, pageId)),
+      async (after, waitMs) => stateBody(await waitPageState(alice, pageId, after, waitMs)),
+      (state) => mapState(state)?.walkthrough?.stopIndex === index,
+      `the page to publish stop ${String(index + 1)} of the flyby`,
+    );
     version = body.version;
     say(
       `   go_to_stop flyby ${String(index)}: ok; get_page_state version ${String(body.version)}, stop ${String(index + 1)} of ${String(FLYBY_STOPS)}, ${centre(mapState(body))}`,
@@ -74,7 +76,7 @@ export async function walk(stage: Stage): Promise<Lesson> {
     `\n   Then Claude waits: wait_for_page_state { after: ${String(version)}, timeoutMs: 20000 }, while the teacher drags the map by hand.`,
   );
   const askedAt = Date.now();
-  const waiting = waitPageState(alice, pageId, version, 20_000);
+  const waiting = inFlight(waitPageState(alice, pageId, version, 20_000));
   const canvas = await operator.page.locator('canvas#map').boundingBox();
   if (canvas === null) throw new Error('the map page shows no canvas');
   // Left of centre, clear of the widget's panel; one drag is one discrete change the page publishes.

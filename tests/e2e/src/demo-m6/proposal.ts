@@ -17,7 +17,7 @@ import {
 } from '../proposal-helpers.ts';
 import { readPageState, stateBody, waitPageState } from '../state-helpers.ts';
 import { callTool } from '../tabdock-harness.ts';
-import { auditLines, bind, centre, type Lesson, mapState, until } from './lesson.ts';
+import { auditLines, bind, centre, inFlight, type Lesson, mapState, until } from './lesson.ts';
 import { maskLink, storyLine } from './narrator.ts';
 import { mintWatchLink, openPanel } from './operator.ts';
 
@@ -52,8 +52,8 @@ export async function proposal(lesson: Lesson): Promise<void> {
   say(
     `   Her Claude waits twice: get_proposal { proposal: "${proposalId}", waitMs: 30000 } and wait_for_page_state { after: ${String(before)} }.`,
   );
-  const decided = getProposal(carol, pageId, proposalId, 30_000);
-  const moved = waitPageState(carol, pageId, before, 30_000);
+  const decided = inFlight(getProposal(carol, pageId, proposalId, 30_000));
+  const moved = inFlight(waitPageState(carol, pageId, before, 30_000));
   await openPanel(operator.page);
   const row = await until(async () => {
     // The row as laid out, a line per block, as the teacher reads it.

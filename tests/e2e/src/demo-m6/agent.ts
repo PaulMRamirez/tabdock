@@ -18,7 +18,7 @@ import {
   widgetItems,
   widgetText,
 } from '../tabdock-harness.ts';
-import { auditLines, bind, type Lesson, until } from './lesson.ts';
+import { auditLines, bind, inFlight, type Lesson, until } from './lesson.ts';
 import { storyLine } from './narrator.ts';
 import { allowIn, openPanel, shownLines, shownText, widgetTextWhen } from './operator.ts';
 
@@ -66,7 +66,7 @@ export async function agent(lesson: Lesson): Promise<void> {
 
   const agentClient = await connectAgent(room.relay.url, token, 'claude-code');
   say(`   An agent connects to ${endpoint} with the token as its bearer, and calls pair_page:`);
-  const pairing = callTool(agentClient, 'pair_page', {});
+  const pairing = inFlight(callTool(agentClient, 'pair_page', {}));
   const requestId = await promptFrom(lesson, 'claude-code');
   say('   The widget asks:');
   for (const line of shownLines(await shownText(page, 'data-request-id', requestId))) {

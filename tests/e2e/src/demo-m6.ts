@@ -94,8 +94,19 @@ try {
   narrator.say(`\nThe demo stopped: ${error instanceof Error ? error.message : String(error)}`);
   process.exitCode = 1;
 } finally {
-  await browser?.close();
-  await classroom?.close();
+  // Each step on its own, so one that fails still leaves the next to run and the directory removed.
+  const cleanup = (step: string, error: unknown): void => {
+    narrator.say(
+      `Cleanup: ${step} failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    process.exitCode = 1;
+  };
+  await browser?.close().catch((error: unknown) => {
+    cleanup('closing the browser', error);
+  });
+  await classroom?.close().catch((error: unknown) => {
+    cleanup('closing the classroom', error);
+  });
   rmSync(scratch, { recursive: true, force: true });
 }
 const seconds = Math.round((Date.now() - startedAt) / 1000);

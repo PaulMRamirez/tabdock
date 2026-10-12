@@ -8,7 +8,7 @@
 import { readPageState, stateBody, waitPageState } from '../state-helpers.ts';
 import { callTool, errorCode } from '../tabdock-harness.ts';
 import { ALICE, BOB } from './classroom.ts';
-import { auditLines, bind, type Lesson, sleep, until } from './lesson.ts';
+import { auditLines, bind, inFlight, type Lesson, sleep, until } from './lesson.ts';
 import { maskCode, storyLine } from './narrator.ts';
 import { allowIn } from './operator.ts';
 
@@ -57,7 +57,7 @@ export async function members(lesson: Lesson): Promise<void> {
   const bob = await room.claude('claude-bob', BOB.sub);
   const next = await operator.freshCode();
   say(`tools/call pair_page { code: "${maskCode(next)}" } from claude-bob (now a member)`);
-  const pairing = callTool(bob, 'pair_page', { code: next });
+  const pairing = inFlight(callTool(bob, 'pair_page', { code: next }));
   await allowIn(operator.page, 'claude-bob', 'observer');
   const paired = await pairing;
   operator.usedUp(next);
@@ -71,7 +71,7 @@ export async function members(lesson: Lesson): Promise<void> {
   say(
     `   Bob's Claude waits: wait_for_page_state { after: ${String(version)}, timeoutMs: 30000 }.`,
   );
-  const waiting = waitPageState(bob, pageId, version, 30_000);
+  const waiting = inFlight(waitPageState(bob, pageId, version, 30_000));
   // Long enough for the wait to reach the relay before the file changes again.
   await sleep(500);
   const before = reloads();

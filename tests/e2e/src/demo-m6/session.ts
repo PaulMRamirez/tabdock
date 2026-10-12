@@ -12,7 +12,7 @@ import type { Client } from '@modelcontextprotocol/client';
 import { joinAtI, student } from '../room-harness.ts';
 import { fillSessionForm, sessionLinkInWidget } from '../session-helpers.ts';
 import { callTool, clickInWidget, errorCode } from '../tabdock-harness.ts';
-import { auditLines, bind, type Lesson, until } from './lesson.ts';
+import { auditLines, bind, inFlight, type Lesson, until } from './lesson.ts';
 import { maskCode, maskLink, storyLine } from './narrator.ts';
 import {
   allowIn,
@@ -45,7 +45,7 @@ export async function session(lesson: Lesson): Promise<void> {
     say(
       `   A second map tab, "Period 2", whose clock Playwright holds, links; Alice pairs with ${maskCode(code)}.`,
     );
-    const pairing = callTool(lesson.alice, 'pair_page', { code });
+    const pairing = inFlight(callTool(lesson.alice, 'pair_page', { code }));
     await allowIn(tab.page, 'claude-alice', 'driver');
     const paired = await pairing;
     tab.usedUp(code);
