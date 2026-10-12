@@ -9,7 +9,11 @@
 // the resume window, from the future, from another mode or reached through a
 // link. A member the list in force no longer gives the same subject comes
 // back with nothing, and what they sponsored goes with them (S8, S13, S14).
-// A revoked attachment or a closed invite never returns. The file holds
+// A revoked attachment or a closed invite never returns, and a live invite's
+// terms and a token's come back whole: a revoked guest's bar by account and
+// email, the uses a link has left, a control link's refusals and a token's
+// timed-out prompts (S14). What ran out while the relay was down ends in
+// the order its timers would have ended it (S7). The file holds
 // digests only: no resume token, invite secret, agent token, pairing code or
 // subject. With the setting off nothing is written, a file an earlier run
 // left is removed unread, and a restart ends everything, as in M5. Against a
@@ -78,23 +82,30 @@ import {
   credentialsDigest,
   fitProblem,
   removeTemporaryFiles,
+  restoredAgent,
   restoredAttachment,
+  restoredInvite,
+  savedAgent,
   savedAttachment,
+  savedInvite,
   SNAPSHOT_FILE,
   type SnapshotFs,
   snapshotAccounts,
   takeSnapshot,
   writeSnapshot,
 } from '../src/snapshot.ts';
-import { agentUserId, connectAgent, mintAgent } from './helpers/agents.ts';
+import type { AgentTokenRecord, InviteRecord } from '../src/store.ts';
+import { agentRequest, agentUserId, connectAgent, mintAgent } from './helpers/agents.ts';
 import {
   attachMember,
   call,
   emailClaims,
+  joinAtI,
   latest,
   MEMBERS,
   mintOk,
   redeem,
+  signedInAtI,
 } from './helpers/invites.ts';
 import {
   connectPage,
@@ -105,7 +116,7 @@ import {
   TOOLS,
 } from './helpers/page-client.ts';
 import { PAIR_CLIENT, startProvider, type TestProvider } from './helpers/provider.ts';
-import { ALICE as DEV_ALICE, FAST_TIMINGS } from './helpers/relay.ts';
+import { ALICE as DEV_ALICE, eventually, FAST_TIMINGS } from './helpers/relay.ts';
 import { PUBLIC_MCP_URL, PUBLIC_ORIGIN, tunnelFetch } from './helpers/tunnel.ts';
 
 const MINUTE = 60_000;
@@ -116,6 +127,17 @@ const PAIR_CREDENTIALS = credentialsDigest(PAIR_CLIENT);
 const GUEST = 'sub-guest';
 const GUEST_EMAIL = 'guest@example.com';
 const POLICY: PolicyInput = { invites: 'all', maxDrivers: 2, proposals: 'members' };
+/** An agent's first request, which raises its attach prompt. */
+const AGENT_INITIALIZE = {
+  jsonrpc: '2.0',
+  id: 1,
+  method: 'initialize',
+  params: {
+    protocolVersion: '2025-11-25',
+    capabilities: {},
+    clientInfo: { name: 'raw-agent', version: '1.0.0' },
+  },
+};
 
 interface Run {
   relay: Relay;
@@ -473,6 +495,155 @@ describe('a graceful restart with TABDOCK_RESTART_SNAPSHOT on (A6.18)', () => {
     expect(back.all('attach_request')).toEqual([]);
   });
 
+  it("keeps a revoked guest's bar on a link left open, by account and by verified email (S14)", async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const first = await startRun(dir, idp);
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    const { secret, inviteId } = await mintOk(page, { uses: 5 });
+    const guest = await signedInAtI({ relay: first.relay, provider: idp }, GUEST, GUEST_EMAIL);
+    const { request } = await joinAtI(guest, page, secret);
+    // Revoked with the link kept open: barred, and the page never hears.
+    page.send({ t: 'revoke', userId: request.user.userId });
+    await page.sync();
+    const barred = { status: 403, data: { error: 'denied_by_operator' } };
+    expect(await guest.post('/i/claim', { secret })).toMatchObject(barred);
+    await first.close();
+
+    const second = await startRun(dir, idp);
+    const back = await resumeOn(second, page);
+    expect(back.welcome?.resumed).toBe(true);
+    expect((await latest(back, 'invites')).invites.map((invite) => invite.inviteId)).toEqual([
+      inviteId,
+    ]);
+    const asked = back.all('attach_request').length;
+    const again = await signedInAtI({ relay: second.relay, provider: idp }, GUEST, GUEST_EMAIL);
+    expect(await again.post('/i/claim', { secret })).toMatchObject(barred);
+    // Another subject with the same verified email, written another way.
+    const other = await signedInAtI(
+      { relay: second.relay, provider: idp },
+      'sub-guest-new',
+      'GUEST@Example.com',
+    );
+    expect(await other.post('/i/claim', { secret })).toMatchObject(barred);
+    await back.sync();
+    expect(back.all('attach_request')).toHaveLength(asked);
+  });
+
+  it('keeps the uses a link has left, so it admits exactly as many more accounts (S14)', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const first = await startRun(dir, idp);
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    const { secret } = await mintOk(page, { uses: 3 });
+    for (const n of [1, 2]) {
+      const phone = await signedInAtI(
+        { relay: first.relay, provider: idp },
+        `sub-g${String(n)}`,
+        `g${String(n)}@example.com`,
+      );
+      expect((await joinAtI(phone, page, secret)).settled).toMatchObject({ status: 'approved' });
+    }
+    expect((await latest(page, 'invites')).invites[0]?.usesLeft).toBe(1);
+    await first.close();
+
+    const second = await startRun(dir, idp);
+    const back = await resumeOn(second, page);
+    expect((await latest(back, 'invites')).invites[0]?.usesLeft).toBe(1);
+    const third = await signedInAtI(
+      { relay: second.relay, provider: idp },
+      'sub-g3',
+      'g3@example.com',
+    );
+    expect((await joinAtI(third, back, secret)).settled).toMatchObject({ status: 'approved' });
+    const fourth = await signedInAtI(
+      { relay: second.relay, provider: idp },
+      'sub-g4',
+      'g4@example.com',
+    );
+    expect(await fourth.post('/i/claim', { secret })).toMatchObject({
+      status: 404,
+      data: { error: 'pairing_expired' },
+    });
+    await back.sync();
+    expect(rosterIds(back).filter((userId) => userId.startsWith(INVITEE_ID_PREFIX))).toHaveLength(
+      3,
+    );
+  });
+
+  it('keeps a control link refused twice one refusal from burning (S14)', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const first = await startRun(dir, idp);
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    const { inviteId, link } = await mintOk(page, { role: 'driver' });
+    const guest = await first.claude(GUEST, GUEST_EMAIL);
+    for (let n = 1; n <= 2; n += 1) {
+      const { outcome } = await redeem(guest, page, link, { allow: false });
+      expect(outcome.text).toMatch(/^denied_by_operator: /);
+    }
+    expect((await latest(page, 'invites')).invites[0]?.refusals).toBe(2);
+    await first.close();
+
+    const second = await startRun(dir, idp);
+    const back = await resumeOn(second, page);
+    expect((await latest(back, 'invites')).invites[0]?.refusals).toBe(2);
+    const guestAgain = await second.claude(GUEST, GUEST_EMAIL);
+    const { outcome } = await redeem(guestAgain, back, link, { allow: false });
+    expect(outcome.text).toMatch(/^denied_by_operator: /);
+    expect((await latest(back, 'invites')).invites).toEqual([]);
+    expect(second.relay.audit.events()).toContainEqual(
+      expect.objectContaining({ type: 'invite_closed', inviteId, reason: 'burned' }),
+    );
+    expect((await call(guestAgain, 'pair_page', { invite: link })).text).toMatch(
+      /^pairing_expired: /,
+    );
+  });
+
+  it("keeps an agent token's timed-out prompts, so its third still burns it (S14)", async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const timings = { attachRequestTtlMs: 200 };
+    const first = await startRun(dir, idp, { timings });
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    const minted = await mintAgent(page);
+    const prompt = async (run: Run, shown: TestPage): Promise<void> => {
+      await agentRequest(run.relay.url, minted.token, AGENT_INITIALIZE);
+      await shown.next('attach_request');
+      await eventually(async () => {
+        await shown.sync();
+        return shown.all('agents').at(-1)?.agents[0]?.state !== 'asking';
+      });
+    };
+    for (let n = 1; n <= 2; n += 1) await prompt(first, page);
+    expect((await latest(page, 'agents')).agents[0]).toMatchObject({
+      state: 'dormant',
+      timeouts: 2,
+    });
+    await first.close();
+
+    const second = await startRun(dir, idp, { timings });
+    const back = await resumeOn(second, page);
+    expect((await latest(back, 'agents')).agents[0]).toMatchObject({ timeouts: 2 });
+    await agentRequest(second.relay.url, minted.token, AGENT_INITIALIZE);
+    await back.next('attach_request');
+    await eventually(() =>
+      second.relay.audit
+        .events()
+        .some(
+          (event) =>
+            event.type === 'agent_closed' &&
+            event.tokenId === minted.tokenId &&
+            event.reason === 'burned',
+        ),
+    );
+    expect((await agentRequest(second.relay.url, minted.token, AGENT_INITIALIZE)).status).toBe(404);
+  });
+
   it('is used at most once: the start removes the file, and a copy put back later is refused', async () => {
     const idp = await provider();
     const dir = auditDir();
@@ -654,6 +825,45 @@ describe('a graceful restart with TABDOCK_RESTART_SNAPSHOT on (A6.18)', () => {
     // Carol signs in as bob now, and holds none of the page.
     const carol = await second.claude('sub-carol');
     expect((await call(carol, 'call_page_tool', getView(page.pageId))).isError).toBe(true);
+  });
+
+  it("keeps a revoke bar on the account when the list in force moves the barred member's id (S14)", async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const members = join(privateDir(), 'members.txt');
+    const save = (lines: string[]): void => {
+      writeFileSync(`${members}.new`, `${lines.join('\n')}\n`, { mode: 0o600 });
+      renameSync(`${members}.new`, members);
+    };
+    save(['sub-alice=alice:Alice', 'sub-carol=carol:Carol']);
+    const first = await startRun(dir, idp, { membersFile: members });
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    const { secret, inviteId } = await mintOk(page, { uses: 5 });
+    const carol = await signedInAtI({ relay: first.relay, provider: idp }, 'sub-carol', null);
+    const joined = await joinAtI(carol, page, secret, { allow: true, role: 'observer' });
+    expect(joined.request.user.userId).toBe('carol');
+    // Revoked with the link kept open, as the widget does with its box unticked.
+    page.send({ t: 'revoke', userId: 'carol' });
+    await latest(page, 'roster');
+    expect(rosterIds(page)).toEqual(['alice']);
+    await first.close();
+
+    // While the relay is down, Carol's subject is given another id.
+    save(['sub-alice=alice:Alice', 'sub-carol=carol2:Carol']);
+    const second = await startRun(dir, idp, { membersFile: members });
+    const back = await resumeOn(second, page);
+    expect(back.welcome?.resumed).toBe(true);
+    expect((await latest(back, 'invites')).invites.map((invite) => invite.inviteId)).toEqual([
+      inviteId,
+    ]);
+    const again = await signedInAtI({ relay: second.relay, provider: idp }, 'sub-carol', null);
+    expect(await again.post('/i/claim', { secret })).toMatchObject({
+      status: 403,
+      data: { error: 'denied_by_operator' },
+    });
+    await back.sync();
+    expect(back.all('attach_request')).toEqual([]);
   });
 
   it('writes no snapshot while a member list change is still owed, so what it ends never comes back (S8, S13)', async () => {
@@ -1330,6 +1540,50 @@ describe('taking the file (snapshot.ts)', () => {
     }
   });
 
+  it('puts back every term of an invite and an agent token it saves, but the prompt waiting on one (S14)', () => {
+    // Every field set, none at its default, so a restore that resets one shows.
+    const invite: InviteRecord = {
+      inviteId: 'inv_1',
+      pageId: 'pg_1',
+      role: 'driver',
+      label: 'class',
+      uses: 5,
+      usesLeft: 2,
+      createdAt: 10,
+      requestedExpiresAt: 30,
+      expiresAt: 20,
+      ownExpiresAt: 25,
+      secretHash: 'b'.repeat(64),
+      sponsor: { userId: 'alice', displayName: 'Alice' },
+      pendingRequestId: 'req_1',
+      refusals: 2,
+      barredUserIds: [`${INVITEE_ID_PREFIX}${'cd'.repeat(16)}`],
+      barredEmailHashes: ['e'.repeat(64)],
+    };
+    expect(restoredInvite(savedInvite(invite))).toEqual({ ...invite, pendingRequestId: null });
+    const agent: AgentTokenRecord = {
+      tokenId: 'agt_1',
+      pageId: 'pg_1',
+      label: 'bot',
+      secretHash: 'c'.repeat(64),
+      createdAt: 10,
+      expiresAt: 20,
+      requestedExpiresAt: 21,
+      sponsor: { userId: 'alice', displayName: 'Alice' },
+      state: 'asking',
+      requestId: 'req_2',
+      timeouts: 2,
+      userId: `${INVITEE_ID_PREFIX}${'ab'.repeat(16)}`,
+      client: { name: 'claude-code', version: '2.0.0' },
+    };
+    // A token that was asking comes back dormant, its prompt gone with the restart.
+    expect(restoredAgent(savedAgent(agent))).toEqual({
+      ...agent,
+      state: 'dormant',
+      requestId: null,
+    });
+  });
+
   it('removes only the temporary files a stop cut short leaves, never following a link', () => {
     const dir = privateDir();
     const cutShort = plantTemporary(dir);
@@ -1568,6 +1822,209 @@ describe("fitting this relay's settings (snapshot.ts, fitProblem)", () => {
       'a page from an origin this relay does not allow',
     );
     expect(fitProblem(snapshotOf([], [unnamed]), config({ allowMissingOrigin: true }))).toBeNull();
+  });
+});
+
+describe('what ran out while the relay was down (S7, ADR 0046)', () => {
+  const GUEST_ID = `${INVITEE_ID_PREFIX}${'cd'.repeat(16)}`;
+  const AGENT_ID = `${INVITEE_ID_PREFIX}${'ab'.repeat(16)}`;
+  const sponsor = { userId: DEV_ALICE.userId, displayName: DEV_ALICE.displayName };
+
+  /** A hub with invites and agent tokens on, holding nothing yet. */
+  function hubOf(): { hub: PageHub; store: ReturnType<typeof createMemoryStore> } {
+    const store = createMemoryStore();
+    const config = resolveConfig({
+      auth: createDevTokenAuth([DEV_ALICE]),
+      invites: true,
+      agentTokens: true,
+    });
+    return { hub: new PageHub(config, store, createLogger({ sink: () => undefined })), store };
+  }
+
+  function snapshotOf(
+    now: number,
+    parts: Partial<Pick<RelaySnapshot, 'attachments' | 'invites' | 'agents'>> & {
+      page?: Partial<SnapshotPage>;
+    },
+  ): RelaySnapshot {
+    return RelaySnapshotSchema.parse({
+      v: SNAPSHOT_VERSION,
+      writtenAt: now - 8 * MINUTE,
+      mode: 'dev_tokens',
+      credentials: null,
+      pages: [
+        savedPageOf('pg_1', now, {
+          ceiling: PolicySchema.parse({ invites: 'all', maxDrivers: 2, proposals: 'members' }),
+          ...parts.page,
+        }),
+      ],
+      attachments: parts.attachments ?? [],
+      invites: parts.invites ?? [],
+      agents: parts.agents ?? [],
+    });
+  }
+
+  function inviteOf(expiresAt: number): SnapshotInvite {
+    return {
+      inviteId: 'inv_1',
+      pageId: 'pg_1',
+      role: 'observer',
+      label: 'class',
+      uses: 5,
+      usesLeft: 5,
+      createdAt: expiresAt - 30 * MINUTE,
+      requestedExpiresAt: expiresAt,
+      expiresAt,
+      ownExpiresAt: expiresAt,
+      secretHash: 'b'.repeat(64),
+      sponsor,
+      refusals: 0,
+      barredUserIds: [],
+      barredEmailHashes: [],
+    };
+  }
+
+  function agentOf(expiresAt: number): SnapshotAgent {
+    return {
+      tokenId: 'agt_1',
+      pageId: 'pg_1',
+      label: 'bot',
+      secretHash: 'c'.repeat(64),
+      createdAt: expiresAt - 30 * MINUTE,
+      expiresAt,
+      requestedExpiresAt: expiresAt,
+      sponsor,
+      state: 'dormant',
+      timeouts: 0,
+      userId: AGENT_ID,
+      client: null,
+    };
+  }
+
+  function guestOf(expiresAt: number, endsAt: number): SnapshotAttachment {
+    return savedAttachmentOf('pg_1', GUEST_ID, {
+      kind: 'invitee',
+      lastUsedAt: expiresAt - 5 * MINUTE,
+      expiresAt,
+      inviteId: 'inv_0',
+      endsAt,
+      inviteRole: 'observer',
+      sponsorId: sponsor.userId,
+    });
+  }
+
+  function sessionEndingAt(endsAt: number): Partial<SnapshotPage> {
+    return {
+      timedSession: {
+        sessionId: 'ses_1',
+        startedAt: endsAt - 30 * MINUTE,
+        endsAt,
+        lengthMs: 30 * MINUTE,
+        policy: { maxDrivers: 1, proposals: 'off' },
+      },
+    };
+  }
+
+  /** The records a restore wrote, each as its type, reason and what it names. */
+  async function restored(snapshot: RelaySnapshot): Promise<string[]> {
+    const { hub, store } = hubOf();
+    hub.restoreSnapshot(snapshot, { ageMs: 8 * MINUTE, accounts: snapshotAccounts(null) });
+    await hub.shutdown();
+    return store.audit
+      .records()
+      .filter((record) => record.type !== 'snapshot_loaded')
+      .map((record) => {
+        const named =
+          record.type === 'session_end'
+            ? `${record.sessionId} attachments=${String(record.attachments)}`
+            : 'tokenId' in record
+              ? record.tokenId
+              : 'inviteId' in record
+                ? record.inviteId
+                : 'userId' in record
+                  ? record.userId
+                  : 'sponsor' in record
+                    ? record.sponsor
+                    : '';
+        return `${record.type} ${'reason' in record ? record.reason : ''} ${named}`;
+      });
+  }
+
+  it("ends an invite and a token that ran out before their sponsor's idle end as expired, not as the sponsor's", async () => {
+    const now = Date.now();
+    const records = await restored(
+      snapshotOf(now, {
+        attachments: [
+          savedAttachmentOf('pg_1', sponsor.userId, {
+            lastUsedAt: now - 30 * MINUTE,
+            expiresAt: now - MINUTE,
+          }),
+        ],
+        invites: [inviteOf(now - 2 * MINUTE)],
+        agents: [agentOf(now - 2 * MINUTE)],
+      }),
+    );
+    // As timers that never stopped would have: the invite and the token at
+    // their own end, then Alice's idle end, which takes nothing more.
+    expect(records.slice(0, 2).sort()).toEqual([
+      'agent_closed expired agt_1',
+      'invite_closed expired inv_1',
+    ]);
+    expect(records.slice(2)).toEqual([`expire idle ${sponsor.userId}`]);
+  });
+
+  it("ends a guest whose idle end came before the session's as idle, and the session's end counts none", async () => {
+    const now = Date.now();
+    const sessionEnd = now - 2 * MINUTE;
+    const records = await restored(
+      snapshotOf(now, {
+        page: sessionEndingAt(sessionEnd),
+        attachments: [
+          savedAttachmentOf('pg_1', sponsor.userId),
+          guestOf(now - 4 * MINUTE, sessionEnd),
+        ],
+      }),
+    );
+    expect(records).toEqual([`expire idle ${GUEST_ID}`, 'session_end time ses_1 attachments=0']);
+  });
+
+  it('judges an idle end that came before an invited end as idle, at its own time', async () => {
+    const now = Date.now();
+    const records = await restored(
+      snapshotOf(now, {
+        attachments: [
+          savedAttachmentOf('pg_1', sponsor.userId),
+          guestOf(now - 4 * MINUTE, now - 2 * MINUTE),
+        ],
+      }),
+    );
+    expect(records).toEqual([`expire idle ${GUEST_ID}`]);
+  });
+
+  it('still ends a guest at its invited end as ends_at, and with a session that ended first as the session', async () => {
+    const now = Date.now();
+    expect(
+      await restored(
+        snapshotOf(now, {
+          attachments: [
+            savedAttachmentOf('pg_1', sponsor.userId),
+            guestOf(now - 2 * MINUTE, now - 2 * MINUTE),
+          ],
+        }),
+      ),
+    ).toEqual([`expire ends_at ${GUEST_ID}`]);
+    const sessionEnd = now - 5 * MINUTE;
+    expect(
+      await restored(
+        snapshotOf(now, {
+          page: sessionEndingAt(sessionEnd),
+          attachments: [
+            savedAttachmentOf('pg_1', sponsor.userId),
+            guestOf(now - 2 * MINUTE, sessionEnd),
+          ],
+        }),
+      ),
+    ).toEqual([`expire session_ended ${GUEST_ID}`, 'session_end time ses_1 attachments=1']);
   });
 });
 

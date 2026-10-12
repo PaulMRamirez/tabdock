@@ -132,7 +132,7 @@ import { type AgentCloseReason, AgentTokens } from './agents.ts';
 import { type HeldTally, holdValue } from './held-tally.ts';
 import type { LogFields, Logger, LogLevel } from './log.ts';
 import type { MemberChange } from './members.ts';
-import { PageParts } from './page-parts.ts';
+import { type AttachmentEnd, PageParts } from './page-parts.ts';
 import { PageStates, type StateView } from './page-state.ts';
 import {
   madeByAgentToken,
@@ -1088,7 +1088,7 @@ const WAIT_REFUSALS: Record<'user' | 'page' | 'invitee', string> = {
 const PROPOSAL_REFUSALS: Record<'user' | 'page' | 'recent' | 'share' | 'relay', string> = {
   user: `you already have ${String(MAX_PENDING_PROPOSALS_PER_USER)} proposals waiting on this page; wait for the operator, or withdraw one with withdraw_proposal`,
   page: `this page already has ${String(MAX_PENDING_PROPOSALS_PER_PAGE)} proposals waiting for its operator; try again later`,
-  recent: `proposals withdrawn or refused on this page keep their places for ${formatDuration(PROPOSAL_PLACE_HOLD_MS)}, so the page is not asked too often; try again shortly`,
+  recent: `proposals withdrawn, left by a detach or refused on this page keep their places for ${formatDuration(PROPOSAL_PLACE_HOLD_MS)}, so the page is not asked too often; try again shortly`,
   share:
     "your proposals waiting across pages already hold as much of the relay's memory as one user's may; wait for their operators, or withdraw one with withdraw_proposal",
   relay: 'the relay holds as many proposals as it can; try again later',
@@ -1453,6 +1453,12 @@ export class PageHub {
   readonly #firstClassLists = new Map<string, FirstClassSnapshot>();
   /** Told the users whose first-class list may have changed; the notifier reads it later. */
   #firstClassListener: ((userId: string) => void) | null = null;
+  /**
+   * The id that stands for a user id's account whatever id the member list
+   * gives it (members.ts, accountIdOf), which an invite's revoke bar holds;
+   * each id stands for itself with no list (useAccountIds).
+   */
+  #accountIdOf: (userId: string) => string = (userId) => userId;
   /** The only place CfWorker runs: a worker thread with a time budget per check (ADR 0010). */
   readonly #checker: ArgumentChecker;
   /** When each page last got a roster, for EXPIRY_ROSTER_REFRESH_MS. */
@@ -2455,9 +2461,17 @@ export class PageHub {
     if (send) this.#sendInvites(pageId);
   }
 
-  /** Bars an account, and its verified email when it has one, from an invite for the invite's life. */
+  /**
+   * Bars an account, and its verified email when it has one, from an invite
+   * for the invite's life. The bar names the account, never a member id the
+   * file assigned (#accountIdOf): a member list change that removes the
+   * account, moves its id or makes a barred invitee a member clears nothing,
+   * since no redemption clears a revoke, and bars nobody the file gives the
+   * old id to next (S14, ADR 0017).
+   */
   #bar(invite: InviteRecord, userId: string, emailHash: string | null): void {
-    if (!invite.barredUserIds.includes(userId)) invite.barredUserIds.push(userId);
+    const accountId = this.#accountIdOf(userId);
+    if (!invite.barredUserIds.includes(accountId)) invite.barredUserIds.push(accountId);
     if (emailHash !== null && !invite.barredEmailHashes.includes(emailHash)) {
       invite.barredEmailHashes.push(emailHash);
     }
@@ -2465,7 +2479,11 @@ export class PageHub {
   }
 
   #barred(invite: InviteRecord, userId: string, account: UserAccount): boolean {
-    if (invite.barredUserIds.includes(userId)) return true;
+    // The id as given too, so a bar a relay without the account rule saved still holds.
+    const { barredUserIds } = invite;
+    if (barredUserIds.includes(userId) || barredUserIds.includes(this.#accountIdOf(userId))) {
+      return true;
+    }
     return (
       account.kind === 'invitee' &&
       account.email !== null &&
@@ -3269,6 +3287,16 @@ export class PageHub {
    */
   onAgentClosed(listener: (userId: string) => void): void {
     this.#agentListener = listener;
+  }
+
+  /**
+   * How to find the account behind a user id under the member list in force
+   * (relay.ts hands it MemberList.accountIdOf when there is a list), so an
+   * invite's revoke bar follows the account across member list changes and
+   * restarts (#bar, S14). It must answer from the list alone.
+   */
+  useAccountIds(accountIdOf: (userId: string) => string): void {
+    this.#accountIdOf = accountIdOf;
   }
 
   /**
@@ -4784,7 +4812,7 @@ export class PageHub {
   #endAttachments(
     pageId: string,
     users: ReadonlySet<string>,
-    reason: 'revoked' | 'client',
+    reason: AttachmentEnd,
     message: string,
   ): void {
     for (const userId of users) {
@@ -4797,7 +4825,7 @@ export class PageHub {
     // and a 2025-era call waiting on its question answers now (S8).
     this.#confirmations.drop(pageId, users, outcome);
     // Nor a wait, a proposal or an agent token's hold (S8, page-parts.ts).
-    this.#parts.attachmentsEnded(pageId, users, outcome);
+    this.#parts.attachmentsEnded(pageId, users, outcome, reason);
     // Queued calls first, so a running one settling does not hand the page a call that is ending.
     for (const call of [...(this.#queues.get(pageId)?.waiting ?? [])]) {
       if (users.has(call.caller.userId)) call.settle(outcome);
@@ -4830,10 +4858,13 @@ export class PageHub {
    * Ends an attachment past its expiresAt like a revoke, with an expire
    * record: unused too long, or an invite-made one at its end, 24 hours
    * after redemption however much it is used (S14). True if it ended.
+   * `lapsedAt`, from a restore, is when it ran out while the relay was down:
+   * its reason is judged then, and the session, whose end the restore has
+   * already run in order, is left alone (#endLapsed).
    */
-  #expireIfDue(pageId: string, userId: string): boolean {
+  #expireIfDue(pageId: string, userId: string, lapsedAt?: number): boolean {
     // An end the session capped is the session's to end, whichever timer runs first (ADR 0043).
-    this.#endSessionIfDue(pageId);
+    if (lapsedAt === undefined) this.#endSessionIfDue(pageId);
     const attachment = this.#store.attachments.get(pageId, userId);
     if (!attachment || attachment.expiresAt === null) return false;
     const now = Date.now();
@@ -4842,7 +4873,7 @@ export class PageHub {
       this.#armExpiry(attachment);
       return false;
     }
-    const ended = attachment.endsAt !== null && attachment.endsAt <= now;
+    const ended = attachment.endsAt !== null && attachment.endsAt <= (lapsedAt ?? now);
     const idle = formatDuration(this.#config.timings.attachmentIdleMs);
     this.#endAttachments(
       pageId,
@@ -8128,8 +8159,9 @@ export class PageHub {
    * change would, an account the list in force no longer gives to the same
    * person loses what it held, and what it sponsored goes with it, each with
    * its records (S8, S13, S14), and those who stay take the names the list
-   * gives them (ADR 0017); a session past its end ends with reason time;
-   * and an attachment, invite or token past its time ends, the rest timed
+   * gives them (ADR 0017); then the session, attachments, invites and
+   * tokens past their time end in the order their timers would have ended
+   * them, the session with reason time (#endLapsed), and the rest are timed
    * again from their stored ends. snapshot_loaded counts what is live after
    * all that, with the attachments the member list dropped.
    */
@@ -8217,17 +8249,7 @@ export class PageHub {
       });
     }
     // What ran out while the relay was down ends now, as each timer would end it.
-    for (const pageId of pageIds) {
-      this.#endSessionIfDue(pageId);
-      for (const attachment of this.#store.attachments.listForPage(pageId)) {
-        this.#expireIfDue(pageId, attachment.userId);
-      }
-      for (const invite of this.#store.invites.listForPage(pageId)) {
-        if (invite.expiresAt <= now) this.#closeInvite(invite, 'expired', false);
-        else this.#armInviteExpiry(invite);
-      }
-      for (const agent of this.#store.agents.listForPage(pageId)) this.#agents.inTime(agent, now);
-    }
+    for (const pageId of pageIds) this.#endLapsed(pageId, now);
     const loaded: AuditEventOf<'snapshot_loaded'> = {
       v: AUDIT_VERSION,
       type: 'snapshot_loaded',
@@ -8245,5 +8267,68 @@ export class PageHub {
     };
     this.#audit(loaded);
     return loaded;
+  }
+
+  /**
+   * Ends what ran out on a restored page while the relay was down in the
+   * order a relay that never stopped would have ended it (ADR 0046), so each
+   * record names the reason its own timer would have given (S7): the
+   * session, each attachment, invite and agent token at or before `now`,
+   * oldest end first, a tie going to the session, whose end a capped
+   * expiry is, and then to an invite or a token, whose own end it is,
+   * before an attachment. Each goes through the end its timer runs,
+   * skipped when an earlier end already took it, and an attachment is
+   * judged idle or at its invited end at its own expiry, not at the load.
+   * What is still to come is timed again from its stored end.
+   */
+  #endLapsed(pageId: string, now: number): void {
+    const lapsed: { at: number; rank: number; end: () => void }[] = [];
+    const session = this.#store.pages.get(pageId)?.timedSession ?? null;
+    if (session !== null && session.endsAt <= now) {
+      lapsed.push({
+        at: session.endsAt,
+        rank: 0,
+        end: () => {
+          if (this.#store.pages.get(pageId)?.timedSession?.sessionId === session.sessionId) {
+            this.#endSession(pageId, 'time');
+          }
+        },
+      });
+    }
+    for (const invite of this.#store.invites.listForPage(pageId)) {
+      if (invite.expiresAt > now) continue;
+      lapsed.push({
+        at: invite.expiresAt,
+        rank: 1,
+        end: () => {
+          const current = this.#store.invites.get(pageId, invite.inviteId);
+          if (current) this.#closeInvite(current, 'expired', false);
+        },
+      });
+    }
+    for (const agent of this.#store.agents.listForPage(pageId)) {
+      // inTime closes it as expired only while it is still the live token.
+      if (agent.expiresAt <= now) {
+        lapsed.push({ at: agent.expiresAt, rank: 1, end: () => this.#agents.inTime(agent, now) });
+      }
+    }
+    for (const attachment of this.#store.attachments.listForPage(pageId)) {
+      const { userId, expiresAt } = attachment;
+      if (expiresAt === null || expiresAt > now) continue;
+      lapsed.push({
+        at: expiresAt,
+        rank: 2,
+        end: () => this.#expireIfDue(pageId, userId, expiresAt),
+      });
+    }
+    lapsed.sort((a, b) => a.at - b.at || a.rank - b.rank);
+    for (const { end } of lapsed) end();
+    // The rest are timed from their stored ends: a session's timer, each
+    // attachment's and each invite's (a token's was armed as it came back).
+    this.#endSessionIfDue(pageId);
+    for (const attachment of this.#store.attachments.listForPage(pageId)) {
+      this.#armExpiry(attachment);
+    }
+    for (const invite of this.#store.invites.listForPage(pageId)) this.#armInviteExpiry(invite);
   }
 }

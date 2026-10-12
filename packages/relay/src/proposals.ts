@@ -41,7 +41,7 @@ import {
 } from '@tabdock/protocol';
 import { type HeldTally, holdValue } from './held-tally.ts';
 import type { CallerIdentity, HubError, ProposalStatus } from './hub.ts';
-import type { PagePart } from './page-parts.ts';
+import type { AttachmentEnd, PagePart } from './page-parts.ts';
 
 /**
  * What one proposal costs beside its values: the record, its map and set
@@ -77,18 +77,22 @@ export const MAX_PROPOSAL_CHARGE =
 const USER_SHARE_DIVISOR = 8;
 
 /**
- * How long a proposal withdrawn by its proposer, or refused by the page,
- * keeps its place among its proposer's MAX_PENDING_PROPOSALS_PER_USER and
- * the page's MAX_PENDING_PROPOSALS_PER_PAGE. withdraw_proposal freed a place
- * at once, so proposing and withdrawing at the call rate sent the operator's
- * tab a proposal frame to check, hash and show each time, however few
- * waited: forty invitees at 30 a minute each. Now, beyond the places the
- * operator frees by deciding, a page is sent at most
- * MAX_PENDING_PROPOSALS_PER_PAGE new proposals a minute.
+ * How long a proposal withdrawn by its proposer, cancelled by its proposer's
+ * own detach_page, or refused by the page, keeps its place among its
+ * proposer's MAX_PENDING_PROPOSALS_PER_USER and the page's
+ * MAX_PENDING_PROPOSALS_PER_PAGE. withdraw_proposal freed a place at once,
+ * so proposing and withdrawing at the call rate sent the operator's tab a
+ * proposal frame to check, hash and show each time, however few waited:
+ * forty invitees at 30 a minute each. A detach withdraws everything its
+ * user had pending, and on a page that lets them pair again unasked
+ * (autoApprove 'observer', a watch invite) detaching and pairing again did
+ * the same at the pairing rate. Now, beyond the places the operator frees
+ * by deciding, a page is sent at most MAX_PENDING_PROPOSALS_PER_PAGE new
+ * proposals a minute.
  */
 export const PROPOSAL_PLACE_HOLD_MS = 60_000;
 
-/** Ends that free a place without the operator: the proposer's, or a page refusing what the relay let through. */
+/** Ends that free a place without the operator: the proposer's, or a page refusing what the relay let through. A detach holds one too (attachmentsEnded). */
 const HOLDS_PLACE: ReadonlySet<ProposalCloseReason> = new Set(['withdrawn', 'refused']);
 
 /** What a proposal's arguments are charged while it may still run: V8 keeps a string at two bytes a unit at most. */
@@ -539,12 +543,17 @@ export class PageProposals implements PagePart {
     entry.timer = null;
   }
 
-  #end(entry: Entry, reason: ProposalCloseReason, frame: ProposalEndReason | null): boolean {
+  #end(
+    entry: Entry,
+    reason: ProposalCloseReason,
+    frame: ProposalEndReason | null,
+    holdsPlace = HOLDS_PLACE.has(reason),
+  ): boolean {
     const held = entry.record;
     if (held.status !== 'pending') return false;
     this.#keep(entry);
     held.status = reason;
-    if (HOLDS_PLACE.has(reason)) {
+    if (holdsPlace) {
       const places = this.#places.get(held.pageId) ?? [];
       places.push({
         userId: held.proposer.userId,
@@ -643,12 +652,20 @@ export class PageProposals implements PagePart {
     for (const entry of [...(this.#pages.get(pageId) ?? [])]) this.#forget(entry);
   }
 
-  attachmentsEnded(pageId: string, users: ReadonlySet<string>, outcome: HubError): void {
+  attachmentsEnded(
+    pageId: string,
+    users: ReadonlySet<string>,
+    outcome: HubError,
+    by: AttachmentEnd,
+  ): void {
     for (const entry of this.#pages.get(pageId) ?? []) {
       if (users.has(entry.record.proposer.userId)) this.#wake(entry, outcome);
     }
+    // The proposer's own detach withdraws what they had pending, so those
+    // places are held as a withdrawal's are (PROPOSAL_PLACE_HOLD_MS); every
+    // other end is the operator's, the list's or the clock's, and frees them.
     for (const entry of this.#pending(pageId, users)) {
-      this.#end(entry, 'cancelled', 'attachment_ended');
+      this.#end(entry, 'cancelled', 'attachment_ended', by === 'client');
     }
   }
 

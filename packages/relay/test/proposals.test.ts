@@ -627,10 +627,48 @@ describe('proposal limits (A6.12)', () => {
       expect((await withdrawProposal(bob, opened.pageId, proposalId)).head).toBe('withdrawn');
     }
     expect((await propose(bob, opened.pageId)).text).toBe(
-      'rate_limited: proposals withdrawn or refused on this page keep their places for 1 minute, so the page is not asked too often; try again shortly',
+      'rate_limited: proposals withdrawn, left by a detach or refused on this page keep their places for 1 minute, so the page is not asked too often; try again shortly',
     );
     await opened.sync();
     expect(opened.all('proposal')).toHaveLength(MAX_PENDING_PROPOSALS_PER_USER);
+  });
+
+  it('keeps the places a detach dropped a minute, so detaching and pairing again unasked cannot pass 20 new proposals a minute', async () => {
+    await setup();
+    // Members pair again with no operator click, so only the places bound the loop.
+    const opened = await page({ proposals: 'members', autoApprove: 'observer' });
+    const members: Client[] = [];
+    for (const user of [ALICE, BOB, CAROL]) members.push(await client(user));
+    const refusals: string[] = [];
+    for (let cycle = 0; cycle < 4; cycle += 1) {
+      for (const member of members) {
+        await opened.sync();
+        const paired = await callTool(member, 'pair_page', { code: opened.code });
+        expect(paired.isError, paired.text).toBe(false);
+        for (let n = 0; n < MAX_PENDING_PROPOSALS_PER_USER; n += 1) {
+          const made = await propose(member, opened.pageId);
+          if (made.isError) {
+            refusals.push(made.text);
+            break;
+          }
+        }
+        const detached = await callTool(member, 'detach_page', { page: opened.pageId });
+        expect(detached.isError, detached.text).toBe(false);
+      }
+    }
+    await opened.sync();
+    // Each member's first three, and from the next pairing on, a refusal.
+    expect(opened.all('proposal')).toHaveLength(3 * MAX_PENDING_PROPOSALS_PER_USER);
+    expect(opened.all('proposal').length).toBeLessThanOrEqual(MAX_PENDING_PROPOSALS_PER_PAGE);
+    expect(refusals).toHaveLength(3 * 3);
+    expect(new Set(refusals)).toEqual(
+      new Set([
+        'rate_limited: proposals withdrawn, left by a detach or refused on this page keep their places for 1 minute, so the page is not asked too often; try again shortly',
+      ]),
+    );
+    expect(opened.all('proposal_end').map((frame) => frame.reason)).toEqual(
+      Array<string>(3 * MAX_PENDING_PROPOSALS_PER_USER).fill('attachment_ended'),
+    );
   });
 
   it('refuses arguments past 16 KiB or 1,000 values, and arguments its schema refuses, with no frame', async () => {

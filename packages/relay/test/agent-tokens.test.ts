@@ -5,7 +5,8 @@
 // request raises an ordinary prompt and is never approved in advance (S4),
 // an approved agent reads one page as observer only (S5, S13), and every way
 // a token can end (deny, three timeouts, revoke, Revoke all, Cancel, its
-// sponsor's end, its page's end and its time) closes it with its own record,
+// sponsor's end, its own detach_page, its attachment going unused, its
+// page's end and its time) closes it with its own record,
 // ends its attachment and leaves /g/mcp answering 404, which is all /g/mcp
 // ever answers a token it does not know (S11). The adapter's half (its own
 // record, the presented token, the derived id) is agent-tokens.test.ts there.
@@ -664,6 +665,54 @@ describe('every way a token ends (S8, S14)', () => {
     expect(await relay.relay.reloadMembers()).toBe('applied');
     expect(records(relay, 'agent_closed')).toHaveLength(2);
     expect(records(relay, 'sponsor_gone')).toHaveLength(1);
+    auditValid(relay);
+  });
+
+  it('its own detach_page closes it as revoked, beside the detach record, and the next request gets 404', async () => {
+    const { relay, page } = await room();
+    const { agent, token, tokenId, userId } = await attachedAgent(relay, page);
+    expect((await agentRequest(relay.relay.url, token, INITIALIZE)).status).toBe(200);
+    const detached = await call(agent, 'detach_page', { page: page.pageId });
+    expect(detached.isError, detached.text).toBe(false);
+    await page.sync();
+    expect(records(relay, 'agent_closed').map((event) => [event.tokenId, event.reason])).toEqual([
+      [tokenId, 'revoked'],
+    ]);
+    expect(records(relay, 'detach')).toMatchObject([{ userId }]);
+    expect(relay.store.attachments.get(page.pageId, userId)).toBeUndefined();
+    expect(relay.store.agents.get(page.pageId, tokenId)).toBeUndefined();
+    await gone(relay, token);
+    auditValid(relay);
+  });
+
+  it('its attachment going unused closes it as revoked, beside the idle expire record', async () => {
+    const { relay, page, alice } = await room({ timings: { attachmentIdleMs: 1500 } });
+    const { token, tokenId, userId } = await attachedAgent(relay, page);
+    // Alice, its sponsor, keeps using the page, so her own idle end cannot close it first.
+    const keepAlive = setInterval(() => {
+      void call(alice, 'call_page_tool', {
+        page: page.pageId,
+        tool: READ_TOOL.name,
+        arguments: {},
+      });
+    }, 250);
+    try {
+      await expect
+        .poll(() => records(relay, 'agent_closed').length, { timeout: 5000, interval: 100 })
+        .toBe(1);
+    } finally {
+      clearInterval(keepAlive);
+    }
+    await page.sync();
+    expect(records(relay, 'agent_closed').map((event) => [event.tokenId, event.reason])).toEqual([
+      [tokenId, 'revoked'],
+    ]);
+    expect(records(relay, 'expire').map((event) => [event.userId, event.reason])).toEqual([
+      [userId, 'idle'],
+    ]);
+    expect(relay.store.attachments.get(page.pageId, userId)).toBeUndefined();
+    expect(relay.store.attachments.get(page.pageId, 'alice')).toBeDefined();
+    await gone(relay, token);
     auditValid(relay);
   });
 

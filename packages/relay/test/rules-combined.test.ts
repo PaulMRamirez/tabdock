@@ -1,6 +1,8 @@
 // Where Wave 2's rules meet on one page (ADRs 0042 to 0044): a time-boxed
 // session's end against agent tokens and proposals (C11, C13), a session's
-// narrowing against pending proposals, the watchers' share while a session
+// narrowing against pending proposals and against an accepted run still
+// queued (S5, which the relay holds as well as the adapter), the watchers'
+// share while a session
 // runs, and a waiting agent prompt against a watch redemption for the last
 // watching seat. Each workstream's own file tests its rule alone; these hold
 // the rules together once merged. Against the relay in public URL mode with
@@ -22,8 +24,9 @@ import {
   signedInAtI,
   startInviteRelay,
 } from './helpers/invites.ts';
-import type { TestPage } from './helpers/page-client.ts';
-import { ARGS, getProposal, propose, proposalIdOf } from './helpers/proposals.ts';
+import type { InvokeReply, TestPage } from './helpers/page-client.ts';
+import { ARGS, decide, getProposal, propose, proposalIdOf } from './helpers/proposals.ts';
+import { eventually } from './helpers/relay.ts';
 import { roomLimits } from './helpers/room.ts';
 
 let current: InviteRelay | undefined;
@@ -266,6 +269,49 @@ describe("a session's narrowing against pending proposals (ADR 0042 meeting ADR 
     expect((await getProposal(bob, page.pageId, proposalId)).head).toBe('cancelled');
     // And a write now is refused as before proposals, not proposed.
     expect((await propose(bob, page.pageId)).text).toMatch(/^role_denied/);
+  });
+
+  it('runs no accepted proposal still queued behind a write when a session starts that takes none (S5)', async () => {
+    const { relay, page, alice, bob } = await classroom({}, { proposals: 'members' });
+    // Alice's write is held on the page, so the accepted run waits behind it.
+    let release: ((reply: InvokeReply) => void) | undefined;
+    page.onInvoke = (frame) =>
+      frame.caller.userId === 'alice'
+        ? new Promise<InvokeReply>((resolve) => {
+            release = resolve;
+          })
+        : { ok: true, content: 'proposal ran' };
+    const write = call(alice, 'call_page_tool', {
+      page: page.pageId,
+      tool: 'add_item',
+      arguments: { label: 'held' },
+    });
+    await page.next('invoke');
+    const proposalId = proposalIdOf(await propose(bob, page.pageId));
+    await decide(page, proposalId, true);
+    await page.sync();
+    await start(page, 'ses_quiet', { maxDrivers: 1, proposals: 'off' });
+    release?.({ ok: true, content: 'alice done' });
+    expect((await write).isError).toBe(false);
+    await eventually(() => page.all('proposal_end').length > 0);
+    // Only Alice's invoke went out: the relay refused the run as it left the queue.
+    expect(
+      page.all('invoke').map((frame) => [frame.caller.userId, frame.proposal?.proposalId ?? null]),
+    ).toEqual([['alice', null]]);
+    expect(page.all('proposal_end')).toEqual([
+      { t: 'proposal_end', proposalId, reason: 'not_run' },
+    ]);
+    const read = await getProposal(bob, page.pageId, proposalId);
+    expect(read.head).toBe('accepted');
+    expect(read.text).toContain('role_denied');
+    expect(records(relay, 'call')).toContainEqual(
+      expect.objectContaining({
+        userId: 'bob',
+        proposalId,
+        acceptedOnPage: true,
+        outcome: 'role_denied',
+      }),
+    );
   });
 });
 

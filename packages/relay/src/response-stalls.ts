@@ -60,8 +60,9 @@
 // sessions give way (sessions.ts), until the rest fit. A member's never
 // does, since members are the owner's own and each is bounded by the count
 // above, so members' alone may still pass the total, the 40 above remaining
-// their bound; then nothing is cut, since no cut could bring it under, and a
-// line says so. A response holding no more than one being written holds
+// their bound; then a line says so, and every invited response waiting is cut
+// all the same, since the bound must not lapse when memory is shortest. A
+// response holding no more than one being written holds
 // (RESPONSE_IN_TRANSIT_BYTES) is taken as waiting only once a check finds
 // its client took none of it, so a watcher's stream read as fast as it
 // comes is never cut for the keep-alive that set the check off.
@@ -123,9 +124,9 @@ export const RESPONSE_IN_TRANSIT_BYTES = 65_536 + 2 * RESPONSE_SLICE_BYTES;
 export const RESPONSE_CEILING_LINE =
   'mcp response cut off: responses waiting to be read hold all the relay lets invited accounts hold';
 
-/** The line written, once a window, when members' responses alone pass the ceiling and none is cut. */
+/** The line written, once a window, when members' responses alone pass the ceiling, which no cut can bring them under. */
 export const RESPONSE_CEILING_MEMBERS_LINE =
-  "mcp responses waiting to be read hold more than the relay's ceiling, all of them members'";
+  "mcp responses waiting to be read hold more than the relay's ceiling in members' alone";
 
 /** An answer handed on in slices, and what it has read and not yet handed on. */
 export interface Slices {
@@ -506,8 +507,10 @@ export class ResponseStalls {
   /**
    * Past the ceiling, cuts strangers' responses waiting to be read, oldest
    * first, then guests', until the rest fit; a member's never. When
-   * members' alone pass it, nothing is cut, since no cut could bring the
-   * total under, and a line says so.
+   * members' alone pass it, a line says so, and every invited response
+   * waiting is cut all the same: the total cannot come under, but each byte
+   * let go is memory the ceiling is there to keep, and the bound must not
+   * lapse just when memory is shortest (S9).
    */
   #ceiling(): void {
     if (this.#ceilingBytes === Number.POSITIVE_INFINITY) return;
@@ -515,7 +518,6 @@ export class ResponseStalls {
     if (total <= this.#ceilingBytes) return;
     if (this.#heldByMembers() > this.#ceilingBytes) {
       this.#lines.write('warn', RESPONSE_CEILING_MEMBERS_LINE);
-      return;
     }
     for (const rank of GIVES_WAY) {
       for (const [response, watched] of [...this.#watched]) {

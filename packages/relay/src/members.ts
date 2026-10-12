@@ -197,6 +197,12 @@ function userIdOf(members: ReadonlyMap<string, User>, sub: string): string {
   return members.get(sub)?.userId ?? `${INVITEE_ID_PREFIX}${inviteeKeyOf(sub)}`;
 }
 
+function accountIds(members: ReadonlyMap<string, User>): Map<string, string> {
+  return new Map(
+    [...members].map(([sub, user]) => [user.userId, `${INVITEE_ID_PREFIX}${inviteeKeyOf(sub)}`]),
+  );
+}
+
 /** What one change to the member list did, for the relay to act on. */
 export interface MemberChange {
   /**
@@ -249,6 +255,8 @@ export class MemberList {
   #bySub: Map<string, User>;
   #names: readonly string[];
   #userIds: ReadonlySet<string>;
+  // Each member's id to the id its subject would sign in under as an invitee (accountIdOf).
+  #accountIds: ReadonlyMap<string, string>;
   #digest: string | null;
   #generation = 0;
   // Each id a change ended, at the generation that change made, oldest first.
@@ -261,6 +269,7 @@ export class MemberList {
     this.#bySub = indexed(entries);
     this.#names = [...this.#bySub.values()].map((user) => user.displayName);
     this.#userIds = new Set([...this.#bySub.values()].map((user) => user.userId));
+    this.#accountIds = accountIds(this.#bySub);
     this.#digest = digest;
   }
 
@@ -284,6 +293,19 @@ export class MemberList {
 
   userIds(): ReadonlySet<string> {
     return this.#userIds;
+  }
+
+  /**
+   * The id that stands for the account behind `userId` whatever id the list
+   * gives it: for a member, the id its subject signs in under once the list
+   * no longer names it (INVITEE_ID_PREFIX and inviteeKeyOf), and for any id
+   * the list does not name, that id itself. An invite's revoke bar holds this
+   * (hub.ts, #bar), so a change that removes a member, moves their id or adds
+   * a barred invitee as a member clears no bar, and the next holder of a
+   * moved id is not barred for its former holder (S14, ADR 0017).
+   */
+  accountIdOf(userId: string): string {
+    return this.#accountIds.get(userId) ?? userId;
   }
 
   /**
@@ -347,6 +369,7 @@ export class MemberList {
     this.#bySub = next;
     this.#names = [...next.values()].map((user) => user.displayName);
     this.#userIds = nowIds;
+    this.#accountIds = accountIds(next);
     this.#digest = digest;
     this.#generation += 1;
     for (const id of ended) {

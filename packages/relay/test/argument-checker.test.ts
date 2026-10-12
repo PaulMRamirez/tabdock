@@ -1,6 +1,7 @@
 // The worker that runs argument checks (ADR 0010), on its own: a time budget
 // per check, a busy worker that never makes other checks wait past it, an
-// overrunning or crashing worker replaced (with backoff when it keeps failing),
+// overrunning or crashing worker, or one that never says it is ready,
+// replaced (with backoff when it keeps failing),
 // a reply that reached the port in time read before any timer judges its
 // check, however long other work held the main thread, a bounded cache of
 // compiled schemas, and shutdown that stops the thread. Misbehaving and
@@ -232,6 +233,45 @@ describe('ArgumentChecker', () => {
     const stopped = lines.filter((line) => line.includes('argument check worker stopped'));
     expect(stopped.length).toBeGreaterThanOrEqual(2);
     expect(lines.join('\n')).not.toContain('broken on purpose');
+  });
+
+  it('gives up on a worker that is alive but never says it is ready, and restarts it with backoff', async () => {
+    // As a worker starved of CPU past the start limit looks: it neither
+    // fails nor says ready, so only the start limit ends the wait on it.
+    const START_LIMIT_MS = 300;
+    const started = performance.now();
+    const { checker, lines } = start({
+      entry: fixture('silent-worker.ts'),
+      startLimitMs: START_LIMIT_MS,
+    });
+    // A check meanwhile goes unchecked within its budget, never waiting on the start.
+    expect(await inTime(checker.check('form', FORM, { name: 'Ada' }))).toEqual({
+      kind: 'unchecked',
+      reason: 'unavailable',
+    });
+    // The relay waits on this before it listens, so it must settle, and false.
+    const ready = await Promise.race([checker.ready(), delay(3000).then(() => 'never settled')]);
+    expect(ready).toBe(false);
+    const waited = performance.now() - started;
+    expect(waited).toBeGreaterThanOrEqual(START_LIMIT_MS - 20);
+    expect(waited).toBeLessThan(5000);
+    await delay(1800);
+    // Each start ends at the limit, and from the second in a row the restarts
+    // wait 250 ms, then 500 and 1000: about four starts in 2.1 s, where
+    // without the backoff there would be seven, and without the limit one.
+    expect(checker.generation).toBeGreaterThanOrEqual(3);
+    expect(checker.generation).toBeLessThanOrEqual(5);
+    expect(await inTime(checker.check('form', FORM, { name: 'Ada' }))).toMatchObject({
+      kind: 'unchecked',
+    });
+    // One warning for each start that ran out, and only those, naming no page text.
+    const warned = lines.filter((line) => line.includes('"level":"warn"'));
+    expect(warned.length).toBeGreaterThanOrEqual(checker.generation - 1);
+    expect(warned.length).toBeLessThanOrEqual(checker.generation);
+    for (const line of warned) {
+      expect(line).toContain('the argument check worker did not start in time');
+      expect(line).not.toContain('Ada');
+    }
   });
 
   it('lets a check through unchecked at once when its worker crashes, and starts another', async () => {

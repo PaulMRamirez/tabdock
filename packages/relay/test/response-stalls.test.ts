@@ -663,26 +663,46 @@ describe('the relay-wide ceiling on what responses hold (S9, ADR 0044)', () => {
     close();
   });
 
-  it("cuts no invited account's response while members' alone pass the ceiling, since that could not bring them under", () => {
+  it("still cuts every invited account's waiting response while members' alone pass the ceiling, strangers' first, and never a member's", () => {
     const { stalls, lines, close } = watchCeiling(10 * MB);
     const older = holding(stalls, 'guest-1', 3 * MB);
-    holding(stalls, 'alice', 6 * MB);
-    const bob = holding(stalls, 'bob', 5 * MB);
+    const members = [holding(stalls, 'alice', 6 * MB), holding(stalls, 'bob', 5 * MB)];
     // A stranger's answer and a guest's arrive, each read into its slicer.
-    const arriving = [holding(stalls, 'stranger-1', 720_000), holding(stalls, 'guest-2', 2000)];
+    const stranger = holding(stalls, 'stranger-1', 720_000);
+    const arriving = holding(stalls, 'guest-2', 200_000);
     stalls.chunkQueued();
+    // The total cannot come under, but every invited byte waiting is let
+    // go all the same, the stranger's first, then the guests' oldest first.
+    expect([stranger, older, arriving].map(({ response }) => response.destroyed)).toEqual([
+      true,
+      true,
+      true,
+    ]);
     stalls.check();
-    expect([older, ...arriving].some(({ response }) => response.destroyed)).toBe(false);
-    // Once members' fit again, invited accounts give way as before.
-    bob.response.emit('finish');
-    holding(stalls, 'carol', 0.9 * MB);
-    stalls.answering('carol');
-    // 10.62 MB with members at 6.9 MB: the stranger's goes, and the rest fit.
-    expect(arriving.map(({ response }) => response.destroyed)).toEqual([true, false]);
-    expect(older.response.destroyed).toBe(false);
+    expect(members.some(({ response }) => response.destroyed)).toBe(false);
     close();
     expect(named(lines, RESPONSE_CEILING_MEMBERS_LINE)).toEqual([undefined]);
     expect(named(lines, RESPONSE_CEILING_LINE)).toEqual(['stranger-1']);
+    expect(lines.filter((line) => line.msg === `${RESPONSE_CEILING_LINE}, repeated`)).toEqual([
+      expect.objectContaining({ repeated: 2 }),
+    ]);
+  });
+
+  it("cuts an invited account's waiting response with members' one byte past the ceiling, as at it", () => {
+    for (const over of [0, 1]) {
+      const { stalls, lines, close } = watchCeiling(10 * MB);
+      const guest = holding(stalls, 'guest-1', 1 * MB);
+      const member = holding(stalls, 'alice', 10 * MB + over);
+      stalls.answering('alice');
+      expect(
+        [guest.response.destroyed, member.response.destroyed],
+        `members ${String(over)} byte past`,
+      ).toEqual([true, false]);
+      close();
+      expect(named(lines, RESPONSE_CEILING_LINE)).toEqual(['guest-1']);
+      expect(named(lines, RESPONSE_CEILING_MEMBERS_LINE)).toEqual(over === 0 ? [] : [undefined]);
+      vi.useRealTimers();
+    }
   });
 
   it('holds the ceiling as a slicer queues a chunk and at every check, before any answer is handed over', () => {
