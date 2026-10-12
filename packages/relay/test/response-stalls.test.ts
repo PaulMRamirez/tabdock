@@ -21,7 +21,7 @@ import { join } from 'node:path';
 import { type NodeIncomingMessageLike, toNodeHandler } from '@modelcontextprotocol/node';
 import type { AuthInfo } from '@modelcontextprotocol/server';
 import { MAX_RESULT_CHARS } from '@tabdock/protocol';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MIN_RESPONSE_BYTES } from '../src/config.ts';
 import {
   type AttachmentRecord,
@@ -1077,9 +1077,28 @@ async function serveOne(
   };
 }
 
+/** The repeated-lines window the real-socket tests write under, as relay.ts sets it. */
+const REAL_LINE_WINDOW_MS = 60_000;
+/** More than any real-socket test below takes from its first line to its last, even under load. */
+const REAL_LINE_ROOM_MS = 15_000;
+
 describe.skipIf(process.platform === 'win32')(
   'on a real socket, written as relay.ts writes it (ADR 0032)',
   () => {
+    // These tests count the lines a run writes: one per kind, the rest held
+    // for the window's summary. The window is the wall clock's own minute
+    // (repeated-lines.ts), so a run that straddles a minute's end rightly
+    // writes the same line again in the next, which once failed the A6.20
+    // room test with two of guest-1's cut lines. Each test therefore starts
+    // with at least REAL_LINE_ROOM_MS left in its window, waiting into the
+    // next minute when it would not.
+    beforeEach(async () => {
+      const left = REAL_LINE_WINDOW_MS - (Date.now() % REAL_LINE_WINDOW_MS);
+      if (left < REAL_LINE_ROOM_MS) {
+        await new Promise((resolve) => setTimeout(resolve, left + 50));
+      }
+    }, REAL_LINE_ROOM_MS + 5_000);
+
     function realStalls(options: Omit<ResponseStallOptions, 'lines'> = {}): {
       stalls: ResponseStalls;
       lines: Record<string, unknown>[];
@@ -1091,7 +1110,7 @@ describe.skipIf(process.platform === 'win32')(
         },
       });
       const stalls = new ResponseStalls({
-        lines: createRepeatedLog(log, 60_000),
+        lines: createRepeatedLog(log, REAL_LINE_WINDOW_MS),
         checkMs: REAL_CHECK_MS,
         ...options,
       });
