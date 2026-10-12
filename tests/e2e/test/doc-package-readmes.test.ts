@@ -6,10 +6,12 @@
 // adapter's entry exports is named in its README and on guide page 04 or 13,
 // where a page author looks it up; every test and spec in tests/e2e is named
 // in that package's README; and every directory under apps/ and tests/ has a
-// README of its own.
+// README of its own. The protocol README's line for images.ts also names each
+// check that module runs on an image's bytes, animation included.
 
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import type { ImageRefusal } from '@tabdock/protocol';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import { existsInRepo, readRepo, ROOT } from '../src/doc-files.ts';
@@ -119,6 +121,27 @@ describe('the package READMEs', () => {
       ).toEqual([]);
     });
   }
+
+  it("say, in the protocol README, each check images.ts runs on an image's bytes", () => {
+    // Keyed by ImageRefusal, so a new refusal fails typecheck until it has its words here.
+    // undeclared and off read the policy and the cap, never the image.
+    const words: Record<ImageRefusal, string | null> = {
+      undeclared: null,
+      off: null,
+      type: 'type',
+      size: 'size',
+      encoding: 'base64',
+      signature: 'first bytes',
+      dimensions: 'header dimensions',
+      animated: 'animated',
+    };
+    const readme = readRepo('packages/protocol/README.md');
+    const start = readme.indexOf('`images.ts`');
+    expect(start).toBeGreaterThan(-1);
+    const clause = readme.slice(start, readme.indexOf(';', start));
+    const unsaid = Object.values(words).filter((word) => word !== null && !clause.includes(word));
+    expect(unsaid).toEqual([]);
+  });
 
   it("name each value the adapter's entry exports, in its README and on page 04 or 13", () => {
     const values = valueExports('packages/adapter/src/index.ts');
