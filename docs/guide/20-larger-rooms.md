@@ -1,6 +1,6 @@
 # Larger rooms
 
-A class of 40 can watch one projected tab while the teacher and a few members drive it. This page covers the watching seats and the roster that holds them, how a class joins, the members file that changes without a restart, agent tokens for programs that cannot sign in, and how to size a relay for a class. The settings are on [Settings for rooms, images and state](14-settings-for-rooms.md), and [Lessons and reviews](19-lessons-and-reviews.md) covers sessions and proposals.
+A class of 40 can watch one projected tab while the teacher and a few members drive it. This page covers watching seats and the roster, a class joining, the members file, agent tokens and sizing a relay. The settings are on [Settings for rooms, images and state](14-settings-for-rooms.md), and [Lessons and reviews](19-lessons-and-reviews.md) covers sessions and proposals.
 
 ## Watching seats
 
@@ -12,7 +12,7 @@ Watchers share the projected tab's attention: together 60 calls a minute to a pa
 
 ## A class joining
 
-A page takes 30 pairings and redemptions a minute however many invites it holds, so a class of 40 arriving together sees the last ten or so answered `rate_limited` at `/i` until the minute turns. Behind one address, as on a campus network, a hosted relay signs in 10 a minute from it. A Join the page refuses still spends its invite's 30 a minute. Measured, 40 students on their own addresses were all in after 85 s, and 40 behind one address after 190 s ([room-measure.md](../notes/m6/room-measure.md)). Hand the link out a few minutes before class, and ask anyone refused to wait a minute before tapping Join again.
+A page takes 30 pairings and redemptions a minute however many invites it holds, so a class of 40 arriving together sees the last ten or so answered `rate_limited` at `/i` until the minute turns. Behind one address, as on a campus network, a hosted relay signs in 10 a minute from it. A Join the page refuses still spends its invite's 30 a minute. Measured, 40 students on their own addresses were all in after 85 s, and 40 behind one address after 190 s ([room-measure.md](../notes/m6/room-measure.md)). Hand the link out a few minutes early, and ask anyone refused to tap Join again a minute later.
 
 ## The members file
 
@@ -20,9 +20,7 @@ In public URL mode, `TABDOCK_MEMBERS_FILE` names a file listing the members, in 
 
 Save a change by writing a new file beside the old one and renaming it over it, which every editor's atomic save does. On macOS and Linux the relay refuses a file that the file itself, any directory above it, or the directory of any symbolic link on the way to it lets group or others write, or that an account other than the relay's or root owns. On Windows it checks no modes, so keep the file in a folder only the relay's account can change.
 
-Adding someone takes effect within about 4 s. Removing someone, or giving their subject another user id, ends at that moment every attachment, pending request, `/pair` sign-in and claim, and MCP session held under the old id, with what they sponsored: a request still in flight is refused, and a session still sending answers closes within a second. With `TABDOCK_RESTART_SNAPSHOT` on, a graceful restart within 10 minutes resumes pages, attachments and invites, and anyone the list no longer gives the same account comes back with nothing ([Settings for rooms](14-settings-for-rooms.md#members-agents-and-restarts)).
-
-A revoke that barred someone from an invite link stays with their account whatever the file later says, and never passes to whoever takes a freed id.
+Adding someone takes effect within about 4 s. Removing someone, or giving their subject another user id, ends at that moment every attachment, pending request, `/pair` sign-in and claim, and MCP session held under the old id, with what they sponsored: a request still in flight is refused, and a session still sending answers closes within a second. With `TABDOCK_RESTART_SNAPSHOT` on, a graceful restart within 10 minutes resumes pages, attachments and invites, and anyone the list no longer gives the same account comes back with nothing ([Settings for rooms](14-settings-for-rooms.md#members-agents-and-restarts)). A revoke's bar on an invite link stays with the account whatever the file later says, never passing to a freed id's next holder.
 
 ## Agent tokens
 
