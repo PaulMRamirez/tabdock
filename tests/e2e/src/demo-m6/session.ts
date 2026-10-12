@@ -4,9 +4,11 @@
 // watching seats from the widget's form; two students scan its link on
 // their phones and join at /i, and each one's Claude reads the map. Then the
 // tab's clock jumps 30 minutes and the session ends on the page's own clock:
-// the page lets the guests go at once, tells the relay once its grace has
-// passed, and the relay closes what the session's link let in. The widget
-// offers the session's record and saves nothing unasked (ADR 0045).
+// the page revokes the guests at once, and its two-use link is already used
+// up; once its grace has passed it sends session_end, and the relay closes
+// whatever the session still held, here nothing, as the record's counts
+// say. The widget offers the session's record and saves nothing unasked
+// (ADR 0045).
 
 import type { Client } from '@modelcontextprotocol/client';
 import { student } from '../room-harness.ts';
@@ -129,7 +131,7 @@ export async function session(lesson: Lesson): Promise<void> {
       check(after.isError, "a guest's call after the session's end should be refused");
     }
     // The page tells the relay of its own end after its grace, so the record may come a moment later.
-    await until(
+    const end = await until(
       () => auditLines(room.auditDir).find((record) => record.type === 'session_end'),
       "the relay's session_end record",
       20_000,
@@ -141,6 +143,12 @@ export async function session(lesson: Lesson): Promise<void> {
     );
     say("   The audit log, from the session's start to its end:");
     for (const record of sessionLines) say(`   ${storyLine(record)}`);
+    const left = end.attachments + end.invites + end.agents;
+    say(
+      left === 0
+        ? "   The page's own revokes had already let the guests go and the link had closed, so the relay's session_end found nothing left to close."
+        : `   The relay's session_end closed what the page had left: ${String(end.attachments)} attachment(s), ${String(end.invites)} invite(s), ${String(end.agents)} agent token(s).`,
+    );
     say(
       "   (A session_end the page sends names no reason, so the relay records it as the operator's; its own clock would say time.)",
     );
