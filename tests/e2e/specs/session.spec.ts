@@ -293,29 +293,47 @@ test('a refused Start says why in a sentence of its own, never a bare code', asy
     );
   expect(relay.framesOf('session_start')).toEqual([]);
 
-  // What the relay refuses, each in its own words.
+  // What the relay refuses, each in its own words, with the session the relay
+  // lists beside the refusal as Tabdock's relay sends it.
   relay.silent = true;
   await typeInWidget(page, 'session-observers', '0');
+  // An earlier session the relay still holds, which the page has no record of.
+  const earlier = {
+    sessionId: 'ses_earlier',
+    lengthMs: 30 * 60_000,
+    remainingMs: 20 * 60_000,
+    policy: { maxDrivers: 1, proposals: 'off' },
+  } as const;
   const refusals = [
     [
       'policy',
+      null,
       "A session only narrows this page's policy: no more driver seats or wider proposals than it allows, and observers only where it makes invites.",
     ],
-    ['active', 'A session is already running on this page. End it first.'],
+    // The form hides while this page runs a session, so the widget's `active`
+    // is always the relay's, and the page ends that session as it refuses.
+    [
+      'active',
+      earlier,
+      'The relay still held an earlier session for this page, which this page has now ended. Start again.',
+    ],
     [
       'limit',
+      null,
       `This page is at a limit: ${String(MAX_LIVE_INVITES_PER_PAGE)} live invites, counting the links this session needs, or ${String(OPERATOR_GRANTS_PER_PAGE)} promotions and new invites a minute at the relay. Cancel an invite or wait a minute.`,
     ],
   ] as const;
-  for (const [index, [reason, words]] of refusals.entries()) {
+  for (const [index, [reason, listed, words]] of refusals.entries()) {
     await clickInWidget(page, { action: 'session-start' });
     await expect.poll(() => relay.framesOf('session_start')).toHaveLength(index + 1);
     const sessionId = relay.framesOf('session_start')[index]?.sessionId ?? '';
-    relay.send({ t: 'session', session: null, refused: { sessionId, reason } });
+    relay.send({ t: 'session', session: listed, refused: { sessionId, reason } });
     await expect.poll(() => widgetText(page, 'session-reason')).toBe(words);
     // The start the page held closed the form; a refusal opens it again, so the words show.
     expect(await widgetVisible(page, 'session-reason')).toBe(true);
   }
+  // What the `active` words say happened did: the page asked the relay to end its earlier one.
+  expect(relay.framesOf('session_end')).toEqual([{ t: 'session_end', sessionId: 'ses_earlier' }]);
 
   // A relay that never answers: the start gives up as unavailable.
   await clickInWidget(page, { action: 'session-start' });

@@ -169,13 +169,16 @@ const RELAY_GRANTS_PER_MINUTE = 10;
  * A sentence for each reason startSession gives, read from its branches in
  * core.ts; unavailable and invalid have more than one cause, so sessionText
  * names the one the form shows. unknown and length answer an extend, never a
- * start, and are here so every reason has its words.
+ * start, and are here so every reason has its words. The form hides while
+ * this page runs a session, so the widget only hears `active` from the relay,
+ * still holding one this page has no record of, which core ends as it refuses.
  */
 const SESSION_TEXT: Record<Extract<SessionResult, { ok: false }>['reason'], string> = {
   invalid: 'Give it a label, a length of 30 to 240 whole minutes and whole numbers of seats.',
   policy:
     "A session only narrows this page's policy: no more driver seats or wider proposals than it allows, and observers only where it makes invites.",
-  active: 'A session is already running on this page. End it first.',
+  active:
+    'The relay still held an earlier session for this page, which this page has now ended. Start again.',
   link_down: REFUSAL_TEXT.link_down,
   unavailable:
     'The relay did not answer in time, or this page cannot make invite links (they need https). Try again.',
