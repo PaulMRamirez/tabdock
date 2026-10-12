@@ -32,12 +32,12 @@ When a session ends the widget offers its record, Save JSON or Save summary, and
 
 ## A lesson on one tab
 
-A whole lesson, from the relay's settings to a record matched against the audit log, is on [Run a class](21-run-a-class.md). `pnpm demo:m6` rehearses its every step on one machine against a stand-in provider.
+A whole lesson, from the relay's settings to a matched record, is on [Run a class](21-run-a-class.md). `pnpm demo:m6` rehearses its every step on one machine against a stand-in provider.
 
 ## When it goes wrong
 
 **A write answers `role_denied`, not `proposed`.** The policy's `proposals` is `'off'`, the session narrowed it, the caller is an invitee under `'members'`, or an agent. **Accept stays grey.** The page is paused; resume it.
 
-**Start is refused**, the form saying why. `active`: the relay held an earlier one, which the page ends; Start again; `policy`: wider than `attach()` allows; `invalid`: more observers than the relay's watching seats, or a bad label or length; `unavailable`: no relay answer within 10 s, or observers with no member to sponsor their invites, or no public URL; `limit`: too many promotions and mints this minute, or the page's 10 live invites cannot hold one more for every 20 observers. **A record will not save.** Nothing is recorded yet, or the record stopped after an error; the audit log still has every call.
+**Start is refused**, saying why. `active`: the relay held an earlier one, which the page ends; Start again; `policy`: wider than `attach()` allows; `invalid`: more observers than the relay's watching seats, no driver seat, or a bad label or length; `unavailable`: no relay answer within 10 s, or observers with no member to sponsor them, or no public URL; `limit`: 10 grants a minute (promotions, invites, agent tokens, session starts and extensions) are spent, or 10 live invites cannot hold one more per 20 observers. **A record will not save.** Nothing is recorded yet, or the record stopped after an error; the audit log still has every call.
 
 Next: [Larger rooms](20-larger-rooms.md).

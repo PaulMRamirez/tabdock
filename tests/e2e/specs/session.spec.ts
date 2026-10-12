@@ -293,10 +293,21 @@ test('a refused Start says why in a sentence of its own, never a bare code', asy
     );
   expect(relay.framesOf('session_start')).toEqual([]);
 
+  // No driver seat, a whole number yet below the 1 a session needs: refused on the page, unsent.
+  await typeInWidget(page, 'session-observers', '0');
+  await typeInWidget(page, 'session-drivers', '0');
+  await clickInWidget(page, { action: 'session-start' });
+  await expect
+    .poll(() => widgetText(page, 'session-reason'))
+    .toBe(
+      'Give it a label, a length of 30 to 240 whole minutes, at least 1 driver seat and whole numbers of seats.',
+    );
+  expect(relay.framesOf('session_start')).toEqual([]);
+  await typeInWidget(page, 'session-drivers', '1');
+
   // What the relay refuses, each in its own words, with the session the relay
   // lists beside the refusal as Tabdock's relay sends it.
   relay.silent = true;
-  await typeInWidget(page, 'session-observers', '0');
   // An earlier session the relay still holds, which the page has no record of.
   const earlier = {
     sessionId: 'ses_earlier',
@@ -320,7 +331,7 @@ test('a refused Start says why in a sentence of its own, never a bare code', asy
     [
       'limit',
       null,
-      `This page is at a limit: ${String(MAX_LIVE_INVITES_PER_PAGE)} live invites, counting the links this session needs, or ${String(OPERATOR_GRANTS_PER_PAGE)} promotions and new invites a minute at the relay. Cancel an invite or wait a minute.`,
+      `This page is at a limit: ${String(MAX_LIVE_INVITES_PER_PAGE)} live invites, counting the links this session needs, or ${String(OPERATOR_GRANTS_PER_PAGE)} grants a minute at the relay (promotions, invites, agent tokens, session starts and extensions). Cancel an invite or wait a minute.`,
     ],
   ] as const;
   for (const [index, [reason, listed, words]] of refusals.entries()) {

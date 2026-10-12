@@ -159,9 +159,10 @@ const REFUSAL_TEXT: Record<InviteRefusal, string> = {
 };
 
 /**
- * Promotions and minted invites one page may make a minute at the relay
- * (OPERATOR_GRANTS_PER_PAGE in the relay's hub.ts), named when a session's
- * start is refused for it.
+ * Grants one page may make a minute at the relay (OPERATOR_GRANTS_PER_PAGE
+ * in the relay's hub.ts), which counts promotions, minted invites and agent
+ * tokens, session starts and extensions alike, named when a session's start
+ * is refused for it.
  */
 const RELAY_GRANTS_PER_MINUTE = 10;
 
@@ -174,7 +175,8 @@ const RELAY_GRANTS_PER_MINUTE = 10;
  * still holding one this page has no record of, which core ends as it refuses.
  */
 const SESSION_TEXT: Record<Extract<SessionResult, { ok: false }>['reason'], string> = {
-  invalid: 'Give it a label, a length of 30 to 240 whole minutes and whole numbers of seats.',
+  invalid:
+    'Give it a label, a length of 30 to 240 whole minutes, at least 1 driver seat and whole numbers of seats.',
   policy:
     "A session only narrows this page's policy: no more driver seats or wider proposals than it allows, and observers only where it makes invites.",
   active:
@@ -182,7 +184,7 @@ const SESSION_TEXT: Record<Extract<SessionResult, { ok: false }>['reason'], stri
   link_down: REFUSAL_TEXT.link_down,
   unavailable:
     'The relay did not answer in time, or this page cannot make invite links (they need https). Try again.',
-  limit: `This page is at a limit: ${String(MAX_LIVE_INVITES_PER_PAGE)} live invites, counting the links this session needs, or ${String(RELAY_GRANTS_PER_MINUTE)} promotions and new invites a minute at the relay. Cancel an invite or wait a minute.`,
+  limit: `This page is at a limit: ${String(MAX_LIVE_INVITES_PER_PAGE)} live invites, counting the links this session needs, or ${String(RELAY_GRANTS_PER_MINUTE)} grants a minute at the relay (promotions, invites, agent tokens, session starts and extensions). Cancel an invite or wait a minute.`,
   unknown: 'The relay no longer holds this session.',
   length: 'The relay already holds this session at least that long.',
 };
