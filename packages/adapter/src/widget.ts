@@ -521,7 +521,8 @@ function inviteDetail(view: InviteView): string {
     view.expiresAt === null
       ? 'open while this page is, 24 h at most'
       : expiryText(view.expiresAt).toLowerCase();
-  const parts = [joined, ends, `shared by ${view.sponsor.displayName}`];
+  // One plain line like every other name here (S10): the relay checks a member's name for length alone.
+  const parts = [joined, ends, `shared by ${personText(view.sponsor)}`];
   if (view.pending) parts.push('someone is waiting');
   if (view.role === 'driver' && view.refusals > 0) {
     parts.push(`${view.refusals} of ${INVITE_BURN_REFUSALS} refusals`);

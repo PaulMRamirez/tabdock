@@ -19,6 +19,7 @@ import { describe, expect, it } from 'vitest';
 import {
   IMAGE_CALL_SPACING_MS,
   MAX_WAITING_IMAGE_CALLS,
+  type RuntimeTool,
   UNWATCHED_HANDLER_GRACE_MS,
 } from '../src/core.ts';
 import {
@@ -65,11 +66,12 @@ const PNG = png(640, 480);
 const DATA = base64(PNG);
 const ENVELOPE = { image: { mimeType: 'image/png', data: DATA }, text: 'the view' };
 
-const CAPTURE = runtimeTool('capture', {
+const CAPTURE_HINTS = {
   consequentialHint: false,
   readOnlyHint: true,
   untrustedContentHint: false,
-});
+};
+const CAPTURE = runtimeTool('capture', CAPTURE_HINTS);
 
 /** A page whose capture tool is declared an image tool, welcomed with `maxImageBytes`. */
 async function page(
@@ -372,31 +374,249 @@ describe('the image gate (A6.4)', () => {
     ]);
   });
 
-  it('answers a waiting call at its deadline, and frees the gate from a handler the runtime never settles', async () => {
-    const { h, socket } = await page({ polyfill: true });
-    h.context.honoursAbort = false;
-    const starts: number[] = [];
-    // A polyfill 5.1 read whose handler never ends.
-    h.context.handlers.set('capture', () => {
-      starts.push(h.clock.now);
-      return new Promise(() => undefined);
+  // The polyfill 5.1 races executeTool against the caller's signal while its
+  // handler never sees it (honoursAbort, as TestContext plays it), so a
+  // deadline once freed the gate under a handler still drawing (A6.28); a
+  // runtime that ignores the signal altogether never settled the call.
+  it.each([
+    ["the polyfill 5.1, which races the caller's signal", true],
+    ['a runtime that ignores the signal', false],
+  ] as const)(
+    'answers a waiting call at its deadline, and holds the gate for a handler that never ends on %s until its deadline and grace',
+    async (_runtime, honoursAbort) => {
+      const { h, socket } = await page({ polyfill: true });
+      h.context.honoursAbort = honoursAbort;
+      const starts: number[] = [];
+      // A polyfill 5.1 read whose handler never ends.
+      h.context.handlers.set('capture', () => {
+        starts.push(h.clock.now);
+        return new Promise(() => undefined);
+      });
+      socket.deliver(invoke('capture', { callId: 'stuck', deadlineMs: 1_000 }));
+      await h.clock.advance(0);
+      socket.deliver(invoke('capture', { callId: 'early', deadlineMs: 500 }));
+      socket.deliver(invoke('capture', { callId: 'later', deadlineMs: 60_000 }));
+      await h.clock.advance(0);
+      const start = h.clock.now;
+      await h.clock.advance(500);
+      // 'early' timed out in the queue, without its handler ever running.
+      expect(results(socket).find((frame) => frame.callId === 'early')).toMatchObject({
+        ok: false,
+        error: { code: 'timeout' },
+      });
+      await h.clock.advance(500 + UNWATCHED_HANDLER_GRACE_MS - 1);
+      expect(starts).toHaveLength(1);
+      await h.clock.advance(1);
+      expect(starts).toEqual([start, start + 1_000 + UNWATCHED_HANDLER_GRACE_MS]);
+    },
+  );
+
+  describe('on the polyfill 5.1, whose handlers never see a cancel (A6.28)', () => {
+    /** A capture handler that counts how many run at once, each ending when the test says. */
+    function counted(h: Harness) {
+      const ends: (() => void)[] = [];
+      const seen = { started: 0, running: 0, most: 0 };
+      h.context.handlers.set('capture', () => {
+        seen.started += 1;
+        seen.running += 1;
+        seen.most = Math.max(seen.most, seen.running);
+        return new Promise((resolve) => {
+          ends.push(() => {
+            seen.running -= 1;
+            resolve(ENVELOPE);
+          });
+        });
+      });
+      return {
+        seen,
+        endAll: () => {
+          for (const end of ends.splice(0)) end();
+        },
+      };
+    }
+
+    it('keeps the gate for a cancelled capture until its handler ends, so captures never overlap', async () => {
+      const { h, socket } = await page({ polyfill: true });
+      const captures = counted(h);
+      for (let index = 1; index <= 4; index += 1) {
+        socket.deliver(invoke('capture', { callId: `img-${String(index)}` }));
+      }
+      await h.clock.advance(0);
+      // The caller's client cancels whichever capture holds the gate, then each waiting one.
+      for (let index = 1; index <= 4; index += 1) {
+        socket.deliver({ t: 'cancel', callId: `img-${String(index)}` });
+        await h.clock.advance(IMAGE_CALL_SPACING_MS);
+      }
+      expect(results(socket).map((frame) => [frame.callId, frame.error?.code])).toEqual([
+        ['img-1', 'cancelled'],
+        ['img-2', 'cancelled'],
+        ['img-3', 'cancelled'],
+        ['img-4', 'cancelled'],
+      ]);
+      expect(captures.seen).toMatchObject({ started: 1, most: 1 });
+      expect(h.dock.state.activity.find((entry) => entry.callId === 'img-1')).toMatchObject({
+        outcome: 'cancelled',
+        handlerRunning: true,
+      });
+      // Once the cancelled handler ends, the gate takes the next capture.
+      captures.endAll();
+      await h.clock.advance(0);
+      expect(h.dock.state.activity.find((entry) => entry.callId === 'img-1')).toMatchObject({
+        handlerRunning: false,
+      });
+      socket.deliver(invoke('capture', { callId: 'img-5' }));
+      await h.clock.advance(IMAGE_CALL_SPACING_MS);
+      expect(captures.seen).toMatchObject({ started: 2, most: 1 });
     });
-    socket.deliver(invoke('capture', { callId: 'stuck', deadlineMs: 1_000 }));
-    await h.clock.advance(0);
-    socket.deliver(invoke('capture', { callId: 'early', deadlineMs: 500 }));
-    socket.deliver(invoke('capture', { callId: 'later', deadlineMs: 60_000 }));
-    await h.clock.advance(0);
-    const start = h.clock.now;
-    await h.clock.advance(500);
-    // 'early' timed out in the queue, without its handler ever running.
-    expect(results(socket).find((frame) => frame.callId === 'early')).toMatchObject({
-      ok: false,
-      error: { code: 'timeout' },
+
+    it('holds the gate for a capture whose tool the page unregisters mid-run until its deadline and grace', async () => {
+      const { h, socket } = await page({ polyfill: true });
+      const captures = counted(h);
+      socket.deliver(invoke('capture', { callId: 'unwatched', deadlineMs: 1_000 }));
+      await h.clock.advance(0);
+      const start = h.clock.now;
+      // The page drops the tool, so the runtime rejects the call and stops
+      // watching its handler, then lists it again for the next capture.
+      const listed = h.context.tools;
+      h.context.unregister('capture');
+      await h.clock.advance(0);
+      expect(results(socket)).toEqual([
+        expect.objectContaining({
+          callId: 'unwatched',
+          ok: false,
+          error: { code: 'tool_error', message: 'Tool unregistered' },
+        }),
+      ]);
+      h.context.tools = listed;
+      h.context.fireToolChange();
+      socket.deliver(invoke('capture', { callId: 'next' }));
+      await h.clock.advance(1_000 + UNWATCHED_HANDLER_GRACE_MS - 1);
+      expect(captures.seen).toMatchObject({ started: 1, most: 1 });
+      await h.clock.advance(1);
+      expect(captures.seen.started).toBe(2);
+      expect(h.clock.now).toBe(start + 1_000 + UNWATCHED_HANDLER_GRACE_MS);
     });
-    await h.clock.advance(500 + UNWATCHED_HANDLER_GRACE_MS - 1);
-    expect(starts).toHaveLength(1);
-    await h.clock.advance(1);
-    expect(starts).toEqual([start, start + 1_000 + UNWATCHED_HANDLER_GRACE_MS]);
+
+    it('lets a native page free the gate when the abort lands, its handler having stopped', async () => {
+      const { h, socket } = await page();
+      let running = 0;
+      let most = 0;
+      h.context.handlers.set('capture', (_input, signal) => {
+        running += 1;
+        most = Math.max(most, running);
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener('abort', () => {
+            running -= 1;
+            reject(new Error('stopped'));
+          });
+        });
+      });
+      socket.deliver(invoke('capture', { callId: 'img-1' }));
+      socket.deliver(invoke('capture', { callId: 'img-2' }));
+      await h.clock.advance(0);
+      socket.deliver({ t: 'cancel', callId: 'img-1' });
+      await h.clock.advance(IMAGE_CALL_SPACING_MS);
+      expect(h.context.runs.map((run) => run.tool)).toEqual(['capture', 'capture']);
+      expect(most).toBe(1);
+    });
+  });
+
+  describe('a tool the page registers anew while a call waits at the gate (A6.28)', () => {
+    const WRITE = { readOnlyHint: false, consequentialHint: false, untrustedContentHint: false };
+    const BOB = { userId: 'bob', displayName: 'Bob', client: null, role: 'observer' as const };
+
+    /**
+     * Alice's capture holds the gate while a second capture waits behind it;
+     * the page then registers capture again, as `again` with a handler of
+     * its own, and Alice's capture ends. The page runs each call through a
+     * wrapper that notes which registration it was handed.
+     */
+    async function swapWhileWaiting(
+      again: RuntimeTool,
+      caller?: typeof BOB,
+    ): Promise<{ socket: FakeSocket; ran: string[]; handed: unknown[] }> {
+      const h = setup({ tools: [CAPTURE], core: { policy: { imageTools: ['capture'] } } });
+      const socket = await link(
+        h,
+        { limits: { ...welcome(h.clock).limits, maxImageBytes: DEFAULT_IMAGE_BYTES } },
+        { alice: 'driver', bob: 'observer' },
+      );
+      const ran: string[] = [];
+      const handed: unknown[] = [];
+      const execute = h.context.executeTool.bind(h.context);
+      h.context.executeTool = (tool, input, options) => {
+        handed.push(tool.description);
+        return execute(tool, input, options);
+      };
+      let release: (value: unknown) => void = () => undefined;
+      h.context.handlers.set('capture', () => {
+        ran.push('first');
+        return new Promise((resolve) => {
+          release = resolve;
+        });
+      });
+      socket.deliver(invoke('capture', { callId: 'holding' }));
+      await h.clock.advance(0);
+      socket.deliver(invoke('capture', { callId: 'waiting', ...(caller && { caller }) }));
+      await h.clock.advance(0);
+      h.context.tools = [again];
+      h.context.handlers.set('capture', () => {
+        ran.push('again');
+        return ENVELOPE;
+      });
+      h.context.fireToolChange();
+      await h.clock.advance(0);
+      release(ENVELOPE);
+      await h.clock.advance(IMAGE_CALL_SPACING_MS);
+      return { socket, ran, handed };
+    }
+
+    const asWrite = runtimeTool('capture', WRITE, { description: 'capture, now a write' });
+
+    it("refuses an observer's waiting capture once capture is a write, never running it", async () => {
+      const { socket, ran } = await swapWhileWaiting(asWrite, BOB);
+      expect(ran).toEqual(['first']);
+      expect(results(socket).find((frame) => frame.callId === 'waiting')).toMatchObject({
+        ok: false,
+        error: { code: 'role_denied', message: 'observers may only run read-only tools' },
+      });
+    });
+
+    it("refuses a driver's waiting capture that became a write, rather than run it beside the write queue", async () => {
+      const { socket, ran } = await swapWhileWaiting(asWrite);
+      expect(ran).toEqual(['first']);
+      expect(results(socket).find((frame) => frame.callId === 'waiting')).toMatchObject({
+        ok: false,
+        error: {
+          code: 'page_busy',
+          message: 'the page changed this tool while the call waited; call again',
+        },
+      });
+    });
+
+    it('refuses a waiting capture that became consequential, rather than run it unasked', async () => {
+      const consequential = runtimeTool('capture', {
+        ...CAPTURE_HINTS,
+        consequentialHint: true,
+      });
+      const { socket, ran } = await swapWhileWaiting(consequential);
+      expect(ran).toEqual(['first']);
+      expect(results(socket).find((frame) => frame.callId === 'waiting')).toMatchObject({
+        ok: false,
+        error: { code: 'page_busy' },
+      });
+    });
+
+    it('runs the registration the page holds now when it is still a read', async () => {
+      const again = runtimeTool('capture', CAPTURE_HINTS, { description: 'capture, again' });
+      const { socket, ran, handed } = await swapWhileWaiting(again, BOB);
+      expect(ran).toEqual(['first', 'again']);
+      expect(handed).toEqual(['capture tool', 'capture, again']);
+      expect(results(socket).map((frame) => [frame.callId, frame.ok])).toEqual([
+        ['holding', true],
+        ['waiting', true],
+      ]);
+    });
   });
 
   /**

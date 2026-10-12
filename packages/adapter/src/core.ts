@@ -1024,6 +1024,17 @@ const PAUSED: Refusal = {
   message: 'the operator paused this page, so it runs no calls for now',
 };
 
+/**
+ * A call whose tool the page registered anew, as another kind, while the
+ * call waited on a prompt or the image gate: it was admitted, queued or
+ * prompted for the old kind, so it does not run as the new one.
+ */
+const TOOL_CHANGED: Refusal = {
+  ok: false,
+  code: 'page_busy',
+  message: 'the page changed this tool while the call waited; call again',
+};
+
 const REVOKED_MESSAGE = 'the operator revoked this caller';
 
 /**
@@ -2917,11 +2928,13 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
 
   /**
    * S5, second check: the caller's role on this page, then the tool. It runs
-   * when a call arrives and again when a write reaches the front of the
-   * queue, since the roster, the grants and the tools may have changed while
-   * it waited. An observer's write runs only as a proposal this page's own
-   * record shows the operator accepted (ADR 0042), never on the relay's word,
-   * and only while the policy in force still takes proposals from them.
+   * when a call arrives, again when a write reaches the front of the queue,
+   * and again on a fresh read of the tools after a prompt or the image gate
+   * (checkedAgain), since the roster, the grants and the tools may have
+   * changed while it waited. An observer's write runs only as a proposal
+   * this page's own record shows the operator accepted (ADR 0042), never on
+   * the relay's word, and only while the policy in force still takes
+   * proposals from them.
    */
   function check(call: CallRecord, snapshot: ToolSnapshot | null): Checked {
     const { frame, proposal } = call;
@@ -3035,19 +3048,25 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         `accepted on the page as proposal ${call.proposal?.view.proposalId ?? ''}, so the page did not ask again`,
       );
     }
+    // The tool the call runs: the one check() last returned, which each wait
+    // below reads again, since the page may register another under its name.
+    let current: NormalisedTool | null = tool;
     // ADR 0039: the operator answers before an image call waits at the gate,
     // so a prompt left open holds no other capture back.
-    if (rule === 'confirm' && !byClient && !accepted && !(await operatorAllows(call, snapshot))) {
-      return;
+    if (rule === 'confirm' && !byClient && !accepted) {
+      current = await operatorAllows(call, tool, snapshot);
+      if (current === null) return;
     }
     const imageTool = policy.imageTools.includes(tool.page.name);
     if (imageTool) {
-      if (!(await takeImageSlot(call, snapshot))) return;
+      current = await takeImageSlot(call, tool, snapshot);
+      if (current === null) return;
       // Only a change made during the wait can end what let the client
       // confirm; the page then asks, holding the gate.
       if (byClient && !takesClientConfirmation(call)) {
         byClient = false;
-        if (!(await operatorAllows(call, snapshot))) return;
+        current = await operatorAllows(call, tool, snapshot);
+        if (current === null) return;
       }
     }
     if (byClient) {
@@ -3062,7 +3081,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     let unwatched = false;
     try {
       // An accepted proposal runs the page's own copy, which its invoke had to match.
-      const value = await execute(tool.runtime, call.proposal?.args ?? frame.arguments, call);
+      const value = await execute(current.runtime, call.proposal?.args ?? frame.arguments, call);
       outcome = imageTool
         ? imageOutcome(resultText(value))
         : { ok: true, content: resultText(value) };
@@ -3070,8 +3089,10 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       outcome = { ok: false, code: 'tool_error', message: errorParts(error).message };
       unwatched = await lostSightOfHandler(call, tool, error);
     }
-    // The runtime has settled the call, so the next image call may start.
-    freeImageSlot(call);
+    // The runtime has settled the call, so the next image call may start;
+    // unless it only stopped watching a handler still running, whose hold on
+    // the gate imageHold then bounds, as holdUnwatched bounds a write's.
+    if (!unwatched) freeImageSlot(call);
     if (unwatched) {
       holdUnwatched(call);
       // The relay still hears the runtime's answer, unless something answered first.
@@ -3090,19 +3111,20 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   }
 
   /**
-   * Whether a write's rejection says only that the runtime stopped watching a
-   * handler that may still be running. On the polyfill a write's executeTool
-   * gets a signal nothing aborts, so it settles early only when the page ends
-   * the tool's registration mid-run: its 'Tool unregistered', or, should
-   * that text change, a tool missing from the list afterwards. A tool
-   * already missing when the call started never ran its handler.
+   * Whether the rejection of a write, or of the call holding the image gate,
+   * says only that the runtime stopped watching a handler that may still be
+   * running. On the polyfill such a call's executeTool gets a signal nothing
+   * aborts, so it settles early only when the page ends the tool's
+   * registration mid-run: its 'Tool unregistered', or, should that text
+   * change, a tool missing from the list afterwards. A tool already missing
+   * when the call started never ran its handler.
    */
   async function lostSightOfHandler(
     call: CallRecord,
     tool: NormalisedTool,
     error: unknown,
   ): Promise<boolean> {
-    if (abortReachesHandlers || writing !== call) return false;
+    if (abortReachesHandlers || (writing !== call && imageRunning !== call)) return false;
     const { name, message } = errorParts(error);
     if (name === 'UnknownError' && message === POLYFILL_UNREGISTERED) return true;
     if (name === 'UnknownError' && POLYFILL_NOT_FOUND.test(message)) return false;
@@ -3144,9 +3166,12 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   ): Promise<unknown> {
     if (!context?.executeTool) throw new Error('this WebMCP runtime has no executeTool');
     // A write on the polyfill gets a signal nothing aborts, so the runtime
-    // settles it when the handler ends and the page stays held until then.
+    // settles it when the handler ends and the page stays held until then;
+    // so does the image call holding the gate, which a cancel, deadline or
+    // revoke would otherwise free while its handler, which never sees the
+    // signal there, still draws (A6.28). imageHold bounds the gate's wait.
     const signal =
-      writing === call && !abortReachesHandlers
+      (writing === call || imageRunning === call) && !abortReachesHandlers
         ? new AbortController().signal
         : call.controller.signal;
     const run = (format: InputFormat): Promise<unknown> =>
@@ -3213,28 +3238,67 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     return null;
   }
 
-  /** The operator's prompt; false when they deny it or the call ended meanwhile. */
-  async function operatorAllows(call: CallRecord, snapshot: ToolSnapshot): Promise<boolean> {
+  /**
+   * The operator's prompt; the tool to run once they allow it, as
+   * checkedAgain reads it, or null when they deny it, the call ended
+   * meanwhile or the check after it refused.
+   */
+  async function operatorAllows(
+    call: CallRecord,
+    admitted: NormalisedTool,
+    snapshot: ToolSnapshot,
+  ): Promise<NormalisedTool | null> {
     const allowed = await askConfirm(call);
-    if (!allowed && !isDone(call)) {
-      finish(call, {
-        ok: false,
-        code: 'denied_by_operator',
-        message: 'the operator denied this call',
-      });
+    if (!allowed) {
+      if (!isDone(call)) {
+        finish(call, {
+          ok: false,
+          code: 'denied_by_operator',
+          message: 'the operator denied this call',
+        });
+      }
+      return null;
     }
-    // The operator may have lowered this caller's role while the prompt was up.
-    const confirmed = allowed && checkedAgain(call, snapshot);
-    if (confirmed) recorder.confirmedOnPage(call.recorded);
+    // The operator may have lowered this caller's role, or the page changed
+    // the tool, while the prompt was up.
+    const confirmed = await checkedAgain(call, admitted, snapshot);
+    if (confirmed !== null) recorder.confirmedOnPage(call.recorded);
     return confirmed;
   }
 
-  /** check() once more after an await, since the roster, grants and tools may have changed. */
-  function checkedAgain(call: CallRecord, snapshot: ToolSnapshot): boolean {
-    if (isDone(call)) return false;
-    const again = check(call, snapshot);
-    if (!again.ok) finish(call, again.refusal);
-    return again.ok;
+  /**
+   * check() once more after a wait, against the page's tools as they are
+   * now, not as they were before it (A6.28): the roster, the grants and the
+   * proposals may have changed meanwhile, and so may what the page registers
+   * under the tool's name, which the runtime runs by name. Returns the tool
+   * the call then runs, or null once the call has ended. The call was
+   * admitted, queued and prompted (or not) for the kind of tool it found, so
+   * a tool now of another kind is refused: a read that became a write would
+   * run beside the write queue, and a tool that became consequential would
+   * run unasked. Nothing may be awaited between this and the handler.
+   */
+  async function checkedAgain(
+    call: CallRecord,
+    admitted: NormalisedTool,
+    snapshot: ToolSnapshot,
+  ): Promise<NormalisedTool | null> {
+    const now = await readTools();
+    if (isDone(call)) return null;
+    const again = check(call, now);
+    if (!again.ok) {
+      finish(call, again.refusal);
+      return null;
+    }
+    if (
+      now === null ||
+      isReadOnly(again.tool.page) !== isReadOnly(admitted.page) ||
+      isConsequential(again.tool.page, now.hintSupport, policy) !==
+        isConsequential(admitted.page, snapshot.hintSupport, policy)
+    ) {
+      finish(call, TOOL_CHANGED);
+      return null;
+    }
+    return again.tool;
   }
 
   function askConfirm(call: CallRecord): Promise<boolean> {
@@ -4231,21 +4295,25 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   const imageWaiting: { call: CallRecord; go: () => void }[] = [];
 
   /**
-   * Waits for the gate, then runs check() again, since the caller's role or
-   * grant may have changed meanwhile; false when the call ended instead, its
-   * handler never run (S8). Past MAX_WAITING_IMAGE_CALLS waiting, a call is
-   * answered page_busy at once.
+   * Waits for the gate, then runs checkedAgain, since the caller's role or
+   * grant, or the tool itself, may have changed meanwhile; the tool to run,
+   * or null when the call ended instead, its handler never run (S8). Past
+   * MAX_WAITING_IMAGE_CALLS waiting, a call is answered page_busy at once.
    */
-  async function takeImageSlot(call: CallRecord, snapshot: ToolSnapshot): Promise<boolean> {
+  async function takeImageSlot(
+    call: CallRecord,
+    admitted: NormalisedTool,
+    snapshot: ToolSnapshot,
+  ): Promise<NormalisedTool | null> {
     if (imageWaiting.filter((waiter) => !waiter.call.finished).length >= MAX_WAITING_IMAGE_CALLS) {
       finish(call, { ok: false, code: 'page_busy', message: 'too many image calls are waiting' });
-      return false;
+      return null;
     }
     await new Promise<void>((go) => {
       imageWaiting.push({ call, go });
       pumpImages();
     });
-    return checkedAgain(call, snapshot);
+    return checkedAgain(call, admitted, snapshot);
   }
 
   /** Drops waiters already answered, then starts the next once the gate is free and the spacing passed. */
@@ -4267,7 +4335,10 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     imageWaiting.shift();
     imageRunning = next.call;
     imageStartedAt = clock();
-    // A handler the runtime never settles (a polyfill 5.1 read) holds the gate no longer than this.
+    // On the polyfill 5.1 the call holding the gate runs under a signal
+    // nothing aborts (execute), so the gate waits for its handler; one that
+    // never ends, or that the runtime stopped watching, holds it no longer
+    // than this. Elsewhere the gate frees when the abort lands (ADR 0001).
     imageHold = timers.setTimeout(
       () => {
         freeImageSlot(next.call);

@@ -127,9 +127,13 @@ describe('the untrusted label', () => {
 // Where a credential travels and what guards the routes that take one, as
 // SPEC says it (ADR 0044's notes): the attach_request row names every field
 // of an invite's and an agent's part of the frame, the secret each carries to
-// the page included, S11 says the relay passes an agent token on to its page
-// once, S12 holds /g/mcp to the Host and Origin checks /mcp has, and
-// section 7's 404 for a token that closes mid-body comes after the body.
+// the page included; S11 says the relay puts an agent token in each prompt it
+// raises for the token, to the page that minted it alone, and the threat
+// model, the guide and the relay README say the same, never that it crosses
+// once (the A6.28 review: the adapter checks the token on every prompt, so
+// the relay must send it with each); S12 holds /g/mcp to the Host and Origin
+// checks /mcp has; and section 7's 404 for a token that closes mid-body
+// comes after the body.
 describe('credentials on the page link and the MCP routes', () => {
   const spec = readRepo('SPEC.md');
 
@@ -150,18 +154,68 @@ describe('credentials on the page link and the MCP routes', () => {
     }
   });
 
-  it('S11 says the relay passes an agent token to its page once, and S12 guards /g/mcp as /mcp', () => {
+  it('S11 says the relay passes an agent token to its page in each prompt, and S12 guards /g/mcp as /mcp', () => {
     const rule = (name: string): string => {
       const line = spec.split('\n').find((text) => text.includes(` ${name}. `));
       if (line === undefined) throw new Error(`SPEC.md has no ${name}`);
       return line;
     };
-    expect(rule('S11')).toContain(
-      "sent only in an `Authorization` header, and once by the relay to the page that minted it, inside the first request's `attach_request`",
+    const s11 = rule('S11');
+    expect(s11).toContain(
+      'sent by its client only in an `Authorization` header, and by the relay inside each `attach_request` it raises for the token',
     );
+    expect(s11).toContain('always and only to the page that minted it');
     const s12 = rule('S12');
     expect(s12).toContain(`\`/mcp\`, \`${AGENT_PATH}\`, \`/pair\``);
     expect(s12).toContain(`\`/mcp\` and \`${AGENT_PATH}\` answer 403`);
+  });
+
+  it('every page that says where an agent token travels has it in each prompt, never once', () => {
+    // How the old wording read: "carries the token once", "sent ... once by the relay".
+    const ONCE = /\b(?:carr(?:y|ies|ied)|sen(?:d|ds|t))\b[^.;]{0,60}\bonce\b/;
+    for (const [path, says] of [
+      ['SPEC.md', 'inside each `attach_request` it raises for the token'],
+      ['docs/threat-model.md', 'in each `attach_request` the relay raises for it'],
+      ['docs/guide/10-security.md', 'in each prompt it raises for the token'],
+      ['packages/relay/README.md', 'in each `attach_request` it raises for the token'],
+    ] as const) {
+      const text = withoutCodeBlocks(readRepo(path)).replace(/\s+/g, ' ');
+      expect(text, path).toContain(says);
+      const once = text
+        .split(/(?<=\.) /)
+        .filter((sentence) => /token/.test(sentence) && ONCE.test(sentence));
+      expect(once, path).toEqual([]);
+    }
+  });
+
+  // The A6.28 review: the widget's `claude mcp add` command carries the
+  // token inline (agent-tokens.test.ts in the adapter holds its form), so the
+  // documents name every place it then lands, as B9 does for the owner token.
+  it("says where the widget's agent command leaves the token, and scopes S11's storage to Tabdock's own", () => {
+    const b13 = readRepo('docs/threat-model.md')
+      .split('\n')
+      .find((line) => line.startsWith('| **B13**'));
+    if (b13 === undefined) throw new Error('the threat model has no row B13');
+    for (const place of [
+      "`claude`'s argument list",
+      "the shell's history",
+      '`~/.claude.json`',
+      '`claude mcp get` prints in full',
+      '`${AGENT_TOKEN}`',
+    ]) {
+      expect(b13, place).toContain(place);
+    }
+    const guide = readRepo('docs/guide/20-larger-rooms.md');
+    for (const place of ["`claude`'s argument list", "your shell's history", '`claude mcp get`']) {
+      expect(guide, place).toContain(place);
+    }
+    const s11 = spec.split('\n').find((text) => text.includes(' S11. ')) ?? '';
+    expect(s11).toContain(
+      "never in a URL, a log, an audit record or the relay's or the adapter's storage",
+    );
+    expect(s11).toContain(
+      "carries it in `claude`'s arguments, so into the holder's shell history and Claude Code's settings",
+    );
   });
 
   it('section 7 answers a token that closes while its body arrives after the body, as the relay does', () => {

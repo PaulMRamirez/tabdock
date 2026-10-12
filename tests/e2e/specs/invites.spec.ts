@@ -1184,6 +1184,30 @@ test('the live list shows how long a link lasts, that someone is waiting, and th
   expect(text).toContain('1 of 3 refusals');
 });
 
+// A6.28: every other name the widget shows is made one plain line whatever
+// the relay sent (S10); the members file checks a name's length only, so a
+// sponsor's may hold a bidirectional override or a line separator.
+test("the live list names an invite's sponsor in one plain line, whatever the relay sent", async ({
+  page,
+}) => {
+  const relay = await openWithInviteRelay(page, { query: 'invites=all' });
+  const minted = await mintByHandle(page, { label: 'Class', role: 'observer' });
+  const listing = relay.listings.get(minted.inviteId);
+  if (!listing) throw new Error('the relay does not list the invite');
+  relay.listings.set(minted.inviteId, {
+    ...listing,
+    pending: true,
+    sponsor: { userId: 'alice', displayName: 'Alice‮ecila Bob' },
+  });
+  relay.list();
+  await expect
+    .poll(async () => (await widgetItems(page, 'invite-list'))[0]?.text)
+    .toContain('someone is waiting');
+  const text = (await widgetItems(page, 'invite-list'))[0]?.text ?? '';
+  expect(text).toContain('shared by Aliceecila Bob, someone is waiting');
+  expect(text).not.toMatch(/[\p{Cf}\p{Zl}\p{Zp}]/u);
+});
+
 test('Revoke all shows while invites are live though nobody is attached, and closes them', async ({
   page,
 }) => {

@@ -32,7 +32,7 @@ An agent token lets a program that cannot sign in, Claude Code in a script or a 
 claude mcp add --transport http --scope local tabdock-1a2b3c4d https://relay.example/g/mcp --header "Authorization: Bearer <token>"
 ```
 
-To keep the token out of Claude Code's settings and your shell history, put an entry like this in the project's .mcp.json file and set `AGENT_TOKEN` in the environment that runs Claude Code, which expands it at each connection:
+That command leaves the token in `claude`'s argument list while it runs, readable by other local accounts, in your shell's history and in `~/.claude.json`, which `claude mcp get` prints in full. To avoid all three, put an entry like this in the project's .mcp.json file and set `AGENT_TOKEN`, not typed at a prompt, where Claude Code runs; Claude Code expands it at each connection:
 
 ```json
 {
