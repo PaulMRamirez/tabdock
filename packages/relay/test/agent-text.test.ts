@@ -23,6 +23,12 @@ const MEMBER_EMPTY =
 const AGENT_SENTENCE =
   "On a connection made with an agent token, call pair_page with no arguments to wait for the operator's answer.";
 
+// detach_page's clause for an agent: its detach closes the token (agents.ts,
+// attachmentsEnded) and /g/mcp answers 404 after, so only a new token from
+// the operator brings it back; the code and invite sentence is for the rest.
+const DETACH_AGENT =
+  "An agent token's detach closes the token for good; to come back, the agent needs a new token from the page's operator. On any other connection, to use the page again, pair with a new code, or, if your account joins pages by invite, with a new invite link from the page's operator.";
+
 const STATE_SENTENCE =
   'get_page_state reads what a page publishes, and wait_for_page_state follows it, without running a page tool; on a page that takes proposals, a write your role may not run answers proposed, which get_proposal follows.';
 
@@ -82,6 +88,15 @@ describe('what an agent token is told (ADR 0044, ADR 0049 decision 4)', () => {
     const outcome = await pending;
     expect(outcome.isError, outcome.text).toBe(false);
     expect(outcome.text).toContain(`Attached to page ${page.pageId}`);
+  });
+
+  it('reads in detach_page that its detach needs a new token, the code and invite left to other connections', async () => {
+    const { agent } = await agentRoom();
+    const { tools } = await agent.listTools();
+    const detach = tools.find((tool) => tool.name === 'detach_page')?.description ?? '';
+    expect(detach).toContain(DETACH_AGENT);
+    // Nothing after the agent's clause sends it back to a code or an invite unscoped.
+    expect(detach.slice(detach.indexOf("An agent token's detach"))).toBe(DETACH_AGENT);
   });
 
   it("leaves a member's empty list_pages on /mcp asking for a code or an invite, and the same instructions", async () => {

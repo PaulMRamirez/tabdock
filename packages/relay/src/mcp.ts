@@ -571,7 +571,7 @@ function fixedEntries(config: ResolvedConfig): ListedTool[] {
       name: 'detach_page',
       title: 'Detach from a page',
       description:
-        "Remove your own attachment to a page. Other people's attachments are not affected, except those your invites let in, which end with yours. An agent token's detach closes the token for good. To use the page again, pair with a new code, or, if your account joins pages by invite, with a new invite link from the page's operator.",
+        "Remove your own attachment to a page. Other people's attachments are not affected, except those your invites let in, which end with yours. An agent token's detach closes the token for good; to come back, the agent needs a new token from the page's operator. On any other connection, to use the page again, pair with a new code, or, if your account joins pages by invite, with a new invite link from the page's operator.",
       inputSchema: listedInputSchema(PAGE_INPUT),
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
