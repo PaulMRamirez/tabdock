@@ -4,8 +4,8 @@
 // as JSON in PAGE_FLOOD_OPTIONS, and every other setting at its default, its
 // log at the production level. It prints its /page and /mcp URLs, space
 // apart, as its first line, sends each log message as `{ line }` over IPC, and
-// `{ closing }` too each time it closes a page socket as not reading, and
-// answers each IPC message with its memory after two
+// `{ closing }` too each time it closes a page socket as not reading or as
+// silent, and answers each IPC message with its memory after two
 // collections, the reasons it gave for closing page sockets, and the most any
 // page socket had queued past what the kernel took right after the relay
 // handed it a frame, both since the last answer, so page-backpressure.test.ts
@@ -40,6 +40,10 @@ const options = JSON.parse(process.env.PAGE_FLOOD_OPTIONS ?? '{}') as Pick<
 >;
 let closes: string[] = [];
 let lines = 0;
+// Both ways the relay closes a page that sends and never reads: once what it
+// queues passes its bounds, or once flow control has kept the page's frames
+// from it for the idle timeout (page-backpressure.test.ts says when).
+const CLOSE_LINES = ['closing page socket', 'closing silent page socket'];
 const relay = await createRelay({
   auth: createDevTokenAuth([
     { token: 'tabdock-page-flood-token-not-a-secret', userId: 'flood', displayName: 'F' },
@@ -55,9 +59,10 @@ const relay = await createRelay({
     const entry = JSON.parse(line) as { msg?: unknown };
     // So a test can say what the relay last did, if its own process stops answering.
     if (typeof entry.msg === 'string') send({ line: entry.msg });
-    if (typeof entry.msg === 'string' && entry.msg.startsWith('closing page socket')) {
-      closes.push(entry.msg);
-      send({ closing: entry.msg });
+    const { msg } = entry;
+    if (typeof msg === 'string' && CLOSE_LINES.some((close) => msg.startsWith(close))) {
+      closes.push(msg);
+      send({ closing: msg });
     }
   },
 });
