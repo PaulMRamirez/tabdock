@@ -10,8 +10,8 @@
 // 5.1.0's, and call installWebMCP() itself, since importing 6.0.0 installs
 // nothing.
 
-import { existsSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MCPB6_POLYFILL_MODULE, MCPB6_POLYFILL_SCRIPT, mcpb6ModuleScript } from '@tabdock/mcpb6';
 import { describe, expect, it } from 'vitest';
@@ -55,10 +55,23 @@ describe('the MCP-B 6.0.0 leg (ADRs 0031 and 0047)', () => {
     expect(config.projects?.map((p) => p.name)).toEqual(['chromium', 'mcpb6']);
   });
 
-  it('would fail a pattern narrowed to mcpb6.spec.ts alone', () => {
-    const narrowed = /mcpb6\.spec\.ts$/;
-    expect(matches(narrowed, 'mcpb6.spec.ts')).toBe(true);
-    expect(matches(narrowed, 'mcpb6-images.spec.ts')).toBe(false);
+  // Read from the specs directory as it stands, so a new mcpb6 spec the
+  // pattern misses, or a pattern narrowed to mcpb6.spec.ts alone, fails here.
+  it('runs every mcpb6*.spec.ts under specs/ in the leg, and every other spec in chromium', () => {
+    const leg = project('mcpb6');
+    const main = project('chromium');
+    const specs = readdirSync(SPECS, { recursive: true, encoding: 'utf8' }).filter((file) =>
+      file.endsWith('.spec.ts'),
+    );
+    const onLeg = (file: string): boolean => basename(file).startsWith('mcpb6');
+    expect(specs.filter(onLeg)).toEqual(
+      expect.arrayContaining(['mcpb6.spec.ts', 'mcpb6-images.spec.ts']),
+    );
+    expect(specs.length).toBeGreaterThan(10);
+    for (const spec of specs) {
+      expect(matches(leg.testMatch, spec), spec).toBe(onLeg(spec));
+      expect(matches(main.testIgnore, spec), spec).toBe(onLeg(spec));
+    }
   });
 
   it('launches the leg without the flag that turns native WebMCP on, and the rest with it', () => {
