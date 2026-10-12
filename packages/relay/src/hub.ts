@@ -4858,10 +4858,13 @@ export class PageHub {
    * Ends an attachment past its expiresAt like a revoke, with an expire
    * record: unused too long, or an invite-made one at its end, 24 hours
    * after redemption however much it is used (S14). True if it ended.
+   * `lapsedAt`, from a restore, is when it ran out while the relay was down:
+   * its reason is judged then, and the session, whose end the restore has
+   * already run in order, is left alone (#endLapsed).
    */
-  #expireIfDue(pageId: string, userId: string): boolean {
+  #expireIfDue(pageId: string, userId: string, lapsedAt?: number): boolean {
     // An end the session capped is the session's to end, whichever timer runs first (ADR 0043).
-    this.#endSessionIfDue(pageId);
+    if (lapsedAt === undefined) this.#endSessionIfDue(pageId);
     const attachment = this.#store.attachments.get(pageId, userId);
     if (!attachment || attachment.expiresAt === null) return false;
     const now = Date.now();
@@ -4870,7 +4873,7 @@ export class PageHub {
       this.#armExpiry(attachment);
       return false;
     }
-    const ended = attachment.endsAt !== null && attachment.endsAt <= now;
+    const ended = attachment.endsAt !== null && attachment.endsAt <= (lapsedAt ?? now);
     const idle = formatDuration(this.#config.timings.attachmentIdleMs);
     this.#endAttachments(
       pageId,
@@ -8156,8 +8159,9 @@ export class PageHub {
    * change would, an account the list in force no longer gives to the same
    * person loses what it held, and what it sponsored goes with it, each with
    * its records (S8, S13, S14), and those who stay take the names the list
-   * gives them (ADR 0017); a session past its end ends with reason time;
-   * and an attachment, invite or token past its time ends, the rest timed
+   * gives them (ADR 0017); then the session, attachments, invites and
+   * tokens past their time end in the order their timers would have ended
+   * them, the session with reason time (#endLapsed), and the rest are timed
    * again from their stored ends. snapshot_loaded counts what is live after
    * all that, with the attachments the member list dropped.
    */
@@ -8245,17 +8249,7 @@ export class PageHub {
       });
     }
     // What ran out while the relay was down ends now, as each timer would end it.
-    for (const pageId of pageIds) {
-      this.#endSessionIfDue(pageId);
-      for (const attachment of this.#store.attachments.listForPage(pageId)) {
-        this.#expireIfDue(pageId, attachment.userId);
-      }
-      for (const invite of this.#store.invites.listForPage(pageId)) {
-        if (invite.expiresAt <= now) this.#closeInvite(invite, 'expired', false);
-        else this.#armInviteExpiry(invite);
-      }
-      for (const agent of this.#store.agents.listForPage(pageId)) this.#agents.inTime(agent, now);
-    }
+    for (const pageId of pageIds) this.#endLapsed(pageId, now);
     const loaded: AuditEventOf<'snapshot_loaded'> = {
       v: AUDIT_VERSION,
       type: 'snapshot_loaded',
@@ -8273,5 +8267,68 @@ export class PageHub {
     };
     this.#audit(loaded);
     return loaded;
+  }
+
+  /**
+   * Ends what ran out on a restored page while the relay was down in the
+   * order a relay that never stopped would have ended it (ADR 0046), so each
+   * record names the reason its own timer would have given (S7): the
+   * session, each attachment, invite and agent token at or before `now`,
+   * oldest end first, a tie going to the session, whose end a capped
+   * expiry is, and then to an invite or a token, whose own end it is,
+   * before an attachment. Each goes through the end its timer runs,
+   * skipped when an earlier end already took it, and an attachment is
+   * judged idle or at its invited end at its own expiry, not at the load.
+   * What is still to come is timed again from its stored end.
+   */
+  #endLapsed(pageId: string, now: number): void {
+    const lapsed: { at: number; rank: number; end: () => void }[] = [];
+    const session = this.#store.pages.get(pageId)?.timedSession ?? null;
+    if (session !== null && session.endsAt <= now) {
+      lapsed.push({
+        at: session.endsAt,
+        rank: 0,
+        end: () => {
+          if (this.#store.pages.get(pageId)?.timedSession?.sessionId === session.sessionId) {
+            this.#endSession(pageId, 'time');
+          }
+        },
+      });
+    }
+    for (const invite of this.#store.invites.listForPage(pageId)) {
+      if (invite.expiresAt > now) continue;
+      lapsed.push({
+        at: invite.expiresAt,
+        rank: 1,
+        end: () => {
+          const current = this.#store.invites.get(pageId, invite.inviteId);
+          if (current) this.#closeInvite(current, 'expired', false);
+        },
+      });
+    }
+    for (const agent of this.#store.agents.listForPage(pageId)) {
+      // inTime closes it as expired only while it is still the live token.
+      if (agent.expiresAt <= now) {
+        lapsed.push({ at: agent.expiresAt, rank: 1, end: () => this.#agents.inTime(agent, now) });
+      }
+    }
+    for (const attachment of this.#store.attachments.listForPage(pageId)) {
+      const { userId, expiresAt } = attachment;
+      if (expiresAt === null || expiresAt > now) continue;
+      lapsed.push({
+        at: expiresAt,
+        rank: 2,
+        end: () => this.#expireIfDue(pageId, userId, expiresAt),
+      });
+    }
+    lapsed.sort((a, b) => a.at - b.at || a.rank - b.rank);
+    for (const { end } of lapsed) end();
+    // The rest are timed from their stored ends: a session's timer, each
+    // attachment's and each invite's (a token's was armed as it came back).
+    this.#endSessionIfDue(pageId);
+    for (const attachment of this.#store.attachments.listForPage(pageId)) {
+      this.#armExpiry(attachment);
+    }
+    for (const invite of this.#store.invites.listForPage(pageId)) this.#armInviteExpiry(invite);
   }
 }

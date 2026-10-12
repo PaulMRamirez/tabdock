@@ -1612,6 +1612,209 @@ describe("fitting this relay's settings (snapshot.ts, fitProblem)", () => {
   });
 });
 
+describe('what ran out while the relay was down (S7, ADR 0046)', () => {
+  const GUEST_ID = `${INVITEE_ID_PREFIX}${'cd'.repeat(16)}`;
+  const AGENT_ID = `${INVITEE_ID_PREFIX}${'ab'.repeat(16)}`;
+  const sponsor = { userId: DEV_ALICE.userId, displayName: DEV_ALICE.displayName };
+
+  /** A hub with invites and agent tokens on, holding nothing yet. */
+  function hubOf(): { hub: PageHub; store: ReturnType<typeof createMemoryStore> } {
+    const store = createMemoryStore();
+    const config = resolveConfig({
+      auth: createDevTokenAuth([DEV_ALICE]),
+      invites: true,
+      agentTokens: true,
+    });
+    return { hub: new PageHub(config, store, createLogger({ sink: () => undefined })), store };
+  }
+
+  function snapshotOf(
+    now: number,
+    parts: Partial<Pick<RelaySnapshot, 'attachments' | 'invites' | 'agents'>> & {
+      page?: Partial<SnapshotPage>;
+    },
+  ): RelaySnapshot {
+    return RelaySnapshotSchema.parse({
+      v: SNAPSHOT_VERSION,
+      writtenAt: now - 8 * MINUTE,
+      mode: 'dev_tokens',
+      credentials: null,
+      pages: [
+        savedPageOf('pg_1', now, {
+          ceiling: PolicySchema.parse({ invites: 'all', maxDrivers: 2, proposals: 'members' }),
+          ...parts.page,
+        }),
+      ],
+      attachments: parts.attachments ?? [],
+      invites: parts.invites ?? [],
+      agents: parts.agents ?? [],
+    });
+  }
+
+  function inviteOf(expiresAt: number): SnapshotInvite {
+    return {
+      inviteId: 'inv_1',
+      pageId: 'pg_1',
+      role: 'observer',
+      label: 'class',
+      uses: 5,
+      usesLeft: 5,
+      createdAt: expiresAt - 30 * MINUTE,
+      requestedExpiresAt: expiresAt,
+      expiresAt,
+      ownExpiresAt: expiresAt,
+      secretHash: 'b'.repeat(64),
+      sponsor,
+      refusals: 0,
+      barredUserIds: [],
+      barredEmailHashes: [],
+    };
+  }
+
+  function agentOf(expiresAt: number): SnapshotAgent {
+    return {
+      tokenId: 'agt_1',
+      pageId: 'pg_1',
+      label: 'bot',
+      secretHash: 'c'.repeat(64),
+      createdAt: expiresAt - 30 * MINUTE,
+      expiresAt,
+      requestedExpiresAt: expiresAt,
+      sponsor,
+      state: 'dormant',
+      timeouts: 0,
+      userId: AGENT_ID,
+      client: null,
+    };
+  }
+
+  function guestOf(expiresAt: number, endsAt: number): SnapshotAttachment {
+    return savedAttachmentOf('pg_1', GUEST_ID, {
+      kind: 'invitee',
+      lastUsedAt: expiresAt - 5 * MINUTE,
+      expiresAt,
+      inviteId: 'inv_0',
+      endsAt,
+      inviteRole: 'observer',
+      sponsorId: sponsor.userId,
+    });
+  }
+
+  function sessionEndingAt(endsAt: number): Partial<SnapshotPage> {
+    return {
+      timedSession: {
+        sessionId: 'ses_1',
+        startedAt: endsAt - 30 * MINUTE,
+        endsAt,
+        lengthMs: 30 * MINUTE,
+        policy: { maxDrivers: 1, proposals: 'off' },
+      },
+    };
+  }
+
+  /** The records a restore wrote, each as its type, reason and what it names. */
+  async function restored(snapshot: RelaySnapshot): Promise<string[]> {
+    const { hub, store } = hubOf();
+    hub.restoreSnapshot(snapshot, { ageMs: 8 * MINUTE, accounts: snapshotAccounts(null) });
+    await hub.shutdown();
+    return store.audit
+      .records()
+      .filter((record) => record.type !== 'snapshot_loaded')
+      .map((record) => {
+        const named =
+          'tokenId' in record
+            ? record.tokenId
+            : 'inviteId' in record
+              ? record.inviteId
+              : 'sessionId' in record
+                ? `${record.sessionId} attachments=${String(record.attachments)}`
+                : 'userId' in record
+                  ? record.userId
+                  : 'sponsor' in record
+                    ? record.sponsor
+                    : '';
+        return `${record.type} ${'reason' in record ? record.reason : ''} ${named}`;
+      });
+  }
+
+  it("ends an invite and a token that ran out before their sponsor's idle end as expired, not as the sponsor's", async () => {
+    const now = Date.now();
+    const records = await restored(
+      snapshotOf(now, {
+        attachments: [
+          savedAttachmentOf('pg_1', sponsor.userId, {
+            lastUsedAt: now - 30 * MINUTE,
+            expiresAt: now - MINUTE,
+          }),
+        ],
+        invites: [inviteOf(now - 2 * MINUTE)],
+        agents: [agentOf(now - 2 * MINUTE)],
+      }),
+    );
+    // As timers that never stopped would have: the invite and the token at
+    // their own end, then Alice's idle end, which takes nothing more.
+    expect(records.slice(0, 2).sort()).toEqual([
+      'agent_closed expired agt_1',
+      'invite_closed expired inv_1',
+    ]);
+    expect(records.slice(2)).toEqual([`expire idle ${sponsor.userId}`]);
+  });
+
+  it("ends a guest whose idle end came before the session's as idle, and the session's end counts none", async () => {
+    const now = Date.now();
+    const sessionEnd = now - 2 * MINUTE;
+    const records = await restored(
+      snapshotOf(now, {
+        page: sessionEndingAt(sessionEnd),
+        attachments: [
+          savedAttachmentOf('pg_1', sponsor.userId),
+          guestOf(now - 4 * MINUTE, sessionEnd),
+        ],
+      }),
+    );
+    expect(records).toEqual([`expire idle ${GUEST_ID}`, 'session_end time ses_1 attachments=0']);
+  });
+
+  it('judges an idle end that came before an invited end as idle, at its own time', async () => {
+    const now = Date.now();
+    const records = await restored(
+      snapshotOf(now, {
+        attachments: [
+          savedAttachmentOf('pg_1', sponsor.userId),
+          guestOf(now - 4 * MINUTE, now - 2 * MINUTE),
+        ],
+      }),
+    );
+    expect(records).toEqual([`expire idle ${GUEST_ID}`]);
+  });
+
+  it('still ends a guest at its invited end as ends_at, and with a session that ended first as the session', async () => {
+    const now = Date.now();
+    expect(
+      await restored(
+        snapshotOf(now, {
+          attachments: [
+            savedAttachmentOf('pg_1', sponsor.userId),
+            guestOf(now - 2 * MINUTE, now - 2 * MINUTE),
+          ],
+        }),
+      ),
+    ).toEqual([`expire ends_at ${GUEST_ID}`]);
+    const sessionEnd = now - 5 * MINUTE;
+    expect(
+      await restored(
+        snapshotOf(now, {
+          page: sessionEndingAt(sessionEnd),
+          attachments: [
+            savedAttachmentOf('pg_1', sponsor.userId),
+            guestOf(now - 2 * MINUTE, sessionEnd),
+          ],
+        }),
+      ),
+    ).toEqual([`expire session_ended ${GUEST_ID}`, 'session_end time ses_1 attachments=1']);
+  });
+});
+
 describe('the hub around a snapshot (hub.ts)', () => {
   function hubOf(store = createMemoryStore()): PageHub {
     const config = resolveConfig({ auth: createDevTokenAuth([DEV_ALICE]) });
