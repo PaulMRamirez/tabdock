@@ -199,7 +199,12 @@ export interface InviteRecord {
   pendingRequestId: string | null;
   /** Refusals and timeouts so far; INVITE_BURN_REFUSALS burns a control invite. */
   refusals: number;
-  /** Accounts revoked from this invite, by user id (for an invitee, the digest of its sub). */
+  /**
+   * Accounts revoked from this invite, each by the id that stands for it
+   * whatever the member list says (MemberList.accountIdOf): an invitee's own
+   * id, which is the digest of its sub, and for a member the id its sub
+   * signs in under as an invitee, so no list change clears a bar (S14).
+   */
   barredUserIds: string[];
   /** Digests of revoked invitees' verified emails, so a new sign-up with the same address stays out. */
   barredEmailHashes: string[];
