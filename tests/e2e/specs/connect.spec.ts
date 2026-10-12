@@ -618,6 +618,6 @@ test.describe("the demo's static build, as Pages serves it", () => {
     await serveStatic(page, '/tabdock/');
     await page.goto('https://board.example/tabdock/');
     await page.waitForSelector('html[data-tools="ready"]');
-    await expect(page.locator('[data-role="status"]')).toHaveText(/6 tools registered/);
+    await expect(page.locator('[data-role="status"]')).toHaveText(/7 tools registered/);
   });
 });

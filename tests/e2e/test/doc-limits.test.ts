@@ -1,9 +1,15 @@
-// The guide's limits table (docs/guide/12-setup-and-limits.md, ADR 0035)
-// names the constant behind each number it states and the file that holds
-// it, so this holds each stated value and unit to the constant itself: a
-// timer or a cap changed in code fails here until the page says the new
-// number. Times must be in s, min or h, character caps in characters and
-// byte caps in bytes, and the named file must export the constant.
+// The guide's limits tables (docs/guide/12-setup-and-limits.md, ADR 0035,
+// and from M6 15-limits-for-rooms.md, which took the limits for rooms,
+// images and state so neither page passes its length cap) name the constant
+// behind each number they state and the file that holds it, so this holds
+// each stated value and unit to the constant itself: a timer or a cap
+// changed in code fails here until the page says the new number. Times must
+// be in ms (for a spacing under a second), s, min or h, character caps in
+// characters and byte caps in bytes, and the named file must export the
+// constant. The docs pass after M6 added the restart snapshot's cap, what an
+// agent token's first request is read for its client, and the slack a page's
+// own end of a session is believed within, which hub.ts and relay.ts export
+// for this.
 
 import * as protocol from '@tabdock/protocol';
 import { dirname, join, normalize } from 'node:path';
@@ -12,10 +18,13 @@ import * as adapterCore from '../../../packages/adapter/src/core.ts';
 import * as auth from '../../../packages/relay/src/auth.ts';
 import * as config from '../../../packages/relay/src/config.ts';
 import * as confirm from '../../../packages/relay/src/confirm.ts';
+import * as hub from '../../../packages/relay/src/hub.ts';
+import * as relay from '../../../packages/relay/src/relay.ts';
 import { readRepo, type TableRow, tables } from '../src/doc-files.ts';
 
 const PAGE = 'docs/guide/12-setup-and-limits.md';
-/** The constants the plan for the guide requires the table to state, at least. */
+const ROOMS_PAGE = 'docs/guide/15-limits-for-rooms.md';
+/** The constants the plan for the guide requires the tables to state, at least. */
 const REQUIRED = [
   'PAIRING_TTL_MS',
   'ATTACH_REQUEST_TTL_MS',
@@ -30,15 +39,83 @@ const REQUIRED = [
   'MAX_INVITE_LIFETIME_MS',
   'MAX_FIRST_CLASS_NAME_CHARS',
   'ATTACHMENT_IDLE_MS',
+  // From M6 (ADRs 0039 to 0045), on the second page.
+  'MAX_IMAGE_BYTES',
+  'DEFAULT_IMAGE_BYTES',
+  'MAX_IMAGE_TEXT_CHARS',
+  'MAX_IMAGE_SIDE',
+  'MAX_IMAGE_PIXELS',
+  'IMAGE_CALL_SPACING_MS',
+  'MAX_WAITING_IMAGE_CALLS',
+  'MAX_STATE_BYTES',
+  'MAX_STATE_FRAME_BYTES',
+  'STATE_MIN_INTERVAL_MS',
+  'DEFAULT_STATE_WAIT_MS',
+  'MAX_WAIT_MS',
+  'MAX_WAITS_PER_USER',
+  'STATE_BYTES',
+  'PROPOSAL_TTL_MS',
+  'MAX_PENDING_PROPOSALS_PER_USER',
+  'MAX_PENDING_PROPOSALS_PER_PAGE',
+  'MAX_PROPOSAL_ARGUMENT_BYTES',
+  'MAX_PROPOSAL_ARGUMENT_NODES',
+  'ACCEPTED_PROPOSAL_RUN_MS',
+  'PROPOSAL_OUTCOME_KEEP_MS',
+  'MAX_SETTLED_PROPOSALS_PER_PAGE',
+  'MAX_PROPOSAL_RESULT_CHARS',
+  'PROPOSAL_BYTES',
+  'MIN_SESSION_MS',
+  'MAX_SESSION_MS',
+  'SESSION_LENGTH_UNIT_MS',
+  'SESSION_EXTEND_MS',
+  'SESSION_END_GRACE_MS',
+  'MAX_MEMBERS',
+  'MAX_MEMBERS_FILE_BYTES',
+  'MEMBERS_POLL_MS',
+  'MAX_USERS_PER_PAGE',
+  'MAX_OBSERVERS_PER_PAGE',
+  'OBSERVERS_PER_PAGE',
+  'MEMBER_RESERVED_SEATS',
+  'MAX_ROSTER_CLIENTS_PER_INVITEE',
+  'INVITEE_SESSIONS',
+  'MIN_INVITEE_SESSIONS',
+  'RESPONSE_BYTES',
+  'MIN_RESPONSE_BYTES',
+  'AGENT_TOKEN_BYTES',
+  'AGENT_TOKEN_CHARS',
+  'DEFAULT_AGENT_LIFETIME_MS',
+  'MAX_AGENT_LIFETIME_MS',
+  'MAX_LIVE_AGENTS_PER_PAGE',
+  'AGENT_BURN_TIMEOUTS',
+  'SESSION_RECORD_MAX_CALLS',
+  'SESSION_RECORD_MAX_ATTACHMENTS',
+  'SESSION_RECORD_MAX_PROPOSALS',
+  'SESSION_RECORD_MAX_PAGE_IDS',
+  'SESSION_RECORD_MAX_ROLE_CHANGES',
+  'SESSION_RECORD_MAX_DROPPED_USERS',
+  'SESSION_RECORD_MAX_BYTES',
+  // From the docs pass after M6 (ADRs 0043, 0044 and 0046).
+  'MAX_SNAPSHOT_BYTES',
+  'MAX_AGENT_NAMING_BYTES',
+  'SESSION_CLOCK_SLACK_MS',
 ];
+/** The required limits page 15 states, for rooms, images and state: the rest are page 12's. */
+const ROOMS_REQUIRED = REQUIRED.slice(REQUIRED.indexOf('MAX_IMAGE_BYTES'));
 const MODULES: readonly Readonly<Record<string, unknown>>[] = [
   protocol,
   config,
   confirm,
   auth,
   adapterCore,
+  hub,
+  relay,
 ];
-const TIME_UNITS: Readonly<Record<string, number>> = { s: 1000, min: 60_000, h: 3_600_000 };
+const TIME_UNITS: Readonly<Record<string, number>> = {
+  ms: 1,
+  s: 1000,
+  min: 60_000,
+  h: 3_600_000,
+};
 const WORDS: Readonly<Record<string, number>> = {
   one: 1,
   two: 2,
@@ -51,6 +128,11 @@ const WORDS: Readonly<Record<string, number>> = {
   nine: 9,
   ten: 10,
 };
+
+/** The required constants no row names. */
+function missingRequired(named: readonly (string | undefined)[]): string[] {
+  return REQUIRED.filter((constant) => !named.includes(constant));
+}
 
 function constantValue(name: string): number | undefined {
   for (const module of MODULES) {
@@ -78,7 +160,7 @@ function partProblem(constant: string, part: string): string | null {
   const { number, unit } = parsed;
   if (constant.endsWith('_MS')) {
     const scale = TIME_UNITS[unit];
-    if (scale === undefined) return `"${part}" gives ${constant} in ${unit}, not s, min or h`;
+    if (scale === undefined) return `"${part}" gives ${constant} in ${unit}, not ms, s, min or h`;
     return number * scale === value ? null : `"${part}" is not ${constant}, ${String(value)} ms`;
   }
   if (constant.endsWith('_CHARS') && unit !== 'characters') {
@@ -91,14 +173,14 @@ function partProblem(constant: string, part: string): string | null {
   return number === value ? null : `"${part}" is not ${constant}, ${String(value)}`;
 }
 
-/** The file a row's In cell names: its link, or the last link with that name above. */
-function filesByRow(rows: readonly TableRow[]): (string | null)[] {
+/** The file a row's In cell names: its link, or the last link with that name above on its page. */
+function filesByRow(rows: readonly TableRow[], page = PAGE): (string | null)[] {
   const seen = new Map<string, string>();
   return rows.map((row) => {
     const cell = row.cells.In ?? '';
     const link = /\[([^\]]+)\]\(([^)]+)\)/.exec(cell);
     if (link !== null) {
-      const path = normalize(join(dirname(PAGE), link[2] ?? ''));
+      const path = normalize(join(dirname(page), link[2] ?? ''));
       seen.set(link[1] ?? '', path);
       return path;
     }
@@ -106,8 +188,8 @@ function filesByRow(rows: readonly TableRow[]): (string | null)[] {
   });
 }
 
-function rowProblems(row: TableRow, file: string | null): string[] {
-  const where = `${PAGE}:${String(row.line)}`;
+function rowProblems(row: TableRow, file: string | null, page = PAGE): string[] {
+  const where = `${page}:${String(row.line)}`;
   const constants = [...(row.cells.Constant ?? '').matchAll(/`([A-Z0-9_]+)`/g)].map(
     (match) => match[1] ?? '',
   );
@@ -132,27 +214,64 @@ function rowProblems(row: TableRow, file: string | null): string[] {
   ];
 }
 
-describe("the setup and limits page's limits table", () => {
-  const table = tables(readRepo(PAGE)).find((candidate) => candidate.header[0] === 'Limit');
-  const rows = table?.rows ?? [];
-
-  it('states every limit the guide promises', () => {
-    const named = rows.flatMap((row) =>
-      [...(row.cells.Constant ?? '').matchAll(/`([A-Z0-9_]+)`/g)].map((match) => match[1]),
-    );
-    expect(REQUIRED.filter((constant) => !named.includes(constant))).toEqual([]);
+describe("the guide's limits tables", () => {
+  const pages = [PAGE, ROOMS_PAGE].map((page) => {
+    const table = tables(readRepo(page)).find((candidate) => candidate.header[0] === 'Limit');
+    return { page, rows: table?.rows ?? [] };
   });
 
-  it('states each value in its unit, as the named file exports it', () => {
-    const files = filesByRow(rows);
-    expect(rows.flatMap((row, index) => rowProblems(row, files[index] ?? null))).toEqual([]);
+  it('are on both pages', () => {
+    expect(pages.map(({ rows }) => rows.length > 0)).toEqual([true, true]);
+  });
+
+  it('state every limit the guide promises, each once', () => {
+    const named = pages.flatMap(({ rows }) =>
+      rows.flatMap((row) =>
+        [...(row.cells.Constant ?? '').matchAll(/`([A-Z0-9_]+)`/g)].map((match) => match[1]),
+      ),
+    );
+    expect(missingRequired(named)).toEqual([]);
+    expect(named.filter((constant, index) => named.indexOf(constant) !== index)).toEqual([]);
+  });
+
+  it('state the limits for rooms, images and state on page 15, and the rest on page 12', () => {
+    const on = (page: string): string[] =>
+      (pages.find((candidate) => candidate.page === page)?.rows ?? []).flatMap((row) =>
+        [...(row.cells.Constant ?? '').matchAll(/`([A-Z0-9_]+)`/g)].map((match) => match[1] ?? ''),
+      );
+    expect(ROOMS_REQUIRED).toContain('SESSION_CLOCK_SLACK_MS');
+    expect(ROOMS_REQUIRED.filter((constant) => !on(ROOMS_PAGE).includes(constant))).toEqual([]);
+    expect(
+      REQUIRED.filter((constant) => !ROOMS_REQUIRED.includes(constant)).filter(
+        (constant) => !on(PAGE).includes(constant),
+      ),
+    ).toEqual([]);
+  });
+
+  it('state each value in its unit, as the named file exports it', () => {
+    const problems = pages.flatMap(({ page, rows }) => {
+      const files = filesByRow(rows, page);
+      return rows.flatMap((row, index) => rowProblems(row, files[index] ?? null, page));
+    });
+    expect(problems).toEqual([]);
   });
 
   it('would fail a stale number or a wrong unit', () => {
     expect(partProblem('PAIRING_TTL_MS', '90 s')).not.toBeNull();
     expect(partProblem('PAIRING_TTL_MS', '2 min')).toBeNull();
+    expect(partProblem('STATE_MIN_INTERVAL_MS', '500 ms')).toBeNull();
+    expect(partProblem('STATE_MIN_INTERVAL_MS', '5 s')).not.toBeNull();
     expect(partProblem('MAX_FRAME_BYTES', '1 MiB')).not.toBeNull();
     expect(partProblem('MAX_RESULT_CHARS', '120,000 bytes')).not.toBeNull();
     expect(partProblem('MAX_PENDING_CONFIRMATIONS', 'four at once per user')).toBeNull();
+    expect(partProblem('SESSION_CLOCK_SLACK_MS', '60 s')).toBeNull();
+    expect(partProblem('SESSION_CLOCK_SLACK_MS', '30 s')).not.toBeNull();
+    expect(partProblem('MAX_AGENT_NAMING_BYTES', '16 KiB')).not.toBeNull();
+    expect(partProblem('MAX_SNAPSHOT_BYTES', '16,777,216 bytes')).toBeNull();
+  });
+
+  it('would fail a required constant the tables leave out', () => {
+    const named = REQUIRED.filter((constant) => constant !== 'SESSION_CLOCK_SLACK_MS');
+    expect(missingRequired(named)).toEqual(['SESSION_CLOCK_SLACK_MS']);
   });
 });

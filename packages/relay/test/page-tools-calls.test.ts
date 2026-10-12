@@ -16,6 +16,7 @@ import type { Client } from '@modelcontextprotocol/client';
 import type { AuditCallEvent, PageTool } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { DevTokenUser } from '../src/index.ts';
+import { FIXED_TOOL_NAMES } from '../src/mcp.ts';
 import {
   attachMember,
   call,
@@ -78,17 +79,26 @@ async function client(user: DevTokenUser = ALICE, modern = false): Promise<Clien
   return connected;
 }
 
-/** A call record without the two fields a second call cannot share. */
-type CallLine = Omit<AuditCallEvent, 'at' | 'durationMs'>;
+/**
+ * A call record without the three fields a second call cannot share: when,
+ * how long, and the id of the invoke it went out as (ADR 0045).
+ */
+type CallLine = Omit<AuditCallEvent, 'at' | 'durationMs' | 'callId'>;
 
-/** The newest call record, without the two fields a second call cannot share. */
+/** The newest call record, without the three fields a second call cannot share. */
 function lastRecord(): CallLine {
   const record = current?.relay.audit.records().at(-1);
   if (!record) throw new Error('no call record');
   const rest: Partial<AuditCallEvent> = { ...record };
   delete rest.at;
   delete rest.durationMs;
+  delete rest.callId;
   return rest as CallLine;
+}
+
+/** The newest call record's invoke id, which only a call that reached the page has. */
+function lastCallId(): string | undefined {
+  return current?.relay.audit.records().at(-1)?.callId;
 }
 
 function recordCount(): number {
@@ -109,19 +119,21 @@ async function bothRoutes(
   named: ToolOutcome;
   fixedRecord: CallLine;
   namedRecord: CallLine;
+  callIds: (string | undefined)[];
 }> {
   const before = recordCount();
   const fixed = await callTool(alice, 'call_page_tool', { page: pageId, tool, arguments: args });
   expect(recordCount(), `${tool}: call_page_tool left no call line`).toBe(before + 1);
   const fixedRecord = lastRecord();
+  const fixedCallId = lastCallId();
   const named = await callTool(alice, `${pageId}__${tool.replaceAll('.', '_')}`, args);
   expect(recordCount(), `${tool}: the first-class call left no call line`).toBe(before + 2);
   const namedRecord = lastRecord();
-  return { fixed, named, fixedRecord, namedRecord };
+  return { fixed, named, fixedRecord, namedRecord, callIds: [fixedCallId, lastCallId()] };
 }
 
 /** The fixed tools, the whole list an invitee or an invite-made attachment sees. */
-const FIXED_TOOLS = ['list_pages', 'pair_page', 'list_page_tools', 'call_page_tool', 'detach_page'];
+const FIXED_TOOLS = [...FIXED_TOOL_NAMES];
 
 /** An invoke frame without the two fields each call has its own of. */
 function samePerCall(frame: InvokeFrame): Omit<InvokeFrame, 'callId' | 'deadlineMs'> {
@@ -181,7 +193,7 @@ describe('a first-class call and call_page_tool', () => {
         ];
         for (const [tool, args, expected, reaches] of cases) {
           const invoked = opened.all('invoke').length;
-          const { fixed, named, fixedRecord, namedRecord } = await bothRoutes(
+          const { fixed, named, fixedRecord, namedRecord, callIds } = await bothRoutes(
             alice,
             opened.pageId,
             tool,
@@ -198,7 +210,12 @@ describe('a first-class call and call_page_tool', () => {
           // so both routes must hand it the same frame, but for the call's
           // own id and deadline.
           await opened.sync();
-          const frames = opened.all('invoke').slice(invoked).map(samePerCall);
+          const invokes = opened.all('invoke').slice(invoked);
+          // Each line that reached the page names its own invoke, and no other does (ADR 0045).
+          expect(callIds, tool).toEqual(
+            reaches ? invokes.map((frame) => frame.callId) : [undefined, undefined],
+          );
+          const frames = invokes.map(samePerCall);
           expect(frames, tool).toHaveLength(reaches ? 2 : 0);
           if (reaches) {
             expect(frames[0], tool).toMatchObject({ tool, arguments: args });
@@ -507,7 +524,7 @@ describe('an invitee and an attachment an invite made', () => {
 
       const name = `${opened.pageId}__get_view`;
       for (const each of [guest, bob]) {
-        // Exactly the five fixed tools, and nothing beside them (A5.1).
+        // Exactly the fixed tools, and nothing beside them (A5.1).
         const listed = (await each.listTools()).tools.map((tool) => tool.name).sort();
         expect(listed).toEqual([...FIXED_TOOLS].sort());
         const answer = await call(each, name);

@@ -1,11 +1,13 @@
 // Relay state behind small interfaces (SPEC section 4). Everything but the
-// audit log lives in memory, and a restart ends it all (ADR 0019); the
+// audit log lives in memory, and a restart ends it all (ADR 0019) unless a
+// graceful stop saved it in the restart snapshot (snapshot.ts, ADR 0046); the
 // persistent audit log (FileAuditLog, audit-file.ts) sits behind the same
 // AuditLog, and live invites behind InviteStore. Interfaces are
 // synchronous on purpose: a persistent audit log can write behind, and the hub
 // never has to reason about interleaved awaits while it changes attachments.
 
 import type {
+  AgentState,
   AttachVia,
   AuditCallEvent,
   AuditEvent,
@@ -13,6 +15,7 @@ import type {
   PageTool,
   Policy,
   Role,
+  SessionPolicy,
   UserKind,
 } from '@tabdock/protocol';
 import type { UserAccount } from './auth.ts';
@@ -22,6 +25,19 @@ export type { AuditOutcome } from '@tabdock/protocol';
 
 export type PageState = 'awake' | 'asleep' | 'gone';
 
+/**
+ * A time-boxed session the operator started on a page (ADR 0043): when it
+ * started and ends on the relay's clock, and the policy it set within the
+ * page's own.
+ */
+export interface TimedSession {
+  sessionId: string;
+  startedAt: number;
+  endsAt: number;
+  lengthMs: number;
+  policy: SessionPolicy;
+}
+
 export interface PageRecord {
   pageId: string;
   /** From the WebSocket Origin header only (S1). */
@@ -29,7 +45,16 @@ export interface PageRecord {
   title: string;
   url: string;
   adapterVersion: string;
+  /**
+   * What the page allows now: its hello's policy, narrowed by a live
+   * time-boxed session field by field (ADR 0043), so every reader keeps
+   * reading this one field.
+   */
   policy: Policy;
+  /** The hello's policy as the page sent it, which no session may pass (ADR 0043). */
+  ceiling: Policy;
+  /** The time-boxed session live on the page, or null (ADR 0043). */
+  timedSession: TimedSession | null;
   tools: PageTool[];
   /**
    * True from a resume until the adapter's first tools frame: until then the
@@ -117,6 +142,8 @@ export interface AttachRequestRecord {
   via: AttachVia;
   /** The invite being redeemed, exactly when via is invite; never its secret. */
   inviteId: string | null;
+  /** The agent token whose first request this is, exactly when via is agent; never the token. */
+  agentTokenId: string | null;
   /**
    * The access token's client_id (RFC 9068) of the request that raised this
    * one, for the attach record an approval writes (ADR 0019); null for a dev
@@ -135,8 +162,9 @@ export interface AttachRequestRecord {
 /**
  * A live invite as the relay keeps it (ADR 0017): its terms, who sponsors it
  * and what is pending on it, but only the digest of its secret, which the
- * adapter alone ever held. An invite lives only in memory, so a restart ends
- * it like everything else (ADR 0019).
+ * adapter alone ever held. An invite lives in memory, so a restart ends it
+ * like everything else (ADR 0019), unless the restart snapshot carries it
+ * across a graceful stop (ADR 0046).
  */
 export interface InviteRecord {
   /** Drawn by the adapter; unique within its page only, so every lookup names the page too. */
@@ -157,9 +185,12 @@ export interface InviteRecord {
    * When it stops working, on the relay's clock: the page's expiry, never
    * past createdAt plus MAX_INVITE_LIFETIME_MS. An invite_create whose
    * expiresAt is less than MIN_INVITE_REMAINING_MS past the relay's now is
-   * refused as expired rather than kept (ADR 0017's notes).
+   * refused as expired rather than kept (ADR 0017's notes). A live
+   * time-boxed session caps it at its own end (ADR 0043).
    */
   expiresAt: number;
+  /** expiresAt before any session's cap, which a session's end or extension recomputes from (ADR 0043). */
+  ownExpiresAt: number;
   /** SHA-256 of the secret, hex, as invite_create carried it; unique across the relay. */
   secretHash: string;
   /** The member attached longest when it was minted; fixed, since /i has shown the name. */
@@ -168,10 +199,50 @@ export interface InviteRecord {
   pendingRequestId: string | null;
   /** Refusals and timeouts so far; INVITE_BURN_REFUSALS burns a control invite. */
   refusals: number;
-  /** Accounts revoked from this invite, by user id (for an invitee, the digest of its sub). */
+  /**
+   * Accounts revoked from this invite, each by the id that stands for it
+   * whatever the member list says (MemberList.accountIdOf): an invitee's own
+   * id, which is the digest of its sub, and for a member the id its sub
+   * signs in under as an invitee, so no list change clears a bar (S14).
+   */
   barredUserIds: string[];
   /** Digests of revoked invitees' verified emails, so a new sign-up with the same address stays out. */
   barredEmailHashes: string[];
+}
+
+/**
+ * A live agent token as the relay keeps it (ADR 0044): a bearer credential
+ * for /g/mcp that watches one page, a record of its own rather than a kind of
+ * invite, since an invite's secret is spent at redemption while a token
+ * authenticates every request for hours. Only the digest of the token is
+ * kept, and the record goes when the token closes, after which /g/mcp
+ * answers it 404. In memory, so a restart ends it (ADR 0019), unless the
+ * restart snapshot carries it across a graceful stop (ADR 0046).
+ */
+export interface AgentTokenRecord {
+  /** Drawn by the adapter; unique across the relay, as is the digest. */
+  tokenId: string;
+  pageId: string;
+  /** Written by the page (S10): listed back to it, never logged, audited or put in a name. */
+  label: string;
+  /** SHA-256 of the token, hex, as agent_create carried it. */
+  secretHash: string;
+  createdAt: number;
+  /** When it stops working on the relay's clock: the page's expiry, at most MAX_AGENT_LIFETIME_MS on. */
+  expiresAt: number;
+  /** As the page asked, on its own clock, which the agents frame lists back. */
+  requestedExpiresAt: number;
+  /** The member attached longest when it was minted; when they go, so does the token. */
+  sponsor: { userId: string; displayName: string };
+  state: AgentState;
+  /** The attach request its first use raised, while the operator is asked. */
+  requestId: string | null;
+  /** Prompts left to time out; AGENT_BURN_TIMEOUTS burns it. */
+  timeouts: number;
+  /** The agent's user id: g_ and a digest of the page and token ids (auth.ts, agentUser). */
+  userId: string;
+  /** The client its requests last named, so a prompt raised again can still name it. */
+  client: ClientInfo | null;
 }
 
 export interface PageStore {
@@ -234,6 +305,19 @@ export interface InviteStore {
   deleteForPage(pageId: string): InviteRecord[];
 }
 
+/** Live agent tokens (ADR 0044), beside the invites; the hub and agents.ts run their lifecycle. */
+export interface AgentStore {
+  get(pageId: string, tokenId: string): AgentTokenRecord | undefined;
+  /** Looks a token up by its digest (hex) without using it. */
+  findBySecretHash(hashHex: string): AgentTokenRecord | undefined;
+  /** Adds or replaces the page's token of that id. */
+  put(agent: AgentTokenRecord): void;
+  /** True if there was one. */
+  delete(pageId: string, tokenId: string): boolean;
+  /** Oldest first. */
+  listForPage(pageId: string): AgentTokenRecord[];
+}
+
 /** What the persistent log adds to a record it wrote: its place in the log and the previous line's digest. */
 export interface AuditLineMeta {
   seq: number;
@@ -268,6 +352,8 @@ export interface RelayStore {
   requests: AttachRequestStore;
   /** Live invites (ADR 0017). */
   invites: InviteStore;
+  /** Live agent tokens (ADR 0044). */
+  agents: AgentStore;
   audit: AuditLog;
 }
 
@@ -522,6 +608,50 @@ export class MemoryInviteStore implements InviteStore {
   }
 }
 
+/** In memory only, like the invites; a page holds MAX_LIVE_AGENTS_PER_PAGE at most. */
+export class MemoryAgentStore implements AgentStore {
+  /** Each page's tokens by id, oldest first, as a Map keeps insertion order. */
+  readonly #byPage = new Map<string, Map<string, AgentTokenRecord>>();
+  /** Token digest (hex) to page and token id. */
+  readonly #byHash = new Map<string, { pageId: string; tokenId: string }>();
+
+  get(pageId: string, tokenId: string): AgentTokenRecord | undefined {
+    return this.#byPage.get(pageId)?.get(tokenId);
+  }
+
+  findBySecretHash(hashHex: string): AgentTokenRecord | undefined {
+    const ref = this.#byHash.get(hashHex);
+    return ref === undefined ? undefined : this.get(ref.pageId, ref.tokenId);
+  }
+
+  put(agent: AgentTokenRecord): void {
+    // A replaced record may carry another digest; the old one must stop finding it.
+    const previous = this.get(agent.pageId, agent.tokenId);
+    if (previous) this.#byHash.delete(previous.secretHash);
+    let agents = this.#byPage.get(agent.pageId);
+    if (!agents) {
+      agents = new Map();
+      this.#byPage.set(agent.pageId, agents);
+    }
+    agents.set(agent.tokenId, agent);
+    this.#byHash.set(agent.secretHash, { pageId: agent.pageId, tokenId: agent.tokenId });
+  }
+
+  delete(pageId: string, tokenId: string): boolean {
+    const agents = this.#byPage.get(pageId);
+    const agent = agents?.get(tokenId);
+    if (!agents || !agent) return false;
+    agents.delete(tokenId);
+    if (agents.size === 0) this.#byPage.delete(pageId);
+    this.#byHash.delete(agent.secretHash);
+    return true;
+  }
+
+  listForPage(pageId: string): AgentTokenRecord[] {
+    return [...(this.#byPage.get(pageId)?.values() ?? [])];
+  }
+}
+
 /** Keeps the newest `capacity` records; older ones fall off the front. */
 export class MemoryAuditLog implements AuditLog {
   readonly #capacity: number;
@@ -559,6 +689,7 @@ export function createMemoryStore(
     singleUse: new MemorySingleUseTicketStore(),
     requests: new MemoryAttachRequestStore(),
     invites: new MemoryInviteStore(),
+    agents: new MemoryAgentStore(),
     audit: options.audit ?? new MemoryAuditLog(options.auditCapacity),
   };
 }

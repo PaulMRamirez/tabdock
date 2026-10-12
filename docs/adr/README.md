@@ -2,50 +2,56 @@
 
 Short records of decisions that change or refine `SPEC.md`, or that a future contributor would otherwise have to rediscover. A record starts as Proposed; the owner accepts or rejects it, and only an accepted record may change the spec. Number them in order and never reuse a number.
 
-| ADR                                              | Title                                                           | Status   |
-| ------------------------------------------------ | --------------------------------------------------------------- | -------- |
-| [0001](0001-webmcp-runtime-variance.md)          | Tolerate WebMCP runtime differences in the adapter              | Accepted |
-| [0002](0002-consequential-tools-without-hint.md) | Consequential tools when the runtime drops the hint             | Accepted |
-| [0003](0003-toolchain.md)                        | Toolchain pins and running TypeScript without a build           | Accepted |
-| [0004](0004-refresh-spec-section-3.md)           | Refresh SPEC section 3 with the facts verified on 2 October     | Accepted |
-| [0005](0005-pair-wait-and-sdk-mode.md)           | How long pair_page waits, and how the relay speaks MCP in M1    | Accepted |
-| [0006](0006-oauth-in-m3.md)                      | Sign in through OAuth from M3                                   | Accepted |
-| [0007](0007-contract-clarifications-m1.md)       | Contract clarifications from M1                                 | Accepted |
-| [0008](0008-argument-validation.md)              | Checking call arguments at the relay                            | Accepted |
-| [0009](0009-sessions-limits-expiry.md)           | MCP sessions, section 9 limits and idle expiry in M2            | Accepted |
-| [0010](0010-bounded-argument-checks.md)          | The argument check runs off the main thread with a time limit   | Accepted |
-| [0011](0011-one-approval-per-page.md)            | One approval covers one page                                    | Accepted |
-| [0012](0012-contract-clarifications-m2.md)       | Contract clarifications from the M2 review                      | Accepted |
-| [0013](0013-oauth-shape-m3.md)                   | OAuth in M3: WorkOS issues tokens, the relay checks them        | Accepted |
-| [0014](0014-public-url-mode.md)                  | Public URL mode for the M3 spike                                | Accepted |
-| [0015](0015-refresh-spec-m3.md)                  | Refresh SPEC sections 3 and 12 with the facts verified for M3   | Accepted |
-| [0016](0016-invites-and-guest-access.md)         | Invites and guest access                                        | Accepted |
-| [0017](0017-invite-wire-format.md)               | Invite wire format and clarifications of ADR 0016               | Accepted |
-| [0018](0018-hosted-relay.md)                     | The relay on a host behind a TLS-terminating edge               | Accepted |
-| [0019](0019-audit-log-and-restart.md)            | The persistent audit log, and what a restart keeps              | Accepted |
-| [0020](0020-production-sign-in.md)               | Production sign-in                                              | Accepted |
-| [0021](0021-refresh-spec-m4.md)                  | Refresh SPEC sections 3, 10, 11 and 12 for M4                   | Accepted |
-| [0022](0022-local-mode-by-default.md)            | Local mode by default                                           | Accepted |
-| [0023](0023-page-frames-that-change-nothing.md)  | Page frames that change nothing                                 | Accepted |
-| [0024](0024-a-page-that-stops-reading.md)        | A page that stops reading                                       | Accepted |
-| [0025](0025-first-class-page-tools.md)           | First-class page tools                                          | Accepted |
-| [0026](0026-confirmation-in-the-client.md)       | Consequential confirmation in the caller's client               | Accepted |
-| [0027](0027-revisions-and-origin.md)             | MCP revisions served, the conformance suite, and Origin on /mcp | Accepted |
-| [0028](0028-packaging-and-release.md)            | Packaging and the 0.1.0 release                                 | Accepted |
-| [0029](0029-tour-on-pages.md)                    | The tour on GitHub Pages and the demo's choice of relay         | Accepted |
-| [0030](0030-limits-from-the-m4-hunt.md)          | Limits and fixes from the last M4 review                        | Accepted |
-| [0031](0031-refresh-spec-m5.md)                  | Refresh SPEC sections 3, 10 and 12 for M5                       | Accepted |
-| [0032](0032-fixes-from-the-m5-step-1-review.md)  | Fixes from the M5 Step 1 review                                 | Accepted |
-| [0033](0033-changes-from-the-a5-6-review.md)     | Changes from the A5.6 review                                    | Accepted |
-| [0034](0034-an-empty-consequential-list.md)      | An empty consequential list                                     | Accepted |
-| [0035](0035-user-guide-on-pages.md)              | A user guide in docs/guide, published at /guide/                | Accepted |
-| [0036](0036-refresh-spec-after-0-1-0.md)         | Refresh SPEC sections 4 to 8 and 11 after 0.1.0                 | Accepted |
-| [0037](0037-sdk-pins-together.md)                | Move the MCP SDK pins to 2.3.1, and keep them together          | Accepted |
-| [0038](0038-map-and-globe-tool-set.md)           | A tool set for map and globe pages                              | Proposed |
-| [0039](0039-image-results.md)                    | Image results                                                   | Proposed |
-| [0040](0040-page-state-clients-can-follow.md)    | Page state clients can follow                                   | Proposed |
-| [0041](0041-checking-a-page-from-ci.md)          | Checking a page from CI                                         | Proposed |
-| [0042](0042-proposals-from-observers.md)         | Proposals from observers                                        | Proposed |
-| [0043](0043-time-boxed-sessions.md)              | Time-boxed sessions                                             | Proposed |
-| [0044](0044-larger-read-only-rooms.md)           | Larger read-only rooms                                          | Proposed |
-| [0045](0045-session-record-for-the-operator.md)  | A session record for the operator                               | Proposed |
+A dated note added to an accepted record may amend that record's Decision, or the spec, when it names the decision or the spec line it changes and says why; the record's status line then lists every spec section and S rule its notes changed, after what its Decision changed (ADR 0049, decision 2). A change of design still takes a record of its own.
+
+| ADR                                              | Title                                                            | Status   |
+| ------------------------------------------------ | ---------------------------------------------------------------- | -------- |
+| [0001](0001-webmcp-runtime-variance.md)          | Tolerate WebMCP runtime differences in the adapter               | Accepted |
+| [0002](0002-consequential-tools-without-hint.md) | Consequential tools when the runtime drops the hint              | Accepted |
+| [0003](0003-toolchain.md)                        | Toolchain pins and running TypeScript without a build            | Accepted |
+| [0004](0004-refresh-spec-section-3.md)           | Refresh SPEC section 3 with the facts verified on 2 October      | Accepted |
+| [0005](0005-pair-wait-and-sdk-mode.md)           | How long pair_page waits, and how the relay speaks MCP in M1     | Accepted |
+| [0006](0006-oauth-in-m3.md)                      | Sign in through OAuth from M3                                    | Accepted |
+| [0007](0007-contract-clarifications-m1.md)       | Contract clarifications from M1                                  | Accepted |
+| [0008](0008-argument-validation.md)              | Checking call arguments at the relay                             | Accepted |
+| [0009](0009-sessions-limits-expiry.md)           | MCP sessions, section 9 limits and idle expiry in M2             | Accepted |
+| [0010](0010-bounded-argument-checks.md)          | The argument check runs off the main thread with a time limit    | Accepted |
+| [0011](0011-one-approval-per-page.md)            | One approval covers one page                                     | Accepted |
+| [0012](0012-contract-clarifications-m2.md)       | Contract clarifications from the M2 review                       | Accepted |
+| [0013](0013-oauth-shape-m3.md)                   | OAuth in M3: WorkOS issues tokens, the relay checks them         | Accepted |
+| [0014](0014-public-url-mode.md)                  | Public URL mode for the M3 spike                                 | Accepted |
+| [0015](0015-refresh-spec-m3.md)                  | Refresh SPEC sections 3 and 12 with the facts verified for M3    | Accepted |
+| [0016](0016-invites-and-guest-access.md)         | Invites and guest access                                         | Accepted |
+| [0017](0017-invite-wire-format.md)               | Invite wire format and clarifications of ADR 0016                | Accepted |
+| [0018](0018-hosted-relay.md)                     | The relay on a host behind a TLS-terminating edge                | Accepted |
+| [0019](0019-audit-log-and-restart.md)            | The persistent audit log, and what a restart keeps               | Accepted |
+| [0020](0020-production-sign-in.md)               | Production sign-in                                               | Accepted |
+| [0021](0021-refresh-spec-m4.md)                  | Refresh SPEC sections 3, 10, 11 and 12 for M4                    | Accepted |
+| [0022](0022-local-mode-by-default.md)            | Local mode by default                                            | Accepted |
+| [0023](0023-page-frames-that-change-nothing.md)  | Page frames that change nothing                                  | Accepted |
+| [0024](0024-a-page-that-stops-reading.md)        | A page that stops reading                                        | Accepted |
+| [0025](0025-first-class-page-tools.md)           | First-class page tools                                           | Accepted |
+| [0026](0026-confirmation-in-the-client.md)       | Consequential confirmation in the caller's client                | Accepted |
+| [0027](0027-revisions-and-origin.md)             | MCP revisions served, the conformance suite, and Origin on /mcp  | Accepted |
+| [0028](0028-packaging-and-release.md)            | Packaging and the 0.1.0 release                                  | Accepted |
+| [0029](0029-tour-on-pages.md)                    | The tour on GitHub Pages and the demo's choice of relay          | Accepted |
+| [0030](0030-limits-from-the-m4-hunt.md)          | Limits and fixes from the last M4 review                         | Accepted |
+| [0031](0031-refresh-spec-m5.md)                  | Refresh SPEC sections 3, 10 and 12 for M5                        | Accepted |
+| [0032](0032-fixes-from-the-m5-step-1-review.md)  | Fixes from the M5 Step 1 review                                  | Accepted |
+| [0033](0033-changes-from-the-a5-6-review.md)     | Changes from the A5.6 review                                     | Accepted |
+| [0034](0034-an-empty-consequential-list.md)      | An empty consequential list                                      | Accepted |
+| [0035](0035-user-guide-on-pages.md)              | A user guide in docs/guide, published at /guide/                 | Accepted |
+| [0036](0036-refresh-spec-after-0-1-0.md)         | Refresh SPEC sections 4 to 8 and 11 after 0.1.0                  | Accepted |
+| [0037](0037-sdk-pins-together.md)                | Move the MCP SDK pins to 2.3.1, and keep them together           | Accepted |
+| [0038](0038-map-and-globe-tool-set.md)           | A tool set for map and globe pages                               | Accepted |
+| [0039](0039-image-results.md)                    | Image results                                                    | Accepted |
+| [0040](0040-page-state-clients-can-follow.md)    | Page state clients can follow                                    | Accepted |
+| [0041](0041-checking-a-page-from-ci.md)          | Checking a page from CI                                          | Accepted |
+| [0042](0042-proposals-from-observers.md)         | Proposals from observers                                         | Accepted |
+| [0043](0043-time-boxed-sessions.md)              | Time-boxed sessions                                              | Accepted |
+| [0044](0044-larger-read-only-rooms.md)           | Larger read-only rooms                                           | Accepted |
+| [0045](0045-session-record-for-the-operator.md)  | A session record for the operator                                | Accepted |
+| [0046](0046-restart-snapshot.md)                 | Restart snapshot                                                 | Accepted |
+| [0047](0047-refresh-spec-m6.md)                  | Refresh SPEC section 3 for M6, and move the MCP-B 6 leg to 6.0.0 | Accepted |
+| [0048](0048-script-tag-ceiling-for-m6.md)        | Script-tag ceiling for M6                                        | Accepted |
+| [0049](0049-refresh-spec-after-m6-docs.md)       | Refresh SPEC after M6's docs pass                                | Accepted |

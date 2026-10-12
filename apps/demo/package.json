@@ -6,7 +6,8 @@
   "license": "Apache-2.0",
   "type": "module",
   "exports": {
-    "./server": "./scripts/server.ts"
+    "./server": "./scripts/server.ts",
+    "./policy": "./src/policy.ts"
   },
   "scripts": {
     "build": "node scripts/server.ts --build",

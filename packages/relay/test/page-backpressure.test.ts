@@ -80,12 +80,14 @@ const BATCH = 1000;
  * How long a flood waits with its queue full and no close before it fails.
  * A relay that runs either reads what the page sends, which drains
  * bufferedAmount and lets the flood go on, or reads nothing and so closes
- * the page as silent IDLE_TIMEOUT_MS after the last frame it read. A flood
- * stuck past that and a margin for load means the fixture relay's process
- * stopped running its loop. Once on CI a case waited out its whole 120 s
- * timeout and said nothing more, as one does here whose fixture is stopped
- * with SIGSTOP mid-flood; one whose fixture is killed also fails on its
- * closed IPC channel.
+ * the page as silent IDLE_TIMEOUT_MS after the last frame it read; the
+ * fixture reports both closes, since a page that never reads sees neither
+ * (the relay's close frame and FIN wait behind the answers it left unread).
+ * A flood stuck past that and a margin for load means the fixture relay's
+ * process stopped running its loop. Once on CI a case waited out its whole
+ * 120 s timeout and said nothing more, as one does here whose fixture is
+ * stopped with SIGSTOP mid-flood; one whose fixture is killed also fails on
+ * its closed IPC channel.
  */
 const STALL_MS = IDLE_TIMEOUT_MS + 15_000;
 /**
@@ -396,6 +398,9 @@ async function stalled(ws: WebSocket, relay: Fixture, sent: number): Promise<str
 
 const PING_PAYLOAD = Buffer.alloc(125, 0x61);
 
+/** The two log lines with which the relay closes a page that sends and never reads. */
+const RELAY_CLOSES = ['closing page socket: the page is not reading', 'closing silent page socket'];
+
 /** Each frame the relay answers, and how a page sends it. */
 const FLOODS: [string, (ws: WebSocket) => void][] = [
   ['ping', frameOf({ t: 'ping' })],
@@ -443,7 +448,15 @@ describe('a page that stops reading (S9, A4.3)', () => {
         lines: after.lines - base.lines,
       });
       // Before, the socket stayed open for all of them and the answers stayed queued.
-      expect(after.closes, report).toEqual(['closing page socket: the page is not reading']);
+      // The relay closes it once: as not reading when what it queues passes its
+      // bounds, which hub.test.ts holds exactly, or as silent when TCP's flow
+      // control stops the page's frames first. On a CI runner the page's socket
+      // was seen probing a zero window with 2.5 MB unsent while the relay's
+      // loop sat idle, and the relay closed it as silent IDLE_TIMEOUT_MS later
+      // (#28). Either close frees what the socket held, which the bounds below
+      // check, and a relay that never closed it fails here or on STALL_MS.
+      expect(after.closes, report).toHaveLength(1);
+      expect(RELAY_CLOSES, report).toContain(after.closes[0]);
       expect(
         after.heapUsed + after.arrayBuffers - base.heapUsed - base.arrayBuffers,
         report,

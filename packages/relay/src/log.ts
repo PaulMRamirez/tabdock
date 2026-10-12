@@ -41,6 +41,9 @@ export const REDACTED_FIELDS: readonly string[] = [
   // file's attach record, never stderr or a platform's logs.
   'email',
   'displayname',
+  // Agent tokens (ADR 0044): what a /g/mcp request carries about its token
+  // stays off every line, however a call site names it.
+  'agent',
 ];
 
 const REDACTED = '[redacted]';

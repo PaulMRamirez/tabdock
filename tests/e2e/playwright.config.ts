@@ -3,8 +3,11 @@ import { defineConfig } from '@playwright/test';
 const executablePath = process.env.CHROMIUM_EXECUTABLE;
 const browser = executablePath ? { executablePath } : {};
 
-/** The MCP-B 6.0 beta leg (A5.4, ADR 0031): specs that run the page on the beta polyfill. */
-const MCPB6_SPECS = /mcpb6\.spec\.ts$/;
+/**
+ * The MCP-B 6 leg (A5.4, ADR 0031): specs that run the page on MCP-B 6,
+ * mcpb6.spec.ts and from M6 mcpb6-images.spec.ts (ADR 0039).
+ */
+const MCPB6_SPECS = /mcpb6(-[a-z-]+)?\.spec\.ts$/;
 
 export default defineConfig({
   testDir: 'specs',
@@ -23,7 +26,7 @@ export default defineConfig({
     },
     {
       // Run alone with `playwright test --project mcpb6`. Without the
-      // WebMCPTesting flag no Chrome turns native WebMCP on, so the beta
+      // WebMCPTesting flag no Chrome turns native WebMCP on, so the 6.0.0
       // polyfill installs instead of keeping a native context; the specs
       // still check that it did before they trust a result.
       name: 'mcpb6',

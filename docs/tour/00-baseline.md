@@ -6,7 +6,7 @@ M0 builds nothing Tabdock-specific on purpose. It gives us a page with real tool
 
 ## What exists now
 
-`apps/demo` is a canvas board: items you can pan and zoom around, plus six tools registered on `document.modelContext`. Two only read (`get_view`, `list_items`), three change things (`add_item`, `move_view`, `highlight_item`) and one is consequential (`clear_board`). The state lives in a plain class ([board.ts](../../apps/demo/src/board.ts)); the tools wrap it with zod-checked arguments ([tools.ts](../../apps/demo/src/tools.ts)); the page redraws on every change and keeps a strip of recent calls ([render.ts](../../apps/demo/src/render.ts)). On browsers without native WebMCP, MCP-B's polyfill supplies `document.modelContext` ([main.ts](../../apps/demo/src/main.ts)).
+`apps/demo` is a canvas board: items you can pan and zoom around, plus six tools registered on `document.modelContext`. Two only read (`get_view`, `list_items`), three change things (`add_item`, `move_view`, `highlight_item`) and one is consequential (`clear_board`). Since M6 there is a seventh, `capture_board`, a read-only image tool that returns a picture of the board (ADR 0039). The state lives in a plain class ([board.ts](../../apps/demo/src/board.ts)); the tools wrap it with zod-checked arguments ([tools.ts](../../apps/demo/src/tools.ts)); the page redraws on every change and keeps a strip of recent calls ([render.ts](../../apps/demo/src/render.ts)). On browsers without native WebMCP, MCP-B's polyfill supplies `document.modelContext` ([main.ts](../../apps/demo/src/main.ts)).
 
 `tests/e2e` wires the baseline: the page in headless Chromium, MCP-B's relay as a stdio MCP server, and the official MCP client standing in for Claude Code ([harness.ts](../../tests/e2e/src/harness.ts)).
 

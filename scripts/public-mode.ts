@@ -28,7 +28,7 @@ export function publicSettings(demoOrigin: string): PublicSetting[] {
     },
     {
       name: 'TABDOCK_OAUTH_USERS',
-      what: 'who may sign in: sub=userId:Display Name entries separated by commas, sub being the person at the provider',
+      what: 'who may sign in: sub=userId:Display Name entries separated by commas, sub being the person at the provider; or TABDOCK_MEMBERS_FILE, the absolute path of a file of such entries, one a line, read again when it changes',
     },
     {
       name: 'TABDOCK_PAIR_CLIENT_ID',
@@ -45,11 +45,18 @@ export function publicSettings(demoOrigin: string): PublicSetting[] {
   ];
 }
 
-/** The settings that are missing or blank, in the order publicSettings gives them. */
+/**
+ * The settings that are missing or blank, in the order publicSettings gives
+ * them. A members file stands in for TABDOCK_OAUTH_USERS (ADR 0043); the
+ * relay itself refuses both at once.
+ */
 export function missingPublicSettings(env: NodeJS.ProcessEnv, demoOrigin: string): string[] {
+  const isSet = (name: string): boolean => (env[name]?.trim() ?? '') !== '';
   return publicSettings(demoOrigin)
     .map((setting) => setting.name)
-    .filter((name) => (env[name]?.trim() ?? '') === '');
+    .filter(
+      (name) => !isSet(name) && !(name === 'TABDOCK_OAUTH_USERS' && isSet('TABDOCK_MEMBERS_FILE')),
+    );
 }
 
 export interface ProviderValues {

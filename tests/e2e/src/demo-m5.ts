@@ -8,7 +8,7 @@
 // read the owner token from its file as the printed Claude Code line does, one
 // pinned to 2026-07-28 (no session) and one on 2025-11-25 (a session); each
 // pairs with the board, lists its tools as `<page id>__<tool>` beside the
-// five fixed tools and calls one by that name. Then a second board, opened
+// fixed tools and calls one by that name. Then a second board, opened
 // with ?confirm=client, takes clear_board's confirmation from the caller's
 // client (ADR 0026): each of the two clients answers the relay's question in
 // its elicitation handler, by input_required on 2026-07-28 and by an
@@ -46,7 +46,17 @@ import {
 } from './tabdock-harness.ts';
 
 const headed = process.argv.includes('--headed');
-const FIXED_TOOLS = ['list_pages', 'pair_page', 'list_page_tools', 'call_page_tool', 'detach_page'];
+const FIXED_TOOLS = [
+  'list_pages',
+  'pair_page',
+  'list_page_tools',
+  'call_page_tool',
+  'detach_page',
+  'get_page_state',
+  'wait_for_page_state',
+  'get_proposal',
+  'withdraw_proposal',
+];
 const LAPTOP = { viewport: { width: 1280, height: 1200 } };
 
 /** Pairing codes seen so far, which must never be printed whole. */
@@ -323,7 +333,7 @@ try {
   say(`   tools/list before pairing: ${before.join(', ')}`);
   check(
     before.length === FIXED_TOOLS.length && FIXED_TOOLS.every((name) => before.includes(name)),
-    'a client attached to nothing should list the five fixed tools alone',
+    'a client attached to nothing should list the fixed tools alone',
   );
 
   say('\n4. The 2026-07-28 client pairs with the code the board shows.');

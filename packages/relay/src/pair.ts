@@ -23,13 +23,14 @@
 
 import { readFileSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { EmailSchema } from '@tabdock/protocol';
+import { EmailSchema, INVITEE_ID_PREFIX } from '@tabdock/protocol';
 import * as oidc from 'openid-client';
 import { z } from 'zod';
-import { type AuthUser, type BrowserSignIn, MEMBER_ACCOUNT } from './auth.ts';
+import { type AuthUser, type BrowserSignIn, inviteeUser, MEMBER_ACCOUNT } from './auth.ts';
 import { type PairClientOptions, pairRedirectUriOf, type ResolvedConfig } from './config.ts';
 import type { CallerIdentity, ClaimOutcome, PageHub, PairOutcome } from './hub.ts';
 import type { Logger } from './log.ts';
+import type { MemberChange } from './members.ts';
 import { SlidingWindowLimiter } from './rate-limit.ts';
 import { digest, newId, newSessionSecret, sameDigest } from './secrets.ts';
 import type { SignInGate } from './sign-in-gate.ts';
@@ -138,7 +139,7 @@ type ClaimStatus =
 
 interface PairSession {
   hash: Buffer;
-  /** Who signed in, named by the oauth plugin's one rule (ADR 0017). */
+  /** Who signed in, named by the oauth plugin's one rule (ADR 0017), renamed by membersChanged. */
   user: AuthUser;
   /** Which account the session counts against for SESSIONS_PER_ACCOUNT. */
   accountKey: string;
@@ -174,6 +175,22 @@ function displayText(text: string): string {
 
 function accountKeyOf(user: AuthUser): string {
   return `${user.account.kind} ${user.userId}`;
+}
+
+/**
+ * Who a browser signed in before a member list change is after it, named as
+ * a sign-in now would name it (ADR 0017): a renamed member by the new name;
+ * an invitee by its verified email, or by its short id when that now reads
+ * as a member's name, so nobody joins under a member's name.
+ */
+function renamedBy(user: AuthUser, change: MemberChange): AuthUser {
+  if (user.account.kind === 'member') {
+    const name = change.renamed.get(user.userId);
+    return name === undefined ? user : { ...user, displayName: name };
+  }
+  if (!user.userId.startsWith(INVITEE_ID_PREFIX)) return user;
+  const key = user.userId.slice(INVITEE_ID_PREFIX.length);
+  return inviteeUser(key, user.account.email, change.memberNames);
 }
 
 /** Cookie values by name, for the two cookies this module sets and nothing else. */
@@ -318,6 +335,15 @@ export interface PairFlow {
     response: ServerResponse,
     address: string,
   ): Promise<void>;
+  /**
+   * A member list change (ADR 0043): signs out every browser signed in under
+   * a user id it ended, so that phone signs in again as who it is now (S8),
+   * forgets every claim made under such an id, so its next holder reads none
+   * of them (S13), and names every other sign-in as a sign-in would now (ADR
+   * 0017), a renamed member by the new name and an invitee whose name now
+   * reads as a member's by its short id. Returns how many sign-ins ended.
+   */
+  membersChanged(change: MemberChange): number;
   close(): void;
 }
 
@@ -491,6 +517,22 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
     return session;
   }
 
+  /**
+   * The browser's sign-in once more, after a request's body has been read:
+   * a member list change may have ended it while the body was on its way,
+   * and nothing is done under an id the change took away (S8). Refuses 401
+   * when it is gone.
+   */
+  function stillSignedIn(
+    request: IncomingMessage,
+    response: ServerResponse,
+    message: string,
+  ): PairSession | null {
+    const session = sessionOf(request, Date.now());
+    if (session === null) refuse(response, 401, 'sign_in_required', message);
+    return session;
+  }
+
   /** Who a session's claims act as: no access token, so no client_id, and no client name. */
   function callerOf(user: AuthUser): CallerIdentity {
     return {
@@ -499,6 +541,8 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
       account: user.account.kind === 'member' ? { ...MEMBER_ACCOUNT } : { ...user.account },
       oauthClientId: null,
       client: null,
+      // A browser signed in at /pair or /i, never an agent token (ADR 0044).
+      agentPageId: null,
     };
   }
 
@@ -776,13 +820,18 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
       refuse(response, 400, 'bad_request', 'expected {"nonce": "..."}');
       return;
     }
+    const current = stillSignedIn(request, response, 'sign in to join a page');
+    if (current === null) {
+      log.info('pair claim refused: signed out while the claim was read');
+      return;
+    }
     sweepClaims(now);
     if (claims.size >= MAX_CLAIMS) {
       log.warn('pair claim refused: too many claims waiting');
       refuse(response, 429, 'rate_limited', 'too many people are joining pages; try again shortly');
       return;
     }
-    const { user } = session;
+    const { user } = current;
     // An invitee's claim goes to the hub as well, which counts it against the
     // user's pairing limit and records its refusal as pair_page's would, then
     // answers invite_required before the nonce is looked at, so the nonce is
@@ -820,10 +869,12 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
       refuse(response, 400, 'bad_request', 'expected {"claim": "..."}');
       return;
     }
+    const current = stillSignedIn(request, response, 'sign in to see your claim');
+    if (current === null) return;
     sweepClaims(now);
     const record = claims.get(body.data.claim);
     // Someone else's claim and no claim at all answer alike (S13).
-    if (record?.userId !== session.user.userId) {
+    if (record?.userId !== current.user.userId) {
       refuse(response, 404, 'unknown_claim', 'no such claim');
       return;
     }
@@ -906,13 +957,18 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
       refuse(response, 400, 'bad_request', 'expected {"secret": "..."}');
       return;
     }
+    const current = stillSignedIn(request, response, 'sign in to join a page');
+    if (current === null) {
+      log.info('invite claim refused: signed out while the claim was read');
+      return;
+    }
     sweepClaims(now);
     if (claims.size >= MAX_CLAIMS) {
       log.warn('invite claim refused: too many claims waiting');
       refuse(response, 429, 'rate_limited', 'too many people are joining pages; try again shortly');
       return;
     }
-    const { user } = session;
+    const { user } = current;
     // Redemptions count per user, per invite and per page in the hub (S14).
     const outcome = hub.claimInvite(callerOf(user), body.data.secret);
     if (outcome.kind === 'error') {
@@ -985,6 +1041,25 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
         default:
           serveAsset(path, response);
       }
+    },
+    membersChanged(change) {
+      let ended = 0;
+      for (const [key, session] of sessions) {
+        if (change.ended.has(session.user.userId)) {
+          sessions.delete(key);
+          ended += 1;
+          continue;
+        }
+        session.user = renamedBy(session.user, change);
+      }
+      // A claim answers only its claimant, told apart by user id alone, so
+      // one made under an id the change ended would answer whoever the list
+      // gives that id next (S13). A settle still on its way writes only to
+      // the record dropped here.
+      for (const [claimId, claim] of claims) {
+        if (change.ended.has(claim.userId)) claims.delete(claimId);
+      }
+      return ended;
     },
     close() {
       sessions.clear();

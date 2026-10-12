@@ -199,7 +199,8 @@ describe('origin policy (S1, S2)', () => {
     expect(limits).toEqual({
       sessionsPerUser: 20,
       sessions: 1000,
-      inviteeSessions: 50,
+      // ADR 0044: sized for a class from M6.
+      inviteeSessions: 100,
       sessionsPerInvitee: 2,
       usersPerPage: 10,
       queueDepth: 32,
@@ -212,6 +213,13 @@ describe('origin policy (S1, S2)', () => {
       toolBytes: 64 * 1024 * 1024,
       requestBytes: 64 * 1024 * 1024,
       requestBytesPerUser: 24 * 1024 * 1024,
+      imageBytes: 65_536,
+      stateBytes: 4 * 1024 * 1024,
+      proposalBytes: 16 * 1024 * 1024,
+      responseBytes: 96 * 1024 * 1024,
+      observersPerPage: 40,
+      watchingCallsInFlight: 4,
+      watchingCallsInFlightPerUser: 2,
     });
     expect(rateLimits.callsPerUserPerPage).toBe(120);
     expect(rateLimits.pairSignIns).toBe(60);
@@ -321,6 +329,7 @@ describe('loadConfigFromEnv', () => {
     expect(config.limits).toEqual({
       sessionsPerUser: 5,
       sessions: 50,
+      // The pool's default gives way to a smaller total (ADR 0044).
       inviteeSessions: 50,
       sessionsPerInvitee: 2,
       usersPerPage: 4,
@@ -334,6 +343,13 @@ describe('loadConfigFromEnv', () => {
       toolBytes: 64 * 1024 * 1024,
       requestBytes: 64 * 1024 * 1024,
       requestBytesPerUser: 24 * 1024 * 1024,
+      imageBytes: 65_536,
+      stateBytes: 4 * 1024 * 1024,
+      proposalBytes: 16 * 1024 * 1024,
+      responseBytes: 96 * 1024 * 1024,
+      observersPerPage: 40,
+      watchingCallsInFlight: 4,
+      watchingCallsInFlightPerUser: 2,
     });
     expect(config.rateLimits.callsPerUserPerPage).toBe(60);
     expect(config.rateLimits.pairSignIns).toBe(20);

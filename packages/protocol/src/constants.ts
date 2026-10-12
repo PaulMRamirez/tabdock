@@ -105,7 +105,11 @@ export const SHORT_INVITE_LIFETIME_MS = 15 * 60_000;
 export const DEFAULT_INVITE_LIFETIME_MS = 60 * 60_000;
 /** Refusals or timeouts of one control invite's prompts that burn it. */
 export const INVITE_BURN_REFUSALS = 3;
-/** Seats of a page's user limit that invite-made attachments always leave to members. */
+/**
+ * Seats of a page's people limit that invite-made attachments always leave to
+ * members. It applies to the people limit only: invitees watching from the
+ * watching seats (ADR 0044) never take a member's seat, so none is kept there.
+ */
 export const MEMBER_RESERVED_SEATS = 2;
 /** pair_page's invite input: a link or its bare secret, never longer than this. */
 export const MAX_INVITE_INPUT_CHARS = 300;
@@ -155,6 +159,115 @@ export const FIRST_CLASS_LIST_TTL_MS = 10_000;
  * through four clients; at one every 10 s four clients spend 24 (ADR 0032).
  */
 export const FIRST_CLASS_NOTIFY_INTERVAL_MS = 10_000;
+
+// M6 (ADRs 0039 to 0046). The adapter and the relay enforce each of these on
+// their own side, so a number changes here or nowhere.
+
+// Images (ADR 0039)
+/** The ceiling of TABDOCK_MAX_IMAGE_BYTES, in decoded bytes: an answer at it is no larger than ADR 0030's text answer. */
+export const MAX_IMAGE_BYTES = 524_288;
+/** TABDOCK_MAX_IMAGE_BYTES by default: its base64 stays under Claude Code's default output tokens. */
+export const DEFAULT_IMAGE_BYTES = 65_536;
+/** The most text an image result carries beside its image; the image itself is never cut. */
+export const MAX_IMAGE_TEXT_CHARS = 2_000;
+/** The longest side an image's header may declare, so a small file cannot unpack into a huge bitmap. */
+export const MAX_IMAGE_SIDE = 8_192;
+/** The most pixels an image's header may declare in all. */
+export const MAX_IMAGE_PIXELS = 16_777_216;
+// Page state and waiting fixed tools (ADRs 0040 and 0042)
+/** UTF-8 bytes of a published value's canonical JSON. */
+export const MAX_STATE_BYTES = 16_384;
+/** The most a whole state frame may take on the wire: the value and its wrapping. */
+export const MAX_STATE_FRAME_BYTES = MAX_STATE_BYTES + 64;
+/** The least time between two state frames from one adapter. */
+export const STATE_MIN_INTERVAL_MS = 500;
+/** How long wait_for_page_state waits when the caller names no time. */
+export const DEFAULT_STATE_WAIT_MS = 25_000;
+/** The longest any fixed tool waits: under the call deadline and Claude Code's 60 s first byte. */
+export const MAX_WAIT_MS = 40_000;
+/** Waiting fixed tool calls one user may hold at once, across every page and both waiting tools. */
+export const MAX_WAITS_PER_USER = 2;
+// Proposals (ADR 0042)
+/** How long a proposal waits for the operator; both sides end it on their own clocks. */
+export const PROPOSAL_TTL_MS = 600_000;
+/** Pending proposals one user may hold on one page. */
+export const MAX_PENDING_PROPOSALS_PER_USER = 3;
+/** Pending proposals one page may hold. */
+export const MAX_PENDING_PROPOSALS_PER_PAGE = 20;
+/** UTF-8 bytes of a proposal's arguments as canonical JSON, since a proposal outlives its request's charge. */
+export const MAX_PROPOSAL_ARGUMENT_BYTES = 16_384;
+/** Values and keys in a proposal's arguments, for the same reason. */
+export const MAX_PROPOSAL_ARGUMENT_NODES = 1_000;
+/** How long after the operator's Accept the adapter still runs the accepted call: one deadline and a margin. */
+export const ACCEPTED_PROPOSAL_RUN_MS = DEFAULT_CALL_DEADLINE_MS + 15_000;
+/** How long a settled proposal's outcome stays readable. */
+export const PROPOSAL_OUTCOME_KEEP_MS = 600_000;
+/** Settled proposals one page keeps readable; the oldest goes first. */
+export const MAX_SETTLED_PROPOSALS_PER_PAGE = 40;
+/** Characters of an accepted run's result a proposal keeps, cut with the visible marker. */
+export const MAX_PROPOSAL_RESULT_CHARS = 20_000;
+// Time-boxed sessions, members file, restart snapshot (ADRs 0043 and 0046)
+/** The shortest time-boxed session: 30 minutes. */
+export const MIN_SESSION_MS = 1_800_000;
+/** The longest time-boxed session, extensions included: 4 hours. */
+export const MAX_SESSION_MS = 14_400_000;
+/** Session lengths are whole minutes. */
+export const SESSION_LENGTH_UNIT_MS = 60_000;
+/** The widget's step when the operator extends a session: 15 minutes. */
+export const SESSION_EXTEND_MS = 900_000;
+/** When the widget warns before a session ends: 5 minutes and 1 minute before. */
+export const SESSION_WARNINGS_MS = [300_000, 60_000] as const;
+/** After its own timer ends a session, the adapter sends session_end this much later, leaving the relay's end on its own clock time to arrive. */
+export const SESSION_END_GRACE_MS = 5_000;
+/** Entries the members file may hold. */
+export const MAX_MEMBERS = 500;
+/** The largest members file the relay reads. */
+export const MAX_MEMBERS_FILE_BYTES = 262_144;
+/** How often the relay looks at the members file for a change. */
+export const MEMBERS_POLL_MS = 2_000;
+/** The version a restart snapshot carries; any other is not read. */
+export const SNAPSHOT_VERSION = 1;
+// Rooms and agent tokens (ADR 0044)
+/** The ceiling of TABDOCK_MAX_OBSERVERS_PER_PAGE, the watching seats beside the people limit. */
+export const MAX_OBSERVERS_PER_PAGE = 100;
+/** The ceiling of TABDOCK_MAX_USERS_PER_PAGE, the people limit. */
+export const MAX_USERS_PER_PAGE = 50;
+/** Clients an invitee's roster row lists, newest first, so a room's welcome stays well under the frame cap. */
+export const MAX_ROSTER_CLIENTS_PER_INVITEE = 2;
+/** Where an agent token's client connects, beside the relay's /mcp. */
+export const AGENT_PATH = '/g/mcp';
+/** What every agent token starts with, so a scanner or a person can tell one at sight. */
+export const AGENT_TOKEN_PREFIX = 'tda_';
+/** An agent token's randomness: 256 bits, as 43 base64url characters after the prefix (S11). */
+export const AGENT_TOKEN_BYTES = 32;
+export const AGENT_TOKEN_CHARS = 47;
+/** The widget's lifetimes for an agent token: an hour by default, at most 8 hours. */
+export const DEFAULT_AGENT_LIFETIME_MS = 3_600_000;
+export const MAX_AGENT_LIFETIME_MS = 28_800_000;
+export const AGENT_LIFETIMES_MS = [3_600_000, 14_400_000, 28_800_000] as const;
+/** Agent tokens one page may hold live at once. */
+export const MAX_LIVE_AGENTS_PER_PAGE = 10;
+/** Unanswered prompts that burn an agent token; one denial burns it at once. */
+export const AGENT_BURN_TIMEOUTS = 3;
+/** The first line of the text an agent's user id is hashed from; see agentKeyInput. */
+export const AGENT_KEY_DOMAIN = 'tabdock agent';
+// Session record (ADR 0045)
+/** The version a saved session record carries. */
+export const SESSION_RECORD_VERSION = 1;
+/** Calls one record holds; past it the oldest are dropped and counted. */
+export const SESSION_RECORD_MAX_CALLS = 5_000;
+/** Attachment spans one record holds. */
+export const SESSION_RECORD_MAX_ATTACHMENTS = 500;
+/** Proposals one record holds. */
+export const SESSION_RECORD_MAX_PROPOSALS = 1_000;
+/** Page sessions one record spans, since a time-boxed session survives a relay restart. */
+export const SESSION_RECORD_MAX_PAGE_IDS = 16;
+/** Role changes one attachment span keeps. */
+export const SESSION_RECORD_MAX_ROLE_CHANGES = 16;
+/** Users whose dropped calls a record counts by name; the rest are counted together. */
+export const SESSION_RECORD_MAX_DROPPED_USERS = 200;
+/** The largest record file the audit reader's --match opens; a full record is about 3 MB. */
+export const SESSION_RECORD_MAX_BYTES = 8_388_608;
 
 // The audit log (ADR 0019).
 

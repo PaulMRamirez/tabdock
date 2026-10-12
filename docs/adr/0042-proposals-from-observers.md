@@ -1,6 +1,6 @@
 # 0042: Proposals from observers
 
-Status: Proposed, 9 October 2026. Priority 5 in `docs/plans/backlog.md`, for the target scenario in `docs/plans/map-classroom.md`. Would change SPEC sections 2 (the tool surface), 5 (what an observer may do), 6 (proposal frames), 7 (a fixed tool and an answer), 8 (the widget), 9 (S5, S6, S7 and S9) and 10 (A5.1's "only the five fixed tools"), and ADR 0016's wording on the five fixed tools.
+Status: Accepted, 10 October 2026, under the owner's standing instruction. Option B, with acceptance on the page only. Changes SPEC sections 2 (the tool surface), 5 (what an observer may do, the queue and the consequential rule), 6 (proposal frames and the invoke's `proposal`), 7 (two fixed tools, `proposed` and `proposal_not_found`), 8 (the widget's queue and the adapter's acceptance record), 9 (S5, S6, S7, S9 and S13), 10 (A5.1, and A6.10 to A6.13) and 12 (fairness), and ADR 0016's wording on the fixed tools. Priority 5 in `docs/plans/backlog.md`; built in M6. Its notes and SPEC's M6 edits also change section 4 (the demo link's `?proposals`, Wave 3's note), S8 (a revoke drops the revoked user's proposals) and S10 (an accepted run's result reaches its proposer only behind its label).
 
 ## Context
 
@@ -26,6 +26,102 @@ Aligned open item: SPEC section 12's per-user fairness rule for the write queue.
 
 The classroom loop works without driver seats: people suggest, the teacher picks. The fixed tools grow by one beside ADR 0040's two, with the same effects on SPEC section 2, A5.1, ADR 0016's wording, first-class listings, the golden test and the guide. The widget gains a queue, which on a phone-sized operator screen needs care. Invitees can propose only where the page chose `all`.
 
-## Open questions
+## Open questions, as proposed
 
 Whether a dismissal may carry a short reason back to the proposer. Whether the operator may accept several at once. Whether `get_proposal` should also wait, as ADR 0040's `wait_for_page_state` does, so a looping agent need not poll.
+
+## Decisions
+
+Accepted with these settings on 10 October 2026, copied from section 1 of the M6 plan. Every recommendation of the record's design not listed here was accepted as written.
+
+1. **Two tools:** get_proposal (read-only) and withdraw_proposal (not read-only, idempotent).
+2. **No dismissal reason** in M6.
+3. **No bulk accept.** Dismiss all is unarmed.
+4. **get_proposal waitMs** runs from 0 to MAX_WAIT_MS with a default of 0, and shares MAX_WAITS_PER_USER.
+5. **Who runs an accepted proposal:** the relay puts it in the write queue in acceptance order. The adapter runs it only against its own single-use record matching caller, tool and canonical arguments, within ACCEPTED_PROPOSAL_RUN_MS (60,000).
+6. **Seven statuses:** pending, accepted, dismissed, refused, expired, withdrawn and cancelled.
+7. **New error code `proposal_not_found`,** worded the same for an unknown id and for another user's.
+8. **'members'** means the account kind.
+9. **Argument caps:** 16,384 bytes and 1,000 nodes.
+10. **Outcomes:** kept 10 minutes, at most 40 per page, with results cut to 20,000 characters.
+11. **No relay switch** for proposals.
+12. **Proposals end with the link.**
+13. **No accept while paused.**
+14. **`proposable: true`** in list_page_tools.
+15. **Images of accepted runs** are not kept.
+16. **Audit:** a call line with outcome 'proposed', a run line with acceptedOnPage, and proposal_closed.
+17. **Dock methods** rather than a UiPort hook.
+18. **No invoke carries both** a confirmation and a proposal.
+19. **PROPOSAL_TTL_MS** is a protocol constant, with a test-only timing knob.
+20. **Fairness** is acceptance order.
+21. **Nine fixed tools.**
+22. **The session form** offers off, members and all within the ceiling.
+23. **CallShape** changes once, in the foundation.
+24. **Agent tokens never propose** (conflict C13).
+25. **INSTRUCTIONS stay unchanged.** call_page_tool's description carries the proposal sentence (conflict C1).
+
+Conflicts between the M6 records, settled by the plan, that touch this one:
+
+- **C1, the fixed tool list.** There are nine fixed tools, in the order above. The frozen `fixed-tools-m4.golden.json` idea is dropped, because ADRs 0042 and 0043 must change three M4 descriptions; detach_page's current text is wrong under ADR 0017. Instead, fixed-tools-golden.test.ts also asserts structurally that the first five names, positions, input schemas and annotations are M4's. The description changes are recorded in the fixture's `_comment`. INSTRUCTIONS are unchanged, so the initialize and server/discover captures keep their answers.
+- **C2, wait limits.** There is one module, `packages/relay/src/waits.ts`:
+  - **Per user:** MAX_WAITS_PER_USER = 2, shared by both waiting tools.
+  - **Per page:** usersPerPage + observersPerPage.
+  - **Invitees on a page:** that number less MEMBER_RESERVED_SEATS.
+  - **Charge:** each wait still holds its request charge.
+- **C13:** ADR 0042's `#propose` and the adapter's `onProposal` refuse agent callers with role_denied.
+- **C18:** every M6 change to CallShape and callRule lands in one foundation commit.
+- **C21, Revoke on a sponsor's row.** It asks first whenever anyone that member's invites let in is still attached, not only during a session, and so does Revoke all. The roster workstream owns this.
+- **C22, the panel order:**
+  1. error line, notice line, joins
+  2. prompts, then the record offer
+  3. proposals, pairing
+  4. roster (People, then Watching by invite), session block
+  5. invites (with the agent kind and list)
+  6. activity, record block, state line, pause box
+- **C27:** detach_page's description now says that attachments your invites let in end with yours.
+
+## Notes from the other M6 records (10 October 2026)
+
+**From ADR 0040.** The fixed tools are nine, in this order: M4's five, `get_page_state`, `wait_for_page_state`, `get_proposal` and `withdraw_proposal` (C1).
+
+**From ADR 0043.** A session may narrow `proposals` within the ceiling `attach()` sets: off, members or all, never wider.
+
+**From ADR 0044.** Agents never propose: the relay's `#propose` and the adapter refuse an agent caller with `role_denied` (C13).
+
+**From ADR 0045.** The arguments a proposal shows in the widget's queue never enter the session record; the record copies only the proposal's id, proposer, tool, times, outcome and `callId`.
+
+**From ADR 0039.** An accepted run's image is not kept, and `get_proposal` returns its text only.
+
+**Open questions.** Settled under Decisions: no dismissal reason (2), no bulk accept (3), and `get_proposal` waits with `waitMs` (4).
+
+## Notes from the review of the proposals build (11 October 2026)
+
+Taken under the owner's standing instruction; none weakens a section 9 requirement, and each has a test that fails without it.
+
+**Proposal frames and the page's link.** A proposal frame carries up to 16 KiB of arguments, and the pending caps did not bound how many reach a page, since `withdraw_proposal` freed a place at once. A proposal now goes out only where the page has room, as an invoke does (ADR 0024's notes): onto an empty queue, or with no call waiting for room and the queue, the frame included, within `PROPOSAL_ROOM` (a quarter of `INVOKE_ROOM`) and below `MAX_UNREAD_FRAMES`; otherwise it answers `page_busy` at once and keeps no place. The proposal frame and the one `proposal_end` that may follow it are never counted toward closing the page, as invokes and cancels are not, so what observers propose never closes a page. A proposal withdrawn by its proposer or refused by the page keeps its place among its proposer's three and the page's twenty for `PROPOSAL_PLACE_HOLD_MS` (one minute), answered `rate_limited`; beyond what the operator frees by deciding, a page is sent at most twenty new proposals a minute. `#propose` also spends ADR 0044's watching share, so a watcher's proposals count as its calls do once that share is built.
+
+**One user's share.** What one user's reserved, pending and running proposals hold, across every page, is at most an eighth of `TABDOCK_MAX_PROPOSAL_BYTES`, or one proposal at the argument caps where that is less, as ADR 0018 gives each user a share of the request budget; past it a proposal answers `rate_limited` before the budget drops anyone's kept outcome. Without it one member running pages of their own could hold the whole budget.
+
+**Kept outcomes are charged.** A settled proposal is charged `PROPOSAL_HEAP_BYTES` until it is forgotten, with its result's text on top while held, and its own unref'd timer forgets it ten minutes after it settled, whether or not anyone reads its page. A new result makes room by dropping the oldest results; a new proposal by dropping those and then the oldest outcomes, relay-wide; one that would not fit even then is refused without dropping anything. SPEC section 6, page 14 and `.env.example` already say the budget covers kept outcomes.
+
+**Waits.** As SPEC section 7 and `get_proposal`'s description say, `waitMs` waits for a change: the Accept wakes a wait with `accepted` while the page runs it, and a second wait answers the run's end. A wait on a page that sleeps or reloads answers `page_asleep`, and on one that goes `page_gone`, before its pending proposals are cancelled; a later read gives the status.
+
+**The attachment a proposal is made under.** The `grantedAt` check in `#proposalRefusal` is the only guard for a revoke or detach followed by a fresh approval while `#propose` waits on the argument check, since a reservation is not yet a proposal that `attachmentsEnded` can end; a relay test holds the check to cover it. Only the same check in `#stillProposes` is defense in depth.
+
+**A decision after a proposal's end.** The page decides each proposal once, so a `proposal_decision` for one no longer pending is expected only as an Accept or Dismiss crossing its end on the wire: one such decision within 30 s of its end (`ENDED_REQUEST_GRACE_MS`, as for attach requests) changes nothing silently, and every other, a replay of a kept outcome among them, is a frame that changes nothing and spends ADR 0023's budget, so its line is held back past it (`proposals.test.ts`, from Wave 2's cross-workstream review).
+
+## Note from Wave 3's cross review (12 October 2026)
+
+**The demo board's link.** Since Wave 2 the demo board reads `?proposals=members` or `?proposals=all` (`apps/demo/src/policy.ts`), names it on the Connect bar beside `?confirm` and `?invites`, keys the remembered choice on it, and offers it as a third box on the Connect form, which sets `all`; SPEC section 4 still named the other two alone. Its demo paragraph now reads "names each policy setting the link makes beyond the defaults (`?confirm`, `?invites`, `?proposals`)" and "which sets `?confirm`, `?invites` and `?proposals` only as its visitor ticks them (ADR 0042's notes)", amending ADR 0029's notes of 5 October to match, and the demo README and guide page 12 say the same. `tests/e2e/test/doc-demo-link.test.ts` holds both of SPEC's lists, the README's and the form's boxes to the parameters `setPolicyParams` writes and `linkPolicyFromQuery` reads, and fails on the old wording. Section 9 is unchanged: a link that sets `?proposals` is named before its visitor chooses, as ADR 0029's notes require of every policy setting.
+
+## Note from the section 9 review (A6.28, 12 October 2026)
+
+**A detach withdraws.** Only a withdrawal and the page's refusal kept a proposal's place, so on a page that lets a member pair again with no operator click (`autoApprove: 'observer'`, or a watch invite) proposing three, calling `detach_page` and pairing again sent the page fresh proposals as fast as the pairing limits allowed: 90 frames a minute to one page from three members, against the 20 these notes, SPEC section 7 and guide page 19 promise. A detach withdraws everything its user had pending, so those proposals, cancelled with `attachment_ended`, now keep their places for `PROPOSAL_PLACE_HOLD_MS` as a withdrawal's do, and the `rate_limited` answer names a detach beside a withdrawal and a refusal. Every other end of an attachment (the operator's revoke, a sponsor's or session's end, the member list, expiry) is not the proposer's choice and still frees its places at once; `PagePart.attachmentsEnded` now says which end it was. `proposals.test.ts` runs the loop and `proposal-keeping.test.ts` holds both kinds of end, each failing without the change; SPEC S9 names the hold.
+
+**The relay's half of S5 for a queued run, tested.** An accepted proposal queued behind another write is checked again as its invoke goes out (`#recheck`, then `#proposalRefusal`), so a session that narrowed the page's proposals to `off` meanwhile keeps it from running, beside the adapter's own refusal. Only the adapter's half had a test, so the relay's check could go and every relay and end-to-end suite still passed. `rules-combined.test.ts` now holds Alice's write on the page while Bob's proposal is accepted and a session starts that takes none: only Alice's invoke goes out, the page hears `proposal_end` with `not_run`, Bob reads `role_denied`, and the audit's run record says `acceptedOnPage` and `role_denied`. It fails with the check removed from `#proposalRefusal` and with it skipped only on the `#recheck` path; product code did not change.
+
+## Notes from the docs pass (12 October 2026)
+
+**Four slips, read as built.** The Consequences' "the fixed tools grow by one" reads "by two", since `get_proposal` and `withdraw_proposal` are both new (decisions 1 and 21). The build review's "or one proposal at the argument caps where that is less" reads "where that is more": one user's share is the larger of an eighth of `TABDOCK_MAX_PROPOSAL_BYTES` and one proposal at the caps (`Math.max` in `packages/relay/src/proposals.ts`), so a small budget still admits one proposal, as SPEC section 6 says. The same note's "once that share is built" is history: `#propose` spends the watchers' share before it reserves anything (`#watchingShareRefusal` in `packages/relay/src/hub.ts`). And the section 9 review's "SPEC section 7" reads section 6, where the 20 new proposals a minute are stated.
+
+**Waits per page, with invites off.** C2's "usersPerPage + observersPerPage" counts the watching seats only with invites on, as ADR 0040's notes of this pass say (`waitLimitsOf` in `packages/relay/src/waits.ts`).

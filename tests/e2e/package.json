@@ -18,11 +18,15 @@
     "conformance": "node src/conformance.ts",
     "check:claude-code:m5": "node src/claude-code-check-m5.ts",
     "check:claude-code:labels": "node src/claude-code-check-labels.ts",
+    "check:claude-code:images": "node src/claude-code-check-images.ts",
     "demo:m1": "node src/demo-m1.ts",
     "demo:m2": "node src/demo-m2.ts",
     "demo:m3": "node src/demo-m3.ts",
     "demo:m4": "node src/demo-m4.ts",
-    "demo:m5": "node src/demo-m5.ts"
+    "demo:m5": "node src/demo-m5.ts",
+    "check:claude-code:agent": "node src/claude-code-check-agent.ts",
+    "measure:room": "node src/measure-room.ts",
+    "demo:m6": "node src/demo-m6.ts"
   },
   "devDependencies": {
     "@mcp-b/webmcp-local-relay": "5.1.0",
@@ -30,7 +34,9 @@
     "@modelcontextprotocol/conformance": "0.2.0-alpha.12",
     "@playwright/test": "1.56.1",
     "@tabdock/adapter": "workspace:*",
+    "@tabdock/ci-check": "workspace:*",
     "@tabdock/demo": "workspace:*",
+    "@tabdock/map-page": "workspace:*",
     "@tabdock/mcpb6": "workspace:*",
     "@tabdock/protocol": "workspace:*",
     "@tabdock/relay": "workspace:*",

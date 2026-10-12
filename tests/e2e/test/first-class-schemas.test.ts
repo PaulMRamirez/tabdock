@@ -19,7 +19,17 @@ afterEach(async () => {
   world = undefined;
 });
 
-const FIXED = ['list_pages', 'pair_page', 'list_page_tools', 'call_page_tool', 'detach_page'];
+const FIXED = [
+  'list_pages',
+  'pair_page',
+  'list_page_tools',
+  'call_page_tool',
+  'detach_page',
+  'get_page_state',
+  'wait_for_page_state',
+  'get_proposal',
+  'withdraw_proposal',
+];
 
 /** Roots a client of some era rejects the whole list over, by the tool that offers each. */
 const REJECTED: Record<string, Record<string, unknown>> = {

@@ -45,7 +45,8 @@ ENV NODE_ENV=production \
 USER 65532:65532
 EXPOSE 8787
 # The base's entrypoint is node itself. Exec form, so SIGTERM and SIGINT reach
-# the relay, which closes within a second (main.ts); no init process is needed,
+# the relay, which closes within a second (main.ts), or after writing a restart
+# snapshot where TABDOCK_RESTART_SNAPSHOT is on; no init process is needed,
 # since the relay starts only worker threads. The heap cap suits a 512 MB host
 # beside the argument worker's own 256 MB cap, and holds TABDOCK_MAX_TOOL_BYTES's
 # default with room to spare: packages/relay/test/tool-heap.test.ts reads this

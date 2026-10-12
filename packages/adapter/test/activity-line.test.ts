@@ -7,7 +7,7 @@
 
 import { describe, expect, it } from 'vitest';
 import type { ActivityEntry } from '../src/core.ts';
-import { confirmedIn } from '../src/widget.ts';
+import { confirmedIn, imageText } from '../src/widget.ts';
 
 const entry: ActivityEntry = {
   callId: 'call-1',
@@ -19,6 +19,9 @@ const entry: ActivityEntry = {
   confirmedBy: 'client',
   durationMs: 12,
   handlerRunning: false,
+  image: null,
+  proposalId: null,
+  acceptedOnPage: false,
 };
 
 describe('confirmedIn', () => {
@@ -51,5 +54,16 @@ describe('confirmedIn', () => {
 
   it('names nobody for any other call, those the operator confirmed here included', () => {
     expect(confirmedIn({ ...entry, confirmedBy: null })).toBeNull();
+  });
+});
+
+describe('imageText (ADR 0039)', () => {
+  it("names an image's type and size, in KB with a decimal under 10 KB, and nothing else", () => {
+    const line = (mimeType: 'image/png' | 'image/jpeg' | 'image/webp', bytes: number) =>
+      imageText({ ...entry, image: { mimeType, bytes } });
+    expect(line('image/png', 48_213)).toBe('image, PNG, 47 KB');
+    expect(line('image/jpeg', 9_000)).toBe('image, JPEG, 8.8 KB');
+    expect(line('image/webp', 524_288)).toBe('image, WEBP, 512 KB');
+    expect(imageText(entry)).toBeNull();
   });
 });

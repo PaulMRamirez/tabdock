@@ -1,0 +1,23 @@
+{
+  "name": "@tabdock/ci-check",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A copyable CI check: Playwright and an SDK client walk a map page's walkthroughs against a local mode relay (ADR 0041). Never published.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    "./profile": "./src/profile.ts",
+    "./walk": "./src/walk.ts"
+  },
+  "scripts": {
+    "check": "playwright test --project chromium",
+    "advisory": "playwright test --project advisory",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.3.1",
+    "@playwright/test": "1.56.1",
+    "@tabdock/adapter": "workspace:*",
+    "zod": "4.6.5"
+  }
+}

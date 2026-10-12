@@ -1,21 +1,130 @@
-// The adapter reference (docs/guide/04-adapter-reference.md, ADR 0035) is
-// where a page author looks up an option, a policy field or a handle method,
-// so each of its tables must list exactly what the code declares: the
-// members of AttachOptions, Dock, DockState and InviteOptions as the
-// TypeScript sources declare them, PolicySchema's fields, and the data-*
-// attributes the script-tag build reads. The policy's defaults must be what
+// The adapter reference (docs/guide/04-adapter-reference.md, ADR 0035) and
+// the control handle page it sends readers on to (13-the-control-handle.md,
+// which took the handle's tables when M6 grew them) are where a page author
+// looks up an option, a policy field or a handle method, so each of their
+// tables must list exactly what the code declares: the members of
+// AttachOptions, Dock, DockState and InviteOptions as the TypeScript sources
+// declare them, PolicySchema's fields, and the data-* attributes the
+// script-tag build reads. The policy's defaults must be what
 // PolicySchema fills in, every value the page lists must parse, and the
 // stated range for maxDrivers must be the schema's. The adapter README's
-// at-a-glance paragraph names the same handle members.
+// at-a-glance paragraph names the same handle members. Every reason a
+// handle method can answer with (startSession, invite, agentToken and
+// publishState, and the state's published status) is named in backticks on
+// the handle page, read with the compiler API from the types Dock and
+// DockState declare for them in core.ts, the aliases those name and the
+// protocol's enums, so a new refusal cannot ship with no words for a page
+// author; SessionResult's inviteRefusal is named too.
 
-import { PolicySchema } from '@tabdock/protocol';
+import {
+  InviteRefusalReasonSchema,
+  PolicySchema,
+  SessionRefusalReasonSchema,
+} from '@tabdock/protocol';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import { INVITE_LIFETIMES } from '../../../packages/adapter/src/core.ts';
+import { OPERATOR_GRANTS_PER_PAGE } from '../../../packages/relay/src/hub.ts';
 import { readScriptOptions } from '../../../packages/adapter/src/script-options.ts';
 import { datasetKey, readRepo, scriptTagAttributes, type Table, tables } from '../src/doc-files.ts';
 
 const PAGE = 'docs/guide/04-adapter-reference.md';
+const HANDLE = 'docs/guide/13-the-control-handle.md';
+const CORE = 'packages/adapter/src/core.ts';
+
+/** The protocol's enums core.ts's result types name, read from the schemas themselves. */
+const PROTOCOL_REASONS: Readonly<Record<string, readonly string[]>> = {
+  InviteRefusalReason: InviteRefusalReasonSchema.options,
+  SessionRefusalReason: SessionRefusalReasonSchema.options,
+};
+
+/** The handle members whose answers a page author reads: four methods and the state's published status. */
+const ANSWERS: readonly (readonly [string, string])[] = [
+  ['Dock', 'startSession'],
+  ['Dock', 'invite'],
+  ['Dock', 'agentToken'],
+  ['Dock', 'publishState'],
+  ['DockState', 'published'],
+];
+
+/** The type a member of an interface in `source` declares: a method's return type or a field's type. */
+function memberType(source: ts.SourceFile, name: string, member: string): ts.TypeNode {
+  const found = source.statements.find(
+    (statement): statement is ts.InterfaceDeclaration =>
+      ts.isInterfaceDeclaration(statement) && statement.name.text === name,
+  );
+  const declared = found?.members.find(
+    (candidate) =>
+      candidate.name !== undefined &&
+      ts.isIdentifier(candidate.name) &&
+      candidate.name.text === member,
+  );
+  if (
+    declared === undefined ||
+    !(ts.isMethodSignature(declared) || ts.isPropertySignature(declared)) ||
+    declared.type === undefined
+  ) {
+    throw new Error(`${source.fileName} declares no typed ${name}.${member}`);
+  }
+  return declared.type;
+}
+
+/**
+ * Every string literal a type node holds, following the aliases it names in
+ * the same file and the protocol enums PROTOCOL_REASONS lists. A name ending
+ * in Reason or Refusal that is neither throws, so a new enum from elsewhere
+ * is never passed over in silence.
+ */
+function literalsIn(source: ts.SourceFile, type: ts.Node, seen = new Set<string>()): string[] {
+  const found: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isLiteralTypeNode(node) && ts.isStringLiteral(node.literal))
+      found.push(node.literal.text);
+    if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName)) {
+      found.push(...literalsOf(source, node.typeName.text, seen));
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(type);
+  return found;
+}
+
+/** Every string literal the type alias `name` in `source` holds (see literalsIn). */
+function literalsOf(source: ts.SourceFile, name: string, seen = new Set<string>()): string[] {
+  if (seen.has(name)) return [];
+  seen.add(name);
+  const alias = source.statements.find(
+    (statement): statement is ts.TypeAliasDeclaration =>
+      ts.isTypeAliasDeclaration(statement) && statement.name.text === name,
+  );
+  if (alias === undefined) {
+    const known = PROTOCOL_REASONS[name];
+    if (known !== undefined) return [...known];
+    if (/(?:Reason|Refusal)$/.test(name)) throw new Error(`no literals known for ${name}`);
+    return [];
+  }
+  return literalsIn(source, alias.type, seen);
+}
+
+/** The type names a type node refers to, Promise<...> looked through. */
+function namedTypes(type: ts.Node): string[] {
+  const names: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName))
+      names.push(node.typeName.text);
+    ts.forEachChild(node, visit);
+  };
+  visit(type);
+  return names.filter((name) => name !== 'Promise');
+}
+
+/** The literals `page` never shows in backticks, bare or quoted. */
+function unnamedReasons(page: string, literals: readonly string[]): string[] {
+  const spans = new Set(
+    [...page.matchAll(/`([^`]+)`/g)].map((match) => (match[1] ?? '').replace(/^'|'$/g, '')),
+  );
+  return [...new Set(literals)].filter((literal) => !spans.has(literal));
+}
 
 /** The member names an interface declares in a source file, in order. */
 function membersOf(path: string, name: string): string[] {
@@ -33,7 +142,8 @@ function membersOf(path: string, name: string): string[] {
 /** The table whose first header cell is `first`. */
 function tableHeaded(all: readonly Table[], first: string): Table {
   const table = all.find((candidate) => candidate.header[0] === first);
-  if (table === undefined) throw new Error(`${PAGE} has no table headed ${first}`);
+  if (table === undefined)
+    throw new Error(`neither ${PAGE} nor ${HANDLE} has a table headed ${first}`);
   return table;
 }
 
@@ -76,7 +186,14 @@ function enumOptions(field: keyof typeof PolicySchema.shape): string[] | null {
 }
 
 describe('the adapter reference', () => {
-  const all = tables(readRepo(PAGE));
+  // Each table is looked for on both pages, so it may move between them, but
+  // never be on neither nor (by its header) on both.
+  const all = [...tables(readRepo(PAGE)), ...tables(readRepo(HANDLE))];
+
+  it('holds each of its tables once across the two pages', () => {
+    const headers = all.map((table) => table.header[0]);
+    expect(headers.filter((header, index) => headers.indexOf(header) !== index)).toEqual([]);
+  });
 
   it('lists every attach() option and no other', () => {
     expect(firstNames(tableHeaded(all, 'Option'))).toEqual(
@@ -201,5 +318,54 @@ describe("the adapter README's at-a-glance paragraph", () => {
     const sentence = /whose members are ([^.]+)\./.exec(readme)?.[1] ?? '';
     const named = [...sentence.matchAll(/`([^`]+)`/g)].map((match) => match[1]);
     expect(named).toEqual(membersOf('packages/adapter/src/core.ts', 'Dock'));
+  });
+});
+
+describe("the handle's answers", () => {
+  const source = ts.createSourceFile(CORE, readRepo(CORE), ts.ScriptTarget.Latest, true);
+  const handle = readRepo(HANDLE);
+
+  it('are read from the types the handle declares for them', () => {
+    expect(
+      ANSWERS.flatMap(([name, member]) => namedTypes(memberType(source, name, member))),
+    ).toEqual([
+      'SessionResult',
+      'InviteResult',
+      'AgentTokenResult',
+      'PublishResult',
+      'PublishStatus',
+    ]);
+  });
+
+  it('are each named in backticks on the handle page, inviteRefusal among them', () => {
+    const literals = ANSWERS.flatMap(([name, member]) =>
+      literalsIn(source, memberType(source, name, member)),
+    );
+    // The session's own refusals and the relay's, which it passes on, are both read.
+    for (const reason of ['active', 'link_down', 'unknown', 'length', 'no_sponsor', 'too_large']) {
+      expect(literals, reason).toContain(reason);
+    }
+    expect(unnamedReasons(handle, literals)).toEqual([]);
+    expect(unnamedReasons(handle, ['inviteRefusal'])).toEqual([]);
+  });
+
+  it("give the widget's words for limit the relay's grant limit, which the adapter cannot import", () => {
+    const widget = readRepo('packages/adapter/src/widget.ts');
+    const stated = /const RELAY_GRANTS_PER_MINUTE = (\d+);/.exec(widget)?.[1];
+    expect(Number(stated)).toBe(OPERATOR_GRANTS_PER_PAGE);
+  });
+
+  it('would fail a reason the page leaves out, and an enum the test cannot read', () => {
+    expect(unnamedReasons('`active`, `policy` or `link_down`', ['active', 'length'])).toEqual([
+      'length',
+    ]);
+    expect(unnamedReasons("`'shared'` or `'paused'`", ['shared', 'paused'])).toEqual([]);
+    const made = ts.createSourceFile(
+      'made.ts',
+      "type Result = { ok: false; reason: 'gone' | NewRefusal };",
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    expect(() => literalsOf(made, 'Result')).toThrow(/NewRefusal/);
   });
 });

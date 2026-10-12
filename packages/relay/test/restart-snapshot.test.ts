@@ -1,0 +1,2156 @@
+// A6.18, the restart snapshot (ADR 0046). With TABDOCK_RESTART_SNAPSHOT on,
+// a graceful stop writes the hub's store to one 0600 file in the audit
+// directory and its SHA-256 to a snapshot_written record that relay_stop
+// follows, and the next start puts it back: the page resumes with its
+// attachments, live invites, time-boxed session and agent tokens. Each start
+// removes the file before it decides anything, so a snapshot is used at most
+// once; it loads only when the log's last two lines bind it to the stop that
+// wrote it, so a tampered, replayed or planted file never does, nor one past
+// the resume window, from the future, from another mode or reached through a
+// link. A member the list in force no longer gives the same subject comes
+// back with nothing, and what they sponsored goes with them (S8, S13, S14).
+// A revoked attachment or a closed invite never returns, and a live invite's
+// terms and a token's come back whole: a revoked guest's bar by account and
+// email, the uses a link has left, a control link's refusals and a token's
+// timed-out prompts (S14). What ran out while the relay was down ends in
+// the order its timers would have ended it (S7). The file holds
+// digests only: no resume token, invite secret, agent token, pairing code or
+// subject. With the setting off nothing is written, a file an earlier run
+// left is removed unread, and a restart ends everything, as in M5. Against a
+// public URL relay and the stand-in provider, each test restarting a real
+// relay on one audit directory; the page is the test's own stand-in.
+
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import {
+  chmodSync,
+  copyFileSync,
+  cpSync,
+  existsSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import * as nodeFs from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import {
+  AUDIT_VERSION,
+  type AuditLine,
+  INVITEE_ID_PREFIX,
+  MAX_ROSTER_CLIENTS_PER_INVITEE,
+  MAX_SNAPSHOT_BYTES,
+  type PolicyInput,
+  PolicySchema,
+  type RelaySnapshot,
+  RelaySnapshotSchema,
+  RESUME_WINDOW_MS,
+  SNAPSHOT_VERSION,
+  type SnapshotAgent,
+  type SnapshotAttachment,
+  type SnapshotInvite,
+  type SnapshotPage,
+} from '@tabdock/protocol';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { resolveConfig } from '../src/config.ts';
+import { PageHub } from '../src/hub.ts';
+import {
+  createDevTokenAuth,
+  createLogger,
+  createMemoryStore,
+  createOAuthAuth,
+  createRelay,
+  inviteeKeyOf,
+  lineHash,
+  NO_ORIGIN,
+  type OAuthUser,
+  readAuditLines,
+  type Relay,
+  type RelayOptions,
+} from '../src/index.ts';
+import {
+  bindingProblem,
+  credentialsDigest,
+  fitProblem,
+  removeTemporaryFiles,
+  restoredAgent,
+  restoredAttachment,
+  restoredInvite,
+  savedAgent,
+  savedAttachment,
+  savedInvite,
+  SNAPSHOT_FILE,
+  type SnapshotFs,
+  snapshotAccounts,
+  takeSnapshot,
+  writeSnapshot,
+} from '../src/snapshot.ts';
+import type { AgentTokenRecord, InviteRecord } from '../src/store.ts';
+import { agentRequest, agentUserId, connectAgent, mintAgent } from './helpers/agents.ts';
+import {
+  attachMember,
+  call,
+  emailClaims,
+  joinAtI,
+  latest,
+  MEMBERS,
+  mintOk,
+  redeem,
+  signedInAtI,
+} from './helpers/invites.ts';
+import {
+  connectPage,
+  openSocket,
+  PAGE_ORIGIN,
+  type PageOptions,
+  TestPage,
+  TOOLS,
+} from './helpers/page-client.ts';
+import { PAIR_CLIENT, startProvider, type TestProvider } from './helpers/provider.ts';
+import { ALICE as DEV_ALICE, eventually, FAST_TIMINGS } from './helpers/relay.ts';
+import { PUBLIC_MCP_URL, PUBLIC_ORIGIN, tunnelFetch } from './helpers/tunnel.ts';
+
+const MINUTE = 60_000;
+const POSIX = process.platform !== 'win32';
+const FIFO_PROBE = resolve(import.meta.dirname, 'fixtures/snapshot-fifo-probe.ts');
+/** What a snapshot the stand-in /pair client's relay wrote is bound to. */
+const PAIR_CREDENTIALS = credentialsDigest(PAIR_CLIENT);
+const GUEST = 'sub-guest';
+const GUEST_EMAIL = 'guest@example.com';
+const POLICY: PolicyInput = { invites: 'all', maxDrivers: 2, proposals: 'members' };
+/** An agent's first request, which raises its attach prompt. */
+const AGENT_INITIALIZE = {
+  jsonrpc: '2.0',
+  id: 1,
+  method: 'initialize',
+  params: {
+    protocolVersion: '2025-11-25',
+    capabilities: {},
+    clientInfo: { name: 'raw-agent', version: '1.0.0' },
+  },
+};
+
+interface Run {
+  relay: Relay;
+  lines: string[];
+  page(options?: PageOptions): Promise<TestPage>;
+  claude(sub: string, email?: string | null): Promise<Client>;
+  close(): Promise<void>;
+}
+
+const runs: Run[] = [];
+const providers: TestProvider[] = [];
+const scratches: string[] = [];
+
+afterEach(async () => {
+  vi.useRealTimers();
+  for (const run of runs.splice(0)) await run.close();
+  for (const provider of providers.splice(0)) await provider.stop().catch(() => undefined);
+  for (const dir of scratches.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+/** A directory only this account can change, under the private scratch root (vitest.setup.ts). */
+function privateDir(): string {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'tabdock-snapshot-')));
+  chmodSync(dir, 0o700);
+  scratches.push(dir);
+  return dir;
+}
+
+/** An audit directory the relay makes itself, as it makes TABDOCK_AUDIT_DIR. */
+function auditDir(): string {
+  return join(privateDir(), 'audit');
+}
+
+async function provider(): Promise<TestProvider> {
+  const started = await startProvider();
+  providers.push(started);
+  return started;
+}
+
+interface RunOptions extends Partial<RelayOptions> {
+  users?: OAuthUser[];
+}
+
+/**
+ * A public URL relay with invites, agent tokens and the snapshot on, its
+ * audit log in `dir`, signing people in at `idp`, which outlives it, so a
+ * client signs in again at the next relay as the same person.
+ */
+async function startRun(dir: string, idp: TestProvider, options: RunOptions = {}): Promise<Run> {
+  const lines: string[] = [];
+  const { users, ...rest } = options;
+  const relay = await createRelay({
+    auth: createOAuthAuth({
+      issuer: idp.issuer,
+      resource: PUBLIC_MCP_URL,
+      users: users ?? MEMBERS,
+    }),
+    publicUrl: PUBLIC_ORIGIN,
+    pairClient: PAIR_CLIENT,
+    allowedOrigins: [PAGE_ORIGIN],
+    invites: true,
+    agentTokens: true,
+    restartSnapshot: true,
+    audit: { dir },
+    port: 0,
+    logLevel: 'debug',
+    logSink: (line) => {
+      lines.push(line);
+    },
+    ...rest,
+    timings: { ...FAST_TIMINGS, ...rest.timings },
+  });
+  const pages: TestPage[] = [];
+  const clients: Client[] = [];
+  let closed: Promise<void> | null = null;
+  const run: Run = {
+    relay,
+    lines,
+    async page(pageOptions = {}) {
+      const opened = await connectPage(relay.pageUrl, {
+        tools: TOOLS,
+        title: 'Board',
+        policy: POLICY,
+        onInvoke: (frame) => ({ ok: true, content: JSON.stringify({ tool: frame.tool }) }),
+        ...pageOptions,
+      });
+      pages.push(opened);
+      return opened;
+    },
+    async claude(sub, email = null) {
+      // Named apart from its subject, so the file's check for subjects means something.
+      const client = new Client({ name: 'claude-test', version: '1.0.0' });
+      await client.connect(
+        new StreamableHTTPClientTransport(new URL(PUBLIC_MCP_URL), {
+          authProvider: {
+            token: () => idp.token({ sub, aud: PUBLIC_MCP_URL, ...emailClaims(email) }),
+          },
+          fetch: tunnelFetch(relay.url),
+        }),
+      );
+      clients.push(client);
+      return client;
+    },
+    close() {
+      // The relay first, with its pages still connected: a graceful stop.
+      closed ??= (async () => {
+        await relay.close();
+        for (const client of clients.splice(0)) await client.close().catch(() => undefined);
+        for (const opened of pages.splice(0)) opened.ws.terminate();
+      })();
+      return closed;
+    },
+  };
+  runs.push(run);
+  return run;
+}
+
+/** Every record the audit files hold, oldest first. */
+function records(dir: string): AuditLine[] {
+  return [...readAuditLines(dir)].map((line) => {
+    if (line.record === null) throw new Error(`line ${String(line.lineNumber)} is no record`);
+    return line.record;
+  });
+}
+
+function recordsOf<T extends AuditLine['type']>(
+  dir: string,
+  type: T,
+): Extract<AuditLine, { type: T }>[] {
+  return records(dir).filter(
+    (record): record is Extract<AuditLine, { type: T }> => record.type === type,
+  );
+}
+
+/** The records a start wrote: everything after the last relay_start. */
+function sinceStart(dir: string): AuditLine[] {
+  const all = records(dir);
+  const at = all.findLastIndex((record) => record.type === 'relay_start');
+  return all.slice(at);
+}
+
+function fileOf(dir: string): string {
+  return join(dir, SNAPSHOT_FILE);
+}
+
+/**
+ * The temporary file a stop killed between writeSnapshot's open and its
+ * rename leaves, holding `from`'s bytes or an invitee's email.
+ */
+function plantTemporary(dir: string, from?: string): string {
+  const path = join(dir, `.${SNAPSHOT_FILE}.0123456789abcdef.tmp`);
+  writeFileSync(
+    path,
+    from === undefined ? `{"displayName":"${GUEST_EMAIL}"}` : readFileSync(from),
+    {
+      mode: 0o600,
+    },
+  );
+  return path;
+}
+
+function sha256(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+/** Whether the text holds a secret or any 10-character run of it; its digest is allowed. */
+function holdsRaw(text: string, secret: string): boolean {
+  for (let at = 0; at + 10 <= secret.length; at += 1) {
+    if (text.includes(secret.slice(at, at + 10))) return true;
+  }
+  return text.includes(secret);
+}
+
+function inviteeId(sub: string): string {
+  return `${INVITEE_ID_PREFIX}${inviteeKeyOf(sub)}`;
+}
+
+const getView = (page: string) => ({ page, tool: 'get_view', arguments: {} });
+
+/** The page reloading against the restarted relay with the token it last had. */
+async function resumeOn(run: Run, page: TestPage, policy: PolicyInput = POLICY): Promise<TestPage> {
+  return run.page({ resumeToken: page.welcome?.resumeToken ?? '', policy });
+}
+
+/** A page's state as list_pages gives it to `who`. */
+async function pageState(who: Client, pageId: string): Promise<string | undefined> {
+  const listed = (await call(who, 'list_pages')).structured as {
+    pages: { page: string; state: string }[];
+  };
+  return listed.pages.find((entry) => entry.page === pageId)?.state;
+}
+
+function rosterIds(page: TestPage): string[] {
+  const roster = page.all('roster').at(-1)?.attachments ?? page.welcome?.roster ?? [];
+  return roster.map((attachment) => attachment.userId).sort();
+}
+
+/** The warning a start writes when it refuses a snapshot, with its fixed reason. */
+function refusalOf(run: Run): string | null {
+  for (const line of run.lines) {
+    const parsed = JSON.parse(line) as Record<string, unknown>;
+    if (parsed.msg === 'restart snapshot not loaded; starting fresh') return String(parsed.reason);
+  }
+  return null;
+}
+
+describe('a graceful restart with TABDOCK_RESTART_SNAPSHOT on (A6.18)', () => {
+  it('resumes the page with its attachments, live invite, session and agent token, holding only digests on disk', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const first = await startRun(dir, idp);
+    const page = await first.page();
+    const alice = await first.claude('sub-alice');
+    await attachMember(alice, page);
+    await attachMember(await first.claude('sub-bob'), page, 'observer');
+    const used = await mintOk(page, { role: 'observer', uses: 1 });
+    const guest = await first.claude(GUEST, GUEST_EMAIL);
+    const joined = await redeem(guest, page, used.link);
+    expect(joined.outcome.isError, joined.outcome.text).toBe(false);
+    const live = await mintOk(page, { role: 'observer', uses: 1 });
+    page.send({
+      t: 'session_start',
+      sessionId: 'ses_lesson',
+      lengthMs: 30 * MINUTE,
+      policy: { maxDrivers: 1, proposals: 'off' },
+    });
+    expect((await latest(page, 'session')).session?.sessionId).toBe('ses_lesson');
+    const minted = await mintAgent(page);
+    const agent = await connectAgent(first.relay.url, minted.token);
+    const asked = await page.next('attach_request');
+    page.send({ t: 'attach_decision', requestId: asked.requestId, allow: true });
+    await page.sync();
+    const agentId = agentUserId(page.pageId, minted.tokenId);
+    expect(rosterIds(page)).toEqual(['alice', agentId, 'bob', inviteeId(GUEST)].sort());
+    await agent.close();
+    const resumeToken = page.welcome?.resumeToken ?? '';
+    await first.close();
+
+    // The stop wrote one 0600 file, bound by the log's last two lines.
+    const bytes = readFileSync(fileOf(dir));
+    expect(statSync(fileOf(dir)).mode & 0o777).toBe(0o600);
+    const [written, stopped] = records(dir).slice(-2);
+    expect(stopped?.type).toBe('relay_stop');
+    expect(written).toMatchObject({
+      type: 'snapshot_written',
+      pages: 1,
+      attachments: 4,
+      invites: 1,
+      sessions: 1,
+      sha256: sha256(bytes),
+    });
+    // Digests only: never a resume token, an invite secret, the agent's
+    // token, the /pair client's secret, the pairing code or a subject,
+    // though their digests are there.
+    const text = bytes.toString('utf8');
+    for (const secret of [
+      resumeToken,
+      used.secret,
+      live.secret,
+      minted.token,
+      PAIR_CLIENT.clientSecret,
+    ]) {
+      expect(holdsRaw(text, secret)).toBe(false);
+    }
+    expect(JSON.parse(text)).toMatchObject({ credentials: PAIR_CREDENTIALS });
+    expect(text).not.toContain(page.code);
+    expect(text).not.toContain(page.code.replace(/\W/g, ''));
+    for (const sub of ['sub-alice', GUEST]) expect(text).not.toContain(sub);
+    expect(text).toContain(live.hash);
+    expect(text).toContain(minted.hash);
+    expect(RelaySnapshotSchema.safeParse(JSON.parse(text)).success).toBe(true);
+
+    const second = await startRun(dir, idp);
+    expect(existsSync(fileOf(dir))).toBe(false);
+    const [start, loaded] = sinceStart(dir);
+    expect(start).toMatchObject({ type: 'relay_start', restartSnapshot: true });
+    expect(loaded).toMatchObject({
+      type: 'snapshot_loaded',
+      pages: 1,
+      attachments: 4,
+      invites: 1,
+      sessions: 1,
+      dropped: 0,
+    });
+    const back = await resumeOn(second, page);
+    expect([back.welcome?.resumed, back.pageId]).toEqual([true, page.pageId]);
+    expect(rosterIds(back)).toEqual(['alice', agentId, 'bob', inviteeId(GUEST)].sort());
+    const session = back.all('session').at(-1)?.session;
+    expect(session?.sessionId).toBe('ses_lesson');
+    expect(session?.remainingMs).toBeGreaterThan(29 * MINUTE);
+    // The session's one driver seat holds again, worked out from the ceiling
+    // and the session rather than read from the file (S5).
+    back.send({ t: 'set_role', userId: 'bob', role: 'driver' });
+    expect(
+      (await latest(back, 'roster')).attachments.find((attachment) => attachment.userId === 'bob')
+        ?.role,
+    ).toBe('observer');
+    expect((await latest(back, 'invites')).invites.map((invite) => invite.inviteId)).toEqual([
+      live.inviteId,
+    ]);
+    expect((await latest(back, 'agents')).agents).toMatchObject([
+      { tokenId: minted.tokenId, state: 'attached' },
+    ]);
+    // Each calls through again, the agent with no new prompt.
+    const aliceAgain = await second.claude('sub-alice');
+    expect((await call(aliceAgain, 'call_page_tool', getView(page.pageId))).isError).toBe(false);
+    const guestAgain = await second.claude(GUEST, GUEST_EMAIL);
+    expect((await call(guestAgain, 'call_page_tool', getView(page.pageId))).isError).toBe(false);
+    const agentAgain = await connectAgent(second.relay.url, minted.token);
+    try {
+      const result = await agentAgain.callTool({
+        name: 'call_page_tool',
+        arguments: getView(page.pageId),
+      });
+      expect(result.isError).not.toBe(true);
+    } finally {
+      await agentAgain.close();
+    }
+    expect(back.all('attach_request')).toEqual([]);
+    // And the live invite still lets someone in.
+    const dave = await second.claude('sub-dave', 'dave@example.com');
+    const later = await redeem(dave, back, live.link);
+    expect(later.outcome.isError, later.outcome.text).toBe(false);
+  });
+
+  it('never brings back a revoked attachment or a closed invite', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const first = await startRun(dir, idp);
+    const page = await first.page();
+    const alice = await first.claude('sub-alice');
+    await attachMember(alice, page);
+    const bob = await first.claude('sub-bob');
+    await attachMember(bob, page, 'observer');
+    const cancelled = await mintOk(page, { role: 'observer', uses: 1 });
+    page.send({ t: 'invite_cancel', inviteId: cancelled.inviteId });
+    page.send({ t: 'revoke', userId: 'bob' });
+    await latest(page, 'roster');
+    expect(rosterIds(page)).toEqual(['alice']);
+    await first.close();
+    expect(recordsOf(dir, 'snapshot_written')[0]).toMatchObject({ attachments: 1, invites: 0 });
+
+    const second = await startRun(dir, idp);
+    const back = await resumeOn(second, page);
+    expect(back.welcome?.resumed).toBe(true);
+    expect(rosterIds(back)).toEqual(['alice']);
+    expect((await latest(back, 'invites')).invites).toEqual([]);
+    const bobAgain = await second.claude('sub-bob');
+    const refused = await call(bobAgain, 'call_page_tool', getView(page.pageId));
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toContain('not_attached');
+    const carol = await second.claude('sub-carol', 'carol@example.com');
+    const closed = await call(carol, 'pair_page', { invite: cancelled.link });
+    expect(closed.isError).toBe(true);
+    expect(back.all('attach_request')).toEqual([]);
+  });
+
+  it("keeps a revoked guest's bar on a link left open, by account and by verified email (S14)", async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const first = await startRun(dir, idp);
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    const { secret, inviteId } = await mintOk(page, { uses: 5 });
+    const guest = await signedInAtI({ relay: first.relay, provider: idp }, GUEST, GUEST_EMAIL);
+    const { request } = await joinAtI(guest, page, secret);
+    // Revoked with the link kept open: barred, and the page never hears.
+    page.send({ t: 'revoke', userId: request.user.userId });
+    await page.sync();
+    const barred = { status: 403, data: { error: 'denied_by_operator' } };
+    expect(await guest.post('/i/claim', { secret })).toMatchObject(barred);
+    await first.close();
+
+    const second = await startRun(dir, idp);
+    const back = await resumeOn(second, page);
+    expect(back.welcome?.resumed).toBe(true);
+    expect((await latest(back, 'invites')).invites.map((invite) => invite.inviteId)).toEqual([
+      inviteId,
+    ]);
+    const asked = back.all('attach_request').length;
+    const again = await signedInAtI({ relay: second.relay, provider: idp }, GUEST, GUEST_EMAIL);
+    expect(await again.post('/i/claim', { secret })).toMatchObject(barred);
+    // Another subject with the same verified email, written another way.
+    const other = await signedInAtI(
+      { relay: second.relay, provider: idp },
+      'sub-guest-new',
+      'GUEST@Example.com',
+    );
+    expect(await other.post('/i/claim', { secret })).toMatchObject(barred);
+    await back.sync();
+    expect(back.all('attach_request')).toHaveLength(asked);
+  });
+
+  it('keeps the uses a link has left, so it admits exactly as many more accounts (S14)', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const first = await startRun(dir, idp);
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    const { secret } = await mintOk(page, { uses: 3 });
+    for (const n of [1, 2]) {
+      const phone = await signedInAtI(
+        { relay: first.relay, provider: idp },
+        `sub-g${String(n)}`,
+        `g${String(n)}@example.com`,
+      );
+      expect((await joinAtI(phone, page, secret)).settled).toMatchObject({ status: 'approved' });
+    }
+    expect((await latest(page, 'invites')).invites[0]?.usesLeft).toBe(1);
+    await first.close();
+
+    const second = await startRun(dir, idp);
+    const back = await resumeOn(second, page);
+    expect((await latest(back, 'invites')).invites[0]?.usesLeft).toBe(1);
+    const third = await signedInAtI(
+      { relay: second.relay, provider: idp },
+      'sub-g3',
+      'g3@example.com',
+    );
+    expect((await joinAtI(third, back, secret)).settled).toMatchObject({ status: 'approved' });
+    const fourth = await signedInAtI(
+      { relay: second.relay, provider: idp },
+      'sub-g4',
+      'g4@example.com',
+    );
+    expect(await fourth.post('/i/claim', { secret })).toMatchObject({
+      status: 404,
+      data: { error: 'pairing_expired' },
+    });
+    await back.sync();
+    expect(rosterIds(back).filter((userId) => userId.startsWith(INVITEE_ID_PREFIX))).toHaveLength(
+      3,
+    );
+  });
+
+  it('keeps a control link refused twice one refusal from burning (S14)', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const first = await startRun(dir, idp);
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    const { inviteId, link } = await mintOk(page, { role: 'driver' });
+    const guest = await first.claude(GUEST, GUEST_EMAIL);
+    for (let n = 1; n <= 2; n += 1) {
+      const { outcome } = await redeem(guest, page, link, { allow: false });
+      expect(outcome.text).toMatch(/^denied_by_operator: /);
+    }
+    expect((await latest(page, 'invites')).invites[0]?.refusals).toBe(2);
+    await first.close();
+
+    const second = await startRun(dir, idp);
+    const back = await resumeOn(second, page);
+    expect((await latest(back, 'invites')).invites[0]?.refusals).toBe(2);
+    const guestAgain = await second.claude(GUEST, GUEST_EMAIL);
+    const { outcome } = await redeem(guestAgain, back, link, { allow: false });
+    expect(outcome.text).toMatch(/^denied_by_operator: /);
+    expect((await latest(back, 'invites')).invites).toEqual([]);
+    expect(second.relay.audit.events()).toContainEqual(
+      expect.objectContaining({ type: 'invite_closed', inviteId, reason: 'burned' }),
+    );
+    expect((await call(guestAgain, 'pair_page', { invite: link })).text).toMatch(
+      /^pairing_expired: /,
+    );
+  });
+
+  it("keeps an agent token's timed-out prompts, so its third still burns it (S14)", async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const timings = { attachRequestTtlMs: 200 };
+    const first = await startRun(dir, idp, { timings });
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    const minted = await mintAgent(page);
+    const prompt = async (run: Run, shown: TestPage): Promise<void> => {
+      await agentRequest(run.relay.url, minted.token, AGENT_INITIALIZE);
+      await shown.next('attach_request');
+      await eventually(async () => {
+        await shown.sync();
+        return shown.all('agents').at(-1)?.agents[0]?.state !== 'asking';
+      });
+    };
+    for (let n = 1; n <= 2; n += 1) await prompt(first, page);
+    expect((await latest(page, 'agents')).agents[0]).toMatchObject({
+      state: 'dormant',
+      timeouts: 2,
+    });
+    await first.close();
+
+    const second = await startRun(dir, idp, { timings });
+    const back = await resumeOn(second, page);
+    expect((await latest(back, 'agents')).agents[0]).toMatchObject({ timeouts: 2 });
+    await agentRequest(second.relay.url, minted.token, AGENT_INITIALIZE);
+    await back.next('attach_request');
+    await eventually(() =>
+      second.relay.audit
+        .events()
+        .some(
+          (event) =>
+            event.type === 'agent_closed' &&
+            event.tokenId === minted.tokenId &&
+            event.reason === 'burned',
+        ),
+    );
+    expect((await agentRequest(second.relay.url, minted.token, AGENT_INITIALIZE)).status).toBe(404);
+  });
+
+  it('is used at most once: the start removes the file, and a copy put back later is refused', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const first = await startRun(dir, idp);
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    await first.close();
+    const kept = join(privateDir(), 'kept.json');
+    copyFileSync(fileOf(dir), kept);
+    // And what an earlier stop killed before its rename left: removed unread, the snapshot still taken.
+    const cutShort = plantTemporary(dir, kept);
+
+    const second = await startRun(dir, idp);
+    expect(existsSync(fileOf(dir))).toBe(false);
+    expect(existsSync(cutShort)).toBe(false);
+    expect(recordsOf(dir, 'snapshot_loaded')).toHaveLength(1);
+    const back = await resumeOn(second, page);
+    expect(back.welcome?.resumed).toBe(true);
+    await second.close();
+
+    // The first stop's file again, over the second stop's own: the log names the second's.
+    copyFileSync(kept, fileOf(dir));
+    chmodSync(fileOf(dir), 0o600);
+    const third = await startRun(dir, idp);
+    expect(refusalOf(third)).toBe('the snapshot_written record names another file');
+    expect(existsSync(fileOf(dir))).toBe(false);
+    expect(recordsOf(dir, 'snapshot_loaded')).toHaveLength(1);
+    const fresh = await resumeOn(third, back);
+    expect(fresh.welcome?.resumed).toBe(false);
+    expect(fresh.pageId).not.toBe(page.pageId);
+  });
+
+  it('refuses a snapshot after the /pair client secret is rotated, so the rotation ends everything with the setting left on', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const first = await startRun(dir, idp);
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    await first.close();
+    expect(recordsOf(dir, 'snapshot_written')).toHaveLength(1);
+    // docs/deploy.md's rotation: a new secret, the same client, then a deploy.
+    const second = await startRun(dir, idp, {
+      pairClient: { ...PAIR_CLIENT, clientSecret: 'pair-client-secret-rotated-0001' },
+    });
+    expect(refusalOf(second)).toBe('it was written under credentials since rotated');
+    expect(existsSync(fileOf(dir))).toBe(false);
+    expect(recordsOf(dir, 'snapshot_loaded')).toEqual([]);
+    expect((await resumeOn(second, page)).welcome?.resumed).toBe(false);
+  });
+
+  it('refuses a snapshot older than the resume window, and removes it', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], shouldAdvanceTime: true });
+    const idp = await provider();
+    const dir = auditDir();
+    const first = await startRun(dir, idp);
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    await first.close();
+    vi.setSystemTime(Date.now() + RESUME_WINDOW_MS);
+    const second = await startRun(dir, idp);
+    expect(refusalOf(second)).toBe('it is older than the resume window');
+    expect(existsSync(fileOf(dir))).toBe(false);
+    expect(recordsOf(dir, 'snapshot_loaded')).toEqual([]);
+    expect((await resumeOn(second, page)).welcome?.resumed).toBe(false);
+  });
+
+  it('drops a member the members file no longer lists, and what they sponsored', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const members = join(privateDir(), 'members.txt');
+    const save = (lines: string[]): void => {
+      writeFileSync(`${members}.new`, `${lines.join('\n')}\n`, { mode: 0o600 });
+      renameSync(`${members}.new`, members);
+    };
+    save(['sub-alice=alice:Alice', 'sub-bob=bob:Bob']);
+    const first = await startRun(dir, idp, { membersFile: members });
+    const page = await first.page();
+    // Bob is attached longest, so he sponsors what the page mints.
+    await attachMember(await first.claude('sub-bob'), page);
+    await attachMember(await first.claude('sub-alice'), page, 'observer');
+    const sponsored = await mintOk(page, { role: 'observer', uses: 1 });
+    const kept = await mintOk(page, { role: 'observer', uses: 1 });
+    expect(sponsored.answer.invites[0]?.sponsor.userId).toBe('bob');
+    const joined = await redeem(await first.claude(GUEST, GUEST_EMAIL), page, sponsored.link);
+    expect(joined.outcome.isError, joined.outcome.text).toBe(false);
+    await first.close();
+    expect(recordsOf(dir, 'snapshot_written')[0]).toMatchObject({ attachments: 3, invites: 1 });
+
+    save(['sub-alice=alice:Alice']);
+    const second = await startRun(dir, idp, { membersFile: members });
+    const loaded = sinceStart(dir);
+    expect(loaded.map((record) => record.type)).toEqual([
+      'relay_start',
+      'expire',
+      'invite_closed',
+      'expire',
+      'sponsor_gone',
+      'snapshot_loaded',
+    ]);
+    expect(loaded).toMatchObject([
+      {},
+      { userId: 'bob', reason: 'membership_changed' },
+      { inviteId: kept.inviteId, reason: 'sponsor_gone' },
+      { userId: inviteeId(GUEST), reason: 'sponsor_gone' },
+      { sponsor: 'bob', invites: 1, attachments: 1 },
+      { pages: 1, attachments: 1, invites: 0, dropped: 2 },
+    ]);
+    const back = await resumeOn(second, page);
+    expect(rosterIds(back)).toEqual(['alice']);
+    const bobAgain = await second.claude('sub-bob');
+    expect((await call(bobAgain, 'call_page_tool', getView(page.pageId))).isError).toBe(true);
+  });
+
+  it('names everyone as the member list in force names them, as a live change would (ADR 0017)', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const members = join(privateDir(), 'members.txt');
+    const save = (lines: string[]): void => {
+      writeFileSync(`${members}.new`, `${lines.join('\n')}\n`, { mode: 0o600 });
+      renameSync(`${members}.new`, members);
+    };
+    save(['sub-alice=alice:Alice', 'sub-bob=bob:Bob']);
+    const first = await startRun(dir, idp, { membersFile: members });
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    await attachMember(await first.claude('sub-bob'), page, 'observer');
+    const invite = await mintOk(page, { role: 'observer', uses: 1 });
+    const joined = await redeem(await first.claude(GUEST, GUEST_EMAIL), page, invite.link);
+    expect(joined.outcome.isError, joined.outcome.text).toBe(false);
+    const guestId = inviteeId(GUEST);
+    const namesOf = (shown: TestPage): Record<string, string> =>
+      Object.fromEntries(
+        (shown.all('roster').at(-1)?.attachments ?? shown.welcome?.roster ?? []).map(
+          (attachment) => [attachment.userId, attachment.displayName],
+        ),
+      );
+    expect(namesOf(page)).toEqual({ alice: 'Alice', bob: 'Bob', [guestId]: GUEST_EMAIL });
+    await first.close();
+
+    // While the relay is down, Alice is renamed and a new member takes the guest's name.
+    save(['sub-alice=alice:Alicia', 'sub-bob=bob:Bob', `sub-gina=gina:${GUEST_EMAIL}`]);
+    const second = await startRun(dir, idp, { membersFile: members });
+    expect(recordsOf(dir, 'snapshot_loaded')[0]).toMatchObject({ attachments: 3, dropped: 0 });
+    const back = await resumeOn(second, page);
+    expect(back.welcome?.resumed).toBe(true);
+    const short = guestId.slice(INVITEE_ID_PREFIX.length, INVITEE_ID_PREFIX.length + 8);
+    expect(namesOf(back)).toEqual({ alice: 'Alicia', bob: 'Bob', [guestId]: `invitee ${short}` });
+  });
+
+  it('drops a member whose user id the list now gives someone else, and an invitee now a member', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const first = await startRun(dir, idp);
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    await attachMember(await first.claude('sub-bob'), page, 'observer');
+    const invite = await mintOk(page, { role: 'observer', uses: 1 });
+    const joined = await redeem(await first.claude(GUEST, GUEST_EMAIL), page, invite.link);
+    expect(joined.outcome.isError, joined.outcome.text).toBe(false);
+    await first.close();
+
+    const second = await startRun(dir, idp, {
+      users: [
+        { sub: 'sub-alice', userId: 'alice', displayName: 'Alice' },
+        // Bob's id now names another subject, and the guest's subject is a member now.
+        { sub: 'sub-carol', userId: 'bob', displayName: 'Bob' },
+        { sub: GUEST, userId: 'gina', displayName: 'Gina' },
+      ],
+    });
+    expect(recordsOf(dir, 'snapshot_loaded')[0]).toMatchObject({ attachments: 1, dropped: 2 });
+    expect(
+      recordsOf(dir, 'expire')
+        .filter((record) => record.reason === 'membership_changed')
+        .map((record) => record.userId)
+        .sort(),
+    ).toEqual(['bob', inviteeId(GUEST)].sort());
+    const back = await resumeOn(second, page);
+    expect(rosterIds(back)).toEqual(['alice']);
+    // Carol signs in as bob now, and holds none of the page.
+    const carol = await second.claude('sub-carol');
+    expect((await call(carol, 'call_page_tool', getView(page.pageId))).isError).toBe(true);
+  });
+
+  it("keeps a revoke bar on the account when the list in force moves the barred member's id (S14)", async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const members = join(privateDir(), 'members.txt');
+    const save = (lines: string[]): void => {
+      writeFileSync(`${members}.new`, `${lines.join('\n')}\n`, { mode: 0o600 });
+      renameSync(`${members}.new`, members);
+    };
+    save(['sub-alice=alice:Alice', 'sub-carol=carol:Carol']);
+    const first = await startRun(dir, idp, { membersFile: members });
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    const { secret, inviteId } = await mintOk(page, { uses: 5 });
+    const carol = await signedInAtI({ relay: first.relay, provider: idp }, 'sub-carol', null);
+    const joined = await joinAtI(carol, page, secret, { allow: true, role: 'observer' });
+    expect(joined.request.user.userId).toBe('carol');
+    // Revoked with the link kept open, as the widget does with its box unticked.
+    page.send({ t: 'revoke', userId: 'carol' });
+    await latest(page, 'roster');
+    expect(rosterIds(page)).toEqual(['alice']);
+    await first.close();
+
+    // While the relay is down, Carol's subject is given another id.
+    save(['sub-alice=alice:Alice', 'sub-carol=carol2:Carol']);
+    const second = await startRun(dir, idp, { membersFile: members });
+    const back = await resumeOn(second, page);
+    expect(back.welcome?.resumed).toBe(true);
+    expect((await latest(back, 'invites')).invites.map((invite) => invite.inviteId)).toEqual([
+      inviteId,
+    ]);
+    const again = await signedInAtI({ relay: second.relay, provider: idp }, 'sub-carol', null);
+    expect(await again.post('/i/claim', { secret })).toMatchObject({
+      status: 403,
+      data: { error: 'denied_by_operator' },
+    });
+    await back.sync();
+    expect(back.all('attach_request')).toEqual([]);
+  });
+
+  it('writes no snapshot while a member list change is still owed, so what it ends never comes back (S8, S13)', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const members = join(privateDir(), 'members.txt');
+    const save = (lines: string[]): void => {
+      writeFileSync(`${members}.new`, `${lines.join('\n')}\n`, { mode: 0o600 });
+      renameSync(`${members}.new`, members);
+    };
+    save(['sub-alice=alice:Alice', 'sub-bob=bob:Bob']);
+    const first = await startRun(dir, idp, { membersFile: members });
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    await attachMember(await first.claude('sub-bob'), page, 'observer');
+    // Bob's id goes to Carol, and the hub's step of settling that fails:
+    // the new list is in force, and Bob's attachment has not ended yet.
+    save(['sub-alice=alice:Alice', 'sub-carol=bob:Bob']);
+    const fault = vi.spyOn(PageHub.prototype, 'membershipChanged').mockImplementation(() => {
+      throw new Error('a settle step failed');
+    });
+    try {
+      await expect(first.relay.reloadMembers()).rejects.toThrow('a settle step failed');
+      await first.close();
+    } finally {
+      fault.mockRestore();
+    }
+    expect(recordsOf(dir, 'snapshot_written')).toEqual([]);
+    expect(
+      first.lines.some(
+        (line) =>
+          line.includes('restart snapshot not written') &&
+          line.includes('a member list change is still unsettled'),
+      ),
+    ).toBe(true);
+    expect(existsSync(fileOf(dir))).toBe(false);
+
+    // So the next start is fresh, and Carol, who signs in as bob now, holds none of the page.
+    const second = await startRun(dir, idp, { membersFile: members });
+    expect(recordsOf(dir, 'snapshot_loaded')).toEqual([]);
+    const back = await resumeOn(second, page);
+    expect(rosterIds(back)).not.toContain('bob');
+    const carol = await second.claude('sub-carol');
+    expect((await call(carol, 'call_page_tool', getView(back.pageId))).isError).toBe(true);
+  });
+
+  it('ends a session whose end passed while the relay was down, with reason time', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], shouldAdvanceTime: true });
+    const idp = await provider();
+    const dir = auditDir();
+    const first = await startRun(dir, idp);
+    const page = await first.page({ policy: { invites: 'watch' } });
+    await attachMember(await first.claude('sub-alice'), page);
+    page.send({
+      t: 'session_start',
+      sessionId: 'ses_short',
+      lengthMs: 30 * MINUTE,
+      policy: { maxDrivers: 1, proposals: 'off' },
+    });
+    await latest(page, 'session');
+    const invite = await mintOk(page, { role: 'observer', uses: 1 });
+    const joined = await redeem(await first.claude(GUEST, GUEST_EMAIL), page, invite.link);
+    expect(joined.outcome.isError, joined.outcome.text).toBe(false);
+    await mintOk(page, { role: 'observer', uses: 1 });
+    const startedAt = Date.now();
+    vi.setSystemTime(startedAt + 29 * MINUTE);
+    await first.close();
+    expect(recordsOf(dir, 'snapshot_written')[0]).toMatchObject({ sessions: 1, attachments: 2 });
+
+    vi.setSystemTime(startedAt + 31 * MINUTE);
+    const second = await startRun(dir, idp);
+    const loaded = sinceStart(dir);
+    expect(loaded.find((record) => record.type === 'session_end')).toMatchObject({
+      sessionId: 'ses_short',
+      reason: 'time',
+      attachments: 1,
+      invites: 1,
+    });
+    expect(loaded.at(-1)).toMatchObject({
+      type: 'snapshot_loaded',
+      sessions: 0,
+      attachments: 1,
+      invites: 0,
+    });
+    const back = await resumeOn(second, page, { invites: 'watch' });
+    expect(back.all('session').at(-1)).toMatchObject({
+      session: null,
+      ended: { sessionId: 'ses_short', reason: 'time' },
+    });
+    expect(rosterIds(back)).toEqual(['alice']);
+  });
+
+  it('refuses a tampered file, and one the log never named', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const first = await startRun(dir, idp);
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    await first.close();
+    const original = readFileSync(fileOf(dir), 'utf8');
+    // One page title changed, the file otherwise as written, its mode kept.
+    writeFileSync(fileOf(dir), original.replace('"title":"Board"', '"title":"Bored"'));
+    expect(statSync(fileOf(dir)).mode & 0o777).toBe(0o600);
+    const second = await startRun(dir, idp);
+    expect(refusalOf(second)).toBe('the snapshot_written record names another file');
+    expect(existsSync(fileOf(dir))).toBe(false);
+    expect((await resumeOn(second, page)).welcome?.resumed).toBe(false);
+    await second.close();
+
+    // A relay with the setting off stops with no snapshot_written; a file planted after it never loads.
+    const quiet = await startRun(dir, idp, { restartSnapshot: false });
+    await quiet.close();
+    writeFileSync(fileOf(dir), original, { mode: 0o600 });
+    const third = await startRun(dir, idp);
+    expect(refusalOf(third)).toBe(
+      'the relay_stop that ends the audit log follows no snapshot_written',
+    );
+    expect(existsSync(fileOf(dir))).toBe(false);
+    expect(recordsOf(dir, 'snapshot_loaded')).toEqual([]);
+  });
+
+  it('with the setting off, writes nothing, removes a file an earlier run left unread, and ends everything', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const on = await startRun(dir, idp);
+    const page = await on.page();
+    await attachMember(await on.claude('sub-alice'), page);
+    await on.close();
+    expect(existsSync(fileOf(dir))).toBe(true);
+
+    const off = await startRun(dir, idp, { restartSnapshot: false });
+    expect(existsSync(fileOf(dir))).toBe(false);
+    expect(sinceStart(dir)[0]).toMatchObject({ type: 'relay_start', restartSnapshot: false });
+    expect(
+      off.lines.some((line) =>
+        line.includes('removed a restart snapshot an earlier run left, unread'),
+      ),
+    ).toBe(true);
+    const fresh = await resumeOn(off, page);
+    expect(fresh.welcome?.resumed).toBe(false);
+    await attachMember(await off.claude('sub-alice'), fresh);
+    await off.close();
+    expect(existsSync(fileOf(dir))).toBe(false);
+    expect(records(dir).at(-1)?.type).toBe('relay_stop');
+    expect(recordsOf(dir, 'snapshot_written')).toHaveLength(1);
+
+    // A stop with the setting on, killed before its rename, left this behind: gone whatever the setting.
+    const cutShort = plantTemporary(dir);
+    const again = await startRun(dir, idp, { restartSnapshot: false });
+    expect(existsSync(cutShort)).toBe(false);
+    expect(
+      again.lines.some((line) =>
+        line.includes('removed restart snapshot files a stop cut short left, unread'),
+      ),
+    ).toBe(true);
+    expect((await resumeOn(again, fresh)).welcome?.resumed).toBe(false);
+  });
+
+  it('warns, whichever way the setting is, when a snapshot an earlier run left cannot be removed', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    // A first run makes the audit directory; a directory then takes the
+    // snapshot's name, which no unlink removes (EISDIR), as a read-only
+    // mount or a changed owner would leave a real file in place.
+    await (await startRun(dir, idp, { restartSnapshot: false })).close();
+    mkdirSync(fileOf(dir));
+    for (const restartSnapshot of [false, true]) {
+      const run = await startRun(dir, idp, { restartSnapshot });
+      const entries = run.lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(
+        entries.filter((entry) => String(entry.msg).includes('restart snapshot')),
+        `restartSnapshot ${String(restartSnapshot)}`,
+      ).toEqual([
+        expect.objectContaining({
+          level: 'warn',
+          msg: 'restart snapshot left on disk and not loaded; remove it by hand',
+          reason: 'it could not be removed (EISDIR)',
+          removed: false,
+        }),
+      ]);
+      await run.close();
+      expect(existsSync(fileOf(dir))).toBe(true);
+    }
+  });
+
+  it("charges a restored page to the address it resumes from, under that address's own limit (S9)", async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    // Sockets are not what binds here: two page sessions an address, six sockets.
+    const limits = { pageSessionsPerAddress: 2, pageSocketsPerAddress: 6 };
+    const first = await startRun(dir, idp, { limits });
+    const one = await first.page();
+    const two = await first.page();
+    await first.close();
+
+    /** A hello from this address, which the relay must refuse before any welcome. */
+    const refusedHello = async (run: Run, resumeToken?: string): Promise<unknown> => {
+      const ws = await openSocket(run.relay.pageUrl);
+      const refused = new TestPage(ws);
+      refused.send({
+        t: 'hello',
+        v: 1,
+        title: 'Board',
+        url: `${PAGE_ORIGIN}/`,
+        adapterVersion: 'test',
+        policy: POLICY,
+        ...(resumeToken === undefined ? {} : { resumeToken }),
+      });
+      // A welcome instead is the failure, said at once rather than by a timeout.
+      const outcome = await Promise.race([
+        refused.closed,
+        refused.next('welcome').then(() => 'welcomed'),
+      ]);
+      ws.terminate();
+      expect(refused.all('welcome')).toEqual([]);
+      return outcome;
+    };
+    const TOO_MANY = { code: 1013, reason: 'too many pages from this address; try again later' };
+
+    // Both restored pages resume, and count against this address as they did
+    // before the restart, so a third new page finds no room.
+    const second = await startRun(dir, idp, { limits });
+    const oneBack = await resumeOn(second, one);
+    expect(oneBack.welcome?.resumed).toBe(true);
+    expect((await resumeOn(second, two)).welcome?.resumed).toBe(true);
+    expect(await refusedHello(second)).toEqual(TOO_MANY);
+    await second.close();
+
+    // An address already at its limit with every page awake has no room for
+    // a restored page either; the page stays asleep and resumable, and once
+    // one of the address's own pages sleeps, that one ends to make way.
+    const third = await startRun(dir, idp, { limits });
+    const fresh = await third.page();
+    await third.page();
+    expect(await refusedHello(third, oneBack.welcome?.resumeToken ?? '')).toEqual(TOO_MANY);
+    const alice = await third.claude('sub-alice');
+    await attachMember(alice, fresh);
+    await fresh.close();
+    await vi.waitFor(async () => {
+      expect(await pageState(alice, fresh.pageId)).toBe('asleep');
+    });
+    const resumed = await resumeOn(third, oneBack);
+    expect(resumed.welcome?.resumed).toBe(true);
+    expect(resumed.pageId).toBe(one.pageId);
+    expect(await pageState(alice, fresh.pageId)).toBe('gone');
+  });
+
+  it('refuses a snapshot this relay could not have taken, with invites now off', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const first = await startRun(dir, idp);
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    const invite = await mintOk(page, { role: 'observer', uses: 1 });
+    const joined = await redeem(await first.claude(GUEST, GUEST_EMAIL), page, invite.link);
+    expect(joined.outcome.isError, joined.outcome.text).toBe(false);
+    await first.close();
+    const second = await startRun(dir, idp, { invites: false, agentTokens: false });
+    expect(refusalOf(second)).toBe('invited accounts, and invites are off');
+    expect(existsSync(fileOf(dir))).toBe(false);
+    expect(recordsOf(dir, 'snapshot_loaded')).toEqual([]);
+    expect((await resumeOn(second, page)).welcome?.resumed).toBe(false);
+  });
+});
+
+/**
+ * One graceful stop's audit directory, copied for each case below so each
+ * takes its own copy of a bound snapshot: the binding itself is the log's.
+ */
+async function boundDirectory(): Promise<{ source: string; snapshot: RelaySnapshot }> {
+  const idp = await provider();
+  const source = auditDir();
+  const run = await startRun(source, idp);
+  const page = await run.page();
+  await attachMember(await run.claude('sub-alice'), page);
+  await run.close();
+  const snapshot = RelaySnapshotSchema.parse(JSON.parse(readFileSync(fileOf(source), 'utf8')));
+  return { source, snapshot };
+}
+
+/** A page session as a snapshot saves it, asleep with no session. */
+function savedPageOf(
+  pageId: string,
+  now: number,
+  overrides: Partial<SnapshotPage> = {},
+): SnapshotPage {
+  return {
+    pageId,
+    origin: PAGE_ORIGIN,
+    title: 'Board',
+    url: `${PAGE_ORIGIN}/`,
+    adapterVersion: 'test',
+    connectedAt: now - MINUTE,
+    ceiling: PolicySchema.parse({ maxDrivers: 2, proposals: 'members' }),
+    timedSession: null,
+    sessionEnded: null,
+    resumeTokenHash: 'a'.repeat(64),
+    ...overrides,
+  };
+}
+
+/** A member's attachment as a snapshot saves it, made by code. */
+function savedAttachmentOf(
+  pageId: string,
+  userId: string,
+  overrides: Partial<SnapshotAttachment> = {},
+): SnapshotAttachment {
+  return {
+    pageId,
+    userId,
+    displayName: userId,
+    kind: 'member',
+    role: 'observer',
+    grantedAt: 1,
+    lastUsedAt: null,
+    expiresAt: null,
+    clients: [],
+    inviteId: null,
+    endsAt: null,
+    inviteRole: null,
+    sponsorId: null,
+    emailHash: null,
+    memberKey: null,
+    ...overrides,
+  };
+}
+
+/**
+ * A hosted relay's fullest store as a snapshot holds it: 100 pages at their
+ * longest, each with 10 members and 40 watchers carrying the most clients
+ * the store keeps, 10 invites with every bar and 10 agent tokens, every name
+ * at its longest. Ends and expiries fall at `until`.
+ */
+
+function fullestSnapshot(now: number, until: number): RelaySnapshot {
+  const text = (char: string, length: number): string => char.repeat(length);
+  const digestOf = (value: string): string => createHash('sha256').update(value).digest('hex');
+  const id = (prefix: string, value: number): string => `${prefix}${String(value)}`.padEnd(64, 'x');
+  const guestId = (value: number): string =>
+    `${INVITEE_ID_PREFIX}${value.toString(16).padStart(32, '0')}`;
+  // Twenty clients on every account, as the store keeps them, each name and version at its longest.
+  const clients = Array.from({ length: 20 }, (_, index) => ({
+    name: `${String(index)}${text('n', 98)}`,
+    version: text('v', 50),
+  }));
+  const accounts = snapshotAccounts(null);
+  const pages: SnapshotPage[] = [];
+  const attachments: SnapshotAttachment[] = [];
+  const invites: SnapshotInvite[] = [];
+  const agents: SnapshotAgent[] = [];
+  let guests = 0;
+  for (let page = 0; page < 100; page += 1) {
+    const pageId = id('pg_', page);
+    pages.push(
+      savedPageOf(pageId, now, {
+        origin: `https://${text('o', 2_030)}.example`,
+        url: `https://${text('u', 2_030)}.example/`,
+        title: text('t', 300),
+        adapterVersion: text('a', 50),
+        resumeTokenHash: digestOf(pageId),
+      }),
+    );
+    const sponsor = { userId: id('member_0_', page), displayName: text('S', 100) };
+    const store = (saved: SnapshotAttachment) =>
+      savedAttachment({ ...restoredAttachment(saved), clients }, accounts.memberKey(saved.userId));
+    for (let member = 0; member < 10; member += 1) {
+      attachments.push(
+        store(
+          savedAttachmentOf(pageId, id(`member_${String(member)}_`, page), {
+            displayName: text('M', 100),
+            lastUsedAt: now,
+            expiresAt: until,
+          }),
+        ),
+      );
+    }
+    for (let watcher = 0; watcher < 40; watcher += 1) {
+      guests += 1;
+      attachments.push(
+        store(
+          savedAttachmentOf(pageId, guestId(guests), {
+            displayName: text('G', 100),
+            kind: 'invitee',
+            lastUsedAt: now,
+            expiresAt: until,
+            inviteId: id('inv_', page),
+            endsAt: until,
+            inviteRole: 'observer',
+            sponsorId: sponsor.userId,
+            emailHash: digestOf(`email ${String(guests)}`),
+          }),
+        ),
+      );
+    }
+    for (let index = 0; index < 10; index += 1) {
+      invites.push({
+        inviteId: id(`inv_${String(index)}_`, page),
+        pageId,
+        role: 'observer',
+        label: text('L', 60),
+        uses: 20,
+        usesLeft: 0,
+        createdAt: now,
+        requestedExpiresAt: until,
+        expiresAt: until,
+        ownExpiresAt: until,
+        secretHash: digestOf(`invite ${String(page)} ${String(index)}`),
+        sponsor,
+        refusals: 0,
+        barredUserIds: Array.from({ length: 20 }, (_, bar) => guestId(1_000_000 + bar)),
+        barredEmailHashes: Array.from({ length: 20 }, (_, bar) => digestOf(`bar ${String(bar)}`)),
+      });
+      agents.push({
+        tokenId: id(`agt_${String(index)}_`, page),
+        pageId,
+        label: text('A', 60),
+        secretHash: digestOf(`agent ${String(page)} ${String(index)}`),
+        createdAt: now,
+        expiresAt: until,
+        requestedExpiresAt: until,
+        sponsor,
+        state: 'dormant',
+        timeouts: 0,
+        userId: guestId(2_000_000 + page * 10 + index),
+        client: clients[0] ?? null,
+      });
+    }
+  }
+  return {
+    v: SNAPSHOT_VERSION,
+    writtenAt: now,
+    mode: 'public',
+    credentials: null,
+    pages,
+    attachments,
+    invites,
+    agents,
+  };
+}
+
+/** lstat answering for `path` with another file's stats, as a swap after the loader looked would leave it. */
+function lyingLstat(path: string, stats: nodeFs.Stats): typeof nodeFs.lstatSync {
+  return ((target: nodeFs.PathLike, options?: nodeFs.StatSyncOptions) =>
+    target === path ? stats : nodeFs.lstatSync(target, options)) as typeof nodeFs.lstatSync;
+}
+
+function copyOf(source: string): string {
+  const dir = join(privateDir(), 'audit');
+  cpSync(source, dir, { recursive: true });
+  // The lock a closed relay released is gone already; nothing else in the copy is the relay's.
+  return dir;
+}
+
+describe('taking the file (snapshot.ts)', () => {
+  it('loads a bound, fresh copy, and only in the mode that wrote it', async () => {
+    const { source, snapshot } = await boundDirectory();
+    const at = snapshot.writtenAt;
+    const take = (now: number, mode: 'public' | 'dev_tokens' = 'public') =>
+      takeSnapshot({
+        dir: copyOf(source),
+        enabled: true,
+        now,
+        mode,
+        credentials: PAIR_CREDENTIALS,
+      });
+    expect(take(at + RESUME_WINDOW_MS - 1)).toMatchObject({
+      kind: 'loaded',
+      ageMs: RESUME_WINDOW_MS - 1,
+    });
+    expect(take(at + RESUME_WINDOW_MS)).toEqual({
+      kind: 'refused',
+      reason: 'it is older than the resume window',
+      removed: true,
+    });
+    expect(take(at - 1)).toEqual({
+      kind: 'refused',
+      reason: 'it was written in the future',
+      removed: true,
+    });
+    expect(take(at, 'dev_tokens')).toEqual({
+      kind: 'refused',
+      reason: 'it was written in another mode',
+      removed: true,
+    });
+    // A /pair client rotated since, or none now: the file names other credentials.
+    const rotated = credentialsDigest({
+      ...PAIR_CLIENT,
+      clientSecret: 'pair-client-secret-rotated-0001',
+    });
+    for (const credentials of [rotated, null]) {
+      expect(
+        takeSnapshot({ dir: copyOf(source), enabled: true, now: at, mode: 'public', credentials }),
+      ).toEqual({
+        kind: 'refused',
+        reason: 'it was written under credentials since rotated',
+        removed: true,
+      });
+    }
+  });
+
+  it('loads nothing when the file cannot be removed first', async () => {
+    const { source, snapshot } = await boundDirectory();
+    const dir = copyOf(source);
+    const fs: SnapshotFs = {
+      ...nodeFs,
+      unlinkSync: () => {
+        throw Object.assign(new Error('read-only'), { code: 'EROFS' });
+      },
+    };
+    expect(
+      takeSnapshot({
+        dir,
+        enabled: true,
+        now: snapshot.writtenAt,
+        mode: 'public',
+        credentials: PAIR_CREDENTIALS,
+        fs,
+      }),
+    ).toEqual({
+      kind: 'refused',
+      reason: 'it could not be removed (EROFS)',
+      removed: false,
+    });
+  });
+
+  it('refuses a file reached through a link, or with another link, or open to other accounts, and removes the name', async () => {
+    const { source, snapshot } = await boundDirectory();
+    const take = (dir: string) =>
+      takeSnapshot({
+        dir,
+        enabled: true,
+        now: snapshot.writtenAt,
+        mode: 'public',
+        credentials: PAIR_CREDENTIALS,
+      });
+
+    const linked = copyOf(source);
+    const target = join(privateDir(), 'elsewhere.json');
+    renameSync(fileOf(linked), target);
+    symlinkSync(target, fileOf(linked));
+    expect(take(linked)).toEqual({ kind: 'refused', reason: 'not a regular file', removed: true });
+    expect(() => lstatSync(fileOf(linked))).toThrow();
+    expect(existsSync(target)).toBe(true);
+    // A link swapped in after the lstat looked: the open itself refuses to follow it.
+    const swapped = copyOf(source);
+    const regular = lstatSync(fileOf(swapped));
+    renameSync(fileOf(swapped), target);
+    symlinkSync(target, fileOf(swapped));
+    expect(
+      takeSnapshot({
+        dir: swapped,
+        enabled: true,
+        now: snapshot.writtenAt,
+        mode: 'public',
+        credentials: PAIR_CREDENTIALS,
+        fs: { ...nodeFs, lstatSync: lyingLstat(fileOf(swapped), regular) },
+      }),
+    ).toEqual({ kind: 'refused', reason: 'cannot open it (ELOOP)', removed: true });
+    expect(existsSync(target)).toBe(true);
+
+    const hard = copyOf(source);
+    const second = join(hard, 'second-name.json');
+    linkSync(fileOf(hard), second);
+    expect(take(hard)).toEqual({ kind: 'refused', reason: 'it has another link', removed: true });
+    expect(existsSync(fileOf(hard))).toBe(false);
+    expect(existsSync(second)).toBe(true);
+
+    const open = copyOf(source);
+    chmodSync(fileOf(open), 0o644);
+    expect(take(open)).toEqual({
+      kind: 'refused',
+      reason: 'readable or writable by other accounts',
+      removed: true,
+    });
+    expect(existsSync(fileOf(open))).toBe(false);
+  });
+
+  it.skipIf(!POSIX || spawnSync('mkfifo', ['--help']).error !== undefined)(
+    'opens nothing but a regular file: a FIFO or a directory at the name is refused without an open, and a FIFO swapped in never holds the start',
+    () => {
+      const dir = privateDir();
+      const opened: string[] = [];
+      const fs: SnapshotFs = {
+        ...nodeFs,
+        openSync: ((path: nodeFs.PathLike, ...rest: [number, number?]) => {
+          opened.push(String(path));
+          return nodeFs.openSync(path, ...rest);
+        }) as typeof nodeFs.openSync,
+      };
+      const take = () =>
+        takeSnapshot({
+          dir,
+          enabled: true,
+          now: Date.now(),
+          mode: 'public',
+          credentials: null,
+          fs,
+        });
+      expect(spawnSync('mkfifo', ['-m', '600', fileOf(dir)]).status).toBe(0);
+      expect(take()).toEqual({ kind: 'refused', reason: 'not a regular file', removed: true });
+      expect(existsSync(fileOf(dir))).toBe(false);
+      mkdirSync(fileOf(dir), { mode: 0o700 });
+      expect(take()).toMatchObject({ kind: 'refused', removed: false });
+      expect(opened.filter((path) => path === fileOf(dir))).toEqual([]);
+      rmSync(fileOf(dir), { recursive: true });
+
+      // lstat answering for a regular file, as when a FIFO replaces one after
+      // it looked: the open must not wait for a writer that never comes. In
+      // a process of its own, since a blocked open would hold this one too.
+      const regular = join(dir, 'regular.json');
+      writeFileSync(regular, '{}', { mode: 0o600 });
+      expect(spawnSync('mkfifo', ['-m', '600', fileOf(dir)]).status).toBe(0);
+      const probe = spawnSync(process.execPath, [FIFO_PROBE, dir, regular], {
+        encoding: 'utf8',
+        timeout: 20_000,
+      });
+      expect(probe.signal, 'the probe was still waiting on the FIFO').toBeNull();
+      expect(JSON.parse(probe.stdout)).toEqual({
+        kind: 'refused',
+        reason: 'not a regular file',
+        removed: true,
+      });
+      expect(existsSync(fileOf(dir))).toBe(false);
+    },
+  );
+
+  it("refuses a file larger than MAX_SNAPSHOT_BYTES, one that grows while read, and another account's, before trusting any of it", async () => {
+    const { source, snapshot } = await boundDirectory();
+    const uid = process.getuid?.();
+    /** fstat answering for the snapshot's descriptor with these facts, every other one as it is. */
+    const take = (facts: Partial<Pick<nodeFs.Stats, 'size' | 'uid'>>) => {
+      const dir = copyOf(source);
+      const descriptors = new Set<number>();
+      const fs: SnapshotFs = {
+        ...nodeFs,
+        openSync: ((path: nodeFs.PathLike, ...rest: [number, number?]) => {
+          const fd = nodeFs.openSync(path, ...rest);
+          if (path === fileOf(dir)) descriptors.add(fd);
+          return fd;
+        }) as typeof nodeFs.openSync,
+        fstatSync: ((fd: number) => {
+          const stats = nodeFs.fstatSync(fd);
+          return descriptors.has(fd) ? Object.assign(stats, facts) : stats;
+        }) as typeof nodeFs.fstatSync,
+      };
+      return takeSnapshot({
+        dir,
+        enabled: true,
+        now: snapshot.writtenAt,
+        mode: 'public',
+        credentials: PAIR_CREDENTIALS,
+        fs,
+      });
+    };
+    // As written, the copy loads: each refusal below is the one fact changed.
+    expect(take({})).toMatchObject({ kind: 'loaded' });
+    expect(take({ size: MAX_SNAPSHOT_BYTES + 1 })).toEqual({
+      kind: 'refused',
+      reason: 'larger than MAX_SNAPSHOT_BYTES',
+      removed: true,
+    });
+    // Ten bytes at the fstat and more by the read: what was checked is not what is read.
+    expect(take({ size: 10 })).toEqual({
+      kind: 'refused',
+      reason: 'it changed while read',
+      removed: true,
+    });
+    if (uid !== undefined) {
+      expect(take({ uid: uid + 1 })).toEqual({
+        kind: 'refused',
+        reason: "another account's file",
+        removed: true,
+      });
+    }
+  });
+
+  it('puts back every term of an invite and an agent token it saves, but the prompt waiting on one (S14)', () => {
+    // Every field set, none at its default, so a restore that resets one shows.
+    const invite: InviteRecord = {
+      inviteId: 'inv_1',
+      pageId: 'pg_1',
+      role: 'driver',
+      label: 'class',
+      uses: 5,
+      usesLeft: 2,
+      createdAt: 10,
+      requestedExpiresAt: 30,
+      expiresAt: 20,
+      ownExpiresAt: 25,
+      secretHash: 'b'.repeat(64),
+      sponsor: { userId: 'alice', displayName: 'Alice' },
+      pendingRequestId: 'req_1',
+      refusals: 2,
+      barredUserIds: [`${INVITEE_ID_PREFIX}${'cd'.repeat(16)}`],
+      barredEmailHashes: ['e'.repeat(64)],
+    };
+    expect(restoredInvite(savedInvite(invite))).toEqual({ ...invite, pendingRequestId: null });
+    const agent: AgentTokenRecord = {
+      tokenId: 'agt_1',
+      pageId: 'pg_1',
+      label: 'bot',
+      secretHash: 'c'.repeat(64),
+      createdAt: 10,
+      expiresAt: 20,
+      requestedExpiresAt: 21,
+      sponsor: { userId: 'alice', displayName: 'Alice' },
+      state: 'asking',
+      requestId: 'req_2',
+      timeouts: 2,
+      userId: `${INVITEE_ID_PREFIX}${'ab'.repeat(16)}`,
+      client: { name: 'claude-code', version: '2.0.0' },
+    };
+    // A token that was asking comes back dormant, its prompt gone with the restart.
+    expect(restoredAgent(savedAgent(agent))).toEqual({
+      ...agent,
+      state: 'dormant',
+      requestId: null,
+    });
+  });
+
+  it('removes only the temporary files a stop cut short leaves, never following a link', () => {
+    const dir = privateDir();
+    const cutShort = plantTemporary(dir);
+    const outside = join(privateDir(), 'outside.json');
+    writeFileSync(outside, '{}', { mode: 0o600 });
+    const linked = join(dir, `.${SNAPSHOT_FILE}.fedcba9876543210.tmp`);
+    symlinkSync(outside, linked);
+    const directory = join(dir, `.${SNAPSHOT_FILE}.00000000000000ff.tmp`);
+    mkdirSync(directory, { mode: 0o700 });
+    // Names a stop never writes, and the snapshot itself, which only a start's take removes.
+    const others = [
+      `.${SNAPSHOT_FILE}.0123456789ABCDEF.tmp`,
+      `.${SNAPSHOT_FILE}.0123.tmp`,
+      `${SNAPSHOT_FILE}.0123456789abcdef.tmp`,
+      'notes.tmp',
+      SNAPSHOT_FILE,
+    ];
+    for (const name of others) writeFileSync(join(dir, name), '{}', { mode: 0o600 });
+    expect(removeTemporaryFiles(dir)).toBe(2);
+    expect(existsSync(cutShort)).toBe(false);
+    expect(() => lstatSync(linked)).toThrow();
+    expect(existsSync(outside)).toBe(true);
+    expect(statSync(directory).isDirectory()).toBe(true);
+    expect(nodeFs.readdirSync(dir).sort()).toEqual(
+      [...others, `.${SNAPSHOT_FILE}.00000000000000ff.tmp`].sort(),
+    );
+    expect(removeTemporaryFiles(join(dir, 'missing'))).toBe(0);
+  });
+
+  it("fits a hosted relay's fullest store, every seat taken and every name at its longest, within MAX_SNAPSHOT_BYTES", () => {
+    const dir = privateDir();
+    const now = Date.now();
+    const fullest = fullestSnapshot(now, now);
+    const { attachments } = fullest;
+    const written = writeSnapshot(dir, fullest);
+    expect(written).toMatchObject({ kind: 'written' });
+    // About 12.1 MB (11 October 2026). Each guest keeps the clients its
+    // roster row shows; with all twenty, the file would pass 24 MB and the
+    // stop would write none, so every page would pair again after a deploy.
+    expect(statSync(fileOf(dir)).size).toBeLessThan(MAX_SNAPSHOT_BYTES);
+    const watcher = attachments.find((attachment) => attachment.kind === 'invitee');
+    expect(watcher?.clients).toHaveLength(MAX_ROSTER_CLIENTS_PER_INVITEE);
+  });
+
+  it('writes nothing past MAX_SNAPSHOT_BYTES, leaving no file behind', () => {
+    const dir = privateDir();
+    const now = Date.now();
+    // Pages at their longest addresses and titles, enough of them to pass the bound.
+    const pages = Array.from({ length: 4_000 }, (_, index) =>
+      savedPageOf(`pg_${String(index)}`, now, {
+        origin: `https://${'o'.repeat(2_030)}.example`,
+        url: `https://${'u'.repeat(2_030)}.example/`,
+        title: 't'.repeat(300),
+        resumeTokenHash: createHash('sha256').update(String(index)).digest('hex'),
+      }),
+    );
+    const large: RelaySnapshot = {
+      v: SNAPSHOT_VERSION,
+      writtenAt: now,
+      mode: 'public',
+      credentials: null,
+      pages,
+      attachments: [],
+      invites: [],
+      agents: [],
+    };
+    expect(RelaySnapshotSchema.safeParse(large).success).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(large))).toBeGreaterThan(MAX_SNAPSHOT_BYTES);
+    expect(writeSnapshot(dir, large)).toEqual({
+      kind: 'refused',
+      reason: 'larger than MAX_SNAPSHOT_BYTES',
+    });
+    expect(nodeFs.readdirSync(dir)).toEqual([]);
+  });
+
+  it('binds only a snapshot_written that the last relay_stop is chained to, across a rotation too', () => {
+    const dir = privateDir();
+    const digest = 'a'.repeat(64);
+    const writtenText = JSON.stringify({
+      v: AUDIT_VERSION,
+      seq: 41,
+      type: 'snapshot_written',
+      at: 1_700_000_000_000,
+      pages: 1,
+      attachments: 1,
+      invites: 0,
+      sessions: 0,
+      sha256: digest,
+      prev: 'b'.repeat(64),
+    });
+    const stop = (prev: string, seq = 42) =>
+      JSON.stringify({ v: AUDIT_VERSION, seq, type: 'relay_stop', at: 1_700_000_000_001, prev });
+    // The stop in a file of its own, as a rotation between the two would leave it.
+    writeFileSync(join(dir, 'audit-2026-10-10-000000000001.jsonl'), `${writtenText}\n`);
+    writeFileSync(
+      join(dir, 'audit-2026-10-11-000000000042.jsonl'),
+      `${stop(lineHash(writtenText))}\n`,
+    );
+    expect(bindingProblem(dir, digest)).toBeNull();
+    expect(bindingProblem(dir, 'c'.repeat(64))).toBe(
+      'the snapshot_written record names another file',
+    );
+    writeFileSync(join(dir, 'audit-2026-10-11-000000000042.jsonl'), `${stop('d'.repeat(64))}\n`);
+    expect(bindingProblem(dir, digest)).toBe("the audit log's last two records are not chained");
+    writeFileSync(
+      join(dir, 'audit-2026-10-11-000000000042.jsonl'),
+      `${stop(lineHash(writtenText), 43)}\n`,
+    );
+    expect(bindingProblem(dir, digest)).toBe("the audit log's last two records are not chained");
+    // Anything after the stop, a torn line included, ends the binding.
+    writeFileSync(
+      join(dir, 'audit-2026-10-11-000000000042.jsonl'),
+      `${stop(lineHash(writtenText))}\n{"v":1,"seq":43,"ty`,
+    );
+    expect(bindingProblem(dir, digest)).toBe("the audit log's last records cannot be read");
+  });
+
+  it('writes a snapshot the schema refuses nowhere, leaving no temporary file', () => {
+    const dir = privateDir();
+    const empty: RelaySnapshot = {
+      v: SNAPSHOT_VERSION,
+      writtenAt: 1,
+      mode: 'public',
+      credentials: null,
+      pages: [],
+      attachments: [],
+      invites: [],
+      agents: [],
+    };
+    // A field no snapshot lists, as a store that grew a secret would hand one over.
+    const broken = { ...empty, pairingCode: 'ABCD-1234' } as RelaySnapshot;
+    expect(writeSnapshot(dir, broken)).toEqual({
+      kind: 'refused',
+      reason: 'the store failed the snapshot schema',
+    });
+    expect(nodeFs.readdirSync(dir)).toEqual([]);
+    const failing: SnapshotFs = {
+      ...nodeFs,
+      renameSync: () => {
+        throw Object.assign(new Error('no'), { code: 'EXDEV' });
+      },
+    };
+    expect(writeSnapshot(dir, empty, failing)).toEqual({
+      kind: 'refused',
+      reason: 'cannot put its file in place (EXDEV)',
+    });
+    expect(nodeFs.readdirSync(dir)).toEqual([]);
+    expect(writeSnapshot(dir, empty)).toMatchObject({ kind: 'written' });
+    expect(nodeFs.readdirSync(dir)).toEqual([SNAPSHOT_FILE]);
+    expect(statSync(join(dir, SNAPSHOT_FILE)).mode & 0o777).toBe(0o600);
+  });
+});
+
+describe("fitting this relay's settings (snapshot.ts, fitProblem)", () => {
+  const now = Date.now();
+  const config = (options: Partial<RelayOptions> = {}) =>
+    resolveConfig({
+      auth: createDevTokenAuth([DEV_ALICE]),
+      allowedOrigins: [PAGE_ORIGIN],
+      invites: true,
+      agentTokens: true,
+      limits: { usersPerPage: 4, observersPerPage: 3 },
+      ...options,
+    });
+  const snapshotOf = (
+    attachments: SnapshotAttachment[],
+    pages: SnapshotPage[] = [savedPageOf('pg_1', now)],
+  ): RelaySnapshot => ({
+    v: SNAPSHOT_VERSION,
+    writtenAt: now,
+    mode: 'dev_tokens',
+    credentials: null,
+    pages,
+    attachments,
+    invites: [],
+    agents: [],
+  });
+  const members = (count: number): SnapshotAttachment[] =>
+    Array.from({ length: count }, (_, index) =>
+      savedAttachmentOf('pg_1', `member${String(index)}`),
+    );
+  /** A guest a watch invite let in, unless `overrides` says otherwise. */
+  const guest = (index: number, overrides: Partial<SnapshotAttachment> = {}): SnapshotAttachment =>
+    savedAttachmentOf('pg_1', `${INVITEE_ID_PREFIX}${index.toString(16).padStart(32, '0')}`, {
+      kind: 'invitee',
+      inviteId: 'inv_1',
+      endsAt: now + MINUTE,
+      inviteRole: 'observer',
+      sponsorId: 'member0',
+      ...overrides,
+    });
+
+  it('counts the people and the watchers each in their own seats, as the hub does (S9)', () => {
+    expect(fitProblem(snapshotOf(members(4)), config())).toBeNull();
+    expect(fitProblem(snapshotOf(members(5)), config())).toBe(
+      'a page with more people than its seats',
+    );
+    // A people limit lowered while the relay was down refuses what it would have kept out.
+    expect(
+      fitProblem(
+        snapshotOf(members(4)),
+        config({ limits: { usersPerPage: 3, observersPerPage: 3 } }),
+      ),
+    ).toBe('a page with more people than its seats');
+    // Three watchers by invite fill the watching seats, and a fourth could never have come in.
+    const watchers = [1, 2, 3].map((index) => guest(index));
+    expect(fitProblem(snapshotOf([...members(4), ...watchers]), config())).toBeNull();
+    expect(fitProblem(snapshotOf([...members(4), ...watchers, guest(4)]), config())).toBe(
+      'a page with more watchers by invite than its watching seats',
+    );
+    // A driver invite's guests moved down from the people watch past the
+    // seats, which the hub allows until someone leaves, so they still fit.
+    const movedDown = [5, 6].map((index) => guest(index, { inviteRole: 'driver' }));
+    expect(fitProblem(snapshotOf([...members(4), ...watchers, ...movedDown]), config())).toBeNull();
+    // What invites let in among the people leaves members their two seats (S14).
+    const drivers = [7, 8, 9].map((index) =>
+      guest(index, { role: 'driver', inviteRole: 'driver' }),
+    );
+    expect(fitProblem(snapshotOf([...members(1), ...drivers.slice(0, 2)]), config())).toBeNull();
+    expect(fitProblem(snapshotOf([...members(1), ...drivers]), config())).toBe(
+      "a page whose invited people take its members' reserved seats",
+    );
+  });
+
+  it('refuses a page from an origin this relay does not allow (S2)', () => {
+    const elsewhere = savedPageOf('pg_2', now, {
+      origin: 'https://elsewhere.example',
+      url: 'https://elsewhere.example/',
+      resumeTokenHash: 'b'.repeat(64),
+    });
+    expect(fitProblem(snapshotOf([], [savedPageOf('pg_1', now), elsewhere]), config())).toBe(
+      'a page from an origin this relay does not allow',
+    );
+    const unnamed = savedPageOf('pg_3', now, { origin: NO_ORIGIN });
+    expect(fitProblem(snapshotOf([], [unnamed]), config())).toBe(
+      'a page from an origin this relay does not allow',
+    );
+    expect(fitProblem(snapshotOf([], [unnamed]), config({ allowMissingOrigin: true }))).toBeNull();
+  });
+});
+
+describe('what ran out while the relay was down (S7, ADR 0046)', () => {
+  const GUEST_ID = `${INVITEE_ID_PREFIX}${'cd'.repeat(16)}`;
+  const AGENT_ID = `${INVITEE_ID_PREFIX}${'ab'.repeat(16)}`;
+  const sponsor = { userId: DEV_ALICE.userId, displayName: DEV_ALICE.displayName };
+
+  /** A hub with invites and agent tokens on, holding nothing yet. */
+  function hubOf(): { hub: PageHub; store: ReturnType<typeof createMemoryStore> } {
+    const store = createMemoryStore();
+    const config = resolveConfig({
+      auth: createDevTokenAuth([DEV_ALICE]),
+      invites: true,
+      agentTokens: true,
+    });
+    return { hub: new PageHub(config, store, createLogger({ sink: () => undefined })), store };
+  }
+
+  function snapshotOf(
+    now: number,
+    parts: Partial<Pick<RelaySnapshot, 'attachments' | 'invites' | 'agents'>> & {
+      page?: Partial<SnapshotPage>;
+    },
+  ): RelaySnapshot {
+    return RelaySnapshotSchema.parse({
+      v: SNAPSHOT_VERSION,
+      writtenAt: now - 8 * MINUTE,
+      mode: 'dev_tokens',
+      credentials: null,
+      pages: [
+        savedPageOf('pg_1', now, {
+          ceiling: PolicySchema.parse({ invites: 'all', maxDrivers: 2, proposals: 'members' }),
+          ...parts.page,
+        }),
+      ],
+      attachments: parts.attachments ?? [],
+      invites: parts.invites ?? [],
+      agents: parts.agents ?? [],
+    });
+  }
+
+  function inviteOf(expiresAt: number): SnapshotInvite {
+    return {
+      inviteId: 'inv_1',
+      pageId: 'pg_1',
+      role: 'observer',
+      label: 'class',
+      uses: 5,
+      usesLeft: 5,
+      createdAt: expiresAt - 30 * MINUTE,
+      requestedExpiresAt: expiresAt,
+      expiresAt,
+      ownExpiresAt: expiresAt,
+      secretHash: 'b'.repeat(64),
+      sponsor,
+      refusals: 0,
+      barredUserIds: [],
+      barredEmailHashes: [],
+    };
+  }
+
+  function agentOf(expiresAt: number): SnapshotAgent {
+    return {
+      tokenId: 'agt_1',
+      pageId: 'pg_1',
+      label: 'bot',
+      secretHash: 'c'.repeat(64),
+      createdAt: expiresAt - 30 * MINUTE,
+      expiresAt,
+      requestedExpiresAt: expiresAt,
+      sponsor,
+      state: 'dormant',
+      timeouts: 0,
+      userId: AGENT_ID,
+      client: null,
+    };
+  }
+
+  function guestOf(expiresAt: number, endsAt: number): SnapshotAttachment {
+    return savedAttachmentOf('pg_1', GUEST_ID, {
+      kind: 'invitee',
+      lastUsedAt: expiresAt - 5 * MINUTE,
+      expiresAt,
+      inviteId: 'inv_0',
+      endsAt,
+      inviteRole: 'observer',
+      sponsorId: sponsor.userId,
+    });
+  }
+
+  function sessionEndingAt(endsAt: number): Partial<SnapshotPage> {
+    return {
+      timedSession: {
+        sessionId: 'ses_1',
+        startedAt: endsAt - 30 * MINUTE,
+        endsAt,
+        lengthMs: 30 * MINUTE,
+        policy: { maxDrivers: 1, proposals: 'off' },
+      },
+    };
+  }
+
+  /** The records a restore wrote, each as its type, reason and what it names. */
+  async function restored(snapshot: RelaySnapshot): Promise<string[]> {
+    const { hub, store } = hubOf();
+    hub.restoreSnapshot(snapshot, { ageMs: 8 * MINUTE, accounts: snapshotAccounts(null) });
+    await hub.shutdown();
+    return store.audit
+      .records()
+      .filter((record) => record.type !== 'snapshot_loaded')
+      .map((record) => {
+        const named =
+          record.type === 'session_end'
+            ? `${record.sessionId} attachments=${String(record.attachments)}`
+            : 'tokenId' in record
+              ? record.tokenId
+              : 'inviteId' in record
+                ? record.inviteId
+                : 'userId' in record
+                  ? record.userId
+                  : 'sponsor' in record
+                    ? record.sponsor
+                    : '';
+        return `${record.type} ${'reason' in record ? record.reason : ''} ${named}`;
+      });
+  }
+
+  it("ends an invite and a token that ran out before their sponsor's idle end as expired, not as the sponsor's", async () => {
+    const now = Date.now();
+    const records = await restored(
+      snapshotOf(now, {
+        attachments: [
+          savedAttachmentOf('pg_1', sponsor.userId, {
+            lastUsedAt: now - 30 * MINUTE,
+            expiresAt: now - MINUTE,
+          }),
+        ],
+        invites: [inviteOf(now - 2 * MINUTE)],
+        agents: [agentOf(now - 2 * MINUTE)],
+      }),
+    );
+    // As timers that never stopped would have: the invite and the token at
+    // their own end, then Alice's idle end, which takes nothing more.
+    expect(records.slice(0, 2).sort()).toEqual([
+      'agent_closed expired agt_1',
+      'invite_closed expired inv_1',
+    ]);
+    expect(records.slice(2)).toEqual([`expire idle ${sponsor.userId}`]);
+  });
+
+  it("ends a guest whose idle end came before the session's as idle, and the session's end counts none", async () => {
+    const now = Date.now();
+    const sessionEnd = now - 2 * MINUTE;
+    const records = await restored(
+      snapshotOf(now, {
+        page: sessionEndingAt(sessionEnd),
+        attachments: [
+          savedAttachmentOf('pg_1', sponsor.userId),
+          guestOf(now - 4 * MINUTE, sessionEnd),
+        ],
+      }),
+    );
+    expect(records).toEqual([`expire idle ${GUEST_ID}`, 'session_end time ses_1 attachments=0']);
+  });
+
+  it('judges an idle end that came before an invited end as idle, at its own time', async () => {
+    const now = Date.now();
+    const records = await restored(
+      snapshotOf(now, {
+        attachments: [
+          savedAttachmentOf('pg_1', sponsor.userId),
+          guestOf(now - 4 * MINUTE, now - 2 * MINUTE),
+        ],
+      }),
+    );
+    expect(records).toEqual([`expire idle ${GUEST_ID}`]);
+  });
+
+  it('still ends a guest at its invited end as ends_at, and with a session that ended first as the session', async () => {
+    const now = Date.now();
+    expect(
+      await restored(
+        snapshotOf(now, {
+          attachments: [
+            savedAttachmentOf('pg_1', sponsor.userId),
+            guestOf(now - 2 * MINUTE, now - 2 * MINUTE),
+          ],
+        }),
+      ),
+    ).toEqual([`expire ends_at ${GUEST_ID}`]);
+    const sessionEnd = now - 5 * MINUTE;
+    expect(
+      await restored(
+        snapshotOf(now, {
+          page: sessionEndingAt(sessionEnd),
+          attachments: [
+            savedAttachmentOf('pg_1', sponsor.userId),
+            guestOf(now - 2 * MINUTE, sessionEnd),
+          ],
+        }),
+      ),
+    ).toEqual([`expire session_ended ${GUEST_ID}`, 'session_end time ses_1 attachments=1']);
+  });
+});
+
+describe('the hub around a snapshot (hub.ts)', () => {
+  function hubOf(store = createMemoryStore()): PageHub {
+    const config = resolveConfig({ auth: createDevTokenAuth([DEV_ALICE]) });
+    return new PageHub(config, store, createLogger({ sink: () => undefined }));
+  }
+
+  it("takes and writes the fullest store's snapshot within the CPU Fly's kill_timeout gives at the baseline share", async () => {
+    // A stop runs its snapshot work on the event loop before relay_stop, and
+    // Fly kills it kill_timeout seconds after SIGTERM, best effort. A
+    // shared-cpu-1x Machine whose burst balance is spent runs at its
+    // baseline, 5 ms of each 80 ms (docs/notes/m6/room-measure.md), so what
+    // the work may cost in CPU is kill_timeout times that share. Measured on
+    // 12 October 2026 at 0.36 to 0.54 s of CPU (6 to 9 s at the baseline),
+    // past the 5 s kill_timeout fly.toml had (docs/notes/verified.md).
+    const toml = readFileSync(resolve(import.meta.dirname, '../../../deploy/fly/fly.toml'), 'utf8');
+    const killTimeoutS = Number(/^kill_timeout = (\d+)$/m.exec(toml)?.[1]);
+    const budgetMs = killTimeoutS * 1000 * (5 / 80);
+    const hub = hubOf();
+    const accounts = snapshotAccounts(null);
+    const now = Date.now();
+    hub.restoreSnapshot(fullestSnapshot(now, now + 60 * MINUTE), { ageMs: 0, accounts });
+    const dir = privateDir();
+    // As relay.ts's stop does it: the hub stops, then the export and the write.
+    const before = process.cpuUsage();
+    await hub.shutdown();
+    const written = writeSnapshot(dir, hub.exportSnapshot(Date.now(), accounts.memberKey, null));
+    const used = process.cpuUsage(before);
+    const cpuMs = (used.user + used.system) / 1000;
+    expect(written).toMatchObject({ kind: 'written' });
+    // The whole store came back and went out again: about 12 MB.
+    expect(statSync(fileOf(dir)).size).toBeGreaterThan(10_000_000);
+    expect(
+      cpuMs,
+      `${String(Math.round(cpuMs))} ms of CPU against ${String(budgetMs)}`,
+    ).toBeLessThan(budgetMs);
+  });
+
+  it('puts a page back asleep, its policy worked out from its ceiling and session, never read', async () => {
+    const store = createMemoryStore();
+    const hub = hubOf(store);
+    const now = Date.now();
+    const snapshot: RelaySnapshot = {
+      v: SNAPSHOT_VERSION,
+      writtenAt: now,
+      mode: 'dev_tokens',
+      credentials: null,
+      pages: [
+        {
+          pageId: 'pg_restored',
+          origin: PAGE_ORIGIN,
+          title: 'Board',
+          url: `${PAGE_ORIGIN}/`,
+          adapterVersion: 'test',
+          connectedAt: now - MINUTE,
+          ceiling: PolicySchema.parse({ maxDrivers: 2, proposals: 'members' }),
+          timedSession: {
+            sessionId: 'ses_1',
+            startedAt: now,
+            endsAt: now + 30 * MINUTE,
+            lengthMs: 30 * MINUTE,
+            policy: { maxDrivers: 1, proposals: 'off' },
+          },
+          sessionEnded: null,
+          resumeTokenHash: 'a'.repeat(64),
+        },
+      ],
+      attachments: [],
+      invites: [],
+      agents: [],
+    };
+    hub.restoreSnapshot(snapshot, { ageMs: 0, accounts: snapshotAccounts(null) });
+    expect(store.pages.get('pg_restored')).toMatchObject({
+      state: 'asleep',
+      policy: { maxDrivers: 1, proposals: 'off' },
+      ceiling: { maxDrivers: 2, proposals: 'members' },
+      tools: [],
+    });
+    expect(store.pages.findByResumeTokenHash('a'.repeat(64))?.pageId).toBe('pg_restored');
+    await hub.shutdown();
+  });
+
+  it('takes one only once it has stopped taking work, and then refuses a detach', async () => {
+    const hub = hubOf();
+    const accounts = snapshotAccounts(null);
+    expect(() => hub.exportSnapshot(Date.now(), accounts.memberKey, null)).toThrow(
+      /only once the hub has stopped taking work/,
+    );
+    await hub.shutdown();
+    expect(hub.exportSnapshot(5, accounts.memberKey, 'c'.repeat(64))).toMatchObject({
+      v: 1,
+      writtenAt: 5,
+      credentials: 'c'.repeat(64),
+      pages: [],
+    });
+    expect(hub.detachPage('alice', 'pg_any')).toEqual({
+      kind: 'error',
+      code: 'page_asleep',
+      message: 'the relay is shutting down',
+    });
+  });
+
+  it('puts one back only into a hub that holds nothing', async () => {
+    const hub = hubOf();
+    const empty: RelaySnapshot = {
+      v: SNAPSHOT_VERSION,
+      writtenAt: 1,
+      mode: 'dev_tokens',
+      credentials: null,
+      pages: [],
+      attachments: [],
+      invites: [],
+      agents: [],
+    };
+    expect(
+      hub.restoreSnapshot(empty, { ageMs: 0, accounts: snapshotAccounts(null) }),
+    ).toMatchObject({
+      type: 'snapshot_loaded',
+      pages: 0,
+      dropped: 0,
+    });
+    await hub.shutdown();
+    expect(() =>
+      hub.restoreSnapshot(empty, { ageMs: 0, accounts: snapshotAccounts(null) }),
+    ).toThrow(/only into a new hub/);
+  });
+});

@@ -49,6 +49,8 @@ const PROFILES: { profile: RuntimeProfile; files: string[] }[] = [
     profile: 'chrome-156',
     files: ['baseline.raw.chrome156.json', 'baseline.raw.chrome155.json'],
   },
+  // 6.0.0's run first (baseline.md, 10 October), and the beta's, whose shapes it matched.
+  { profile: 'mcpb-6', files: ['baseline.raw.mcpb6.json', 'baseline.raw.mcpb6-beta.json'] },
 ];
 
 const DEMO_TOOLS = [
@@ -295,9 +297,12 @@ describe.each(PROFILES)('FakeModelContext as $profile', ({ profile, files }) => 
     expect(tools.map((tool) => tool.window)).toEqual(expect.arrayContaining([mc.window, frame]));
     const frameTool = tools.find((tool) => tool.window === frame);
     if (!frameTool) throw new Error('missing frame tool');
-    const input = profile === 'chrome-156' ? {} : '{}';
+    const input = profile === 'chrome-156' || profile === 'mcpb-6' ? {} : '{}';
     const outcome = await settle('frame', () => mc.executeTool(frameTool, input));
-    if (profile === 'polyfill-5.1') {
+    if (profile === 'mcpb-6') {
+      // Not measured: MCP-B 6 runs a frame's tool as Chrome does, its string quoted.
+      expect(outcome).toMatchObject({ ok: true, value: '"frame"' });
+    } else if (profile === 'polyfill-5.1') {
       expect(outcome).toMatchObject({
         ok: false,
         kind: 'UnknownError',

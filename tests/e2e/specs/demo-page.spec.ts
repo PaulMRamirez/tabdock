@@ -18,7 +18,7 @@ interface Ctx {
   executeTool(tool: object, input: unknown): Promise<string>;
 }
 
-test('registers the six demo tools with read-only hints on the reads', async ({ page }) => {
+test('registers the seven demo tools with read-only hints on the reads', async ({ page }) => {
   await page.goto(demo.url);
   await page.waitForSelector('html[data-tools="ready"]');
   const tools = await page.evaluate(async () => {
@@ -30,8 +30,8 @@ test('registers the six demo tools with read-only hints on the reads', async ({ 
   });
   expect(tools.map((t) => t.name)).toEqual([...DEMO_TOOL_NAMES]);
   const readOnly = tools.filter((t) => t.readOnly).map((t) => t.name);
-  expect(readOnly).toEqual(['get_view', 'list_items']);
-  await expect(page.locator('[data-role="status"]')).toHaveText(/6 tools registered/);
+  expect(readOnly).toEqual(['capture_board', 'get_view', 'list_items']);
+  await expect(page.locator('[data-role="status"]')).toHaveText(/7 tools registered/);
 });
 
 test('a call through executeTool changes the board and shows in the activity log', async ({

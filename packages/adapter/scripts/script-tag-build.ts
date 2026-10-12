@@ -1,7 +1,7 @@
 // The script-tag build's esbuild options, shared by scripts/build.ts, which
 // writes dist/tabdock-adapter.js, and by the size test
 // (tests/e2e/test/adapter-size.test.ts), which builds the same file in memory
-// and holds it under 150,000 bytes (ADR 0028), so the size measured is the
+// and holds it under 200,000 bytes (ADRs 0028 and 0048), so the size measured is the
 // size shipped; tests/e2e/specs/widget.spec.ts loads that same file in a page.
 
 import { join, resolve, sep } from 'node:path';
@@ -66,4 +66,16 @@ export async function scriptTagFile(): Promise<Uint8Array> {
 /** The script-tag file's size in bytes, as scriptTagFile builds it. */
 export async function scriptTagBytes(): Promise<number> {
   return (await scriptTagFile()).byteLength;
+}
+
+/**
+ * The bytes each source module puts in the script-tag file, keyed by its
+ * path as esbuild's metafile names it, so the size test can hold one
+ * feature's modules to a budget of their own (ADR 0045, decision 23).
+ */
+export async function scriptTagModuleBytes(): Promise<Map<string, number>> {
+  const { metafile } = await esbuild.build({ ...scriptTagOptions(), write: false });
+  const output = Object.values(metafile.outputs).find((built) => built.entryPoint !== undefined);
+  if (output === undefined) throw new Error('the script-tag build wrote no entry point');
+  return new Map(Object.entries(output.inputs).map(([path, input]) => [path, input.bytesInOutput]));
 }

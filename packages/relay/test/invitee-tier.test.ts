@@ -5,7 +5,9 @@
 // small pool evicted first; every user has a request budget before the access
 // check (S9, ADR 0018), never per address; and the refusal budget keeps
 // strangers from flooding the audit log while a call that reaches a page is
-// always written (S7, ADR 0019).
+// always written (S7, ADR 0019). From M6 the pool is a setting sized for a
+// class, TABDOCK_MAX_INVITEE_SESSIONS, whose default of 100 serves 40 guests
+// with two sessions each (ADR 0044, A6.20).
 
 import type { Client } from '@modelcontextprotocol/client';
 import { AuditEventSchema } from '@tabdock/protocol';
@@ -17,12 +19,14 @@ import {
   createDevTokenAuth,
   createMemoryStore,
   type DevTokenUser,
+  loadConfigFromEnv,
   MAX_STRANGERS_COUNTED,
   type RelayStore,
 } from '../src/index.ts';
 import { connectPage, type TestPage, TOOLS } from './helpers/page-client.ts';
 import {
   initializeBody,
+  openListen,
   openSession,
   openStream,
   type OpenStream,
@@ -155,7 +159,7 @@ describe('an invitee with invites on (ADR 0016)', () => {
     );
   });
 
-  it('gets the five fixed tools and never the spike marker', async () => {
+  it('gets the fixed tools and never the spike marker', async () => {
     const { relay } = await setup({ spike: true });
     relay.spike?.addMarker();
     const names = async (who: Client) =>
@@ -163,11 +167,16 @@ describe('an invitee with invites on (ADR 0016)', () => {
     expect(await names(await client(G1))).toEqual([
       'call_page_tool',
       'detach_page',
+      'get_page_state',
+      'get_proposal',
       'list_page_tools',
       'list_pages',
       'pair_page',
+      'wait_for_page_state',
+      'withdraw_proposal',
     ]);
-    expect((await names(await client(ALICE))).length).toBe(6);
+    // A member gets the marker beside the nine.
+    expect((await names(await client(ALICE))).length).toBe(10);
   });
 
   it('gets 403 with invites off, as in M3', async () => {
@@ -311,6 +320,69 @@ describe("the invitee tier's sessions (ADR 0016)", () => {
     expect((await rawCall(relay, G4, guestSession, 'list_pages')).status).toBe(200);
     expect((await rawCall(relay, ALICE, aliceSession, 'list_pages')).status).toBe(200);
   });
+});
+
+describe('the invitee pool as a setting (ADR 0044)', () => {
+  it("takes TABDOCK_MAX_INVITEE_SESSIONS from the environment: a fifth stranger is refused, and a guest still takes a stranger's place", async () => {
+    const strangers = [G1, G2, G3, G4];
+    const held = guest(6);
+    const users = [ALICE, ...strangers, G5, held];
+    const env = loadConfigFromEnv({
+      TABDOCK_DEV_TOKENS: users.map((user) => `${user.userId}=${user.token}`).join(','),
+      TABDOCK_INVITES: '1',
+      TABDOCK_MAX_INVITEE_SESSIONS: '4',
+      TABDOCK_PORT: '0',
+    });
+    const store = createMemoryStore();
+    current = await startRelay({ ...env, store, timings: { sseKeepAliveMs: 50 } });
+    const { relay } = current;
+    // Four strangers, each with a busy session, fill the pool.
+    const ids: string[] = [];
+    for (const stranger of strangers) {
+      const id = await openSession(relay, stranger);
+      streams.push(await openStream(relay, stranger, id));
+      ids.push(id);
+    }
+    const refused = await rawPost(relay, G5, initializeBody());
+    expect(refused.status).toBe(503);
+    await refused.body?.cancel();
+    // A guest takes the place of the stranger active longest ago, busy or not.
+    heldBy(store, held, 'pg_HELD000000');
+    const guestSession = await openSession(relay, held);
+    expect((await rawCall(relay, held, guestSession, 'list_pages')).status).toBe(200);
+    const left = await Promise.all(
+      ids.map(async (id, n) => (await rawCall(relay, strangers[n] ?? G1, id, 'list_pages')).status),
+    );
+    expect(left).toEqual([404, 200, 200, 200]);
+  });
+
+  it("serves 40 guests on the default pool, each with two sessions and a listen stream, and strangers past it never close a guest's session (A6.20)", async () => {
+    const guests = Array.from({ length: 40 }, (_, n) => guest(100 + n));
+    const strangers = Array.from({ length: 25 }, (_, n) => guest(200 + n));
+    const store = createMemoryStore();
+    const { relay } = await setup({ store }, [ALICE, ...guests, ...strangers]);
+    const sessions: [DevTokenUser, string][] = [];
+    for (const each of guests) {
+      heldBy(store, each, 'pg_HELD000000');
+      for (let n = 0; n < 2; n += 1) sessions.push([each, await openSession(relay, each)]);
+      const listen = await openListen(relay, each);
+      streams.push(listen);
+      expect(listen.streaming).toBe(true);
+    }
+    // 80 of the 100 sessions: strangers fill the rest and then keep coming,
+    // each refused or taking another stranger's idle place.
+    const answers: number[] = [];
+    for (const stranger of strangers) {
+      const answer = await rawPost(relay, stranger, initializeBody());
+      answers.push(answer.status);
+      await answer.body?.cancel();
+    }
+    expect(answers.every((status) => status === 200 || status === 503)).toBe(true);
+    const statuses = await Promise.all(
+      sessions.map(async ([user, id]) => (await rawCall(relay, user, id, 'list_pages')).status),
+    );
+    expect(statuses).toEqual(Array<number>(80).fill(200));
+  }, 60_000);
 });
 
 describe('the request budget (S9, ADR 0018)', () => {

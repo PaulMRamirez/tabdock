@@ -1,7 +1,8 @@
 import { initializeWebMCPPolyfill } from '@mcp-b/webmcp-polyfill';
 import { attach, type Dock } from '@tabdock/adapter';
-import { Board } from './board.ts';
+import { Board, boardState } from './board.ts';
 import { busyFromQuery, startBusy } from './busy.ts';
+import { captureBoard } from './capture.ts';
 import { mountConnectBar, mountConnectForm, tabStore, wasChosen } from './connect.ts';
 import { linkPolicyFromQuery, policyInput, policyNotes, policyTag } from './policy.ts';
 import { relayFromQuery } from './relay.ts';
@@ -61,7 +62,7 @@ if (busy) {
 
 const context = document.modelContext;
 if (context) {
-  const tools = createTools(board, ui.logCall);
+  const tools = createTools(board, ui.logCall, (options) => captureBoard(board, options));
   // Registration lives as long as the page; aborting this signal would remove every tool.
   const registration = new AbortController();
   await Promise.all(
@@ -140,6 +141,12 @@ function attachToRelay(params: URLSearchParams, ui: BoardUi, registered: string)
       ui.setStatus(`${registered}; Tabdock relay ${relay.host}: ${state.link}`);
     });
     ui.setStatus(`${registered}; Tabdock relay ${relay.host}: ${dock.state.link}`);
+    // The board publishes where its view is, so clients can follow it without
+    // a call (ADR 0040); the adapter sends at most two values a second.
+    dock.publishState(boardState(board.snapshot()));
+    board.subscribe((snapshot) => {
+      dock.publishState(boardState(snapshot));
+    });
     showPolicy(status, policyNotes(policy));
     document.documentElement.dataset.link = 'chosen';
     // Test hook for the Playwright specs and the demo scripts, nothing else:

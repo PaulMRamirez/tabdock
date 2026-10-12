@@ -1,8 +1,11 @@
-// The guide's settings page (docs/guide/08-relay-settings.md, ADR 0035) is
-// the canonical list an operator reads, so it must name exactly the settings
-// the relay reads, both ways, and state the defaults the code applies: a
-// setting renamed in config.ts, or a default changed there, fails here rather
-// than leaving a page that sends someone to a variable nothing reads. The
+// The guide's settings pages (docs/guide/08-relay-settings.md, ADR 0035, and
+// from M6 14-settings-for-rooms.md, which took the settings for rooms, images
+// and state so neither page passes its length cap) are the canonical list an
+// operator reads, so together they must name exactly the settings the relay
+// reads, both ways, each on one page only, and state the defaults the code
+// applies: a setting renamed in config.ts, or a default changed there, fails
+// here rather than leaving a page that sends someone to a variable nothing
+// reads. The
 // docs at large may name only settings something reads, and the .env.example
 // template must itself load, so copying it to .env never stops the relay.
 // Each setting's place in the relay README and .env.example stays with
@@ -38,7 +41,9 @@ import {
   LOCAL_AUDIT_DIR,
   LOOPBACK_HOSTNAMES,
   loadConfigFromEnv,
+  MIN_INVITEE_SESSIONS,
   MIN_REQUEST_BYTES,
+  MIN_RESPONSE_BYTES,
   type RelayLimits,
   type RelayRateLimits,
   resolveConfig,
@@ -49,6 +54,7 @@ import { DEFAULT_MAX_TOKEN_AGE_MINUTES } from '../src/oauth.ts';
 
 const ROOT = new URL('../../../', import.meta.url).pathname;
 const PAGE = 'docs/guide/08-relay-settings.md';
+const ROOMS_PAGE = 'docs/guide/14-settings-for-rooms.md';
 const SETTING = /\bTABDOCK_[A-Z0-9_]+\b/g;
 /** A constant the bundle defines at build time (ADR 0028), never a setting anyone sets. */
 const BUILD_CONSTANTS = new Set(['TABDOCK_PACKAGED']);
@@ -77,10 +83,12 @@ function namesUnder(dir: string): Set<string> {
 interface Row {
   readonly cells: Readonly<Record<string, string>>;
   readonly line: number;
+  /** The page the row is on; PAGE where a test builds a row. */
+  readonly page?: string;
 }
 
-/** Every pipe table in `text`, each as its rows. */
-function tables(text: string): Row[][] {
+/** Every pipe table in `text`, each as its rows, marked with the page they are on. */
+function tables(text: string, page = PAGE): Row[][] {
   const lines = text.split('\n');
   const found: Row[][] = [];
   const split = (line: string): string[] =>
@@ -101,6 +109,7 @@ function tables(text: string): Row[][] {
       rows.push({
         cells: Object.fromEntries(names.map((name, column) => [name, values[column] ?? ''])),
         line: at + 1,
+        page,
       });
     }
     found.push(rows);
@@ -167,6 +176,23 @@ const EXPECTED: Readonly<Record<string, Expected>> = {
   TABDOCK_MAX_SESSIONS_PER_USER: { kind: 'limit', key: 'sessionsPerUser', least: 1 },
   TABDOCK_MAX_SESSIONS: { kind: 'limit', key: 'sessions', least: 1 },
   TABDOCK_MAX_USERS_PER_PAGE: { kind: 'limit', key: 'usersPerPage', least: 1 },
+  TABDOCK_MAX_OBSERVERS_PER_PAGE: { kind: 'limit', key: 'observersPerPage', least: 0 },
+  TABDOCK_MAX_INVITEE_SESSIONS: {
+    kind: 'limit',
+    key: 'inviteeSessions',
+    least: MIN_INVITEE_SESSIONS,
+  },
+  TABDOCK_MAX_IMAGE_BYTES: { kind: 'limit', key: 'imageBytes', least: 0 },
+  TABDOCK_MAX_STATE_BYTES: { kind: 'limit', key: 'stateBytes', least: MAX_FRAME_BYTES },
+  TABDOCK_MAX_PROPOSAL_BYTES: { kind: 'limit', key: 'proposalBytes', least: MAX_FRAME_BYTES },
+  TABDOCK_MAX_RESPONSE_BYTES: {
+    kind: 'limit',
+    key: 'responseBytes',
+    least: MIN_RESPONSE_BYTES,
+  },
+  TABDOCK_AGENT_TOKENS: off,
+  TABDOCK_MEMBERS_FILE: none,
+  TABDOCK_RESTART_SNAPSHOT: off,
   TABDOCK_MAX_CALLS_PER_MINUTE: { kind: 'rate', key: 'callsPerUserPerPage', least: 1 },
   TABDOCK_MAX_QUEUE_DEPTH: { kind: 'limit', key: 'queueDepth', least: 1 },
   TABDOCK_MAX_REQUESTS_PER_USER: { kind: 'rate', key: 'requestsPerUser', least: 1 },
@@ -198,7 +224,7 @@ const HOSTED: RelayLimits = { ...DEFAULT_LIMITS, ...HOSTED_LIMITS };
 
 /** What is wrong with one row, against EXPECTED; empty when nothing is. */
 function rowProblems(name: string, row: Row): string[] {
-  const where = `${name} (${PAGE}:${String(row.line)})`;
+  const where = `${name} (${row.page ?? PAGE}:${String(row.line)})`;
   const expected = EXPECTED[name];
   if (expected === undefined) return [`${where}: no expected default in this test`];
   const cell = row.cells.Default ?? '';
@@ -290,15 +316,15 @@ function docsNamingSettings(): string[] {
   ];
 }
 
-describe('the relay settings page', () => {
-  const rows = tables(read(PAGE))
+describe('the relay settings pages', () => {
+  const rows = [...tables(read(PAGE)), ...tables(read(ROOMS_PAGE), ROOMS_PAGE)]
     .flat()
     .flatMap((row) => {
       const name = settingOf(row);
       return name === null ? [] : [{ name, row }];
     });
 
-  it('lists every setting the relay reads, and only those, once each', () => {
+  it('list every setting the relay reads, and only those, once each across the two', () => {
     const listed = rows.map(({ name }) => name);
     expect(listed.length).toBeGreaterThan(30);
     expect([...new Set(listed)].sort()).toEqual(relaySettings());
@@ -313,7 +339,7 @@ describe('the relay settings page', () => {
     expect(Object.keys(EXPECTED).sort()).toEqual(relaySettings());
   });
 
-  it('says flags are off when unset, as the code reads them', () => {
+  it('say flags are off when unset, as the code reads them', () => {
     const options = loadConfigFromEnv({
       TABDOCK_DEV_TOKENS: `alice=${'k'.repeat(MIN_DEV_TOKEN_LENGTH)}`,
     });
@@ -322,7 +348,13 @@ describe('the relay settings page', () => {
       options.invites,
       options.firstClassTools,
       options.spike,
-    ]).toEqual([false, false, false, false]);
+      options.agentTokens,
+      options.restartSnapshot,
+    ]).toEqual([false, false, false, false, false, false]);
+  });
+
+  it('send a reader from the first page to the second', () => {
+    expect(read(PAGE)).toContain('(14-settings-for-rooms.md)');
   });
 
   it('fails a row whose default drifts from the code', () => {

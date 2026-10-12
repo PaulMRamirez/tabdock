@@ -38,18 +38,25 @@ const ERAS = [
   ['2026-07-28', true],
 ] as const;
 
-/** A call that waits on the operator: the prompt it raised, and its answer once given. */
+/**
+ * A call that waits on the operator: the prompt it raised, the id of the
+ * call the page was handed, and its answer once given.
+ */
 async function prompted(
   sim: SimPage,
   pending: Promise<ToolOutcome>,
   allow: boolean,
-): Promise<{ prompt: Omit<PendingConfirm, 'callId' | 'expiresAt'>; answer: ToolOutcome }> {
+): Promise<{
+  prompt: Omit<PendingConfirm, 'callId' | 'expiresAt'>;
+  callId: string;
+  answer: ToolOutcome;
+}> {
   const state = await sim.waitFor((s) => s.pendingConfirms.length > 0);
   const [first] = state.pendingConfirms;
   if (first === undefined) throw new Error('no prompt on the page');
   expect(sim.dock.confirm(first.callId, allow)).toBe(true);
   const { tool, caller } = first;
-  return { prompt: { tool, caller }, answer: await pending };
+  return { prompt: { tool, caller }, callId: first.callId, answer: await pending };
 }
 
 async function attachedDriver(
@@ -92,10 +99,15 @@ describe('a consequential tool called by its first-class name', () => {
       expect(errorCode(fixed.answer), fixed.answer.text).toBe('denied_by_operator');
       expect(named.answer).toEqual(fixed.answer);
       expect(namedRecord).toMatchObject({ tool: 'wipe', outcome: 'denied_by_operator' });
-      expect({ ...namedRecord, at: 0, durationMs: 0 }).toEqual({
+      // Each line names the call the page was handed (ADR 0045), and the
+      // two differ in nothing else a second call could share.
+      expect(fixedRecord?.callId).toBe(fixed.callId);
+      expect(namedRecord?.callId).toBe(named.callId);
+      expect({ ...namedRecord, at: 0, durationMs: 0, callId: '' }).toEqual({
         ...fixedRecord,
         at: 0,
         durationMs: 0,
+        callId: '',
       });
       expect(sim.store.value).toBe('keep me');
       expect(sim.store.calls.some((call) => call.tool === 'wipe')).toBe(false);

@@ -1,6 +1,6 @@
 # Adapter reference
 
-`@tabdock/adapter` exports one function, `attach()`, which links the page's WebMCP tools to a relay, mounts the widget and returns the only control handle. This page lists all of it as [core.ts](../../packages/adapter/src/core.ts), [script-options.ts](../../packages/adapter/src/script-options.ts) and the protocol's `PolicySchema` ([page-link.ts](../../packages/protocol/src/page-link.ts)) declare it; [Add to your app](03-add-to-your-app.md) explains when to use what.
+`@tabdock/adapter` exports `attach()`, which links the page's WebMCP tools to a relay, mounts the widget and returns the only control handle, and a few values [listed below](#what-the-package-exports). This page and [The control handle](13-the-control-handle.md) list all of it as [core.ts](../../packages/adapter/src/core.ts), [script-options.ts](../../packages/adapter/src/script-options.ts) and the protocol's `PolicySchema` ([page-link.ts](../../packages/protocol/src/page-link.ts)) declare it; [Add to your app](03-add-to-your-app.md) explains when to use what.
 
 ## attach(options)
 
@@ -15,16 +15,20 @@
 
 ## The policy
 
-| Field                | Type                               | Default     | Script tag                 | Effect                                                                                      |
-| -------------------- | ---------------------------------- | ----------- | -------------------------- | ------------------------------------------------------------------------------------------- |
-| `autoApprove`        | `'none'` or `'observer'`           | `'none'`    | `data-auto-approve`        | `'observer'` lets members attach as observers with no prompt; invitees never                |
-| `maxDrivers`         | an integer from 1 to 100           | `1`         | `data-max-drivers`         | How many people may drive at once, counting people, not clients                             |
-| `consequential`      | `'confirm'`, `'allow'` or `'deny'` | `'confirm'` | `data-consequential`       | A consequential call prompts, runs, or is refused with `denied_by_operator`                 |
-| `consequentialTools` | tool names, at most 128            | `[]`        | `data-consequential-tools` | Tools that are consequential whatever the runtime reports; the attribute is a comma list    |
-| `invites`            | `'off'`, `'watch'` or `'all'`      | `'watch'`   | `data-invites`             | Which invites the operator may mint: none, Can watch, or Can watch and Can control          |
-| `confirmVia`         | `'page'` or `'client'`             | `'page'`    | `data-confirm-via`         | Under `'confirm'`, whether a member driver confirms in their own client instead of the page |
+| Field                | Type                               | Default     | Script tag                 | Effect                                                                                                       |
+| -------------------- | ---------------------------------- | ----------- | -------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `autoApprove`        | `'none'` or `'observer'`           | `'none'`    | `data-auto-approve`        | `'observer'` lets members attach as observers with no prompt; invitees never                                 |
+| `maxDrivers`         | an integer from 1 to 100           | `1`         | `data-max-drivers`         | How many people may drive at once, counting people, not clients                                              |
+| `consequential`      | `'confirm'`, `'allow'` or `'deny'` | `'confirm'` | `data-consequential`       | A consequential call prompts, runs, or is refused with `denied_by_operator`                                  |
+| `consequentialTools` | tool names, at most 128            | `[]`        | `data-consequential-tools` | Tools that are consequential whatever the runtime reports; the attribute is a comma list                     |
+| `invites`            | `'off'`, `'watch'` or `'all'`      | `'watch'`   | `data-invites`             | Which invites the operator may mint: none, Can watch, or Can watch and Can control                           |
+| `confirmVia`         | `'page'` or `'client'`             | `'page'`    | `data-confirm-via`         | Under `'confirm'`, whether a member driver confirms in their own client instead of the page                  |
+| `imageTools`         | tool names, at most 128            | `[]`        | `data-image-tools`         | Tools whose results may carry one image, as an envelope (ADR 0039); the attribute is a comma list            |
+| `proposals`          | `'off'`, `'members'` or `'all'`    | `'off'`     | `data-proposals`           | Whose calls to tools not marked read-only become proposals the operator accepts or dismisses here (ADR 0042) |
 
 How they combine: the relay seats a driver past `maxDrivers` as an observer, so a guest driving beside another driver needs `maxDrivers: 2` or more, and a Can control invite also needs `invites: 'all'`; without a free seat its guest joins as an observer. `confirmVia: 'client'` applies only under `consequential: 'confirm'`, to a member driver whose attachment no invite made, in a client that declares form elicitation; everyone else gets the page's prompt ([Sharing](06-sharing.md)). An empty `consequentialTools` names no tool, so on a runtime that drops `consequentialHint` every tool that is not read-only prompts (ADR 0034); a page that wants no prompts says `consequential: 'allow'`.
+
+A tool `imageTools` names returns `{ image: { mimeType, data }, text }`, and its PNG, JPEG or WebP reaches clients only within the size the relay's welcome allows; any other tool's result is text, whatever it holds. `proposals` changes only what an observer's call to a tool not marked read-only does: `'members'` takes it from members, `'all'` from invitees too, and accepting one in the widget is that call's confirmation ([Sharing](06-sharing.md)). A time-boxed session may narrow `maxDrivers` and `proposals` for its length, never widen them.
 
 ## The script tag
 
@@ -39,63 +43,14 @@ The script-tag build, `dist/tabdock-adapter.js`, reads these attributes from its
 | `data-consequential-tools` | Tool names separated by commas; an empty value names none |
 | `data-invites`             | `off`, `watch` or `all`                                   |
 | `data-confirm-via`         | `page` or `client`                                        |
+| `data-image-tools`         | Tool names separated by commas; an empty value names none |
+| `data-proposals`           | `off`, `members` or `all`                                 |
 
 An absent attribute keeps the default, and so does a misspelled one, which is ignored without a word. A bad value logs `[tabdock] invalid data attributes for <fields>`, naming policy fields (`maxDrivers` for `data-max-drivers`); a missing `data-relay` logs `[tabdock] data-relay is required, for example ws://127.0.0.1:8787/page`, and one that is not a `ws:` or `wss:` URL `[tabdock] data-relay must be a ws: or wss: URL, for example ws://127.0.0.1:8787/page`, never repeating it; a file loaded as a module logs `[tabdock] load the adapter build with a classic <script> tag`; and in each case nothing attaches. The widget's hint notice names `data-consequential-tools` rather than `policy.consequentialTools`.
 
 ## The handle
 
-`attach()` returns a frozen `Dock`. Its methods that return a boolean return `false` when there was nothing to act on, such as a request that already ended.
-
-| Member          | Call                                   | Returns                      | What it does                                                                                                                                                |
-| --------------- | -------------------------------------- | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `state`         | `dock.state`                           | `DockState`                  | The current state, a frozen snapshot                                                                                                                        |
-| `on`            | `dock.on('state', listener)`           | a function that unsubscribes | Calls the listener after every change; `'state'` is the only event, and any other name throws                                                               |
-| `approve`       | `dock.approve(requestId, role)`        | boolean                      | Allows a pending attach request as `'driver'` or `'observer'`                                                                                               |
-| `deny`          | `dock.deny(requestId)`                 | boolean                      | Denies it                                                                                                                                                   |
-| `confirm`       | `dock.confirm(callId, allow)`          | boolean                      | Answers a consequential prompt; only `true` allows                                                                                                          |
-| `rotatePairing` | `dock.rotatePairing()`                 | boolean                      | Asks the relay for a fresh pairing code; `false` while not linked                                                                                           |
-| `setRole`       | `dock.setRole(userId, role)`           | boolean                      | Switches the role of someone approved here or let in by `autoApprove`; at `maxDrivers` the relay keeps a new driver an observer, though this returns `true` |
-| `revoke`        | `dock.revoke(userId, { closeInvite })` | boolean                      | Ends one user's attachment, or everyone's with `'*'`, cancelling their calls and prompts; `closeInvite` also closes the invite that let them in             |
-| `cancelInvite`  | `dock.cancelInvite(inviteId)`          | boolean                      | Closes one invite link; attachments it made stay until revoked                                                                                              |
-| `invite`        | `dock.invite(options)`                 | `Promise<InviteResult>`      | Mints an invite, below                                                                                                                                      |
-| `pause`         | `dock.pause(paused)`                   | nothing                      | `true` answers `page_busy` to every call not yet running, queued and prompted ones included; only `false` resumes; it survives a reload                     |
-| `close`         | `dock.close()`                         | nothing                      | Detaches for good: denies open prompts, ends the page session at once, forgets the resume token and grants, and removes the widget                          |
-
-Calls run under the least of the operator's grant here, the relay's roster and the role the call claims. Revoking someone an invite let in bars them from that invite; for a multi-use link, Revoke closes it unless `closeInvite` is `false`, and `revoke('*')` closes every link.
-
-## Invites
-
-`dock.invite(options)` mints an invite on the page, as far as `policy.invites` allows, on a relay with invites on (`TABDOCK_INVITES=1` and a public URL; [Sharing](06-sharing.md)). The secret is 128 bits from WebCrypto, which needs a secure context; only its SHA-256 leaves the page.
-
-| `InviteOptions` field | Type                                                 | Default  | Meaning                                                                   |
-| --------------------- | ---------------------------------------------------- | -------- | ------------------------------------------------------------------------- |
-| `label`               | 1 to 60 characters                                   | required | Shown wherever the invite appears, as the page's own words                |
-| `role`                | `'observer'` (Can watch) or `'driver'` (Can control) | required | Can control needs `invites: 'all'` and prompts the operator on redemption |
-| `lifetime`            | `'15m'`, `'1h'` or `'open'`                          | `'1h'`   | `'open'` lasts while the page is open; no invite outlives 24 hours        |
-| `uses`                | 1 to 20                                              | `1`      | Can watch only; Can control always has one                                |
-
-The promise resolves once, with `{ ok: true, inviteId, link, expiresAt }`, the link being `<public URL>/i#<secret>`, or with `{ ok: false, reason }`. The reasons: `invalid` (bad options), `policy` (`policy.invites` forbids that role), `link_down`, `unavailable` (no invites on the relay, no WebCrypto, or no answer in 10 s), `no_public_url`, `limit` (10 live per page), `no_sponsor` (no member attached to sponsor it), `duplicate`, `expired` (the page's clock runs behind the relay's) and `cancelled` (closed before the relay answered). The link exists only in that result; the page stores the hash.
-
-## The state
-
-| `DockState` field | Type                                                                 | What it holds                                                                                                         |
-| ----------------- | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `link`            | `'idle'`, `'connecting'`, `'linked'`, `'reconnecting'` or `'closed'` | The page link                                                                                                         |
-| `pageId`          | string or null                                                       | The relay's id for this page session, such as `pg_0123456789`                                                         |
-| `pairing`         | `{ code, url?, expiresAt }` or null                                  | The current code, and the QR link when the relay has a public URL                                                     |
-| `roster`          | attachments                                                          | Everyone attached, as the relay lists them: user, kind, role, clients, times, and the invite that made it             |
-| `pageRoles`       | one per roster entry                                                 | The role the page itself runs that user's calls under (null for none), and whether a revoke is pending                |
-| `pendingRequests` | attach requests                                                      | `requestId`, `user`, `account`, `via` (`code`, `qr` or `invite`), `invite`, `client`, `expiresAt`                     |
-| `pendingConfirms` | consequential prompts                                                | `callId`, `tool`, `caller`, and `expiresAt`, the call's deadline                                                      |
-| `notice`          | string or null                                                       | Advice for the page author, such as the `consequentialHint` fallback                                                  |
-| `error`           | string or null                                                       | Why the link is not working, such as a missing `document.modelContext`                                                |
-| `paused`          | boolean                                                              | The pause switch                                                                                                      |
-| `activity`        | the last 50 calls, newest first                                      | user, client, tool, outcome, `confirmedBy`, duration; never arguments or results                                      |
-| `invites`         | live invites                                                         | Those this page minted and its own record still holds                                                                 |
-| `invitesOffered`  | `{ linkBase }` or null                                               | Null until a relay with invites on says so                                                                            |
-| `joins`           | people let in by invite                                              | Newest first, while their grant lasts                                                                                 |
-| `observerSeats`   | people the driver limit held back                                    | Newest first: each `seq`, `user`, `account`, `asked` (`'allow'` or `'promote'`) and `time`, while they stay observers |
-| `policy`          | `Policy`                                                             | The policy `attach()` was given, with defaults filled in; a copy                                                      |
+`attach()` returns a frozen `Dock`, the only control handle. With it your code approves and denies attach requests, answers prompts, switches roles, revokes, mints invites and pauses, publishes the page's state, decides proposals, runs time-boxed sessions, mints agent tokens, and reads and discards session records; saving one as a file is the widget's Save JSON or Save summary, or page code using `sessionRecordJson` and `sessionRecordMarkdown`. [The control handle](13-the-control-handle.md) lists every member, every `DockState` field and the invite options.
 
 ## Your own operator UI
 
@@ -161,12 +116,34 @@ render(dock.state);
 
 Your UI takes on what the widget did: it should take only trusted clicks, keep the code and links off logs, and, against clickjacking, refuse to be framed; the widget also ignores clicks on a prompt until it has held still for half a second.
 
+What the example leaves out is yours too. A page that takes proposals renders `state.proposals` and calls `acceptProposal` and `dismissProposal`; unanswered, a proposal expires after 10 minutes. A page that runs sessions shows `state.session`'s time left and `state.sessionEnded`, as the widget warns at 5 minutes and at 1. An agent token's first request arrives in `pendingRequests` with `via` set to `'agent'` and `agent` naming its label. And a page that keeps records offers `state.records` for saving.
+
 ## Timeouts and limits
 
 An attach request waits 60 s for the operator, and silence denies it. A consequential prompt waits until the call's deadline, about 45 s from the relay's receipt of the call, and silence denies it too. `invite()` waits 10 s for the relay. The page remembers its last 1,000 prompted call ids and takes no new call under any of them, so a late `confirm()` from a stale dialog answers nothing. After a dropped link the adapter reconnects with backoff from 0.5 s to 30 s.
 
 ## Secrets
 
-Never log or send on `state.pairing.code`, `state.pairing.url` (its fragment is a single-use nonce), an invite link or the resume token in `sessionStorage`: anyone who sees a live code can ask to attach. The adapter's own log lines name invitees by a short id, never by email.
+Never log or send on `state.pairing.code`, `state.pairing.url` (its fragment is a single-use nonce), an invite link, the agent token and command `agentToken()` resolves with, the observers' links `startSession()` and `renewSessionLink()` resolve with, or the resume token in `sessionStorage`: anyone who sees a live code can ask to attach, and anyone holding a link or token can use it. The adapter's own log lines name invitees by a short id, never by email.
+
+## What the package exports
+
+| Export                  | What it is for                                                                                                                                                 |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `attach`                | Links the page's tools to a relay and returns the handle, as above                                                                                             |
+| `ADAPTER_VERSION`       | The adapter's version, which it sends the relay in its first frame                                                                                             |
+| `INVITE_LIFETIMES`      | The lifetimes `invite()` takes: `'15m'`, `'1h'` and `'open'`                                                                                                   |
+| `STATE_EVENT`           | `'tabdock:state'`, the event a script-tag page dispatches on `document` to publish its state                                                                   |
+| `DEFAULT_IMAGE_BYTES`   | 65,536, a relay's image cap unless `TABDOCK_MAX_IMAGE_BYTES` changes it; `state.maxImageBytes` says what this page's relay takes                               |
+| `MAX_IMAGE_BYTES`       | 524,288, the most any relay takes                                                                                                                              |
+| `sessionRecordJson`     | `sessionRecordJson(record)` gives the JSON file Save JSON writes, for a record from `dock.sessionRecord()`                                                     |
+| `sessionRecordMarkdown` | `sessionRecordMarkdown(record)` gives the Markdown summary Save summary writes                                                                                 |
+| `sessionRecordFileName` | `sessionRecordFileName(record, 'json')`, or `'md'`, gives the name the widget saves under: `tabdock-record-`, the start's date and time, and a session's label |
+
+It also exports the TypeScript types of the handle, its state, the policy and the results. A separate entry, `@tabdock/adapter/testing`, drives the widget from a test through the DevTools protocol ([Scripts and the widget](24-scripts-and-the-widget.md#the-testing-helper)).
+
+## What counts as one page
+
+The adapter keeps its resume token, grants, revoked list, invite records, pause switch, running time-boxed session and agent token records (hashes, never a token or invite secret) in the tab's `sessionStorage`, keyed by relay URL and the page's origin and path, read once at `attach()`. A reload of the same path in the same tab within 10 minutes resumes with the same page id and attachments; a new tab, or a full load of another path, is a new page for the operator to approve. A single-page app that changes its path through the History API stays one page, under the path it attached with.
 
 Next: [Connect clients](05-connect-clients.md).

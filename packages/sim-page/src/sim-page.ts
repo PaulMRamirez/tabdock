@@ -12,6 +12,8 @@
 
 import {
   type ActivityEntry,
+  type AgentTokenOptions,
+  type AgentTokenResult,
   createAdapterCore,
   type AdapterCore,
   type CryptoLike,
@@ -21,13 +23,17 @@ import {
   type InviteResult,
   type Logger,
   type PendingConfirm,
+  type PublishResult,
+  type RecordWhich,
   type RevokeOptions,
+  type SessionOptions,
+  type SessionResult,
   type SocketFactory,
   type StorageLike,
   type Timers,
   type UiPort,
 } from '@tabdock/adapter/core';
-import type { PolicyInput, Role } from '@tabdock/protocol';
+import type { PolicyInput, Role, SessionRecord } from '@tabdock/protocol';
 import { WebSocket } from 'ws';
 import { createDefaultTools, createSimStore, type SimStore } from './default-tools.ts';
 import {
@@ -63,7 +69,12 @@ export class MemoryStorage implements StorageLike {
 /**
  * A scripted operator. attach returns 'driver', 'observer' or 'deny'; confirm
  * returns true or false. Leaving a method out, or returning undefined, leaves
- * that prompt to sim.dock, and silence until the deadline denies.
+ * that prompt to sim.dock, and silence until the deadline denies. An agent
+ * token's first request (ADR 0044) reaches attach with via 'agent' and
+ * `agent` naming the token's id and label, only once the adapter has checked
+ * it against the page's own record; whatever attach answers, the page grants
+ * an agent observer alone. A deny burns the token at once; a silence sends
+ * the relay nothing, whose own timer counts it, and the third burns it.
  */
 export type SimOperator = UiPort;
 
@@ -84,6 +95,13 @@ export interface SimPageOptions {
   operator?: SimOperator;
   /** Builds the page's tools; createDefaultTools by default. */
   tools?: (store: SimStore) => FakeToolDefinition[];
+  /**
+   * Test only: the state the page publishes (ADR 0040), read from its store
+   * when it boots and after each tool call that succeeds, as a page that
+   * publishes on every change would. Left out, the page publishes nothing
+   * unless a test calls publishState.
+   */
+  stateFrom?: (store: SimStore) => Record<string, unknown> | null;
   title?: string;
   /** Path part of the page's URL, '/' by default; navigate() moves the tab to another. */
   path?: string;
@@ -92,6 +110,8 @@ export interface SimPageOptions {
   adapterVersion?: string;
   /** Timers for the adapter core; a test can shorten one, such as the silence watchdog. */
   timers?: Timers;
+  /** The page's clock, Date.now unless set; a test can run it ahead of the relay's, as a real tab's may be. */
+  clock?: () => number;
   /**
    * WebCrypto for minting and checking invites (ADR 0017); Node's global
    * crypto unless set, which mints for real. A test can pass one without
@@ -152,6 +172,37 @@ export interface SimPage {
   invite(options: InviteOptions): Promise<InviteResult>;
   /** The operator's pause switch (Dock.pause); it survives reload(), as the adapter stores it. */
   pause(paused: boolean): void;
+  /**
+   * The current page publishing its state (Dock.publishState, ADR 0040). A
+   * reload() is a new document, so a test publishes again after one, as a
+   * real page would.
+   */
+  publishState(value: unknown): PublishResult;
+  /** The operator's Accept on a proposal row (Dock.acceptProposal, ADR 0042). */
+  acceptProposal(proposalId: string): boolean;
+  /** The operator's Dismiss on a proposal row (Dock.dismissProposal). */
+  dismissProposal(proposalId: string): boolean;
+  /** The operator's Dismiss all (Dock.dismissAllProposals). */
+  dismissAllProposals(): number;
+  /** The operator's Start in the session form (Dock.startSession, ADR 0043). */
+  startSession(options: SessionOptions): Promise<SessionResult>;
+  /** The operator's Extend (Dock.extendSession). */
+  extendSession(minutes: number): boolean;
+  /** The operator's End session (Dock.endSession). */
+  endSession(): boolean;
+  /** The operator's New link for a running session (Dock.renewSessionLink). */
+  renewSessionLink(): Promise<InviteResult>;
+  /** The operator minting an agent token (Dock.agentToken, ADR 0044). */
+  agentToken(options: AgentTokenOptions): Promise<AgentTokenResult>;
+  /** The operator's Cancel beside one agent token (Dock.cancelAgent). */
+  cancelAgent(tokenId: string): boolean;
+  /**
+   * The current page's session record (Dock.sessionRecord, ADR 0045). It is
+   * kept in memory only, so a reload() starts an empty one.
+   */
+  sessionRecord(which?: RecordWhich): SessionRecord | null;
+  /** The operator's Discard or Clear on a session record (Dock.discardRecord). */
+  discardRecord(which: RecordWhich): boolean;
   /** Resolves with the first state, current or later, that matches; rejects after timeoutMs (5000). */
   waitFor(predicate: (state: DockState) => boolean, timeoutMs?: number): Promise<DockState>;
   /**
@@ -254,8 +305,23 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
     const context = new FakeModelContext({ profile, origin: pageOrigin });
     // Registrations last as long as the simulated page.
     const registration = new AbortController();
+    const stateFrom = options.stateFrom;
+    // A tool that succeeded publishes the store's state after it, for stateFrom.
+    const publishing = (tool: FakeToolDefinition): FakeToolDefinition =>
+      stateFrom === undefined
+        ? tool
+        : {
+            ...tool,
+            execute: async (input, executeOptions) => {
+              const result: unknown = await tool.execute(input, executeOptions);
+              current.core.dock.publishState(stateFrom(store));
+              return result;
+            },
+          };
     await Promise.all(
-      buildTools(store).map((tool) => context.registerTool(tool, { signal: registration.signal })),
+      buildTools(store).map((tool) =>
+        context.registerTool(publishing(tool), { signal: registration.signal }),
+      ),
     );
     const core = createAdapterCore({
       relayUrl: options.relayUrl,
@@ -270,6 +336,7 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
       adapterVersion: options.adapterVersion ?? '0.0.0-sim',
       logger,
       timers: options.timers,
+      clock: options.clock,
       crypto: options.crypto,
     });
     core.dock.on('state', (state) => {
@@ -279,6 +346,7 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
         prompts.push(pending);
       }
     });
+    if (stateFrom !== undefined) core.dock.publishState(stateFrom(store));
     core.start();
     return { core, context };
   }
@@ -340,6 +408,42 @@ export async function startSimPage(options: SimPageOptions): Promise<SimPage> {
     },
     pause(paused) {
       current.core.dock.pause(paused);
+    },
+    publishState(value) {
+      return current.core.dock.publishState(value);
+    },
+    acceptProposal(proposalId) {
+      return current.core.dock.acceptProposal(proposalId);
+    },
+    dismissProposal(proposalId) {
+      return current.core.dock.dismissProposal(proposalId);
+    },
+    dismissAllProposals() {
+      return current.core.dock.dismissAllProposals();
+    },
+    startSession(sessionOptions) {
+      return current.core.dock.startSession(sessionOptions);
+    },
+    extendSession(minutes) {
+      return current.core.dock.extendSession(minutes);
+    },
+    endSession() {
+      return current.core.dock.endSession();
+    },
+    renewSessionLink() {
+      return current.core.dock.renewSessionLink();
+    },
+    agentToken(agentOptions) {
+      return current.core.dock.agentToken(agentOptions);
+    },
+    cancelAgent(tokenId) {
+      return current.core.dock.cancelAgent(tokenId);
+    },
+    sessionRecord(which) {
+      return current.core.dock.sessionRecord(which);
+    },
+    discardRecord(which) {
+      return current.core.dock.discardRecord(which);
     },
     waitFor(predicate, timeoutMs = 5000) {
       const dock = current.core.dock;

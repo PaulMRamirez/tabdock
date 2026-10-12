@@ -1,0 +1,3245 @@
+{
+  "machine": {
+    "date": "2026-10-11T20:53:48.691Z",
+    "commit": "db9a1152584e4fa88dac3823e162edb24106fba7",
+    "uncommitted": false,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "cpus": 4,
+    "memoryGiB": 15.7,
+    "kernel": "6.18.44-fc-v114",
+    "node": "v22.22.0",
+    "heapFlag": "--max-old-space-size=192",
+    "harnessCpus": "0-2",
+    "network": "namespace",
+    "limits": {
+      "sessionsPerUser": 20,
+      "sessions": 1000,
+      "inviteeSessions": 100,
+      "sessionsPerInvitee": 2,
+      "usersPerPage": 10,
+      "queueDepth": 32,
+      "pageSocketsPerAddress": 20,
+      "pageSessionsPerAddress": 20,
+      "pageSessions": 1000,
+      "pairSessions": 200,
+      "pairSignInsInFlight": 8,
+      "signInsInFlightPerAddress": 2,
+      "toolBytes": 67108864,
+      "requestBytes": 67108864,
+      "requestBytesPerUser": 25165824,
+      "imageBytes": 65536,
+      "stateBytes": 4194304,
+      "proposalBytes": 16777216,
+      "responseBytes": 100663296,
+      "observersPerPage": 40,
+      "watchingCallsInFlight": 4,
+      "watchingCallsInFlightPerUser": 2
+    },
+    "rateLimits": {
+      "pairAttemptsPerUser": 10,
+      "pairAttemptsPerPage": 30,
+      "pairPreviewsPerNonce": 30,
+      "pairSignIns": 60,
+      "callsPerUserPerPage": 120,
+      "windowMs": 60000,
+      "toolsFramesPerSocket": 10,
+      "toolsFramesPerAddress": 30,
+      "toolsFramesWindowMs": 10000,
+      "stateFramesPerSocket": 40,
+      "stateFramesPerAddress": 200,
+      "stateFramesWindowMs": 10000,
+      "watchingCallsPerPage": 60,
+      "watchingCallsPerUserPerPage": 15,
+      "ignoredFramesPerSocket": 20,
+      "ignoredFramesPerAddress": 60,
+      "connectionLinesPerAddress": 60,
+      "requestsPerUser": 240,
+      "requestsPerInvitee": 60,
+      "redemptionsPerInvite": 30,
+      "signInsPerAddress": 10,
+      "auditRefusalsPerUser": 10,
+      "auditRefusalsForStrangers": 30
+    }
+  },
+  "phaseMinutes": 5,
+  "bars": {
+    "rssMiB": 381.4697265625,
+    "heapAfterGcMiB": 150,
+    "eventLoopP99Ms": 50,
+    "teacherP95Ms": 250
+  },
+  "lateFrameMs": 33,
+  "ceilingLine": "mcp response cut off: responses waiting to be read hold all the relay lets invited accounts hold",
+  "rooms": [
+    {
+      "size": 40,
+      "pages": 1,
+      "settings": {},
+      "sharedAddress": false,
+      "confinement": {
+        "kind": "cgroup-v1",
+        "cpu": 3,
+        "notes": []
+      },
+      "answerBytes": {
+        "notes": 717262,
+        "capture": 86436
+      },
+      "rosterFrameMaxBytes": 14181,
+      "join": {
+        "students": 40,
+        "joined": 40,
+        "allJoinedSeconds": 84.9,
+        "joinedInFirstMinute": 29,
+        "signInRefusals": 0,
+        "claimRefusals": {
+          "429 rate_limited": 60
+        },
+        "waitSeconds": {
+          "p50": 0.1,
+          "p95": 60.2,
+          "max": 60.2
+        },
+        "sessionRefusals": 0
+      },
+      "phases": [
+        {
+          "name": "join",
+          "seconds": 86,
+          "quotaUs": 80000,
+          "peaks": {
+            "vmRssMiB": 158.6,
+            "vmHwmMiB": 162.9,
+            "heapUsedMiB": 35.2,
+            "externalMiB": 14.9,
+            "arrayBuffersMiB": 1.1,
+            "groupPeakMiB": 107.6,
+            "responsesHeldMiB": 0
+          },
+          "heapAfterGcUnderLoadMiB": 31.1,
+          "heapAfterGcMiB": 31.1,
+          "eventLoopMs": {
+            "p50": 0.3,
+            "p99": 3.7,
+            "max": 82.8
+          },
+          "cpuMs": 4149,
+          "cpuMsPerRequest": 7.63,
+          "cpuShare": 0.048,
+          "throttledPeriods": 0,
+          "throttledMs": 0,
+          "oomKills": 0,
+          "calls": {
+            "teacher set_view": {
+              "latency": {
+                "count": 42,
+                "p50": 17.9,
+                "p95": 22.6,
+                "p99": 31.8,
+                "max": 31.8
+              },
+              "outcomes": {
+                "ok": 42
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 324,
+            "http 202": 80,
+            "http 303": 80,
+            "http 429": 60
+          },
+          "logLines": {
+            "info mcp client": 120,
+            "info call": 66,
+            "info attach": 40,
+            "info attach request sent": 40,
+            "info attached": 40,
+            "info invite claim accepted": 40,
+            "info invite_redeemed": 40,
+            "info pair signed in": 40,
+            "warn redemption refused: too many for one invite": 39,
+            "info attach_refused": 30,
+            "warn redemption refused: too many pairings for one page": 21,
+            "info invite closed": 2,
+            "info invite_closed": 2,
+            "info refused_summary": 2
+          },
+          "cuts": {
+            "stall": 0,
+            "cap": 0,
+            "ceiling": 0
+          },
+          "held": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "memberHeld": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "harnessLoopP99Ms": 16.5
+        },
+        {
+          "name": "class",
+          "seconds": 301,
+          "quotaUs": 80000,
+          "peaks": {
+            "vmRssMiB": 171,
+            "vmHwmMiB": 171.7,
+            "heapUsedMiB": 40.1,
+            "externalMiB": 14.4,
+            "arrayBuffersMiB": 0.5,
+            "groupPeakMiB": 121.3,
+            "responsesHeldMiB": 0
+          },
+          "heapAfterGcUnderLoadMiB": 32.5,
+          "heapAfterGcMiB": 32.1,
+          "eventLoopMs": {
+            "p50": 0.2,
+            "p99": 2.9,
+            "max": 114.6
+          },
+          "cpuMs": 13756,
+          "cpuMsPerRequest": 10.03,
+          "cpuShare": 0.046,
+          "throttledPeriods": 0,
+          "throttledMs": 0,
+          "oomKills": 0,
+          "calls": {
+            "get_page_state": {
+              "latency": {
+                "count": 599,
+                "p50": 6.8,
+                "p95": 10.8,
+                "p99": 16.1,
+                "max": 54.2
+              },
+              "outcomes": {
+                "ok": 599
+              }
+            },
+            "get_page_state (second device)": {
+              "latency": {
+                "count": 200,
+                "p50": 6.7,
+                "p95": 10.6,
+                "p99": 14.7,
+                "max": 33.4
+              },
+              "outcomes": {
+                "ok": 200
+              }
+            },
+            "teacher set_view": {
+              "latency": {
+                "count": 150,
+                "p50": 14.6,
+                "p95": 21.1,
+                "p99": 29,
+                "max": 46.5
+              },
+              "outcomes": {
+                "ok": 150
+              }
+            },
+            "get_view": {
+              "latency": {
+                "count": 167,
+                "p50": 12.4,
+                "p95": 20.5,
+                "p99": 58,
+                "max": 63
+              },
+              "outcomes": {
+                "ok": 167,
+                "rate_limited": 33
+              }
+            },
+            "capture_view": {
+              "latency": {
+                "count": 80,
+                "p50": 18.7,
+                "p95": 27.8,
+                "p99": 43.3,
+                "max": 43.3
+              },
+              "outcomes": {
+                "ok": 80,
+                "rate_limited": 21
+              }
+            },
+            "propose go_to_stop": {
+              "latency": {
+                "count": 53,
+                "p50": 9.3,
+                "p95": 12.1,
+                "p99": 16,
+                "max": 16
+              },
+              "outcomes": {
+                "ok": 53,
+                "rate_limited": 16
+              }
+            },
+            "get_proposal (waits)": {
+              "latency": {
+                "count": 53,
+                "p50": 9602,
+                "p95": 18331.5,
+                "p99": 19264.1,
+                "max": 19264.1
+              },
+              "outcomes": {
+                "ok": 53
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 1372
+          },
+          "logLines": {
+            "info call": 565,
+            "info proposal made": 53,
+            "info proposal dismissed": 38,
+            "info proposal_closed": 38,
+            "info proposal accepted on the page": 15,
+            "info mcp client": 1
+          },
+          "cuts": {
+            "stall": 0,
+            "cap": 0,
+            "ceiling": 0
+          },
+          "held": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "memberHeld": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "harnessLoopP99Ms": 1.6
+        },
+        {
+          "name": "agents",
+          "seconds": 121,
+          "quotaUs": 80000,
+          "peaks": {
+            "vmRssMiB": 172.3,
+            "vmHwmMiB": 173.1,
+            "heapUsedMiB": 43.2,
+            "externalMiB": 14.2,
+            "arrayBuffersMiB": 0.3,
+            "groupPeakMiB": 122.6,
+            "responsesHeldMiB": 0
+          },
+          "heapAfterGcUnderLoadMiB": 34.4,
+          "heapAfterGcMiB": 33.9,
+          "eventLoopMs": {
+            "p50": 0.2,
+            "p99": 8.7,
+            "max": 84.9
+          },
+          "cpuMs": 21425,
+          "cpuMsPerRequest": 4.84,
+          "cpuShare": 0.177,
+          "throttledPeriods": 0,
+          "throttledMs": 0,
+          "oomKills": 0,
+          "calls": {
+            "wait_for_page_state": {
+              "latency": {
+                "count": 4363,
+                "p50": 5.6,
+                "p95": 10.9,
+                "p99": 40.7,
+                "max": 98.3
+              },
+              "outcomes": {
+                "ok": 4363
+              }
+            },
+            "teacher set_view": {
+              "latency": {
+                "count": 60,
+                "p50": 13.4,
+                "p95": 21.8,
+                "p99": 51.9,
+                "max": 51.9
+              },
+              "outcomes": {
+                "ok": 60
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 4423
+          },
+          "logLines": {
+            "info call": 90,
+            "info mcp client": 40
+          },
+          "cuts": {
+            "stall": 0,
+            "cap": 0,
+            "ceiling": 0
+          },
+          "held": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "memberHeld": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "harnessLoopP99Ms": 2.1
+        },
+        {
+          "name": "class at the 6.25% baseline",
+          "seconds": 127,
+          "quotaUs": 5000,
+          "peaks": {
+            "vmRssMiB": 177.7,
+            "vmHwmMiB": 181.4,
+            "heapUsedMiB": 41.6,
+            "externalMiB": 15.3,
+            "arrayBuffersMiB": 1.5,
+            "groupPeakMiB": 131,
+            "responsesHeldMiB": 0
+          },
+          "heapAfterGcUnderLoadMiB": 34.3,
+          "heapAfterGcMiB": 33.9,
+          "eventLoopMs": {
+            "p50": 0.2,
+            "p99": 549.9,
+            "max": 2387
+          },
+          "cpuMs": 6743,
+          "cpuMsPerRequest": 12.26,
+          "cpuShare": 0.053,
+          "throttledPeriods": 1243,
+          "throttledMs": 89365,
+          "oomKills": 0,
+          "calls": {
+            "get_page_state": {
+              "latency": {
+                "count": 238,
+                "p50": 371.7,
+                "p95": 2465.5,
+                "p99": 5018.5,
+                "max": 6769.3
+              },
+              "outcomes": {
+                "ok": 238
+              }
+            },
+            "get_page_state (second device)": {
+              "latency": {
+                "count": 84,
+                "p50": 594.8,
+                "p95": 3019.6,
+                "p99": 3117.5,
+                "max": 3117.5
+              },
+              "outcomes": {
+                "ok": 84
+              }
+            },
+            "teacher set_view": {
+              "latency": {
+                "count": 56,
+                "p50": 566.9,
+                "p95": 3440.4,
+                "p99": 4323,
+                "max": 4323
+              },
+              "outcomes": {
+                "ok": 56
+              }
+            },
+            "get_view": {
+              "latency": {
+                "count": 65,
+                "p50": 534.2,
+                "p95": 3008.1,
+                "p99": 4591.8,
+                "max": 4591.8
+              },
+              "outcomes": {
+                "ok": 65,
+                "rate_limited": 15
+              }
+            },
+            "capture_view": {
+              "latency": {
+                "count": 32,
+                "p50": 883.5,
+                "p95": 3444.5,
+                "p99": 6550.9,
+                "max": 6550.9
+              },
+              "outcomes": {
+                "ok": 32,
+                "rate_limited": 8
+              }
+            },
+            "propose go_to_stop": {
+              "latency": {
+                "count": 23,
+                "p50": 549.9,
+                "p95": 1958.8,
+                "p99": 2857.8,
+                "max": 2857.8
+              },
+              "outcomes": {
+                "ok": 23,
+                "rate_limited": 6
+              }
+            },
+            "get_proposal (waits)": {
+              "latency": {
+                "count": 23,
+                "p50": 11118.2,
+                "p95": 19675.4,
+                "p99": 20879.9,
+                "max": 20879.9
+              },
+              "outcomes": {
+                "ok": 23
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 550
+          },
+          "logLines": {
+            "info call": 239,
+            "info proposal made": 23,
+            "info proposal dismissed": 17,
+            "info proposal_closed": 17,
+            "warn the argument check worker did not start in time; calls go to the page unchecked until another starts": 8,
+            "info proposal accepted on the page": 6,
+            "warn no argument check worker was ready; calls go to the page unchecked until one starts": 4,
+            "warn an argument check ran out of time; calls it overruns go to the page unchecked": 1
+          },
+          "cuts": {
+            "stall": 0,
+            "cap": 0,
+            "ceiling": 0
+          },
+          "held": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "memberHeld": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "harnessLoopP99Ms": 3.2
+        },
+        {
+          "name": "agents at the 6.25% baseline",
+          "seconds": 130,
+          "quotaUs": 5000,
+          "peaks": {
+            "vmRssMiB": 186.4,
+            "vmHwmMiB": 186.4,
+            "heapUsedMiB": 45.7,
+            "externalMiB": 14.5,
+            "arrayBuffersMiB": 0.7,
+            "groupPeakMiB": 136.1,
+            "responsesHeldMiB": 0
+          },
+          "heapAfterGcUnderLoadMiB": 35.1,
+          "heapAfterGcMiB": 34.7,
+          "eventLoopMs": {
+            "p50": 1193.8,
+            "p99": 5111.2,
+            "max": 5593.6
+          },
+          "cpuMs": 7985,
+          "cpuMsPerRequest": 6,
+          "cpuShare": 0.062,
+          "throttledPeriods": 1619,
+          "throttledMs": 120951,
+          "oomKills": 0,
+          "calls": {
+            "wait_for_page_state": {
+              "latency": {
+                "count": 1302,
+                "p50": 2884.7,
+                "p95": 7201.2,
+                "p99": 17627.6,
+                "max": 40392.1
+              },
+              "outcomes": {
+                "ok": 1302
+              }
+            },
+            "teacher set_view": {
+              "latency": {
+                "count": 28,
+                "p50": 3440.9,
+                "p95": 12563.1,
+                "p99": 13434.7,
+                "max": 13434.7
+              },
+              "outcomes": {
+                "ok": 28
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 1330
+          },
+          "logLines": {
+            "info call": 55,
+            "warn the argument check worker did not start in time; calls go to the page unchecked until another starts": 3,
+            "info audit checkpoint": 1
+          },
+          "cuts": {
+            "stall": 0,
+            "cap": 0,
+            "ceiling": 0
+          },
+          "held": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "memberHeld": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "harnessLoopP99Ms": 2.8
+        },
+        {
+          "name": "stalled",
+          "seconds": 115,
+          "quotaUs": 80000,
+          "peaks": {
+            "vmRssMiB": 196.4,
+            "vmHwmMiB": 198.1,
+            "heapUsedMiB": 43.6,
+            "externalMiB": 21.9,
+            "arrayBuffersMiB": 8,
+            "groupPeakMiB": 147.9,
+            "responsesHeldMiB": 7.5
+          },
+          "heapAfterGcUnderLoadMiB": 35.4,
+          "heapAfterGcMiB": 34.8,
+          "eventLoopMs": {
+            "p50": 0.2,
+            "p99": 3.1,
+            "max": 84.6
+          },
+          "cpuMs": 5445,
+          "cpuMsPerRequest": 10.25,
+          "cpuShare": 0.047,
+          "throttledPeriods": 0,
+          "throttledMs": 0,
+          "oomKills": 0,
+          "calls": {
+            "get_page_state": {
+              "latency": {
+                "count": 220,
+                "p50": 5.8,
+                "p95": 11.2,
+                "p99": 18.2,
+                "max": 57.3
+              },
+              "outcomes": {
+                "ok": 220
+              }
+            },
+            "get_page_state (second device)": {
+              "latency": {
+                "count": 76,
+                "p50": 5.9,
+                "p95": 10.1,
+                "p99": 12.7,
+                "max": 12.7
+              },
+              "outcomes": {
+                "ok": 76
+              }
+            },
+            "teacher set_view": {
+              "latency": {
+                "count": 58,
+                "p50": 13.4,
+                "p95": 21.5,
+                "p99": 54.7,
+                "max": 54.7
+              },
+              "outcomes": {
+                "ok": 58
+              }
+            },
+            "get_view": {
+              "latency": {
+                "count": 56,
+                "p50": 11.5,
+                "p95": 18.5,
+                "p99": 24.4,
+                "max": 24.4
+              },
+              "outcomes": {
+                "ok": 56,
+                "rate_limited": 18
+              }
+            },
+            "capture_view": {
+              "latency": {
+                "count": 25,
+                "p50": 17.8,
+                "p95": 26.3,
+                "p99": 118.3,
+                "max": 118.3
+              },
+              "outcomes": {
+                "ok": 25,
+                "rate_limited": 12
+              }
+            },
+            "propose go_to_stop": {
+              "latency": {
+                "count": 19,
+                "p50": 7.5,
+                "p95": 12.6,
+                "p99": 12.6,
+                "max": 12.6
+              },
+              "outcomes": {
+                "ok": 19,
+                "rate_limited": 8
+              }
+            },
+            "get_proposal (waits)": {
+              "latency": {
+                "count": 19,
+                "p50": 7986,
+                "p95": 18865.5,
+                "p99": 18865.5,
+                "max": 18865.5
+              },
+              "outcomes": {
+                "ok": 19
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 531
+          },
+          "logLines": {
+            "info call": 251,
+            "info proposal made": 19,
+            "info proposal dismissed": 14,
+            "info proposal_closed": 14,
+            "warn mcp response cut off: its client read none of it for 30 s": 10,
+            "info proposal accepted on the page": 5
+          },
+          "cuts": {
+            "stall": 10,
+            "cap": 0,
+            "ceiling": 0
+          },
+          "held": {
+            "asked": 20,
+            "outcomes": {
+              "cut": 10,
+              "whole": 10
+            }
+          },
+          "memberHeld": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "harnessLoopP99Ms": 1.8
+        },
+        {
+          "name": "ceiling",
+          "seconds": 152,
+          "quotaUs": 80000,
+          "peaks": {
+            "vmRssMiB": 248,
+            "vmHwmMiB": 248,
+            "heapUsedMiB": 43.4,
+            "externalMiB": 77.1,
+            "arrayBuffersMiB": 63.3,
+            "groupPeakMiB": 197.7,
+            "responsesHeldMiB": 60.5
+          },
+          "heapAfterGcUnderLoadMiB": 36.8,
+          "heapAfterGcMiB": 35.2,
+          "eventLoopMs": {
+            "p50": 0.2,
+            "p99": 7.9,
+            "max": 114.3
+          },
+          "cpuMs": 8924,
+          "cpuMsPerRequest": 15.71,
+          "cpuShare": 0.059,
+          "throttledPeriods": 0,
+          "throttledMs": 0,
+          "oomKills": 0,
+          "calls": {
+            "get_page_state": {
+              "latency": {
+                "count": 302,
+                "p50": 6.3,
+                "p95": 11.3,
+                "p99": 19.8,
+                "max": 37.4
+              },
+              "outcomes": {
+                "ok": 302
+              }
+            },
+            "get_page_state (second device)": {
+              "latency": {
+                "count": 104,
+                "p50": 6.3,
+                "p95": 13.8,
+                "p99": 46.5,
+                "max": 48.5
+              },
+              "outcomes": {
+                "ok": 104
+              }
+            },
+            "teacher set_view": {
+              "latency": {
+                "count": 76,
+                "p50": 13.7,
+                "p95": 32.7,
+                "p99": 74.4,
+                "max": 74.4
+              },
+              "outcomes": {
+                "ok": 76
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 568
+          },
+          "logLines": {
+            "info call": 176,
+            "warn mcp response cut off: its client read none of it for 30 s": 21
+          },
+          "cuts": {
+            "stall": 21,
+            "cap": 0,
+            "ceiling": 0
+          },
+          "held": {
+            "asked": 80,
+            "outcomes": {
+              "whole": 59,
+              "cut": 21
+            }
+          },
+          "memberHeld": {
+            "asked": 6,
+            "outcomes": {
+              "whole": 6
+            }
+          },
+          "harnessLoopP99Ms": 1.6
+        }
+      ],
+      "skipped": [],
+      "socketBuffers": "tcp_rmem and tcp_wmem set to \"4096 16384 65536\" in the run's own network namespace for the unread phases, from \"4096 131072 33554432\" and \"4096 16384 4194304\", and put back after",
+      "relayExit": "code 0",
+      "bars": [
+        {
+          "name": "peak RSS at most 400 MB",
+          "value": "248 MiB",
+          "pass": true
+        },
+        {
+          "name": "heap after GC, taken under load, at most 150 MiB",
+          "value": "36.8 MiB",
+          "pass": true
+        },
+        {
+          "name": "event loop p99 at most 50 ms at the burst quota",
+          "value": "8.7 ms",
+          "pass": true
+        },
+        {
+          "name": "teacher's set_view p95 at most 250 ms at the burst quota",
+          "value": "32.7 ms",
+          "pass": true
+        },
+        {
+          "name": "no guest 503",
+          "value": "0",
+          "pass": true
+        },
+        {
+          "name": "no member cut: the teacher's unread answers all end whole",
+          "value": "6 held, 0 cut",
+          "pass": true
+        },
+        {
+          "name": "every teacher call answered at the burst quota",
+          "value": "0 failed",
+          "pass": true
+        },
+        {
+          "name": "no OOM kill in the group",
+          "value": "0",
+          "pass": true
+        }
+      ]
+    },
+    {
+      "size": 80,
+      "pages": 1,
+      "settings": {
+        "TABDOCK_MAX_OBSERVERS_PER_PAGE": "80",
+        "TABDOCK_MAX_INVITEE_SESSIONS": "200"
+      },
+      "sharedAddress": false,
+      "confinement": {
+        "kind": "cgroup-v1",
+        "cpu": 3,
+        "notes": []
+      },
+      "answerBytes": {
+        "notes": 717262,
+        "capture": 86436
+      },
+      "rosterFrameMaxBytes": 27710,
+      "join": {
+        "students": 80,
+        "joined": 80,
+        "allJoinedSeconds": 142.3,
+        "joinedInFirstMinute": 29,
+        "signInRefusals": 80,
+        "claimRefusals": {
+          "429 rate_limited": 311
+        },
+        "waitSeconds": {
+          "p50": 40.2,
+          "p95": 120.2,
+          "max": 120.2
+        },
+        "sessionRefusals": 0
+      },
+      "phases": [
+        {
+          "name": "join",
+          "seconds": 145,
+          "quotaUs": 80000,
+          "peaks": {
+            "vmRssMiB": 166.5,
+            "vmHwmMiB": 171.7,
+            "heapUsedMiB": 38,
+            "externalMiB": 14.9,
+            "arrayBuffersMiB": 1,
+            "groupPeakMiB": 121.5,
+            "responsesHeldMiB": 0
+          },
+          "heapAfterGcUnderLoadMiB": 35.3,
+          "heapAfterGcMiB": 35.1,
+          "eventLoopMs": {
+            "p50": 0.3,
+            "p99": 4.4,
+            "max": 191.6
+          },
+          "cpuMs": 8444,
+          "cpuMsPerRequest": 5.93,
+          "cpuShare": 0.058,
+          "throttledPeriods": 5,
+          "throttledMs": 8,
+          "oomKills": 0,
+          "calls": {
+            "teacher set_view": {
+              "latency": {
+                "count": 72,
+                "p50": 16.1,
+                "p95": 24.4,
+                "p99": 439.2,
+                "max": 439.2
+              },
+              "outcomes": {
+                "ok": 72
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 634,
+            "http 303": 320,
+            "http 429": 311,
+            "http 202": 160
+          },
+          "logLines": {
+            "info mcp client": 240,
+            "warn redemption refused: too many for one invite": 225,
+            "info call": 88,
+            "warn redemption refused: too many pairings for one page": 86,
+            "info attach": 80,
+            "info attach request sent": 80,
+            "info attached": 80,
+            "info invite claim accepted": 80,
+            "info invite_redeemed": 80,
+            "info pair signed in": 80,
+            "warn pair sign-in refused: too many sign-ins in this window": 80,
+            "info attach_refused": 64,
+            "info invite closed": 4,
+            "info invite_closed": 4,
+            "info refused_summary": 2
+          },
+          "cuts": {
+            "stall": 0,
+            "cap": 0,
+            "ceiling": 0
+          },
+          "held": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "memberHeld": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "harnessLoopP99Ms": 3.7
+        },
+        {
+          "name": "class",
+          "seconds": 301,
+          "quotaUs": 80000,
+          "peaks": {
+            "vmRssMiB": 176.8,
+            "vmHwmMiB": 177.1,
+            "heapUsedMiB": 46.5,
+            "externalMiB": 14.4,
+            "arrayBuffersMiB": 0.5,
+            "groupPeakMiB": 127.2,
+            "responsesHeldMiB": 0
+          },
+          "heapAfterGcUnderLoadMiB": 38,
+          "heapAfterGcMiB": 37.7,
+          "eventLoopMs": {
+            "p50": 0.2,
+            "p99": 3.6,
+            "max": 124.3
+          },
+          "cpuMs": 21547,
+          "cpuMsPerRequest": 8.48,
+          "cpuShare": 0.072,
+          "throttledPeriods": 0,
+          "throttledMs": 0,
+          "oomKills": 0,
+          "calls": {
+            "teacher set_view": {
+              "latency": {
+                "count": 151,
+                "p50": 14.7,
+                "p95": 24,
+                "p99": 125.8,
+                "max": 215.2
+              },
+              "outcomes": {
+                "ok": 151
+              }
+            },
+            "get_page_state": {
+              "latency": {
+                "count": 1199,
+                "p50": 6.1,
+                "p95": 10.7,
+                "p99": 30.5,
+                "max": 129.1
+              },
+              "outcomes": {
+                "ok": 1199
+              }
+            },
+            "get_page_state (second device)": {
+              "latency": {
+                "count": 400,
+                "p50": 6.1,
+                "p95": 9.9,
+                "p99": 17.4,
+                "max": 23.9
+              },
+              "outcomes": {
+                "ok": 400
+              }
+            },
+            "get_view": {
+              "latency": {
+                "count": 166,
+                "p50": 11.8,
+                "p95": 22.5,
+                "p99": 31.6,
+                "max": 67.8
+              },
+              "outcomes": {
+                "rate_limited": 234,
+                "ok": 166
+              }
+            },
+            "propose go_to_stop": {
+              "latency": {
+                "count": 51,
+                "p50": 8.2,
+                "p95": 12.1,
+                "p99": 15.7,
+                "max": 15.7
+              },
+              "outcomes": {
+                "rate_limited": 87,
+                "ok": 51
+              }
+            },
+            "get_proposal (waits)": {
+              "latency": {
+                "count": 51,
+                "p50": 11742.9,
+                "p95": 19266.3,
+                "p99": 19562.8,
+                "max": 19562.8
+              },
+              "outcomes": {
+                "ok": 51
+              }
+            },
+            "capture_view": {
+              "latency": {
+                "count": 83,
+                "p50": 17.1,
+                "p95": 24.4,
+                "p99": 27.7,
+                "max": 27.7
+              },
+              "outcomes": {
+                "rate_limited": 118,
+                "ok": 83
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 2540
+          },
+          "logLines": {
+            "info call": 929,
+            "info proposal made": 51,
+            "info proposal dismissed": 41,
+            "info proposal_closed": 41,
+            "info proposal accepted on the page": 10,
+            "info refused_summary": 1
+          },
+          "cuts": {
+            "stall": 0,
+            "cap": 0,
+            "ceiling": 0
+          },
+          "held": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "memberHeld": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "harnessLoopP99Ms": 1.8
+        },
+        {
+          "name": "agents",
+          "seconds": 121,
+          "quotaUs": 80000,
+          "peaks": {
+            "vmRssMiB": 183.4,
+            "vmHwmMiB": 184.4,
+            "heapUsedMiB": 52.7,
+            "externalMiB": 14.2,
+            "arrayBuffersMiB": 0.3,
+            "groupPeakMiB": 134.7,
+            "responsesHeldMiB": 0
+          },
+          "heapAfterGcUnderLoadMiB": 40.5,
+          "heapAfterGcMiB": 39.9,
+          "eventLoopMs": {
+            "p50": 0.3,
+            "p99": 10.1,
+            "max": 101.2
+          },
+          "cpuMs": 37182,
+          "cpuMsPerRequest": 4.23,
+          "cpuShare": 0.307,
+          "throttledPeriods": 7,
+          "throttledMs": 9,
+          "oomKills": 0,
+          "calls": {
+            "wait_for_page_state": {
+              "latency": {
+                "count": 8730,
+                "p50": 5.6,
+                "p95": 13.3,
+                "p99": 78.5,
+                "max": 156
+              },
+              "outcomes": {
+                "ok": 8730
+              }
+            },
+            "teacher set_view": {
+              "latency": {
+                "count": 61,
+                "p50": 13.8,
+                "p95": 57.4,
+                "p99": 145.6,
+                "max": 145.6
+              },
+              "outcomes": {
+                "ok": 61
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 8791
+          },
+          "logLines": {
+            "info call": 90
+          },
+          "cuts": {
+            "stall": 0,
+            "cap": 0,
+            "ceiling": 0
+          },
+          "held": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "memberHeld": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "harnessLoopP99Ms": 2.1
+        },
+        {
+          "name": "class at the 6.25% baseline",
+          "seconds": 151,
+          "quotaUs": 5000,
+          "peaks": {
+            "vmRssMiB": 180.8,
+            "vmHwmMiB": 184.4,
+            "heapUsedMiB": 48.4,
+            "externalMiB": 15.4,
+            "arrayBuffersMiB": 1.5,
+            "groupPeakMiB": 132.7,
+            "responsesHeldMiB": 0
+          },
+          "heapAfterGcUnderLoadMiB": 40.2,
+          "heapAfterGcMiB": 39.9,
+          "eventLoopMs": {
+            "p50": 147.5,
+            "p99": 4150.7,
+            "max": 6155.6
+          },
+          "cpuMs": 9323,
+          "cpuMsPerRequest": 10.27,
+          "cpuShare": 0.062,
+          "throttledPeriods": 1887,
+          "throttledMs": 141072,
+          "oomKills": 0,
+          "calls": {
+            "teacher set_view": {
+              "latency": {
+                "count": 33,
+                "p50": 3359,
+                "p95": 10086.9,
+                "p99": 11036.3,
+                "max": 11036.3
+              },
+              "outcomes": {
+                "ok": 33
+              }
+            },
+            "get_page_state": {
+              "latency": {
+                "count": 324,
+                "p50": 3838.6,
+                "p95": 40394.1,
+                "p99": 52778.4,
+                "max": 59585.5
+              },
+              "outcomes": {
+                "ok": 324,
+                "thrown SdkError REQUEST_TIMEOUT": 46,
+                "thrown Error ECONNRESET": 1
+              }
+            },
+            "get_page_state (second device)": {
+              "latency": {
+                "count": 126,
+                "p50": 3949.2,
+                "p95": 50678,
+                "p99": 59743.7,
+                "max": 59991.7
+              },
+              "outcomes": {
+                "ok": 126,
+                "thrown SdkError REQUEST_TIMEOUT": 42
+              }
+            },
+            "get_view": {
+              "latency": {
+                "count": 68,
+                "p50": 6411.2,
+                "p95": 44216,
+                "p99": 50409.2,
+                "max": 50409.2
+              },
+              "outcomes": {
+                "ok": 68,
+                "page_busy": 36,
+                "thrown SdkError REQUEST_TIMEOUT": 10,
+                "rate_limited": 4,
+                "thrown Error ECONNRESET": 1
+              }
+            },
+            "propose go_to_stop": {
+              "latency": {
+                "count": 23,
+                "p50": 4719.7,
+                "p95": 9784.5,
+                "p99": 32010.9,
+                "max": 32010.9
+              },
+              "outcomes": {
+                "ok": 23,
+                "page_busy": 18,
+                "thrown SdkError REQUEST_TIMEOUT": 2,
+                "rate_limited": 1
+              }
+            },
+            "get_proposal (waits)": {
+              "latency": {
+                "count": 23,
+                "p50": 6481,
+                "p95": 18726.7,
+                "p99": 19360.4,
+                "max": 19360.4
+              },
+              "outcomes": {
+                "ok": 23
+              }
+            },
+            "capture_view": {
+              "latency": {
+                "count": 28,
+                "p50": 5363,
+                "p95": 12483.6,
+                "p99": 12562.4,
+                "max": 12562.4
+              },
+              "outcomes": {
+                "ok": 28,
+                "page_busy": 23,
+                "rate_limited": 1
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 808,
+            "http 202": 100
+          },
+          "logLines": {
+            "info call": 270,
+            "info proposal made": 24,
+            "info proposal dismissed": 17,
+            "info proposal_closed": 17,
+            "warn the argument check worker did not start in time; calls go to the page unchecked until another starts": 9,
+            "info proposal accepted on the page": 7,
+            "warn no argument check worker was ready; calls go to the page unchecked until one starts": 4,
+            "warn an argument check ran out of time; calls it overruns go to the page unchecked": 1
+          },
+          "cuts": {
+            "stall": 0,
+            "cap": 0,
+            "ceiling": 0
+          },
+          "held": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "memberHeld": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "harnessLoopP99Ms": 6.4
+        },
+        {
+          "name": "agents at the 6.25% baseline",
+          "seconds": 140,
+          "quotaUs": 5000,
+          "peaks": {
+            "vmRssMiB": 186.2,
+            "vmHwmMiB": 186.2,
+            "heapUsedMiB": 51.4,
+            "externalMiB": 14.5,
+            "arrayBuffersMiB": 0.7,
+            "groupPeakMiB": 136.4,
+            "responsesHeldMiB": 0
+          },
+          "heapAfterGcUnderLoadMiB": 40.7,
+          "heapAfterGcMiB": 40.6,
+          "eventLoopMs": {
+            "p50": 229.9,
+            "p99": 5748.8,
+            "max": 7749.5
+          },
+          "cpuMs": 8624,
+          "cpuMsPerRequest": 7.36,
+          "cpuShare": 0.061,
+          "throttledPeriods": 1755,
+          "throttledMs": 131189,
+          "oomKills": 0,
+          "calls": {
+            "wait_for_page_state": {
+              "latency": {
+                "count": 1171,
+                "p50": 3360.5,
+                "p95": 14646.4,
+                "p99": 51200.2,
+                "max": 58836.3
+              },
+              "outcomes": {
+                "ok": 1171,
+                "thrown SdkError REQUEST_TIMEOUT": 68,
+                "thrown Error ECONNRESET": 12
+              }
+            },
+            "teacher set_view": {
+              "latency": {
+                "count": 1,
+                "p50": 953.9,
+                "p95": 953.9,
+                "p99": 953.9,
+                "max": 953.9
+              },
+              "outcomes": {
+                "thrown SdkError REQUEST_TIMEOUT": 2,
+                "ok": 1
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 1172
+          },
+          "logLines": {
+            "info call": 23,
+            "error mcp adapter error (Error)": 3,
+            "warn the argument check worker did not start in time; calls go to the page unchecked until another starts": 3,
+            "error mcp adapter error": 2,
+            "info audit checkpoint": 1
+          },
+          "cuts": {
+            "stall": 0,
+            "cap": 0,
+            "ceiling": 0
+          },
+          "held": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "memberHeld": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "harnessLoopP99Ms": 1.6
+        },
+        {
+          "name": "stalled",
+          "seconds": 135,
+          "quotaUs": 80000,
+          "peaks": {
+            "vmRssMiB": 198.1,
+            "vmHwmMiB": 198.8,
+            "heapUsedMiB": 53.6,
+            "externalMiB": 21.7,
+            "arrayBuffersMiB": 7.9,
+            "groupPeakMiB": 149,
+            "responsesHeldMiB": 6.7
+          },
+          "heapAfterGcUnderLoadMiB": 41.3,
+          "heapAfterGcMiB": 40.7,
+          "eventLoopMs": {
+            "p50": 0.2,
+            "p99": 3.9,
+            "max": 181.9
+          },
+          "cpuMs": 9310,
+          "cpuMsPerRequest": 8.03,
+          "cpuShare": 0.069,
+          "throttledPeriods": 1,
+          "throttledMs": 2,
+          "oomKills": 0,
+          "calls": {
+            "teacher set_view": {
+              "latency": {
+                "count": 68,
+                "p50": 13.4,
+                "p95": 29,
+                "p99": 124.8,
+                "max": 124.8
+              },
+              "outcomes": {
+                "ok": 68
+              }
+            },
+            "get_page_state": {
+              "latency": {
+                "count": 527,
+                "p50": 5.7,
+                "p95": 10.3,
+                "p99": 15.5,
+                "max": 66.1
+              },
+              "outcomes": {
+                "ok": 527
+              }
+            },
+            "get_page_state (second device)": {
+              "latency": {
+                "count": 176,
+                "p50": 5.7,
+                "p95": 11.7,
+                "p99": 30.3,
+                "max": 36.6
+              },
+              "outcomes": {
+                "ok": 176
+              }
+            },
+            "get_view": {
+              "latency": {
+                "count": 71,
+                "p50": 11.3,
+                "p95": 20.8,
+                "p99": 39.8,
+                "max": 39.8
+              },
+              "outcomes": {
+                "rate_limited": 104,
+                "ok": 71
+              }
+            },
+            "propose go_to_stop": {
+              "latency": {
+                "count": 24,
+                "p50": 7.4,
+                "p95": 11,
+                "p99": 12,
+                "max": 12
+              },
+              "outcomes": {
+                "rate_limited": 38,
+                "ok": 24
+              }
+            },
+            "get_proposal (waits)": {
+              "latency": {
+                "count": 24,
+                "p50": 8299.6,
+                "p95": 17930.8,
+                "p99": 18859.1,
+                "max": 18859.1
+              },
+              "outcomes": {
+                "ok": 24
+              }
+            },
+            "capture_view": {
+              "latency": {
+                "count": 34,
+                "p50": 18.6,
+                "p95": 58.4,
+                "p99": 120,
+                "max": 120
+              },
+              "outcomes": {
+                "rate_limited": 54,
+                "ok": 34
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 1160
+          },
+          "logLines": {
+            "info call": 458,
+            "info proposal made": 24,
+            "info proposal dismissed": 19,
+            "info proposal_closed": 19,
+            "warn mcp response cut off: its client read none of it for 30 s": 9,
+            "info proposal accepted on the page": 5
+          },
+          "cuts": {
+            "stall": 9,
+            "cap": 0,
+            "ceiling": 0
+          },
+          "held": {
+            "asked": 40,
+            "outcomes": {
+              "rate_limited": 23,
+              "cut": 9,
+              "whole": 8
+            }
+          },
+          "memberHeld": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "harnessLoopP99Ms": 6.4
+        },
+        {
+          "name": "ceiling",
+          "seconds": 200,
+          "quotaUs": 80000,
+          "peaks": {
+            "vmRssMiB": 280,
+            "vmHwmMiB": 280.3,
+            "heapUsedMiB": 53.3,
+            "externalMiB": 104.8,
+            "arrayBuffersMiB": 90.9,
+            "groupPeakMiB": 231.2,
+            "responsesHeldMiB": 84.7
+          },
+          "heapAfterGcUnderLoadMiB": 43.5,
+          "heapAfterGcMiB": 41.2,
+          "eventLoopMs": {
+            "p50": 0.2,
+            "p99": 10,
+            "max": 256.7
+          },
+          "cpuMs": 18073,
+          "cpuMsPerRequest": 13.67,
+          "cpuShare": 0.091,
+          "throttledPeriods": 5,
+          "throttledMs": 4,
+          "oomKills": 0,
+          "calls": {
+            "get_page_state": {
+              "latency": {
+                "count": 790,
+                "p50": 6.2,
+                "p95": 15.1,
+                "p99": 46.9,
+                "max": 421.4
+              },
+              "outcomes": {
+                "ok": 790
+              }
+            },
+            "get_page_state (second device)": {
+              "latency": {
+                "count": 264,
+                "p50": 6.2,
+                "p95": 11.6,
+                "p99": 39.4,
+                "max": 62.3
+              },
+              "outcomes": {
+                "ok": 264
+              }
+            },
+            "teacher set_view": {
+              "latency": {
+                "count": 100,
+                "p50": 14.7,
+                "p95": 34.7,
+                "p99": 118.8,
+                "max": 285.6
+              },
+              "outcomes": {
+                "ok": 100
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 1322
+          },
+          "logLines": {
+            "info call": 288,
+            "warn mcp response cut off: its client read none of it for 30 s": 45
+          },
+          "cuts": {
+            "stall": 45,
+            "cap": 0,
+            "ceiling": 0
+          },
+          "held": {
+            "asked": 160,
+            "outcomes": {
+              "whole": 115,
+              "cut": 45
+            }
+          },
+          "memberHeld": {
+            "asked": 8,
+            "outcomes": {
+              "whole": 8
+            }
+          },
+          "harnessLoopP99Ms": 1.1
+        }
+      ],
+      "skipped": [],
+      "socketBuffers": "tcp_rmem and tcp_wmem set to \"4096 16384 65536\" in the run's own network namespace for the unread phases, from \"4096 131072 33554432\" and \"4096 16384 4194304\", and put back after",
+      "relayExit": "code 0",
+      "bars": [
+        {
+          "name": "peak RSS at most 400 MB",
+          "value": "280.3 MiB",
+          "pass": true
+        },
+        {
+          "name": "heap after GC, taken under load, at most 150 MiB",
+          "value": "43.5 MiB",
+          "pass": true
+        },
+        {
+          "name": "event loop p99 at most 50 ms at the burst quota",
+          "value": "10.1 ms",
+          "pass": true
+        },
+        {
+          "name": "teacher's set_view p95 at most 250 ms at the burst quota",
+          "value": "57.4 ms",
+          "pass": true
+        },
+        {
+          "name": "no guest 503",
+          "value": "0",
+          "pass": true
+        },
+        {
+          "name": "no member cut: the teacher's unread answers all end whole",
+          "value": "8 held, 0 cut",
+          "pass": true
+        },
+        {
+          "name": "every teacher call answered at the burst quota",
+          "value": "0 failed",
+          "pass": true
+        },
+        {
+          "name": "no OOM kill in the group",
+          "value": "0",
+          "pass": true
+        }
+      ]
+    },
+    {
+      "size": 40,
+      "pages": 2,
+      "settings": {
+        "TABDOCK_MAX_INVITEE_SESSIONS": "200"
+      },
+      "sharedAddress": false,
+      "confinement": {
+        "kind": "cgroup-v1",
+        "cpu": 3,
+        "notes": []
+      },
+      "answerBytes": {
+        "notes": 717262,
+        "capture": 86436
+      },
+      "rosterFrameMaxBytes": 14191,
+      "join": {
+        "students": 80,
+        "joined": 80,
+        "allJoinedSeconds": 69.4,
+        "joinedInFirstMinute": 58,
+        "signInRefusals": 80,
+        "claimRefusals": {
+          "429 rate_limited": 8
+        },
+        "waitSeconds": {
+          "p50": 0.2,
+          "p95": 40.2,
+          "max": 40.2
+        },
+        "sessionRefusals": 0
+      },
+      "phases": [
+        {
+          "name": "join",
+          "seconds": 71,
+          "quotaUs": 80000,
+          "peaks": {
+            "vmRssMiB": 163.7,
+            "vmHwmMiB": 163.7,
+            "heapUsedMiB": 40.3,
+            "externalMiB": 15,
+            "arrayBuffersMiB": 1.1,
+            "groupPeakMiB": 113.4,
+            "responsesHeldMiB": 0
+          },
+          "heapAfterGcUnderLoadMiB": 35.5,
+          "heapAfterGcMiB": 35.4,
+          "eventLoopMs": {
+            "p50": 0.2,
+            "p99": 5.7,
+            "max": 93.7
+          },
+          "cpuMs": 5722,
+          "cpuMsPerRequest": 5.1,
+          "cpuShare": 0.08,
+          "throttledPeriods": 0,
+          "throttledMs": 0,
+          "oomKills": 0,
+          "calls": {
+            "teacher set_view": {
+              "latency": {
+                "count": 70,
+                "p50": 18.6,
+                "p95": 43.3,
+                "p99": 729.3,
+                "max": 729.3
+              },
+              "outcomes": {
+                "ok": 70
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 634,
+            "http 303": 320,
+            "http 202": 160,
+            "http 429": 8
+          },
+          "logLines": {
+            "info mcp client": 240,
+            "info call": 118,
+            "info attach": 80,
+            "info attach request sent": 80,
+            "info attached": 80,
+            "info invite claim accepted": 80,
+            "info invite_redeemed": 80,
+            "info pair signed in": 80,
+            "warn pair sign-in refused: too many sign-ins in this window": 80,
+            "info attach_refused": 8,
+            "warn redemption refused: too many pairings for one page": 8,
+            "info invite closed": 4,
+            "info invite_closed": 4
+          },
+          "cuts": {
+            "stall": 0,
+            "cap": 0,
+            "ceiling": 0
+          },
+          "held": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "memberHeld": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "harnessLoopP99Ms": 2.7
+        },
+        {
+          "name": "class",
+          "seconds": 301,
+          "quotaUs": 80000,
+          "peaks": {
+            "vmRssMiB": 176.3,
+            "vmHwmMiB": 179.5,
+            "heapUsedMiB": 46.1,
+            "externalMiB": 15.5,
+            "arrayBuffersMiB": 1.7,
+            "groupPeakMiB": 129.9,
+            "responsesHeldMiB": 0
+          },
+          "heapAfterGcUnderLoadMiB": 38.5,
+          "heapAfterGcMiB": 37.8,
+          "eventLoopMs": {
+            "p50": 0.2,
+            "p99": 5.9,
+            "max": 110.3
+          },
+          "cpuMs": 22679,
+          "cpuMsPerRequest": 8.25,
+          "cpuShare": 0.075,
+          "throttledPeriods": 0,
+          "throttledMs": 0,
+          "oomKills": 0,
+          "calls": {
+            "get_page_state": {
+              "latency": {
+                "count": 1197,
+                "p50": 7.2,
+                "p95": 15.9,
+                "p99": 116,
+                "max": 160.7
+              },
+              "outcomes": {
+                "ok": 1197
+              }
+            },
+            "get_page_state (second device)": {
+              "latency": {
+                "count": 400,
+                "p50": 7.3,
+                "p95": 15.2,
+                "p99": 20,
+                "max": 48.1
+              },
+              "outcomes": {
+                "ok": 400
+              }
+            },
+            "teacher set_view": {
+              "latency": {
+                "count": 300,
+                "p50": 15.1,
+                "p95": 27.9,
+                "p99": 56.4,
+                "max": 150.5
+              },
+              "outcomes": {
+                "ok": 300
+              }
+            },
+            "get_view": {
+              "latency": {
+                "count": 324,
+                "p50": 14.8,
+                "p95": 23.6,
+                "p99": 29.2,
+                "max": 68.3
+              },
+              "outcomes": {
+                "ok": 324,
+                "rate_limited": 76
+              }
+            },
+            "capture_view": {
+              "latency": {
+                "count": 163,
+                "p50": 25.4,
+                "p95": 37.2,
+                "p99": 146.2,
+                "max": 153.5
+              },
+              "outcomes": {
+                "ok": 163,
+                "rate_limited": 39
+              }
+            },
+            "propose go_to_stop": {
+              "latency": {
+                "count": 113,
+                "p50": 11.5,
+                "p95": 20.9,
+                "p99": 26.7,
+                "max": 27.3
+              },
+              "outcomes": {
+                "ok": 113,
+                "rate_limited": 25
+              }
+            },
+            "get_proposal (waits)": {
+              "latency": {
+                "count": 113,
+                "p50": 9235.1,
+                "p95": 18326,
+                "p99": 19266.4,
+                "max": 19281.4
+              },
+              "outcomes": {
+                "ok": 113
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 2750
+          },
+          "logLines": {
+            "info call": 1130,
+            "info proposal made": 113,
+            "info proposal dismissed": 83,
+            "info proposal_closed": 83,
+            "info proposal accepted on the page": 30
+          },
+          "cuts": {
+            "stall": 0,
+            "cap": 0,
+            "ceiling": 0
+          },
+          "held": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "memberHeld": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "harnessLoopP99Ms": 1.2
+        },
+        {
+          "name": "agents",
+          "seconds": 121,
+          "quotaUs": 80000,
+          "peaks": {
+            "vmRssMiB": 181.4,
+            "vmHwmMiB": 181.5,
+            "heapUsedMiB": 52.5,
+            "externalMiB": 14.2,
+            "arrayBuffersMiB": 0.4,
+            "groupPeakMiB": 132,
+            "responsesHeldMiB": 0
+          },
+          "heapAfterGcUnderLoadMiB": 40.7,
+          "heapAfterGcMiB": 40.1,
+          "eventLoopMs": {
+            "p50": 0.2,
+            "p99": 10,
+            "max": 125.5
+          },
+          "cpuMs": 33568,
+          "cpuMsPerRequest": 3.79,
+          "cpuShare": 0.277,
+          "throttledPeriods": 0,
+          "throttledMs": 0,
+          "oomKills": 0,
+          "calls": {
+            "wait_for_page_state": {
+              "latency": {
+                "count": 8732,
+                "p50": 4.8,
+                "p95": 12.2,
+                "p99": 66.6,
+                "max": 146.1
+              },
+              "outcomes": {
+                "ok": 8732
+              }
+            },
+            "teacher set_view": {
+              "latency": {
+                "count": 120,
+                "p50": 12.4,
+                "p95": 98.7,
+                "p99": 158.4,
+                "max": 162.8
+              },
+              "outcomes": {
+                "ok": 120
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 8852
+          },
+          "logLines": {
+            "info call": 180
+          },
+          "cuts": {
+            "stall": 0,
+            "cap": 0,
+            "ceiling": 0
+          },
+          "held": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "memberHeld": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "harnessLoopP99Ms": 2.6
+        },
+        {
+          "name": "class at the 6.25% baseline",
+          "seconds": 159,
+          "quotaUs": 5000,
+          "peaks": {
+            "vmRssMiB": 177.8,
+            "vmHwmMiB": 181.5,
+            "heapUsedMiB": 48.3,
+            "externalMiB": 15.9,
+            "arrayBuffersMiB": 2,
+            "groupPeakMiB": 128.9,
+            "responsesHeldMiB": 0
+          },
+          "heapAfterGcUnderLoadMiB": 40.6,
+          "heapAfterGcMiB": 40.1,
+          "eventLoopMs": {
+            "p50": 0.3,
+            "p99": 3750.2,
+            "max": 6470.2
+          },
+          "cpuMs": 9603,
+          "cpuMsPerRequest": 10.37,
+          "cpuShare": 0.061,
+          "throttledPeriods": 1948,
+          "throttledMs": 145152,
+          "oomKills": 0,
+          "calls": {
+            "get_page_state": {
+              "latency": {
+                "count": 343,
+                "p50": 4376.9,
+                "p95": 39009,
+                "p99": 48361.5,
+                "max": 59810.6
+              },
+              "outcomes": {
+                "ok": 343,
+                "thrown SdkError REQUEST_TIMEOUT": 36,
+                "thrown Error ECONNRESET": 5
+              }
+            },
+            "get_page_state (second device)": {
+              "latency": {
+                "count": 136,
+                "p50": 4510.5,
+                "p95": 39118.6,
+                "p99": 55372.8,
+                "max": 59954.9
+              },
+              "outcomes": {
+                "ok": 136,
+                "thrown SdkError REQUEST_TIMEOUT": 22,
+                "thrown Error ECONNRESET": 10
+              }
+            },
+            "teacher set_view": {
+              "latency": {
+                "count": 68,
+                "p50": 1835.7,
+                "p95": 10639.7,
+                "p99": 13916,
+                "max": 13916
+              },
+              "outcomes": {
+                "ok": 68
+              }
+            },
+            "get_view": {
+              "latency": {
+                "count": 111,
+                "p50": 6880.9,
+                "p95": 38208.3,
+                "p99": 48523.6,
+                "max": 48830.4
+              },
+              "outcomes": {
+                "ok": 111,
+                "page_busy": 12,
+                "thrown SdkError REQUEST_TIMEOUT": 2,
+                "thrown Error ECONNRESET": 1
+              }
+            },
+            "capture_view": {
+              "latency": {
+                "count": 57,
+                "p50": 6801.1,
+                "p95": 14958,
+                "p99": 39773.8,
+                "max": 39773.8
+              },
+              "outcomes": {
+                "ok": 57
+              }
+            },
+            "propose go_to_stop": {
+              "latency": {
+                "count": 36,
+                "p50": 5960.6,
+                "p95": 11755.9,
+                "p99": 11759.3,
+                "max": 11759.3
+              },
+              "outcomes": {
+                "ok": 36,
+                "page_busy": 6,
+                "thrown SdkError REQUEST_TIMEOUT": 1
+              }
+            },
+            "get_proposal (waits)": {
+              "latency": {
+                "count": 36,
+                "p50": 8951.5,
+                "p95": 18958.5,
+                "p99": 19200.6,
+                "max": 19200.6
+              },
+              "outcomes": {
+                "ok": 36
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 866,
+            "http 202": 60
+          },
+          "logLines": {
+            "info call": 331,
+            "info proposal made": 37,
+            "info proposal dismissed": 23,
+            "info proposal_closed": 23,
+            "info proposal accepted on the page": 14,
+            "warn no argument check worker was ready; calls go to the page unchecked until one starts": 8,
+            "warn the argument check worker did not start in time; calls go to the page unchecked until another starts": 8,
+            "warn an argument check could not start in time behind another; calls go to the page unchecked while the checker is busy": 1,
+            "warn an argument check ran out of time; calls it overruns go to the page unchecked": 1
+          },
+          "cuts": {
+            "stall": 0,
+            "cap": 0,
+            "ceiling": 0
+          },
+          "held": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "memberHeld": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "harnessLoopP99Ms": 1.2
+        },
+        {
+          "name": "agents at the 6.25% baseline",
+          "seconds": 140,
+          "quotaUs": 5000,
+          "peaks": {
+            "vmRssMiB": 185.9,
+            "vmHwmMiB": 185.9,
+            "heapUsedMiB": 52.8,
+            "externalMiB": 14.8,
+            "arrayBuffersMiB": 0.9,
+            "groupPeakMiB": 136.5,
+            "responsesHeldMiB": 0
+          },
+          "heapAfterGcUnderLoadMiB": 41.2,
+          "heapAfterGcMiB": 40.8,
+          "eventLoopMs": {
+            "p50": 151.5,
+            "p99": 5509.7,
+            "max": 8475.1
+          },
+          "cpuMs": 8607,
+          "cpuMsPerRequest": 7.86,
+          "cpuShare": 0.061,
+          "throttledPeriods": 1753,
+          "throttledMs": 131075,
+          "oomKills": 0,
+          "calls": {
+            "wait_for_page_state": {
+              "latency": {
+                "count": 1062,
+                "p50": 3121.9,
+                "p95": 13443.9,
+                "p99": 36376.1,
+                "max": 54683.8
+              },
+              "outcomes": {
+                "ok": 1062,
+                "thrown SdkError REQUEST_TIMEOUT": 82,
+                "thrown Error ECONNRESET": 13
+              }
+            },
+            "teacher set_view": {
+              "latency": {
+                "count": 33,
+                "p50": 2960.1,
+                "p95": 15519.5,
+                "p99": 16473.8,
+                "max": 16473.8
+              },
+              "outcomes": {
+                "ok": 33,
+                "thrown SdkError REQUEST_TIMEOUT": 2
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 1095
+          },
+          "logLines": {
+            "info call": 77,
+            "warn the argument check worker did not start in time; calls go to the page unchecked until another starts": 4,
+            "error mcp adapter error": 1,
+            "info audit checkpoint": 1
+          },
+          "cuts": {
+            "stall": 0,
+            "cap": 0,
+            "ceiling": 0
+          },
+          "held": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "memberHeld": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "harnessLoopP99Ms": 2.6
+        },
+        {
+          "name": "stalled",
+          "seconds": 115,
+          "quotaUs": 80000,
+          "peaks": {
+            "vmRssMiB": 202.8,
+            "vmHwmMiB": 203.4,
+            "heapUsedMiB": 52.9,
+            "externalMiB": 31.7,
+            "arrayBuffersMiB": 17.8,
+            "groupPeakMiB": 154.3,
+            "responsesHeldMiB": 14.9
+          },
+          "heapAfterGcUnderLoadMiB": 41.4,
+          "heapAfterGcMiB": 40.8,
+          "eventLoopMs": {
+            "p50": 0.2,
+            "p99": 6.3,
+            "max": 120.4
+          },
+          "cpuMs": 8929,
+          "cpuMsPerRequest": 8.41,
+          "cpuShare": 0.077,
+          "throttledPeriods": 0,
+          "throttledMs": 0,
+          "oomKills": 0,
+          "calls": {
+            "get_page_state": {
+              "latency": {
+                "count": 440,
+                "p50": 6.7,
+                "p95": 12.3,
+                "p99": 23.8,
+                "max": 104
+              },
+              "outcomes": {
+                "ok": 440
+              }
+            },
+            "get_page_state (second device)": {
+              "latency": {
+                "count": 152,
+                "p50": 6.4,
+                "p95": 13.2,
+                "p99": 30.8,
+                "max": 31.9
+              },
+              "outcomes": {
+                "ok": 152
+              }
+            },
+            "teacher set_view": {
+              "latency": {
+                "count": 116,
+                "p50": 15.8,
+                "p95": 36.6,
+                "p99": 60.4,
+                "max": 69.3
+              },
+              "outcomes": {
+                "ok": 116
+              }
+            },
+            "get_view": {
+              "latency": {
+                "count": 112,
+                "p50": 14.1,
+                "p95": 24.2,
+                "p99": 174.9,
+                "max": 193.7
+              },
+              "outcomes": {
+                "ok": 112,
+                "rate_limited": 36
+              }
+            },
+            "capture_view": {
+              "latency": {
+                "count": 50,
+                "p50": 27.7,
+                "p95": 56.4,
+                "p99": 133.4,
+                "max": 133.4
+              },
+              "outcomes": {
+                "ok": 50,
+                "rate_limited": 24
+              }
+            },
+            "propose go_to_stop": {
+              "latency": {
+                "count": 38,
+                "p50": 11.7,
+                "p95": 18.9,
+                "p99": 21.5,
+                "max": 21.5
+              },
+              "outcomes": {
+                "ok": 38,
+                "rate_limited": 16
+              }
+            },
+            "get_proposal (waits)": {
+              "latency": {
+                "count": 38,
+                "p50": 7975.2,
+                "p95": 18852.6,
+                "p99": 18857.1,
+                "max": 18857.1
+              },
+              "outcomes": {
+                "ok": 38
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 1062
+          },
+          "logLines": {
+            "info call": 502,
+            "info proposal made": 38,
+            "info proposal dismissed": 28,
+            "info proposal_closed": 28,
+            "warn mcp response cut off: its client read none of it for 30 s": 20,
+            "info proposal accepted on the page": 10,
+            "info mcp client": 2
+          },
+          "cuts": {
+            "stall": 20,
+            "cap": 0,
+            "ceiling": 0
+          },
+          "held": {
+            "asked": 40,
+            "outcomes": {
+              "cut": 20,
+              "whole": 20
+            }
+          },
+          "memberHeld": {
+            "asked": 0,
+            "outcomes": {}
+          },
+          "harnessLoopP99Ms": 7.1
+        },
+        {
+          "name": "ceiling",
+          "seconds": 152,
+          "quotaUs": 80000,
+          "peaks": {
+            "vmRssMiB": 292.7,
+            "vmHwmMiB": 293.9,
+            "heapUsedMiB": 53.2,
+            "externalMiB": 120,
+            "arrayBuffersMiB": 106.2,
+            "groupPeakMiB": 245.1,
+            "responsesHeldMiB": 95.5
+          },
+          "heapAfterGcUnderLoadMiB": 43.6,
+          "heapAfterGcMiB": 41.2,
+          "eventLoopMs": {
+            "p50": 0.2,
+            "p99": 11.7,
+            "max": 184.4
+          },
+          "cpuMs": 16840,
+          "cpuMsPerRequest": 14.82,
+          "cpuShare": 0.11,
+          "throttledPeriods": 1,
+          "throttledMs": 0,
+          "oomKills": 0,
+          "calls": {
+            "get_page_state": {
+              "latency": {
+                "count": 604,
+                "p50": 7.4,
+                "p95": 26.2,
+                "p99": 93,
+                "max": 154
+              },
+              "outcomes": {
+                "ok": 604
+              }
+            },
+            "get_page_state (second device)": {
+              "latency": {
+                "count": 208,
+                "p50": 7.8,
+                "p95": 20,
+                "p99": 92.6,
+                "max": 132.8
+              },
+              "outcomes": {
+                "ok": 208
+              }
+            },
+            "teacher set_view": {
+              "latency": {
+                "count": 152,
+                "p50": 13.5,
+                "p95": 50,
+                "p99": 139.8,
+                "max": 154.1
+              },
+              "outcomes": {
+                "ok": 152
+              }
+            }
+          },
+          "statuses": {
+            "http 200": 1136
+          },
+          "logLines": {
+            "info call": 352,
+            "warn mcp response cut off: its client read none of it for 30 s": 46,
+            "warn mcp response cut off: responses waiting to be read hold all the relay lets invited accounts hold": 28
+          },
+          "cuts": {
+            "stall": 46,
+            "cap": 0,
+            "ceiling": 28
+          },
+          "held": {
+            "asked": 160,
+            "outcomes": {
+              "whole": 86,
+              "cut": 74
+            }
+          },
+          "memberHeld": {
+            "asked": 12,
+            "outcomes": {
+              "whole": 12
+            }
+          },
+          "harnessLoopP99Ms": 31.7
+        }
+      ],
+      "skipped": [],
+      "socketBuffers": "tcp_rmem and tcp_wmem set to \"4096 16384 65536\" in the run's own network namespace for the unread phases, from \"4096 131072 33554432\" and \"4096 16384 4194304\", and put back after",
+      "relayExit": "code 0",
+      "bars": [
+        {
+          "name": "peak RSS at most 400 MB",
+          "value": "293.9 MiB",
+          "pass": true
+        },
+        {
+          "name": "heap after GC, taken under load, at most 150 MiB",
+          "value": "43.6 MiB",
+          "pass": true
+        },
+        {
+          "name": "event loop p99 at most 50 ms at the burst quota",
+          "value": "11.7 ms",
+          "pass": true
+        },
+        {
+          "name": "teacher's set_view p95 at most 250 ms at the burst quota",
+          "value": "98.7 ms",
+          "pass": true
+        },
+        {
+          "name": "no guest 503",
+          "value": "0",
+          "pass": true
+        },
+        {
+          "name": "no member cut: the teacher's unread answers all end whole",
+          "value": "12 held, 0 cut",
+          "pass": true
+        },
+        {
+          "name": "every teacher call answered at the burst quota",
+          "value": "0 failed",
+          "pass": true
+        },
+        {
+          "name": "no OOM kill in the group",
+          "value": "0",
+          "pass": true
+        }
+      ]
+    }
+  ],
+  "sharedAddressJoin": {
+    "size": 40,
+    "pages": 1,
+    "settings": {},
+    "sharedAddress": true,
+    "confinement": {
+      "kind": "cgroup-v1",
+      "cpu": 3,
+      "notes": []
+    },
+    "answerBytes": {
+      "notes": 717262,
+      "capture": 86436
+    },
+    "rosterFrameMaxBytes": 10542,
+    "join": {
+      "students": 40,
+      "joined": 40,
+      "allJoinedSeconds": 190,
+      "joinedInFirstMinute": 10,
+      "signInRefusals": 321,
+      "claimRefusals": {},
+      "waitSeconds": {
+        "p50": 40.2,
+        "p95": 180.2,
+        "max": 180.3
+      },
+      "sessionRefusals": 0
+    },
+    "phases": [
+      {
+        "name": "join",
+        "seconds": 191,
+        "quotaUs": 80000,
+        "peaks": {
+          "vmRssMiB": 158.8,
+          "vmHwmMiB": 161.6,
+          "heapUsedMiB": 34.1,
+          "externalMiB": 14.9,
+          "arrayBuffersMiB": 1,
+          "groupPeakMiB": 107.8,
+          "responsesHeldMiB": 0
+        },
+        "heapAfterGcUnderLoadMiB": 30.7,
+        "heapAfterGcMiB": 30.7,
+        "eventLoopMs": {
+          "p50": 0.2,
+          "p99": 2.2,
+          "max": 110.4
+        },
+        "cpuMs": 6679,
+        "cpuMsPerRequest": 5.66,
+        "cpuShare": 0.035,
+        "throttledPeriods": 0,
+        "throttledMs": 0,
+        "oomKills": 0,
+        "calls": {
+          "teacher set_view": {
+            "latency": {
+              "count": 95,
+              "p50": 15.3,
+              "p95": 22.7,
+              "p99": 38.3,
+              "max": 38.3
+            },
+            "outcomes": {
+              "ok": 95
+            }
+          }
+        },
+        "statuses": {
+          "http 303": 722,
+          "http 200": 377,
+          "http 202": 80
+        },
+        "logLines": {
+          "warn pair sign-in refused: too many sign-ins from one address in this window": 321,
+          "info mcp client": 120,
+          "info call": 118,
+          "info attach": 40,
+          "info attach request sent": 40,
+          "info attached": 40,
+          "info invite claim accepted": 40,
+          "info invite_redeemed": 40,
+          "info pair signed in": 40,
+          "info invite closed": 2,
+          "info invite_closed": 2
+        },
+        "cuts": {
+          "stall": 0,
+          "cap": 0,
+          "ceiling": 0
+        },
+        "held": {
+          "asked": 0,
+          "outcomes": {}
+        },
+        "memberHeld": {
+          "asked": 0,
+          "outcomes": {}
+        },
+        "harnessLoopP99Ms": 3.9
+      }
+    ],
+    "skipped": [],
+    "socketBuffers": "not narrowed: no phase left answers unread",
+    "relayExit": "code 0"
+  },
+  "frames": {
+    "runs": [
+      {
+        "tool": "none",
+        "callsPerSecond": 0,
+        "seconds": 40,
+        "frames": 2400,
+        "late": 0,
+        "p99Ms": 16.8,
+        "maxMs": 16.8,
+        "outcomes": {}
+      },
+      {
+        "tool": "capture_view",
+        "callsPerSecond": 0.5,
+        "seconds": 40,
+        "frames": 2516,
+        "late": 4,
+        "p99Ms": 16.8,
+        "maxMs": 33.3,
+        "outcomes": {
+          "ok": 21
+        }
+      },
+      {
+        "tool": "capture_view",
+        "callsPerSecond": 1,
+        "seconds": 40,
+        "frames": 2443,
+        "late": 15,
+        "p99Ms": 16.8,
+        "maxMs": 50,
+        "outcomes": {
+          "ok": 41
+        }
+      },
+      {
+        "tool": "capture_view",
+        "callsPerSecond": 2,
+        "seconds": 40,
+        "frames": 2370,
+        "late": 47,
+        "p99Ms": 33.3,
+        "maxMs": 83.3,
+        "outcomes": {
+          "ok": 81
+        }
+      },
+      {
+        "tool": "capture_view",
+        "callsPerSecond": 4,
+        "seconds": 40,
+        "frames": 2388,
+        "late": 27,
+        "p99Ms": 33.3,
+        "maxMs": 33.4,
+        "outcomes": {
+          "ok": 161
+        }
+      },
+      {
+        "tool": "get_view",
+        "callsPerSecond": 1,
+        "seconds": 40,
+        "frames": 2455,
+        "late": 5,
+        "p99Ms": 16.8,
+        "maxMs": 50,
+        "outcomes": {
+          "ok": 41
+        }
+      },
+      {
+        "tool": "get_view",
+        "callsPerSecond": 2,
+        "seconds": 40,
+        "frames": 2397,
+        "late": 10,
+        "p99Ms": 16.8,
+        "maxMs": 216.6,
+        "outcomes": {
+          "ok": 81
+        }
+      },
+      {
+        "tool": "get_view",
+        "callsPerSecond": 4,
+        "seconds": 40,
+        "frames": 2411,
+        "late": 5,
+        "p99Ms": 16.8,
+        "maxMs": 33.4,
+        "outcomes": {
+          "ok": 161
+        }
+      },
+      {
+        "tool": "get_view",
+        "callsPerSecond": 20,
+        "seconds": 40,
+        "frames": 1996,
+        "late": 321,
+        "p99Ms": 50.1,
+        "maxMs": 83.4,
+        "outcomes": {
+          "ok": 801
+        }
+      }
+    ],
+    "browser": "141.0.7390.37"
+  },
+  "moreFrames": [
+    {
+      "runs": [
+        {
+          "tool": "none",
+          "callsPerSecond": 0,
+          "seconds": 40,
+          "frames": 2401,
+          "late": 0,
+          "p99Ms": 16.8,
+          "maxMs": 16.8,
+          "outcomes": {}
+        },
+        {
+          "tool": "capture_view",
+          "callsPerSecond": 0.5,
+          "seconds": 40,
+          "frames": 2397,
+          "late": 2,
+          "p99Ms": 16.8,
+          "maxMs": 50,
+          "outcomes": {
+            "ok": 20
+          }
+        },
+        {
+          "tool": "capture_view",
+          "callsPerSecond": 1,
+          "seconds": 40,
+          "frames": 2393,
+          "late": 7,
+          "p99Ms": 16.8,
+          "maxMs": 50,
+          "outcomes": {
+            "ok": 40
+          }
+        },
+        {
+          "tool": "capture_view",
+          "callsPerSecond": 2,
+          "seconds": 40,
+          "frames": 2382,
+          "late": 34,
+          "p99Ms": 33.3,
+          "maxMs": 66.7,
+          "outcomes": {
+            "ok": 81
+          }
+        },
+        {
+          "tool": "capture_view",
+          "callsPerSecond": 4,
+          "seconds": 40,
+          "frames": 2387,
+          "late": 29,
+          "p99Ms": 33.3,
+          "maxMs": 50.1,
+          "outcomes": {
+            "ok": 161
+          }
+        },
+        {
+          "tool": "get_view",
+          "callsPerSecond": 1,
+          "seconds": 40,
+          "frames": 2454,
+          "late": 6,
+          "p99Ms": 16.8,
+          "maxMs": 50.1,
+          "outcomes": {
+            "ok": 41
+          }
+        },
+        {
+          "tool": "get_view",
+          "callsPerSecond": 2,
+          "seconds": 40,
+          "frames": 2426,
+          "late": 3,
+          "p99Ms": 16.8,
+          "maxMs": 50,
+          "outcomes": {
+            "ok": 81
+          }
+        },
+        {
+          "tool": "get_view",
+          "callsPerSecond": 4,
+          "seconds": 40,
+          "frames": 2410,
+          "late": 5,
+          "p99Ms": 16.8,
+          "maxMs": 33.4,
+          "outcomes": {
+            "ok": 161
+          }
+        },
+        {
+          "tool": "get_view",
+          "callsPerSecond": 20,
+          "seconds": 40,
+          "frames": 2227,
+          "late": 162,
+          "p99Ms": 33.4,
+          "maxMs": 50.1,
+          "outcomes": {
+            "ok": 800
+          }
+        }
+      ],
+      "browser": "141.0.7390.37"
+    },
+    {
+      "runs": [
+        {
+          "tool": "none",
+          "callsPerSecond": 0,
+          "seconds": 40,
+          "frames": 2398,
+          "late": 2,
+          "p99Ms": 16.8,
+          "maxMs": 33.4,
+          "outcomes": {}
+        },
+        {
+          "tool": "capture_view",
+          "callsPerSecond": 0.5,
+          "seconds": 40,
+          "frames": 2519,
+          "late": 1,
+          "p99Ms": 16.8,
+          "maxMs": 33.3,
+          "outcomes": {
+            "ok": 21
+          }
+        },
+        {
+          "tool": "capture_view",
+          "callsPerSecond": 1,
+          "seconds": 40,
+          "frames": 2393,
+          "late": 7,
+          "p99Ms": 16.8,
+          "maxMs": 50,
+          "outcomes": {
+            "ok": 40
+          }
+        },
+        {
+          "tool": "capture_view",
+          "callsPerSecond": 2,
+          "seconds": 40,
+          "frames": 2384,
+          "late": 42,
+          "p99Ms": 33.3,
+          "maxMs": 50,
+          "outcomes": {
+            "ok": 81
+          }
+        },
+        {
+          "tool": "capture_view",
+          "callsPerSecond": 4,
+          "seconds": 40,
+          "frames": 2356,
+          "late": 45,
+          "p99Ms": 33.3,
+          "maxMs": 33.4,
+          "outcomes": {
+            "ok": 160
+          }
+        },
+        {
+          "tool": "get_view",
+          "callsPerSecond": 1,
+          "seconds": 40,
+          "frames": 2460,
+          "late": 1,
+          "p99Ms": 16.8,
+          "maxMs": 33.3,
+          "outcomes": {
+            "ok": 41
+          }
+        },
+        {
+          "tool": "get_view",
+          "callsPerSecond": 2,
+          "seconds": 40,
+          "frames": 2418,
+          "late": 10,
+          "p99Ms": 16.8,
+          "maxMs": 50,
+          "outcomes": {
+            "ok": 81
+          }
+        },
+        {
+          "tool": "get_view",
+          "callsPerSecond": 4,
+          "seconds": 40,
+          "frames": 2412,
+          "late": 4,
+          "p99Ms": 16.8,
+          "maxMs": 33.4,
+          "outcomes": {
+            "ok": 161
+          }
+        },
+        {
+          "tool": "get_view",
+          "callsPerSecond": 20,
+          "seconds": 40,
+          "frames": 2137,
+          "late": 204,
+          "p99Ms": 50,
+          "maxMs": 83.4,
+          "outcomes": {
+            "ok": 800
+          }
+        }
+      ],
+      "browser": "141.0.7390.37"
+    },
+    {
+      "runs": [
+        {
+          "tool": "none",
+          "callsPerSecond": 0,
+          "seconds": 40,
+          "frames": 2399,
+          "late": 1,
+          "p99Ms": 16.8,
+          "maxMs": 33.3,
+          "outcomes": {}
+        },
+        {
+          "tool": "capture_view",
+          "callsPerSecond": 0.5,
+          "seconds": 40,
+          "frames": 2518,
+          "late": 3,
+          "p99Ms": 16.8,
+          "maxMs": 33.3,
+          "outcomes": {
+            "ok": 21
+          }
+        },
+        {
+          "tool": "capture_view",
+          "callsPerSecond": 1,
+          "seconds": 40,
+          "frames": 2387,
+          "late": 13,
+          "p99Ms": 16.8,
+          "maxMs": 50,
+          "outcomes": {
+            "ok": 40
+          }
+        },
+        {
+          "tool": "capture_view",
+          "callsPerSecond": 2,
+          "seconds": 40,
+          "frames": 2361,
+          "late": 35,
+          "p99Ms": 33.3,
+          "maxMs": 50.1,
+          "outcomes": {
+            "ok": 80
+          }
+        },
+        {
+          "tool": "capture_view",
+          "callsPerSecond": 4,
+          "seconds": 40,
+          "frames": 2384,
+          "late": 26,
+          "p99Ms": 33.3,
+          "maxMs": 50.1,
+          "outcomes": {
+            "ok": 161
+          }
+        },
+        {
+          "tool": "get_view",
+          "callsPerSecond": 1,
+          "seconds": 40,
+          "frames": 2459,
+          "late": 1,
+          "p99Ms": 16.8,
+          "maxMs": 33.4,
+          "outcomes": {
+            "ok": 41
+          }
+        },
+        {
+          "tool": "get_view",
+          "callsPerSecond": 2,
+          "seconds": 40,
+          "frames": 2420,
+          "late": 8,
+          "p99Ms": 16.8,
+          "maxMs": 66.6,
+          "outcomes": {
+            "ok": 81
+          }
+        },
+        {
+          "tool": "get_view",
+          "callsPerSecond": 4,
+          "seconds": 40,
+          "frames": 2405,
+          "late": 9,
+          "p99Ms": 16.8,
+          "maxMs": 50,
+          "outcomes": {
+            "ok": 161
+          }
+        },
+        {
+          "tool": "get_view",
+          "callsPerSecond": 20,
+          "seconds": 40,
+          "frames": 2061,
+          "late": 239,
+          "p99Ms": 66.6,
+          "maxMs": 100,
+          "outcomes": {
+            "ok": 801
+          }
+        }
+      ],
+      "browser": "141.0.7390.37"
+    },
+    {
+      "runs": [
+        {
+          "tool": "none",
+          "callsPerSecond": 0,
+          "seconds": 40,
+          "frames": 2394,
+          "late": 4,
+          "p99Ms": 16.8,
+          "maxMs": 50.1,
+          "outcomes": {}
+        },
+        {
+          "tool": "capture_view",
+          "callsPerSecond": 0.5,
+          "seconds": 40,
+          "frames": 2520,
+          "late": 1,
+          "p99Ms": 16.8,
+          "maxMs": 33.3,
+          "outcomes": {
+            "ok": 21
+          }
+        },
+        {
+          "tool": "capture_view",
+          "callsPerSecond": 1,
+          "seconds": 40,
+          "frames": 2447,
+          "late": 14,
+          "p99Ms": 16.8,
+          "maxMs": 33.4,
+          "outcomes": {
+            "ok": 41
+          }
+        },
+        {
+          "tool": "capture_view",
+          "callsPerSecond": 2,
+          "seconds": 40,
+          "frames": 2393,
+          "late": 31,
+          "p99Ms": 33.3,
+          "maxMs": 50.1,
+          "outcomes": {
+            "ok": 81
+          }
+        },
+        {
+          "tool": "capture_view",
+          "callsPerSecond": 4,
+          "seconds": 40,
+          "frames": 2353,
+          "late": 45,
+          "p99Ms": 33.3,
+          "maxMs": 50,
+          "outcomes": {
+            "ok": 160
+          }
+        },
+        {
+          "tool": "get_view",
+          "callsPerSecond": 1,
+          "seconds": 40,
+          "frames": 2457,
+          "late": 4,
+          "p99Ms": 16.8,
+          "maxMs": 33.4,
+          "outcomes": {
+            "ok": 41
+          }
+        },
+        {
+          "tool": "get_view",
+          "callsPerSecond": 2,
+          "seconds": 40,
+          "frames": 2431,
+          "late": 0,
+          "p99Ms": 16.8,
+          "maxMs": 16.8,
+          "outcomes": {
+            "ok": 81
+          }
+        },
+        {
+          "tool": "get_view",
+          "callsPerSecond": 4,
+          "seconds": 40,
+          "frames": 2404,
+          "late": 9,
+          "p99Ms": 16.8,
+          "maxMs": 50,
+          "outcomes": {
+            "ok": 161
+          }
+        },
+        {
+          "tool": "get_view",
+          "callsPerSecond": 20,
+          "seconds": 40,
+          "frames": 2081,
+          "late": 268,
+          "p99Ms": 50,
+          "maxMs": 66.8,
+          "outcomes": {
+            "ok": 801
+          }
+        }
+      ],
+      "browser": "141.0.7390.37"
+    }
+  ],
+  "failures": []
+}

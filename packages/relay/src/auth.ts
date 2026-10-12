@@ -15,9 +15,11 @@
 
 import type { IncomingMessage } from 'node:http';
 import {
+  agentKeyInput,
   EmailSchema,
   IdSchema,
   INVITEE_ID_PREFIX,
+  INVITEE_KEY_HEX_CHARS,
   INVITEE_SHORT_ID_CHARS,
   InviteeIdSchema,
   MAX_DISPLAY_NAME_CHARS,
@@ -30,7 +32,8 @@ import {
 } from '@tabdock/protocol';
 import { z } from 'zod';
 import type { Logger } from './log.ts';
-import { digest, sameDigest } from './secrets.ts';
+import type { MemberList } from './members.ts';
+import { digest, digestHex, sameDigest } from './secrets.ts';
 
 export interface AuthRefusal {
   kind: 'refused';
@@ -157,6 +160,23 @@ export function inviteeUser(
 }
 
 /**
+ * The user an agent token's requests come from (ADR 0044): an invitee by its
+ * id, so every bound on invitees holds for it with no kind of its own, the
+ * id being g_ and the first 32 hex characters of SHA-256 over
+ * agentKeyInput, which takes in the page, so no two pages share an agent
+ * and none is a signed-in account (S13). The relay names it `agent <short
+ * id>`, never by its label, which is page text (S10); it has no email.
+ */
+export function agentUser(pageId: string, tokenId: string): AuthUser {
+  const key = digestHex(agentKeyInput(pageId, tokenId)).slice(0, INVITEE_KEY_HEX_CHARS);
+  return {
+    userId: `${INVITEE_ID_PREFIX}${key}`,
+    displayName: `agent ${key.slice(0, INVITEE_SHORT_ID_CHARS)}`,
+    account: { kind: 'invitee', email: null },
+  };
+}
+
+/**
  * ADR 0017: g_ starts an invitee's id and no member's, so a member listed
  * with one is refused at start rather than failing every request later.
  */
@@ -248,6 +268,20 @@ export interface AuthPlugin {
   readonly routes?: ReadonlyMap<string, AuthRoute> | undefined;
   /** Present on a plugin that signs people in at a provider; public URL mode needs it for /pair. */
   readonly browserSignIn?: BrowserSignIn | undefined;
+  /**
+   * The live member list a plugin maps subjects through, on the oauth plugin.
+   * A members file (TABDOCK_MEMBERS_FILE) replaces its entries while the
+   * relay runs, so the request after a reload maps as the file now says
+   * (ADR 0043); a plugin without one cannot take a members file.
+   */
+  readonly members?: MemberList | undefined;
+  /**
+   * The answer to a request the relay signed in and then found a member list
+   * change had ended its user id while its body was on its way (ADR 0043): a
+   * 401 whose challenge has the client sign in again, which only the plugin
+   * can write. A plugin with `members` gives it.
+   */
+  signInAgain?(): Promise<AuthRefusal>;
   /**
    * Set on a plugin whose credential is good only on this machine, as local
    * mode's owner token is (ADR 0022). resolveConfig refuses a plugin so

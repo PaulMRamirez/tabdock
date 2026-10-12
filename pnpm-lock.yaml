@@ -128,10 +128,28 @@ importers:
       ws:
         specifier: 8.22.0
         version: 8.22.0
+      zod:
+        specifier: 4.6.5
+        version: 4.6.5
     devDependencies:
       '@types/ws':
         specifier: 8.18.2
         version: 8.18.2
+
+  tests/ci-check:
+    devDependencies:
+      '@modelcontextprotocol/client':
+        specifier: 2.3.1
+        version: 2.3.1
+      '@playwright/test':
+        specifier: 1.56.1
+        version: 1.56.1
+      '@tabdock/adapter':
+        specifier: workspace:*
+        version: link:../../packages/adapter
+      zod:
+        specifier: 4.6.5
+        version: 4.6.5
 
   tests/e2e:
     devDependencies:
@@ -150,9 +168,15 @@ importers:
       '@tabdock/adapter':
         specifier: workspace:*
         version: link:../../packages/adapter
+      '@tabdock/ci-check':
+        specifier: workspace:*
+        version: link:../ci-check
       '@tabdock/demo':
         specifier: workspace:*
         version: link:../../apps/demo
+      '@tabdock/map-page':
+        specifier: workspace:*
+        version: link:../map-page
       '@tabdock/mcpb6':
         specifier: workspace:*
         version: link:../mcpb6
@@ -184,14 +208,34 @@ importers:
         specifier: 8.22.0
         version: 8.22.0
 
+  tests/map-page:
+    dependencies:
+      '@mcp-b/webmcp-polyfill':
+        specifier: 5.1.0
+        version: 5.1.0
+      '@tabdock/adapter':
+        specifier: workspace:*
+        version: link:../../packages/adapter
+      '@tabdock/sim-page':
+        specifier: workspace:*
+        version: link:../../packages/sim-page
+    devDependencies:
+      esbuild:
+        specifier: 0.28.2
+        version: 0.28.2
+
   tests/mcpb6:
     dependencies:
-      webmcp-local-relay-6-beta:
-        specifier: npm:@mcp-b/webmcp-local-relay@6.0.0-beta.20261001010549
-        version: '@mcp-b/webmcp-local-relay@6.0.0-beta.20261001010549'
-      webmcp-polyfill-6-beta:
-        specifier: npm:@mcp-b/webmcp-polyfill@6.0.0-beta.20261001010549
-        version: '@mcp-b/webmcp-polyfill@6.0.0-beta.20261001010549'
+      webmcp-local-relay-6:
+        specifier: npm:@mcp-b/webmcp-local-relay@6.0.0
+        version: '@mcp-b/webmcp-local-relay@6.0.0'
+      webmcp-polyfill-6:
+        specifier: npm:@mcp-b/webmcp-polyfill@6.0.0
+        version: '@mcp-b/webmcp-polyfill@6.0.0'
+    devDependencies:
+      esbuild:
+        specifier: 0.28.2
+        version: 0.28.2
 
 packages:
 
@@ -446,8 +490,8 @@ packages:
     engines: {node: '>=22'}
     hasBin: true
 
-  '@mcp-b/webmcp-local-relay@6.0.0-beta.20261001010549':
-    resolution: {integrity: sha512-7ErnbBHHDmHbzdg2+OTH7B/ryvfxsXDxubstI1BHGHdkxybH+BoTiVHMKEtEliLJPKXjGcs0QmDGCFKdRepMFw==}
+  '@mcp-b/webmcp-local-relay@6.0.0':
+    resolution: {integrity: sha512-5gwHqy4krDAe9Go4edqmVZ2A+L+rOuQs50Sq6S2nzcVZk8JCbKVaDzgm289t/1dC4IgumBDWl511K12T5j5/3g==}
     engines: {node: '>=22'}
     hasBin: true
 
@@ -455,8 +499,8 @@ packages:
     resolution: {integrity: sha512-KL09hniFssPY8HBO3qzurWPqm+1JYRwV3wx6x2XSySgo+6BL1XHGsHGIoAO7U9zzigv7TA5keNBoZ+3P1jq18g==}
     engines: {node: '>=20'}
 
-  '@mcp-b/webmcp-polyfill@6.0.0-beta.20261001010549':
-    resolution: {integrity: sha512-xIFrgRBXfVEK0vThMYqcTUilX51hKV4oX5M13WpYJOg8FwScJwLWQYaBavtY2MrVNnPu8gmyVDvvO5wC8mrPhg==}
+  '@mcp-b/webmcp-polyfill@6.0.0':
+    resolution: {integrity: sha512-Z1wYbaYjwEM1FjxHFyw1oRgDAuLCjcQYeAOHtNNlqZ3n1aVA44Ci0kQrnpi7gySZbeiva2zMEU8XO6EG5MS8FA==}
     engines: {node: '>=20'}
 
   '@mcp-b/webmcp-types@5.1.0':
@@ -1881,7 +1925,7 @@ snapshots:
       - bufferutil
       - utf-8-validate
 
-  '@mcp-b/webmcp-local-relay@6.0.0-beta.20261001010549':
+  '@mcp-b/webmcp-local-relay@6.0.0':
     dependencies:
       '@modelcontextprotocol/core': 2.0.0
       '@modelcontextprotocol/server': 2.0.0
@@ -1896,7 +1940,7 @@ snapshots:
       '@mcp-b/webmcp-types': 5.1.0
       '@standard-schema/spec': 1.1.0
 
-  '@mcp-b/webmcp-polyfill@6.0.0-beta.20261001010549':
+  '@mcp-b/webmcp-polyfill@6.0.0':
     dependencies:
       webmcp-types: 0.1.9
 

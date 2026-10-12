@@ -1,23 +1,33 @@
 import { describe, expect, it } from 'vitest';
 import { Board } from './board.ts';
+import type { CaptureOptions } from './capture.ts';
 import { createTools, type ToolCall } from './tools.ts';
 import type { ModelContextTool } from './webmcp.ts';
 
 function setup() {
   const board = new Board();
   const calls: ToolCall[] = [];
-  const tools = createTools(board, (call) => calls.push(call));
+  const captures: CaptureOptions[] = [];
+  // A stand-in for capture.ts, which needs a canvas: it records what it was asked for.
+  const tools = createTools(
+    board,
+    (call) => calls.push(call),
+    (options) => {
+      captures.push(options);
+      return { data: 'data:image/webp;base64,UklGRg==', width: 400, height: 250, bytes: 4 };
+    },
+  );
   const byName = new Map(tools.map((t) => [t.name, t]));
   const tool = (name: string): ModelContextTool => {
     const found = byName.get(name);
     if (!found) throw new Error(`missing tool ${name}`);
     return found;
   };
-  return { board, calls, tools, tool };
+  return { board, calls, tools, tool, captures };
 }
 
 describe('demo tools', () => {
-  it('registers exactly the six tools from SPEC.md section 4 with the right annotations', () => {
+  it('registers exactly the seven tools from SPEC.md section 4 with the right annotations', () => {
     const { tools } = setup();
     expect(tools.map((t) => [t.name, t.annotations])).toEqual([
       ['get_view', { readOnlyHint: true }],
@@ -26,7 +36,35 @@ describe('demo tools', () => {
       ['move_view', { readOnlyHint: false }],
       ['highlight_item', { readOnlyHint: false, untrustedContentHint: true }],
       ['clear_board', { readOnlyHint: false, consequentialHint: true }],
+      ['capture_board', { readOnlyHint: true, untrustedContentHint: true }],
     ]);
+  });
+
+  it('answers capture_board with an image envelope of the view, in the format asked for', async () => {
+    const { board, tool, calls, captures } = setup();
+    board.addItem({ label: 'A', x: 0, y: 0 });
+    const result = await tool('capture_board').execute({ format: 'png', maxEdge: 400 });
+    expect(captures).toEqual([{ format: 'png', maxEdge: 400 }]);
+    expect(result).toEqual({
+      image: { data: 'data:image/webp;base64,UklGRg==' },
+      text: 'Board view: centre (0, 0), zoom 1, 1 items, 400 by 250 pixels',
+    });
+    await tool('capture_board').execute({});
+    expect(captures[1]).toEqual({ format: 'webp', maxEdge: 1024 });
+    await expect(tool('capture_board').execute({ maxEdge: 64 })).rejects.toThrow(/Invalid/);
+    await expect(tool('capture_board').execute({ format: 'svg' })).rejects.toThrow(/Invalid/);
+    expect(calls.map((call) => [call.tool, call.ok])).toEqual([
+      ['capture_board', true],
+      ['capture_board', true],
+      ['capture_board', false],
+      ['capture_board', false],
+    ]);
+  });
+
+  it('refuses capture_board on a page that gave it no way to capture', async () => {
+    const tools = createTools(new Board());
+    const capture = tools.find((each) => each.name === 'capture_board');
+    await expect(capture?.execute({})).rejects.toThrow(/no canvas/);
   });
 
   it('publishes plain, serialisable JSON Schemas that forbid unknown arguments', () => {

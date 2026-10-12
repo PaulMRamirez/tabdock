@@ -21,14 +21,16 @@ import {
   type Tabdock,
 } from '../src/tabdock-harness.ts';
 
-// A5.4: the adapter's call, cancel and consequential specs on MCP-B's 6.0
-// beta polyfill (M5 decision D4, ADR 0031). The demo page and the adapter it
-// bundles run unchanged; src/mcpb6-page.ts installs the beta before the page's
-// own scripts, so its 5.1.0 initializeWebMCPPolyfill() finds a context and
-// steps aside. The playwright.config.ts project "mcpb6" runs this file
-// without the flag that turns native WebMCP on, and every test first proves
-// the context is 6's, so a pass can never be 5.1.0's or Chrome's. On 6 the adapter takes the
-// path it takes on native Chrome (ADR 0001's notes): no __isWebMCPPolyfill
+// A5.4 and A6.26: the adapter's call, cancel and consequential specs on
+// MCP-B's 6.0.0 polyfill (ADR 0047; the beta before it, M5 decision D4 and
+// ADR 0031). The demo page and the adapter it bundles run unchanged;
+// src/mcpb6-page.ts loads 6.0.0's module before the page's own scripts and
+// calls installWebMCP(), since importing it installs nothing, so the page's
+// 5.1.0 initializeWebMCPPolyfill() finds a context and steps aside. The
+// playwright.config.ts project "mcpb6" runs this file without the flag that
+// turns native WebMCP on, and every test first proves the context is 6's, so
+// a pass can never be 5.1.0's or Chrome's. On 6 the adapter takes the path
+// it takes on native Chrome (ADR 0001's notes): no __isWebMCPPolyfill
 // marker, an object input taken the first time, consequentialHint reported,
 // and the caller's signal handed to the handler, so a revoke or a client's
 // cancel aborts it. Results arrive as 6 gives them, a plain string quoted and
@@ -152,15 +154,16 @@ function resultsFromPage(callId: string): string[] {
 }
 
 /**
- * Opens the demo on the beta and proves that is what runs: the polyfill
- * installed over nothing, no 5.1.0 marker or navigator alias, and 6's own
- * refusal of a JSON string.
+ * Opens the demo on 6.0.0 and proves that is what runs: the module loaded
+ * over nothing and installed nothing until installWebMCP() ran, no 5.1.0
+ * marker or navigator alias, and 6's own refusal of a JSON string.
  */
 async function openOnMcpb6(page: Page): Promise<string> {
   await page.goto(tabdock.pageUrl);
   await page.waitForSelector('html[data-tools="ready"]');
   expect(await mcpb6Runtime(page)).toEqual({
     hadContextBefore: false,
+    installedOnImport: false,
     installed: true,
     marker: undefined,
     navigatorAlias: false,
@@ -214,7 +217,7 @@ async function registerTool(
     await context.registerTool({
       name,
       title: name,
-      description: `A tool the 6.0 leg registers: ${name}.`,
+      description: `A tool the 6.0.0 leg registers: ${name}.`,
       inputSchema: { type: 'object', properties: {} },
       annotations,
       execute: () => returns,
@@ -265,13 +268,14 @@ async function registerSlowWrite(page: Page): Promise<void> {
   });
 }
 
-test('call: on the 6.0 beta a driver lists and calls tools, the object input is taken the first time, and results arrive as 6 gives them', async ({
+test('call: on 6.0.0 a driver lists and calls tools, the object input is taken the first time, and results arrive as 6 gives them', async ({
   page,
 }) => {
   const pageId = await openOnMcpb6(page);
   expect(await pairByClick(page)).toBe(pageId);
-  expect((await waitForToolCount(pageId, 6)).sort()).toEqual([
+  expect((await waitForToolCount(pageId, 7)).sort()).toEqual([
     'add_item',
+    'capture_board',
     'clear_board',
     'get_view',
     'highlight_item',
@@ -290,10 +294,10 @@ test('call: on the 6.0 beta a driver lists and calls tools, the object input is 
   const added = await callTool(client, 'call_page_tool', {
     page: pageId,
     tool: 'add_item',
-    arguments: { label: 'From the 6.0 leg', x: 120, y: 80, color: 'purple' },
+    arguments: { label: 'From the 6.0.0 leg', x: 120, y: 80, color: 'purple' },
   });
   expect(added.isError, added.text).toBe(false);
-  expect(added.structured).toMatchObject({ item: { id: 'item-4', label: 'From the 6.0 leg' } });
+  expect(added.structured).toMatchObject({ item: { id: 'item-4', label: 'From the 6.0.0 leg' } });
   await expect(page.locator('[data-role="view"]')).toHaveText(/4 items/);
 
   // 6 serializes every result as JSON, so a handler's plain text arrives quoted,
@@ -303,7 +307,7 @@ test('call: on the 6.0 beta a driver lists and calls tools, the object input is 
     annotations: { readOnlyHint: true },
     returns: 'plain text',
   });
-  await waitForToolCount(pageId, 7);
+  await waitForToolCount(pageId, 8);
   const plain = await callTool(client, 'call_page_tool', { page: pageId, tool: 'say_plain' });
   expect(plain.isError, plain.text).toBe(false);
   expect(plain.text).toBe(`${untrustedHeader(origin, 'say_plain')}\n"plain text"`);
@@ -339,7 +343,7 @@ test("cancel: Revoke ends a running and a queued write with not_attached, and th
   const pageId = await openOnMcpb6(page);
   expect(await pairByClick(page)).toBe(pageId);
   await registerSlowWrite(page);
-  await waitForToolCount(pageId, 7);
+  await waitForToolCount(pageId, 8);
   // Her attachment covers every client she uses; this one speaks 2026-07-28.
   const aliceModern = await connectMcp(tabdock.relay, tabdock.users.alice, ALICE_MODERN_CLIENT, {
     modern: true,
@@ -402,7 +406,7 @@ test("cancel: a client's cancellation reaches the page as cancel and aborts the 
   const pageId = await openOnMcpb6(page);
   expect(await pairByClick(page)).toBe(pageId);
   await registerSlowWrite(page);
-  await waitForToolCount(pageId, 7);
+  await waitForToolCount(pageId, 8);
 
   const abort = new AbortController();
   const pending = client
@@ -447,7 +451,7 @@ test('consequential: clear_board prompts on the page and Deny returns denied_by_
 }) => {
   const pageId = await openOnMcpb6(page);
   expect(await pairByClick(page)).toBe(pageId);
-  await waitForToolCount(pageId, 6);
+  await waitForToolCount(pageId, 7);
   // 6 keeps the demo's consequentialHint and reports all four hints, where 5.1.0 drops it.
   expect(
     await page.evaluate(async () => {
@@ -483,7 +487,7 @@ test('consequential: clear_board prompts on the page and Deny returns denied_by_
     annotations: { readOnlyHint: false, consequentialHint: true },
     returns: 'stamped',
   });
-  await waitForToolCount(pageId, 7);
+  await waitForToolCount(pageId, 8);
   const stamping = callTool(client, 'call_page_tool', { page: pageId, tool: 'stamp_board' });
   const hinted = await waitForDock(page, (s) => s.pendingConfirms[0]);
   expect(hinted.tool).toBe('stamp_board');
@@ -510,6 +514,7 @@ test('consequential: clear_board prompts on the page and Deny returns denied_by_
   expect(Object.fromEntries(marks ?? [])).toEqual({
     get_view: 'unmarked',
     list_items: 'unmarked',
+    capture_board: 'unmarked',
     add_item: 'unmarked',
     move_view: 'unmarked',
     highlight_item: 'unmarked',

@@ -31,14 +31,19 @@
 // within its address's budget (hub.ts). Every 2026-07-28 request spends the
 // caller's request budget once, and an /mcp response its client leaves unread
 // is cut off once it stops moving, or once its user has more such responses
-// than they may (response-stalls.ts, ADRs 0030 and 0032).
+// than they may, or, an invited account's, once all the responses waiting
+// hold more than the relay lets them (response-stalls.ts, ADRs 0030, 0032
+// and 0044).
 // The client address that /page and /pair count by, and that /mcp's refusal
 // line names, comes from one place (client-address.ts), which answers 400 on
 // a route that counts by address when a host edge names no client (ADR 0018).
 // With an audit directory (production, local mode, or TABDOCK_AUDIT_DIR) the
 // audit log is a FileAuditLog there, bracketed by relay_start and relay_stop
 // records so a restart shows as a gap (ADR 0019); production refuses to start
-// without one, or if relay_start does not reach the disk. The plugin says who
+// without one, or if relay_start does not reach the disk. With
+// TABDOCK_RESTART_SNAPSHOT on, a graceful stop also writes a snapshot of the
+// hub's store there, which the next start loads only when the log binds it to
+// that stop (snapshot.ts, ADR 0046). The plugin says who
 // someone is and the relay decides whether an invitee may in (ADR 0020). The
 // M3 spike's measurements (spike.ts) hook in here when TABDOCK_SPIKE is on;
 // nothing over HTTP controls them.
@@ -61,11 +66,14 @@ import {
   readRequestBody,
 } from '@modelcontextprotocol/server';
 import {
+  AGENT_PATH,
   AUDIT_VERSION,
   type AuditCallEvent,
   type AuditEvent,
+  type ClientInfo,
   InviteeIdSchema,
   MAX_FRAME_BYTES,
+  snapshotCounts,
   SUBPROTOCOL,
 } from '@tabdock/protocol';
 import { WebSocketServer } from 'ws';
@@ -95,6 +103,14 @@ import { EMPTY_FIRST_CLASS, PageHub } from './hub.ts';
 import { ListenStreams } from './listen-streams.ts';
 import { createLogger, type Logger } from './log.ts';
 import {
+  loadMembersFile,
+  type MemberChange,
+  type MembersReload,
+  type MembersWatch,
+  settlingMembers,
+  watchMembersFile,
+} from './members.ts';
+import {
   type AuthExtra,
   AuthExtraSchema,
   BUDGET_CODE,
@@ -104,6 +120,7 @@ import {
   createRequestBudget,
   envelopeOf,
   FIXED_TOOL_NAMES,
+  parseClientInfo,
   RELAY_VERSION,
   userIdOf,
 } from './mcp.ts';
@@ -113,10 +130,41 @@ import { createPairFlow, PAIR_ROUTES, type PairFlow } from './pair.ts';
 import { createRepeatedLog, errorKind } from './repeated-lines.ts';
 import { requestHeapBytes } from './request-heap.ts';
 import { inSlices, ResponseStalls } from './response-stalls.ts';
-import { type InviteeSessionOptions, McpSessions } from './sessions.ts';
+import { type InviteeSessionOptions, McpSessions, rankOf } from './sessions.ts';
 import { createSignInGate } from './sign-in-gate.ts';
+import {
+  credentialsDigest,
+  fitProblem,
+  removeTemporaryFiles,
+  snapshotAccounts,
+  takeSnapshot,
+  writeSnapshot,
+} from './snapshot.ts';
 import { Spike, type SpikeControl } from './spike.ts';
 import { type AuditLog, callRecords, createMemoryStore, recordAudit } from './store.ts';
+
+/**
+ * The longest a 2025-era session a member list change ended stays open to
+ * finish answering, so the answers the hub just gave its calls are written
+ * (ADR 0043). One with nothing open closes at once, and one answering
+ * closes when its last response is done; this bounds a client's listening
+ * GET stream, which never ends on its own. It serves no new request meanwhile.
+ */
+export const MEMBER_SESSIONS_CLOSE_MS = 1000;
+
+/**
+ * A bare sign-in challenge, for a request a member list change ended on its
+ * way when the plugin writes none of its own (AuthPlugin.signInAgain).
+ */
+const SIGN_IN_AGAIN: AuthRefusal = {
+  kind: 'refused',
+  status: 401,
+  reason: 'membership changed',
+  body: 'Unauthorized',
+  headers: { 'WWW-Authenticate': 'Bearer' },
+  accountKind: null,
+  oauthClientId: null,
+};
 
 export interface Relay {
   /** http://127.0.0.1:<port> */
@@ -136,6 +184,13 @@ export interface Relay {
    * from the relay's own process only (main.ts reads it from stdin).
    */
   readonly spike: SpikeControl | null;
+  /**
+   * Reads the members file now, without waiting for the poll to see it
+   * settle, and applies it if its text changed (ADR 0043): 'refused' keeps
+   * the list in force. Without a members file there is nothing to read, and
+   * it answers 'unchanged'.
+   */
+  reloadMembers(): Promise<MembersReload>;
   close(): Promise<void>;
 }
 
@@ -202,6 +257,13 @@ const MAX_MCP_BODY_BYTES = 2 * MAX_FRAME_BYTES;
  * it, and whatever the request carried may stay with it (A4.3).
  */
 const MAX_LISTEN_BODY_BYTES = 16 * 1024;
+
+/**
+ * The most of a /g/mcp body parsed to name its client in a token's prompt.
+ * An initialize or a discover naming one is a few hundred bytes, and only
+ * the leg past the per-user heap measure parses anything larger (ADR 0044).
+ */
+export const MAX_AGENT_NAMING_BYTES = 16 * 1024;
 
 /** A JSON-RPC error answer, shaped as the SDK shapes its own. */
 function jsonRpcError(status: number, code: number, message: string, id: unknown = null): Response {
@@ -272,7 +334,7 @@ async function readModernBody(request: Request): Promise<ModernBody> {
  * `toolAnswers` says whether one past the budget still goes on, to be
  * refused in the dispatcher with its audit record: a tools/call the SDK's
  * own schema takes, whose requestState the SDK will not refuse first, naming
- * one of the five fixed tools, refused in that tool's own words as in M4,
+ * one of the fixed tools, refused in that tool's own words as in M4,
  * or, while first-class tools are on, a first-class name, refused as
  * call_page_tool is, so both routes answer and record a call past the budget
  * alike (SPEC section 7, ADR 0025's notes). relay.ts answers any other
@@ -406,9 +468,52 @@ const ORIGIN_REFUSAL = JSON.stringify({
   id: null,
 });
 
-/** Paths the relay answers whatever its mode; any other is logged as OTHER_ROUTE. */
+/**
+ * Paths the relay answers whatever its mode; any other is logged as
+ * OTHER_ROUTE. /g/mcp joins them only while agent tokens are on (ADR 0044),
+ * and is otherwise a path like any other the relay does not serve.
+ */
 const FIXED_ROUTES: readonly string[] = ['/healthz', '/mcp', '/page', ...PAIR_ROUTES];
+const AGENT_ROUTES: readonly string[] = [AGENT_PATH];
 const OTHER_ROUTE = '(other)';
+
+/**
+ * /g/mcp's one answer to a missing, malformed, unknown, expired or closed
+ * token, alike (ADR 0044): never 401, which would start a sign-in in some
+ * clients, nor 403, with no challenge and no resource metadata, and before
+ * the body is read. The connection closes after it, so a body the client
+ * still sends is never read either.
+ */
+const AGENT_NOT_FOUND = JSON.stringify({
+  jsonrpc: '2.0',
+  error: { code: -32001, message: 'Not found' },
+  id: null,
+});
+
+/** The bearer token an Authorization header carries, or null; checked against AgentTokenSchema later. */
+function bearerOf(header: string | undefined): string | null {
+  const match = /^Bearer ([\x21-\x7e]{1,128})$/.exec(header ?? '');
+  return match?.[1] ?? null;
+}
+
+/**
+ * The client a /g/mcp request names: initialize's clientInfo on a 2025-era
+ * session, the envelope's on 2026-07-28; null when it names none. Self-declared,
+ * so capped and made plain (parseClientInfo); for the prompt, never a check.
+ */
+function agentClientOf(bytes: ArrayBuffer): ClientInfo | null {
+  let message: unknown;
+  try {
+    message = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+  } catch {
+    // Not JSON: the leg answers it, and it names no client.
+    return null;
+  }
+  const first: unknown = Array.isArray(message) ? (message as unknown[])[0] : message;
+  if (!isJSONRPCRequest(first)) return null;
+  if (first.method === 'initialize') return parseClientInfo(recordAt(first.params, 'clientInfo'));
+  return envelopeOf(first)?.client ?? null;
+}
 
 function pathOf(rawUrl: string | undefined): string | null {
   const raw = rawUrl ?? '/';
@@ -513,6 +618,15 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     ...(options.logLevel ? { level: options.logLevel } : {}),
   });
   const auth = options.auth;
+  // The members file, read before anything starts, so a file the relay cannot
+  // use stops it, naming a line at most, and the list in force from the first
+  // request is the file's (ADR 0043). resolveConfig refused a file beside a
+  // plugin that keeps no member list.
+  const members = config.membersFile === null ? null : (auth.members ?? null);
+  if (config.membersFile !== null && members !== null) {
+    const { entries, digest } = loadMembersFile(config.membersFile, options.membersSystem);
+    if (digest !== members.digest) members.replace(entries, digest);
+  }
   // Before the plugin starts, so a directory the relay cannot use sets nothing going.
   const fileAudit = openAudit(config, options, log);
   // Then, before anything else exists: a plugin that cannot work (an identity
@@ -526,6 +640,42 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     throw error;
   }
   const store = options.store ?? createMemoryStore(fileAudit ? { audit: fileAudit } : {});
+  // The restart snapshot a graceful stop left (ADR 0046), taken now: after
+  // the log is open, so its lock is held and its last line whole, and before
+  // relay_start, whose line ends the binding to the stop that wrote it.
+  // Taken whatever the setting, so a file an earlier run left never waits
+  // on disk; it is applied below, once the hub exists. A temporary file a
+  // stop cut short left goes first, unread, for the same reason.
+  const leftover = fileAudit === null ? 0 : removeTemporaryFiles(fileAudit.dir);
+  if (leftover > 0) {
+    log.warn('removed restart snapshot files a stop cut short left, unread', { files: leftover });
+  }
+  // A rotated /pair client refuses a snapshot written under the old one.
+  const snapshotCredentials = credentialsDigest(options.pairClient);
+  const taken =
+    fileAudit === null
+      ? null
+      : takeSnapshot({
+          dir: fileAudit.dir,
+          enabled: config.restartSnapshot,
+          now: Date.now(),
+          mode: config.mode,
+          credentials: snapshotCredentials,
+        });
+  if (taken?.kind === 'refused') {
+    // Fixed words only: never a value from the file.
+    const fields = { reason: taken.reason, removed: taken.removed };
+    // A file still on disk holds names and titles whichever way the setting
+    // is, and "off means gone" (ADR 0046's notes) has failed, so the
+    // operator is warned to remove it, never told it went.
+    if (!taken.removed) {
+      log.warn('restart snapshot left on disk and not loaded; remove it by hand', fields);
+    } else if (config.restartSnapshot) {
+      log.warn('restart snapshot not loaded; starting fresh', fields);
+    } else {
+      log.info('removed a restart snapshot an earlier run left, unread', fields);
+    }
+  }
   // Only a log that outlives the process marks its starts and stops; a memory
   // ring forgets everything at a restart anyway.
   if (fileAudit !== null) {
@@ -537,6 +687,8 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       env: config.env,
       mode: config.mode,
       invites: config.invites,
+      agentTokens: config.agentTokens,
+      restartSnapshot: config.restartSnapshot,
     });
     // Production serves no one until its first record is on disk (ADR 0019).
     if (!fileAudit.sync() && config.env === 'production') {
@@ -556,6 +708,83 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   };
   const spike = config.spike ? new Spike(log, MAX_MCP_BODY_BYTES) : null;
   const hub = new PageHub(config, store, log, spike);
+  // A revoke bar names the account, found through the list the plugin maps subjects with (S14).
+  const accountList = auth.members;
+  if (accountList !== undefined) {
+    hub.useAccountIds((userId) => accountList.accountIdOf(userId));
+  }
+  if (taken?.kind === 'loaded') {
+    const unfit = fitProblem(taken.snapshot, config);
+    if (unfit !== null) {
+      log.warn('restart snapshot not loaded; starting fresh', { reason: unfit, removed: true });
+    } else {
+      try {
+        // The member list in force, the members file's when one is named, read above.
+        hub.restoreSnapshot(taken.snapshot, {
+          ageMs: taken.ageMs,
+          accounts: snapshotAccounts(auth.members ?? null),
+        });
+      } catch (error) {
+        // A store half put back is never served; the file is gone, so the next start is fresh.
+        await hub.shutdown();
+        await closeAudit(store.audit);
+        auth.stop?.();
+        throw error;
+      }
+    }
+  }
+  /**
+   * Whether a member list change is in force that settleMembers has not
+   * finished ending (members.ts, settlingMembers keeps it owed): set when a
+   * settle begins, cleared only when one finishes with every step done.
+   */
+  let membersUnsettled = false;
+  /**
+   * At a graceful stop with the setting on (ADR 0046): the hub's store, once
+   * it takes no more work, into the snapshot file, and its digest into the
+   * log, which relay_stop follows at once. Anything that goes wrong writes no
+   * record, so the next start finds nothing bound and starts fresh; the stop
+   * itself goes on whatever happens here.
+   */
+  const writeRestartSnapshot = (): void => {
+    if (!config.restartSnapshot || fileAudit === null) return;
+    if (membersUnsettled) {
+      // The list in force has not yet ended what it took away (settleMembers
+      // threw part way, so the change is owed): keyed to that list, the file
+      // would hand a moved id's attachments to whoever the id names now
+      // (S8, S13). With none written, the next start ends everything.
+      log.error('restart snapshot not written', {
+        reason: 'a member list change is still unsettled',
+      });
+      return;
+    }
+    let outcome: ReturnType<typeof writeSnapshot>;
+    let snapshot: ReturnType<typeof hub.exportSnapshot>;
+    try {
+      snapshot = hub.exportSnapshot(
+        Date.now(),
+        snapshotAccounts(auth.members ?? null).memberKey,
+        snapshotCredentials,
+      );
+      outcome = writeSnapshot(fileAudit.dir, snapshot);
+    } catch (error) {
+      log.error('restart snapshot not written', { reason: errorKind(error) });
+      return;
+    }
+    if (outcome.kind === 'refused') {
+      // An error, not a warning: the operator turned the setting on, and the
+      // next start will end every attachment instead of resuming them.
+      log.error('restart snapshot not written', { reason: outcome.reason });
+      return;
+    }
+    recordAudit(store.audit, log, {
+      v: AUDIT_VERSION,
+      type: 'snapshot_written',
+      at: Date.now(),
+      ...snapshotCounts(snapshot),
+      sha256: outcome.sha256,
+    });
+  };
   const addresses = createClientAddresses(config, log);
   const refusals = createAuthRefusalLog(log);
   let pair: PairFlow | null = null;
@@ -582,7 +811,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     }
   }
 
-  // One request budget for the five tools, the listen streams and the
+  // One request budget for the fixed tools, the listen streams and the
   // 2026-07-28 requests the SDK refuses alike (ADR 0018).
   const budget = createRequestBudget(config);
   // Lines a signed-in client can cause at will on /mcp: one per kind a window, the rest counted (A4.3).
@@ -591,10 +820,30 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   const clientLines = createClientLines(log);
   // Refused Origins on /mcp, a few named in full each window apart from the lines above (ADR 0027).
   const originRefusals = new OriginRefusals(log, config.rateLimits.windowMs);
+  // The invitee tier (ADRs 0016 and 0017), for 2025-era sessions and listen
+  // streams alike, and for who gives way to the response ceiling below.
+  const invitees: InviteeSessionOptions = {
+    pool: config.limits.inviteeSessions,
+    perInvitee: config.limits.sessionsPerInvitee,
+    isInvitee: (userId) => InviteeIdSchema.safeParse(userId).success,
+    holds: (userId) => hub.holds(userId),
+  };
   // Responses a client leaves unread are cut off once they stop moving, and a
   // user's oldest once more of theirs wait than they may, an invitee a
   // quarter as many as a member (responsesWaitingFor, ADR 0030 and its notes).
-  const stalls = new ResponseStalls({ lines: mcpLines });
+  // Past the bytes they may hold together, invited accounts' answers waiting
+  // to be read give way, strangers' oldest first, then guests', ranked as
+  // sessions are; a member's never does, so members' alone may pass it, and
+  // invited accounts' still give way then (S9, ADR 0044).
+  const stalls = new ResponseStalls({
+    lines: mcpLines,
+    ceilingBytes: config.limits.responseBytes,
+    rankOf: (userId) => rankOf(userId, invitees),
+  });
+  // The Node response each /mcp request is answered on, keyed by the
+  // request's own auth object as below, so the slicer that writes its answer
+  // can tell the check what it holds (ADR 0044).
+  const nodeResponses = new WeakMap<AuthInfo, ServerResponse>();
   // What each /mcp request's body holds on the heap, measured before either
   // leg reads it, so a call or pairing that waits on a page is charged it
   // (request-heap.ts, ADR 0018's notes). Keyed by the request's own auth
@@ -604,6 +853,35 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   // Whether each 2026-07-28 request spent its budget as it arrived, under the
   // same key, so the dispatcher neither spends again nor serves one past it.
   const paidOnArrival = new WeakMap<AuthInfo, boolean>();
+  // The member list generation each /mcp request signed in under, by the
+  // same key. A change ends what is held under an id it takes away, and a
+  // request whose body is still on its way holds nothing yet, so the request
+  // is held to the list it signed in under once it can act (S8, S13).
+  const signedInUnder = new WeakMap<AuthInfo, number>();
+  /** Whether a member list change since this request signed in ended its user id. */
+  const signInEnded = (authInfo: AuthInfo | undefined): boolean => {
+    if (members === null || authInfo === undefined) return false;
+    const generation = signedInUnder.get(authInfo);
+    const userId = userIdOf(authInfo);
+    return generation !== undefined && userId !== null && members.endedSince(generation, userId);
+  };
+  /**
+   * The answer to such a request: the plugin's challenge, so the client signs
+   * in again and its retry maps as the list now says, with one line a window
+   * naming the user id alone.
+   */
+  const endedSignIn = async (userId: string | null): Promise<Response> => {
+    mcpLines.write('info', 'mcp request refused: a member list change ended its sign-in', {
+      userId,
+    });
+    const answer: unknown = await auth.signInAgain?.().catch(() => null);
+    const parsed = AuthOutcomeSchema.safeParse(answer);
+    const refusal =
+      parsed.success && parsed.data.kind === 'refused' && parsed.data.status === 401
+        ? parsed.data
+        : SIGN_IN_AGAIN;
+    return new Response(refusal.body, { status: refusal.status, headers: refusal.headers });
+  };
   const refusedLine = (userId: string): void => {
     mcpLines.write('warn', 'mcp request refused: past the request budget', { userId });
   };
@@ -616,6 +894,7 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     paidOnArrival: (authInfo) => (authInfo === undefined ? undefined : paidOnArrival.get(authInfo)),
     refusedLine,
     clientLines,
+    signInEnded,
   });
   /**
    * A strict 2026-07-28 handler. One serves every request but a listen; each
@@ -638,13 +917,6 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       },
     });
   const mcp = strictHandler();
-  // The invitee tier (ADRs 0016 and 0017), for 2025-era sessions and listen streams alike.
-  const invitees: InviteeSessionOptions = {
-    pool: config.limits.inviteeSessions,
-    perInvitee: config.limits.sessionsPerInvitee,
-    isInvitee: (userId) => InviteeIdSchema.safeParse(userId).success,
-    holds: (userId) => hub.holds(userId),
-  };
   const sessions = new McpSessions({
     createServer: (authInfo, request) => factory({ era: 'legacy', authInfo, requestInfo: request }),
     ownerOf: userIdOf,
@@ -669,6 +941,60 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     log,
     lines: mcpLines,
     createHandler: strictHandler,
+  });
+  /**
+   * Ends what a member list change took away (ADR 0043), the new list being
+   * in force for the next request already. Whatever is held under a user id
+   * the change ended ends now, every way in (S8): attachments, requests and
+   * invites in the hub, /pair sign-ins, listen streams, and the 2025-era
+   * sessions held now, each serving nothing more and closing once its
+   * answers are out. Every step runs even if one before it throws; a fault
+   * then leaves the change owed, settled again with the next apply
+   * (settlingMembers). The line names user ids and counts, never a sub or a
+   * name.
+   */
+  const settleMembers = (change: MemberChange): void => {
+    // Each settle carries every change still owed, so one that finishes settles them all.
+    membersUnsettled = true;
+    const faults: unknown[] = [];
+    const step = <T>(run: () => T, otherwise: T): T => {
+      try {
+        return run();
+      } catch (error) {
+        faults.push(error);
+        return otherwise;
+      }
+    };
+    const { attachments } = step(() => hub.membershipChanged(change), { attachments: 0 });
+    const signIns = step(() => pair?.membersChanged(change) ?? 0, 0);
+    log.info('members reloaded', {
+      members: change.total,
+      added: change.added,
+      removed: change.removed,
+      renamed: change.renamed.size,
+      attachments,
+      signIns,
+    });
+    // Only those held now: the change may give an id to someone new, whose
+    // session or stream opened a moment later is theirs. A call or a
+    // pair_page the hub just ended answers not_attached or pairing_expired on
+    // the session it came in on, which closes once that answer is written.
+    const mcpSessions = step(() => sessions.endUsers(change.ended, MEMBER_SESSIONS_CLOSE_MS), 0);
+    const streams = step(() => listens.endUsers(change.ended), 0);
+    if (mcpSessions + streams > 0) {
+      log.info('sessions closed for a member list change', { mcpSessions, streams });
+    }
+    if (faults.length > 0) throw faults[0];
+    membersUnsettled = false;
+  };
+  const applyMembers = members === null ? null : settlingMembers(members, settleMembers);
+  // A closed agent token's user holds nothing more (ADR 0044): its 2025-era
+  // sessions close as a member list change closes them, once their answers
+  // are out, and its listen streams end, so every later request is a 404.
+  hub.onAgentClosed((userId) => {
+    const ended = new Set([userId]);
+    sessions.endUsers(ended, MEMBER_SESSIONS_CLOSE_MS, 'agent token closed');
+    listens.endUsers(ended);
   });
   // The marker concerns every member, who all list it (spike.ts).
   spike?.setNotifier(() => {
@@ -798,6 +1124,15 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         }
         heldBytes.set(options.authInfo, charge);
       }
+      // After the body, which a client may hold back for minutes: a change
+      // to the member list since this request signed in may have ended its
+      // user id, and then nothing is done under it on either leg (S8, S13).
+      // The dispatcher checks again before a tool acts (mcp.ts), since the
+      // SDK's own awaits lie between here and there.
+      if (signInEnded(options?.authInfo)) {
+        await request.body?.cancel().catch(() => undefined);
+        return endedSignIn(userIdOf(options?.authInfo));
+      }
       const legacy = await isLegacyRequest(request, undefined, {
         maxRequestBodySize: MAX_MCP_BODY_BYTES,
       });
@@ -813,19 +1148,91 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   // one shows progress as each slice is written (response-stalls.ts, ADR 0032).
   // Before it is written its user's oldest responses waiting past their cap
   // go, so answers that arrive between two checks cannot pile up unread
-  // (ADR 0030's notes).
+  // (ADR 0030's notes). What the slicer has read of it and not handed on
+  // counts toward the relay-wide ceiling, which is held again each time that
+  // grows (ADR 0044).
   const sliced = {
     fetch: async (request: Request, options?: McpHandlerRequestOptions): Promise<Response> => {
       const answer = await legs.fetch(request, options);
       const userId = userIdOf(options?.authInfo);
       if (userId !== null) stalls.answering(userId);
-      return inSlices(answer);
+      const slices = inSlices(answer, () => {
+        stalls.chunkQueued();
+      });
+      const written =
+        options?.authInfo === undefined ? undefined : nodeResponses.get(options.authInfo);
+      if (written !== undefined) stalls.measure(written, slices.queuedBytes);
+      return slices.response;
     },
   };
   const mcpNode = toNodeHandler(sliced, {
     maxRequestBodySize: MAX_MCP_BODY_BYTES,
     onerror: (error) => {
       // undici's message for a Request it cannot build quotes the URL, query and all.
+      const kind = errorClass(error);
+      mcpLines.write('error', 'mcp adapter error', { errorClass: kind }, kind);
+    },
+  });
+  /**
+   * The token each /g/mcp request presented, by the request's own auth
+   * object, from its arrival until its body is in and its first prompt, if
+   * any, has carried it to the page (ADR 0044); never past that request.
+   */
+  const agentTokens = new WeakMap<AuthInfo, string>();
+  /**
+   * /g/mcp ahead of the same legs as /mcp (ADR 0044), so sessions, listen
+   * streams, budgets, the dispatcher and the response ceiling are shared.
+   * Its body read, the token presented is asked about again, as a member
+   * list change is for /mcp (S8): one closed while the client held its body
+   * back gets the same 404, and so does one closed and minted again under
+   * the same id, which is another token. Then its arrival can prompt the
+   * operator, naming the client a small body names; nothing larger is
+   * parsed before the leg's heap measure, nor anything an attached agent
+   * sends, which no prompt needs.
+   */
+  const agentSliced = {
+    fetch: async (request: Request, options?: McpHandlerRequestOptions): Promise<Response> => {
+      const authInfo = options?.authInfo;
+      const agent = AuthExtraSchema.safeParse(authInfo?.extra);
+      const token = authInfo === undefined ? undefined : agentTokens.get(authInfo);
+      if (authInfo !== undefined) agentTokens.delete(authInfo);
+      if (!agent.success || agent.data.agent === undefined || token === undefined) {
+        // handleAgentMcp sets both for every request it hands on; nothing else gets here.
+        await request.body?.cancel().catch(() => undefined);
+        return new Response(AGENT_NOT_FOUND, { status: 404 });
+      }
+      const { pageId, tokenId } = agent.data.agent;
+      // A copy, read whole and dropped, as legs.fetch reads its own.
+      const bytes =
+        request.method === 'POST'
+          ? await request
+              .clone()
+              .arrayBuffer()
+              .catch(() => null)
+          : null;
+      const now = Date.now();
+      const live = hub.agentCaller(token, now);
+      if (live === null || live.pageId !== pageId || live.tokenId !== tokenId) {
+        await request.body?.cancel().catch(() => undefined);
+        mcpLines.write('info', 'agent request refused: its token closed while the body arrived', {
+          tokenId,
+        });
+        return new Response(AGENT_NOT_FOUND, {
+          status: 404,
+          headers: { 'Content-Type': 'application/json', Connection: 'close' },
+        });
+      }
+      if (request.method === 'POST') {
+        const named =
+          !live.attached && bytes !== null && bytes.byteLength <= MAX_AGENT_NAMING_BYTES;
+        hub.agentArrived(live, token, named ? agentClientOf(bytes) : null, now);
+      }
+      return sliced.fetch(request, options);
+    },
+  };
+  const agentNode = toNodeHandler(agentSliced, {
+    maxRequestBodySize: MAX_MCP_BODY_BYTES,
+    onerror: (error) => {
       const kind = errorClass(error);
       mcpLines.write('error', 'mcp adapter error', { errorClass: kind }, kind);
     },
@@ -851,7 +1258,11 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     return false;
   };
   const authRoutes: ReadonlyMap<string, AuthRoute> = auth.routes ?? new Map();
-  const knownRoutes = new Set([...FIXED_ROUTES, ...authRoutes.keys()]);
+  const knownRoutes = new Set([
+    ...FIXED_ROUTES,
+    ...(config.agentTokens ? AGENT_ROUTES : []),
+    ...authRoutes.keys(),
+  ]);
   /**
    * The name a request is logged under: a route the relay knows, or one word
    * for anything else, so a secret someone puts in a path or query (a nonce
@@ -930,6 +1341,10 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       send(response, 403, 'This relay serves only clients on its own machine');
       return;
     }
+    // Taken before the plugin maps the subject, so a change made while the
+    // request signs in counts as made after it: at worst a member the change
+    // added is asked to sign in again once (signInEnded).
+    const generation = members?.generation ?? null;
     const outcome = await authenticate(request, response);
     if (outcome === null) return;
     const refuse = (refusal: AuthRefusal): void => {
@@ -964,10 +1379,74 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     // under exactOptionalPropertyTypes (method is string | undefined there).
     const withAuth = request as IncomingMessage & { auth?: AuthInfo };
     withAuth.auth = authInfo;
+    nodeResponses.set(authInfo, response);
+    if (generation !== null) signedInUnder.set(authInfo, generation);
     // Until it finishes or closes: one the client leaves unread is cut off
     // (ADR 0030), and one queued on a connection that closes is ended with it.
     stalls.track(response, outcome.user.userId, request.socket);
     await mcpNode(withAuth as NodeIncomingMessageLike, response);
+  }
+
+  /**
+   * /g/mcp (ADR 0044), served only while agent tokens are on: the Host check
+   * and the Origin 403 first, as for /mcp (S12), and on a relay without a
+   * public URL only requests made on this machine. Then the bearer token,
+   * and every miss is one 404 before the body is read, its line naming the
+   * address and never the header. A live token's request goes on as its
+   * agent user, an invitee by id, with the one page it watches, to the same
+   * legs /mcp uses, its response watched as every /mcp response is.
+   */
+  async function handleAgentMcp(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const receivedAt = performance.now();
+    if (!validateHost(request, response)) return;
+    const client = addresses.of(request);
+    const origin = request.headers.origin;
+    if (origin !== undefined && !config.isMcpOriginAllowed(origin)) {
+      originRefusals.refused(origin, loggedAddress(client));
+      send(response, 403, ORIGIN_REFUSAL, { 'Content-Type': 'application/json' });
+      return;
+    }
+    if (config.publicUrl === null && !madeLocally(request)) {
+      mcpLines.write('info', 'mcp request refused: not made on this machine', {
+        address: loggedAddress(client),
+      });
+      send(response, 403, 'This relay serves only clients on its own machine');
+      return;
+    }
+    const token = bearerOf(request.headers.authorization);
+    const identity = token === null ? null : hub.agentCaller(token, Date.now());
+    if (token === null || identity === null) {
+      mcpLines.write('info', 'agent request refused: no live agent token', {
+        address: loggedAddress(client),
+      });
+      send(response, 404, AGENT_NOT_FOUND, {
+        'Content-Type': 'application/json',
+        Connection: 'close',
+      });
+      return;
+    }
+    const extra: AuthExtra = {
+      userId: identity.user.userId,
+      displayName: identity.user.displayName,
+      kind: identity.user.account.kind,
+      email: identity.user.account.email,
+      oauthClientId: null,
+      agent: { tokenId: identity.tokenId, pageId: identity.pageId },
+    };
+    // The SDK requires a token field; the real one stays out of everything downstream.
+    const authInfo: AuthInfo = {
+      token: '',
+      clientId: identity.user.userId,
+      scopes: [],
+      extra: { ...extra, ...(spike ? { receivedAt } : {}) },
+    };
+    const withAuth = request as IncomingMessage & { auth?: AuthInfo };
+    withAuth.auth = authInfo;
+    agentTokens.set(authInfo, token);
+    // Before the leg, so the slicer can tell the response ceiling what an agent's answer holds (ADR 0044).
+    nodeResponses.set(authInfo, response);
+    stalls.track(response, identity.user.userId, request.socket);
+    await agentNode(withAuth as NodeIncomingMessageLike, response);
   }
 
   /** A plugin's GET route, such as its metadata document, behind the same Host check as /mcp. */
@@ -1002,6 +1481,8 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
         else send(response, 405, 'Method not allowed');
       } else if (path === '/mcp') {
         await handleMcp(request, response);
+      } else if (path === AGENT_PATH && config.agentTokens) {
+        await handleAgentMcp(request, response);
       } else if (path === '/page') {
         send(response, 426, 'Upgrade required', { Upgrade: 'websocket' });
       } else if (authRoute !== undefined) {
@@ -1171,6 +1652,18 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
     );
   }
 
+  // Polled from here on; a relay that never listened has nothing to stop.
+  const membersWatch: MembersWatch | null =
+    config.membersFile === null || members === null || applyMembers === null
+      ? null
+      : watchMembersFile({
+          path: config.membersFile,
+          system: options.membersSystem,
+          intervalMs: config.timings.membersPollMs,
+          applied: members.digest,
+          apply: applyMembers,
+          log,
+        });
   let closing: Promise<void> | null = null;
   return {
     url,
@@ -1183,10 +1676,23 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
       events: () => store.audit.records(),
     },
     spike,
+    reloadMembers() {
+      // A throw from the read or the hub rejects, as from an async function.
+      return new Promise<MembersReload>((resolveReload) => {
+        resolveReload(
+          closing !== null || membersWatch === null ? 'unchanged' : membersWatch.reloadNow(),
+        );
+      });
+    },
     close() {
       closing ??= (async () => {
+        membersWatch?.stop();
         pair?.close();
         await hub.shutdown();
+        // Then, with nothing awaited between them, the snapshot_written
+        // record and relay_stop, so they are the log's last two lines and a
+        // start can tell this stop's snapshot from any other (ADR 0046).
+        writeRestartSnapshot();
         // After the hub, whose shutdown audits the calls it fails (ADR 0019).
         await closeAudit(store.audit);
         for (const ws of wss.clients) ws.terminate();

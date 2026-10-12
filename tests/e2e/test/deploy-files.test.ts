@@ -22,6 +22,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { RUNTIME_DEPENDENCIES } from '../../../scripts/release-check.ts';
+import { markdownIn, packageReadmes } from '../src/doc-files.ts';
 
 const ROOT = resolve(import.meta.dirname, '../../..');
 const read = (path: string): string => readFileSync(join(ROOT, path), 'utf8');
@@ -136,6 +137,32 @@ export function readFlyToml(text: string): { tables: Map<string, TomlTable[]>; t
   return { tables, top };
 }
 
+/**
+ * What fly.toml's [env] must never set: secrets and the owner's own values,
+ * which deploy.yml stages from the production environment, and
+ * TABDOCK_MEMBERS_FILE, which deploy.yml manages from that environment's
+ * variable beside TABDOCK_OAUTH_USERS: set in [env] as well, deploy.yml would
+ * still stage TABDOCK_OAUTH_USERS, and config.ts refuses the two together, so
+ * the relay would not start.
+ */
+const NEVER_IN_ENV = [
+  'TABDOCK_PUBLIC_URL',
+  'TABDOCK_ALLOWED_ORIGINS',
+  'TABDOCK_OAUTH_ISSUER',
+  'TABDOCK_OAUTH_USERS',
+  'TABDOCK_MEMBERS_FILE',
+  'TABDOCK_PAIR_CLIENT_ID',
+  'TABDOCK_PAIR_CLIENT_SECRET',
+  'TABDOCK_DEV_TOKENS',
+  'TABDOCK_SPIKE',
+  'TABDOCK_DEV_ALLOW_NO_ORIGIN',
+];
+
+/** The names of NEVER_IN_ENV that `env` sets. */
+function setInEnv(env: Readonly<Record<string, unknown>>): string[] {
+  return NEVER_IN_ENV.filter((name) => env[name] !== undefined);
+}
+
 describe('deploy/fly/fly.toml (ADR 0018)', () => {
   const { tables, top } = readFlyToml(read('deploy/fly/fly.toml'));
   const one = (name: string): TomlTable => {
@@ -180,19 +207,13 @@ describe('deploy/fly/fly.toml (ADR 0018)', () => {
       TABDOCK_INVITES: '1',
     });
     expect(top.app).toBeUndefined();
-    for (const secret of [
-      'TABDOCK_PUBLIC_URL',
-      'TABDOCK_ALLOWED_ORIGINS',
-      'TABDOCK_OAUTH_ISSUER',
-      'TABDOCK_OAUTH_USERS',
-      'TABDOCK_PAIR_CLIENT_ID',
-      'TABDOCK_PAIR_CLIENT_SECRET',
-      'TABDOCK_DEV_TOKENS',
-      'TABDOCK_SPIKE',
-      'TABDOCK_DEV_ALLOW_NO_ORIGIN',
-    ]) {
-      expect(env[secret], secret).toBeUndefined();
-    }
+    expect(setInEnv(env)).toEqual([]);
+  });
+
+  it('would fail an [env] that sets the members file', () => {
+    expect(
+      setInEnv({ TABDOCK_ENV: 'production', TABDOCK_MEMBERS_FILE: '/data/members.json' }),
+    ).toEqual(['TABDOCK_MEMBERS_FILE']);
   });
 
   it('reads only the forms it knows', () => {
@@ -476,6 +497,53 @@ describe('the image and the workflows, as they run (comments left out)', () => {
     expect(stepsOf(deploy).at(-1)).toBe(live);
   });
 
+  it('stages the members from exactly one place: the secret, or the variable naming a file (ADR 0043)', () => {
+    const deploy = jobsOf(read(`${dir}/deploy.yml`)).get('deploy') ?? '';
+    const stage = stepWith(deploy, 'flyctl secrets import');
+    expect(stage).toContain('TABDOCK_OAUTH_USERS: ${{ secrets.TABDOCK_OAUTH_USERS }}');
+    // A path is no secret, and a file on the volume holds subjects and names, never a token.
+    expect(stage).toContain('TABDOCK_MEMBERS_FILE: ${{ vars.TABDOCK_MEMBERS_FILE }}');
+    expect(stage).not.toContain('secrets.TABDOCK_MEMBERS_FILE');
+    expect(stage).toMatch(
+      /if \[\[ -n "\$TABDOCK_MEMBERS_FILE" \]\]; then\n\s+if \[\[ -n "\$TABDOCK_OAUTH_USERS" \]\]; then\n[^\n]*\n\s+exit 1\n\s+fi\n\s+names\+=\(TABDOCK_MEMBERS_FILE\)\n\s+unused=TABDOCK_OAUTH_USERS\n\s+else\n\s+names\+=\(TABDOCK_OAUTH_USERS\)\n\s+unused=TABDOCK_MEMBERS_FILE\n\s+fi\n/,
+    );
+    // Fly keeps a secret until it is unset, so the one not in use is unset
+    // after the import, by name alone: a move either way never leaves both.
+    expect(hashCode(stage)).toMatch(
+      /flyctl secrets import --stage --app "\$FLY_APP"\n\s+flyctl secrets unset --stage --app "\$FLY_APP" "\$unused"$/m,
+    );
+  });
+
+  // vars.TABDOCK_MEMBERS_FILE reads a repository variable as well as one of
+  // the production environment, but docs/deploy.md and the M6 checklist set
+  // it on the environment, beside the secrets its approval guards, so no doc
+  // may send a reader to the repository's variables instead.
+  it('is set, as every doc says, as a variable of the production environment the deploy job reads it in', () => {
+    const deploy = jobsOf(hashCode(read(`${dir}/deploy.yml`))).get('deploy') ?? '';
+    expect(deploy).toMatch(/^ {4}environment: production$/m);
+    expect(deploy).toContain('TABDOCK_MEMBERS_FILE: ${{ vars.TABDOCK_MEMBERS_FILE }}');
+    expect(read('docs/deploy.md')).toContain(
+      'It is a variable of the `production` environment (Environment variables, not secrets)',
+    );
+    const docs = [
+      'README.md',
+      'CHANGELOG.md',
+      'SPEC.md',
+      ...markdownIn('docs'),
+      ...markdownIn('docs/guide'),
+      ...markdownIn('docs/checklists'),
+      ...packageReadmes(),
+    ];
+    const elsewhere = docs.flatMap((path) =>
+      read(path)
+        .split(/(?<=[.!?])\s+/)
+        .filter((line) => line.includes('TABDOCK_MEMBERS_FILE'))
+        .filter((line) => /\b(?:repository|repo|organi[sz]ation) variables?\b/i.test(line))
+        .map((line) => `${path}: ${line}`),
+    );
+    expect(elsewhere).toEqual([]);
+  });
+
   it('publishes the site from main only: a build that can only read, then a deploy that runs only deploy-pages (ADR 0029)', () => {
     const raw = read(`${dir}/pages.yml`);
     const pages = hashCode(raw);
@@ -531,6 +599,26 @@ describe('the image and the workflows, as they run (comments left out)', () => {
     expect(install).toBeGreaterThan(-1);
     expect(site).toBeGreaterThan(install);
     expect(steps.filter(stepIf)).toEqual([]);
+  });
+
+  // Each milestone's demo is one root script, and CI runs every one of them
+  // in order, so a demo added without its step (or a step left after its
+  // script went) fails here; docs/deploy.md names the range CI runs.
+  it("runs every milestone's demo in CI, in order, as docs/deploy.md says", () => {
+    const steps = stepsOf(jobsOf(read(`${dir}/ci.yml`)).get('check') ?? '');
+    const ran = steps.flatMap((step) => {
+      const demo = /^ {6}- run: pnpm (demo:m\d+)$/m.exec(step)?.[1];
+      return demo === undefined ? [] : [demo];
+    });
+    const manifest = JSON.parse(read('package.json')) as { scripts: Record<string, string> };
+    const demos = Object.keys(manifest.scripts)
+      .filter((name) => /^demo:m\d+$/.test(name))
+      .sort((a, b) => Number(a.slice(6)) - Number(b.slice(6)));
+    expect(demos.length).toBeGreaterThan(6);
+    expect(ran).toEqual(demos);
+    expect(demos.map((name) => Number(name.slice(6)))).toEqual(demos.map((_, index) => index));
+    const said = /the demos `demo:m0` to `(demo:m\d+)`/.exec(read('docs/deploy.md'))?.[1];
+    expect(said).toBe(demos.at(-1));
   });
 
   it('reads workflows the way it means to: a disabled step or job is seen', () => {

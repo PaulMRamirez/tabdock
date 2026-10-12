@@ -1200,8 +1200,10 @@ describe('S14: invite-made attachments end with the page session, on revoke or a
 });
 
 describe('S14: invite-made attachments leave members two seats', () => {
+  // With no watching seats, M5's rule: watchers sit among the people too.
+  // observer-seats.test.ts covers the seats of their own (ADR 0044).
   it('turns invitees away past usersPerPage minus two, while a member still pairs', async () => {
-    const { relay, page } = await sharedPage({ limits: { usersPerPage: 4 } });
+    const { relay, page } = await sharedPage({ limits: { usersPerPage: 4, observersPerPage: 0 } });
     const { secret } = await mintOk(page, { uses: 5 });
     for (const sub of ['sub-g1', 'sub-g2']) {
       const guest = await signedInAtI(relay, sub, `${sub}@example.com`);

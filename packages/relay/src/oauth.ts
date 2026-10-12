@@ -37,7 +37,7 @@ import {
 } from '@modelcontextprotocol/server';
 import {
   EmailSchema,
-  IdSchema,
+  MemberSubSchema,
   OAuthClientIdSchema,
   type User,
   type UserKind,
@@ -65,6 +65,7 @@ import {
   type ProviderEndpoints,
 } from './auth.ts';
 import type { Logger } from './log.ts';
+import { inviteeKeyOf, MemberList, parseMemberEntry, refuseRepeats } from './members.ts';
 import { digestHex } from './secrets.ts';
 
 export interface OAuthUser {
@@ -81,9 +82,15 @@ export interface OAuthAuthOptions {
   resource: string;
   /**
    * The members, by subject. Anyone else who signs in is an invitee, whom the
-   * relay answers with 403 unless it admits invitees (ADR 0020).
+   * relay answers with 403 unless it admits invitees (ADR 0020). Exactly one
+   * of this and `members`.
    */
-  users: readonly OAuthUser[];
+  users?: readonly OAuthUser[] | undefined;
+  /**
+   * The members as a live list, which a members file replaces while the
+   * relay runs (ADR 0043); in place of `users`.
+   */
+  members?: MemberList | undefined;
   /**
    * The longest a token may live, from its iat to its exp, and the oldest its
    * iat may be, in minutes (TABDOCK_OAUTH_MAX_TOKEN_AGE): DEFAULT_MAX_TOKEN_AGE_MINUTES
@@ -209,8 +216,12 @@ const ALGORITHMS = ['RS256'];
 const REQUIRED_CLAIMS = ['exp', 'sub', 'iat', 'jti'];
 const RESOURCE_NAME = 'Tabdock relay';
 
-/** OIDC limits `sub` to 255 ASCII characters; spaces and controls never belong in one. */
-const SubSchema = z.string().regex(/^[\x21-\x7e]{1,255}$/);
+/**
+ * OIDC limits `sub` to 255 ASCII characters; spaces and controls never belong
+ * in one. The rule lives in the protocol from M6, where the members file reads
+ * it too (ADR 0043).
+ */
+const SubSchema = MemberSubSchema;
 
 /**
  * The fields of the provider's metadata the relay relies on. Loose, so the
@@ -462,47 +473,21 @@ function scopesOf(claim: unknown): string[] {
  * a sub may hold neither ',' nor '=', and a display name no ','.
  */
 export function parseOAuthUsers(envValue: string): OAuthUser[] {
-  const users: OAuthUser[] = [];
-  const parts = envValue
+  // One entry rule for this variable and the members file (members.ts, ADR 0043).
+  const entries = envValue
     .split(',')
     .map((part) => part.trim())
-    .filter((part) => part.length > 0);
-  parts.forEach((part, index) => {
-    const entry = `TABDOCK_OAUTH_USERS entry ${String(index + 1)}`;
-    const split = part.indexOf('=');
-    const sub = split > 0 ? part.slice(0, split).trim() : '';
-    const rest = split > 0 ? part.slice(split + 1) : '';
-    const colon = rest.indexOf(':');
-    const userId = (colon === -1 ? rest : rest.slice(0, colon)).trim();
-    const displayName = colon === -1 ? userId : rest.slice(colon + 1).trim();
-    if (sub === '' || userId === '') {
-      throw new Error(`${entry} is not of the form sub=userId:Display Name`);
-    }
-    if (!SubSchema.safeParse(sub).success) {
-      throw new Error(`${entry} has a sub that is not 1 to 255 printable characters`);
-    }
-    if (!IdSchema.safeParse(userId).success) {
-      throw new Error(`${entry} has a user id that is not 1 to 64 letters, digits, '_' or '-'`);
-    }
-    if (isInviteePrefixed(userId)) {
-      throw new Error(`${entry} has a user id starting g_, which only an invitee's may (ADR 0017)`);
-    }
-    users.push({ sub, userId, displayName });
-  });
-  if (users.length === 0) throw new Error('TABDOCK_OAUTH_USERS lists no users');
+    .filter((part) => part.length > 0)
+    .map((part, index) => ({
+      entry: parseMemberEntry(part, `TABDOCK_OAUTH_USERS entry ${String(index + 1)}`),
+      at: index + 1,
+    }));
+  if (entries.length === 0) throw new Error('TABDOCK_OAUTH_USERS lists no users');
   // createOAuthAuth refuses these too, naming the user, as fits users given in
   // code; from the environment the entries are numbered, as above, since a
   // secret pasted into the list could sit where a user id goes.
-  for (let i = 0; i < users.length; i += 1) {
-    for (let j = i + 1; j < users.length; j += 1) {
-      const pair = `TABDOCK_OAUTH_USERS entries ${String(i + 1)} and ${String(j + 1)}`;
-      if (users[i]?.sub === users[j]?.sub) throw new Error(`${pair} share a sub`);
-      if (users[i]?.userId === users[j]?.userId) {
-        throw new Error(`${pair} name the same user id`);
-      }
-    }
-  }
-  return users;
+  refuseRepeats(entries, 'TABDOCK_OAUTH_USERS entries');
+  return entries.map(({ entry }) => entry);
 }
 
 /** What a checked token says, kept in AuthInfo.extra between the verifier and authenticate(). */
@@ -556,7 +541,10 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
   }
   const resource = resourceUrl.href;
 
-  if (options.users.length === 0) {
+  if ((options.users === undefined) === (options.members === undefined)) {
+    throw new Error('OAuth sign-in takes its members as users or as a member list, exactly one');
+  }
+  if ((options.users ?? []).length === 0 && (options.members?.size ?? 0) === 0) {
     throw new Error('OAuth sign-in needs at least one user (TABDOCK_OAUTH_USERS)');
   }
   checkMaxTokenAge(options.maxTokenAgeMinutes);
@@ -570,7 +558,7 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
   }
   const bySub = new Map<string, User>();
   const userIds = new Set<string>();
-  for (const entry of options.users) {
+  for (const entry of options.users ?? []) {
     if (!SubSchema.safeParse(entry.sub).success) {
       throw new Error('OAuth user subs must be 1 to 255 printable characters without spaces');
     }
@@ -594,6 +582,10 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
     bySub.set(entry.sub, user.data);
     userIds.add(user.data.userId);
   }
+  // Read live from here on: a members file swaps the entries in place while
+  // the relay runs, and the next request maps its subject as they now say.
+  const members =
+    options.members ?? new MemberList([...bySub].map(([sub, user]) => ({ sub, ...user })));
 
   /**
    * The one account mapping (ADR 0016): an allowlisted subject is a member;
@@ -602,12 +594,11 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
    * leaves this function.
    */
   const accountOf = (sub: string): Account => {
-    const user = bySub.get(sub);
+    const user = members.bySub(sub);
     return user === undefined
-      ? { kind: 'invitee', key: digestHex(`invitee ${sub}`).slice(0, 32) }
+      ? { kind: 'invitee', key: inviteeKeyOf(sub) }
       : { kind: 'member', user };
   };
-  const memberNames = [...bySub.values()].map((user) => user.displayName);
   /**
    * The user behind a subject, named once for /mcp, /pair and /i alike (ADR
    * 0017): a member as the owner listed them, with no email kept, since the
@@ -618,7 +609,7 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
     const account = accountOf(sub);
     return account.kind === 'member'
       ? { ...account.user, account: { ...MEMBER_ACCOUNT } }
-      : inviteeUser(account.key, email, memberNames);
+      : inviteeUser(account.key, email, members.names());
   };
 
   const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(resourceUrl);
@@ -738,6 +729,16 @@ export function createOAuthAuth(options: OAuthAuthOptions): AuthPlugin {
     resource,
     routes: new Map([[new URL(resourceMetadataUrl).pathname, metadataRoute]]),
     browserSignIn: { provider: () => provider, accountOf, userOf },
+    members,
+    // The token itself is sound: the client signs in again and its next
+    // request maps its subject as the list now says.
+    signInAgain: () =>
+      challenge(
+        new OAuthError(
+          OAuthErrorCode.InvalidToken,
+          'Membership on this relay changed while the request was on its way',
+        ),
+      ),
 
     async start(context) {
       log = context.log;

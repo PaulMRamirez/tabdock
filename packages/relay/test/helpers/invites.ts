@@ -260,7 +260,7 @@ export async function attachMember(
  * email claims of scope `openid email` when an email is given.
  */
 export async function signedInAtI(
-  relay: InviteRelay,
+  relay: Pick<InviteRelay, 'relay' | 'provider'>,
   sub: string,
   email: string | null,
   verified = true,

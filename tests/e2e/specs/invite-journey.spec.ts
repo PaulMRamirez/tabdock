@@ -195,6 +195,11 @@ test('a watch invite and a control invite from the widget, joined at /i and thro
   await phone.locator('#join').tap();
   await expect(phone.locator('#message')).toHaveText('Joined as observer.');
   await expect(phone.locator('#connector')).toHaveText(PUBLIC_MCP_URL);
+  // Adding a custom connector in the phone app is not something a guest can count on.
+  await expect(phone.locator('#connect .hint')).toHaveText(
+    'Add it in Claude on the web or the desktop app; it then appears in the phone app too.',
+  );
+  await expect(phone.locator('#connect .hint')).toBeVisible();
   const bobEntry = await waitForDock(page, (state) =>
     state.roster.find((entry) => entry.displayName === BOB.email),
   );
@@ -272,6 +277,8 @@ test('a watch invite and a control invite from the widget, joined at /i and thro
   // 4. Revoke all: every attachment ends, and so does every live invite.
   expect(await rosterIds(page)).toHaveLength(3);
   await clickInWidget(page, { action: 'revoke-all' });
+  // Invites let two people in, so it asks first (ADR 0043, plan C21).
+  await clickInWidget(page, { action: 'revoke-anyway' });
   await waitForDock(page, (state) => state.roster.length === 0 && state.invites.length === 0);
   await expect.poll(() => widgetItems(page, 'invite-list')).toEqual([]);
   expect(errorCode(await onPage(bob, pageId, 'get_view'))).toBe('not_attached');

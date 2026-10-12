@@ -119,8 +119,12 @@ const BARE_NAMES_IN_CONTEXT = new Set([
   'settings.json',
   'owner-token',
   'claude-headers',
+  // The restart snapshot a relay writes into its audit directory (ADR 0046).
+  'relay-snapshot.json',
   // Made by the reader in a folder of their own, as the guide shows.
   'list-pages.ts',
+  'sign-in.ts',
+  'pair-script.ts',
 ]);
 
 /** GitHub's anchor for a heading. */

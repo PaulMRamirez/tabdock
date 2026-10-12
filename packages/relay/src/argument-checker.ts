@@ -50,6 +50,8 @@ export interface ArgumentCheckerOptions {
   log: Logger;
   /** The worker module; tests swap in ones that misbehave. */
   entry?: URL;
+  /** How long a worker may take to say it is ready, START_LIMIT_MS unless a test shortens it. */
+  startLimitMs?: number;
 }
 
 /**
@@ -127,6 +129,7 @@ export class ArgumentChecker {
   readonly #budgetMs: number;
   readonly #log: Logger;
   readonly #entry: URL;
+  readonly #startLimitMs: number;
   #worker: Worker | null = null;
   #ready = false;
   #closed = false;
@@ -146,6 +149,7 @@ export class ArgumentChecker {
     this.#budgetMs = options.budgetMs;
     this.#log = options.log;
     this.#entry = options.entry ?? WORKER_ENTRY;
+    this.#startLimitMs = options.startLimitMs ?? START_LIMIT_MS;
     this.#spawn();
   }
 
@@ -238,7 +242,7 @@ export class ArgumentChecker {
     this.#ready = false;
     this.#startLimit = setTimeout(() => {
       this.#failed(worker, 'the argument check worker did not start in time');
-    }, START_LIMIT_MS);
+    }, this.#startLimitMs);
     this.#startLimit.unref();
     worker.on('message', (message: unknown) => {
       this.#onMessage(worker, message);

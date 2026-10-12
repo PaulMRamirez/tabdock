@@ -29,6 +29,7 @@ import {
   startRelay,
 } from '../src/cli.ts';
 import { headersHelperPath, OWNER_TOKEN_FILE } from '../src/local-token.ts';
+import { FIXED_TOOL_NAMES } from '../src/mcp.ts';
 import { PACKAGED } from '../src/packaged.ts';
 import { TOKEN_LOCK_FILE } from '../src/token-lock.ts';
 import type { Relay } from '../src/relay.ts';
@@ -224,6 +225,9 @@ describe('the usage, the version and the audit subcommand', () => {
     const packaged = context({}, true);
     expect(await runCommand(['audit', '--help'], packaged)).toBe(0);
     expect(packaged.printed[0]?.split('\n')[0]).toBe('Usage: tabdock-relay audit [options]');
+    // ADR 0045: a call line by the invoke's id, and a saved session record held to the log.
+    expect(packaged.printed[0]).toMatch(/^ {2}--call <id> +call records with this callId/m);
+    expect(packaged.printed[0]).toMatch(/^ {2}--match <file> +check a session record saved/m);
     const checkout = context({});
     expect(await runCommand(['audit', '--nope'], checkout)).toBe(2);
     expect(checkout.errors.join('\n')).toContain('Usage: pnpm audit:log [options]');
@@ -280,7 +284,7 @@ describe('--new-token (ADR 0028)', () => {
     expect(fresh === old).toBe(false);
     expect(/^tabdock_[A-Za-z0-9_-]{43}$/.test(fresh)).toBe(true);
     expect(await mcpStatus(second.relay.mcpUrl, old)).toBe(401);
-    expect(await toolCount(second.relay.mcpUrl, fresh)).toBe(5);
+    expect(await toolCount(second.relay.mcpUrl, fresh)).toBe(FIXED_TOOL_NAMES.size);
     const text = second.lines.join('\n');
     expect(text).toContain(`Owner token:   ${tokenPath} (created just now)`);
     expect(text).toContain(
@@ -359,7 +363,9 @@ describe('--new-token (ADR 0028)', () => {
           expect(readFileSync(tokenPath).equals(before)).toBe(true);
           expect(ran.printed).toEqual([]);
         }
-        expect(await toolCount(`http://127.0.0.1:${String(runningPort)}/mcp`, old)).toBe(5);
+        expect(await toolCount(`http://127.0.0.1:${String(runningPort)}/mcp`, old)).toBe(
+          FIXED_TOOL_NAMES.size,
+        );
       } finally {
         running.child.kill('SIGTERM');
         await running.exited;

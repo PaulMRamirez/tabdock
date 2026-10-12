@@ -144,6 +144,14 @@ interface Session {
   lastActive: number;
   idleTimer: NodeJS.Timeout | null;
   closed: boolean;
+  /**
+   * Set when a member list change ended the session's user id (endUsers):
+   * it serves no new request, and closes once its open responses are done or
+   * its grace runs out, whichever comes first.
+   */
+  ending: NodeJS.Timeout | null;
+  /** Why it is ending, for its close line: a member list change, or its agent token's close (ADR 0044). */
+  endingReason: string;
 }
 
 function jsonRpcError(status: number, code: number, message: string): Response {
@@ -268,7 +276,12 @@ export class McpSessions {
     const sessionId = request.headers.get('mcp-session-id');
     if (sessionId !== null) {
       const session = this.#sessions.get(sessionId);
-      if (!session?.ready || session.closed || session.userId !== userId) {
+      if (
+        !session?.ready ||
+        session.closed ||
+        session.ending !== null ||
+        session.userId !== userId
+      ) {
         if (session?.ready && session.userId !== userId) {
           if (this.#presented.take(userId, 'presented', undefined)) {
             this.#options.log.warn('MCP session id presented by another user', { userId });
@@ -331,6 +344,8 @@ export class McpSessions {
       lastActive: Date.now(),
       idleTimer: null,
       closed: false,
+      ending: null,
+      endingReason: 'membership changed',
     };
     // Counted from now, so initializes that overlap cannot overshoot a cap together.
     this.#sessions.set(id, session);
@@ -480,6 +495,10 @@ export class McpSessions {
     session.open -= 1;
     session.lastActive = Date.now();
     if (session.open > 0 || session.closed) return;
+    if (session.ending !== null) {
+      void this.#close(session, session.endingReason);
+      return;
+    }
     session.idleTimer = setTimeout(() => {
       void this.#close(session, 'idle');
     }, this.#options.idleMs);
@@ -490,6 +509,7 @@ export class McpSessions {
     session.closed = true;
     if (session.idleTimer) clearTimeout(session.idleTimer);
     session.idleTimer = null;
+    if (session.ending !== null) clearTimeout(session.ending);
     if (this.#sessions.get(session.id) === session) this.#sessions.delete(session.id);
   }
 
@@ -522,6 +542,39 @@ export class McpSessions {
    */
   notifyUser(userId: string): number {
     return this.#notify((session) => session.userId === userId);
+  }
+
+  /**
+   * Ends the sessions held now under user ids a member list change ended
+   * (ADR 0043, S8), one still opening included, and no session opened after:
+   * the change can give an id to someone new, who may open one in the next
+   * moment. Each serves no new request from now, answering 404 as an unknown
+   * one does, so the client starts again as who it is now. One with nothing
+   * open closes at once; one still answering closes when its last response
+   * is done, so the not_attached or pairing_expired the hub just gave a call
+   * reaches it, and after `graceMs` at the latest, since a client's listening
+   * GET stream never ends on its own. Returns how many it ends. A closed
+   * agent token's user goes the same way (ADR 0044), its line naming
+   * `reason` instead.
+   */
+  endUsers(userIds: ReadonlySet<string>, graceMs: number, reason = 'membership changed'): number {
+    const held = [...this.#sessions.values()].filter(
+      (session) => userIds.has(session.userId) && !session.closed && session.ending === null,
+    );
+    for (const session of held) {
+      if (session.open === 0) {
+        void this.#close(session, reason);
+        continue;
+      }
+      if (session.idleTimer) clearTimeout(session.idleTimer);
+      session.idleTimer = null;
+      session.endingReason = reason;
+      session.ending = setTimeout(() => {
+        void this.#close(session, reason);
+      }, graceMs);
+      session.ending.unref();
+    }
+    return held.length;
   }
 
   /** Tells every open session whose user `whose` names; the spike's marker concerns every member. */

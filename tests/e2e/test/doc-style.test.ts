@@ -7,7 +7,10 @@
 // Short enough counts tables too, since a wide table fills a phone screen as
 // prose does (a troubleshooting page once held 1,300 words of table cells
 // beside its prose), and holds each paragraph and table cell to what a
-// phone shows at once.
+// phone shows at once. The tour's explainers stay under CLAUDE.md's "about
+// 600 words" (at most 620, no paragraph over 160), and the guide names no
+// milestone (M0 to M9): its readers know versions and features, never the
+// build's milestones, which belong to the tour and the plans.
 
 import { execFileSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
@@ -48,6 +51,11 @@ const PARAGRAPH_LIMIT = 120;
 /** Words in one table cell. */
 const CELL_LIMIT = 45;
 const URL = /\b(?:https?|wss?):\/\/([^\s/)>`"',;]+)/g;
+/** Words in a tour page outside code blocks and comments, tables included. */
+const TOUR_LIMIT = 620;
+/** Words in one paragraph or list item of a tour page. */
+const TOUR_PARAGRAPH_LIMIT = 160;
+const MILESTONE = /\bM[0-9]\b/;
 
 function tracked(patterns: readonly string[]): string[] {
   return execFileSync(
@@ -232,5 +240,65 @@ describe('the guide pages', () => {
       return linked.test(last) ? [] : [`${path} does not end with a link to ${next}`];
     });
     expect(missing).toEqual([]);
+  });
+});
+
+/** Each line of `text` outside code blocks and comments that names a milestone, link targets left out. */
+function milestoneLines(text: string): string[] {
+  return textLines(text).flatMap((line, index) => {
+    const read = line.replace(/\]\([^)]*\)/g, ']');
+    return MILESTONE.test(read) ? [`${String(index + 1)}: ${line.trim().slice(0, 80)}`] : [];
+  });
+}
+
+/** What is too long on a tour page: the page, or a paragraph or list item. */
+function tourProblems(text: string): string[] {
+  const words = pageWords(text);
+  return [
+    ...(words > TOUR_LIMIT ? [`${String(words)} words`] : []),
+    ...paragraphs(text)
+      .filter((paragraph) => paragraph.words > TOUR_PARAGRAPH_LIMIT)
+      .map(({ start, words: count }) => `a paragraph of ${String(count)} words, "${start}"`),
+  ];
+}
+
+describe('the tour pages', () => {
+  const pages = markdownIn('docs/tour');
+
+  it(`each hold at most ${String(TOUR_LIMIT)} words outside code blocks and no paragraph over ${String(TOUR_PARAGRAPH_LIMIT)}`, () => {
+    expect(pages.length).toBeGreaterThan(6);
+    const long = pages.flatMap((path) =>
+      tourProblems(readRepo(path)).map((problem) => `${path}: ${problem}`),
+    );
+    expect(long).toEqual([]);
+  });
+
+  it('would fail a long page and a long paragraph', () => {
+    const paragraph = (count: number): string =>
+      Array.from({ length: count }, () => 'word').join(' ');
+    expect(tourProblems(paragraph(TOUR_PARAGRAPH_LIMIT))).toEqual([]);
+    expect(tourProblems(paragraph(TOUR_PARAGRAPH_LIMIT + 1))).toHaveLength(1);
+    const page = Array.from({ length: 5 }, () => paragraph(130)).join('\n\n');
+    expect(tourProblems(page)).toEqual(['650 words']);
+    // Code blocks do not count.
+    expect(tourProblems(`${paragraph(10)}\n\n\`\`\`sh\n${paragraph(700)}\n\`\`\`\n`)).toEqual([]);
+  });
+});
+
+describe('milestone words in the guide', () => {
+  it('appear on no guide page outside code blocks', () => {
+    const found = markdownIn('docs/guide').flatMap((path) =>
+      milestoneLines(readRepo(path)).map((line) => `${path}:${line}`),
+    );
+    expect(found).toEqual([]);
+  });
+
+  it('would fail a milestone named in prose or a table, and pass one in code or a link target', () => {
+    expect(milestoneLines('Since M6 a page can publish state.')).toHaveLength(1);
+    expect(milestoneLines('| Setting | Since M5 |')).toHaveLength(1);
+    expect(
+      milestoneLines('```sh\npnpm demo:m6 # M6\n```\nSee [the plan](../plans/M6.md).'),
+    ).toEqual([]);
+    expect(milestoneLines('MCP-B 6.0.0, M365 and SM6 are no milestones.')).toEqual([]);
   });
 });

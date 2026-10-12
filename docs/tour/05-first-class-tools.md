@@ -1,6 +1,6 @@
 # 05: First-class tools
 
-M5 lets a page's tools stand beside the client's own. With `TABDOCK_FIRST_CLASS_TOOLS=1`, off by default in every mode (ADR 0025), a member's `tools/list` adds `<page id>__<tool>` for each page they hold other than by invite, all of a driver's tools and an observer's read-only ones; invitees keep the five fixed tools. A page with `policy.confirmVia: 'client'` lets a member driver confirm a consequential call in their own client (ADR 0026). The relay serves 2025-03-26 to 2026-07-28, checked by a client matrix, the official conformance suite and Claude Code, and refuses a foreign `Origin` on `/mcp` (ADR 0027). `npx @tabdock/relay` starts local mode once the owner publishes 0.1.0 (ADR 0028), and `apps/site` builds the demo and this tour for Pages, each diagram drawn at build time (ADR 0029).
+M5 lets a page's tools stand beside the client's own. With `TABDOCK_FIRST_CLASS_TOOLS=1`, off by default in every mode (ADR 0025), a member's `tools/list` adds `<page id>__<tool>` for each page they hold other than by invite, all of a driver's tools and an observer's read-only ones; invitees keep the fixed tools alone (five then, nine since M6). A page with `policy.confirmVia: 'client'` lets a member driver confirm a consequential call in their own client (ADR 0026). The relay serves 2025-03-26 to 2026-07-28, checked by a client matrix, the official conformance suite and Claude Code, and refuses a foreign `Origin` on `/mcp` (ADR 0027). `npx @tabdock/relay` starts local mode once the owner publishes 0.1.0 (ADR 0028), and `apps/site` builds the demo, this tour and the guide for Pages, each diagram drawn at build time (ADRs 0029 and 0035).
 
 ## One call, traced
 
@@ -14,7 +14,7 @@ sequenceDiagram
   participant A as adapter (board)
   C->>M: tools/list
   M->>H: firstClassList(you)
-  M-->>C: five fixed tools, pg_X__clear_board and the rest
+  M-->>C: the fixed tools (nine since M6), pg_X__clear_board and more
   C->>M: tools/call pg_X__clear_board
   M->>H: callPageTool, as call_page_tool does
   opt the board chose confirmVia client
@@ -42,4 +42,4 @@ The `tools/call` handler spends one request, `parseFirstClassName` splits the na
 
 1. Run `pnpm demo:m5`: local mode with the flag on, an SDK client on each revision listing and calling a first-class tool, then confirming a consequential call through its elicitation handler.
 2. Start `TABDOCK_FIRST_CLASS_TOOLS=1 pnpm relay` (or `npx @tabdock/relay` with the same setting, once published), paste its `claude mcp add-json` line, run `pnpm dev:demo`, open `http://127.0.0.1:5173/?relay=ws://127.0.0.1:8787/page`, click Connect, pair from Claude Code and allow it on the board. `/mcp` then lists `<page id>__add_item` beside `call_page_tool`.
-3. Add `&confirm=client`, reconnect and ask Claude Code to clear the board: it asks you, the board runs the call without its prompt, and the activity log reads `confirmed in "claude-code <version>" by You`. Decline once to see `not_confirmed`. The sandbox checked this route with Claude Code headless, which with no person at it answers each question `cancel` at once; the dialog with you at it is still an owner check (`docs/checklists/M5.md`, step 16).
+3. Add `&confirm=client`, reconnect and ask Claude Code to clear the board: it asks you, the board runs the call without its prompt, and the activity log reads `confirmed in "claude-code <version>" by You`. Decline once to see `not_confirmed`. The sandbox checked this route with Claude Code headless, which answers each question `cancel` at once; the dialog with a person is still an owner check (`docs/checklists/M5.md`, step 16).

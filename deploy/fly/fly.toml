@@ -9,9 +9,15 @@
 # tabdock_audit mount goes, or if the relay could run as more than one Machine.
 
 primary_region = "iad"
-# main.ts closes on SIGTERM within a second; Fly waits this many seconds before killing.
+# main.ts closes on SIGTERM within a second, or with TABDOCK_RESTART_SNAPSHOT
+# on after writing the snapshot: for a full relay 0.4 to 0.6 s of CPU, which
+# is 6 to 9 s at shared-cpu-1x's baseline share once its burst balance is
+# spent (docs/notes/verified.md, 12 October 2026). Fly kills this many
+# seconds after the signal, best effort, at most 300; a stop cut short
+# leaves no snapshot, and the next start ends everything.
+# restart-snapshot.test.ts holds the write to this figure at that share.
 kill_signal = "SIGTERM"
-kill_timeout = 5
+kill_timeout = 30
 
 [deploy]
   # One Machine with a volume: rolling stops the old Machine before starting
@@ -47,7 +53,8 @@ kill_timeout = 5
     path = "/healthz"
 
 [mounts]
-  # Created by hand before the first deploy (docs/deploy.md); only the audit log lives here.
+  # Created by hand before the first deploy (docs/deploy.md). The audit log lives here, and
+  # once chosen the members file and the restart snapshot (ADRs 0043 and 0046).
   source = "tabdock_audit"
   destination = "/data"
 

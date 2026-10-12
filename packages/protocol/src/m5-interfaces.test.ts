@@ -239,7 +239,10 @@ describe("the invoke frame's confirmation (ADR 0026)", () => {
   });
 
   it('is dropped by an adapter older than M5, which then prompts as it always has', () => {
-    const older = z.omit(InvokeFrameSchema, { confirmation: true });
+    // M6 refines the invoke (ADR 0042), and zod omits no key from a refined
+    // object, so the invoke an adapter older than M5 knew is rebuilt from the
+    // shape without the keys M5 and M6 added.
+    const older = z.omit(z.object(InvokeFrameSchema.shape), { confirmation: true, proposal: true });
     expect(older.parse({ ...invoke, confirmation })).toEqual(invoke);
   });
 });

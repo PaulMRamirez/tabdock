@@ -242,7 +242,7 @@ export function mountConnectBar(
  * submission clicks the button for the person. The submit event itself will
  * not do, since a script's form.requestSubmit() fires a trusted one.
  *
- * The two boxes set the policy choices that loosen the defaults, unticked
+ * The three boxes set the policy choices that loosen the defaults, unticked
  * whatever the page's own query says, so only the visitor's tick puts them
  * in the link the form goes to.
  */
@@ -274,6 +274,8 @@ export function mountConnectForm(
     'Let members I approve confirm clear_board in their own MCP client',
   );
   const invitesBox = option('invites', 'Offer Can control invites and a second driver seat');
+  // 'all', so invited guests watching can propose too (ADR 0042).
+  const proposalsBox = option('proposals', 'Let people who watch propose changes for me to accept');
   const error = document.createElement('p');
   error.className = 'meta connect-error';
   error.dataset.role = 'connect-error';
@@ -294,12 +296,13 @@ export function mountConnectForm(
     const policy: LinkPolicy = {
       confirmInClient: confirmBox.input.checked,
       invites: invitesBox.input.checked ? 'all' : 'watch',
+      proposals: proposalsBox.input.checked ? 'all' : 'off',
     };
     rememberChoice(store, checked.url, policyTag(policy));
     navigate(connectHref(window.location.href, checked.url, policy));
   });
   // The boxes come before the button, so they are seen before anyone connects.
-  form.append(label, input, confirmBox.label, invitesBox.label, button, error);
+  form.append(label, input, confirmBox.label, invitesBox.label, proposalsBox.label, button, error);
   after.after(form);
   return form;
 }

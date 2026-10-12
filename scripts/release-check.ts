@@ -33,8 +33,12 @@ export const DEFAULT_OUT = join(ROOT, 'dist', 'packages');
 /** The repository exactly as trusted publishing compares it with package.json's repository.url. */
 export const REPOSITORY_URL = 'git+https://github.com/PaulMRamirez/tabdock.git';
 
-/** Over this, the script-tag build fails the size test and the release (ADR 0028). */
-export const SCRIPT_TAG_LIMIT_BYTES = 150_000;
+/**
+ * Over this, the script-tag build fails the size test and the release: ADR
+ * 0028's 150,000 bytes, raised for M6 by ADR 0048, whose per-wave checkpoints
+ * docs/plans/M6.md records at each wave's merge.
+ */
+export const SCRIPT_TAG_LIMIT_BYTES = 200_000;
 
 export const PACKAGES = ['protocol', 'adapter', 'relay'] as const;
 export type PackageName = (typeof PACKAGES)[number];
@@ -52,7 +56,15 @@ const COMMON_REQUIRED = ['package.json', 'README.md', 'LICENSE', 'NOTICE'];
 const RULES: Record<PackageName, Rules> = {
   protocol: {
     allowed: [...COMMON, /^dist\/[a-z-]+\.(?:js|d\.ts)$/],
-    required: [...COMMON_REQUIRED, 'dist/index.js', 'dist/index.d.ts', 'dist/zod-config.js'],
+    required: [
+      ...COMMON_REQUIRED,
+      'dist/index.js',
+      'dist/index.d.ts',
+      'dist/zod-config.js',
+      // The DevTools reply schemas the adapter's testing entry checks with (ADR 0041).
+      'dist/devtools.js',
+      'dist/devtools.d.ts',
+    ],
   },
   adapter: {
     allowed: [...COMMON, /^dist\/[a-z-]+\.(?:js|d\.ts)$/, /^dist\/tabdock-adapter\.js\.map$/],
@@ -62,6 +74,9 @@ const RULES: Record<PackageName, Rules> = {
       'dist/index.d.ts',
       'dist/tabdock-adapter.js',
       'dist/tabdock-adapter.js.map',
+      // @tabdock/adapter/testing, the helper a CI check reads the widget with (ADR 0041).
+      'dist/testing.js',
+      'dist/testing.d.ts',
     ],
   },
   relay: {
@@ -432,6 +447,14 @@ function checkManifest(
   }
   if (manifest.sideEffects === false) {
     problems.push(`${where} declares sideEffects false, which would drop zod-config.ts`);
+  } else if (
+    name === 'protocol' &&
+    Array.isArray(manifest.sideEffects) &&
+    !manifest.sideEffects.includes('./dist/zod-config.js')
+  ) {
+    // A list lets a bundler drop the modules a page never imports (ADR 0048's
+    // notes), but one without zod-config.js would drop the jitless setting too.
+    problems.push(`${where}'s sideEffects does not name ./dist/zod-config.js`);
   }
   if (JSON.stringify(manifest).includes('workspace:')) {
     problems.push(`${where}'s package.json still holds a workspace: specifier`);

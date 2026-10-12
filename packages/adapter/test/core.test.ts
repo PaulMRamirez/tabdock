@@ -89,6 +89,9 @@ describe('linking', () => {
           invites: 'watch',
           // M5's default (ADR 0026): the operator confirms on the page.
           confirmVia: 'page',
+          // M6's defaults (ADRs 0039 and 0042): no image tools and no proposals.
+          imageTools: [],
+          proposals: 'off',
         },
       },
     ]);
@@ -1252,6 +1255,74 @@ describe('an answer counts only for the prompt it was asked about (S6)', () => {
     await flush();
     expect(h.context.runs).toEqual([]);
     expect(outcomes(socket).at(-1)).toBe('c1:denied_by_operator');
+  });
+});
+
+describe('a tool the page registers anew while its prompt is up (A6.28)', () => {
+  const hints = (readOnlyHint: boolean) => ({
+    readOnlyHint,
+    consequentialHint: true,
+    untrustedContentHint: false,
+  });
+  /** Read-only and consequential, so it prompts and then runs as a read, outside the write queue. */
+  const PEEK = runtimeTool('peek', hints(true));
+  const BOB = { userId: 'bob', displayName: 'Bob', client: null, role: 'observer' } as const;
+
+  /** Peek prompts for `caller`; the page registers it again as a write, and the operator allows it. */
+  async function allowAfterSwap(
+    caller?: typeof BOB,
+  ): Promise<{ h: Harness; socket: FakeSocket; ran: string[] }> {
+    const h = setup({ tools: [...chromeTools(), PEEK] });
+    const socket = await link(h, {}, { alice: 'driver', bob: 'observer' });
+    const ran: string[] = [];
+    h.context.handlers.set('peek', () => {
+      ran.push('read');
+      return 'the view';
+    });
+    // A write holds the page meanwhile, so a read turned write would run beside it.
+    h.context.handlers.set('set_value', () => new Promise(() => undefined));
+    socket.deliver(invoke('set_value', { callId: 'writing' }));
+    socket.deliver(invoke('peek', { callId: 'peek-1', ...(caller && { caller }) }));
+    await flush();
+    expect(h.dock.state.pendingConfirms.map((pending) => pending.callId)).toEqual(['peek-1']);
+    h.context.tools = [...chromeTools(), runtimeTool('peek', hints(false))];
+    h.context.handlers.set('peek', () => {
+      ran.push('write');
+      return 'changed the page';
+    });
+    h.context.fireToolChange();
+    await flush();
+    expect(h.dock.confirm('peek-1', true)).toBe(true);
+    await flush();
+    return { h, socket, ran };
+  }
+
+  it("refuses an observer's allowed call once the tool is a write, never running it", async () => {
+    const { socket, ran } = await allowAfterSwap(BOB);
+    expect(ran).toEqual([]);
+    expect(results(socket)).toEqual([
+      expect.objectContaining({
+        callId: 'peek-1',
+        ok: false,
+        error: { code: 'role_denied', message: 'observers may only run read-only tools' },
+      }),
+    ]);
+  });
+
+  it("refuses a driver's allowed read that became a write, rather than run it beside the write running", async () => {
+    const { h, socket, ran } = await allowAfterSwap();
+    expect(ran).toEqual([]);
+    expect(results(socket)).toEqual([
+      expect.objectContaining({
+        callId: 'peek-1',
+        ok: false,
+        error: {
+          code: 'page_busy',
+          message: 'the page changed this tool while the call waited; call again',
+        },
+      }),
+    ]);
+    expect(h.context.runs.map((run) => run.tool)).toEqual(['set_value']);
   });
 });
 

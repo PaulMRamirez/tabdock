@@ -1,37 +1,54 @@
 # The Tabdock guide
 
-This guide is for people using Tabdock: adding it to a web app, calling a page from Claude or another MCP client, sharing a page, or running a relay. It describes the code as it stands, and says so wherever something waits for the 0.1.0 publish or has not yet run live. The [tour](../tour/00-baseline.md) is different: one short explainer per milestone, the history of how Tabdock was built.
+This guide is for people using Tabdock: adding it to a web app, calling a page from Claude or another MCP client, sharing a page, or running a relay. It describes the code as it stands, and says so wherever something waits for a release or has not yet run live. The [tour](../tour/00-baseline.md) is different: one short explainer per milestone, the history of how Tabdock was built.
 
-Tabdock 0.1.0 is prepared but not yet on npm, so every page leads with the path that works from a clone. `npx @tabdock/relay`, `npm install @tabdock/adapter` and the CDN script tag work once 0.1.0 is on npm.
+Tabdock 0.1.0 is prepared but not yet on npm. It carries pairing, roles, invites, every relay mode, first-class tools and confirmation in the client. Everything for rooms, images and state (images, page state, proposals, time-boxed sessions, watching seats, the members file, agent tokens, the restart snapshot, the session record and `@tabdock/adapter/testing`) arrives in the release after 0.1.0, and until then works from a clone, so every page leads with the path that works from a clone. `npx @tabdock/relay`, `npm install @tabdock/adapter` and the CDN script tag work once 0.1.0 is on npm.
 
 ## Where to start
 
-| You want to                                    | Read, in order                                                                                                     |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| Understand what Tabdock is and whether it fits | [Concepts](01-concepts.md), [Use cases](09-use-cases.md)                                                           |
-| See it work in ten minutes                     | [Quick start](02-quick-start.md)                                                                                   |
-| Add it to your own web app                     | [Add to your app](03-add-to-your-app.md), [Adapter reference](04-adapter-reference.md), [Security](10-security.md) |
-| Use a page from Claude or another MCP client   | [Connect clients](05-connect-clients.md), [Troubleshooting](11-troubleshooting.md)                                 |
-| Let other people use a page you operate        | [Sharing](06-sharing.md)                                                                                           |
-| Run a relay for yourself or a team             | [Run a relay](07-run-a-relay.md), [Relay settings](08-relay-settings.md), [Security](10-security.md)               |
-| Find out why something failed                  | [Troubleshooting](11-troubleshooting.md) for a call, [Setup problems and limits](12-setup-and-limits.md) for setup |
+| You want to                                                    | Read, in order                                                                                                                                                                                                                                                                                                                                                           |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Understand what Tabdock is and whether it fits                 | [Concepts](01-concepts.md), [Use cases](09-use-cases.md)                                                                                                                                                                                                                                                                                                                 |
+| See it work in ten minutes                                     | [Quick start](02-quick-start.md)                                                                                                                                                                                                                                                                                                                                         |
+| Add it to your own web app                                     | [Quick start](02-quick-start.md), [Add to your app](03-add-to-your-app.md), [Adapter reference](04-adapter-reference.md), [Connect clients](05-connect-clients.md), [The control handle](13-the-control-handle.md), [Images and page state](18-images-and-state.md), [Scripts and the widget](24-scripts-and-the-widget.md), [Security](10-security.md)                  |
+| Build a map or globe page every client drives alike            | [Map and globe pages](16-map-pages.md), [Check a page from CI](17-check-from-ci.md), [Images and page state](18-images-and-state.md)                                                                                                                                                                                                                                     |
+| Check a page on every change                                   | [Check a page from CI](17-check-from-ci.md), [Copy the CI check](23-copy-the-ci-check.md), [Scripts and the widget](24-scripts-and-the-widget.md#the-testing-helper)                                                                                                                                                                                                     |
+| Use a page from Claude or another MCP client                   | [Connect clients](05-connect-clients.md), [Scripts and the widget](24-scripts-and-the-widget.md), [Images and page state](18-images-and-state.md), [Troubleshooting](11-troubleshooting.md)                                                                                                                                                                              |
+| Join a page someone shared with you, or give a program a token | [Join a shared page](22-join-a-shared-page.md)                                                                                                                                                                                                                                                                                                                           |
+| Let other people use a page you operate                        | [Sharing](06-sharing.md), [Lessons and reviews](19-lessons-and-reviews.md), [Larger rooms](20-larger-rooms.md)                                                                                                                                                                                                                                                           |
+| Teach a class or review work on one tab                        | [Run a class](21-run-a-class.md), starting with [a rehearsal](21-run-a-class.md#rehearse-on-one-computer), then [Lessons and reviews](19-lessons-and-reviews.md) and [Larger rooms](20-larger-rooms.md)                                                                                                                                                                  |
+| Run a relay for yourself or a team                             | [Run a relay](07-run-a-relay.md), [Relay settings](08-relay-settings.md), [Settings for rooms, images and state](14-settings-for-rooms.md), [Security](10-security.md)                                                                                                                                                                                                   |
+| Look up a setting or a limit                                   | [Relay settings](08-relay-settings.md), [Settings for rooms, images and state](14-settings-for-rooms.md), [Setup problems and limits](12-setup-and-limits.md), [Limits for rooms, images and state](15-limits-for-rooms.md)                                                                                                                                              |
+| Find out why something failed                                  | [Troubleshooting](11-troubleshooting.md) for a call, [Setup problems and limits](12-setup-and-limits.md) for setup, and the When it goes wrong sections of [Images and page state](18-images-and-state.md#when-it-goes-wrong), [Lessons and reviews](19-lessons-and-reviews.md#when-it-goes-wrong) and [Join a shared page](22-join-a-shared-page.md#when-it-goes-wrong) |
 
-Whatever your role, read [Concepts](01-concepts.md) first: every other page uses its words (operator, member, invitee, driver, observer, consequential) in exactly its sense.
+Whatever your role, read [Concepts](01-concepts.md) first: every other page uses its words (operator, member, invitee, driver, observer, consequential, proposal, watcher and watching seat, time-boxed session, agent token, page state, image tool, session record, members file, restart snapshot, profile) in exactly its sense.
 
 ## Every page
 
-1. [Concepts](01-concepts.md): the five parts, four flows and three dials, and what makes Tabdock unusual.
-2. [Quick start](02-quick-start.md): from a clone to a working call with Claude Code, then a first page of your own.
+1. [Concepts](01-concepts.md): the five parts, four flows and three dials, the words for rooms, state and records, and what makes Tabdock unusual.
+2. [Quick start](02-quick-start.md): from a clone to a working call with Claude Code, a picture and the page's state, then a first page of your own.
 3. [Add to your app](03-add-to-your-app.md): a WebMCP runtime, writing tools, marking them, the adapter, the script tag and which relay URL to dial.
-4. [Adapter reference](04-adapter-reference.md): `attach()`, every policy field, the handle's methods and its state, as tables.
-5. [Connect clients](05-connect-clients.md): adding the connector to Claude Code, Claude on the web, desktop and phone, or another client; the fixed tools; pairing and results.
-6. [Sharing](06-sharing.md): approvals, roles, Revoke and Pause, invites, and confirmation in the client, as tasks for the operator.
+4. [Adapter reference](04-adapter-reference.md): `attach()`, every policy field, the script tag's attributes and the package's exports, as tables, and what counts as one page.
+5. [Connect clients](05-connect-clients.md): adding the connector to Claude Code, Claude on the web, desktop and phone, or another client; the nine fixed tools; pairing and results.
+6. [Sharing](06-sharing.md): approvals, roles, proposals, Revoke and Pause, invites, and confirmation in the client, as tasks for the operator.
 7. [Run a relay](07-run-a-relay.md): choosing local, dev token, public URL or hosted mode, and running each.
-8. [Relay settings](08-relay-settings.md): every `TABDOCK_*` setting with its mode, default and bounds.
+8. [Relay settings](08-relay-settings.md): every `TABDOCK_*` setting except those for rooms, images and state, which page 14 lists, with its mode, default and bounds.
 9. [Use cases](09-use-cases.md): what you can build, with an honest status on each.
 10. [Security](10-security.md): what Tabdock protects, and what it relies on you for.
 11. [Troubleshooting](11-troubleshooting.md): each error code a client sees, and failures without one.
-12. [Setup problems and limits](12-setup-and-limits.md): a relay, page or client that misbehaves before any call, and the fixed limits.
+12. [Setup problems and limits](12-setup-and-limits.md): a relay, page or client that misbehaves before any call, and the older fixed limits; page 15 has those for rooms.
+13. [The control handle](13-the-control-handle.md): every member of the handle `attach()` returns, its state, and the options its minting methods take.
+14. [Settings for rooms, images and state](14-settings-for-rooms.md): the settings for images, page state, proposals, watching seats, the members file, agent tokens and the restart snapshot.
+15. [Limits for rooms, images and state](15-limits-for-rooms.md): the fixed numbers behind those, each with its constant.
+16. [Map and globe pages](16-map-pages.md): the shared tool profile for map and globe pages, its units and shapes, and its worked examples.
+17. [Check a page from CI](17-check-from-ci.md): a check that walks a map page's every stop in local mode on a CI runner, what it needs of the page, and the advisory walk.
+18. [Images and page state](18-images-and-state.md): returning a picture of the page's canvas, publishing its state, following it with a wait, and which clients show images.
+19. [Lessons and reviews](19-lessons-and-reviews.md): proposals from observers, time-boxed sessions, and the session record and `audit --match`.
+20. [Larger rooms](20-larger-rooms.md): watching seats and the compact roster, a class joining, the members file, agent tokens and sizing a class relay.
+21. [Run a class](21-run-a-class.md): the teacher's walkthrough in order, from the relay's settings to a saved record matched against the audit log, with an honest status.
+22. [Join a shared page](22-join-a-shared-page.md): the joiner's side, for a guest with a link, a watcher in a session and a program holding an agent token, and what to do when it goes wrong.
+23. [Copy the CI check](23-copy-the-ci-check.md): the check in another repository, with its install before and after the release, the four things to change and the workflow.
+24. [Scripts and the widget](24-scripts-and-the-widget.md): a client that signs in at a public relay, a script that pairs in headless Chromium and fills the widget's fields, and the testing helper's calls.
 
 For the design itself, `SPEC.md` is the source of truth, `docs/adr/` holds the decisions and `docs/threat-model.md` maps each boundary to its tests. `docs/develop.md` is for contributors.
 

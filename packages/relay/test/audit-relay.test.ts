@@ -7,7 +7,8 @@
 // chain stays whole; and no file line or log line holds a token, a pairing
 // code, a resume token, an argument or a client address. Then the reader,
 // pnpm audit:log, over what the relay wrote, each filter shown to leave
-// something out.
+// something out. A call line names the invoke the page was handed by its
+// callId, and only a call whose invoke went out names one (ADR 0045).
 
 import {
   mkdirSync,
@@ -22,7 +23,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Client } from '@modelcontextprotocol/client';
-import { AUDIT_VERSION, AuditLineSchema } from '@tabdock/protocol';
+import { AUDIT_VERSION, AuditLineSchema, MAX_FRAME_BYTES } from '@tabdock/protocol';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { escapeForTerminal, runAuditCli } from '../src/audit-cli.ts';
 import {
@@ -44,6 +45,7 @@ import { connectPage, PAGE_ORIGIN, type TestPage, TOOLS } from './helpers/page-c
 import {
   ALICE,
   BOB,
+  CAROL,
   callTool,
   connectClient,
   pairAndApprove,
@@ -405,6 +407,62 @@ describe('a relay with an audit directory (ADR 0019)', () => {
     }
     // The client's address is for log lines that need it, never for a record.
     expect(text).not.toContain('127.0.0.1');
+  });
+});
+
+describe("a call line's callId (ADR 0045)", () => {
+  it('is the id of the invoke the page was handed, and no call that sent none has one', async () => {
+    const dir = join(scratch(), 'audit');
+    const relay = await startRelay({ audit: { dir }, rateLimits: { callsPerUserPerPage: 3 } });
+    relays.push(relay);
+    const handed: string[] = [];
+    const page = await connectPage(relay.relay.pageUrl, {
+      tools: TOOLS,
+      onInvoke: (frame) => {
+        handed.push(frame.callId);
+        return { ok: true, content: 'done' };
+      },
+    });
+    pages.push(page);
+    const [alice, bob, carol] = await Promise.all(
+      [ALICE, BOB, CAROL].map((user) => connectClient(relay.relay, user)),
+    );
+    if (alice === undefined || bob === undefined || carol === undefined)
+      throw new Error('no clients');
+    clients.push(alice, bob, carol);
+    await pairAndApprove(alice, page, 'driver');
+    await pairAndApprove(bob, page, 'observer');
+    const call = (client: Client, tool: string, args: Record<string, unknown> = {}) =>
+      callTool(client, 'call_page_tool', { page: page.pageId, tool, arguments: args });
+
+    expect((await call(alice, 'get_view')).isError).toBe(false);
+    // Refused after the relay minted the call's id: by the argument check and by the frame's size.
+    expect((await call(alice, 'get_view', { stray: true })).isError).toBe(true);
+    expect((await call(alice, 'clear_board', { pad: 'z'.repeat(MAX_FRAME_BYTES) })).isError).toBe(
+      true,
+    );
+    // Refused before: past the call rate, for an observer's write, and for no attachment.
+    expect((await call(alice, 'get_view')).isError).toBe(true);
+    expect((await call(bob, 'add_item', { label: 'x' })).isError).toBe(true);
+    expect((await call(carol, 'get_view')).isError).toBe(true);
+    await relay.close();
+    relays.splice(0);
+
+    expect(handed).toHaveLength(1);
+    const lines = records(dir).flatMap((record) =>
+      record.type === 'call' ? [{ outcome: record.outcome, callId: record.callId }] : [],
+    );
+    expect(lines).toEqual([
+      { outcome: 'ok', callId: handed[0] },
+      { outcome: 'invalid_arguments', callId: undefined },
+      { outcome: 'invalid_arguments', callId: undefined },
+      { outcome: 'rate_limited', callId: undefined },
+      { outcome: 'role_denied', callId: undefined },
+      { outcome: 'not_attached', callId: undefined },
+    ]);
+    // Absent, not written as nothing: a line that sent no invoke has no such field.
+    expect(fileText(dir)).toContain(`"callId":"${handed[0] ?? ''}"`);
+    expect(fileText(dir).match(/"callId"/g)).toHaveLength(1);
   });
 });
 

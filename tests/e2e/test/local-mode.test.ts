@@ -31,6 +31,9 @@ import {
 const scratches: string[] = [];
 const runs: Run[] = [];
 
+/** The fixed tools a member sees on a relay with no page attached: M4's five and M6's four. */
+const FIXED_TOOL_COUNT = 9;
+
 /** The step every local mode banner prints for an older tabdock-local entry in Claude Code. */
 const REMOVE_FIRST =
   'If Claude Code says tabdock-local already exists, remove the old entry first: claude mcp remove --scope user tabdock-local';
@@ -156,9 +159,13 @@ describe.skipIf(process.platform === 'win32')('local mode from a clean checkout'
     expect(await toolNames(banner.mcpUrl, token)).toEqual([
       'call_page_tool',
       'detach_page',
+      'get_page_state',
+      'get_proposal',
       'list_page_tools',
       'list_pages',
       'pair_page',
+      'wait_for_page_state',
+      'withdraw_proposal',
     ]);
     await stopAndScan(first, token);
 
@@ -169,7 +176,7 @@ describe.skipIf(process.platform === 'win32')('local mode from a clean checkout'
     expect(second.stdout()).toContain('(kept from an earlier start)');
     expect(second.stdout()).toContain(REMOVE_FIRST);
     expect(readFileSync(again.tokenPath).equals(bytes)).toBe(true);
-    expect(await toolNames(again.mcpUrl, token)).toHaveLength(5);
+    expect(await toolNames(again.mcpUrl, token)).toHaveLength(FIXED_TOOL_COUNT);
     await stopAndScan(second, token);
 
     // pnpm relay --new-token (ADR 0028): the same command and helper, a new token.
@@ -183,7 +190,7 @@ describe.skipIf(process.platform === 'win32')('local mode from a clean checkout'
     expect(newToken === token).toBe(false);
     expect(helperHeader(replaced.command) === `Bearer ${newToken}`).toBe(true);
     expect(await mcpStatus(replaced.mcpUrl, { Authorization: `Bearer ${token}` })).toBe(401);
-    expect(await toolNames(replaced.mcpUrl, newToken)).toHaveLength(5);
+    expect(await toolNames(replaced.mcpUrl, newToken)).toHaveLength(FIXED_TOOL_COUNT);
     await stopAndScan(third, newToken);
     expect(leakIn(third.stdout() + third.stderr(), token)).toBeNull();
   }, 90_000);
@@ -221,7 +228,7 @@ describe.skipIf(process.platform === 'win32')('local mode from a clean checkout'
     // under tabdock-local, which claude mcp add will not overwrite.
     expect(next.stdout()).toContain(REMOVE_FIRST);
     expect(readFileSync(banner.tokenPath).equals(bytes)).toBe(true);
-    expect(await toolNames(banner.mcpUrl, token)).toHaveLength(5);
+    expect(await toolNames(banner.mcpUrl, token)).toHaveLength(FIXED_TOOL_COUNT);
     expect(leakIn(failed.stdout(), token), 'stdout').toBeNull();
     expect(leakIn(failed.stderr(), token), 'stderr').toBeNull();
     await stopAndScan(next, token);
@@ -247,7 +254,7 @@ describe.skipIf(process.platform === 'win32')('local mode from a clean checkout'
     );
     const token = readFileSync(banner.tokenPath, 'latin1').trim();
     expect(helperHeader(banner.command) === `Bearer ${token}`).toBe(true);
-    expect(await toolNames(banner.mcpUrl, token)).toHaveLength(5);
+    expect(await toolNames(banner.mcpUrl, token)).toHaveLength(FIXED_TOOL_COUNT);
     expect(
       await mcpStatus(banner.mcpUrl, {
         Authorization: `Bearer ${token}`,

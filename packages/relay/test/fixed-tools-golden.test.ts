@@ -1,19 +1,23 @@
-// The five fixed tools as clients receive them, held to what M4 sent (ADR
-// 0025). M5 moves the whole tool surface from McpServer.registerTool to the
-// SDK's low-level Server, which answers tools/list and dispatches tools/call
-// in the relay's own code, so nothing but this test says the fixed tools'
-// wire entries stayed as they were: name, title, description, input schema,
-// annotations and _meta, on both eras, with first-class tools off and on.
-// The fixture was captured from the relay before the move (its _comment says
-// where); <RELAY_VERSION> stands for the version the release bumps. Beside
-// the lists, initialize and server/discover keep their answers (discover's
+// The fixed tools as clients receive them (ADR 0025). M5 moved the whole
+// tool surface from McpServer.registerTool to the SDK's low-level Server,
+// which answers tools/list and dispatches tools/call in the relay's own code,
+// so nothing but this test says the fixed tools' wire entries stay as they
+// were: name, title, description, input schema, annotations and _meta, on
+// both eras, with first-class tools off and on. The fixture was first
+// captured from the relay before the move (its _comment says where);
+// <RELAY_VERSION> stands for the version the release bumps. Beside the
+// lists, initialize and server/discover keep their answers (discover's
 // supportedVersions now naming every revision /mcp serves, ADR 0027's Step 3
 // review notes), a name the relay does not serve keeps M4's JSON-RPC error,
 // and a handler that throws still answers an isError result in the thrown
-// message, as McpServer did. One wording change since is deliberate and
-// recorded in the fixture's _comment: detach_page's description names a new
-// invite link beside a new code, since an invitee who offers a code gets
-// invite_required.
+// message, as McpServer did. Every wording change since is deliberate and
+// recorded in the fixture's _comment: M6 recaptured both lists once, with
+// four tools after M4's five (ADRs 0040 and 0042) and three of M4's
+// descriptions changed (ADRs 0042 and 0043), and the docs pass after M6
+// changed the instructions and pair_page's and detach_page's descriptions
+// for agent tokens (ADR 0049 decision 4). So the old entries never move,
+// M4's five still lead every list in M4's order, each with M4's name, input
+// schema and annotations, which the fixture keeps apart as m4Structure.
 
 import { readFileSync } from 'node:fs';
 import { type AuthInfo, createMcpHandler } from '@modelcontextprotocol/server';
@@ -24,6 +28,8 @@ import type { PageHub } from '../src/hub.ts';
 import { createDevTokenAuth } from '../src/index.ts';
 import { createMcpFactory, RELAY_VERSION } from '../src/mcp.ts';
 import { SERVED_REVISIONS } from '../src/relay.ts';
+import { agentWire, mintAgent } from './helpers/agents.ts';
+import { attachMember, type InviteRelay, startInviteRelay } from './helpers/invites.ts';
 import { connectPage, type TestPage, TOOLS } from './helpers/page-client.ts';
 import {
   ALICE,
@@ -42,6 +48,8 @@ import {
 interface Golden {
   legacy: { initialize: unknown; toolsList: unknown; unknownTool: unknown };
   modern: { discover: unknown; toolsList: unknown; unknownTool: unknown };
+  /** M4's five as M4 served them: what no later change may move. */
+  m4Structure: { name: string; inputSchema: unknown; annotations: unknown }[];
 }
 
 const GOLDEN = JSON.parse(
@@ -68,16 +76,35 @@ function toolsOf(result: unknown): unknown[] {
   return (result as { result: { tools: unknown[] } }).result.tools;
 }
 
+/** The list starts with M4's five in M4's order, each with M4's name, input schema and annotations. */
+function expectM4First(tools: unknown[]): void {
+  expect(GOLDEN.m4Structure.map((tool) => tool.name)).toEqual([
+    'list_pages',
+    'pair_page',
+    'list_page_tools',
+    'call_page_tool',
+    'detach_page',
+  ]);
+  const leading = tools.slice(0, GOLDEN.m4Structure.length).map((tool) => {
+    const { name, inputSchema, annotations } = tool as Record<string, unknown>;
+    return { name, inputSchema, annotations };
+  });
+  expectWire(leading, GOLDEN.m4Structure);
+}
+
 let current: TestRelay | undefined;
+let agents: InviteRelay | undefined;
 const pages: TestPage[] = [];
 
 afterEach(async () => {
   for (const page of pages.splice(0)) page.ws.terminate();
   await current?.close();
   current = undefined;
+  await agents?.close();
+  agents = undefined;
 });
 
-describe('the five fixed tools stay as M4 sent them', () => {
+describe('the fixed tools stay as clients were last shown them', () => {
   for (const firstClassTools of [false, true]) {
     describe(firstClassTools ? 'with first-class tools on' : 'with first-class tools off', () => {
       it('on a 2025-era session: initialize, tools/list and an unknown name', async () => {
@@ -86,6 +113,7 @@ describe('the five fixed tools stay as M4 sent them', () => {
         expectWire(asCaptured(init), GOLDEN.legacy.initialize);
         const list = await legacyExchange(current.relay, ALICE, init.sessionId ?? '', 'tools/list');
         expectWire(asCaptured(list), GOLDEN.legacy.toolsList);
+        expectM4First(toolsOf(asCaptured(list)));
         const unknown = await legacyExchange(
           current.relay,
           ALICE,
@@ -110,6 +138,7 @@ describe('the five fixed tools stay as M4 sent them', () => {
           result: { ...captured.result, supportedVersions: [...SERVED_REVISIONS] },
         });
         const list = await modernExchange(current.relay, ALICE, 'tools/list');
+        expectM4First(toolsOf(asCaptured(list)));
         const expected = GOLDEN.modern.toolsList as { result: Record<string, unknown> };
         // The one difference the flag makes to an empty list: ADR 0025's cache hint.
         expectWire(
@@ -141,10 +170,42 @@ describe('the five fixed tools stay as M4 sent them', () => {
     const modern = toolsOf(asCaptured(await modernExchange(current.relay, ALICE, 'tools/list')));
     const fixed = toolsOf(GOLDEN.legacy.toolsList);
     for (const tools of [legacy, modern]) {
-      // The page's tools follow, so the list is longer than the five.
+      // The page's tools follow, so the list is longer than the fixed tools.
       expect(tools.length).toBeGreaterThan(fixed.length);
       expectWire(tools.slice(0, fixed.length), fixed);
+      expectM4First(tools);
     }
+  });
+});
+
+describe('the fixed tools on /g/mcp (ADR 0044)', () => {
+  it("are what /mcp serves, on both eras, to an agent token's agent", async () => {
+    agents = await startInviteRelay({ agentTokens: true });
+    const page = await agents.page({ policy: { invites: 'all' } });
+    await attachMember(await agents.claude('sub-alice'), page);
+    const minted = await mintAgent(page);
+    const wire = agentWire(agents.relay.url, minted.token);
+
+    const init = await wire.legacyInitialize();
+    expectWire(asCaptured(init), GOLDEN.legacy.initialize);
+    const sessionId = init.sessionId ?? '';
+    const list = await wire.legacy(sessionId, 'tools/list');
+    expectWire(asCaptured(list), GOLDEN.legacy.toolsList);
+    expectM4First(toolsOf(asCaptured(list)));
+    const unknown = await wire.legacy(sessionId, 'tools/call', { name: 'nope', arguments: {} });
+    expectWire(asCaptured(unknown), GOLDEN.legacy.unknownTool);
+
+    const discover = await wire.modern('server/discover');
+    const captured = GOLDEN.modern.discover as { result: Record<string, unknown> };
+    expectWire(asCaptured(discover), {
+      ...captured,
+      result: { ...captured.result, supportedVersions: [...SERVED_REVISIONS] },
+    });
+    const modern = await wire.modern('tools/list');
+    expectWire(asCaptured(modern), GOLDEN.modern.toolsList);
+    expectM4First(toolsOf(asCaptured(modern)));
+    const modernUnknown = await wire.modern('tools/call', { name: 'nope', arguments: {} });
+    expectWire(asCaptured(modernUnknown), GOLDEN.modern.unknownTool);
   });
 });
 

@@ -4,10 +4,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   ATTACH_REQUEST_TTL_MS,
+  DEFAULT_IMAGE_BYTES,
   IDLE_TIMEOUT_MS,
   MAX_DESCRIPTION_CHARS,
   MAX_FRAME_BYTES,
   MAX_RESULT_CHARS,
+  MAX_STATE_BYTES,
   PAIRING_TTL_MS,
   PING_INTERVAL_MS,
   RESUME_WINDOW_MS,
@@ -198,7 +200,26 @@ describe('hello', () => {
       idleTimeoutMs: 10_000,
       resumeWindowMs: 5000,
       attachRequestTtlMs: 5000,
+      // M6: the page's people with no watching seats, invites off (ADR
+      // 0044), the largest image the relay passes (ADR 0039) and the
+      // protocol's cap on page state (ADR 0040).
+      maxImageBytes: DEFAULT_IMAGE_BYTES,
+      maxStateBytes: MAX_STATE_BYTES,
+      usersPerPage: 10,
+      observersPerPage: 0,
     });
+  });
+
+  it('tells the page its watching seats as set, with invites on', async () => {
+    const { relay } = await relayWith({
+      invites: true,
+      limits: { observersPerPage: 25, usersPerPage: 6, imageBytes: 4096 },
+    });
+    const opened = await page(relay.pageUrl, { tools: TOOLS });
+    expect(opened.welcome?.limits).toMatchObject({ usersPerPage: 6, observersPerPage: 25 });
+    // The image size as set (ADR 0039) and the state cap (ADR 0040).
+    expect(opened.welcome?.limits.maxImageBytes).toBe(4096);
+    expect(opened.welcome?.limits.maxStateBytes).toBe(MAX_STATE_BYTES);
   });
 
   it('advertises the protocol defaults when no timings are overridden', async () => {

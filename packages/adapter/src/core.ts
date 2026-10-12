@@ -4,11 +4,20 @@
 // timers and the operator's prompts all arrive through CoreOptions.
 
 import {
+  ACCEPTED_PROPOSAL_RUN_MS,
   type Account,
+  AGENT_BURN_TIMEOUTS,
+  AGENT_TOKEN_BYTES,
+  AGENT_TOKEN_PREFIX,
+  agentKeyInput,
+  type AgentListing,
+  type AgentState,
   ATTACH_REQUEST_TTL_MS,
   type AttachmentView,
   type AttachVia,
   type Caller,
+  canonicalJson,
+  checkImage,
   type ClientInfo,
   CLOSE_DETACH,
   CLOSE_INVALID_FRAME_PAGE,
@@ -17,8 +26,11 @@ import {
   CONTROL_INVITE_USES,
   DEFAULT_INVITE_LIFETIME_MS,
   encodeFrame,
+  encodeValue,
+  escapeUnseen,
   IdSchema,
   IDLE_TIMEOUT_MS,
+  type ImageMimeType,
   INVITE_BURN_REFUSALS,
   INVITE_SECRET_BYTES,
   InviteeIdSchema,
@@ -26,41 +38,87 @@ import {
   inviteLink,
   type InviteListing,
   type InviteRefusalReason,
+  INVITEE_ID_PREFIX,
+  INVITEE_KEY_HEX_CHARS,
   INVITEE_SHORT_ID_CHARS,
+  type JsonObject,
   JsonObjectSchema,
+  MAX_AGENT_LIFETIME_MS,
   MAX_FRAME_BYTES,
+  MAX_IMAGE_BYTES,
+  MAX_IMAGE_TEXT_CHARS,
   MAX_INVITE_LIFETIME_MS,
   MAX_INVITE_USES,
+  MAX_LIVE_AGENTS_PER_PAGE,
   MAX_LIVE_INVITES_PER_PAGE,
+  MAX_OBSERVERS_PER_PAGE,
+  MAX_PENDING_PROPOSALS_PER_PAGE,
+  MAX_PENDING_PROPOSALS_PER_USER,
   MAX_RESULT_CHARS,
+  MAX_SESSION_MS,
+  MAX_STATE_BYTES,
   MAX_TIMER_MS,
+  MAX_USERS_PER_PAGE,
+  MEMBER_RESERVED_SEATS,
+  narrowPolicy,
   type PageErrorCode,
   type PageFrameInput,
   PageFrameSchema,
   type PageTool,
   type Pairing,
+  parseImageEnvelope,
   parseRelayFrame,
+  parseValue,
   type Policy,
   type PolicyInput,
   PolicySchema,
+  PROPOSAL_TTL_MS,
+  proposalArgumentProblem,
+  type ProposalPolicy,
+  type ProposalRefusal,
+  proposalsAdmit,
   PROTOCOL_VERSION,
   RECONNECT_MAX_MS,
   RECONNECT_MIN_MS,
   type RelayFrame,
   type Role,
   RoleSchema,
+  SESSION_END_GRACE_MS,
+  SESSION_LENGTH_UNIT_MS,
+  type SessionEndReason,
+  SessionLengthSchema,
+  SessionPolicySchema,
+  type SessionRecord,
+  type SessionRefusalReason,
   SHORT_INVITE_LIFETIME_MS,
+  STATE_MIN_INTERVAL_MS,
+  StateValueSchema,
+  type StoredAgent,
+  StoredAgentsSchema,
   type StoredGrant,
   StoredGrantSchema,
   type StoredInvite,
   StoredInvitesSchema,
+  type StoredSession,
+  StoredSessionSchema,
   SUBPROTOCOL,
   TOOL_POLL_MS,
   truncate,
   type User,
+  withinCeiling,
 } from '@tabdock/protocol';
 import * as z from 'zod/mini';
-import { apply } from './taken.ts';
+import {
+  createRecorder,
+  NOOP_RECORDER,
+  type RecordContext,
+  type Recorder,
+  type RecordHandle,
+  type RecordView,
+  type RecordWayIn,
+  type RecordWhich,
+} from './record.ts';
+import { apply, type Taken } from './taken.ts';
 import {
   isConsequential,
   isReadOnly,
@@ -72,6 +130,7 @@ import {
 } from './tools.ts';
 
 export type { HintSupport, RuntimeTool } from './tools.ts';
+export type { Recorder, RecordView, RecordWhich } from './record.ts';
 export type { StoredGrant, StoredInvite, StoredInvites } from '@tabdock/protocol';
 
 // Ports: everything the core needs from its environment.
@@ -211,6 +270,11 @@ export interface CoreOptions {
    * docs/threat-model.md (B5) says what such a script can still read.
    */
   crypto?: CryptoLike | undefined;
+  /**
+   * Keeps the session record (ADR 0045). Internal, for tests: one that
+   * throws shows that a recorder fault stops the record and never changes a call.
+   */
+  recorder?: Recorder | undefined;
 }
 
 // What the page sees.
@@ -228,6 +292,12 @@ export interface PendingRequest {
    * secret, which stays inside the adapter. null for a code or QR request.
    */
   readonly invite: { readonly inviteId: string; readonly label: string } | null;
+  /**
+   * The agent token whose first request this is (ADR 0044), as the relay
+   * names it; never the token. Its label is checked against this page's own
+   * record before the operator is asked. null for every other request.
+   */
+  readonly agent: { readonly tokenId: string; readonly label: string } | null;
   readonly client: ClientInfo | null;
   /** Local epoch milliseconds at which silence becomes a denial. */
   readonly expiresAt: number;
@@ -324,6 +394,180 @@ export interface PendingConfirm {
   readonly expiresAt: number;
 }
 
+// From M6: page state, proposals, time-boxed sessions and agent tokens.
+
+/** What publishState did with a value (ADR 0040). Never a throw: pages publish from render loops. */
+export type PublishResult =
+  { readonly ok: true } | { readonly ok: false; readonly reason: 'too_large' | 'invalid' };
+
+/**
+ * Whether the page's state reaches the relay (ADR 0040): nothing published
+ * yet, shared, held while paused, refused for its size or its shape, or a
+ * relay that takes no page state. It changes only between these, never with
+ * each value, so a page publishing twice a second re-renders nothing.
+ */
+export type PublishStatus = 'none' | 'shared' | 'paused' | 'too_large' | 'invalid' | 'unsupported';
+
+/** The CustomEvent a script-tag page dispatches on document to publish its state (ADR 0040). */
+export const STATE_EVENT = 'tabdock:state';
+
+/** How a proposal left the queue (ADR 0042). */
+export type ProposalOutcome =
+  'accepted' | 'dismissed' | 'refused' | 'expired' | 'withdrawn' | 'cancelled' | 'not_run';
+
+/**
+ * An observer's call the page holds for the operator to accept or dismiss
+ * (ADR 0042). Its arguments are here as text to show, never to run: an
+ * accepted proposal runs the page's own parsed copy.
+ */
+export interface PendingProposal {
+  readonly proposalId: string;
+  readonly tool: string;
+  readonly proposer: Caller;
+  /** The arguments' JSON as received, unseen characters escaped (escapeUnseen), for showing. */
+  readonly arguments: string;
+  readonly argumentChars: number;
+  /** By the page's own rule (ADR 0002): accepting it is then that call's confirmation (S6). */
+  readonly consequential: boolean;
+  /** Local epoch milliseconds. */
+  readonly receivedAt: number;
+  readonly expiresAt: number;
+}
+
+/** A proposal that left the queue, as the session record keeps it (ADR 0045); never its arguments. */
+export interface ProposalLogEntry {
+  readonly proposalId: string;
+  readonly tool: string;
+  readonly proposer: User;
+  readonly client: ClientInfo | null;
+  readonly outcome: ProposalOutcome;
+  /** The call that ran an accepted proposal; null for every other. */
+  readonly callId: string | null;
+  /** Local epoch milliseconds. */
+  readonly time: number;
+}
+
+/** A time-boxed session this page started (ADR 0043). Never its invite link, which shows once. */
+export interface SessionView {
+  readonly sessionId: string;
+  /** Written on this page: shown as its own words (S10). */
+  readonly label: string;
+  /** Local epoch milliseconds. */
+  readonly startedAt: number;
+  readonly endsAt: number;
+  readonly lengthMinutes: number;
+  /** The page's policy as the session narrows it; never wider than attach()'s. */
+  readonly policy: Policy;
+  /** Seats offered by watch invite, and the invites minted for them. */
+  readonly observers: number;
+  readonly inviteIds: readonly string[];
+  /** The member the relay named as sponsor of the session's invites; null without observers. */
+  readonly sponsor: User | null;
+}
+
+/** Why a session ended: the relay's reasons, or 'relay' when it started a new page session. */
+export type SessionEndedReason = SessionEndReason | 'relay';
+
+export interface SessionEnded {
+  readonly sessionId: string;
+  readonly label: string;
+  readonly reason: SessionEndedReason;
+  /** Local epoch milliseconds. */
+  readonly time: number;
+}
+
+/** What the operator asks for when starting a session (ADR 0043), each within attach()'s policy. */
+export interface SessionOptions {
+  /** 1 to 60 characters, shown wherever the session is. */
+  readonly label: string;
+  /** Whole minutes from 30 to 240. */
+  readonly lengthMinutes: number;
+  /** Driver seats, 1 to policy.maxDrivers. */
+  readonly drivers?: number;
+  /** Seats by watch invite; none unless set. */
+  readonly observers?: number;
+  /** Who may propose, no wider than policy.proposals. */
+  readonly proposals?: ProposalPolicy;
+}
+
+/** One of a session's watch invites and its link, which shows once (ADR 0043). */
+export interface SessionLink {
+  readonly inviteId: string;
+  readonly link: string;
+}
+
+/** The observers' links show here once and are never stored, as an invite's is. */
+export type SessionResult =
+  | {
+      readonly ok: true;
+      readonly sessionId: string;
+      /** Local epoch milliseconds. */
+      readonly endsAt: number;
+      /** The first of links, or null with no observers. */
+      readonly link: string | null;
+      /** One watch invite for every 20 observers, each to be shown in turn (conflict C12). */
+      readonly links: readonly SessionLink[];
+      /** Why a session with observers started without its link. */
+      readonly inviteRefusal?: InviteRefusal;
+    }
+  | {
+      readonly ok: false;
+      readonly reason:
+        'invalid' | 'policy' | 'active' | 'link_down' | 'unavailable' | SessionRefusalReason;
+    };
+
+/** Why no session started. */
+type SessionFailure = Extract<SessionResult, { ok: false }>['reason'];
+
+/** How long an agent token works (ADR 0044). */
+export type AgentLifetime = '1h' | '4h' | '8h';
+
+export interface AgentTokenOptions {
+  /** 1 to 60 characters, shown in the prompt the token's first request raises. */
+  readonly label: string;
+  /** An hour unless set. */
+  readonly lifetime?: AgentLifetime;
+}
+
+/** The token and its command show here once and are never stored: only the token's hash is. */
+export type AgentTokenResult =
+  | {
+      readonly ok: true;
+      readonly tokenId: string;
+      readonly token: string;
+      readonly endpoint: string;
+      readonly command: string;
+      /** Local epoch milliseconds. */
+      readonly expiresAt: number;
+    }
+  | { readonly ok: false; readonly reason: InviteRefusal };
+
+/** One live agent token this page minted, as the relay lists it and this page's record holds it. */
+export interface AgentView {
+  readonly tokenId: string;
+  /** Written on this page: shown as its own words (S10). */
+  readonly label: string;
+  readonly expiresAt: number;
+  readonly state: AgentState;
+  /** Prompts its requests left to time out; three burn it. */
+  readonly timeouts: number;
+  readonly sponsor: User;
+}
+
+/** What a relay that takes agent tokens said in its last agents frame. */
+export interface AgentsOffered {
+  /** `<public URL>/g/mcp`; null where the relay mints no agent endpoint. */
+  readonly endpoint: string | null;
+}
+
+/** The relay's seat numbers from its welcome (ADR 0044), within the protocol's ceilings. */
+export interface SeatLimits {
+  /** The people limit. */
+  readonly usersPerPage: number;
+  /** Watching seats for invitees beside it; 0 where there are none. */
+  readonly observersPerPage: number;
+}
+
 /** How a call ended, as the page activity log shows it; 'running' until it does. */
 export type ActivityOutcome = 'running' | 'ok' | PageErrorCode;
 
@@ -354,6 +598,12 @@ export interface ActivityEntry {
    * the page meanwhile, so later writes wait for it.
    */
   readonly handlerRunning: boolean;
+  /** An image result's type and size, never its data (ADR 0039); null for every other call. */
+  readonly image: { readonly mimeType: ImageMimeType; readonly bytes: number } | null;
+  /** The proposal this call ran, accepted on this page (ADR 0042); null for every other call. */
+  readonly proposalId: string | null;
+  /** True once the page bound the call to a proposal its own record shows accepted. */
+  readonly acceptedOnPage: boolean;
 }
 
 /** What this page lets one user the roster lists do; see DockState.pageRoles. */
@@ -405,6 +655,11 @@ export interface ObserverSeat {
   readonly asked: 'allow' | 'promote';
   /** Local epoch milliseconds of the roster that showed it. */
   readonly time: number;
+  /**
+   * 'people' when no driver limit held them back but the page's people had
+   * no seat for a watcher made a driver (ADR 0044); absent for the driver limit.
+   */
+  readonly heldBy?: 'people';
 }
 
 /** A set_role the page sent, until a roster that could answer it has come. */
@@ -467,8 +722,10 @@ export interface DockState {
    */
   readonly joins: readonly InviteJoin[];
   /**
-   * Who the driver limit seated as an observer after the operator chose
-   * driver, newest first, while the roster still lists them as one.
+   * Who the relay seated as an observer after the operator chose driver,
+   * newest first, while the roster still lists them as one: held by the
+   * driver limit, or by the people limit when a watcher made a driver found
+   * no seat among the page's people (heldBy 'people', ADR 0044).
    */
   readonly observerSeats: readonly ObserverSeat[];
   /**
@@ -477,6 +734,35 @@ export interface DockState {
    * say a guest will join as observer. A copy; changing it changes nothing.
    */
   readonly policy: Policy;
+  /** Whether the page's state reaches the relay (ADR 0040); see PublishStatus. */
+  readonly published: PublishStatus;
+  /**
+   * The largest image result, in bytes, this link's relay takes (ADR 0039),
+   * within MAX_IMAGE_BYTES; 0 for a relay that takes none, and null until a
+   * welcome says and whenever the link drops.
+   */
+  readonly maxImageBytes: number | null;
+  /** Proposals waiting for the operator, oldest first (ADR 0042). */
+  readonly proposals: readonly PendingProposal[];
+  /** The last ACTIVITY_LIMIT proposals that left the queue, newest first. */
+  readonly proposalLog: readonly ProposalLogEntry[];
+  /** The time-boxed session this page runs (ADR 0043), or null. */
+  readonly session: SessionView | null;
+  /**
+   * Whether this link's relay sent a session frame after its welcome, which
+   * only a relay that takes sessions does; the page offers none otherwise.
+   */
+  readonly sessionsOffered: boolean;
+  /** How the last session ended, for the end notice and the session record; null before any has. */
+  readonly sessionEnded: SessionEnded | null;
+  /** This page's live agent tokens (ADR 0044), oldest first, holding only those its own record knows. */
+  readonly agents: readonly AgentView[];
+  /** null until an agents frame arrives on this link, which only a relay with agent tokens on sends. */
+  readonly agentsOffered: AgentsOffered | null;
+  /** This link's welcome's seat numbers (ADR 0044); null from a relay that sends none. */
+  readonly seatLimits: SeatLimits | null;
+  /** The session records held now (ADR 0045): counts and times, never a name. */
+  readonly records: readonly RecordView[];
 }
 
 /** The only control handle. Each method returns false when there was nothing to act on. */
@@ -490,8 +776,9 @@ export interface Dock {
   /**
    * The operator's role switch, for a user the roster lists and the operator
    * approved on this page (or autoApprove let in). The relay may still hold a
-   * new driver at maxDrivers; the page runs calls under the lesser of this
-   * choice and the relay's roster either way.
+   * new driver an observer, at maxDrivers or, for a watcher, when the page's
+   * people have no seat left (state.observerSeats says which); the page runs
+   * calls under the lesser of this choice and the relay's roster either way.
    */
   setRole(userId: string, role: Role): boolean;
   /**
@@ -519,6 +806,39 @@ export interface Dock {
   /** Pauses or resumes calls on this page. Only false resumes, and the choice survives a reload. */
   pause(paused: boolean): void;
   close(): void;
+  /**
+   * Shares a JSON object, or null, as the page's state for attached clients
+   * to read (ADR 0040). It never throws: a value too large, or not an
+   * object, clears what the relay holds and says why.
+   */
+  publishState(value: unknown): PublishResult;
+  /**
+   * Accepts a waiting proposal (ADR 0042), which is that call's confirmation
+   * (S6); the relay then runs it in turn. False when there is none to accept now.
+   */
+  acceptProposal(proposalId: string): boolean;
+  dismissProposal(proposalId: string): boolean;
+  /** Dismisses every waiting proposal and says how many. */
+  dismissAllProposals(): number;
+  /** Starts a time-boxed session (ADR 0043), never wider than attach()'s policy. */
+  startSession(options: SessionOptions): Promise<SessionResult>;
+  /** Lengthens the running session by whole minutes, up to 4 hours from its start. */
+  extendSession(minutes: number): boolean;
+  /**
+   * Ends the running session now, and with it every attachment an invite or
+   * agent token made, every live invite and every agent token on the page,
+   * those from before the session too, as Revoke all ends invites.
+   */
+  endSession(): boolean;
+  /** A new observers' link for the running session, since a reload keeps none. */
+  renewSessionLink(): Promise<InviteResult>;
+  /** Mints an agent token (ADR 0044) whose first request asks the operator; the token shows once. */
+  agentToken(options: AgentTokenOptions): Promise<AgentTokenResult>;
+  cancelAgent(tokenId: string): boolean;
+  /** A schema-checked copy of one session record (ADR 0045), the current one unless named. */
+  sessionRecord(which?: RecordWhich): SessionRecord | null;
+  /** Drops a sealed record, or restarts the current one from now. */
+  discardRecord(which: RecordWhich): boolean;
 }
 
 /**
@@ -585,6 +905,15 @@ export const REMEMBERED_PROMPT_IDS = 1000;
 /** Results are cut this far under the cap so the truncation marker fits under it too. */
 const MARKER_ROOM = 100;
 
+/**
+ * Image calls start one at a time on a page, at least this far apart (ADR
+ * 0039), so a client looping on a capture cannot keep the page drawing.
+ */
+export const IMAGE_CALL_SPACING_MS = 250;
+
+/** Image calls one page holds waiting at once; past it they are answered page_busy (ADR 0039). */
+export const MAX_WAITING_IMAGE_CALLS = 8;
+
 /** The protocol caps result error messages at this length. */
 const MAX_ERROR_CHARS = 2000;
 
@@ -604,9 +933,11 @@ const INVITE_ID_BYTES = 9;
 /**
  * What the adapter keeps in the tab's storage, each for one relay and one
  * page: from M4 also its invite records (StoredInvites, ADR 0017), beside
- * the grants and dropped with them.
+ * the grants and dropped with them, and from M6 its time-boxed session
+ * (StoredSession, ADR 0043) and agent token records (StoredAgents, ADR 0044).
  */
-export type StoredRecord = 'resume' | 'grants' | 'revoked' | 'paused' | 'invites';
+export type StoredRecord =
+  'resume' | 'grants' | 'revoked' | 'paused' | 'invites' | 'session' | 'agents';
 
 const STORED_RECORDS: readonly StoredRecord[] = [
   'resume',
@@ -614,6 +945,8 @@ const STORED_RECORDS: readonly StoredRecord[] = [
   'revoked',
   'paused',
   'invites',
+  'session',
+  'agents',
 ];
 
 const LOCK_PREFIX = 'tabdock:';
@@ -671,14 +1004,38 @@ type InvokeFrame = Extract<RelayFrame, { t: 'invoke' }>;
 type WelcomeFrame = Extract<RelayFrame, { t: 'welcome' }>;
 type AttachRequestFrame = Extract<RelayFrame, { t: 'attach_request' }>;
 type InvitesFrame = Extract<RelayFrame, { t: 'invites' }>;
+type ProposalFrame = Extract<RelayFrame, { t: 'proposal' }>;
+type ProposalEndFrame = Extract<RelayFrame, { t: 'proposal_end' }>;
+type SessionFrame = Extract<RelayFrame, { t: 'session' }>;
+type AgentsFrame = Extract<RelayFrame, { t: 'agents' }>;
 
-type Outcome = { ok: true; content: string } | { ok: false; code: PageErrorCode; message: string };
+/** A declared image tool's checked image (ADR 0039): bare base64, never re-encoded. */
+interface ResultImage {
+  mimeType: ImageMimeType;
+  data: string;
+  bytes: number;
+}
+
+type Outcome =
+  | { ok: true; content: string; image?: ResultImage }
+  | { ok: false; code: PageErrorCode; message: string };
 type Refusal = Extract<Outcome, { ok: false }>;
 
 const PAUSED: Refusal = {
   ok: false,
   code: 'page_busy',
   message: 'the operator paused this page, so it runs no calls for now',
+};
+
+/**
+ * A call whose tool the page registered anew, as another kind, while the
+ * call waited on a prompt or the image gate: it was admitted, queued or
+ * prompted for the old kind, so it does not run as the new one.
+ */
+const TOOL_CHANGED: Refusal = {
+  ok: false,
+  code: 'page_busy',
+  message: 'the page changed this tool while the call waited; call again',
 };
 
 const REVOKED_MESSAGE = 'the operator revoked this caller';
@@ -715,6 +1072,25 @@ interface CallRecord {
     readonly port: AbortController;
     readonly pending: PendingConfirm;
   } | null;
+  /** The accepted proposal this call ran under, bound once from this page's own record (ADR 0042). */
+  proposal: HeldProposal | null;
+  /** Where the session record keeps this call (ADR 0045), so each change to its line reaches it. */
+  readonly recorded: RecordHandle;
+}
+
+/** This page's own record of a proposal (ADR 0042), in memory only. */
+interface HeldProposal {
+  readonly view: PendingProposal;
+  /** The page's own parsed copy, which an accepted run executes. */
+  readonly args: JsonObject;
+  /** What binds an invoke to it: the arguments as canonical JSON. */
+  readonly canonical: string;
+  /** Whether an agent token made the proposer's grant; such a proposer never proposes (C13). */
+  readonly agent: boolean;
+  state: 'pending' | 'accepted';
+  /** When the operator accepted it, on this page's clock. */
+  acceptedAt: number;
+  timer: unknown;
 }
 
 type Checked = { ok: true; tool: NormalisedTool } | { ok: false; refusal: Refusal };
@@ -759,9 +1135,11 @@ interface RequestRecord {
 /**
  * Why a request was answered, which decides whether a control invite counts
  * a refusal: only the operator's Deny and a prompt left to time out do,
- * since three of those burn it (ADR 0017).
+ * since three of those burn it (ADR 0017). 'closing' is a request the relay
+ * ends itself, as it applies the session_end, invite_cancel or agent_cancel
+ * this page sends with it, or its own session's end.
  */
-type DecisionCause = 'operator' | 'timeout' | 'rule' | 'invite' | 'revoke' | 'detach';
+type DecisionCause = 'operator' | 'timeout' | 'rule' | 'invite' | 'revoke' | 'detach' | 'closing';
 
 interface MintInFlight {
   /** Only until the relay answers; then it goes into the link, and from here nowhere. */
@@ -842,6 +1220,28 @@ const typedArrayLength = (() => {
  */
 function byteLength(text: string): number {
   return typedArrayLength(encodeUtf8(text));
+}
+
+/**
+ * A value the page publishes as its state, as the canonical text the adapter
+ * keeps and sends, or why it is refused (ADR 0040). It is written once
+ * through the protocol's taken JSON.stringify, so a getter that changes
+ * between reads cannot make what is sent differ from what was checked; that
+ * text, read back, must be a JSON object or null. Null comes back as null
+ * text. Never a throw: pages publish from render loops.
+ */
+function stateTextOf(value: unknown): { text: string | null; bytes: number } | 'invalid' {
+  let text: string | undefined;
+  try {
+    text = encodeValue(value);
+  } catch {
+    // A cycle or a BigInt.
+    return 'invalid';
+  }
+  if (text === undefined) return 'invalid';
+  const parsed = parseValue(text);
+  if (!StateValueSchema.safeParse(parsed).success) return 'invalid';
+  return parsed === null ? { text: null, bytes: 0 } : { text, bytes: byteLength(text) };
 }
 
 /** Unpadded base64url, as the relay's Buffer.toString('base64url') writes it: 16 bytes make 22 characters. */
@@ -928,6 +1328,53 @@ function sameTerms(invite: StoredInvite, listing: InviteListing): boolean {
 function lifetimeMs(lifetime: InviteLifetime): number | null {
   if (lifetime === 'open') return null;
   return lifetime === '15m' ? SHORT_INVITE_LIFETIME_MS : DEFAULT_INVITE_LIFETIME_MS;
+}
+
+/**
+ * The relay's seat numbers (ADR 0044), for the widget to show and never for
+ * a decision: the relay seats people, and the page enforces its own grants
+ * whatever it says. The schema caps neither number, so a hostile relay's
+ * large one is clamped here rather than closing the link; a relay that sends
+ * no people limit (0.1.0) gives none.
+ */
+function seatLimitsOf(limits: WelcomeFrame['limits']): SeatLimits | null {
+  if (limits.usersPerPage === undefined) return null;
+  return Object.freeze({
+    usersPerPage: Math.min(MAX_USERS_PER_PAGE, limits.usersPerPage),
+    observersPerPage: Math.min(MAX_OBSERVERS_PER_PAGE, limits.observersPerPage ?? 0),
+  });
+}
+
+/**
+ * How many may watch by a session's invites (conflict C12): the relay's
+ * watching seats, or its people less the members' two where it has none,
+ * or one invite's uses from a relay that names no seats (0.1.0).
+ */
+export function sessionSeats(seats: SeatLimits | null): number {
+  if (seats === null) return MAX_INVITE_USES;
+  return seats.observersPerPage || Math.max(0, seats.usersPerPage - MEMBER_RESERVED_SEATS);
+}
+
+/**
+ * Whether the roster shows `entry`, an invitee watching by invite, kept out
+ * of the people's seats (ADR 0044): the people fill the people limit, or
+ * those an invite let in leave members no more than their reserve (every
+ * watcher came in by an invite or an agent token). For the widget's words
+ * only, as seatLimitsOf is.
+ */
+function noPeopleSeat(
+  limits: SeatLimits | null,
+  roster: readonly AttachmentView[],
+  entry: AttachmentView,
+): boolean {
+  const watching = (row: AttachmentView): boolean =>
+    row.kind === 'invitee' && row.role === 'observer';
+  if (!limits?.observersPerPage || !watching(entry)) return false;
+  const people = roster.filter((row) => !watching(row));
+  return (
+    people.length >= limits.usersPerPage ||
+    people.filter((row) => row.inviteId).length >= limits.usersPerPage - MEMBER_RESERVED_SEATS
+  );
 }
 
 /** Each UTF-16 code unit becomes at most 3 UTF-8 bytes, so only longer strings need counting. */
@@ -1141,6 +1588,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   const revokedKey = storageKey('revoked', options.relayUrl, options.pageUrl);
   const pausedKey = storageKey('paused', options.relayUrl, options.pageUrl);
   const invitesKey = storageKey('invites', options.relayUrl, options.pageUrl);
+  const sessionKey = storageKey('session', options.relayUrl, options.pageUrl);
+  const agentsKey = storageKey('agents', options.relayUrl, options.pageUrl);
   forgetLegacyRecords(options.storage, options.relayUrl);
   const webCrypto = usableCrypto(options.crypto);
   const polyfillMarker: unknown = context && Reflect.get(context, POLYFILL_MARKER);
@@ -1151,6 +1600,56 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    * hides when the handler really ends, which the write queue must know.
    */
   const abortReachesHandlers = polyfillMarker !== true;
+  /** The relay's host alone, which a saved session record names (ADR 0045). */
+  const relayHost = new URL(options.relayUrl).host.slice(0, 300);
+  /**
+   * The session record (ADR 0045) is advisory, so every hook the core calls
+   * goes through this guard (decision 22): the first throw stops the record,
+   * logged once by its class alone, and the no-op recorder takes every later
+   * hook, so the call, decision or link it was told of goes on exactly as it
+   * would have. Its views then show one failed record, which the widget
+   * offers no Save for, saying the audit log keeps every call.
+   */
+  let keeper: Recorder = options.recorder ?? createRecorder();
+  let recordStopped: readonly RecordView[] | null = null;
+  const recorder = Object.freeze(
+    Object.fromEntries(
+      Object.keys(NOOP_RECORDER).map((hook) => [
+        hook,
+        (...args: unknown[]): unknown => {
+          const run = (held: Recorder): unknown =>
+            apply((held as unknown as Record<string, Taken>)[hook] as Taken, held, args);
+          try {
+            return run(keeper);
+          } catch (error) {
+            keeper = NOOP_RECORDER;
+            recordStopped ??= Object.freeze([
+              Object.freeze({
+                which: 'current' as const,
+                scope: 'page' as const,
+                label: null,
+                from: clock(),
+                to: null,
+                calls: 0,
+                people: 0,
+                emails: 0,
+                proposals: 0,
+                dropped: 0,
+                failed: true,
+              }),
+            ]);
+            log.warn(`session record stopped: ${errorParts(error).name}`);
+            return run(NOOP_RECORDER);
+          }
+        },
+      ]),
+    ) as unknown as Recorder,
+  );
+  /** The records as DockState shows them: the failed one once a fault, even in views, stopped them. */
+  const recordViews = (): readonly RecordView[] => {
+    const views = recorder.views();
+    return recordStopped ?? views;
+  };
 
   let state: DockState = Object.freeze({
     link: 'idle',
@@ -1168,7 +1667,22 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     invitesOffered: null,
     joins: [],
     observerSeats: [],
-    policy: { ...policy, consequentialTools: [...policy.consequentialTools] },
+    policy: {
+      ...policy,
+      consequentialTools: [...policy.consequentialTools],
+      imageTools: [...policy.imageTools],
+    },
+    published: 'none',
+    maxImageBytes: null,
+    proposals: [],
+    proposalLog: [],
+    session: null,
+    sessionsOffered: false,
+    sessionEnded: null,
+    agents: [],
+    agentsOffered: null,
+    seatLimits: null,
+    records: recordViews(),
   });
   const listeners = new Set<(state: DockState) => void>();
 
@@ -1274,10 +1788,15 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   const rolesUnanswered: SentRole[] = [];
   /** The seq of the last ObserverSeat recorded. */
   let seatSeq = 0;
+  /**
+   * The time-boxed session this page started (ADR 0043), as its stored
+   * record holds it; up here because pageRole reads it from the first grant.
+   */
+  let session: StoredSession | null = null;
 
   function setState(patch: Partial<DockState>): void {
     const next = { ...state, ...patch };
-    state = Object.freeze({ ...next, pageRoles: rolesFor(next.roster) });
+    state = Object.freeze({ ...next, pageRoles: rolesFor(next.roster), records: recordViews() });
     for (const listener of [...listeners]) {
       try {
         listener(state);
@@ -1285,6 +1804,11 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         log.error(`a state listener threw: ${describe(error)}`);
       }
     }
+  }
+
+  /** Shows the records again after a hook, telling listeners only when a count or a time changed. */
+  function noteRecords(): void {
+    if (recordViews() !== state.records) setState({});
   }
 
   // Storage can throw (blocked cookies, sandboxed frames); the link still works without it.
@@ -1427,6 +1951,10 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     for (const inviteId of [...invites.keys()]) forgetInvite(inviteId, 'cancelled');
     grantsPage = null;
     saveGrants();
+    // A time-boxed session and agent tokens belong to the page session too
+    // (ADRs 0043 and 0044), so a detach leaves neither record in storage.
+    writeStored(sessionKey, null, "the page's session");
+    writeStored(agentsKey, null, "the page's agent tokens");
   }
 
   /**
@@ -1502,14 +2030,32 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    * `listed`. An invite-made grant gives nothing past its end, and never
    * more than its invite's role (S14). autoApprove lets in members only: an
    * invitee comes in through an invite this page honoured, or not at all,
-   * whatever the relay says (ADR 0017's notes).
+   * whatever the relay says (ADR 0017's notes). A running session's seats
+   * hold here too, whatever the relay lists (S5; ADR 0043, decision 13): of
+   * the drivers this page would run, only the oldest grants by the roster's
+   * order drive, as the relay demotes the newest first.
    */
   function pageRole(userId: string, listed: Role): Role | null {
+    const role = grantedRole(userId, listed);
+    if (role !== 'driver' || session === null) return role;
+    const seated = state.roster
+      .filter((entry) => grantedRole(entry.userId, entry.role) === 'driver')
+      .sort((a, b) => a.grantedAt - b.grantedAt)
+      .slice(0, effective().maxDrivers);
+    return seated.some((entry) => entry.userId === userId) ? 'driver' : 'observer';
+  }
+
+  /** pageRole before a running session's seats. */
+  function grantedRole(userId: string, listed: Role): Role | null {
     if (revoked.has(userId)) return null;
     const grant = grants.get(userId);
     let granted: Role;
     if (grant) {
       if (grant.endsAt !== undefined && clock() >= grant.endsAt) return null;
+      // Past a live session's end, before its end has run, an invite or token lets in nobody (ADR 0043).
+      if (grant.inviteId !== undefined && session !== null && clock() >= session.endsAt) {
+        return null;
+      }
       granted = grant.inviteRole === 'observer' ? 'observer' : grant.role;
     } else {
       if (policy.autoApprove !== 'observer' || isInvitee(userId)) return null;
@@ -1695,6 +2241,18 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       case 'cancel':
         onCancel(frame.callId);
         return;
+      case 'proposal':
+        onProposal(frame);
+        return;
+      case 'proposal_end':
+        onProposalEnd(frame);
+        return;
+      case 'session':
+        onSession(frame);
+        return;
+      case 'agents':
+        onAgents(frame);
+        return;
     }
   }
 
@@ -1720,19 +2278,22 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       if (!samePage || !listed.has(userId)) revoked.delete(userId);
     }
     // Invites belong to their page session too: a relay that did not resume it
-    // holds none of them (a restart ends every invite, ADR 0019), and the
-    // invites frame that follows a resumed welcome prunes what it ended.
+    // holds none of them (a restart without its snapshot ends every invite,
+    // ADRs 0019 and 0046), and the invites frame that follows a resumed
+    // welcome, after a dropped link or a restart from the snapshot, prunes what it ended.
     if (!samePage) {
       for (const inviteId of [...invites.keys()]) forgetInvite(inviteId, 'link_down');
     }
     cancelSent.clear();
     grantsPage = frame.pageId;
     saveGrants();
+    sessionWelcome(frame);
     frameLimit = Math.max(MIN_FRAME_BYTES, Math.min(MAX_FRAME_BYTES, frame.limits.maxFrameBytes));
     resultLimit = Math.max(
       MARKER_ROOM * 2,
       Math.min(MAX_RESULT_CHARS, frame.limits.maxResultChars),
     );
+    imageWelcome(frame);
     // Never shorter than the protocol's own: a tiny value would turn the
     // watchdog into a reconnect loop. Nor past the timer maximum: the schema
     // takes any positive integer, and a longer timer fires at once in
@@ -1748,11 +2309,24 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       pairing: frame.pairing,
       roster: frame.roster,
       error: null,
+      seatLimits: seatLimitsOf(frame.limits),
     });
     log.info(frame.resumed ? `resumed page ${frame.pageId}` : `linked as page ${frame.pageId}`);
+    // A new page session seals the page record and a resumed one keeps it (ADR 0045, decision 5).
+    recorder.pageSession(frame.pageId, frame.resumed, clock());
+    // A session the relay has listed, which a reload or a resumed link left
+    // running, goes on in a record of its own from here, with everyone
+    // listed now there from its start. A start the relay has not answered
+    // waits for its session frame: refused, or never heard, it never ran.
+    const running = sessionView();
+    if (running !== null && session?.listed === true) recorder.sessionStarted(running);
+    recordRoster(frame.roster);
     for (const userId of revoked) send({ t: 'revoke', userId });
     takeLock(frame.pageId);
     lastToolsKey = null;
+    // State goes before tools (ADR 0040): the relay serves reads again only
+    // once the tools frame comes, so no reader sees the null a sleep left.
+    stateWelcome(frame);
     void syncTools();
     schedulePoll();
   }
@@ -1784,6 +2358,55 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       (seat) => observers.has(seat.user.userId) && !fresh.has(seat.user.userId),
     );
     setState({ roster: attachments, observerSeats: [...seats, ...kept] });
+    proposalsRoster();
+    recordRoster(attachments);
+  }
+
+  /**
+   * The roster as the session record keeps it, with the roles this page
+   * enforces and how its own grants let each one in, never the relay's word:
+   * an agent by the label its token has here, as the widget names it (ADR 0044).
+   */
+  function recordRoster(attachments: readonly AttachmentView[]): void {
+    recorder.roster(
+      attachments.map((attachment) => ({
+        ...attachment,
+        displayName: agentName(attachment.userId) ?? attachment.displayName,
+      })),
+      state.pageRoles,
+      wayIn,
+      clock(),
+    );
+    noteRecords();
+  }
+
+  /** How the page let a listed user in, by its own grant: an invite's, an agent token's, the operator's, autoApprove's, or none. */
+  function wayIn(userId: string): RecordWayIn {
+    const grant = grants.get(userId);
+    const inviteId = grant?.inviteId ?? null;
+    return {
+      how:
+        inviteId !== null
+          ? agentRecords.has(inviteId)
+            ? 'agent'
+            : 'invite'
+          : grant
+            ? 'approved'
+            : policy.autoApprove === 'observer' && !isInvitee(userId)
+              ? 'auto'
+              : 'unapproved',
+      inviteId,
+    };
+  }
+
+  /**
+   * An agent as this page names it (ADR 0044): by the label its token has in
+   * this page's own record, never the relay's word; null for anyone else.
+   */
+  function agentName(userId: string): string | null {
+    const tokenId = grants.get(userId)?.inviteId;
+    const agent = tokenId === undefined ? undefined : agentRecords.get(tokenId);
+    return agent === undefined ? null : `agent "${agent.label}"`;
   }
 
   /**
@@ -1819,19 +2442,33 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       const drivers = attachments.filter(
         (other) => other.role === 'driver' && other.userId !== userId,
       ).length;
-      if (drivers < policy.maxDrivers) {
+      if (drivers < effective().maxDrivers) {
         if (asked.asked === 'allow') {
           // The first roster that lists someone new is the relay's answer.
           askedDriver.delete(userId);
           log.info(`${who} joined as observer`);
         } else {
           asked.saidObserver = true;
-          log.info(`the relay kept ${who} an observer`);
+          // ADR 0044: a watcher the people had no seat for is told of, as the driver limit is.
+          if (noPeopleSeat(state.seatLimits, attachments, entry)) {
+            log.info(`${who} is still an observer: no seat left among the people`);
+            seatSeq += 1;
+            seats.push(
+              Object.freeze({
+                seq: seatSeq,
+                user: Object.freeze({ ...asked.user }),
+                account: null,
+                asked: asked.asked,
+                time: clock(),
+                heldBy: 'people' as const,
+              }),
+            );
+          } else log.info(`the relay kept ${who} an observer`);
         }
         continue;
       }
       log.info(
-        `${who} ${asked.asked === 'allow' ? 'joined as observer' : 'is still an observer'}: the page already has its maximum drivers (${String(policy.maxDrivers)})`,
+        `${who} ${asked.asked === 'allow' ? 'joined as observer' : 'is still an observer'}: the page already has its maximum drivers (${String(effective().maxDrivers)})`,
       );
       if (asked.asked === 'allow') askedDriver.delete(userId);
       else asked.saidObserver = true;
@@ -1894,6 +2531,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   /** Everything tied to one socket ends with it; the relay answers waiting callers itself. */
   function tearDownLink(): void {
     welcomed = false;
+    // Should the next welcome start a new page session, everyone left when the link went.
+    recorder.linkLost(clock());
     for (const handle of [watchdogTimer, pollTimer, syncTimer]) timers.clearTimeout(handle);
     watchdogTimer = null;
     pollTimer = null;
@@ -1914,12 +2553,20 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     // relay list it, the page closes it as one it holds no record of.
     for (const inviteId of [...minting.keys()]) forgetInvite(inviteId, 'link_down');
     listings = new Map();
+    stateLinkDown();
+    proposalsLinkDown();
+    // What this link's relay said of itself goes with it, until the next welcome says again.
     setState({
       pairing: null,
       pendingRequests: [],
       pendingConfirms: [],
       invites: [],
       invitesOffered: null,
+      maxImageBytes: null,
+      sessionsOffered: false,
+      agents: [],
+      agentsOffered: null,
+      seatLimits: null,
     });
   }
 
@@ -2086,16 +2733,22 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     const now = clock();
     const deadlineMs = Math.min(frame.deadlineMs, MAX_DEADLINE_MS);
     const { userId, displayName, client } = frame.caller;
+    // ADR 0042: bound now, and spent, or never; check() refuses an invoke naming a proposal it did not bind.
+    const proposal = bindProposal(frame);
     const entry: ActivityEntry = Object.freeze({
       callId: frame.callId,
       time: now,
-      user: Object.freeze({ userId, displayName }),
+      // An agent by its token's label here, in the log as in the roster (ADR 0044, S7).
+      user: Object.freeze({ userId, displayName: agentName(userId) ?? displayName }),
       client: client === null ? null : Object.freeze({ ...client }),
       tool: frame.tool,
       outcome: 'running',
       confirmedBy: null,
       durationMs: null,
       handlerRunning: false,
+      image: null,
+      proposalId: proposal === null ? null : proposal.view.proposalId,
+      acceptedOnPage: proposal !== null,
     });
     const call: CallRecord = {
       frame,
@@ -2108,6 +2761,9 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       executing: false,
       deadline: null,
       confirm: null,
+      proposal,
+      // Every call the page accepted, past the checks above (ADR 0045, decision 16).
+      recorded: recorder.call(entry, state.pageId ?? ''),
     };
     calls.set(frame.callId, call);
     setState({ activity: [entry, ...state.activity].slice(0, ACTIVITY_LIMIT) });
@@ -2149,22 +2805,28 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     log.info(`call ${callId} ${tool} by ${logName(caller)} (${caller.role}): ${outcome}`);
   }
 
+  /**
+   * The call's line changes in the session record always, and in the
+   * activity log while it is still there: a call fifty newer ones pushed out
+   * of the log still ends in the record (ADR 0045).
+   */
   function updateEntry(call: CallRecord, patch: Partial<ActivityEntry>): void {
     const index = state.activity.indexOf(call.entry);
-    // Gone when fifty newer calls have pushed it out.
+    call.entry = Object.freeze({ ...call.entry, ...patch });
+    recorder.update(call.recorded, call.entry);
     if (index === -1) return;
     const activity = [...state.activity];
-    call.entry = Object.freeze({ ...call.entry, ...patch });
     activity[index] = call.entry;
     setState({ activity });
   }
 
-  /** Replaces the call's running line in the activity log with how it ended. */
-  function settleEntry(call: CallRecord, outcome: ActivityOutcome): void {
+  /** Replaces the call's running line in the activity log with how it ended, and any image's type and size. */
+  function settleEntry(call: CallRecord, outcome: ActivityOutcome, image?: ResultImage): void {
     updateEntry(call, {
       outcome,
       durationMs: Math.max(0, clock() - call.entry.time),
       handlerRunning: call.executing,
+      ...(image && { image: Object.freeze({ mimeType: image.mimeType, bytes: image.bytes }) }),
     });
   }
 
@@ -2198,6 +2860,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     // The log's outcomes are the page's own, and from here the call was cancelled.
     settleEntry(call, 'cancelled');
     release(call);
+    // As in finish: a lost link must not leave the gate to the hold timer.
+    freeImageSlot(call.executing ? null : call);
   }
 
   function finish(call: CallRecord, outcome: Outcome): void {
@@ -2206,29 +2870,56 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     timers.clearTimeout(call.deadline);
     settleConfirmPromise(call, false);
     const { callId } = call.frame;
-    logCall(call, outcome.ok ? 'ok' : outcome.code);
-    if (outcome.ok) {
-      send(resultFrame(callId, outcome.content));
-    } else {
+    const frame = outcome.ok ? resultFrame(callId, outcome.content, outcome.image) : null;
+    // An image is never cut, so one that leaves no room on this link is refused whole (ADR 0039).
+    const ended: Outcome =
+      outcome.ok && frame === null
+        ? {
+            ok: false,
+            code: 'tool_error',
+            message: "the image is too large for this relay's page link",
+          }
+        : outcome;
+    const image = ended.ok ? ended.image : undefined;
+    // S7: the type and size, never the data.
+    logCall(
+      call,
+      ended.ok ? (image ? `ok, an ${image.mimeType} of ${image.bytes} bytes` : 'ok') : ended.code,
+    );
+    if (frame) send(frame);
+    else if (!ended.ok) {
       send({
         t: 'result',
         callId,
         ok: false,
-        error: { code: outcome.code, message: outcome.message.slice(0, MAX_ERROR_CHARS) },
+        error: { code: ended.code, message: ended.message.slice(0, MAX_ERROR_CHARS) },
       });
     }
-    settleEntry(call, outcome.ok ? 'ok' : outcome.code);
+    settleEntry(call, ended.ok ? 'ok' : ended.code, image);
     release(call);
+    // A call answered before its handler started gives up the image gate, and
+    // one answered while it waited leaves it, its handler never run (S8).
+    freeImageSlot(call.executing ? null : call);
   }
 
-  /** Cuts the text to the result limit, then further if JSON escaping or UTF-8 still overflow the frame. */
-  function resultFrame(callId: string, content: string): PageFrameInput {
+  /**
+   * Cuts the text to the result limit, then further if JSON escaping or UTF-8
+   * still overflow the frame. An image beside it is never cut: null when the
+   * frame cannot fit it even with the text gone.
+   */
+  function resultFrame(
+    callId: string,
+    content: string,
+    image?: ResultImage,
+  ): PageFrameInput | null {
+    const extra = image && { image: { mimeType: image.mimeType, data: image.data } };
     let max = content.length > resultLimit ? resultLimit - MARKER_ROOM : content.length;
     for (;;) {
       const text = max >= content.length ? content : truncate(content, max).text;
-      const frame = { t: 'result', callId, ok: true, content: text } as const;
+      const frame = { t: 'result', callId, ok: true, content: text, ...extra } as const;
       const size = byteLength(encodeFrame(frame));
-      if (size <= frameLimit || max === 0) return frame;
+      if (size <= frameLimit) return frame;
+      if (max === 0) return extra ? null : frame;
       max = Math.floor(Math.min(max, content.length) * (frameLimit / size) * 0.9);
     }
   }
@@ -2240,19 +2931,30 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
 
   /**
    * S5, second check: the caller's role on this page, then the tool. It runs
-   * when a call arrives and again when a write reaches the front of the
-   * queue, since the roster, the grants and the tools may have changed while
-   * it waited.
+   * when a call arrives, again when a write reaches the front of the queue,
+   * and again on a fresh read of the tools after a prompt or the image gate
+   * (checkedAgain), since the roster, the grants and the tools may have
+   * changed while it waited. An observer's write runs only as a proposal
+   * this page's own record shows the operator accepted (ADR 0042), never on
+   * the relay's word, and only while the policy in force still takes
+   * proposals from them.
    */
-  function check(frame: InvokeFrame, snapshot: ToolSnapshot | null): Checked {
+  function check(call: CallRecord, snapshot: ToolSnapshot | null): Checked {
+    const { frame, proposal } = call;
     const role = callerRole(frame.caller);
     if (role === null) {
       return refuse('role_denied', 'the operator has not approved this caller on this page');
     }
+    if (
+      frame.proposal !== undefined &&
+      (proposal === null || !takesFrom(frame.caller.userId, proposal.agent))
+    ) {
+      return refuse('role_denied', 'the page holds no accepted proposal for this call');
+    }
     if (!snapshot) return refuse('tool_error', 'the page could not list its tools');
     const tool = snapshot.byName.get(frame.tool);
     if (!tool) return refuse('tool_not_found', `no tool named ${frame.tool}`);
-    if (role === 'observer' && !isReadOnly(tool.page)) {
+    if (role === 'observer' && proposal === null && !isReadOnly(tool.page)) {
       return refuse('role_denied', 'observers may only run read-only tools');
     }
     return { ok: true, tool };
@@ -2266,7 +2968,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   async function admit(call: CallRecord): Promise<void> {
     const snapshot = await readTools();
     if (isDone(call)) return;
-    const checked = check(call.frame, snapshot);
+    const checked = check(call, snapshot);
     if (!checked.ok) {
       finish(call, checked.refusal);
       return;
@@ -2312,7 +3014,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   async function runWrite(call: CallRecord): Promise<void> {
     const snapshot = await readTools();
     if (isDone(call)) return;
-    const checked = check(call.frame, snapshot);
+    const checked = check(call, snapshot);
     if (!checked.ok) {
       finish(call, checked.refusal);
       return;
@@ -2321,59 +3023,79 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     if (snapshot) await proceed(call, checked.tool, snapshot);
   }
 
-  /** Consequential policy and the operator's confirmation, then the handler. */
+  /** Consequential policy and the operator's confirmation, the image gate, then the handler. */
   async function proceed(
     call: CallRecord,
     tool: NormalisedTool,
     snapshot: ToolSnapshot,
   ): Promise<void> {
     const { frame } = call;
-    if (isConsequential(tool.page, snapshot.hintSupport, policy)) {
-      if (policy.consequential === 'deny') {
-        finish(call, {
-          ok: false,
-          code: 'denied_by_operator',
-          message: 'this page does not run consequential tools',
-        });
-        return;
+    const rule = isConsequential(tool.page, snapshot.hintSupport, policy) && policy.consequential;
+    if (rule === 'deny') {
+      finish(call, {
+        ok: false,
+        code: 'denied_by_operator',
+        message: 'this page does not run consequential tools',
+      });
+      return;
+    }
+    let byClient = rule === 'confirm' && takesClientConfirmation(call);
+    // ADR 0042: the operator's armed Accept on the page was this call's
+    // confirmation (S6), so the page does not ask again; under deny it was
+    // refused above all the same.
+    const accepted = rule === 'confirm' && call.proposal !== null;
+    if (accepted) {
+      recorder.confirmedOnPage(call.recorded);
+      logCall(
+        call,
+        `accepted on the page as proposal ${call.proposal?.view.proposalId ?? ''}, so the page did not ask again`,
+      );
+    }
+    // The tool the call runs: the one check() last returned, which each wait
+    // below reads again, since the page may register another under its name.
+    let current: NormalisedTool | null = tool;
+    // ADR 0039: the operator answers before an image call waits at the gate,
+    // so a prompt left open holds no other capture back.
+    if (rule === 'confirm' && !byClient && !accepted) {
+      current = await operatorAllows(call, tool, snapshot);
+      if (current === null) return;
+    }
+    const imageTool = policy.imageTools.includes(tool.page.name);
+    if (imageTool) {
+      current = await takeImageSlot(call, tool, snapshot);
+      if (current === null) return;
+      // Only a change made during the wait can end what let the client
+      // confirm; the page then asks, holding the gate.
+      if (byClient && !takesClientConfirmation(call)) {
+        byClient = false;
+        current = await operatorAllows(call, tool, snapshot);
+        if (current === null) return;
       }
-      if (policy.consequential === 'confirm') {
-        if (takesClientConfirmation(call)) {
-          // Nothing is awaited between check() and the handler, so the
-          // grant, roster and role this read are the ones the call runs under.
-          logCall(call, 'confirmed in their client, so the page did not ask');
-          updateEntry(call, { confirmedBy: 'client' });
-        } else {
-          const allowed = await askConfirm(call);
-          if (isDone(call)) return;
-          if (!allowed) {
-            finish(call, {
-              ok: false,
-              code: 'denied_by_operator',
-              message: 'the operator denied this call',
-            });
-            return;
-          }
-          // The operator may have lowered this caller's role while the prompt was up.
-          const again = check(frame, snapshot);
-          if (!again.ok) {
-            finish(call, again.refusal);
-            return;
-          }
-        }
-      }
+    }
+    if (byClient) {
+      // Nothing is awaited between check() and the handler, so the grant,
+      // roster and role this read are the ones the call runs under.
+      logCall(call, 'confirmed in their client, so the page did not ask');
+      updateEntry(call, { confirmedBy: 'client' });
     }
     call.stage = 'running';
     call.executing = true;
     let outcome: Outcome;
     let unwatched = false;
     try {
-      const value = await execute(tool.runtime, frame.arguments, call);
-      outcome = { ok: true, content: resultText(value) };
+      // An accepted proposal runs the page's own copy, which its invoke had to match.
+      const value = await execute(current.runtime, call.proposal?.args ?? frame.arguments, call);
+      outcome = imageTool
+        ? imageOutcome(resultText(value))
+        : { ok: true, content: resultText(value) };
     } catch (error) {
       outcome = { ok: false, code: 'tool_error', message: errorParts(error).message };
       unwatched = await lostSightOfHandler(call, tool, error);
     }
+    // The runtime has settled the call, so the next image call may start;
+    // unless it only stopped watching a handler still running, whose hold on
+    // the gate imageHold then bounds, as holdUnwatched bounds a write's.
+    if (!unwatched) freeImageSlot(call);
     if (unwatched) {
       holdUnwatched(call);
       // The relay still hears the runtime's answer, unless something answered first.
@@ -2392,19 +3114,20 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   }
 
   /**
-   * Whether a write's rejection says only that the runtime stopped watching a
-   * handler that may still be running. On the polyfill a write's executeTool
-   * gets a signal nothing aborts, so it settles early only when the page ends
-   * the tool's registration mid-run: its 'Tool unregistered', or, should
-   * that text change, a tool missing from the list afterwards. A tool
-   * already missing when the call started never ran its handler.
+   * Whether the rejection of a write, or of the call holding the image gate,
+   * says only that the runtime stopped watching a handler that may still be
+   * running. On the polyfill such a call's executeTool gets a signal nothing
+   * aborts, so it settles early only when the page ends the tool's
+   * registration mid-run: its 'Tool unregistered', or, should that text
+   * change, a tool missing from the list afterwards. A tool already missing
+   * when the call started never ran its handler.
    */
   async function lostSightOfHandler(
     call: CallRecord,
     tool: NormalisedTool,
     error: unknown,
   ): Promise<boolean> {
-    if (abortReachesHandlers || writing !== call) return false;
+    if (abortReachesHandlers || (writing !== call && imageRunning !== call)) return false;
     const { name, message } = errorParts(error);
     if (name === 'UnknownError' && message === POLYFILL_UNREGISTERED) return true;
     if (name === 'UnknownError' && POLYFILL_NOT_FOUND.test(message)) return false;
@@ -2446,9 +3169,12 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   ): Promise<unknown> {
     if (!context?.executeTool) throw new Error('this WebMCP runtime has no executeTool');
     // A write on the polyfill gets a signal nothing aborts, so the runtime
-    // settles it when the handler ends and the page stays held until then.
+    // settles it when the handler ends and the page stays held until then;
+    // so does the image call holding the gate, which a cancel, deadline or
+    // revoke would otherwise free while its handler, which never sees the
+    // signal there, still draws (A6.28). imageHold bounds the gate's wait.
     const signal =
-      writing === call && !abortReachesHandlers
+      (writing === call || imageRunning === call) && !abortReachesHandlers
         ? new AbortController().signal
         : call.controller.signal;
     const run = (format: InputFormat): Promise<unknown> =>
@@ -2513,6 +3239,69 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     }
     if (callerRole(frame.caller) !== 'driver') return 'the caller is not a driver here';
     return null;
+  }
+
+  /**
+   * The operator's prompt; the tool to run once they allow it, as
+   * checkedAgain reads it, or null when they deny it, the call ended
+   * meanwhile or the check after it refused.
+   */
+  async function operatorAllows(
+    call: CallRecord,
+    admitted: NormalisedTool,
+    snapshot: ToolSnapshot,
+  ): Promise<NormalisedTool | null> {
+    const allowed = await askConfirm(call);
+    if (!allowed) {
+      if (!isDone(call)) {
+        finish(call, {
+          ok: false,
+          code: 'denied_by_operator',
+          message: 'the operator denied this call',
+        });
+      }
+      return null;
+    }
+    // The operator may have lowered this caller's role, or the page changed
+    // the tool, while the prompt was up.
+    const confirmed = await checkedAgain(call, admitted, snapshot);
+    if (confirmed !== null) recorder.confirmedOnPage(call.recorded);
+    return confirmed;
+  }
+
+  /**
+   * check() once more after a wait, against the page's tools as they are
+   * now, not as they were before it (A6.28): the roster, the grants and the
+   * proposals may have changed meanwhile, and so may what the page registers
+   * under the tool's name, which the runtime runs by name. Returns the tool
+   * the call then runs, or null once the call has ended. The call was
+   * admitted, queued and prompted (or not) for the kind of tool it found, so
+   * a tool now of another kind is refused: a read that became a write would
+   * run beside the write queue, and a tool that became consequential would
+   * run unasked. Nothing may be awaited between this and the handler.
+   */
+  async function checkedAgain(
+    call: CallRecord,
+    admitted: NormalisedTool,
+    snapshot: ToolSnapshot,
+  ): Promise<NormalisedTool | null> {
+    const now = await readTools();
+    if (isDone(call)) return null;
+    const again = check(call, now);
+    if (!again.ok) {
+      finish(call, again.refusal);
+      return null;
+    }
+    if (
+      now === null ||
+      isReadOnly(again.tool.page) !== isReadOnly(admitted.page) ||
+      isConsequential(again.tool.page, now.hintSupport, policy) !==
+        isConsequential(admitted.page, snapshot.hintSupport, policy)
+    ) {
+      finish(call, TOOL_CHANGED);
+      return null;
+    }
+    return again.tool;
   }
 
   function askConfirm(call: CallRecord): Promise<boolean> {
@@ -2595,6 +3384,11 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         frame.invite === undefined
           ? null
           : Object.freeze({ inviteId: frame.invite.inviteId, label: frame.invite.label }),
+      // Never the token either: checkAgent checks it against this page's own record (ADR 0044).
+      agent:
+        frame.agent === undefined
+          ? null
+          : Object.freeze({ tokenId: frame.agent.tokenId, label: frame.agent.label }),
       client: frame.client,
       expiresAt,
     });
@@ -2603,7 +3397,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       timer: null,
       port: new AbortController(),
       shown: false,
-      secret: frame.invite?.secret ?? null,
+      secret: frame.invite?.secret ?? frame.agent?.secret ?? null,
       verified: false,
     };
     record.timer = timers.setTimeout(
@@ -2614,6 +3408,12 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     );
     requests.set(frame.requestId, record);
     log.info(`attach request from ${logName(frame.user)} via ${frame.via}`);
+    // An agent token is never approved in advance (S4): its request reaches
+    // the operator only once it checks out against this page's own record.
+    if (frame.agent !== undefined) {
+      void checkAgent(record);
+      return;
+    }
     if (frame.invite !== undefined) {
       void checkRedemption(record);
       return;
@@ -2723,6 +3523,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       return "the page's policy no longer allows it";
     }
     if (clock() >= inviteEnd(invite)) return 'it has expired';
+    // A live session ends every invite with it, however long its own life (ADR 0043).
+    if (session !== null && clock() >= session.endsAt) return 'the session has ended';
     if (invite.usesLeft <= 0) return 'it is used up';
     if (invite.refusals >= INVITE_BURN_REFUSALS) return 'three refusals burnt it';
     if (invite.barred.includes(userId)) return 'the operator revoked this account from it';
@@ -2774,7 +3576,19 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     }
     const inviteId = request.invite?.inviteId;
     const invite = inviteId === undefined ? undefined : invites.get(inviteId);
+    const agentId = request.agent?.tokenId;
+    const agent = agentId === undefined ? undefined : agentRecords.get(agentId);
     let granted = role;
+    if (allow && agentId !== undefined) {
+      // S4 and S5: never a token this page has not matched to its record,
+      // never past the record's terms now, and only ever an observer.
+      const problem = record.verified ? agentProblem(request) : 'unchecked';
+      if (problem !== null || !agent) {
+        log.warn(`refused agent token ${agentId}: ${problem ?? 'no record'}`);
+        return decide(record, false, undefined, 'rule');
+      }
+      granted = 'observer';
+    }
     if (allow && inviteId !== undefined) {
       // S14: never a redemption whose secret this page has not matched to its
       // record, whoever approves it, and never past the record's terms now.
@@ -2813,7 +3627,9 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     const keptAttachment = revoked.has(userId)
       ? undefined
       : state.roster.find((attachment) => attachment.userId === userId);
-    if (allow && granted !== undefined && invite && inviteId !== undefined) {
+    if (allow && granted !== undefined && agent) {
+      agentGranted(userId, agent);
+    } else if (allow && granted !== undefined && invite && inviteId !== undefined) {
       // An invite-made grant ends 24 hours after redemption and names the
       // invite's role as its cap (ADR 0017); its use is spent here, on the
       // page's own count, whatever the relay counts.
@@ -2846,6 +3662,10 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     if (!allow && invite && record.shown && (cause === 'operator' || cause === 'timeout')) {
       updateInvite({ ...invite, refusals: Math.min(INVITE_BURN_REFUSALS, invite.refusals + 1) });
     }
+    const burned =
+      !allow && agent !== undefined && record.shown && (cause === 'operator' || cause === 'timeout')
+        ? agentRefused(agent, cause)
+        : false;
     const who = logName(request.user);
     askedDriver.delete(userId);
     if (!allow) {
@@ -2873,13 +3693,28 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     // frame, which went first; a decision would only reach a request already
     // gone there, and count against the page's budget for frames that change
     // nothing (A4.3). While the link is down the relay dropped them anyway.
-    if (cause === 'revoke') return true;
-    return send({
-      t: 'attach_decision',
-      requestId,
-      allow,
-      ...(allow && granted !== undefined ? { role: granted } : {}),
-    });
+    // An agent token's silence is the relay's to count: its own timer ends
+    // the request as a timeout, which only the third time burns the token,
+    // whereas a refusal from here reads as the operator's deny and burns it
+    // at once (ADR 0044), whichever clock runs ahead. A request the relay
+    // ends itself with a frame this page sends beside it, or with its own
+    // session's end, gets none either, which would read there as the
+    // operator's deny and close a token as denied rather than as ended or
+    // cancelled (S7).
+    const sent =
+      cause === 'revoke' || cause === 'closing' || (cause === 'timeout' && agentId !== undefined)
+        ? true
+        : send({
+            t: 'attach_decision',
+            requestId,
+            allow,
+            ...(allow && granted !== undefined ? { role: granted } : {}),
+          });
+    // After the deny that burned it, which the relay closes the token on as
+    // denied; agent_cancel then closes it too should that deny have crossed
+    // the prompt's end there, and changes nothing otherwise.
+    if (burned && agent) cancelAgent(agent.tokenId);
+    return sent;
   }
 
   // Invites (ADR 0017)
@@ -2917,9 +3752,13 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   /**
    * The page stops honouring an invite: its record goes, stored copy too, a
    * redemption of it still being checked or waiting on the operator is
-   * refused, and a mint still waiting on the relay settles with `reason`.
+   * refused (`cause`), and a mint still waiting on the relay settles with `reason`.
    */
-  function forgetInvite(inviteId: string, reason: InviteRefusal): void {
+  function forgetInvite(
+    inviteId: string,
+    reason: InviteRefusal,
+    cause: DecisionCause = 'rule',
+  ): void {
     const had = invites.delete(inviteId);
     listings.delete(inviteId);
     const mint = minting.get(inviteId);
@@ -2929,9 +3768,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       mint.resolve(Object.freeze({ ok: false, reason }));
     }
     for (const record of [...requests.values()]) {
-      if (record.request.invite?.inviteId === inviteId) {
-        decide(record, false, undefined, 'rule');
-      }
+      if (record.request.invite?.inviteId === inviteId) decide(record, false, undefined, cause);
     }
     if (had) saveGrants();
   }
@@ -3128,6 +3965,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     // Barred first, so nothing below can let them back in by it.
     if (!everyone) bar(target, theirs);
     for (const userId of listed) revoked.add(userId);
+    // Their spans close as revoked once the relay's roster drops them.
+    recorder.revoking(target);
     for (const userId of granted) grants.delete(userId);
     // Whatever they were asked for, nothing is announced for someone revoked.
     for (const userId of [...askedDriver.keys()].filter(hits)) askedDriver.delete(userId);
@@ -3150,6 +3989,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
         finish(call, { ok: false, code: 'cancelled', message: REVOKED_MESSAGE });
       }
     }
+    proposalsRevoked(target);
+    agentsRevoked(target);
     return true;
   }
 
@@ -3181,15 +4022,42 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    * so a reload while the relay answers still knows the invite it may hold.
    */
   async function invite(request: InviteOptions): Promise<InviteResult> {
-    const refuse = (reason: InviteRefusal): InviteResult => Object.freeze({ ok: false, reason });
     const given: unknown = request;
     if (typeof given !== 'object' || given === null || !validInvite(request)) {
-      return refuse('invalid');
+      return refuseInvite('invalid');
     }
     // ADR 0016: watch by default, so Can control needs a page that opted into 'all'.
     if (policy.invites === 'off' || (request.role === 'driver' && policy.invites !== 'all')) {
-      return refuse('policy');
+      return refuseInvite('policy');
     }
+    const lifetime = lifetimeMs(request.lifetime ?? '1h');
+    return mintInvite(
+      request.role,
+      request.label,
+      request.role === 'driver' ? CONTROL_INVITE_USES : (request.uses ?? 1),
+      lifetime === null ? null : clock() + lifetime,
+    );
+  }
+
+  function refuseInvite(reason: InviteRefusal): InviteResult {
+    return Object.freeze({ ok: false, reason });
+  }
+
+  /**
+   * The mint itself, for invite() and a time-boxed session's watch invites
+   * alike, its terms already checked: `expiresAt` on this page's clock, or
+   * null for "while the page is open". `live` says whether what the invite
+   * is for still stands once its digest is made: a session's link minted
+   * after the session ended would outlive it, uncapped.
+   */
+  async function mintInvite(
+    role: Role,
+    label: string,
+    uses: number,
+    expiresAt: number | null,
+    live: () => boolean = () => true,
+  ): Promise<InviteResult> {
+    const refuse = refuseInvite;
     if (!isLinked()) return refuse('link_down');
     const offered = state.invitesOffered;
     if (offered === null || !webCrypto) return refuse('unavailable');
@@ -3206,19 +4074,17 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     }
     // The link may have dropped, or the page closed, while the hash was made.
     if (!isLinked()) return refuse('link_down');
+    if (!live()) return refuse('cancelled');
     if (invites.size >= MAX_LIVE_INVITES_PER_PAGE) return refuse('limit');
-    const now = clock();
-    const lifetime = lifetimeMs(request.lifetime ?? '1h');
-    const uses = request.role === 'driver' ? CONTROL_INVITE_USES : (request.uses ?? 1);
     const record: StoredInvite = {
       inviteId,
       secretHash,
-      role: request.role,
-      label: request.label,
+      role,
+      label,
       uses,
       usesLeft: uses,
-      createdAt: now,
-      expiresAt: lifetime === null ? null : now + lifetime,
+      createdAt: clock(),
+      expiresAt,
       refusals: 0,
       barred: [],
     };
@@ -3252,9 +4118,11 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
    */
   function cancelInvite(inviteId: string): boolean {
     if (closed || !invites.has(inviteId)) return false;
-    forgetInvite(inviteId, 'cancelled');
-    log.info(`closed invite ${inviteId}`);
+    // The cancel first: the relay ends a redemption waiting on it as it
+    // closes the invite, never as a refusal that counts toward burning it.
     if (isLinked() && send({ t: 'invite_cancel', inviteId })) cancelSent.add(inviteId);
+    forgetInvite(inviteId, 'cancelled', 'closing');
+    log.info(`closed invite ${inviteId}`);
     return true;
   }
 
@@ -3263,6 +4131,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     writePaused(paused);
     if (paused === state.paused) return;
     setState({ paused });
+    stateFlush();
     log.info(paused ? 'the operator paused calls' : 'the operator resumed calls');
     if (!paused) {
       pump();
@@ -3272,6 +4141,1328 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       if (call.stage !== 'running') finish(call, PAUSED);
     }
   }
+
+  // The M6 parts (plan section 2.6), each built by its workstream behind the
+  // signature the foundation gave it, so the call sites above and the handle
+  // below kept their shape as each body came.
+
+  // Page state (ADR 0040). The page's latest value is kept as canonical
+  // text, and at most one state frame goes out each STATE_MIN_INTERVAL_MS:
+  // the first change after a quiet spell at once, the last of a burst when
+  // the interval ends, and nothing when the relay already holds that text
+  // from this link. While paused the relay is sent null, as pause refuses
+  // every call, reads included. The value is never logged.
+
+  /** The page's latest valid value as canonical text; null for nothing, or after a refusal. */
+  let stateText: string | null = null;
+  let stateBytes = 0;
+  /** Why the page's latest value was refused, or null. */
+  let stateRefused: 'too_large' | 'invalid' | null = null;
+  /** What the relay holds from this link: nothing after every welcome, since a sleep drops it. */
+  let sentStateText: string | null = null;
+  let stateSentAt = Number.NEGATIVE_INFINITY;
+  let stateTimer: unknown = null;
+  /** The welcome's maxStateBytes within the protocol's own; null until a welcome names one. */
+  let stateCap: number | null = null;
+  /** Whether the last welcome named maxStateBytes; null before any welcome. */
+  let relayTakesState: boolean | null = null;
+
+  function publishedNow(): PublishStatus {
+    if (stateRefused !== null) return stateRefused;
+    if (stateText === null) return 'none';
+    if (relayTakesState === false) return 'unsupported';
+    return state.paused ? 'paused' : 'shared';
+  }
+
+  /** Says the status once each time it changes, never per value, so a busy page re-renders nothing. */
+  function syncPublished(): void {
+    const published = publishedNow();
+    if (state.published === published) return;
+    if (published === 'too_large') {
+      log.warn(
+        `page state not shared: ${stateBytes} bytes, over the ${stateCap ?? MAX_STATE_BYTES} byte limit`,
+      );
+    } else if (published === 'invalid') {
+      log.warn('page state not shared: not a JSON object or null');
+    } else if (published === 'unsupported') {
+      log.warn('page state not shared: this relay does not take page state');
+    }
+    setState({ published });
+  }
+
+  const publishState: Dock['publishState'] = (value) => {
+    const written = stateTextOf(value);
+    let refusal: 'too_large' | 'invalid' | null = 'invalid';
+    // A refused value clears what the relay holds rather than leave a stale one current.
+    stateText = null;
+    if (written !== 'invalid') {
+      stateBytes = written.bytes;
+      refusal = written.bytes > (stateCap ?? MAX_STATE_BYTES) ? 'too_large' : null;
+      if (refusal === null) stateText = written.text;
+    }
+    stateRefused = refusal;
+    syncPublished();
+    flushState();
+    return Object.freeze(refusal === null ? { ok: true } : { ok: false, reason: refusal });
+  };
+
+  function flushState(): void {
+    if (!isLinked() || stateCap === null) return;
+    const wanted = state.paused ? null : stateText;
+    if (wanted === sentStateText) return;
+    const now = clock();
+    const due = stateSentAt + STATE_MIN_INTERVAL_MS;
+    if (now < due) {
+      // One timer for the rest of the interval, which sends whatever is latest then.
+      stateTimer ??= timers.setTimeout(() => {
+        stateTimer = null;
+        flushState();
+      }, due - now);
+      return;
+    }
+    // The text read back, so what goes out is exactly what was measured.
+    // stateTextOf checked it is an object; send() checks the frame again.
+    const value = wanted === null ? null : (parseValue(wanted) as JsonObject);
+    if (!send({ t: 'state', value })) return;
+    sentStateText = wanted;
+    stateSentAt = now;
+  }
+
+  /** Before the tools frame: the relay serves reads again only once tools come, so none sees the gap. */
+  const stateWelcome = (frame: WelcomeFrame): void => {
+    const offered = frame.limits.maxStateBytes;
+    relayTakesState = offered !== undefined;
+    stateCap = offered === undefined ? null : Math.min(MAX_STATE_BYTES, offered);
+    sentStateText = null;
+    stateSentAt = Number.NEGATIVE_INFINITY;
+    if (stateCap !== null && stateText !== null && stateBytes > stateCap) {
+      stateText = null;
+      stateRefused = 'too_large';
+    }
+    syncPublished();
+    flushState();
+  };
+
+  const stateLinkDown = (): void => {
+    timers.clearTimeout(stateTimer);
+    stateTimer = null;
+    sentStateText = null;
+  };
+
+  const stateFlush = (): void => {
+    syncPublished();
+    flushState();
+  };
+
+  // Image results (ADR 0039)
+
+  /**
+   * What the welcome says the relay takes, held to the protocol's ceiling so
+   * a relay's large number never lets the page send more; absent, as from a
+   * 0.1.0 relay, is none, and an image tool's image is then refused here
+   * rather than sent to be dropped.
+   */
+  const imageWelcome = (frame: WelcomeFrame): void => {
+    setState({ maxImageBytes: Math.min(MAX_IMAGE_BYTES, frame.limits.maxImageBytes ?? 0) });
+  };
+
+  /**
+   * A declared image tool's result: an envelope, checked here as the relay
+   * checks it again (one checkImage for both); anything else stays text as
+   * the runtime gave it (ADR 0001), so the tool can still answer in words.
+   * The page's words beside an image are cut so the marker fits within
+   * MAX_IMAGE_TEXT_CHARS, and the image never is. A relay that named no cap
+   * takes none, which checkImage refuses as images off.
+   */
+  function imageOutcome(text: string): Outcome {
+    const envelope = parseImageEnvelope(text);
+    if (envelope.kind === 'text') return { ok: true, content: text };
+    const refused = (message: string): Outcome => ({ ok: false, code: 'tool_error', message });
+    if (envelope.kind === 'invalid') return refused(envelope.message);
+    const checked = checkImage(envelope.image, state.maxImageBytes ?? 0);
+    if (!checked.ok) return refused(checked.message);
+    return {
+      ok: true,
+      content: truncate(envelope.text, MAX_IMAGE_TEXT_CHARS - MARKER_ROOM).text,
+      image: { mimeType: checked.mimeType, data: envelope.image.data, bytes: checked.bytes.length },
+    };
+  }
+
+  // The image gate (ADR 0039): image calls start one at a time on this page,
+  // IMAGE_CALL_SPACING_MS apart, so a room capturing the projected tab cannot
+  // keep it drawing; the page holds it, so no relay can get round it.
+  let imageRunning: CallRecord | null = null;
+  let imageStartedAt = -Infinity;
+  let imageTimer: unknown = null;
+  let imageHold: unknown = null;
+  const imageWaiting: { call: CallRecord; go: () => void }[] = [];
+
+  /**
+   * Waits for the gate, then runs checkedAgain, since the caller's role or
+   * grant, or the tool itself, may have changed meanwhile; the tool to run,
+   * or null when the call ended instead, its handler never run (S8). Past
+   * MAX_WAITING_IMAGE_CALLS waiting, a call is answered page_busy at once.
+   */
+  async function takeImageSlot(
+    call: CallRecord,
+    admitted: NormalisedTool,
+    snapshot: ToolSnapshot,
+  ): Promise<NormalisedTool | null> {
+    if (imageWaiting.filter((waiter) => !waiter.call.finished).length >= MAX_WAITING_IMAGE_CALLS) {
+      finish(call, { ok: false, code: 'page_busy', message: 'too many image calls are waiting' });
+      return null;
+    }
+    await new Promise<void>((go) => {
+      imageWaiting.push({ call, go });
+      pumpImages();
+    });
+    return checkedAgain(call, admitted, snapshot);
+  }
+
+  /** Drops waiters already answered, then starts the next once the gate is free and the spacing passed. */
+  function pumpImages(): void {
+    for (const waiter of imageWaiting.filter((each) => each.call.finished)) {
+      imageWaiting.splice(imageWaiting.indexOf(waiter), 1);
+      waiter.go();
+    }
+    const next = imageWaiting[0];
+    if (!next || imageRunning !== null || imageTimer !== null) return;
+    const wait = imageStartedAt + IMAGE_CALL_SPACING_MS - clock();
+    if (wait > 0) {
+      imageTimer = timers.setTimeout(() => {
+        imageTimer = null;
+        pumpImages();
+      }, wait);
+      return;
+    }
+    imageWaiting.shift();
+    imageRunning = next.call;
+    imageStartedAt = clock();
+    // On the polyfill 5.1 the call holding the gate runs under a signal
+    // nothing aborts (execute), so the gate waits for its handler; one that
+    // never ends, or that the runtime stopped watching, holds it no longer
+    // than this. Elsewhere the gate frees when the abort lands (ADR 0001).
+    imageHold = timers.setTimeout(
+      () => {
+        freeImageSlot(next.call);
+      },
+      Math.max(next.call.deadlineAt, imageStartedAt) + UNWATCHED_HANDLER_GRACE_MS - imageStartedAt,
+    );
+    next.go();
+  }
+
+  /** Frees the gate if `call` holds it, then lets the next waiter start. */
+  function freeImageSlot(call: CallRecord | null): void {
+    if (call !== null && imageRunning === call) {
+      imageRunning = null;
+      timers.clearTimeout(imageHold);
+    }
+    pumpImages();
+  }
+
+  // Proposals (ADR 0042). An observer's write reaches the page as a proposal
+  // frame, never an invoke. The page takes it only under its own policy and
+  // role rules, never from an agent token's caller (C13), and keeps its own
+  // record of it in memory alone, never in storage, so a reload or a lost
+  // link leaves nothing to accept (decision 12). The operator's Accept,
+  // armed in the widget, is that call's confirmation (S6); the relay then
+  // queues the call, and its invoke runs only against this page's record of
+  // that Accept: the same caller, tool and canonical arguments, once, within
+  // ACCEPTED_PROPOSAL_RUN_MS (S5). Arguments are shown, never logged.
+  const proposals = new Map<string, HeldProposal>();
+
+  function showProposals(): void {
+    setState({
+      proposals: [...proposals.values()]
+        .filter((held) => held.state === 'pending')
+        .map((held) => held.view),
+    });
+  }
+
+  /** Whether the policy in force, a session's narrowing included, takes proposals from this caller. */
+  function takesFrom(userId: string, agent: boolean): boolean {
+    return proposalsAdmit(effective().proposals, {
+      kind: isInvitee(userId) ? 'invitee' : 'member',
+      agent,
+    });
+  }
+
+  /**
+   * Whether an agent token made this caller's grant (ADR 0044): an agent's id
+   * is drawn from the page's id and the token's, so this page tells one from
+   * its own grant, whatever the relay says.
+   */
+  async function isAgent(userId: string): Promise<boolean> {
+    const tokenId = grants.get(userId)?.inviteId;
+    const pageId = grantsPage;
+    if (!isInvitee(userId) || tokenId === undefined || pageId === null || !webCrypto) return false;
+    const hash = await sha256Hex(webCrypto, agentKeyInput(pageId, tokenId));
+    return userId === `${INVITEE_ID_PREFIX}${hash.slice(0, 32)}`;
+  }
+
+  /** Why this page will not take the proposal now, or null; read before and after every await. */
+  function proposalProblem(frame: ProposalFrame, agent: boolean): ProposalRefusal | null {
+    const { userId } = frame.proposer;
+    if (agent) return 'role';
+    if (!takesFrom(userId, agent)) return 'policy';
+    const listed = state.roster.find((attachment) => attachment.userId === userId);
+    if (listed === undefined || pageRole(userId, listed.role) !== 'observer') return 'role';
+    if (proposalArgumentProblem(frame.arguments) !== null) return 'too_large';
+    let mine = 0;
+    let all = 0;
+    for (const held of proposals.values()) {
+      if (held.state !== 'pending') continue;
+      all += 1;
+      if (held.view.proposer.userId === userId) mine += 1;
+    }
+    if (mine >= MAX_PENDING_PROPOSALS_PER_USER || all >= MAX_PENDING_PROPOSALS_PER_PAGE) {
+      return 'limit';
+    }
+    return null;
+  }
+
+  function onProposal(frame: ProposalFrame): void {
+    void takeProposal(frame);
+  }
+
+  async function takeProposal(frame: ProposalFrame): Promise<void> {
+    const { proposalId, tool, proposer } = frame;
+    const named = `proposal ${proposalId} ${tool} by ${logName(proposer)}`;
+    if (proposals.has(proposalId)) {
+      log.warn(`ignored a repeated ${named}`);
+      return;
+    }
+    const link = socket;
+    const refuse = (refused: ProposalRefusal): void => {
+      log.info(`${named}: refused (${refused})`);
+      send({ t: 'proposal_decision', proposalId, accept: false, refused });
+    };
+    const agent = await isAgent(proposer.userId);
+    const first = proposalProblem(frame, agent);
+    if (first !== null) {
+      refuse(first);
+      return;
+    }
+    const snapshot = await readTools();
+    // A link that ended meanwhile took the proposal with it, on both sides.
+    if (socket !== link || !isLinked() || proposals.has(proposalId)) return;
+    const runtime = snapshot?.byName.get(tool);
+    const canonical = canonicalJson(frame.arguments);
+    const problem =
+      proposalProblem(frame, agent) ??
+      (runtime === undefined || isReadOnly(runtime.page) ? 'tool' : null) ??
+      (canonical === null ? 'too_large' : null);
+    if (problem !== null || runtime === undefined || snapshot === null || canonical === null) {
+      refuse(problem ?? 'tool');
+      return;
+    }
+    const consequential = isConsequential(runtime.page, snapshot.hintSupport, policy);
+    if (consequential && policy.consequential === 'deny') {
+      refuse('consequential');
+      return;
+    }
+    const now = clock();
+    const shown = escapeUnseen(encodeValue(frame.arguments) ?? '{}');
+    const held: HeldProposal = {
+      view: Object.freeze({
+        proposalId,
+        tool,
+        proposer: Object.freeze({
+          ...proposer,
+          client: proposer.client && Object.freeze({ ...proposer.client }),
+        }),
+        arguments: shown,
+        argumentChars: shown.length,
+        consequential,
+        receivedAt: now,
+        expiresAt: Math.min(frame.expiresAt, now + PROPOSAL_TTL_MS),
+      }),
+      args: frame.arguments,
+      canonical,
+      agent,
+      state: 'pending',
+      acceptedAt: 0,
+      timer: null,
+    };
+    held.timer = timers.setTimeout(
+      () => {
+        settleProposal(held, 'expired', null);
+      },
+      Math.max(0, held.view.expiresAt - now),
+    );
+    proposals.set(proposalId, held);
+    // Told first, so the state this shows counts it; never its arguments (ADR 0045, decision 25).
+    if (state.pageId !== null) recorder.proposal(held.view, state.pageId);
+    showProposals();
+    log.info(`${named}: waiting for the operator`);
+  }
+
+  /** The proposal leaves this page's record for its log, and the session record hears how (ADR 0045). */
+  function settleProposal(
+    held: HeldProposal,
+    outcome: ProposalOutcome,
+    callId: string | null,
+  ): void {
+    const { proposalId, tool, proposer } = held.view;
+    if (proposals.get(proposalId) !== held) return;
+    proposals.delete(proposalId);
+    timers.clearTimeout(held.timer);
+    const entry: ProposalLogEntry = Object.freeze({
+      proposalId,
+      tool,
+      proposer: Object.freeze({ userId: proposer.userId, displayName: proposer.displayName }),
+      client: proposer.client,
+      outcome,
+      callId,
+      time: clock(),
+    });
+    recorder.proposalSettled(entry);
+    setState({ proposalLog: [entry, ...state.proposalLog].slice(0, ACTIVITY_LIMIT) });
+    showProposals();
+    log.info(`proposal ${proposalId} ${tool} by ${logName(proposer)}: ${outcome}`);
+  }
+
+  /**
+   * S5 for an invoke naming a proposal: the page's own record of the
+   * operator's Accept, for this caller, tool and arguments, within
+   * ACCEPTED_PROPOSAL_RUN_MS of it. A match is spent at once, so a second
+   * invoke under the same proposal finds nothing; anything else binds
+   * nothing, and check() refuses the call.
+   */
+  function bindProposal(frame: InvokeFrame): HeldProposal | null {
+    const proposalId = frame.proposal?.proposalId;
+    if (proposalId === undefined) return null;
+    const held = proposals.get(proposalId);
+    if (
+      held?.state !== 'accepted' ||
+      clock() > held.acceptedAt + ACCEPTED_PROPOSAL_RUN_MS ||
+      held.view.proposer.userId !== frame.caller.userId ||
+      held.view.tool !== frame.tool ||
+      held.canonical !== canonicalJson(frame.arguments)
+    ) {
+      log.warn(
+        `call ${frame.callId} names proposal ${proposalId}, which this page holds no Accept for`,
+      );
+      return null;
+    }
+    settleProposal(held, 'accepted', frame.callId);
+    return held;
+  }
+
+  function onProposalEnd(frame: ProposalEndFrame): void {
+    const held = proposals.get(frame.proposalId);
+    if (held === undefined) return;
+    const { reason } = frame;
+    settleProposal(
+      held,
+      held.state === 'accepted' || reason === 'not_run'
+        ? 'not_run'
+        : reason === 'withdrawn' || reason === 'expired'
+          ? reason
+          : 'cancelled',
+      null,
+    );
+    // The relay narrowed the policy: whatever else it no longer admits goes too.
+    if (reason === 'policy') proposalsPolicyChanged();
+  }
+
+  /** Proposals of those the page no longer lists, or no longer runs anything for, end with them. */
+  const proposalsRoster = (): void => {
+    for (const held of [...proposals.values()]) {
+      const { userId } = held.view.proposer;
+      const listed = state.roster.find((attachment) => attachment.userId === userId);
+      if (listed === undefined || pageRole(userId, listed.role) === null) {
+        settleProposal(held, 'cancelled', null);
+      }
+    }
+  };
+
+  const proposalsLinkDown = (): void => {
+    for (const held of [...proposals.values()]) settleProposal(held, 'cancelled', null);
+  };
+
+  const proposalsRevoked = (target: string): void => {
+    for (const held of [...proposals.values()]) {
+      if (target === '*' || held.view.proposer.userId === target) {
+        settleProposal(held, 'cancelled', null);
+      }
+    }
+  };
+
+  /** A session that narrowed proposals ends the pending ones it no longer admits (ADR 0043). */
+  function proposalsPolicyChanged(): void {
+    for (const held of [...proposals.values()]) {
+      if (held.state === 'pending' && !takesFrom(held.view.proposer.userId, held.agent)) {
+        settleProposal(held, 'cancelled', null);
+      }
+    }
+  }
+
+  /**
+   * The operator's Accept: only while the proposal waits, before its end,
+   * on a linked page that is not paused (decision 13), for a proposer the
+   * page still lists and the policy still admits.
+   */
+  const acceptProposal: Dock['acceptProposal'] = (proposalId) => {
+    const held = typeof proposalId === 'string' ? proposals.get(proposalId) : undefined;
+    if (held?.state !== 'pending' || state.paused || !isLinked()) return false;
+    const { userId } = held.view.proposer;
+    const listed = state.roster.find((attachment) => attachment.userId === userId);
+    if (
+      clock() >= held.view.expiresAt ||
+      listed === undefined ||
+      pageRole(userId, listed.role) === null ||
+      !takesFrom(userId, held.agent) ||
+      !send({ t: 'proposal_decision', proposalId: held.view.proposalId, accept: true })
+    ) {
+      return false;
+    }
+    held.state = 'accepted';
+    held.acceptedAt = clock();
+    timers.clearTimeout(held.timer);
+    // An Accept no invoke binds in time ends as not run.
+    held.timer = timers.setTimeout(() => {
+      settleProposal(held, 'not_run', null);
+    }, ACCEPTED_PROPOSAL_RUN_MS);
+    showProposals();
+    log.info(`the operator accepted proposal ${held.view.proposalId}`);
+    return true;
+  };
+
+  const dismissProposal: Dock['dismissProposal'] = (proposalId) => {
+    const held = typeof proposalId === 'string' ? proposals.get(proposalId) : undefined;
+    if (held?.state !== 'pending') return false;
+    send({ t: 'proposal_decision', proposalId: held.view.proposalId, accept: false });
+    settleProposal(held, 'dismissed', null);
+    return true;
+  };
+
+  const dismissAllProposals: Dock['dismissAllProposals'] = () => {
+    let dismissed = 0;
+    for (const held of [...proposals.values()]) {
+      if (dismissProposal(held.view.proposalId)) dismissed += 1;
+    }
+    return dismissed;
+  };
+
+  // Time-boxed sessions (ADR 0043). This page starts, extends and ends its
+  // own; the relay applies one only within the hello's policy and holds its
+  // end on its own clock, and this page holds the end on its clock too, so
+  // neither a silent relay nor a frozen tab keeps a guest past it. Only a
+  // session this page started is ever adopted: a relay cannot impose one,
+  // nor make one longer than the operator asked. Its links show once, as an
+  // invite's do, and are never stored.
+
+  /** The session the relay listed in its last session frame on this link. */
+  let relayLists: string | null = null;
+  /** The last session this page ended itself; the relay hears of it while it still lists it. */
+  let endedHere: string | null = null;
+  /** Whether this page's own clock made that end, which its session_end says (ADR 0043's notes). */
+  let endedByClock = false;
+  /** The session this page last asked the relay to end on this link, so it asks once. */
+  let endSent: string | null = null;
+  /** The longest the operator asked the session to run, which no relay can pass. */
+  let askedMs = 0;
+  let sessionTimer: unknown = null;
+  let graceTimer: unknown = null;
+  /** A start waiting for the relay: its answer is null once listed, or why not. */
+  let starting: {
+    readonly sessionId: string;
+    readonly answer: (refused: SessionFailure | null) => void;
+  } | null = null;
+
+  /** attach()'s policy as a running session narrows it; every read a session may narrow goes through here. */
+  function effective(): Policy {
+    return narrowPolicy(policy, session?.policy ?? null);
+  }
+
+  function sessionView(): SessionView | null {
+    if (session === null) return null;
+    // The sponsor the relay named for its invites, fixed at minting (ADR 0017).
+    let sponsor: User | null = null;
+    for (const inviteId of session.inviteIds) sponsor ??= listings.get(inviteId)?.sponsor ?? null;
+    return Object.freeze({
+      sessionId: session.sessionId,
+      label: session.label,
+      startedAt: session.startedAt,
+      endsAt: session.endsAt,
+      lengthMinutes: session.lengthMs / SESSION_LENGTH_UNIT_MS,
+      policy: effective(),
+      observers: session.observers,
+      inviteIds: [...session.inviteIds],
+      sponsor: sponsor === null ? null : { ...sponsor },
+    });
+  }
+
+  /** Every change to the session ends here, so storage and the state shown match memory. */
+  function showSession(): void {
+    writeStored(sessionKey, session && JSON.stringify(session), "the page's session");
+    setState({ session: sessionView(), records: recorder.views() });
+  }
+
+  function armSessionEnd(): void {
+    timers.clearTimeout(sessionTimer);
+    sessionTimer = null;
+    if (session === null || closed) return;
+    sessionTimer = timers.setTimeout(
+      () => {
+        sessionTimer = null;
+        if (session === null || closed) return;
+        if (clock() >= session.endsAt) finishSession('time', true);
+        else armSessionEnd();
+      },
+      Math.min(Math.max(0, session.endsAt - clock()), MAX_TIMER_MS),
+    );
+  }
+
+  /**
+   * The drivers past `seats`, newest grant first as the relay picks them,
+   * become observers on this page at once, before the relay hears (S5).
+   */
+  function demoteBeyond(seats: number): void {
+    const drivers = state.roster
+      .filter((entry) => entry.role === 'driver')
+      .sort((a, b) => a.grantedAt - b.grantedAt);
+    for (const entry of drivers.slice(seats)) setRole(entry.userId, 'observer');
+  }
+
+  /** Asks the relay to end a session it lists, once per link, saying so when this page's clock ended it. */
+  function endListed(sessionId: string, byClock = false): void {
+    const frame: PageFrameInput = byClock
+      ? { t: 'session_end', sessionId, reason: 'time' }
+      : { t: 'session_end', sessionId };
+    if (endSent !== sessionId && isLinked() && send(frame)) {
+      endSent = sessionId;
+    }
+  }
+
+  /** The relay hears of an end this page made only while it still lists that session. */
+  function tellEnd(): void {
+    if (endedHere !== null && relayLists === endedHere) endListed(endedHere, endedByClock);
+  }
+
+  const sessionWelcome = (frame: WelcomeFrame): void => {
+    relayLists = null;
+    endSent = null;
+    if (session === null) {
+      const text = readStored(sessionKey);
+      const stored = text === null ? null : StoredSessionSchema.safeParse(parseJson(text));
+      if (stored?.success === false) log.warn('ignored a stored session that did not parse');
+      if (stored?.success) session = { ...stored.data };
+    }
+    if (session === null) return;
+    // Kept across a reload that resumed its page session, until the relay's frame says.
+    if (session.pageId === frame.pageId) {
+      armSessionEnd();
+      showSession();
+    } else {
+      finishSession('relay');
+    }
+  };
+
+  const onSession = (frame: SessionFrame): void => {
+    if (!state.sessionsOffered) setState({ sessionsOffered: true });
+    const live = frame.session;
+    relayLists = live?.sessionId ?? null;
+    const { refused, ended } = frame;
+    if (refused !== undefined) {
+      log.info(`the relay refused session ${refused.sessionId}: ${refused.reason}`);
+      if (starting?.sessionId === refused.sessionId) starting.answer(refused.reason);
+    }
+    const kept = session;
+    if (kept !== null && live?.sessionId === kept.sessionId) {
+      // Reckoned again on this clock, never past what the operator asked,
+      // and the relay's policy taken only where it is no wider than this page's.
+      const lengthMs = Math.min(live.lengthMs, Math.max(kept.lengthMs, askedMs));
+      kept.lengthMs = lengthMs;
+      kept.endsAt = Math.min(clock() + live.remainingMs, kept.startedAt + lengthMs);
+      if (withinCeiling(effective(), live.policy)) kept.policy = { ...live.policy };
+      kept.listed = true;
+      if (starting?.sessionId === kept.sessionId) starting.answer(null);
+      armSessionEnd();
+      demoteBeyond(effective().maxDrivers);
+      proposalsPolicyChanged();
+      const view = sessionView();
+      // Told after each decision, through the seam W3-A guards (ADR 0045, decision 22).
+      if (view !== null) recorder.sessionStarted(view);
+      showSession();
+      return;
+    }
+    // The relay holds none of this page's: it ended there, unless a start still waits.
+    if (kept !== null && starting?.sessionId !== kept.sessionId) {
+      finishSession(ended?.sessionId === kept.sessionId ? ended.reason : 'relay');
+    }
+    // One the relay lists while this page holds none is never adopted, and is
+    // ended there, as an unknown invite is closed: whether this page ended it
+    // while the relay could not hear and a reload lost that, or never started
+    // it. An end only takes access away, and without one the relay would keep
+    // the seats narrowed and refuse every start until its own clock ran out.
+    // One this page ended on its own clock waits out the grace first.
+    if (live !== null && session === null) {
+      if (live.sessionId !== endedHere) {
+        if (endSent !== live.sessionId) {
+          log.warn(`ended session ${live.sessionId}, which this page holds no record of`);
+        }
+        endListed(live.sessionId);
+      } else if (graceTimer === null) {
+        tellEnd();
+      }
+    }
+  };
+
+  /**
+   * The end, however it came: everyone an invite or agent token let in
+   * leaves, their redemptions are refused and their calls cancelled, as on
+   * revoke (S8, C11), and the page's own policy returns. An end this page
+   * made itself is told to the relay, at once for the operator's, after
+   * SESSION_END_GRACE_MS for its clock's, so the relay's own end wins a tie.
+   */
+  function finishSession(reason: SessionEndedReason, local = false): void {
+    const ended = session;
+    if (ended === null) return;
+    session = null;
+    timers.clearTimeout(sessionTimer);
+    if (starting?.sessionId === ended.sessionId) starting.answer('unavailable');
+    const listed = new Set(state.roster.map((entry) => entry.userId));
+    const gone: string[] = [];
+    for (const [userId, grant] of grants) {
+      if (grant.inviteId === undefined) continue;
+      gone.push(userId);
+      grants.delete(userId);
+      // Refused here until the relay drops them, and revoked there should a later link find them.
+      if (listed.has(userId)) revoked.add(userId);
+    }
+    // The relay ends what waits on them with the session (its session_end,
+    // or its own end), so nothing here answers it as a refusal (S7).
+    for (const inviteId of [...invites.keys()]) forgetInvite(inviteId, 'cancelled', 'closing');
+    saveGrants();
+    for (const call of [...calls.values()]) {
+      if (!gone.includes(call.frame.caller.userId)) continue;
+      if (!call.confirm) call.controller.abort();
+      finish(call, {
+        ok: false,
+        code: call.confirm ? 'denied_by_operator' : 'cancelled',
+        message: 'the time-boxed session ended',
+      });
+    }
+    for (const userId of gone) proposalsRevoked(userId);
+    for (const tokenId of [...agentRecords.keys()]) forgetAgent(tokenId, 'cancelled', 'closing');
+    const end: SessionEnded = Object.freeze({
+      sessionId: ended.sessionId,
+      label: ended.label,
+      reason,
+      time: clock(),
+    });
+    recorder.sessionEnded(end);
+    setState({ sessionEnded: end });
+    showSession();
+    log.info(`session ${ended.sessionId} ended (${reason})`);
+    if (!local) return;
+    endedHere = ended.sessionId;
+    endedByClock = reason === 'time';
+    timers.clearTimeout(graceTimer);
+    graceTimer = null;
+    if (reason !== 'time') {
+      tellEnd();
+      return;
+    }
+    graceTimer = timers.setTimeout(() => {
+      graceTimer = null;
+      tellEnd();
+    }, SESSION_END_GRACE_MS);
+  }
+
+  /** The session under this id, while it runs; an await may end it. */
+  function runs(sessionId: string): StoredSession | null {
+    return session?.sessionId === sessionId ? session : null;
+  }
+
+  /** A start the relay refused or never answered leaves nothing behind but its demotions. */
+  function dropStart(sessionId: string): void {
+    if (runs(sessionId) === null) return;
+    session = null;
+    timers.clearTimeout(sessionTimer);
+    showSession();
+    // Should the relay hold it after all, it hears the end once it lists it.
+    endedHere = sessionId;
+    endedByClock = false;
+    tellEnd();
+  }
+
+  /**
+   * Starts a session: checked at run time, since a page script can pass
+   * anything, and never wider than attach()'s policy, so a start this page
+   * would refuse never leaves it (S5). The drivers past its seats are
+   * demoted here first. Its watch invites are minted once the relay lists
+   * it, each ending with the session at the latest.
+   */
+  const startSession: Dock['startSession'] = async (options) => {
+    const refuse = (reason: SessionFailure): SessionResult => Object.freeze({ ok: false, reason });
+    const given: unknown = options;
+    if (typeof given !== 'object' || given === null) return refuse('invalid');
+    const {
+      label,
+      lengthMinutes,
+      drivers = policy.maxDrivers,
+      observers = 0,
+      proposals = policy.proposals,
+    } = options;
+    const lengthMs =
+      typeof lengthMinutes === 'number' ? lengthMinutes * SESSION_LENGTH_UNIT_MS : Number.NaN;
+    const wanted = SessionPolicySchema.safeParse({ maxDrivers: drivers, proposals });
+    if (
+      !wanted.success ||
+      !InviteLabelSchema.safeParse(label).success ||
+      !SessionLengthSchema.safeParse(lengthMs).success ||
+      !Number.isInteger(observers) ||
+      observers < 0 ||
+      observers > sessionSeats(state.seatLimits)
+    ) {
+      return refuse('invalid');
+    }
+    if (!withinCeiling(policy, wanted.data) || (observers > 0 && policy.invites === 'off')) {
+      return refuse('policy');
+    }
+    if (session !== null) return refuse('active');
+    if (!isLinked()) return refuse('link_down');
+    const offered = state.invitesOffered?.linkBase ?? null;
+    if (
+      !state.sessionsOffered ||
+      (observers > 0 &&
+        (offered === null || !webCrypto || !state.roster.some((entry) => entry.kind === 'member')))
+    ) {
+      return refuse('unavailable');
+    }
+    if (invites.size + Math.ceil(observers / MAX_INVITE_USES) > MAX_LIVE_INVITES_PER_PAGE) {
+      return refuse('limit');
+    }
+    demoteBeyond(wanted.data.maxDrivers);
+    const now = clock();
+    const sessionId = `ses_${webCrypto ? randomText(webCrypto, INVITE_ID_BYTES) : String(now)}`;
+    session = {
+      pageId: state.pageId ?? '',
+      sessionId,
+      label,
+      startedAt: now,
+      endsAt: now + lengthMs,
+      lengthMs,
+      policy: wanted.data,
+      observers,
+      inviteIds: [],
+    };
+    askedMs = lengthMs;
+    armSessionEnd();
+    // Proposals the narrowed policy no longer takes end here first, as its drivers were demoted.
+    proposalsPolicyChanged();
+    showSession();
+    if (!send({ t: 'session_start', sessionId, lengthMs, policy: wanted.data })) {
+      dropStart(sessionId);
+      return refuse('link_down');
+    }
+    const answer = await new Promise<SessionFailure | null>((resolve) => {
+      const settle = (reason: SessionFailure | null): void => {
+        timers.clearTimeout(timer);
+        starting = null;
+        if (reason !== null) dropStart(sessionId);
+        resolve(reason);
+      };
+      const timer = timers.setTimeout(() => {
+        settle('unavailable');
+      }, MINT_ANSWER_MS);
+      starting = { sessionId, answer: settle };
+    });
+    if (answer !== null) return refuse(answer);
+    const links: SessionLink[] = [];
+    let inviteRefusal: InviteRefusal | undefined;
+    // One watch invite for every MAX_INVITE_USES observers, as far as the relay mints them.
+    for (let left = observers; left > 0 && runs(sessionId); left -= MAX_INVITE_USES) {
+      const minted = await mintInvite(
+        'observer',
+        label,
+        Math.min(left, MAX_INVITE_USES),
+        now + MAX_SESSION_MS,
+        () => runs(sessionId) !== null,
+      );
+      if (!minted.ok) {
+        inviteRefusal = minted.reason;
+        break;
+      }
+      links.push({ inviteId: minted.inviteId, link: minted.link });
+      runs(sessionId)?.inviteIds.push(minted.inviteId);
+      showSession();
+    }
+    return Object.freeze({
+      ok: true,
+      sessionId,
+      endsAt: runs(sessionId)?.endsAt ?? now,
+      link: links[0]?.link ?? null,
+      links: Object.freeze(links),
+      ...(inviteRefusal === undefined ? {} : { inviteRefusal }),
+    });
+  };
+
+  const extendSession: Dock['extendSession'] = (minutes) => {
+    const live = session;
+    const step = typeof minutes === 'number' && minutes > 0 ? minutes : Number.NaN;
+    const lengthMs = (live?.lengthMs ?? 0) + step * SESSION_LENGTH_UNIT_MS;
+    if (live === null || relayLists !== live.sessionId) return false;
+    if (!SessionLengthSchema.safeParse(lengthMs).success) return false;
+    askedMs = Math.max(askedMs, lengthMs);
+    return send({ t: 'session_extend', sessionId: live.sessionId, lengthMs });
+  };
+
+  const endSession: Dock['endSession'] = () => {
+    if (session === null || closed) return false;
+    finishSession('operator', true);
+    return true;
+  };
+
+  /**
+   * A new watch link for the running session, since its links live only in
+   * the widget's memory and a reload loses them: the old invites close, and
+   * one mint covers the seats still open, up to an invite's uses.
+   */
+  const renewSessionLink: Dock['renewSessionLink'] = async () => {
+    const live = session;
+    if (live === null || live.observers === 0) return refuseInvite('invalid');
+    let joined = 0;
+    for (const grant of grants.values()) {
+      if (grant.inviteId !== undefined && live.inviteIds.includes(grant.inviteId)) joined += 1;
+    }
+    for (const inviteId of live.inviteIds) cancelInvite(inviteId);
+    live.inviteIds = [];
+    showSession();
+    const minted = await mintInvite(
+      'observer',
+      live.label,
+      Math.min(MAX_INVITE_USES, Math.max(1, live.observers - joined)),
+      live.startedAt + MAX_SESSION_MS,
+      () => session === live,
+    );
+    if (minted.ok && session === live) {
+      live.inviteIds.push(minted.inviteId);
+      showSession();
+    }
+    return minted;
+  };
+
+  // Agent tokens (ADR 0044). A token is minted here as an invite is: 256
+  // bits from getRandomValues, its SHA-256 kept in this page's own record
+  // and sent to the relay, the token itself only in what agentToken()
+  // resolves with, once. Its first request is honoured only against that
+  // record: the token presented, its label, the agent's id derived from this
+  // page and the token, and its time; then the operator is asked, for
+  // observer only, and a denial or three prompts left to time out burn it.
+
+  /** This page's records of the tokens it minted, by id: hashes, never tokens. */
+  const agentRecords = new Map<string, StoredAgent>();
+  /** The page session the records belong to; they mean nothing on another. */
+  let agentsPage: string | null = null;
+  /** What the relay's last agents frame said of each token the records hold, terms matching. */
+  let agentListings = new Map<string, AgentListing>();
+  /** Tokens sent to the relay that it has neither listed nor refused yet, each with its token until then. */
+  const agentMinting = new Map<
+    string,
+    {
+      readonly token: string;
+      readonly resolve: (result: AgentTokenResult) => void;
+      readonly timer: unknown;
+    }
+  >();
+  /** Tokens closed on this link because this page holds no record of them, so each is closed once. */
+  const agentCancelSent = new Set<string>();
+  /** The agent users this page checked, by user id, so revoking one also cancels its token. */
+  const agentUsers = new Map<string, string>();
+
+  function loadAgents(): void {
+    const text = readStored(agentsKey);
+    const stored = text === null ? null : StoredAgentsSchema.safeParse(parseJson(text));
+    // A strict schema: a record holding a token, or anything malformed, is no record at all.
+    if (stored && !stored.success) log.warn('ignored unparsable stored agent tokens');
+    if (stored?.success && (grantsPage === null || grantsPage === stored.data.pageId)) {
+      agentsPage = stored.data.pageId;
+      for (const agent of stored.data.agents) agentRecords.set(agent.tokenId, agent);
+    }
+  }
+
+  loadAgents();
+
+  /** Every change to the records ends here, so storage and the shown tokens match memory. */
+  function saveAgents(): void {
+    writeStored(
+      agentsKey,
+      agentRecords.size === 0 || agentsPage === null
+        ? null
+        : JSON.stringify({ pageId: agentsPage, agents: [...agentRecords.values()] }),
+      "the page's agent tokens",
+    );
+    const views = agentViews();
+    if (JSON.stringify(views) !== JSON.stringify(state.agents)) setState({ agents: views });
+  }
+
+  /** When a token stops working on this page's clock: its expiry, never past 8 hours from minting. */
+  function agentEnd(agent: StoredAgent): number {
+    return Math.min(agent.expiresAt, agent.createdAt + MAX_AGENT_LIFETIME_MS);
+  }
+
+  /**
+   * Every token this page minted that the relay lists on the very terms it
+   * was minted with, oldest first: the records are kept in minting order.
+   */
+  function agentViews(): AgentView[] {
+    const views: AgentView[] = [];
+    for (const agent of agentRecords.values()) {
+      const listing = agentListings.get(agent.tokenId);
+      if (listing) {
+        views.push(
+          Object.freeze({
+            tokenId: agent.tokenId,
+            label: agent.label,
+            expiresAt: agentEnd(agent),
+            state: listing.state,
+            timeouts: Math.max(listing.timeouts, agent.timeouts),
+            sponsor: Object.freeze(listing.sponsor),
+          }),
+        );
+      }
+    }
+    return views;
+  }
+
+  /**
+   * The page stops honouring a token: its record goes, stored copy too, a
+   * first request of it still being checked or waiting on the operator is
+   * refused (`cause`), the grant it made goes, and a mint still waiting
+   * settles with `reason`.
+   */
+  function forgetAgent(
+    tokenId: string,
+    reason: InviteRefusal,
+    cause: DecisionCause = 'rule',
+  ): void {
+    const had = agentRecords.delete(tokenId);
+    agentListings.delete(tokenId);
+    const mint = agentMinting.get(tokenId);
+    if (mint) {
+      agentMinting.delete(tokenId);
+      timers.clearTimeout(mint.timer);
+      mint.resolve(Object.freeze({ ok: false, reason }));
+    }
+    for (const record of [...requests.values()]) {
+      if (record.request.agent?.tokenId === tokenId) decide(record, false, undefined, cause);
+    }
+    for (const [userId, ofToken] of [...agentUsers]) {
+      if (ofToken === tokenId) agentUsers.delete(userId);
+    }
+    const holders = [...grants].filter(([, grant]) => grant.inviteId === tokenId);
+    if (holders.length > 0) pruneGrants(holders.map(([userId]) => userId));
+    if (had) saveAgents();
+  }
+
+  /** Closes a token the relay lists that this page holds no record of, once per link. */
+  function closeUnknownAgent(tokenId: string): void {
+    if (agentCancelSent.has(tokenId) || !isLinked()) return;
+    if (send({ t: 'agent_cancel', tokenId })) {
+      agentCancelSent.add(tokenId);
+      log.warn(`closed unknown agent token ${tokenId}`);
+    }
+  }
+
+  /**
+   * The relay's list of this page's live tokens. Only those this page's own
+   * record holds, on the very terms it minted them with, are shown; any
+   * other is closed, since nothing here would honour it. A record the relay
+   * no longer lists was cancelled, burned or expired there and goes, unless
+   * its mint is still waiting for this very answer.
+   */
+  function onAgents(frame: AgentsFrame): void {
+    // The first agents frame of each link follows its welcome (tearDownLink cleared the last).
+    if (state.agentsOffered === null) agentCancelSent.clear();
+    // Records of another page session were never this one's to honour.
+    if (agentsPage !== null && agentsPage !== state.pageId) {
+      for (const tokenId of [...agentRecords.keys()]) forgetAgent(tokenId, 'link_down');
+      agentsPage = null;
+    }
+    const refused = frame.refused;
+    const listed = new Map<string, AgentListing>();
+    for (const listing of frame.agents) {
+      const agent = agentRecords.get(listing.tokenId);
+      const same =
+        agent !== undefined &&
+        agent.label === listing.label &&
+        agent.expiresAt === listing.expiresAt;
+      if (same && listing.tokenId !== refused?.tokenId) {
+        listed.set(listing.tokenId, listing);
+        continue;
+      }
+      if (agent) {
+        log.warn(`agent token ${listing.tokenId} listed on other terms`);
+        forgetAgent(listing.tokenId, 'unavailable');
+      }
+      closeUnknownAgent(listing.tokenId);
+    }
+    if (refused && agentMinting.has(refused.tokenId)) {
+      log.info(`relay refused agent token ${refused.tokenId}: ${refused.reason}`);
+      forgetAgent(refused.tokenId, refused.reason);
+    }
+    for (const tokenId of [...agentRecords.keys()]) {
+      if (!listed.has(tokenId) && !agentMinting.has(tokenId)) forgetAgent(tokenId, 'cancelled');
+    }
+    agentListings = listed;
+    setState({ agentsOffered: Object.freeze({ endpoint: frame.endpoint }), agents: agentViews() });
+    for (const tokenId of [...agentMinting.keys()]) {
+      if (listed.has(tokenId)) answerAgentMint(tokenId, frame.endpoint);
+    }
+  }
+
+  /**
+   * The relay listed a new token: agentToken() resolves with it and the
+   * command that uses it, the only place either ever goes. Every part of the
+   * command is shell-safe by schema: the endpoint passed isAgentEndpoint,
+   * and the token and its id are base64url.
+   */
+  function answerAgentMint(tokenId: string, endpoint: string | null): void {
+    const mint = agentMinting.get(tokenId);
+    const agent = agentRecords.get(tokenId);
+    if (!mint || !agent) return;
+    if (endpoint === null) {
+      // A relay with no public URL mints nothing, so one listing a token anyway gets it closed.
+      forgetAgent(tokenId, 'no_public_url');
+      closeUnknownAgent(tokenId);
+      return;
+    }
+    agentMinting.delete(tokenId);
+    timers.clearTimeout(mint.timer);
+    log.info(`minted agent token ${tokenId}`);
+    mint.resolve(
+      Object.freeze({
+        ok: true,
+        tokenId,
+        token: mint.token,
+        endpoint,
+        command: `claude mcp add --transport http --scope local tabdock-${tokenId.slice(4, 12)} ${endpoint} --header "Authorization: Bearer ${mint.token}"`,
+        expiresAt: agentEnd(agent),
+      }),
+    );
+  }
+
+  /**
+   * Whatever about a token's own record stops its request now, beyond the
+   * token itself, or null. An agent named with an account never gets here:
+   * the frame's schema refuses one.
+   */
+  function agentProblem(request: PendingRequest): string | null {
+    const agent = request.agent && agentRecords.get(request.agent.tokenId);
+    if (!agent) return 'no record';
+    if (agentsPage !== state.pageId) return 'another page session';
+    if (request.agent.label !== agent.label) return 'wrong label';
+    if (clock() >= agentEnd(agent)) return 'expired';
+    if (agent.burned || agent.timeouts >= AGENT_BURN_TIMEOUTS) return 'burned';
+    // The page's policy as it stands now, which a reload may have narrowed since minting.
+    if (policy.invites === 'off') return 'policy';
+    const { userId } = request.user;
+    if (revoked.has(userId)) return 'revoked';
+    return state.roster.some((attachment) => attachment.userId === userId) ? 'attached' : null;
+  }
+
+  /**
+   * S4 for agents: a token's first request reaches the operator only when
+   * the token presented hashes to this page's own record, its label is the
+   * record's, the agent's id is the one this page derives from its own page
+   * id and the token id (so a relay cannot reuse a token for another
+   * account), and the record's terms still hold. Then the operator is asked,
+   * for observer only. Anything else is refused without troubling them: only
+   * a relay's mistake or lie could have sent it.
+   */
+  async function checkAgent(record: RequestRecord): Promise<void> {
+    const { request } = record;
+    const secret = record.secret;
+    record.secret = null;
+    const tokenId = request.agent?.tokenId ?? '';
+    const kept = agentRecords.get(tokenId);
+    const pageId = state.pageId;
+    let matches = false;
+    let derived: string | null = null;
+    if (kept && secret !== null && webCrypto && pageId !== null) {
+      try {
+        // Both sides are digests, so how long the comparison takes says nothing of the token.
+        matches = (await sha256Hex(webCrypto, secret)) === kept.secretHash;
+        const key = await sha256Hex(webCrypto, agentKeyInput(pageId, tokenId));
+        derived = `g_${key.slice(0, INVITEE_KEY_HEX_CHARS)}`;
+      } catch (error) {
+        log.warn(`agent token hash failed: ${describe(error)}`);
+      }
+    }
+    // Answered meanwhile: expired, revoked, the token forgotten, or the link lost.
+    if (requests.get(request.requestId) !== record) return;
+    // Without a record or WebCrypto nothing matches, so nothing is honoured.
+    const problem = !matches
+      ? 'wrong token'
+      : derived !== request.user.userId
+        ? 'wrong agent id'
+        : agentProblem(request);
+    if (problem !== null) {
+      log.warn(`refused agent token ${tokenId}: ${problem}`);
+      decide(record, false, undefined, 'rule');
+      return;
+    }
+    record.verified = true;
+    agentUsers.set(request.user.userId, tokenId);
+    show(record);
+  }
+
+  /** The operator allowed a checked token: an observer, capped as a watch invite's guest, ending with the token. */
+  function agentGranted(userId: string, agent: StoredAgent): void {
+    forgetRevokes([userId]);
+    setGrant(userId, {
+      role: 'observer',
+      inviteId: agent.tokenId,
+      endsAt: agentEnd(agent),
+      inviteRole: 'observer',
+    });
+  }
+
+  /**
+   * The operator denied a token's prompt, which says they do not know the
+   * agent, so the token burns at once; one left to time out counts, and its
+   * third does too (ADR 0044). The relay burns it by the same rules, and is
+   * told to close it whatever it counts: true when it burned, for decide to
+   * close once its own answer has gone.
+   */
+  function agentRefused(agent: StoredAgent, cause: 'operator' | 'timeout'): boolean {
+    const timeouts = cause === 'timeout' ? agent.timeouts + 1 : agent.timeouts;
+    const burned = cause === 'operator' || timeouts >= AGENT_BURN_TIMEOUTS;
+    agentRecords.set(agent.tokenId, { ...agent, burned, timeouts });
+    if (!burned) saveAgents();
+    return burned;
+  }
+
+  /**
+   * Revoke's end: Revoke all forgets every token, which the relay's revoke
+   * '*' closes itself; revoking an agent forgets its token and tells the
+   * relay to close it too (agent_cancel), so no later request is honoured.
+   */
+  function agentsRevoked(target: string): void {
+    if (target === '*') {
+      for (const tokenId of [...agentRecords.keys()]) forgetAgent(tokenId, 'cancelled');
+      return;
+    }
+    const tokenId =
+      agentUsers.get(target) ??
+      state.roster.find((attachment) => attachment.userId === target)?.inviteId;
+    // cancelAgent passes over an id that names no token: an invite's, or none.
+    if (tokenId) cancelAgent(tokenId);
+  }
+
+  /**
+   * Mints an agent token (ADR 0044) once the page's policy, the relay and
+   * this page's own limit allow: its record is stored before agent_create
+   * goes, so a reload while the relay answers still knows the token it may
+   * hold. The token and its command come back once and are kept nowhere.
+   */
+  async function agentToken(request: AgentTokenOptions): Promise<AgentTokenResult> {
+    const refuse = (reason: InviteRefusal): AgentTokenResult =>
+      Object.freeze({ ok: false, reason });
+    const given: unknown = request;
+    if (typeof given !== 'object' || given === null) return refuse('invalid');
+    const lifetime: unknown = request.lifetime ?? '1h';
+    const hours = lifetime === '1h' ? 1 : lifetime === '4h' ? 4 : lifetime === '8h' ? 8 : 0;
+    if (!InviteLabelSchema.safeParse(request.label).success || hours === 0)
+      return refuse('invalid');
+    if (policy.invites === 'off') return refuse('policy');
+    if (!isLinked()) return refuse('link_down');
+    const offered = state.agentsOffered;
+    if (offered === null || !webCrypto) return refuse('unavailable');
+    if (offered.endpoint === null) return refuse('no_public_url');
+    const token = `${AGENT_TOKEN_PREFIX}${randomText(webCrypto, AGENT_TOKEN_BYTES)}`;
+    const tokenId = `agt_${randomText(webCrypto, INVITE_ID_BYTES)}`;
+    let secretHash: string;
+    try {
+      secretHash = await sha256Hex(webCrypto, token);
+    } catch (error) {
+      log.warn(`agent token hash failed: ${describe(error)}`);
+      return refuse('unavailable');
+    }
+    // The link may have dropped, or the page closed, while the hash was made.
+    const pageId = state.pageId;
+    if (!isLinked() || pageId === null) return refuse('link_down');
+    if (agentRecords.size >= MAX_LIVE_AGENTS_PER_PAGE) return refuse('limit');
+    const now = clock();
+    const record: StoredAgent = {
+      tokenId,
+      secretHash,
+      label: request.label,
+      createdAt: now,
+      expiresAt: now + hours * 3_600_000,
+      timeouts: 0,
+      burned: false,
+    };
+    if (agentsPage !== pageId) {
+      for (const stale of [...agentRecords.keys()]) forgetAgent(stale, 'link_down');
+      agentsPage = pageId;
+    }
+    agentRecords.set(tokenId, record);
+    saveAgents();
+    return new Promise<AgentTokenResult>((resolve) => {
+      const timer = timers.setTimeout(() => {
+        if (!agentMinting.has(tokenId)) return;
+        log.warn(`no answer for agent token ${tokenId}`);
+        forgetAgent(tokenId, 'unavailable');
+        closeUnknownAgent(tokenId);
+      }, MINT_ANSWER_MS);
+      agentMinting.set(tokenId, { token, resolve, timer });
+      const sent = send({
+        t: 'agent_create',
+        tokenId,
+        label: record.label,
+        expiresAt: record.expiresAt,
+        secretHash,
+      });
+      if (!sent) forgetAgent(tokenId, 'link_down');
+    });
+  }
+
+  /**
+   * Closes one token (agent_cancel) and forgets its record at once, so this
+   * page honours it no more whatever the relay does; the relay ends what it
+   * let in. False when this page holds no such token.
+   */
+  function cancelAgent(tokenId: string): boolean {
+    if (closed || !agentRecords.has(tokenId)) return false;
+    // The cancel first: the relay ends a prompt of it still waiting as it
+    // closes the token, as cancelled, never as the operator's deny.
+    if (isLinked() && send({ t: 'agent_cancel', tokenId })) agentCancelSent.add(tokenId);
+    forgetAgent(tokenId, 'cancelled', 'closing');
+    log.info(`closed agent token ${tokenId}`);
+    return true;
+  }
+
+  // The session record (ADR 0045): what the widget saves, and what a host
+  // with ui: false reads. Checked at run time, since a page script can pass anything.
+
+  const recordSlots: readonly unknown[] = ['current', 'previous', 'ended'];
+
+  /** What a saved record says of its page, read only as one is saved. */
+  function recordContext(): RecordContext {
+    const split = address.indexOf('/', address.indexOf('//') + 2);
+    return {
+      adapterVersion: options.adapterVersion.slice(0, 50),
+      origin: split < 0 ? address : address.slice(0, split),
+      path: split < 0 ? '' : address.slice(split),
+      title: options.pageInfo().title,
+      relay: relayHost,
+      policy,
+    };
+  }
+
+  const sessionRecord: Dock['sessionRecord'] = (which = 'current') =>
+    recordSlots.includes(which) ? recorder.snapshot(which, recordContext(), clock()) : null;
+
+  const discardRecord: Dock['discardRecord'] = (which) => {
+    const dropped = recordSlots.includes(which) && recorder.discard(which, clock());
+    noteRecords();
+    return dropped;
+  };
 
   // Public surface
 
@@ -3322,6 +5513,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       writeToken(null);
       clearGrants();
     }
+    // Memory only (decision 13): the records go with the page's link, whichever way it closed.
+    recorder.dropAll();
     stopForGood(null);
   }
 
@@ -3360,6 +5553,18 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     close: () => {
       close('detach');
     },
+    publishState: (value: unknown) => publishState(value),
+    acceptProposal: (proposalId: string) => acceptProposal(proposalId),
+    dismissProposal: (proposalId: string) => dismissProposal(proposalId),
+    dismissAllProposals: () => dismissAllProposals(),
+    startSession: (sessionOptions: SessionOptions) => startSession(sessionOptions),
+    extendSession: (minutes: number) => extendSession(minutes),
+    endSession: () => endSession(),
+    renewSessionLink: () => renewSessionLink(),
+    agentToken: (agentOptions: AgentTokenOptions) => agentToken(agentOptions),
+    cancelAgent: (tokenId: string) => cancelAgent(tokenId),
+    sessionRecord: (which?: RecordWhich) => sessionRecord(which),
+    discardRecord: (which: RecordWhich) => discardRecord(which),
   });
 
   return Object.freeze({ dock, start, close });

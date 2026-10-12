@@ -12,11 +12,16 @@
   "bugs": "https://github.com/PaulMRamirez/tabdock/issues",
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./devtools": "./src/devtools.ts"
   },
   "files": [
     "dist",
     "NOTICE"
+  ],
+  "sideEffects": [
+    "./src/zod-config.ts",
+    "./dist/zod-config.js"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -31,6 +36,10 @@
       ".": {
         "types": "./dist/index.d.ts",
         "default": "./dist/index.js"
+      },
+      "./devtools": {
+        "types": "./dist/devtools.d.ts",
+        "default": "./dist/devtools.js"
       }
     },
     "types": "./dist/index.d.ts"

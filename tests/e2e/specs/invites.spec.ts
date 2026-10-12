@@ -22,6 +22,7 @@ import {
   clickInWidget,
   demoPageUrl,
   dockState,
+  typeInWidget,
   waitForDock,
   widgetButtonCentre,
   widgetButtonNow,
@@ -272,13 +273,6 @@ async function pauseClock(page: Page): Promise<void> {
       if (attempt === 5 || !String(error).includes('to the past')) throw error;
     }
   }
-}
-
-/** Types into a widget input as the operator would: a real click to focus it, then keys. */
-async function typeInWidget(page: Page, action: string, text: string): Promise<void> {
-  await clickInWidget(page, { action });
-  await page.keyboard.press('ControlOrMeta+A');
-  await page.keyboard.type(text);
 }
 
 /** Mints through the page's handle (the ?e2e hook), for tests about what happens after. */
@@ -1188,6 +1182,30 @@ test('the live list shows how long a link lasts, that someone is waiting, and th
   expect(text).toContain('"Help", Can control');
   expect(text).toMatch(/expires in (1 h 0|59) min/);
   expect(text).toContain('1 of 3 refusals');
+});
+
+// A6.28: every other name the widget shows is made one plain line whatever
+// the relay sent (S10); the members file checks a name's length only, so a
+// sponsor's may hold a bidirectional override or a line separator.
+test("the live list names an invite's sponsor in one plain line, whatever the relay sent", async ({
+  page,
+}) => {
+  const relay = await openWithInviteRelay(page, { query: 'invites=all' });
+  const minted = await mintByHandle(page, { label: 'Class', role: 'observer' });
+  const listing = relay.listings.get(minted.inviteId);
+  if (!listing) throw new Error('the relay does not list the invite');
+  relay.listings.set(minted.inviteId, {
+    ...listing,
+    pending: true,
+    sponsor: { userId: 'alice', displayName: 'Alice‮ecila Bob' },
+  });
+  relay.list();
+  await expect
+    .poll(async () => (await widgetItems(page, 'invite-list'))[0]?.text)
+    .toContain('someone is waiting');
+  const text = (await widgetItems(page, 'invite-list'))[0]?.text ?? '';
+  expect(text).toContain('shared by Aliceecila Bob, someone is waiting');
+  expect(text).not.toMatch(/[\p{Cf}\p{Zl}\p{Zp}]/u);
 });
 
 test('Revoke all shows while invites are live though nobody is attached, and closes them', async ({
