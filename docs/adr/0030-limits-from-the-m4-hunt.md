@@ -79,3 +79,7 @@ The surcharge stays at 128 bytes. The charge exists so that what waiting request
 ## Notes from M6 (10 October 2026)
 
 ADR 0039 adds image answers, which carry no byte charge as text answers carry none. Its decoded cap, 524,288 bytes at most, with 2,000 characters of text beside it, is sized so that an image answer is no larger on the wire than a text answer of 120,000 worst-case characters on either leg, which A6.5 tests; this record's count of answers waiting per user therefore keeps its sizing. ADR 0044 adds the relay-wide ceiling this record's notes weighed, `TABDOCK_MAX_RESPONSE_BYTES` (96 MiB by default, at least 4 MiB): past it, strangers' oldest unread answers are cut first, then guests', and never a member's.
+
+## Notes from M6's build (11 October 2026)
+
+The adapter's image gate (ADR 0039, decision 18) comes after the operator's prompt, so a call waits there only once allowed; to the relay it is a call still waiting on its page, its request charged as this record says until it answers. ADR 0044's ceiling, as built, counts an unread answer by what `inSlices` holds of it, each chunk whole until its last slice goes, so the largest answer counts about 786 KB rather than this record's 0.72 MB (ADR 0044's notes). This record's per-user counts and their sizing are unchanged.

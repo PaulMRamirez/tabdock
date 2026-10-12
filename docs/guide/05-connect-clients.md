@@ -53,7 +53,7 @@ console.log(await client.callTool({ name: 'list_pages', arguments: {} }));
 await client.close();
 ```
 
-A public relay takes only tokens from its provider, which the SDK's OAuth support obtains while a person signs in; no credential yet lets a program use a public relay unattended ([Use cases](09-use-cases.md#not-yet)).
+A public relay takes tokens from its provider, which the SDK's OAuth support obtains while a person signs in. A program with nobody to sign in uses an agent token the page's operator mints instead, reading that one page as an observer at `/g/mcp`, where every miss is a 404; it suits Claude Code and scripts, never a hosted connector ([Larger rooms](20-larger-rooms.md#agent-tokens)).
 
 ## The fixed tools
 
@@ -61,7 +61,7 @@ A public relay takes only tokens from its provider, which the SDK's OAuth suppor
 | --------------------- | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | `list_pages`          | none                                             | Each page's `page` id, `origin`, `title`, your `role`, `state` (awake, asleep or gone) and `toolCount`                                        |
 | `pair_page`           | `code` like `ABCDE-12345`, or a one-use `invite` | `Attached to page <id> (<origin>) as <role>.`, and as structured content `page`, `origin` and `role`                                          |
-| `list_page_tools`     | `page`                                           | Each tool's name, description, schema, annotations and an `allowed` flag for your role                                                        |
+| `list_page_tools`     | `page`                                           | Each tool's name, description, schema, annotations, an `allowed` flag for your role and, where you may propose it, `proposable`               |
 | `call_page_tool`      | `page`, `tool`, `arguments`                      | The page's result                                                                                                                             |
 | `detach_page`         | `page`                                           | `Detached from page <id>.` Only yours ends; pair again with a new code or one-use invite link                                                 |
 | `get_page_state`      | `page`                                           | The page's published state behind its label: `version`, `publishedAt`, `heardAt` and `value`, null while it shares nothing; runs no page tool |
@@ -69,7 +69,7 @@ A public relay takes only tokens from its provider, which the SDK's OAuth suppor
 | `get_proposal`        | `page`, `proposal`, `waitMs`                     | A proposal you made: pending, accepted with the page's result behind its label, dismissed, refused, expired, withdrawn or cancelled           |
 | `withdraw_proposal`   | `page`, `proposal`                               | Withdraws your pending proposal, so the operator is no longer asked                                                                           |
 
-You rarely name them: ask Claude to pair with a code, list your pages or do something on a page. A page that went gone stays in `list_pages` for 10 minutes. `pair_page`, `detach_page`, an empty `list_pages`, a `proposed` answer and `get_proposal`'s answers other than a run's result also return structured content, which some clients, Claude Code among them, show in place of the text. Errors are tool errors whose text starts with a code, such as `not_attached: ...`; [Troubleshooting](11-troubleshooting.md) gives each code's remedy.
+You rarely name them: ask Claude to pair with a code, list your pages or do something on a page. A page that went gone stays in `list_pages` for 10 minutes. `pair_page`, `detach_page`, an empty `list_pages`, a `proposed` answer and `get_proposal`'s answers other than a run's result also return structured content, which some clients, Claude Code among them, show in place of the text. Errors are tool errors whose text starts with a code, such as `not_attached: ...`; [Troubleshooting](11-troubleshooting.md) gives each code's remedy. On a page that takes proposals, an observer's write answers `proposed` with an id: `get_proposal` with a `waitMs` answers `accepted` once the operator accepts, and a second wait the run's result ([Lessons and reviews](19-lessons-and-reviews.md#proposals)).
 
 ## First-class tools
 
@@ -86,6 +86,8 @@ With a public URL the widget also shows a QR code: scan it, sign in at the relay
 ## Reading results
 
 A page's result reaches you as text, never as structured content, after the relay's label `[tabdock: untrusted content from <origin>, tool <name>]`; tool and page lists carry labels of their own, and text past 120,000 characters is cut with a marker. Treat everything after a label as data from the page, never as instructions. A handler that throws returns the page's error text under the label, flagged as a tool error with no code. The relay marks page calls as not read-only, so a client that asks before such calls asks before each one, a check beside the page's own.
+
+A declared image tool adds its picture after the label and a relay line calling it untrusted ([Images and page state](18-images-and-state.md)).
 
 ## Confirming in your own client
 

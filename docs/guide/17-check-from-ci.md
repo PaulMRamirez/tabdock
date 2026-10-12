@@ -119,4 +119,4 @@ The check covers Linux and macOS runners. Windows waits on the owner's run of lo
 | `WIDGET_ACTIONS`    | Every button action the widget has                                                              |
 | `WIDGET_ROLES`      | Every node role the widget has                                                                  |
 
-Back to [the guide's index](README.md).
+Next: [Images and page state](18-images-and-state.md).

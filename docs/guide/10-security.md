@@ -43,7 +43,17 @@ The page's origin comes only from the browser's `Origin` header. The relay never
 
 **Look after your page.** Allow only the relay in `connect-src`, keep the handle `attach()` returns inside your own code, and refuse framing by other sites. Load the adapter before scripts you trust less: it takes the WebSocket, crypto and DOM built-ins it relies on when it loads and when `attach()` runs, so a script that runs later cannot sit inside the page link or predict a secret. Such a script can still read some frames and invite secrets through the page's other built-ins, and do anything your page can do, so Tabdock assumes the page is trusted (the threat model's row B5; [below](#csp-trusted-types-and-frames)).
 
-**Operate the relay with care.** In hosted mode name the client address in one header, `TABDOCK_CLIENT_ADDRESS_HEADER`, believed only from `TABDOCK_TRUSTED_PROXY_CIDR`. Keep the audit log, which chains every line to the one before, and check it with `pnpm audit:log --verify`. A restart forgets every page, attachment, code and invite, so everyone pairs again, unless `TABDOCK_RESTART_SNAPSHOT` carries pages, attachments and invites across a graceful stop, for at most 10 minutes and bound to the audit log; only the audit log, that snapshot and local mode's token survive. [Run a relay](07-run-a-relay.md) and [Relay settings](08-relay-settings.md) cover the rest.
+**Operate the relay with care.** In hosted mode name the client address in one header, `TABDOCK_CLIENT_ADDRESS_HEADER`, believed only from `TABDOCK_TRUSTED_PROXY_CIDR`. Keep the audit log, which chains every line to the one before, and check it with `pnpm audit:log --verify`. A restart forgets every page, attachment, code and invite unless `TABDOCK_RESTART_SNAPSHOT` carries them across a graceful stop of under 10 minutes, bound to the audit log; only the audit log, that snapshot and local mode's token survive. [Run a relay](07-run-a-relay.md) and [Relay settings](08-relay-settings.md) cover the rest.
+
+## Images, state, rooms and records
+
+Images and page state are page content. A picture reaches a client only after the label and a relay line calling it untrusted, as one PNG, JPEG or WebP whose type, first bytes, size and dimensions the relay checks again; state comes behind a label of its own, and every attached role, invited people included, may read it. Never draw or publish a secret. The page's image gate comes after any consequential prompt.
+
+An observer's proposal runs only when the operator accepts it on the page, and the adapter runs it only against its own record of that Accept, so a relay alone cannot make a proposal a write. A time-boxed session only narrows the page's policy, in both layers, and its end closes what invites and agent tokens let in. An agent token is a bearer credential: kept only as digests, carried once by the relay to its own page in the first request's prompt, never approved in advance, observer only, for one page, and burned by a deny or three timeouts.
+
+Whoever can write the members file can make anyone a member, so on macOS and Linux the relay refuses one that group or others may write, or an account other than its own or root owns, anywhere on its path, symbolic links' directories included; on Windows keep it where only the relay's account can write. A saved session record names people, invitees by email: keep it as you keep the audit log.
+
+DevTools access to the operator's browser is the operator's seat: launch a CI check's browser over a pipe, never with `--remote-debugging-port` on a shared machine, and never cache or upload the runner's `TABDOCK_HOME`. The threat model's rows B11 to B14 cover these.
 
 ## CSP, Trusted Types and frames
 

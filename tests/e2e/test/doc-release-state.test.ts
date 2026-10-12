@@ -22,9 +22,13 @@ const INSTALL =
 const WAITS = /\b(?:once|after)\b/i;
 const NOT_YET = /\bnot yet (?:on npm|published)\b/i;
 
-/** The newest release heading in CHANGELOG.md. */
+/**
+ * The newest release heading in CHANGELOG.md. An Unreleased section above
+ * it gathers work no release carries yet (docs/release.md), so it is read
+ * past: what is on npm is what the newest release heading says.
+ */
 function newestHeading(changelog: string): string {
-  return /^## (.+)$/m.exec(changelog)?.[1] ?? '';
+  return /^## (?!Unreleased\b)(.+)$/m.exec(changelog)?.[1] ?? '';
 }
 
 /** Whether a heading says its release has not reached npm. */
@@ -107,5 +111,22 @@ describe('install claims and the release state', () => {
       ),
     ).not.toEqual([]);
     expect(staleWaits('x.md', 'Tabdock 0.1.0 is not yet on npm.')).not.toEqual([]);
+  });
+
+  it('reads the newest release past an Unreleased section, never the section itself', () => {
+    const unreleasedAbove = [
+      '# Changelog',
+      '## Unreleased (M6)',
+      'Work in progress.',
+      '## 0.1.0 (prepared 5 October 2026, not yet published)',
+      '## 0.0.9, 1 October 2026',
+    ].join('\n\n');
+    expect(newestHeading(unreleasedAbove)).toBe(
+      '0.1.0 (prepared 5 October 2026, not yet published)',
+    );
+    expect(unpublished(newestHeading(unreleasedAbove))).toBe(true);
+    expect(newestHeading('# Changelog\n\n## 0.2.0, 1 November 2026\n\n## 0.1.0, 9 October')).toBe(
+      '0.2.0, 1 November 2026',
+    );
   });
 });

@@ -47,7 +47,8 @@ kill_timeout = 5
     path = "/healthz"
 
 [mounts]
-  # Created by hand before the first deploy (docs/deploy.md); only the audit log lives here.
+  # Created by hand before the first deploy (docs/deploy.md). The audit log lives here, and
+  # once chosen the members file and the restart snapshot (ADRs 0043 and 0046).
   source = "tabdock_audit"
   destination = "/data"
 

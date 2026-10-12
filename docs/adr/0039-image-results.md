@@ -85,3 +85,11 @@ Conflicts between the M6 records, settled by the plan, that touch this one:
 **From ADR 0047.** The MCP-B 6 leg runs on exact 6.0.0, so the envelope is tested on the release, and the fake runtime profile is `mcpb-6`.
 
 **Open questions.** Settled under Decisions: hosted Claude's handling stays on the owner's checklist while the 64 KiB default ships (1, 2), and neither side downscales or re-encodes (3).
+
+## Notes from M6's build (11 October 2026)
+
+**The MCP-B 6 leg.** The Decision's "with the beta held in `tests/mcpb6`" now reads "with exact 6.0.0 held there" (ADR 0047): the `mcpb6` project runs the envelope on the release in `mcpb6-images.spec.ts`, and the demo stays on exact 5.1.0.
+
+**The gate after the prompt.** The gate (decision 18) sits after the consequential deny check and the operator's prompt, so a call waits its turn only once allowed, and an accepted proposal of an image tool waits at the gate without a second prompt (ADR 0042). A confirmation given in the caller's client is read again after the wait, a call that ends while waiting frees its place, and every other tool's path is unchanged.
+
+**Claude Code, measured.** `check:claude-code:images` with Claude Code 2.1.296 and no model call handed the model the label's text block, the image and a line naming the file it kept: PNGs of 64, 128 and 256 KiB went through unchanged, and one of 512 KiB came out re-encoded as a JPEG of about 7,500 characters (`docs/notes/verified.md`). The 65,536 byte default stands. Whether the model reads the picture, and what hosted Claude does with one, wait on the owner's runs (decision 1); the default may only fall, in 8 KiB steps, if the live run fails.

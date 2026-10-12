@@ -8,11 +8,11 @@ A refusal reaches the client as a tool error whose text is `<code>: <reason>`, t
 
 ### `not_attached`
 
-You hold no attachment to that page: you never paired, the operator revoked you, it went unused for 8 hours, an invite-made attachment reached its end, or the page id is wrong or stale, as in a first-class name from before a new tab, a gone page or a relay restart. A stranger and an unknown page get the same answer (S13). **What to do:** run `list_pages`, and list tools again rather than reuse a first-class name. Pair again with the code the page shows now or, if your account joins by invite, ask the operator for a new invite link.
+You hold no attachment to that page: you never paired, the operator revoked you, it went unused for 8 hours, an invite-made attachment or its session reached its end, the relay's member list dropped you, or the page id is wrong or stale, as in a first-class name from before a new tab, a gone page or a relay restart. A stranger and an unknown page get the same answer (S13). **What to do:** run `list_pages`, and list tools again rather than reuse a first-class name. Pair again with the code the page shows now or, if your account joins by invite, ask the operator for a new invite link.
 
 ### `role_denied`
 
-You are an observer and the tool is not marked `readOnlyHint: true`, by the relay's check or the page's own. The page also answers it for a caller its operator never approved. **What to do:** ask the operator to make you a driver in the widget. A page author whose read tool is refused marks it `readOnlyHint: true`.
+You are an observer and the tool is not marked `readOnlyHint: true`, by the relay's check or the page's own. The page also answers it for a caller its operator never approved. **What to do:** ask the operator to make you a driver in the widget; on a page that takes proposals from you, the write is proposed instead ([Lessons and reviews](19-lessons-and-reviews.md#proposals)). A page author whose read tool is refused marks it `readOnlyHint: true`.
 
 ### `tool_not_found`
 
@@ -20,7 +20,7 @@ The page lists no tool by that name now, or you used a first-class name on an at
 
 ### `page_asleep`
 
-The tab disconnected (reload, close, freeze, network) or is reconnecting and has not listed its tools yet, a pairing waiting on it ended, or the relay is shutting down. Attachments are kept for 10 minutes. **What to do:** retry in a moment. The operator brings the tab back within 10 minutes; a pairing that was waiting starts again with the code the page shows when it is back.
+The tab disconnected (reload, close, freeze, network) or is reconnecting and has not listed its tools yet, a pairing or a wait on it ended, or the relay is shutting down. Attachments are kept for 10 minutes. **What to do:** retry in a moment. The operator brings the tab back within 10 minutes; a pairing that was waiting starts again with the code the page shows when it is back.
 
 ### `page_gone`
 
@@ -36,7 +36,7 @@ The page did not answer within 45 seconds, the call waited 45 seconds behind oth
 
 ### `page_busy`
 
-The operator paused the page, 32 writes already wait at the relay or on the page, the page holds its 10 users already, the seats invites may use are full, another redemption of the same invite is waiting, or the relay holds all the waiting requests it allows. **What to do:** retry shortly. The operator can resume, or revoke someone to make room.
+The operator paused the page, 32 writes already wait at the relay or on the page, the page holds its 10 users already, the seats invites may use are full, another redemption of the same invite is waiting, the relay holds all the waiting requests it allows, the page's link has no room for a proposal, 8 image calls already wait on the page, or 4 of its watchers' calls are running. **What to do:** retry shortly. The operator can resume, or revoke someone to make room.
 
 ### `pairing_expired`
 
@@ -45,6 +45,8 @@ The code is wrong, used or older than 120 seconds (the page shows a new one afte
 ### `rate_limited`
 
 Past a budget: requests to the relay (240 a minute for a member, 60 for an invitee), 120 calls a minute to one page, 10 pairing attempts a minute per account or 30 per page, 30 redemptions of one invite a minute, four confirmations already waiting in your clients, or the memory your waiting requests may hold. **What to do:** wait a minute and retry. A relay's operator can raise some of these ([Relay settings](08-relay-settings.md)).
+
+From M6 it also answers a third wait at once, a fourth pending proposal of yours on a page or a twenty-first on it, a place a withdrawn proposal still holds for its minute, and your share of the relay's proposals; and for a watcher by invite, the page's share: 60 calls a minute for all its watchers, 15 for one and 2 running. A watcher's refusal points to `get_page_state`, which never touches the page.
 
 ### `invalid_arguments`
 
@@ -79,5 +81,6 @@ A page code: the page ended a call it had started, or a client's cancellation re
 | HTTP 401 with `WWW-Authenticate`                                               | No token or a wrong one. Sign in again; for local mode, see [Setup problems](12-setup-and-limits.md#setup-problems).                                                                                                                         |
 | HTTP 404, `Session not found`                                                  | A 2025-era session idle for 30 minutes, or another user's. The client opens a new one.                                                                                                                                                       |
 | HTTP 413                                                                       | One request would hold more of the relay's memory than one user's requests may. Send less.                                                                                                                                                   |
+| HTTP 404 on `/g/mcp`                                                           | The agent token is unknown, cancelled, burned, revoked or past its end; Claude Code says no MCP endpoint was found. Ask the operator for a new one.                                                                                          |
 
 Next: [Setup problems and limits](12-setup-and-limits.md).
