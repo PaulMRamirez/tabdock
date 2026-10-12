@@ -78,20 +78,3 @@ export type DevToolsBoxModel = z.infer<typeof DevToolsBoxModelSchema>;
 /** DOM.getNodeForLocation: the node a hit test found. */
 export const DevToolsNodeAtSchema = z.object({ backendNodeId: NodeIdSchema });
 export type DevToolsNodeAt = z.infer<typeof DevToolsNodeAtSchema>;
-
-/**
- * DOM.resolveNode. The helper no longer resolves nodes: a function run on one
- * runs in the page's own world, so a prototype a later script patched is
- * handed the node, and through it the closed shadow root.
- */
-export const DevToolsRemoteObjectSchema = z.object({
-  object: z.object({ objectId: z.optional(z.string().check(z.maxLength(256))) }),
-});
-export type DevToolsRemoteObject = z.infer<typeof DevToolsRemoteObjectSchema>;
-
-/** Runtime.callFunctionOn with returnByValue; the helper no longer calls it, as above. */
-export const DevToolsCallResultSchema = z.object({
-  result: z.object({ value: z.optional(z.unknown()) }),
-  exceptionDetails: z.optional(z.object({ text: z.string() })),
-});
-export type DevToolsCallResult = z.infer<typeof DevToolsCallResultSchema>;

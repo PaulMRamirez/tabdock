@@ -8,12 +8,10 @@ import manifest from '../package.json' with { type: 'json' };
 import * as exported from './index.ts';
 import {
   DevToolsBoxModelSchema,
-  DevToolsCallResultSchema,
   DevToolsDocumentSchema,
   type DevToolsNode,
   DevToolsNodeAtSchema,
   DevToolsNodeSchema,
-  DevToolsRemoteObjectSchema,
 } from './devtools.ts';
 
 /** DOM.getDocument with depth -1 and pierce true, cut down from Chromium 155 on the demo board. */
@@ -133,31 +131,6 @@ describe('the DevTools reply schemas', () => {
     expect(DevToolsNodeAtSchema.parse({ backendNodeId: 14, frameId: 'F1', nodeId: 0 })).toEqual({
       backendNodeId: 14,
     });
-    const remote = {
-      object: {
-        type: 'object',
-        subtype: 'node',
-        className: 'HTMLButtonElement',
-        objectId: '-123.4.5',
-      },
-    };
-    expect(DevToolsRemoteObjectSchema.parse(remote)).toEqual({ object: { objectId: '-123.4.5' } });
-    expect(DevToolsRemoteObjectSchema.parse({ object: { type: 'undefined' } })).toEqual({
-      object: {},
-    });
-    expect(
-      DevToolsCallResultSchema.parse({ result: { type: 'string', value: 'ABCD-1234' } }),
-    ).toEqual({
-      result: { value: 'ABCD-1234' },
-    });
-    const thrown = {
-      result: { type: 'object' },
-      exceptionDetails: { exceptionId: 1, text: 'Uncaught', lineNumber: 0 },
-    };
-    expect(DevToolsCallResultSchema.parse(thrown)).toEqual({
-      result: {},
-      exceptionDetails: { text: 'Uncaught' },
-    });
   });
 
   it('refuse what the helper must never act on', () => {
@@ -192,15 +165,6 @@ describe('the DevTools reply schemas', () => {
     expect(quad([1, 2, 3, 4, 5, 6, 7, Number.NaN])).toBe(false);
     expect(quad([1, 2, 3, 4, 5, 6, 7, '8'])).toBe(false);
     expect(DevToolsNodeAtSchema.safeParse({}).success).toBe(false);
-    expect(
-      DevToolsRemoteObjectSchema.safeParse({ object: { objectId: 'x'.repeat(257) } }).success,
-    ).toBe(false);
-    expect(DevToolsCallResultSchema.safeParse({ exceptionDetails: { text: 'x' } }).success).toBe(
-      false,
-    );
-    expect(DevToolsCallResultSchema.safeParse({ result: {}, exceptionDetails: {} }).success).toBe(
-      false,
-    );
   });
 });
 
@@ -212,6 +176,19 @@ describe('the devtools subpath', () => {
       default: './dist/devtools.js',
     });
     expect(Object.keys(exported).filter((name) => name.startsWith('DevTools'))).toEqual([]);
+  });
+
+  // The helper reads DOM.getDocument, DOM.getBoxModel and DOM.getNodeForLocation
+  // replies and nothing else (it never runs a function on a node), so the
+  // subpath ships those schemas alone (checklist M6, decision 3).
+  it('ships only the replies the helper reads', async () => {
+    const devtools = await import('./devtools.ts');
+    expect(Object.keys(devtools).sort()).toEqual([
+      'DevToolsBoxModelSchema',
+      'DevToolsDocumentSchema',
+      'DevToolsNodeAtSchema',
+      'DevToolsNodeSchema',
+    ]);
   });
 
   it('resolves by its package name', async () => {

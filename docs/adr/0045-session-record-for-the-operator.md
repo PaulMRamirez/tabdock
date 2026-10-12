@@ -98,3 +98,7 @@ Conflicts between the M6 records, settled by the plan, that touch this one:
 ## Notes from the docs pass (12 October 2026)
 
 **What was owed is paid.** The notes of the wiring's review and of Wave 3's merge each say their rules are "owed to SPEC section 8 and guide page 13". Both now say them: SPEC section 8 has the record reach a session only once the relay lists it, seal only a record that holds something, re-arm the save box when its slot's record is replaced, count people by an email address and record an end given while the link is down as on a live link, and guide page 13's "Session records" section says the same.
+
+## Note from the pull request (12 October 2026)
+
+The owner's checklist asked whether decision 23's 13,000 bytes should stand or a decided part of the record give way. Under the owner's standing instruction the recommendation is taken: the budget stays at 13,000, with the modules at 12,743 bytes when M6 merged.
