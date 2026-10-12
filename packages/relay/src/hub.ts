@@ -823,9 +823,12 @@ interface AddressSessions {
 }
 
 /**
- * Where page sessions a restart snapshot put back are counted (ADR 0046): a
- * snapshot names no client address, and no address a socket arrives from is
- * written this way, so no page from a real address is ever charged for them.
+ * Where page sessions a restart snapshot put back are counted until each
+ * first resumes (ADR 0046): a snapshot names no client address, and no
+ * address a socket arrives from is written this way, so no page from a real
+ * address is charged for one it never resumed. A resume moves the page to
+ * its socket's address under that address's own limit (#hello), so a
+ * restart never hands an address a second allowance of page sessions.
  */
 const RESTORED_ADDRESS = '(restored from a snapshot)';
 
@@ -1400,7 +1403,8 @@ export class PageHub {
   /**
    * The address that created each awake or asleep page; its size is the page
    * sessions held (pageSessions). A page stays counted there until it is gone,
-   * even if it resumes from elsewhere.
+   * even if it resumes from elsewhere; only a page a restart snapshot put back
+   * moves, once, from RESTORED_ADDRESS to the address it first resumes from.
    */
   readonly #pageAddress = new Map<string, string>();
   /** Page sessions per creating address, for pageSessionsPerAddress. */
@@ -1726,24 +1730,10 @@ export class PageHub {
    * Returns why there is no room when nothing asleep can make way.
    */
   #makeRoom(address: string): string | null {
-    const { pageSessionsPerAddress, pageSessions } = this.#config.limits;
+    const { pageSessions } = this.#config.limits;
+    const refused = this.#roomAtAddress(address);
+    if (refused !== null) return refused;
     const own = this.#sessionsByAddress.get(address);
-    if ((own?.pages.size ?? 0) >= pageSessionsPerAddress) {
-      const oldest = firstOf(own?.asleep);
-      if (oldest === undefined) {
-        this.connectionLine(address, 'warn', 'page session refused: too many from one address', {
-          address,
-        });
-        return 'too many pages from this address; try again later';
-      }
-      this.connectionLine(
-        address,
-        'info',
-        "ended this address's page asleep longest to make room for its new one",
-        { pageId: oldest },
-      );
-      this.#gone(oldest);
-    }
     if (this.#pageAddress.size >= pageSessions) {
       const oldest = firstOf(own?.asleep) ?? firstOf(this.#asleep);
       if (oldest === undefined) {
@@ -1764,6 +1754,50 @@ export class PageHub {
       this.#gone(oldest);
     }
     return null;
+  }
+
+  /**
+   * Room for one more page session charged to this address, under
+   * pageSessionsPerAddress: past it the address's own page asleep longest
+   * ends, and with none asleep there is no room. Asked for a new page
+   * session (#makeRoom) and for a restored one's first resume (#hello).
+   */
+  #roomAtAddress(address: string): string | null {
+    const own = this.#sessionsByAddress.get(address);
+    if ((own?.pages.size ?? 0) < this.#config.limits.pageSessionsPerAddress) return null;
+    const oldest = firstOf(own?.asleep);
+    if (oldest === undefined) {
+      this.connectionLine(address, 'warn', 'page session refused: too many from one address', {
+        address,
+      });
+      return 'too many pages from this address; try again later';
+    }
+    this.connectionLine(
+      address,
+      'info',
+      "ended this address's page asleep longest to make room for its new one",
+      { pageId: oldest },
+    );
+    this.#gone(oldest);
+    return null;
+  }
+
+  /** Counts a page session against `address`, moving it from wherever it was counted. */
+  #chargeTo(pageId: string, address: string): void {
+    const from = this.#pageAddress.get(pageId);
+    if (from !== undefined) {
+      const was = this.#sessionsByAddress.get(from);
+      was?.pages.delete(pageId);
+      was?.asleep.delete(pageId);
+      if (was?.pages.size === 0) this.#sessionsByAddress.delete(from);
+    }
+    this.#pageAddress.set(pageId, address);
+    let sessions = this.#sessionsByAddress.get(address);
+    if (!sessions) {
+      sessions = { pages: new Set(), asleep: new Set() };
+      this.#sessionsByAddress.set(address, sessions);
+    }
+    sessions.pages.add(pageId);
   }
 
   /** Takes a socket that already passed the origin and subprotocol checks. */
@@ -3319,6 +3353,18 @@ export class PageHub {
 
     const resumed = page !== undefined;
     if (page) {
+      // A page a restart snapshot put back is charged, at its first resume,
+      // to the address it resumes from, under that address's own limit as a
+      // new page session would be (S9); with no room it stays asleep and
+      // resumable, as a refused new session may try again later.
+      if (this.#pageAddress.get(page.pageId) === RESTORED_ADDRESS) {
+        const noRoom = this.#roomAtAddress(conn.address);
+        if (noRoom !== null) {
+          this.#closeSocket(conn, CLOSE_TRY_AGAIN_LATER, noRoom);
+          return;
+        }
+        this.#chargeTo(page.pageId, conn.address);
+      }
       const previous = this.#live.get(page.pageId);
       if (previous && previous !== conn) {
         this.#live.delete(page.pageId);
@@ -3372,13 +3418,7 @@ export class PageHub {
       }
       let pageId = newId('pg');
       while (this.#store.pages.get(pageId)) pageId = newId('pg');
-      this.#pageAddress.set(pageId, conn.address);
-      let sessions = this.#sessionsByAddress.get(conn.address);
-      if (!sessions) {
-        sessions = { pages: new Set(), asleep: new Set() };
-        this.#sessionsByAddress.set(conn.address, sessions);
-      }
-      sessions.pages.add(pageId);
+      this.#chargeTo(pageId, conn.address);
       page = {
         pageId,
         origin: conn.origin,
@@ -8069,7 +8109,8 @@ export class PageHub {
    * Puts a restart snapshot back into a hub that holds nothing yet, before
    * the relay listens (ADR 0046). Every page returns asleep with a fresh
    * resume window, so its tab resumes as after a dropped link, counted under
-   * one stand-in address, since a snapshot names no client's; its policy is
+   * one stand-in address until it first resumes, since a snapshot names no
+   * client's; its policy is
    * worked out again from its ceiling and session. Then, as a member list
    * change would, an account the list in force no longer gives to the same
    * person loses what it held, and what it sponsored goes with it, each with

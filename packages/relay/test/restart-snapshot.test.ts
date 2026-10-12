@@ -98,9 +98,10 @@ import {
 } from './helpers/invites.ts';
 import {
   connectPage,
+  openSocket,
   PAGE_ORIGIN,
   type PageOptions,
-  type TestPage,
+  TestPage,
   TOOLS,
 } from './helpers/page-client.ts';
 import { PAIR_CLIENT, startProvider, type TestProvider } from './helpers/provider.ts';
@@ -297,6 +298,14 @@ const getView = (page: string) => ({ page, tool: 'get_view', arguments: {} });
 /** The page reloading against the restarted relay with the token it last had. */
 async function resumeOn(run: Run, page: TestPage, policy: PolicyInput = POLICY): Promise<TestPage> {
   return run.page({ resumeToken: page.welcome?.resumeToken ?? '', policy });
+}
+
+/** A page's state as list_pages gives it to `who`. */
+async function pageState(who: Client, pageId: string): Promise<string | undefined> {
+  const listed = (await call(who, 'list_pages')).structured as {
+    pages: { page: string; state: string }[];
+  };
+  return listed.pages.find((entry) => entry.page === pageId)?.state;
 }
 
 function rosterIds(page: TestPage): string[] {
@@ -828,6 +837,68 @@ describe('a graceful restart with TABDOCK_RESTART_SNAPSHOT on (A6.18)', () => {
       await run.close();
       expect(existsSync(fileOf(dir))).toBe(true);
     }
+  });
+
+  it("charges a restored page to the address it resumes from, under that address's own limit (S9)", async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    // Sockets are not what binds here: two page sessions an address, six sockets.
+    const limits = { pageSessionsPerAddress: 2, pageSocketsPerAddress: 6 };
+    const first = await startRun(dir, idp, { limits });
+    const one = await first.page();
+    const two = await first.page();
+    await first.close();
+
+    /** A hello from this address, which the relay must refuse before any welcome. */
+    const refusedHello = async (run: Run, resumeToken?: string): Promise<unknown> => {
+      const ws = await openSocket(run.relay.pageUrl);
+      const refused = new TestPage(ws);
+      refused.send({
+        t: 'hello',
+        v: 1,
+        title: 'Board',
+        url: `${PAGE_ORIGIN}/`,
+        adapterVersion: 'test',
+        policy: POLICY,
+        ...(resumeToken === undefined ? {} : { resumeToken }),
+      });
+      // A welcome instead is the failure, said at once rather than by a timeout.
+      const outcome = await Promise.race([
+        refused.closed,
+        refused.next('welcome').then(() => 'welcomed'),
+      ]);
+      ws.terminate();
+      expect(refused.all('welcome')).toEqual([]);
+      return outcome;
+    };
+    const TOO_MANY = { code: 1013, reason: 'too many pages from this address; try again later' };
+
+    // Both restored pages resume, and count against this address as they did
+    // before the restart, so a third new page finds no room.
+    const second = await startRun(dir, idp, { limits });
+    const oneBack = await resumeOn(second, one);
+    expect(oneBack.welcome?.resumed).toBe(true);
+    expect((await resumeOn(second, two)).welcome?.resumed).toBe(true);
+    expect(await refusedHello(second)).toEqual(TOO_MANY);
+    await second.close();
+
+    // An address already at its limit with every page awake has no room for
+    // a restored page either; the page stays asleep and resumable, and once
+    // one of the address's own pages sleeps, that one ends to make way.
+    const third = await startRun(dir, idp, { limits });
+    const fresh = await third.page();
+    await third.page();
+    expect(await refusedHello(third, oneBack.welcome?.resumeToken ?? '')).toEqual(TOO_MANY);
+    const alice = await third.claude('sub-alice');
+    await attachMember(alice, fresh);
+    await fresh.close();
+    await vi.waitFor(async () => {
+      expect(await pageState(alice, fresh.pageId)).toBe('asleep');
+    });
+    const resumed = await resumeOn(third, oneBack);
+    expect(resumed.welcome?.resumed).toBe(true);
+    expect(resumed.pageId).toBe(one.pageId);
+    expect(await pageState(alice, fresh.pageId)).toBe('gone');
   });
 
   it('refuses a snapshot this relay could not have taken, with invites now off', async () => {
