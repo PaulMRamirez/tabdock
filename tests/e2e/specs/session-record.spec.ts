@@ -48,7 +48,7 @@ import {
 
 // The session record in a real browser (ADR 0045, A6.25). The operator
 // saves it from the widget, as JSON and as a Markdown summary, only with a
-// trusted click on a box that held still and said whom the file names; a
+// trusted click on a box that held still and said how many people the file names; a
 // script's click saves nothing. The saved file passes `pnpm audit:log
 // --match` against the relay's own audit directory, and fails it once a
 // call is taken out. At a phone's width the box fits; a session's end offers
@@ -146,7 +146,7 @@ test.describe('with a relay that keeps an audit directory', () => {
     await waitForDock(page, (state) => state.records[0]?.calls === 3);
     expect(await widgetText(page, 'record-summary')).toMatch(/^3 calls, 2 people since /);
 
-    // The box warns whom the file names, and Save takes no click until it holds still.
+    // The box warns how many people the file names, and Save takes no click until it holds still.
     const downloads = countDownloads(page);
     await clickInWidget(page, { action: 'record-open' });
     expect((await widgetButtonNow(page, { action: 'record-save-json' }))?.armed).toBe(false);

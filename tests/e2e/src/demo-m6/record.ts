@@ -1,5 +1,5 @@
 // Leg 9 of pnpm demo:m6 (ADR 0045): the teacher saves the page's record from
-// the widget's record box, after the warning that names everyone in it, with
+// the widget's record box, after the warning saying how many people it names, with
 // a trusted click once Save has held still; then `pnpm audit:log --match
 // <file> --verify` holds the record to the relay's hash-chained log, the
 // restart in between. Carol's accepted proposal is in both under one callId,

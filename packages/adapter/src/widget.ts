@@ -48,7 +48,7 @@
 // script can run the page's tools itself; docs/threat-model.md (B5) records
 // it.
 // From M6 the panel also saves the session record (ADR 0045). It leaves the
-// page only on a trusted click in an armed box that says whom it names, as a
+// page only on a trusted click in an armed box that says how many people it names, as a
 // file through the Blob, object URL and click dom.ts took at mount, never
 // unasked; the page itself, and scripts before attach(), stay trusted.
 // Buttons carry stable data-action attributes, and blocks data-role ones, for
@@ -2553,7 +2553,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   // The session record (ADR 0045): what the current record holds, Save
   // record to open the box that saves one, and the offer of a session's
   // record at its end. Each Save sits in an armed box beside a warning that
-  // says whom the file names, and the offer and the box are never on show
+  // says how many people the file names, and the offer and the box are never on show
   // together, so each Save is the only one of its name.
   const recordSummary = element('p', 'muted');
   role(recordSummary, 'record-summary');
@@ -2581,7 +2581,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   const recordCounts = (view: RecordView): string =>
     `${counted(view.calls, 'call', 'calls')}, ${counted(view.people, 'person', 'people')}`;
 
-  /** Whom a record names, said before any Save: everyone in it, and how many by an email address (ADR 0017). */
+  /** Whom a record names, said before any Save as counts: how many people, and how many by an email address (ADR 0017). */
   function warning(view: RecordView): string {
     return `This record names ${counted(view.people, 'person', 'people')}${view.emails > 0 ? `, ${String(view.emails)} of them by email address,` : ''} and every call they made on this page, never its arguments or result. Anyone you share the file with can read it.`;
   }
