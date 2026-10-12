@@ -50,7 +50,7 @@ The agent list's Cancel, Revoke on its row, Revoke all, a session's end, the spo
 
 ## Sizing a class relay
 
-`pnpm measure:room` ran the relay as its image does, in 512 MiB and one CPU. With the whole CPU, a shared-cpu-1x Machine's burst, a chat class of 40 used 4.6 to 7.5% of it and a room of 40 agents 18 to 31%. At Fly's sustained baseline of 6.25% only a slow chat class of 40 kept up, the teacher's `set_view` taking 3.4 s at the 95th percentile, and nothing larger did, so choose a Machine whose sustained CPU covers the room you expect.
+`pnpm measure:room` ran the relay as its image does, in 512 MiB and one CPU. With the whole CPU, a shared-cpu-1x Machine's burst, a chat class of 40 used 4.6% of it and a room of 40 agents about 18%, while a class of 80, or two classes of 40 at once, took up to 7.5% and 31%. At Fly's sustained baseline of 6.25% only a slow chat class of 40 kept up, the teacher's `set_view` taking 3.4 s at the 95th percentile, and nothing larger did, so choose a Machine whose sustained CPU covers the room you expect.
 
 The default invitee pool of 100 sessions fits one class of 40 at a time; a relay hosting several at once sets `TABDOCK_MAX_INVITEE_SESSIONS` to about 96 for each class. Keep the audit log 7 days for a class (`TABDOCK_AUDIT_RETENTION_DAYS=7`), long enough to check a lesson's record and short enough not to keep students' emails for a month.
 
