@@ -1,6 +1,6 @@
 # Sharing a page
 
-The person at the tab, the operator, decides who may use a page and what each person may do. This page covers those decisions as tasks. The widget is the operator's control surface; a page that hides it (`ui: false`) does the same through the adapter's handle ([adapter reference](04-adapter-reference.md)). [Connect clients](05-connect-clients.md) is the client's side.
+The person at the tab, the operator, decides who may use a page and what each person may do. The widget is the operator's control surface; a page that hides it (`ui: false`) does the same through the adapter's handle ([adapter reference](04-adapter-reference.md)). [Connect clients](05-connect-clients.md) is the client's side.
 
 ## Who can reach a page
 
@@ -19,15 +19,15 @@ When someone pairs by code or QR, the widget names them and their client and off
 
 `maxDrivers` in the page's policy (`data-max-drivers` on the script tag), from 1, the default, to 100, caps how many people may drive. It counts people, so one person's phone and laptop take one seat. Past it, Allow as driver seats the person as an observer: their client hears the role (`... as observer.`), and once the relay lists them the widget says, for Bob, "The page already has its maximum drivers, so Bob joined as observer." The page's console says the same, never that they drive; nor does it when you allow someone already attached, whose role the relay keeps. To seat another driver, make the current one an observer first, or raise `maxDrivers`.
 
-A page holds at most 10 people (`TABDOCK_MAX_USERS_PER_PAGE`), and a full page refuses pairings with `page_busy` before asking you. With `autoApprove: 'observer'`, members who pair attach as observers with no prompt; invitees never do, and driving still takes your Make driver. That suits an unattended screen whose tools are all read-only.
+A page holds at most 10 people (`TABDOCK_MAX_USERS_PER_PAGE`), and a full page refuses pairings with `page_busy` before asking you. With `autoApprove: 'observer'`, members who pair attach as observers with no prompt; invitees never do, and driving still takes your Make driver. That suits an unattended, read-only screen.
 
 ## Change your mind
 
-Each roster row shows the person, their clients, their role and their time left. Make driver and Make observer switch roles; Make driver at `maxDrivers` leaves the person an observer, and the widget and console say so: "The page already has its maximum drivers, so Bob is still an observer." The page judges a click by the roster the relay sends back for it, never an earlier one, so making one driver an observer and then another a driver hands the seat over without that notice. Should a roster sent for something else, such as someone leaving, cross your click and the relay then seat the person as a driver after all, the console says so and the notice goes.
+Each roster row shows the person, their clients, their role and their time left. Make driver and Make observer switch roles; Make driver at `maxDrivers` leaves the person an observer, and the widget and console say so: "The page already has its maximum drivers, so Bob is still an observer." The page judges a click by the roster the relay sends back for it, never an earlier one, so making one driver an observer and then another a driver hands the seat over without that notice. Should a roster sent for something else cross your click and the relay then seat the person as a driver after all, the console says so and the notice goes.
 
 Revoke ends an attachment at once, cancelling calls in flight and dropping queued ones, and the person must pair again like anyone new; Revoke all does that for everyone and closes every live invite. While anyone a member's invites let in is still attached, Revoke on that member's row, and Revoke all, first ask, saying how many people it would also end, and act only on Revoke anyway.
 
-Pause answers `page_busy` to every call that has not started, queued ones and those waiting at your prompt included, while running calls finish, and holds across a reload until Resume. New code replaces a code that, say, was read off a shared screen. A reload in the same tab within 10 minutes keeps the page and its attachments; a closed tab leaves it asleep, then gone after 10 minutes, and a new tab is a new page needing new approvals.
+Pause answers `page_busy` to every call that has not started, queued ones and those waiting at your prompt included, while running calls finish, and holds across a reload until Resume. New code replaces a code read off a shared screen, say. A reload in the same tab within 10 minutes keeps the page and its attachments; a closed tab leaves it asleep, then gone after 10 minutes, and a new tab is a new page needing new approvals.
 
 ## Try sharing on one computer
 
@@ -68,7 +68,7 @@ sequenceDiagram
 
 At `/i` the guest sees who shared the page, its address and title, your label and what the invite allows, signs in with any account at the relay's provider and chooses Join; the page then tells them to add the connector with that account and ask Claude to list their pages. A one-use link also works in `pair_page`, but a multi-use one only at `/i`.
 
-A guest's attachment ends within 24 hours, never gets first-class tools or confirmation in its client, and shows an invited badge, the verified email (or "unverified account") and a short id. Revoking a guest bars their account from that invite, and the "and close this link" box, ticked by default while a multi-use link has uses left, closes the link too. Cancel closes a link but keeps whoever it let in. Invites run with a stand-in provider in `pnpm demo:m4`, not yet with a real one ([the M5 checklist](../checklists/M5.md)).
+A guest's attachment ends within 24 hours, never gets first-class tools or confirmation in its client, and shows an invited badge, the verified email (or "unverified account") and a short id. Revoking a guest bars their account from that invite, and the "and close this link" box, ticked by default while a multi-use link has uses left, closes the link too. Cancel closes a link but keeps whoever it let in. A prompt dropped by Cancel, End session or a session's end counts no refusal against a control invite. Invites run with a stand-in provider in `pnpm demo:m4`, not yet with a real one ([the M5 checklist](../checklists/M5.md)).
 
 The form's Agent kind mints a token for Claude Code or a script instead, and a time-boxed session's end closes every invite and token ([Lessons and reviews](19-lessons-and-reviews.md#time-boxed-sessions), [Larger rooms](20-larger-rooms.md#agent-tokens)).
 

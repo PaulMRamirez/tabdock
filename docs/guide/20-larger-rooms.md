@@ -46,7 +46,9 @@ To keep the token out of Claude Code's settings and your shell history, put an e
 
 A token is never approved in advance: its first request raises an ordinary prompt naming the label and the client, and the operator may allow it only as an observer. A deny burns the token, and so do three prompts left to time out, never one. Once in, it reads and waits like any watcher, held to the watching share, and never proposes.
 
-The agent list's Cancel, Revoke on its row, Revoke all, a session's end, the sponsor leaving and the token's own end each close it. A Cancel or a session's end while its first prompt waits drops the prompt as the page's own act, so the token closes as cancelled or with the session, never as denied. Every miss on `/g/mcp`, a closed or unknown token included, is a 404, which Claude Code reports as no MCP endpoint found. Use agent tokens for Claude Code and scripts, never as a hosted connector, which signs in at `/mcp` instead.
+The agent list's Cancel, Revoke on its row, Revoke all, a session's end, the sponsor leaving and the token's own end each close it. A Cancel or a session's end while its first prompt waits drops the prompt as the page's own act, so the token closes as cancelled or with the session, never as denied; a page whose clock runs ahead closes a token at its third silence as cancelled rather than burned.
+
+Every miss on `/g/mcp`, a closed or unknown token included, is a 404, which Claude Code reports as no MCP endpoint found; a token that closes while a request's body arrives gets it once the body is read. Only a token waiting for its first approval has its body read to name its client, at most 16 KiB of it. Use agent tokens for Claude Code and scripts, never as a hosted connector, which signs in at `/mcp` instead.
 
 ## Sizing a class relay
 
