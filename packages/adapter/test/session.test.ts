@@ -566,8 +566,9 @@ describe("the session's end on the page's own clock (A6.17)", () => {
     // The relay's own end gets SESSION_END_GRACE_MS to come first; it did not.
     expect(socket.framesOf('session_end')).toEqual([]);
     await h.clock.advance(SESSION_END_GRACE_MS);
+    // Its own clock ended it, which the frame says, so the audit log can too (ADR 0043's notes).
     expect(socket.framesOf('session_end')).toEqual([
-      { t: 'session_end', sessionId: start.sessionId },
+      { t: 'session_end', sessionId: start.sessionId, reason: 'time' },
     ]);
   });
 
@@ -664,8 +665,11 @@ describe("a prompt the session's end takes (ADR 0044's notes)", () => {
       expect(socket.framesOf('attach_decision').filter((sent) => sent.requestId === asked)).toEqual(
         [],
       );
+      // An End names no reason, the operator's; the page's clock names time.
       expect(socket.framesOf('session_end')).toEqual([
-        { t: 'session_end', sessionId: start.sessionId },
+        how === 'End'
+          ? { t: 'session_end', sessionId: start.sessionId }
+          : { t: 'session_end', sessionId: start.sessionId, reason: 'time' },
       ]);
     });
   }

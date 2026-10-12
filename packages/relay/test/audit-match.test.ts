@@ -931,6 +931,64 @@ describe('audit --match against logs written line by line', () => {
       ),
     );
   });
+
+  it("notes a session the record and the log say ended differently, and still passes (ADR 0043's notes)", async () => {
+    const ended = (reason: 'operator' | 'time'): AuditEvent => ({
+      v: AUDIT_VERSION,
+      type: 'session_end',
+      at: 1_005_000,
+      pageId: 'pg_1',
+      origin: 'http://localhost:5173',
+      sessionId: 'ss_class',
+      reason,
+      attachments: 0,
+      invites: 0,
+      agents: 0,
+    });
+    const record = (endedBy: 'operator' | 'time' | 'relay'): SessionRecord =>
+      SessionRecordSchema.parse(
+        sessionRecord({
+          from: 1_000_000,
+          to: 1_005_100,
+          exportedAt: 1_006_000,
+          sealed: true,
+          scope: {
+            kind: 'session',
+            sessionId: 'ss_class',
+            label: 'Class',
+            startedAt: 1_000_000,
+            endsAt: 1_005_000,
+            endedAt: 1_005_000,
+            endedBy,
+            maxDrivers: 1,
+            proposals: 'off',
+            observers: 0,
+            invites: 0,
+          },
+        }),
+      );
+    const sessionNotes = async (
+      endedBy: 'operator' | 'time' | 'relay',
+      logged: 'operator' | 'time',
+    ) => {
+      const lines = logLines(await writeLog([ended(logged)]));
+      const report = matchSessionRecord(record(endedBy), lines);
+      expect(report.failed).toBe(false);
+      return report.findings.filter((finding) => finding.kind === 'session');
+    };
+    expect(await sessionNotes('time', 'operator')).toEqual([
+      {
+        level: 'note',
+        kind: 'session',
+        id: 'ss_class',
+        text: 'session ss_class ended by time in the record and by operator in the log',
+      },
+    ]);
+    expect(await sessionNotes('time', 'time')).toEqual([]);
+    expect(await sessionNotes('operator', 'operator')).toEqual([]);
+    // A new page session is the page's word alone; the log has no reason to set beside it.
+    expect(await sessionNotes('relay', 'operator')).toEqual([]);
+  });
 });
 
 describe('audit --match refusals', () => {

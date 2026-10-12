@@ -83,7 +83,8 @@ export interface MatchFinding {
     | 'skew'
     | 'edge'
     | 'unplaced'
-    | 'attachment';
+    | 'attachment'
+    | 'session';
   /** The call or proposal the finding is about, when one is. */
   readonly id: string | null;
   readonly text: string;
@@ -612,6 +613,24 @@ export function matchSessionRecord(
         span.pageId,
         `${named(span.user)}, who joined at ${iso(span.joinedAt)}, has no attach line on that page`,
       );
+    }
+  }
+
+  // How a time-boxed session ended, as the page and the relay each saw it:
+  // a note, since either clock may end it first, and the log says only what
+  // the page told the relay (ADR 0043's notes). 'relay' is the page's word
+  // for a new page session, which the log has no reason for.
+  const { scope } = record;
+  if (scope.kind === 'session' && scope.endedBy !== null && scope.endedBy !== 'relay') {
+    for (const line of lines) {
+      if (line.type !== 'session_end' || line.sessionId !== scope.sessionId) continue;
+      if (line.reason !== scope.endedBy) {
+        note(
+          'session',
+          scope.sessionId,
+          `session ${scope.sessionId} ended by ${scope.endedBy} in the record and by ${line.reason} in the log`,
+        );
+      }
     }
   }
 

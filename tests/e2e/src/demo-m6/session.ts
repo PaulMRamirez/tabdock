@@ -149,8 +149,16 @@ export async function session(lesson: Lesson): Promise<void> {
         ? "   The page's own revokes had already let the guests go and the link had closed, so the relay's session_end found nothing left to close."
         : `   The relay's session_end closed what the page had left: ${String(end.attachments)} attachment(s), ${String(end.invites)} invite(s), ${String(end.agents)} agent token(s).`,
     );
+    // The page's session_end says its clock ended the session, and the relay
+    // believes that only near the end it holds itself (ADR 0043's notes).
+    // Here only the tab's clock jumped, so the relay sees an end 30 minutes
+    // early and records the operator's.
     say(
-      "   (A session_end the page sends names no reason, so the relay records it as the operator's; its own clock would say time.)",
+      `   The page's session_end said its own clock ended the session. Only the tab's clock jumped, so the relay, still 30 minutes from its own end, records reason ${end.reason}: an early end is the page asking, as an operator does.`,
+    );
+    check(
+      end.reason === 'operator',
+      "an end this far before the relay's own should be recorded as the operator's",
     );
     const offer = await widgetTextWhen(tab.page, 'record-offer', (text) => text !== '');
     say(`   The widget offers the lesson's record: "${offer.split('?')[0] ?? ''}?"`);

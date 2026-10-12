@@ -699,9 +699,17 @@ export const SessionExtendFrameSchema = z.object({
   lengthMs: SessionLengthSchema,
 });
 
+/**
+ * Ends the live session. `reason` is 'time' when the page's own clock ended
+ * it (it tells the relay SESSION_END_GRACE_MS later), and absent when the
+ * operator did, so the audit log names who ended it as the page's record
+ * does (ADR 0043's notes). Optional, so a page that never sends it reads as
+ * before.
+ */
 export const SessionEndFrameSchema = z.object({
   t: z.literal('session_end'),
   sessionId: IdSchema,
+  reason: z.optional(z.literal('time')),
 });
 
 // Agent tokens (ADR 0044), page to relay

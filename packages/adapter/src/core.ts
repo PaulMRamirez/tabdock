@@ -4583,6 +4583,8 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   let relayLists: string | null = null;
   /** The last session this page ended itself; the relay hears of it while it still lists it. */
   let endedHere: string | null = null;
+  /** Whether this page's own clock made that end, which its session_end says (ADR 0043's notes). */
+  let endedByClock = false;
   /** The session this page last asked the relay to end on this link, so it asks once. */
   let endSent: string | null = null;
   /** The longest the operator asked the session to run, which no relay can pass. */
@@ -4650,16 +4652,19 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     for (const entry of drivers.slice(seats)) setRole(entry.userId, 'observer');
   }
 
-  /** Asks the relay to end a session it lists, once per link. */
-  function endListed(sessionId: string): void {
-    if (endSent !== sessionId && isLinked() && send({ t: 'session_end', sessionId })) {
+  /** Asks the relay to end a session it lists, once per link, saying so when this page's clock ended it. */
+  function endListed(sessionId: string, byClock = false): void {
+    const frame: PageFrameInput = byClock
+      ? { t: 'session_end', sessionId, reason: 'time' }
+      : { t: 'session_end', sessionId };
+    if (endSent !== sessionId && isLinked() && send(frame)) {
       endSent = sessionId;
     }
   }
 
   /** The relay hears of an end this page made only while it still lists that session. */
   function tellEnd(): void {
-    if (endedHere !== null && relayLists === endedHere) endListed(endedHere);
+    if (endedHere !== null && relayLists === endedHere) endListed(endedHere, endedByClock);
   }
 
   const sessionWelcome = (frame: WelcomeFrame): void => {
@@ -4780,6 +4785,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     log.info(`session ${ended.sessionId} ended (${reason})`);
     if (!local) return;
     endedHere = ended.sessionId;
+    endedByClock = reason === 'time';
     timers.clearTimeout(graceTimer);
     graceTimer = null;
     if (reason !== 'time') {
@@ -4805,6 +4811,7 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     showSession();
     // Should the relay hold it after all, it hears the end once it lists it.
     endedHere = sessionId;
+    endedByClock = false;
     tellEnd();
   }
 

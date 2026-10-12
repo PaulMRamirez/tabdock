@@ -390,6 +390,18 @@ describe('time-boxed sessions (ADR 0043)', () => {
     expect(parsePageFrame('{"t":"session_end"}').kind).toBe('invalid');
   });
 
+  it("end saying the page's own clock ended it, and no other reason (ADR 0043's notes)", () => {
+    const byClock = parsePageFrame('{"t":"session_end","sessionId":"ss_1","reason":"time"}');
+    expect(byClock).toEqual({
+      kind: 'ok',
+      frame: { t: 'session_end', sessionId: 'ss_1', reason: 'time' },
+    });
+    for (const reason of ['operator', 'page_gone', '', 1]) {
+      const frame = JSON.stringify({ t: 'session_end', sessionId: 'ss_1', reason });
+      expect(parsePageFrame(frame).kind, String(reason)).toBe('invalid');
+    }
+  });
+
   it('come back in a session frame with what remains, how one ended or why one was refused', () => {
     const session = {
       t: 'session',

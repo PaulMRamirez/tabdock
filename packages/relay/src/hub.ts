@@ -832,6 +832,16 @@ interface AddressSessions {
  */
 const RESTORED_ADDRESS = '(restored from a snapshot)';
 
+/**
+ * How far before the end the relay holds a page may end a time-boxed session
+ * on its own clock and have the audit log say time (ADR 0043's notes). The
+ * page reckons its end again from the relay's remaining time at every
+ * session frame, so the two differ by the link's latency and a late timer,
+ * and the page waits SESSION_END_GRACE_MS before telling; a minute covers
+ * that, and a claim made earlier is recorded as the operator's.
+ */
+const SESSION_CLOCK_SLACK_MS = 60_000;
+
 function firstOf(set: ReadonlySet<string> | undefined): string | undefined {
   return set?.values().next().value;
 }
@@ -2555,7 +2565,10 @@ export class PageHub {
     if (frame.t === 'session_end') {
       // An end for a session that is not live changes nothing (#ignored counts it).
       if (ours === null) return false;
-      this.#endSession(pageId, 'operator');
+      // The page says when its own clock ended it, and is believed only near
+      // the end this relay holds: earlier, the page asked, as an operator does.
+      const byClock = frame.reason === 'time' && ours.endsAt - Date.now() <= SESSION_CLOCK_SLACK_MS;
+      this.#endSession(pageId, byClock ? 'time' : 'operator');
       return true;
     }
     const now = Date.now();

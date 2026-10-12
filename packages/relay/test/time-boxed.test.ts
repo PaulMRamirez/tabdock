@@ -270,6 +270,33 @@ describe('S8 and S14: a session end ends what its invites let in', () => {
     expect(events(relay, 'session_end')).toHaveLength(1);
   });
 
+  it("records an end the page's own clock made as time near the relay's end, and as the operator's long before it (S7)", async () => {
+    const relay = await setup();
+    const page = await relay.page({ policy: { invites: 'watch' } });
+    await attachMember(await relay.claude('sub-alice'), page);
+    // Twenty-nine minutes early, the page asked, whatever reason it gives.
+    await start(page, 'ses_early', { maxDrivers: 1, proposals: 'off' });
+    page.send({ t: 'session_end', sessionId: 'ses_early', reason: 'time' });
+    expect(await latest(page, 'session')).toMatchObject({
+      session: null,
+      ended: { sessionId: 'ses_early', reason: 'operator' },
+    });
+    // Ten seconds before the relay's own end, as a page whose clock runs a little ahead.
+    await start(page, 'ses_clock', { maxDrivers: 1, proposals: 'off' });
+    const endsAt = relay.store.pages.get(page.pageId)?.timedSession?.endsAt ?? 0;
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(endsAt - 10_000);
+    page.send({ t: 'session_end', sessionId: 'ses_clock', reason: 'time' });
+    expect(await latest(page, 'session')).toMatchObject({
+      session: null,
+      ended: { sessionId: 'ses_clock', reason: 'time' },
+    });
+    expect(events(relay, 'session_end').map((event) => [event.sessionId, event.reason])).toEqual([
+      ['ses_early', 'operator'],
+      ['ses_clock', 'time'],
+    ]);
+  });
+
   it("closes the page's agent tokens as session_ended before any attachment its invites made, and counts them (C11)", async () => {
     const { relay, page } = await classroom();
     await start(page, 'ses_tokens', { maxDrivers: 1, proposals: 'off' });
