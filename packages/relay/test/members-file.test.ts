@@ -952,6 +952,54 @@ describe('a user id the file moves (S13)', () => {
     expect((await call(other, 'list_pages')).structured).toEqual({ pages: [] });
     expect((await latest(live, 'roster')).attachments).toEqual([]);
   });
+
+  it("answers its new holder unknown_claim for the former holder's claims, settled or pending, at /pair and /i", async () => {
+    const { relay, save: saveMembers } = await membersRelay([ALICE, BOB]);
+    const answered = await relay.page();
+    const waiting = await relay.page({ title: 'Waiting' });
+    const alice = await relay.claude('sub-alice');
+    await attachMember(alice, answered);
+    await attachMember(alice, waiting);
+    const phoneOf = async (sub: string): Promise<Phone> => {
+      relay.provider.signInSubject = sub;
+      try {
+        const phone = new Phone(relay.relay.url);
+        await phone.signIn();
+        return phone;
+      } finally {
+        relay.provider.signInSubject = null;
+      }
+    };
+    const bob = await phoneOf('sub-bob');
+    // One claim the operator answers, and one still waiting on the operator.
+    const settledClaim = await bob.claim(answered.nonce);
+    expect(settledClaim.status).toBe(200);
+    const asked = await answered.next('attach_request');
+    answered.send({
+      t: 'attach_decision',
+      requestId: asked.requestId,
+      allow: true,
+      role: 'observer',
+    });
+    await eventually(
+      async () => (await bob.status(String(settledClaim.data.claim))).data.status !== 'pending',
+    );
+    const pendingClaim = await bob.claim(waiting.nonce);
+    expect(pendingClaim.status).toBe(200);
+    await waiting.next('attach_request');
+    // Bob's id goes to Dave.
+    saveMembers([ALICE, 'sub-dave=bob:Dave']);
+    expect(await relay.relay.reloadMembers()).toBe('applied');
+    const dave = await phoneOf('sub-dave');
+    for (const claim of [settledClaim.data.claim, pendingClaim.data.claim]) {
+      for (const path of ['/pair/status', '/i/status']) {
+        expect(await dave.post(path, { claim })).toMatchObject({
+          status: 404,
+          data: { error: 'unknown_claim' },
+        });
+      }
+    }
+  });
 });
 
 describe("an invite's revoke bar across a member list change (S14)", () => {

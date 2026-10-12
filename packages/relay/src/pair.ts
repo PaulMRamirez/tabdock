@@ -338,9 +338,10 @@ export interface PairFlow {
   /**
    * A member list change (ADR 0043): signs out every browser signed in under
    * a user id it ended, so that phone signs in again as who it is now (S8),
-   * and names every other one as a sign-in would now (ADR 0017), a renamed
-   * member by the new name and an invitee whose name now reads as a
-   * member's by its short id. Returns how many sign-ins ended.
+   * forgets every claim made under such an id, so its next holder reads none
+   * of them (S13), and names every other sign-in as a sign-in would now (ADR
+   * 0017), a renamed member by the new name and an invitee whose name now
+   * reads as a member's by its short id. Returns how many sign-ins ended.
    */
   membersChanged(change: MemberChange): number;
   close(): void;
@@ -1050,6 +1051,13 @@ export function createPairFlow(options: PairFlowOptions): PairFlow {
           continue;
         }
         session.user = renamedBy(session.user, change);
+      }
+      // A claim answers only its claimant, told apart by user id alone, so
+      // one made under an id the change ended would answer whoever the list
+      // gives that id next (S13). A settle still on its way writes only to
+      // the record dropped here.
+      for (const [claimId, claim] of claims) {
+        if (change.ended.has(claim.userId)) claims.delete(claimId);
       }
       return ended;
     },
