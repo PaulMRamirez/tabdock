@@ -188,6 +188,36 @@ describe('credentials on the page link and the MCP routes', () => {
     }
   });
 
+  // The A6.28 review: the widget's `claude mcp add` command carries the
+  // token inline (agent-tokens.test.ts in the adapter holds its form), so the
+  // documents name every place it then lands, as B9 does for the owner token.
+  it("says where the widget's agent command leaves the token, and scopes S11's storage to Tabdock's own", () => {
+    const b13 = readRepo('docs/threat-model.md')
+      .split('\n')
+      .find((line) => line.startsWith('| **B13**'));
+    if (b13 === undefined) throw new Error('the threat model has no row B13');
+    for (const place of [
+      "`claude`'s argument list",
+      "the shell's history",
+      '`~/.claude.json`',
+      '`claude mcp get` prints in full',
+      '`${AGENT_TOKEN}`',
+    ]) {
+      expect(b13, place).toContain(place);
+    }
+    const guide = readRepo('docs/guide/20-larger-rooms.md');
+    for (const place of ["`claude`'s argument list", "your shell's history", '`claude mcp get`']) {
+      expect(guide, place).toContain(place);
+    }
+    const s11 = spec.split('\n').find((text) => text.includes(' S11. ')) ?? '';
+    expect(s11).toContain(
+      "never in a URL, a log, an audit record or the relay's or the adapter's storage",
+    );
+    expect(s11).toContain(
+      "carries it in `claude`'s arguments, so into the holder's shell history and Claude Code's settings",
+    );
+  });
+
   it('section 7 answers a token that closes while its body arrives after the body, as the relay does', () => {
     expect(spec).toContain(
       'gets 404 before the body is read, or after it for a token that closes while its body arrives',
