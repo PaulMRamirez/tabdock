@@ -550,6 +550,26 @@ describe('the image and the workflows, as they run (comments left out)', () => {
     expect(steps.filter(stepIf)).toEqual([]);
   });
 
+  // Each milestone's demo is one root script, and CI runs every one of them
+  // in order, so a demo added without its step (or a step left after its
+  // script went) fails here; docs/deploy.md names the range CI runs.
+  it("runs every milestone's demo in CI, in order, as docs/deploy.md says", () => {
+    const steps = stepsOf(jobsOf(read(`${dir}/ci.yml`)).get('check') ?? '');
+    const ran = steps.flatMap((step) => {
+      const demo = /^ {6}- run: pnpm (demo:m\d+)$/m.exec(step)?.[1];
+      return demo === undefined ? [] : [demo];
+    });
+    const manifest = JSON.parse(read('package.json')) as { scripts: Record<string, string> };
+    const demos = Object.keys(manifest.scripts)
+      .filter((name) => /^demo:m\d+$/.test(name))
+      .sort((a, b) => Number(a.slice(6)) - Number(b.slice(6)));
+    expect(demos.length).toBeGreaterThan(6);
+    expect(ran).toEqual(demos);
+    expect(demos.map((name) => Number(name.slice(6)))).toEqual(demos.map((_, index) => index));
+    const said = /the demos `demo:m0` to `(demo:m\d+)`/.exec(read('docs/deploy.md'))?.[1];
+    expect(said).toBe(demos.at(-1));
+  });
+
   it('reads workflows the way it means to: a disabled step or job is seen', () => {
     const disabled = `jobs:\n  a:\n    if: false\n    steps:\n      - name: x\n        if: false\n        run: echo\n`;
     const job = jobsOf(disabled).get('a') ?? '';
