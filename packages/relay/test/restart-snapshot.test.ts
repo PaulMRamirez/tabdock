@@ -981,6 +981,119 @@ function savedAttachmentOf(
   };
 }
 
+/**
+ * A hosted relay's fullest store as a snapshot holds it: 100 pages at their
+ * longest, each with 10 members and 40 watchers carrying the most clients
+ * the store keeps, 10 invites with every bar and 10 agent tokens, every name
+ * at its longest. Ends and expiries fall at `until`.
+ */
+
+function fullestSnapshot(now: number, until: number): RelaySnapshot {
+  const text = (char: string, length: number): string => char.repeat(length);
+  const digestOf = (value: string): string => createHash('sha256').update(value).digest('hex');
+  const id = (prefix: string, value: number): string => `${prefix}${String(value)}`.padEnd(64, 'x');
+  const guestId = (value: number): string =>
+    `${INVITEE_ID_PREFIX}${value.toString(16).padStart(32, '0')}`;
+  // Twenty clients on every account, as the store keeps them, each name and version at its longest.
+  const clients = Array.from({ length: 20 }, (_, index) => ({
+    name: `${String(index)}${text('n', 98)}`,
+    version: text('v', 50),
+  }));
+  const accounts = snapshotAccounts(null);
+  const pages: SnapshotPage[] = [];
+  const attachments: SnapshotAttachment[] = [];
+  const invites: SnapshotInvite[] = [];
+  const agents: SnapshotAgent[] = [];
+  let guests = 0;
+  for (let page = 0; page < 100; page += 1) {
+    const pageId = id('pg_', page);
+    pages.push(
+      savedPageOf(pageId, now, {
+        origin: `https://${text('o', 2_030)}.example`,
+        url: `https://${text('u', 2_030)}.example/`,
+        title: text('t', 300),
+        adapterVersion: text('a', 50),
+        resumeTokenHash: digestOf(pageId),
+      }),
+    );
+    const sponsor = { userId: id('member_0_', page), displayName: text('S', 100) };
+    const store = (saved: SnapshotAttachment) =>
+      savedAttachment({ ...restoredAttachment(saved), clients }, accounts.memberKey(saved.userId));
+    for (let member = 0; member < 10; member += 1) {
+      attachments.push(
+        store(
+          savedAttachmentOf(pageId, id(`member_${String(member)}_`, page), {
+            displayName: text('M', 100),
+            lastUsedAt: now,
+            expiresAt: until,
+          }),
+        ),
+      );
+    }
+    for (let watcher = 0; watcher < 40; watcher += 1) {
+      guests += 1;
+      attachments.push(
+        store(
+          savedAttachmentOf(pageId, guestId(guests), {
+            displayName: text('G', 100),
+            kind: 'invitee',
+            lastUsedAt: now,
+            expiresAt: until,
+            inviteId: id('inv_', page),
+            endsAt: until,
+            inviteRole: 'observer',
+            sponsorId: sponsor.userId,
+            emailHash: digestOf(`email ${String(guests)}`),
+          }),
+        ),
+      );
+    }
+    for (let index = 0; index < 10; index += 1) {
+      invites.push({
+        inviteId: id(`inv_${String(index)}_`, page),
+        pageId,
+        role: 'observer',
+        label: text('L', 60),
+        uses: 20,
+        usesLeft: 0,
+        createdAt: now,
+        requestedExpiresAt: until,
+        expiresAt: until,
+        ownExpiresAt: until,
+        secretHash: digestOf(`invite ${String(page)} ${String(index)}`),
+        sponsor,
+        refusals: 0,
+        barredUserIds: Array.from({ length: 20 }, (_, bar) => guestId(1_000_000 + bar)),
+        barredEmailHashes: Array.from({ length: 20 }, (_, bar) => digestOf(`bar ${String(bar)}`)),
+      });
+      agents.push({
+        tokenId: id(`agt_${String(index)}_`, page),
+        pageId,
+        label: text('A', 60),
+        secretHash: digestOf(`agent ${String(page)} ${String(index)}`),
+        createdAt: now,
+        expiresAt: until,
+        requestedExpiresAt: until,
+        sponsor,
+        state: 'dormant',
+        timeouts: 0,
+        userId: guestId(2_000_000 + page * 10 + index),
+        client: clients[0] ?? null,
+      });
+    }
+  }
+  return {
+    v: SNAPSHOT_VERSION,
+    writtenAt: now,
+    mode: 'public',
+    credentials: null,
+    pages,
+    attachments,
+    invites,
+    agents,
+  };
+}
+
 /** lstat answering for `path` with another file's stats, as a swap after the loader looked would leave it. */
 function lyingLstat(path: string, stats: nodeFs.Stats): typeof nodeFs.lstatSync {
   return ((target: nodeFs.PathLike, options?: nodeFs.StatSyncOptions) =>
@@ -1249,113 +1362,8 @@ describe('taking the file (snapshot.ts)', () => {
   it("fits a hosted relay's fullest store, every seat taken and every name at its longest, within MAX_SNAPSHOT_BYTES", () => {
     const dir = privateDir();
     const now = Date.now();
-    const text = (char: string, length: number): string => char.repeat(length);
-    const digestOf = (value: string): string => createHash('sha256').update(value).digest('hex');
-    const id = (prefix: string, value: number): string =>
-      `${prefix}${String(value)}`.padEnd(64, 'x');
-    const guestId = (value: number): string =>
-      `${INVITEE_ID_PREFIX}${value.toString(16).padStart(32, '0')}`;
-    // Twenty clients on every account, as the store keeps them, each name and version at its longest.
-    const clients = Array.from({ length: 20 }, (_, index) => ({
-      name: `${String(index)}${text('n', 98)}`,
-      version: text('v', 50),
-    }));
-    const accounts = snapshotAccounts(null);
-    const pages: SnapshotPage[] = [];
-    const attachments: SnapshotAttachment[] = [];
-    const invites: SnapshotInvite[] = [];
-    const agents: SnapshotAgent[] = [];
-    let guests = 0;
-    for (let page = 0; page < 100; page += 1) {
-      const pageId = id('pg_', page);
-      pages.push(
-        savedPageOf(pageId, now, {
-          origin: `https://${text('o', 2_030)}.example`,
-          url: `https://${text('u', 2_030)}.example/`,
-          title: text('t', 300),
-          adapterVersion: text('a', 50),
-          resumeTokenHash: digestOf(pageId),
-        }),
-      );
-      const sponsor = { userId: id('member_0_', page), displayName: text('S', 100) };
-      const store = (saved: SnapshotAttachment) =>
-        savedAttachment(
-          { ...restoredAttachment(saved), clients },
-          accounts.memberKey(saved.userId),
-        );
-      for (let member = 0; member < 10; member += 1) {
-        attachments.push(
-          store(
-            savedAttachmentOf(pageId, id(`member_${String(member)}_`, page), {
-              displayName: text('M', 100),
-              lastUsedAt: now,
-              expiresAt: now,
-            }),
-          ),
-        );
-      }
-      for (let watcher = 0; watcher < 40; watcher += 1) {
-        guests += 1;
-        attachments.push(
-          store(
-            savedAttachmentOf(pageId, guestId(guests), {
-              displayName: text('G', 100),
-              kind: 'invitee',
-              lastUsedAt: now,
-              expiresAt: now,
-              inviteId: id('inv_', page),
-              endsAt: now,
-              inviteRole: 'observer',
-              sponsorId: sponsor.userId,
-              emailHash: digestOf(`email ${String(guests)}`),
-            }),
-          ),
-        );
-      }
-      for (let index = 0; index < 10; index += 1) {
-        invites.push({
-          inviteId: id(`inv_${String(index)}_`, page),
-          pageId,
-          role: 'observer',
-          label: text('L', 60),
-          uses: 20,
-          usesLeft: 0,
-          createdAt: now,
-          requestedExpiresAt: now,
-          expiresAt: now,
-          ownExpiresAt: now,
-          secretHash: digestOf(`invite ${String(page)} ${String(index)}`),
-          sponsor,
-          refusals: 0,
-          barredUserIds: Array.from({ length: 20 }, (_, bar) => guestId(1_000_000 + bar)),
-          barredEmailHashes: Array.from({ length: 20 }, (_, bar) => digestOf(`bar ${String(bar)}`)),
-        });
-        agents.push({
-          tokenId: id(`agt_${String(index)}_`, page),
-          pageId,
-          label: text('A', 60),
-          secretHash: digestOf(`agent ${String(page)} ${String(index)}`),
-          createdAt: now,
-          expiresAt: now,
-          requestedExpiresAt: now,
-          sponsor,
-          state: 'dormant',
-          timeouts: 0,
-          userId: guestId(2_000_000 + page * 10 + index),
-          client: clients[0] ?? null,
-        });
-      }
-    }
-    const fullest: RelaySnapshot = {
-      v: SNAPSHOT_VERSION,
-      writtenAt: now,
-      mode: 'public',
-      credentials: null,
-      pages,
-      attachments,
-      invites,
-      agents,
-    };
+    const fullest = fullestSnapshot(now, now);
+    const { attachments } = fullest;
     const written = writeSnapshot(dir, fullest);
     expect(written).toMatchObject({ kind: 'written' });
     // About 12.1 MB (11 October 2026). Each guest keeps the clients its
@@ -1568,6 +1576,37 @@ describe('the hub around a snapshot (hub.ts)', () => {
     const config = resolveConfig({ auth: createDevTokenAuth([DEV_ALICE]) });
     return new PageHub(config, store, createLogger({ sink: () => undefined }));
   }
+
+  it("takes and writes the fullest store's snapshot within the CPU Fly's kill_timeout gives at the baseline share", async () => {
+    // A stop runs its snapshot work on the event loop before relay_stop, and
+    // Fly kills it kill_timeout seconds after SIGTERM, best effort. A
+    // shared-cpu-1x Machine whose burst balance is spent runs at its
+    // baseline, 5 ms of each 80 ms (docs/notes/m6/room-measure.md), so what
+    // the work may cost in CPU is kill_timeout times that share. Measured on
+    // 12 October 2026 at 0.36 to 0.54 s of CPU (6 to 9 s at the baseline),
+    // past the 5 s kill_timeout fly.toml had (docs/notes/verified.md).
+    const toml = readFileSync(resolve(import.meta.dirname, '../../../deploy/fly/fly.toml'), 'utf8');
+    const killTimeoutS = Number(/^kill_timeout = (\d+)$/m.exec(toml)?.[1]);
+    const budgetMs = killTimeoutS * 1000 * (5 / 80);
+    const hub = hubOf();
+    const accounts = snapshotAccounts(null);
+    const now = Date.now();
+    hub.restoreSnapshot(fullestSnapshot(now, now + 60 * MINUTE), { ageMs: 0, accounts });
+    const dir = privateDir();
+    // As relay.ts's stop does it: the hub stops, then the export and the write.
+    const before = process.cpuUsage();
+    await hub.shutdown();
+    const written = writeSnapshot(dir, hub.exportSnapshot(Date.now(), accounts.memberKey, null));
+    const used = process.cpuUsage(before);
+    const cpuMs = (used.user + used.system) / 1000;
+    expect(written).toMatchObject({ kind: 'written' });
+    // The whole store came back and went out again: about 12 MB.
+    expect(statSync(fileOf(dir)).size).toBeGreaterThan(10_000_000);
+    expect(
+      cpuMs,
+      `${String(Math.round(cpuMs))} ms of CPU against ${String(budgetMs)}`,
+    ).toBeLessThan(budgetMs);
+  });
 
   it('puts a page back asleep, its policy worked out from its ceiling and session, never read', async () => {
     const store = createMemoryStore();

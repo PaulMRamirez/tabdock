@@ -156,7 +156,7 @@ The image caps the heap at 192 MiB, which holds the default byte budgets (`TABDO
 
 ## Operating it
 
-Run one relay per URL; a second one on the same audit directory refuses to start. Stop it with SIGTERM (Ctrl-C, `docker stop`, `systemctl stop`): it closes within about a second and releases its locks. Every restart forgets every pairing code and `/pair` sign-in, and every page, attachment and invite unless `TABDOCK_RESTART_SNAPSHOT` keeps them; clients stay signed in, and only the audit log, that snapshot and local mode's token survive. Settings take effect at a restart. See [Larger rooms](20-larger-rooms.md) for a members file and class sizing, and [Check a page from CI](17-check-from-ci.md) for CI.
+Run one relay per URL; a second one on the same audit directory refuses to start. Stop it with SIGTERM (Ctrl-C, `docker stop`, `systemctl stop`): it closes within about a second (writing a restart snapshot can take 9 s on a small shared CPU) and releases its locks. A restart forgets pairing codes, `/pair` sign-ins, and pages, attachments and invites unless `TABDOCK_RESTART_SNAPSHOT` keeps them; clients stay signed in. Settings take effect at a restart. See [Larger rooms](20-larger-rooms.md) for a members file and class sizing, and [Check a page from CI](17-check-from-ci.md) for CI.
 
 To upgrade, read the [changelog](../../CHANGELOG.md) (while versions start with 0, a minor version may change settings), then `git pull` and `pnpm install` in the clone, or rebuild the image, and restart.
 
