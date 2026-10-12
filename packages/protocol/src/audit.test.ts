@@ -459,6 +459,8 @@ describe("M6's call record fields", () => {
       'size',
       'signature',
       'dimensions',
+      // ADR 0039's note of 12 October: added to the call record within AUDIT_VERSION 1.
+      'animated',
     ]) {
       const refusedImage = { ...call, outcome: 'tool_error', imageRefused: reason };
       expect(AuditEventSchema.safeParse(refusedImage).success, reason).toBe(true);
