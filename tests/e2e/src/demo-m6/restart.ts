@@ -7,7 +7,8 @@
 // page id, Alice still driving, the class still watching. A restart keeps no
 // MCP session, so Alice's Claude connects again, with no pairing.
 
-import { callTool } from '../tabdock-harness.ts';
+import { callMapTool } from '../map-harness.ts';
+import { callTool, errorCode } from '../tabdock-harness.ts';
 import { ALICE } from './classroom.ts';
 import { auditLines, bind, type Lesson } from './lesson.ts';
 import { storyLine } from './narrator.ts';
@@ -52,8 +53,15 @@ export async function restart(lesson: Lesson): Promise<void> {
     `   Alice's Claude connects again: list_pages names ${pageId}${same === undefined ? ' nowhere' : `, role ${same.role ?? '?'}`}, with no new pairing.`,
   );
   check(same !== undefined, 'the page should resume under the same page id');
-  const view = await callTool(lesson.alice, 'call_page_tool', { page: pageId, tool: 'get_view' });
-  check(!view.isError, 'Alice should drive again at once');
+  check(same?.role === 'driver', 'Alice should resume as the driver');
+  // A write, which an observer would be refused, shows she still drives.
+  const moved = await callMapTool(lesson.alice, pageId, 'go_to_stop', {
+    walkthroughId: 'flyby',
+    index: 0,
+  });
+  check(!moved.isError, `Alice should drive again at once: ${moved.text.slice(0, 120)}`);
   await watchingTitle(operator.page, 'Watching by invite: 39 of 40');
-  say('   get_view: ok, and the widget still reads "Watching by invite: 39 of 40".');
+  say(
+    `   go_to_stop flyby 0: ${moved.isError ? (errorCode(moved) ?? 'refused') : 'ok'}, a write, and the widget still reads "Watching by invite: 39 of 40".`,
+  );
 }
