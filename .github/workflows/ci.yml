@@ -51,6 +51,7 @@ jobs:
       - run: pnpm demo:m3
       - run: pnpm demo:m4
       - run: pnpm demo:m5
+      - run: pnpm demo:m6
 
   # A6.8 (ADR 0041): the copyable check in tests/ci-check against local mode
   # on this runner, reading no secret. TABDOCK_HOME goes under RUNNER_TEMP,

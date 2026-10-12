@@ -36,7 +36,8 @@
     "spike:soak": "node scripts/spike/soak.ts",
     "measure:room": "pnpm --filter @tabdock/e2e measure:room",
     "dev:map": "pnpm --filter @tabdock/map-page dev",
-    "ci-check": "node scripts/ci-check.ts"
+    "ci-check": "node scripts/ci-check.ts",
+    "demo:m6": "pnpm --filter @tabdock/e2e demo:m6"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
