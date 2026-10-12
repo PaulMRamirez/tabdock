@@ -38,6 +38,6 @@ A whole lesson, from the relay's settings to a record matched against the audit 
 
 **A write answers `role_denied`, not `proposed`.** The policy's `proposals` is `'off'`, the session narrowed it, the caller is an invitee under `'members'`, or an agent. **Accept stays grey.** The page is paused; resume it.
 
-**Start a session is refused**, the widget saying why. `active`: one runs already; `policy`: wider than `attach()` allows; `invalid`: more observers than the relay's watching seats, or a bad label or length; `unavailable`: observers with no member attached to sponsor their invites, or no public URL; `limit`: too many promotions and mints this minute, or the page's 10 live invites cannot hold one more for every 20 observers. **A record will not save.** Nothing is recorded yet, or the record stopped after an error; the audit log still has every call.
+**Start a session is refused**, the form saying why. `active`: one runs already; `policy`: wider than `attach()` allows; `invalid`: more observers than the relay's watching seats, or a bad label or length; `unavailable`: no answer from the relay within 10 s, or observers with no member attached to sponsor their invites, or no public URL; `limit`: too many promotions and mints this minute, or the page's 10 live invites cannot hold one more for every 20 observers. **A record will not save.** Nothing is recorded yet, or the record stopped after an error; the audit log still has every call.
 
 Next: [Larger rooms](20-larger-rooms.md).

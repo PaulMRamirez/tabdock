@@ -2496,6 +2496,8 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       setText(sAlert, result.inviteRefusal === undefined ? '' : REFUSAL_TEXT[result.inviteRefusal]);
     } else {
       sessionError = sessionText(result.reason, observers);
+      // The start the page held while the relay answered closed the form; the reason shows in it.
+      dom.flag(sessionForm, 'hidden', false);
     }
     render(dock.state);
   }

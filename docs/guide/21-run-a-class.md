@@ -42,7 +42,7 @@ attach({
 
 Add the relay's connector to your own Claude and pair it with the widget's code as a member, before anyone else ([Connect clients](05-connect-clients.md), [Sharing](06-sharing.md#approve-and-choose-a-role)). Your attachment sponsors the session's watch links, so it must not end or idle out before the lesson does, or every student leaves with it; the session block warns when it may.
 
-A few minutes early, choose Start a session: a label, the length, one driver seat, the observers you expect and proposals from all ([Lessons and reviews](19-lessons-and-reviews.md#time-boxed-sessions)). The form names you as the sponsor before Start. Project Show QR, which shows the first watch link with uses left, and tell the room the widget keeps a record of who joined and every call. Links show once, so after a reload the widget offers New link, which closes the earlier links: anyone holding an old one needs the new one.
+A few minutes early, choose Start a session: a label, the length, one driver seat, the observers you expect and proposals from all ([Lessons and reviews](19-lessons-and-reviews.md#time-boxed-sessions)). The form names you as the sponsor before Start, and says why if Start is refused: for more observers than the relay's watching seats, it names `TABDOCK_MAX_OBSERVERS_PER_PAGE`. Project Show QR, which shows the first watch link with uses left, and tell the room the widget keeps a record of who joined and every call. Links show once, so after a reload the widget offers New link, which closes the earlier links: anyone holding an old one needs the new one.
 
 ## Students join
 

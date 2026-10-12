@@ -4,9 +4,15 @@ import { join } from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { type BrowserContext, expect, test } from '@playwright/test';
 import { startDemoServer, type DemoServer } from '@tabdock/demo/server';
-import { type AuditLine, MAX_INVITE_LIFETIME_MS, MAX_SESSION_MS } from '@tabdock/protocol';
+import {
+  type AuditLine,
+  MAX_INVITE_LIFETIME_MS,
+  MAX_LIVE_INVITES_PER_PAGE,
+  MAX_SESSION_MS,
+} from '@tabdock/protocol';
 import { EMAIL_CLAIM, EMAIL_VERIFIED_CLAIM, readAuditLines } from '@tabdock/relay';
 import { tunnelFetch } from '@tabdock/relay/test/tunnel';
+import { OPERATOR_GRANTS_PER_PAGE } from '../../../packages/relay/src/hub.ts';
 import {
   MOCK_SUBJECT,
   playTunnel,
@@ -50,6 +56,8 @@ import {
 
 /** The widget's ARM_DELAY_MS. */
 const ARM_DELAY_MS = 500;
+/** The adapter's MINT_ANSWER_MS: how long a start waits for the relay's answer. */
+const MINT_ANSWER_MS = 10_000;
 const MINUTE = 60_000;
 const GUEST = `g_${'1a2b3c4d'.repeat(4)}`;
 const SESSION_LINK = /^https:\/\/relay\.example\/i#([A-Za-z0-9_-]{22})$/;
@@ -267,6 +275,98 @@ test('Extend lengthens it through the relay, and End asks once before the room l
       ),
     )
     .toBe(true);
+});
+
+// A refused start once showed only its code, "The session did not start
+// (invalid).", which told a teacher with 41 students nothing of the relay's
+// 40 watching seats; each reason now has a sentence (ADR 0049, decision 4).
+
+test('a refused Start says why in a sentence of its own, never a bare code', async ({ page }) => {
+  const relay = await openWithSessionRelay(page, demo, { query: 'invites=all' });
+  // One past the 40 watching seats this relay's welcome names: refused on the page, unsent.
+  await fillSessionForm(page, { label: 'Year 9', minutes: 45, observers: 41 });
+  await clickInWidget(page, { action: 'session-start' });
+  await expect
+    .poll(() => widgetText(page, 'session-reason'))
+    .toBe(
+      'This relay seats at most 40 observers on a page; its owner sets its watching seats with TABDOCK_MAX_OBSERVERS_PER_PAGE.',
+    );
+  expect(relay.framesOf('session_start')).toEqual([]);
+
+  // What the relay refuses, each in its own words.
+  relay.silent = true;
+  await typeInWidget(page, 'session-observers', '0');
+  const refusals = [
+    [
+      'policy',
+      "A session only narrows this page's policy: no more driver seats or wider proposals than it allows, and observers only where it makes invites.",
+    ],
+    ['active', 'A session is already running on this page. End it first.'],
+    [
+      'limit',
+      `This page is at a limit: ${String(MAX_LIVE_INVITES_PER_PAGE)} live invites, counting the links this session needs, or ${String(OPERATOR_GRANTS_PER_PAGE)} promotions and new invites a minute at the relay. Cancel an invite or wait a minute.`,
+    ],
+  ] as const;
+  for (const [index, [reason, words]] of refusals.entries()) {
+    await clickInWidget(page, { action: 'session-start' });
+    await expect.poll(() => relay.framesOf('session_start')).toHaveLength(index + 1);
+    const sessionId = relay.framesOf('session_start')[index]?.sessionId ?? '';
+    relay.send({ t: 'session', session: null, refused: { sessionId, reason } });
+    await expect.poll(() => widgetText(page, 'session-reason')).toBe(words);
+    // The start the page held closed the form; a refusal opens it again, so the words show.
+    expect(await widgetVisible(page, 'session-reason')).toBe(true);
+  }
+
+  // A relay that never answers: the start gives up as unavailable.
+  await clickInWidget(page, { action: 'session-start' });
+  await expect.poll(() => relay.framesOf('session_start')).toHaveLength(refusals.length + 1);
+  await page.clock.runFor(MINT_ANSWER_MS);
+  await expect
+    .poll(() => widgetText(page, 'session-reason'))
+    .toBe(
+      'The relay did not answer in time, or this page cannot make invite links (they need https). Try again.',
+    );
+  expect(await widgetVisible(page, 'session-reason')).toBe(true);
+  expect(await dockState(page)).toMatchObject({ session: null });
+});
+
+/** Whether the line beside New link shows, read by its words, since it carries no data-role. */
+async function renewNoteShown(page: Parameters<typeof widgetText>[0]) {
+  return widgetEvaluate(
+    page,
+    'session',
+    `function () {
+      const note = [...this.querySelectorAll('p')].find(
+        (line) => line.textContent === "New link closes the session's earlier links.",
+      );
+      return note === undefined ? null : note.getClientRects().length > 0;
+    }`,
+  );
+}
+
+test('New link says it closes the earlier links, and does, once no link has uses left', async ({
+  page,
+}) => {
+  const relay = await openWithSessionRelay(page, demo);
+  await startSessionInWidget(page, { label: 'Lab', minutes: 30, observers: 3 });
+  const [first] = relay.framesOf('invite_create');
+  if (first === undefined) throw new Error('no invite_create');
+  // A link with uses left shows its QR, and neither New link nor its line.
+  expect(await widgetButtonNow(page, { action: 'session-renew' })).toBeNull();
+  expect(await renewNoteShown(page)).toBe(false);
+
+  // Its uses spent, as after a reload would leave none shown: New link, with its warning.
+  const spent = relay.listings.get(first.inviteId);
+  if (spent === undefined) throw new Error('the invite is not listed');
+  relay.listings.set(first.inviteId, { ...spent, usesLeft: 0 });
+  relay.list();
+  await expect.poll(() => renewNoteShown(page)).toBe(true);
+
+  // What it says is what it does: the earlier link closes before the new one is minted.
+  await clickInWidget(page, { action: 'session-renew' });
+  await expect.poll(() => relay.framesOf('invite_create')).toHaveLength(2);
+  expect(relay.framesOf('invite_cancel').map((frame) => frame.inviteId)).toEqual([first.inviteId]);
+  await expect.poll(() => renewNoteShown(page)).toBe(false);
 });
 
 // A lesson on a real relay: the member's own Claude drives, the session's
