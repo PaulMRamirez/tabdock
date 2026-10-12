@@ -39,8 +39,11 @@ export default defineConfig({
         pageUrl === ''
           ? 'echo set CI_CHECK_PAGE_URL >&2; exit 1'
           : (process.env.CI_CHECK_PAGE_COMMAND ?? 'echo set CI_CHECK_PAGE_COMMAND >&2; exit 1'),
-      // Playwright needs an address even while the command above stops the run.
-      url: pageUrl === '' ? 'http://127.0.0.1:5180/' : pageUrl,
+      // Playwright needs an address even while the command above stops the run,
+      // and probes it first: one that answers stops the run as "already used"
+      // before the command can say what is missing. Port 1 serves nothing, where
+      // a page's usual port (guide page 17 serves it on 5180) may well answer.
+      url: pageUrl === '' ? 'http://127.0.0.1:1/' : pageUrl,
       reuseExistingServer: false,
       gracefulShutdown: { signal: 'SIGINT', timeout: 5_000 },
       stdout: 'ignore',

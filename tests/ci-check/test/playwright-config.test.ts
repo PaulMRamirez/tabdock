@@ -4,9 +4,15 @@
 // Playwright's server timeout on a URL nothing serves before any spec could
 // say so. With the URL unset or empty, the page server's command now exits at
 // once saying to set it, whatever CI_CHECK_PAGE_COMMAND holds; an unset
-// repository variable reaches a workflow's env as an empty string.
+// repository variable reaches a workflow's env as an empty string. Playwright
+// probes a server's URL before it runs the command, and a URL that answers
+// stops the run as "already used", so the address the config falls back on
+// must be one no page is served at: never a port guide page 17's workflow
+// or this repository's own check serves the page or the relay on.
 
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { connect } from 'node:net';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 interface WebServer {
@@ -50,6 +56,35 @@ describe("the copied check's page server", () => {
       }
     });
   }
+
+  it('falls back on an address no page or relay of the guide or this repository is served at', async () => {
+    const fallback = new URL((await pageServer({ CI_CHECK_PAGE_URL: '' })).url ?? '');
+    const guide = readFileSync(
+      new URL('../../../docs/guide/17-check-from-ci.md', import.meta.url),
+      'utf8',
+    );
+    // The guide's workflow: the page's --port and its URL, read so a new example is held too.
+    const inGuide = [
+      ...[...guide.matchAll(/--port (\d+)/g)].map((match) => match[1]),
+      ...[...guide.matchAll(/https?:\/\/[\w.-]+:(\d+)/g)].map((match) => match[1]),
+    ];
+    expect(inGuide).toContain('5180');
+    // pnpm ci-check's page (scripts/ci-check.ts), the map page's own default, and the relay's.
+    const served = new Set([...inGuide, '5180', '5174', '8787']);
+    expect(served.has(fallback.port)).toBe(false);
+    // And nothing answers there now, so Playwright's probe finds it free and runs the command.
+    const refused = await new Promise<string>((resolve) => {
+      const socket = connect({ host: fallback.hostname, port: Number(fallback.port) });
+      socket.once('connect', () => {
+        socket.destroy();
+        resolve('connected');
+      });
+      socket.once('error', (error: NodeJS.ErrnoException) => {
+        resolve(error.code ?? 'error');
+      });
+    });
+    expect(refused).toBe('ECONNREFUSED');
+  });
 
   it('stops at once saying to set CI_CHECK_PAGE_COMMAND when only the URL is set', async () => {
     const page = await pageServer({
