@@ -833,8 +833,8 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   // quarter as many as a member (responsesWaitingFor, ADR 0030 and its notes).
   // Past the bytes they may hold together, invited accounts' answers waiting
   // to be read give way, strangers' oldest first, then guests', ranked as
-  // sessions are; a member's never does, so members' alone may pass it (S9,
-  // ADR 0044).
+  // sessions are; a member's never does, so members' alone may pass it, and
+  // invited accounts' still give way then (S9, ADR 0044).
   const stalls = new ResponseStalls({
     lines: mcpLines,
     ceilingBytes: config.limits.responseBytes,
