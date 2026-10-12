@@ -195,6 +195,11 @@ test('a watch invite and a control invite from the widget, joined at /i and thro
   await phone.locator('#join').tap();
   await expect(phone.locator('#message')).toHaveText('Joined as observer.');
   await expect(phone.locator('#connector')).toHaveText(PUBLIC_MCP_URL);
+  // Adding a custom connector in the phone app is not something a guest can count on.
+  await expect(phone.locator('#connect .hint')).toHaveText(
+    'Add it in Claude on the web or the desktop app; it then appears in the phone app too.',
+  );
+  await expect(phone.locator('#connect .hint')).toBeVisible();
   const bobEntry = await waitForDock(page, (state) =>
     state.roster.find((entry) => entry.displayName === BOB.email),
   );

@@ -79,6 +79,16 @@ describe('the page at /i', () => {
     expect((await phone.request('/i', { method: 'POST' })).status).toBe(405);
   });
 
+  it('says, beside the connector, where to add it, since the phone app may not add one', async () => {
+    const { relay } = await setup();
+    const invite = await new Phone(relay.relay.url).request('/i');
+    // The section that shows the connector once the guest has joined.
+    const connect = /<section id="connect" hidden>([\s\S]*?)<\/section>/.exec(invite.body)?.[1];
+    expect(connect?.replace(/\s+/g, ' ')).toContain(
+      '<p class="code" id="connector"></p> <p class="hint"> Add it in Claude on the web or the desktop app; it then appears in the phone app too. </p>',
+    );
+  });
+
   it('is not there at all on a relay with invites off', async () => {
     const relay = await startInviteRelay({ invites: false });
     current = relay;
