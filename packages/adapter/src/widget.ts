@@ -1934,7 +1934,13 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
 
   function setFormOpen(open: boolean): void {
     dom.flag(formBox, 'hidden', !open);
-    if (open) dom.flag(inviteError, 'hidden', true);
+    if (open) {
+      dom.flag(inviteError, 'hidden', true);
+      // Each opening starts at Can watch, so Create never mints another agent
+      // token, shown in full on a tab that may be projected, because the last
+      // invite was one.
+      dom.setChecked(watchChoice.input, true);
+    }
     render(dock.state);
   }
 

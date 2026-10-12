@@ -184,6 +184,13 @@ test('a token minted in the widget prompts with its label and client, reads as o
   expect(shadow).not.toContain(token);
   expect(shadow).not.toContain('Authorization');
 
+  // The form opens again at Can watch, never at the agent kind used last, so
+  // a second Create cannot mint another token in full on a projected tab.
+  await clickInWidget(page, { action: 'invite-open' });
+  await expect.poll(() => widgetButtonNow(page, { action: 'invite-uses' })).not.toBeNull();
+  expect(await widgetButtonNow(page, { action: 'agent-lifetime-1h' })).toBeNull();
+  await clickInWidget(page, { action: 'invite-close' });
+
   // Its first request raises an ordinary prompt: the label, the client, observer only.
   const agent = await connectAgent(tabdock.relay.url, token, 'claude-code');
   clients.push(agent);
