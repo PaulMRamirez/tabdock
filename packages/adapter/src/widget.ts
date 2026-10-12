@@ -2061,8 +2061,8 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   /** Whether the panel has opened by itself to show the code since anyone was last attached; see render. */
   let codeShown = false;
 
-  // M6 seams (plan section 2.6), each its workstream's own: until one is
-  // filled in, its block stays hidden. core.ts says what the marker is for.
+  // The M6 blocks (plan section 2.6): the state line, proposals, the
+  // time-boxed session, agent tokens and the session record.
 
   /**
    * Whether the page's state reaches everyone attached (ADR 0040): the
