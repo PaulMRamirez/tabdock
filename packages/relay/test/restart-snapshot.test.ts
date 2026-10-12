@@ -9,7 +9,11 @@
 // the resume window, from the future, from another mode or reached through a
 // link. A member the list in force no longer gives the same subject comes
 // back with nothing, and what they sponsored goes with them (S8, S13, S14).
-// A revoked attachment or a closed invite never returns. The file holds
+// A revoked attachment or a closed invite never returns, and a live invite's
+// terms and a token's come back whole: a revoked guest's bar by account and
+// email, the uses a link has left, a control link's refusals and a token's
+// timed-out prompts (S14). What ran out while the relay was down ends in
+// the order its timers would have ended it (S7). The file holds
 // digests only: no resume token, invite secret, agent token, pairing code or
 // subject. With the setting off nothing is written, a file an earlier run
 // left is removed unread, and a restart ends everything, as in M5. Against a
@@ -78,15 +82,20 @@ import {
   credentialsDigest,
   fitProblem,
   removeTemporaryFiles,
+  restoredAgent,
   restoredAttachment,
+  restoredInvite,
+  savedAgent,
   savedAttachment,
+  savedInvite,
   SNAPSHOT_FILE,
   type SnapshotFs,
   snapshotAccounts,
   takeSnapshot,
   writeSnapshot,
 } from '../src/snapshot.ts';
-import { agentUserId, connectAgent, mintAgent } from './helpers/agents.ts';
+import type { AgentTokenRecord, InviteRecord } from '../src/store.ts';
+import { agentRequest, agentUserId, connectAgent, mintAgent } from './helpers/agents.ts';
 import {
   attachMember,
   call,
@@ -107,7 +116,7 @@ import {
   TOOLS,
 } from './helpers/page-client.ts';
 import { PAIR_CLIENT, startProvider, type TestProvider } from './helpers/provider.ts';
-import { ALICE as DEV_ALICE, FAST_TIMINGS } from './helpers/relay.ts';
+import { ALICE as DEV_ALICE, eventually, FAST_TIMINGS } from './helpers/relay.ts';
 import { PUBLIC_MCP_URL, PUBLIC_ORIGIN, tunnelFetch } from './helpers/tunnel.ts';
 
 const MINUTE = 60_000;
@@ -118,6 +127,17 @@ const PAIR_CREDENTIALS = credentialsDigest(PAIR_CLIENT);
 const GUEST = 'sub-guest';
 const GUEST_EMAIL = 'guest@example.com';
 const POLICY: PolicyInput = { invites: 'all', maxDrivers: 2, proposals: 'members' };
+/** An agent's first request, which raises its attach prompt. */
+const AGENT_INITIALIZE = {
+  jsonrpc: '2.0',
+  id: 1,
+  method: 'initialize',
+  params: {
+    protocolVersion: '2025-11-25',
+    capabilities: {},
+    clientInfo: { name: 'raw-agent', version: '1.0.0' },
+  },
+};
 
 interface Run {
   relay: Relay;
@@ -473,6 +493,155 @@ describe('a graceful restart with TABDOCK_RESTART_SNAPSHOT on (A6.18)', () => {
     const closed = await call(carol, 'pair_page', { invite: cancelled.link });
     expect(closed.isError).toBe(true);
     expect(back.all('attach_request')).toEqual([]);
+  });
+
+  it("keeps a revoked guest's bar on a link left open, by account and by verified email (S14)", async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const first = await startRun(dir, idp);
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    const { secret, inviteId } = await mintOk(page, { uses: 5 });
+    const guest = await signedInAtI({ relay: first.relay, provider: idp }, GUEST, GUEST_EMAIL);
+    const { request } = await joinAtI(guest, page, secret);
+    // Revoked with the link kept open: barred, and the page never hears.
+    page.send({ t: 'revoke', userId: request.user.userId });
+    await page.sync();
+    const barred = { status: 403, data: { error: 'denied_by_operator' } };
+    expect(await guest.post('/i/claim', { secret })).toMatchObject(barred);
+    await first.close();
+
+    const second = await startRun(dir, idp);
+    const back = await resumeOn(second, page);
+    expect(back.welcome?.resumed).toBe(true);
+    expect((await latest(back, 'invites')).invites.map((invite) => invite.inviteId)).toEqual([
+      inviteId,
+    ]);
+    const asked = back.all('attach_request').length;
+    const again = await signedInAtI({ relay: second.relay, provider: idp }, GUEST, GUEST_EMAIL);
+    expect(await again.post('/i/claim', { secret })).toMatchObject(barred);
+    // Another subject with the same verified email, written another way.
+    const other = await signedInAtI(
+      { relay: second.relay, provider: idp },
+      'sub-guest-new',
+      'GUEST@Example.com',
+    );
+    expect(await other.post('/i/claim', { secret })).toMatchObject(barred);
+    await back.sync();
+    expect(back.all('attach_request')).toHaveLength(asked);
+  });
+
+  it('keeps the uses a link has left, so it admits exactly as many more accounts (S14)', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const first = await startRun(dir, idp);
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    const { secret } = await mintOk(page, { uses: 3 });
+    for (const n of [1, 2]) {
+      const phone = await signedInAtI(
+        { relay: first.relay, provider: idp },
+        `sub-g${String(n)}`,
+        `g${String(n)}@example.com`,
+      );
+      expect((await joinAtI(phone, page, secret)).settled).toMatchObject({ status: 'approved' });
+    }
+    expect((await latest(page, 'invites')).invites[0]?.usesLeft).toBe(1);
+    await first.close();
+
+    const second = await startRun(dir, idp);
+    const back = await resumeOn(second, page);
+    expect((await latest(back, 'invites')).invites[0]?.usesLeft).toBe(1);
+    const third = await signedInAtI(
+      { relay: second.relay, provider: idp },
+      'sub-g3',
+      'g3@example.com',
+    );
+    expect((await joinAtI(third, back, secret)).settled).toMatchObject({ status: 'approved' });
+    const fourth = await signedInAtI(
+      { relay: second.relay, provider: idp },
+      'sub-g4',
+      'g4@example.com',
+    );
+    expect(await fourth.post('/i/claim', { secret })).toMatchObject({
+      status: 404,
+      data: { error: 'pairing_expired' },
+    });
+    await back.sync();
+    expect(rosterIds(back).filter((userId) => userId.startsWith(INVITEE_ID_PREFIX))).toHaveLength(
+      3,
+    );
+  });
+
+  it('keeps a control link refused twice one refusal from burning (S14)', async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const first = await startRun(dir, idp);
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    const { inviteId, link } = await mintOk(page, { role: 'driver' });
+    const guest = await first.claude(GUEST, GUEST_EMAIL);
+    for (let n = 1; n <= 2; n += 1) {
+      const { outcome } = await redeem(guest, page, link, { allow: false });
+      expect(outcome.text).toMatch(/^denied_by_operator: /);
+    }
+    expect((await latest(page, 'invites')).invites[0]?.refusals).toBe(2);
+    await first.close();
+
+    const second = await startRun(dir, idp);
+    const back = await resumeOn(second, page);
+    expect((await latest(back, 'invites')).invites[0]?.refusals).toBe(2);
+    const guestAgain = await second.claude(GUEST, GUEST_EMAIL);
+    const { outcome } = await redeem(guestAgain, back, link, { allow: false });
+    expect(outcome.text).toMatch(/^denied_by_operator: /);
+    expect((await latest(back, 'invites')).invites).toEqual([]);
+    expect(second.relay.audit.events()).toContainEqual(
+      expect.objectContaining({ type: 'invite_closed', inviteId, reason: 'burned' }),
+    );
+    expect((await call(guestAgain, 'pair_page', { invite: link })).text).toMatch(
+      /^pairing_expired: /,
+    );
+  });
+
+  it("keeps an agent token's timed-out prompts, so its third still burns it (S14)", async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const timings = { attachRequestTtlMs: 200 };
+    const first = await startRun(dir, idp, { timings });
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    const minted = await mintAgent(page);
+    const prompt = async (run: Run, shown: TestPage): Promise<void> => {
+      await agentRequest(run.relay.url, minted.token, AGENT_INITIALIZE);
+      await shown.next('attach_request');
+      await eventually(async () => {
+        await shown.sync();
+        return shown.all('agents').at(-1)?.agents[0]?.state !== 'asking';
+      });
+    };
+    for (let n = 1; n <= 2; n += 1) await prompt(first, page);
+    expect((await latest(page, 'agents')).agents[0]).toMatchObject({
+      state: 'dormant',
+      timeouts: 2,
+    });
+    await first.close();
+
+    const second = await startRun(dir, idp, { timings });
+    const back = await resumeOn(second, page);
+    expect((await latest(back, 'agents')).agents[0]).toMatchObject({ timeouts: 2 });
+    await agentRequest(second.relay.url, minted.token, AGENT_INITIALIZE);
+    await back.next('attach_request');
+    await eventually(() =>
+      second.relay.audit
+        .events()
+        .some(
+          (event) =>
+            event.type === 'agent_closed' &&
+            event.tokenId === minted.tokenId &&
+            event.reason === 'burned',
+        ),
+    );
+    expect((await agentRequest(second.relay.url, minted.token, AGENT_INITIALIZE)).status).toBe(404);
   });
 
   it('is used at most once: the start removes the file, and a copy put back later is refused', async () => {
@@ -1369,6 +1538,50 @@ describe('taking the file (snapshot.ts)', () => {
         removed: true,
       });
     }
+  });
+
+  it('puts back every term of an invite and an agent token it saves, but the prompt waiting on one (S14)', () => {
+    // Every field set, none at its default, so a restore that resets one shows.
+    const invite: InviteRecord = {
+      inviteId: 'inv_1',
+      pageId: 'pg_1',
+      role: 'driver',
+      label: 'class',
+      uses: 5,
+      usesLeft: 2,
+      createdAt: 10,
+      requestedExpiresAt: 30,
+      expiresAt: 20,
+      ownExpiresAt: 25,
+      secretHash: 'b'.repeat(64),
+      sponsor: { userId: 'alice', displayName: 'Alice' },
+      pendingRequestId: 'req_1',
+      refusals: 2,
+      barredUserIds: [`${INVITEE_ID_PREFIX}${'cd'.repeat(16)}`],
+      barredEmailHashes: ['e'.repeat(64)],
+    };
+    expect(restoredInvite(savedInvite(invite))).toEqual({ ...invite, pendingRequestId: null });
+    const agent: AgentTokenRecord = {
+      tokenId: 'agt_1',
+      pageId: 'pg_1',
+      label: 'bot',
+      secretHash: 'c'.repeat(64),
+      createdAt: 10,
+      expiresAt: 20,
+      requestedExpiresAt: 21,
+      sponsor: { userId: 'alice', displayName: 'Alice' },
+      state: 'asking',
+      requestId: 'req_2',
+      timeouts: 2,
+      userId: `${INVITEE_ID_PREFIX}${'ab'.repeat(16)}`,
+      client: { name: 'claude-code', version: '2.0.0' },
+    };
+    // A token that was asking comes back dormant, its prompt gone with the restart.
+    expect(restoredAgent(savedAgent(agent))).toEqual({
+      ...agent,
+      state: 'dormant',
+      requestId: null,
+    });
   });
 
   it('removes only the temporary files a stop cut short leaves, never following a link', () => {
