@@ -8,7 +8,7 @@ With invites on, invitees watching a page by invite take a watching seat, 40 a p
 
 The roster lists People first, then Watching by invite: one compact line each, closed past 8 rows with a count of seats in use, and with a filter by name or short id. An invitee's row lists their two newest clients. Join notices come one per invite: from the third person a link lets in, one line counts them and names the newest. In the Watching section one "Revoke closes their link" box covers every row, and it is ticked again after each Revoke and whenever the section reappears. Revoke on a member's row, and Revoke all, ask first while anyone that member's invites let in is still attached.
 
-Watchers share the projected tab's attention: together 60 calls a minute to a page, 15 for one watcher, and 4 running at once, 2 of them one watcher's; past these a call answers `rate_limited`, pointing to `get_page_state`, which never touches the tab. These are the room measurement's numbers and options of the relay's code, not settings. Members are held to none of them.
+Watchers share the projected tab's attention: together 60 calls a minute to a page, 15 for one watcher, and 4 running at once, 2 of them one watcher's. Past the rates or a watcher's 2 a call answers `rate_limited`, pointing to `get_page_state`, which never touches the tab, and while the page's 4 run it answers `page_busy`. These are the room measurement's numbers and options of the relay's code, not settings. Members are held to none of them.
 
 ## A class joining
 
