@@ -4,7 +4,7 @@ What to do when the relay, a page or a client misbehaves before a call gets anyw
 
 ## Setup problems
 
-**The board sits at "Connect to 127.0.0.1:8787".** By design: the demo board dials only a relay its visitor chose (ADR 0029), so click that bar and the widget and its code appear. A reload in the same tab reconnects without a click; a link that changes `?confirm` or `?invites` asks again. Your own page dials as soon as it calls `attach()`.
+**The board sits at "Connect to 127.0.0.1:8787".** By design: the demo board dials only a relay its visitor chose (ADR 0029), so click that bar and the widget and its code appear. A reload in the same tab reconnects without a click; a link that changes `?confirm`, `?invites` or `?proposals` asks again. Your own page dials as soon as it calls `attach()`.
 
 **Claude Code says `tabdock-local` already exists.** It never replaces an entry: run `claude mcp remove --scope user tabdock-local`, paste the line the banner printed, and check with `claude mcp list`, never `claude mcp get`, which prints a stored header in full. After `pnpm relay --new-token`, an entry from the `claude mcp add-json` line needs no change, since its `claude-headers` helper reads the new token at each connection; only an entry from the `--header` line (PowerShell, or a token directory whose path holds a quote, backslash, `$` or backtick) answers 401 until you replace it.
 
