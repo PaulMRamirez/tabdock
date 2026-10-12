@@ -12,22 +12,22 @@ A view's bounds are `west`, `south`, `east` and `north`, with west greater than 
 
 ## The tools
 
-| Group        | Tool                    | Annotation                   | Arguments                                                                          | Returns                                                                                                        |
-| ------------ | ----------------------- | ---------------------------- | ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| view         | `get_view`              | read-only                    | none                                                                               | `MapView`                                                                                                      |
-| view         | `set_view`              | write                        | any of the view's fields but profile and bounds; `widthM` or `altitudeM`, not both | the `MapView` it set                                                                                           |
-| capture      | `capture_view`          | read-only, untrusted content | `maxWidthPx` 64 to 2048 (1024), format png or jpeg (png)                           | an image and the view as JSON, or the view and a description as JSON                                           |
-| clock        | `get_clock`             | read-only                    | none                                                                               | `MapClock`                                                                                                     |
-| clock        | `set_clock`             | write                        | time, rate or playing                                                              | the `MapClock` it set                                                                                          |
-| layers       | `list_layers`           | read-only, untrusted content | none                                                                               | `{ layers }`, each a `MapLayer`                                                                                |
-| layers       | `set_layer`             | write                        | id, with visible or opacity; showing a base layer hides the other base layers      | id, visible and opacity                                                                                        |
-| features     | `features_in_view`      | read-only, untrusted content | limit 1 to 200 (50), kind                                                          | `{ features, total, truncated }`, most prominent first, then nearest                                           |
-| walkthroughs | `list_walkthroughs`     | read-only, untrusted content | none                                                                               | `{ walkthroughs, current }`: each a `WalkthroughSummary`, and `current` `{ walkthroughId, stopIndex }` or null |
-| walkthroughs | `get_stop`              | read-only, untrusted content | `walkthroughId` and index, the current stop by default                             | `MapStop`                                                                                                      |
-| walkthroughs | `go_to_stop`            | write                        | index, and `walkthroughId` unless the current one                                  | the stop's index and `stopCount`, the new view and clock, its observation                                      |
-| observations | `list_observations`     | read-only, untrusted content | `walkthroughId`, from, to, limit 1 to 150 (100)                                    | `{ observations, total, truncated }`, each an `ObservationSummary`, by time                                    |
-| observations | `get_observation`       | read-only, untrusted content | id                                                                                 | `MapObservation`                                                                                               |
-| observations | `view_from_observation` | write                        | id                                                                                 | the `observationId` and the new view, on the globe where the page has one                                      |
+| Group        | Tool                    | Annotation                   | Arguments                                                                              | Returns                                                                     |
+| ------------ | ----------------------- | ---------------------------- | -------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| view         | `get_view`              | read-only                    | none                                                                                   | `MapView`                                                                   |
+| view         | `set_view`              | write                        | any of the view's fields but `profile` and `bounds`; `widthM` or `altitudeM`, not both | the `MapView` it set                                                        |
+| capture      | `capture_view`          | read-only, untrusted content | `maxWidthPx` 64 to 2048 (1024), `format` `'png'` or `'jpeg'` (`'png'`)                 | an image and `CaptureViewText`, or `CaptureViewDescription`                 |
+| clock        | `get_clock`             | read-only                    | none                                                                                   | `MapClock`                                                                  |
+| clock        | `set_clock`             | write                        | `time`, `rate` or `playing`                                                            | the `MapClock` it set                                                       |
+| layers       | `list_layers`           | read-only, untrusted content | none                                                                                   | `{ layers }`, each a `MapLayer`                                             |
+| layers       | `set_layer`             | write                        | `id`, with `visible` or `opacity`; showing a base layer hides the other base layers    | `id`, `visible` and `opacity`                                               |
+| features     | `features_in_view`      | read-only, untrusted content | `limit` 1 to 200 (50), `kind`                                                          | `{ features, total, truncated }`, most prominent first, then nearest        |
+| walkthroughs | `list_walkthroughs`     | read-only, untrusted content | none                                                                                   | `ListWalkthroughsResult`                                                    |
+| walkthroughs | `get_stop`              | read-only, untrusted content | `walkthroughId` and `index`, the current stop by default                               | `MapStop`                                                                   |
+| walkthroughs | `go_to_stop`            | write                        | `index`, and `walkthroughId` unless the current one                                    | `GoToStopResult`                                                            |
+| observations | `list_observations`     | read-only, untrusted content | `walkthroughId`, `from`, `to`, `limit` 1 to 150 (100)                                  | `{ observations, total, truncated }`, each an `ObservationSummary`, by time |
+| observations | `get_observation`       | read-only, untrusted content | `id`                                                                                   | `MapObservation`                                                            |
+| observations | `view_from_observation` | write                        | `id`                                                                                   | `ViewFromObservationResult`, on the globe where the page has one            |
 
 Every result is JSON text behind the relay's label, never structured content. A handler refuses by throwing, so the call ends as `tool_error`, and the schemas carry every fixed bound, so the relay names most mistakes itself as `invalid_arguments` before the page sees them. Rules that depend on state, such as an index past `stopCount` or a time outside the clock's start and end, are in the descriptions and readable from `list_walkthroughs` and `get_clock`. Each write resolves with the state it produced, and `get_view` reports the target view at once, even while the page still animates toward it. `go_to_stop` takes an index only, so a call repeated, or two accepted proposals, land on the same stop.
 
@@ -124,6 +124,43 @@ interface MapObservation {
   onScreen: boolean;
 }
 
+interface ListWalkthroughsResult {
+  walkthroughs: WalkthroughSummary[];
+  current: { walkthroughId: string; stopIndex: number } | null;
+}
+
+interface GoToStopResult {
+  walkthroughId: string;
+  index: number;
+  stopCount: number;
+  view: MapView;
+  clock: MapClock | null;
+  observationId: string | null;
+}
+
+interface ViewFromObservationResult {
+  observationId: string;
+  view: MapView;
+}
+
+/** The JSON text beside capture_view's image. */
+interface CaptureViewText {
+  view: MapView;
+  visibleLayers: string[];
+  visibleLayersOmitted?: number; // present only when some ids did not fit
+  observationId: string | null;
+  widthPx: number;
+  heightPx: number;
+}
+
+/** capture_view's text, on a page that returns no images. */
+interface CaptureViewDescription {
+  description: string;
+  view: MapView;
+  visibleLayers: string[];
+  observationId: string | null;
+}
+
 interface MapPageState {
   view: MapView;
   clock: MapClock | null;
@@ -136,7 +173,7 @@ interface MapPageState {
 
 `get_view` and `set_view` are the core. Capture, clock, layers, features, walkthroughs and observations are optional groups, each registered whole or not at all, so a client that finds `list_walkthroughs` in `list_page_tools` can rely on `go_to_stop`, and a static 2D map with no clock simply has no clock group. `get_view` carries `profile: 'tabdock.map.v1'`, since a name alone cannot prove a page follows the profile. A page may add result fields and optional arguments within v1; any change of meaning makes v2. Each description is one ASCII line of at most 200 characters, so a first-class listing shows it whole.
 
-A 2D map's core takes little more than this, with the declaration from [Add to your app](03-add-to-your-app.md#a-webmcp-runtime); a globe adds `altitudeM` and `fovDeg`:
+A 2D map's core takes little more than this, with the declaration from [Add to your app](03-add-to-your-app.md#a-webmcp-runtime). Its `set_view` takes the five fields one body and one projection need; a page that shows several adds `body` and `projection`, and a globe `altitudeM` and `fovDeg`:
 
 ```ts
 /** The page's own 2D map library, as far as these two tools use it. */
@@ -184,7 +221,7 @@ await document.modelContext?.registerTool({
   name: 'set_view',
   title: 'Set view',
   description:
-    "Move the camera to any of get_view's fields but profile and bounds. Returns the view it set.",
+    'Move the camera: give any of lon, lat, widthM, headingDeg and pitchDeg. Returns the view it set.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -227,7 +264,7 @@ attach({
 
 ## capture_view
 
-A page that names `capture_view` in `imageTools` returns ADR 0039's envelope, `{ image: { mimeType, data }, text }`, with the view, `visibleLayers`, `observationId`, `widthPx` and `heightPx` as JSON in its text ([Images and page state](18-images-and-state.md)). A page that does not returns `{ description, view, visibleLayers, observationId }` as text, with no size and no `visibleLayersOmitted`.
+A page that names `capture_view` in `imageTools` returns ADR 0039's envelope, `{ image: { mimeType, data }, text }`, with `CaptureViewText` as JSON in its text ([Images and page state](18-images-and-state.md)). A page that does not returns `CaptureViewDescription` as text, with no size and no `visibleLayersOmitted`. The image is a PNG unless the caller asks `format: 'jpeg'`, and [the CI check](17-check-from-ci.md) asks for PNG.
 
 The text beside an image stays within 1,800 characters, so no adapter cuts it: where the visible layers' ids would not fit, the list stops and `visibleLayersOmitted` counts the rest, which `list_layers` names. Capture only the page's own canvas, never the tab, which shows the pairing code, with `toDataURL` and `image/png` or `image/jpeg`. A WebGL canvas captures in the same task as its render, or keeps `preserveDrawingBuffer`; tiles from another origin need CORS, or the canvas cannot be read at all. Refuse a `"data:,"` result, or one of another type than you asked for. `maxWidthPx` lets a client retry smaller when a capture is refused as too large.
 

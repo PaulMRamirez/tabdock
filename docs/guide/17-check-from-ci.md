@@ -1,6 +1,12 @@
 # Check a page from CI
 
-A walkthrough is content, and content breaks: a stop's view moves, a photo's viewpoint drifts, a layer is renamed. This page sets up a check that walks every stop of a map page (page 16) on every change, with no secret and no person at the tab. It runs the relay in local mode on the CI runner, which is one machine, so the owner token never leaves it (ADR 0041). It does not reach a public relay: that needs an interactive sign-in, so an unattended driver there is still not supported.
+A walkthrough is content, and content breaks: a stop's view moves, a photo's viewpoint drifts, a layer is renamed. This page describes a check that walks every stop of a map page (page 16) on every change, with no secret and no person at the tab. It runs the relay in local mode on the CI runner, which is one machine, so the owner token never leaves it (ADR 0041). It does not reach a public relay: that needs an interactive sign-in, so an unattended driver there is still not supported.
+
+## What the check needs
+
+The walk needs four of the profile's tools, each listed to a driver: `get_view` and the whole walkthroughs group, `list_walkthroughs`, `get_stop` and `go_to_stop`. Without them it fails at once with one `tools` finding for each, `not listed`, and walks nothing. It never calls `set_view`. The page must also publish `MapPageState` ([Images and page state](18-images-and-state.md#share-what-the-page-shows)), since every stop waits until the state names it, and hold at least one walkthrough with a stop: a page with none passes having checked nothing.
+
+`REQUIRE_TOOLS` in `specs/walk.spec.ts` covers only the optional groups the walk checks where the page lists them: the clock (`get_clock`), capture (`capture_view`) and observations (`list_observations`, `get_observation`, `view_from_observation`). It passes them to `walkPage()` as `requireTools`, so a page that stops registering one fails the walk instead of skipping its checks. Layers and features are never walked.
 
 ## What runs
 
@@ -17,71 +23,15 @@ flowchart LR
 
 Playwright starts the relay and your page's server, opens the page and links it to the relay. The testing helper reads the pairing code from the widget's closed shadow root through the DevTools protocol, and once the client has called `pair_page` it clicks Allow as driver with trusted input, after the widget's half second of arming, as a person would. It refuses to choose when two waiting requests carry the client's name. Then the client walks the page, and a last step verifies the relay's audit chain.
 
-## Set it up
+`tests/ci-check/playwright.config.ts` starts the relay with readiness on `/healthz`, which needs no token, and stops it with SIGINT, so it writes `relay_stop` to its audit log. It never reuses a server already on a port, which could hold another token.
 
-From a clone, `pnpm ci-check` runs the example in `tests/ci-check` against the canvas map page. Another repository needs the release after 0.1.0, since 0.1.0 lacks the testing helper and the state tools the walk calls; once it is on npm, install it by its version:
+## Run it
 
-```sh
-npm install --save-dev --save-exact @tabdock/relay@<version> @tabdock/adapter@<version> @playwright/test@1.56.1 @modelcontextprotocol/client@2.3.1 zod@4.6.5
-```
-
-Copy the `tests/ci-check` directory and change the four things its README lists: `connectPage()` in `src/tabdock.ts`; `CI_CHECK_PAGE_COMMAND`, which serves your page, and `CI_CHECK_PAGE_URL`, its required http address on 127.0.0.1 or localhost, without which, or with it empty, the run stops at once; `CI_CHECK_RELAY_COMMAND`, `npx --no-install tabdock-relay` unless set, so `@tabdock/relay` is installed beside it; and `REQUIRE_TOOLS` in `specs/walk.spec.ts`, the optional tools your page has. The canvas page links when its own script asks, never from its URL, so the fixture calls that script:
-
-```ts
-import type { Page } from '@playwright/test';
-
-/** Links the page to the relay through the page's own script, never its URL. */
-export async function connectPage(page: Page, relayPageUrl: string): Promise<void> {
-  const linked = await page.evaluate((relay) => {
-    const hook = (window as { __tabdockMapPage?: { connect(relayUrl: string): boolean } })
-      .__tabdockMapPage;
-    return hook?.connect(relay) ?? false;
-  }, relayPageUrl);
-  if (!linked) throw new Error('the page did not link to the relay');
-}
-```
-
-A page that attaches as it loads needs a test-only connect hook like that one, or a test build naming the relay, such as `ws://127.0.0.1:8787/page` on the job's `TABDOCK_PORT`, never a relay read from its own URL. `tests/ci-check/playwright.config.ts` starts both servers, the relay with readiness on `/healthz`, which needs no token, and SIGINT to stop it, so it writes `relay_stop` to its audit log. It never reuses a server already on a port, which could hold another token.
-
-## The workflow job
-
-```yaml
-ci-check:
-  runs-on: ubuntu-24.04
-  timeout-minutes: 15
-  permissions:
-    contents: read
-  steps:
-    - uses: actions/checkout@<commit SHA> # pin by SHA
-      with:
-        persist-credentials: false
-    - uses: actions/setup-node@<commit SHA> # pin by SHA
-      with:
-        node-version: 22
-    - run: npm ci
-    - run: npx playwright install --with-deps chromium
-    - name: A fresh TABDOCK_HOME under the runner's temporary directory
-      run: echo "TABDOCK_HOME=$RUNNER_TEMP/tabdock-ci-check" >> "$GITHUB_ENV"
-    - run: npx playwright test --config tests/ci-check/playwright.config.ts --project chromium
-      env:
-        CI_CHECK_PAGE_COMMAND: npm run serve -- --port 5180
-        CI_CHECK_PAGE_URL: http://127.0.0.1:5180/
-    - name: Verify the audit chain
-      run: npx tabdock-relay audit --verify
-    - name: Delete TABDOCK_HOME
-      if: always()
-      run: rm -rf -- "${TABDOCK_HOME:?}"
-```
-
-`TABDOCK_HOME` holds the owner token and the audit log. It must be a fresh absolute directory outside every repository, whose every parent only the runner account or root can write, and never under `/tmp`, which local mode refuses. A job's `env` cannot read the runner context, so a step writes it to `$GITHUB_ENV`, where `audit --verify` finds the log too, and the last step deletes it whatever happened. Never cache or upload it; to keep a record, keep the output of `npx tabdock-relay audit --json`, which holds no token, code or argument. Set no other relay setting: local mode's defaults are what make the check safe.
-
-On a self-hosted runner, follow the same steps under its own `RUNNER_TEMP`, with one runner account per machine, since local mode trusts every account on it. Give each runner on one machine its own `TABDOCK_PORT`. Playwright drives Chromium over a pipe, so no other process gets a DevTools port to click Allow with; never add `--remote-debugging-port` on a shared machine.
+From a clone, `pnpm ci-check` runs the example in `tests/ci-check` against the canvas map page, as CI's `ci-check` job does. [Copy the CI check](23-copy-the-ci-check.md) sets it up in another repository: the files to copy, the install before and after the release, the four things to change and the workflow job.
 
 ## What the walk checks
 
-The walk, `walkPage()` in `tests/ci-check/src/walk.ts`, first checks that `list_pages` shows the page with the role driver. For every stop it calls `go_to_stop`, `get_stop`, `get_view` and `get_clock`: the view must match the stop's, angles within 1e-6 degrees and metres within a relative 1e-6, and a paused clock its time. It reads the state the page publishes with `get_page_state`, waits with `wait_for_page_state` until the state names the stop, and holds its view and clock to what the tools said. `capture_view` must return one PNG within the image cap. For every observation, `view_from_observation` must land on its viewpoint and the state must follow.
-
-The clock, capture and observation checks run only where the page lists those tools. The spec names the ones its page has in `REQUIRE_TOOLS`, which it passes to `walkPage()` as `requireTools`, so a page that stops registering one fails the walk instead of skipping its checks.
+The walk, `walkPage()` in `tests/ci-check/src/walk.ts`, first checks that `list_pages` shows the page with the role driver. For every stop it calls `go_to_stop`, `get_stop`, `get_view` and `get_clock`: the view must match the stop's, angles within 1e-6 degrees and metres within a relative 1e-6, and a paused clock its time. It reads the state the page publishes with `get_page_state`, waits with `wait_for_page_state` until the state names the stop, and holds its view and clock to what the tools said. `capture_view`, asked for `{ format: 'png' }`, must return one PNG within the relay's image cap, 65,536 bytes by default ([Images and page state](18-images-and-state.md#return-an-image)). For every observation, `view_from_observation` must land on its viewpoint and the state must follow.
 
 Every result is read from after the relay's label, with copies of the profile's schemas in `tests/ci-check/src/profile.ts`, and a result with no label is a finding. Findings hold ids and numbers only, never page text, and one bad stop never hides the rest. The spec prints `ci-check: <n> page calls`. Only this repository's runner, `scripts/ci-check.ts`, then matches that many call records, every one ok, from `you` through `tabdock-ci-check`, and scans its output for the token or an unmasked pairing code; a copy's workflow verifies the chain alone.
 
@@ -97,30 +47,16 @@ A page can attach with `ui: false` and answer prompts through its own handle (pa
 
 ## The advisory walk
 
-`pnpm ci-check --advisory` runs headless Claude Code against the same setup: it looks at each stop's picture and gives a verdict, and gates nothing. It never runs in this repository's CI. In a copy, the package's `advisory` script (`playwright test --project advisory`) runs it on Linux or macOS, where local mode writes the `claude-headers` helper it connects with, with `claude` on the PATH and signed in or `ANTHROPIC_API_KEY` set; without `claude` the spec skips. Give it a job of its own with `continue-on-error`, the key on its one step, and a condition that keeps it off pull requests from forks; never use `pull_request_target`.
+`pnpm ci-check --advisory` runs headless Claude Code against the same setup: it looks at each stop's picture and gives a verdict, and gates nothing. It never runs in this repository's CI. In a copy, `npx playwright test --config tests/ci-check/playwright.config.ts --project advisory` runs it on Linux or macOS, where local mode writes the `claude-headers` helper it connects with, with `claude` on the PATH and signed in or `ANTHROPIC_API_KEY` set; without `claude` the spec skips. Give it a job of its own with `continue-on-error`, the key on its one step, and a condition that keeps it off pull requests from forks; never use `pull_request_target`.
 
-The model reads untrusted page text and images, so Claude Code gets the four Tabdock tools a walk needs and nothing else. `--tools ""` removes every built-in tool, so it has no shell and no files; `--strict-mcp-config` drops every other server; `--setting-sources project`, from an empty scratch directory, leaves out your own settings files with their allow rules, hooks and plugins, while your sign-in still works; and `--permission-mode dontAsk` denies whatever `--allowedTools` does not name. `--max-turns` bounds the run. The spec stops the run at once if Claude Code's init event lists any other tool, and ends it when the test ends. Its token comes from local mode's `claude-headers`.
+The model reads untrusted page text and images, so Claude Code is held to the relay's tools. `--tools ""` removes every built-in tool, so it has no shell and no files, and `--strict-mcp-config` drops every other server, which leaves it the relay's nine; `--allowedTools` names the four a walk calls, `list_pages`, `list_page_tools`, `call_page_tool` and `get_page_state`, and `--permission-mode dontAsk` denies the rest.
+
+`--setting-sources project`, from an empty scratch directory, leaves out your own settings files with their allow rules, hooks and plugins, while your sign-in still works, and `--max-turns` bounds the run. The spec stops the run at once if Claude Code's init event lists a tool or server outside the relay's, lacks one of the four, or names a permission mode other than dontAsk, and ends it when the test ends. Its token comes from local mode's `claude-headers`.
 
 ## Windows
 
 The check covers Linux and macOS runners. Windows waits on the owner's run of local mode there: `RUNNER_TEMP` lies outside the folders local mode accepts on Windows, and Playwright cannot stop the relay gracefully there, so it would end without `relay_stop`.
 
-## The testing helper
-
-`@tabdock/adapter/testing` ships in the adapter's package and takes any DevTools session through a structural `DevToolsSession` type, so Playwright is not a dependency. It never logs, and no error it throws quotes what it read.
-
-| Export              | What it does                                                                                    |
-| ------------------- | ----------------------------------------------------------------------------------------------- |
-| `readPairingCode()` | Waits for the widget to show a pairing code and returns it; never print it                      |
-| `allowAttach()`     | Clicks Allow as driver or observer on the one request with this client name or id               |
-| `clickInWidget()`   | Clicks a widget button by its action once it is armed and a hit test reaches it                 |
-| `widgetButton()`    | Waits until a button is armed and uncovered, and returns its centre                             |
-| `widgetText()`      | Reads the text of a widget node by its role                                                     |
-| `waitingPrompts()`  | Lists waiting attach requests and confirmations, so a walk fails fast on a prompt it cannot see |
-| `maskCode()`        | Hides a pairing code's second half for narration                                                |
-| `WidgetTestError`   | What the helper throws: counts, actions and timeouts, never text it read                        |
-| `HOST_TAG`          | The widget's element name, `tabdock-dock`                                                       |
-| `WIDGET_ACTIONS`    | Every button action the widget has                                                              |
-| `WIDGET_ROLES`      | Every node role the widget has                                                                  |
+The check pairs through `@tabdock/adapter/testing`, whose calls [Scripts and the widget](24-scripts-and-the-widget.md#the-testing-helper) lists.
 
 Next: [Images and page state](18-images-and-state.md).

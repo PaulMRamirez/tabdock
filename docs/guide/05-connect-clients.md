@@ -53,7 +53,7 @@ console.log(await client.callTool({ name: 'list_pages', arguments: {} }));
 await client.close();
 ```
 
-A public relay takes tokens from its provider, which the SDK's OAuth support obtains while a person signs in. A program with nobody to sign in uses an agent token the operator mints, reading one page as an observer at `/g/mcp` ([Join a shared page](22-join-a-shared-page.md)).
+A public relay takes tokens from its provider, which the SDK's OAuth support obtains while a person signs in: [Scripts and the widget](24-scripts-and-the-widget.md#a-client-that-signs-in) gives that program. One with nobody to sign in uses an agent token, reading one page as an observer at `/g/mcp` ([Join a shared page](22-join-a-shared-page.md)).
 
 ## The fixed tools
 
@@ -65,7 +65,7 @@ A public relay takes tokens from its provider, which the SDK's OAuth support obt
 | `call_page_tool`      | `page`, `tool`, `arguments`                                            | The page's result                                                                                                                                                                  |
 | `detach_page`         | `page`                                                                 | `Detached from page <id>.` Your attachment ends, and so do your invites and agent tokens and every attachment they let in; pair again with a new code or invite link               |
 | `get_page_state`      | `page`                                                                 | The page's published state behind its label: `version`, `publishedAt`, `heardAt` and `value`, null while it shares nothing; runs no page tool                                      |
-| `wait_for_page_state` | `page`, `after`, `timeoutMs`                                           | The same with `changed`, as soon as the version passes `after`, or at the timeout (25 s unless set, at most 40 s)                                                                  |
+| `wait_for_page_state` | `page`, `after`, `timeoutMs`                                           | The same with `changed`, as soon as the version differs from `after` (at once if it already does), or at the timeout (25 s unless set, at most 40 s)                               |
 | `get_proposal`        | `page`, `proposal`, `waitMs`                                           | A proposal you made: pending, accepted with the page's result behind its label, dismissed, refused, expired, withdrawn or cancelled                                                |
 | `withdraw_proposal`   | `page`, `proposal`                                                     | Withdraws your pending proposal, so the operator is no longer asked                                                                                                                |
 

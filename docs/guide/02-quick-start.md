@@ -19,6 +19,8 @@ pnpm dev
 
 `pnpm dev` starts the relay on `127.0.0.1:8787` and a demo board on `127.0.0.1:5173` and prints a banner; Ctrl-C stops both. With no auth settings in the environment or a `.env` file, the relay runs in local mode: loopback only, one user shown as You, and trust in every account on this computer. Its only credential is an owner token in a private file outside the repository: `~/.config/tabdock/owner-token` on Linux (or under `$XDG_CONFIG_HOME`), `~/Library/Application Support/Tabdock/owner-token` on macOS, `%LOCALAPPDATA%\Tabdock\owner-token` on Windows, or inside `TABDOCK_HOME` when you set it. The relay refuses a token directory inside a repository or under one another account can write, such as `/tmp`, and prints the token's path, never the token.
 
+Its `relay listening` log line says `"mode":"local"` beside `"auth":"dev-token"`: local mode signs its one user in through the dev-token plugin, though with the owner token rather than `TABDOCK_DEV_TOKENS`.
+
 ## Add the relay to Claude Code
 
 On macOS and Linux the banner prints one line for Claude Code, naming your own token directory; for a user `you` on Linux it reads:

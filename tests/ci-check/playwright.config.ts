@@ -42,7 +42,7 @@ export default defineConfig({
       // Playwright needs an address even while the command above stops the run,
       // and probes it first: one that answers stops the run as "already used"
       // before the command can say what is missing. Port 1 serves nothing, where
-      // a page's usual port (guide page 17 serves it on 5180) may well answer.
+      // a page's usual port (guide page 23 serves it on 5180) may well answer.
       url: pageUrl === '' ? 'http://127.0.0.1:1/' : pageUrl,
       reuseExistingServer: false,
       gracefulShutdown: { signal: 'SIGINT', timeout: 5_000 },

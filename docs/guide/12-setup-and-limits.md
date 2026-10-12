@@ -1,6 +1,6 @@
 # Setup problems and limits
 
-What to do when the relay, a page or a client misbehaves before a call gets anywhere, and the fixed limits behind the codes on [Troubleshooting](11-troubleshooting.md). The relay's log, which names each refusal but never a token, code or argument, says most; the widget's notice line the rest. [Images and state](18-images-and-state.md#when-it-goes-wrong), [lessons](19-lessons-and-reviews.md#when-it-goes-wrong) and [joining](22-join-a-shared-page.md#when-it-goes-wrong) have their own, and [the members file](20-larger-rooms.md#the-members-file) explains its refusals.
+What to do when the relay, a page or a client misbehaves before a call gets anywhere, and the fixed limits behind the codes on [Troubleshooting](11-troubleshooting.md). The relay's log, which names each refusal but never a token, code or argument, says most; the widget's notice line the rest. [Images and state](18-images-and-state.md#when-it-goes-wrong), [lessons](19-lessons-and-reviews.md#when-it-goes-wrong) and [joining](22-join-a-shared-page.md#when-it-goes-wrong) have their own, and [the members file's rules](14-settings-for-rooms.md#members-agents-and-restarts) say what it refuses.
 
 ## Setup problems
 

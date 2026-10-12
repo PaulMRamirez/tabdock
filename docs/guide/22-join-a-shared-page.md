@@ -26,4 +26,4 @@ The token ends with the operator's Cancel or Revoke, the session's end, the spon
 
 **A 404 at `/g/mcp`.** The token is closed, unknown or mistyped; ask the operator for a new one. **`denied_by_operator`.** The operator denied or closed the token, its text saying how, or that it is "no longer live"; "the page takes no invited guests now" means the page's invites are off. **`timeout`, "the page operator has not been asked yet; call pair_page again".** Call it again; the next request asks. [Troubleshooting](11-troubleshooting.md) gives every code.
 
-Next: [the guide's index](README.md).
+Next: [Copy the CI check](23-copy-the-ci-check.md), or back to [the guide's index](README.md).

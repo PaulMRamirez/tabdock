@@ -1,8 +1,8 @@
 # 06: A class on one tab
 
-M6 lets a room drive, follow and review a projected map. A map and globe profile runs on the sim page and the canvas page in `tests/map-page` (ADR 0038, the guide's [page 16](../guide/16-map-pages.md)); an image tool returns one checked picture behind its label (ADR 0039); clients read and wait on page state (ADR 0040); and `pnpm ci-check` walks a page from CI with no secret (ADR 0041). Observers propose writes the teacher accepts (ADR 0042); a members file reloads without a restart, and a time-boxed session narrows the policy and ends what it let in (ADR 0043); forty watchers sit apart from the members' seats, and an agent token lets an unattended client watch one page (ADR 0044). The teacher saves a record that `audit --match` holds to the log (ADR 0045), and a graceful restart can resume from a snapshot (ADR 0046).
+M6 lets a room drive, follow and review a projected map. A map and globe profile runs on the sim page and the canvas page in `tests/map-page` (ADR 0038, [page 16](../guide/16-map-pages.md)); an image tool returns one checked picture behind its label (ADR 0039); clients read and wait on page state (ADR 0040); and `pnpm ci-check` walks a page from CI with no secret (ADR 0041). Observers propose writes the teacher accepts (ADR 0042); a members file reloads without a restart, and a time-boxed session narrows the policy and ends what it let in (ADR 0043); forty watchers sit apart from the members' seats, and an agent token lets a client with no sign-in watch one page once the operator allows its first request (ADR 0044). The teacher saves a record that `audit --match` holds to the log (ADR 0045), and a graceful restart can resume from a snapshot (ADR 0046).
 
-Underneath, the MCP-B leg runs exact 6.0.0, where a page calls `installWebMCP()` (ADR 0047); the script-tag build may reach 200,000 bytes (ADR 0048); and `@tabdock/adapter/testing` clicks the widget for a CI check. Guide pages [17](../guide/17-check-from-ci.md), [18](../guide/18-images-and-state.md), [19](../guide/19-lessons-and-reviews.md), [20](../guide/20-larger-rooms.md), [21](../guide/21-run-a-class.md) and [22](../guide/22-join-a-shared-page.md) cover each part.
+Underneath, the MCP-B leg runs exact 6.0.0, where a page calls `installWebMCP()` (ADR 0047); the script-tag build may reach 200,000 bytes (ADR 0048); and `@tabdock/adapter/testing` clicks the widget for a CI check. Guide pages [17](../guide/17-check-from-ci.md) to [24](../guide/24-scripts-and-the-widget.md) cover each part.
 
 ## One proposal, traced
 
@@ -44,7 +44,7 @@ sequenceDiagram
 
 ## Try it by hand
 
-`pnpm demo:m6` runs this and nine more legs. By hand, a proposal needs the demo board with `&proposals=members` and a second dev-token user, set up as [tour 02](02-many-clients.md) does.
+`pnpm demo:m6` runs this and nine more legs. By hand, a proposal needs the demo board with `&proposals=members` and a second dev-token user, as in [tour 02](02-many-clients.md).
 
 1. Run `pnpm relay` and paste its `claude mcp add-json` line; run `pnpm dev:map`, open `http://127.0.0.1:5174/`, check the relay URL and click Connect. Pair Claude Code, allow it, and ask it to read the guide's page 16 (`docs/guide/16-map-pages.md`) and walk the flyby, waiting on the state between stops.
 2. In the widget, click Start a session, give it a label and 30 minutes, and Start; watch the countdown, then End session and End now. In local mode a session is a time box alone; once Claude has called during it, its end offers its record.

@@ -1,6 +1,6 @@
 # Add Tabdock to your app
 
-From "my app has functions" to "Claude can call them safely": a WebMCP runtime, marked tools, the adapter and a relay URL, with words as [Concepts](01-concepts.md) defines them. A page's Content-Security-Policy and framing are covered in [Security](10-security.md#csp-trusted-types-and-frames).
+From "my app has functions" to "Claude can call them safely": a WebMCP runtime, marked tools, the adapter and a relay URL, in the words of [Concepts](01-concepts.md). A page's Content-Security-Policy and framing are covered in [Security](10-security.md#csp-trusted-types-and-frames).
 
 ## A WebMCP runtime
 
@@ -14,7 +14,7 @@ import { initializeWebMCPPolyfill } from '@mcp-b/webmcp-polyfill';
 initializeWebMCPPolyfill(); // on 6.0.0, call installWebMCP() instead: importing it installs nothing
 ```
 
-This guide pins exact 5.1.0, which the demo and the map test page keep so a runtime that drops `consequentialHint` stays tested. MCP-B 6.0.0 keeps the hint and passes the call, cancel, consequential and image specs on its own leg, but importing it installs nothing: call `installWebMCP()` (ADR 0047).
+This guide pins exact 5.1.0, which the demo and the map test page keep so a runtime that drops `consequentialHint` stays tested. MCP-B 6.0.0 keeps the hint and passes the specs on its own leg, but importing it installs nothing: call `installWebMCP()` (ADR 0047).
 
 Without a bundler, load the package's `dist/index.iife.js` in a classic script tag before the adapter; it installs itself. The adapter looks for `document.modelContext` once, at `attach()`; if it is missing, the adapter logs how to add a polyfill, puts that text in `state.error` and stays idle.
 
@@ -27,7 +27,11 @@ declare global {
     title?: string;
     description: string;
     inputSchema: object;
-    annotations?: { readOnlyHint?: boolean; consequentialHint?: boolean };
+    annotations?: {
+      readOnlyHint?: boolean;
+      consequentialHint?: boolean;
+      untrustedContentHint?: boolean;
+    };
     execute: (input: unknown, options?: { signal?: AbortSignal }) => Promise<unknown>;
   }
   interface WebMcpContext extends EventTarget {
@@ -126,7 +130,7 @@ Only the page's own `readOnlyHint: true` makes a tool read-only. Set `consequent
 
 ## Add the adapter
 
-Today it comes from a clone. For a page with no build step, `pnpm --filter @tabdock/adapter build` writes the script-tag file, `dist/tabdock-adapter.js` in `packages/adapter`, to serve from your own origin ([the script tag](#the-script-tag)). For a bundler, `pnpm release:pack` in the clone writes the protocol and adapter tarballs to `dist/packages`. In your app's folder, install both in one command, since the adapter needs that exact protocol, with `<clone>` standing for the clone's path:
+Today it comes from a clone. For a page with no build step, `pnpm --filter @tabdock/adapter build` writes the script-tag file, `dist/tabdock-adapter.js` in `packages/adapter`, to serve from your own origin ([the script tag](#the-script-tag)). For a bundler, `pnpm release:pack` in the clone writes the protocol, adapter and relay tarballs to `dist/packages`, labelled 0.1.0 but built from the clone's checkout. In your app's folder, install the first two together, since the adapter needs that exact protocol, `<clone>` being the clone's path:
 
 ```sh
 npm install --save-exact @mcp-b/webmcp-polyfill@5.1.0 \
@@ -140,7 +144,7 @@ npx --yes esbuild@0.28.2 src/main.ts --bundle --format=esm --outfile=main.js
 npx --yes http-server@14 . -a 127.0.0.1 -p 5500 -c-1
 ```
 
-Open `http://127.0.0.1:5500/`, pair from Claude Code with the widget's code as in the [Quick start](02-quick-start.md#connect-pair-and-call), and ask it to submit order A-1; [Connect clients](05-connect-clients.md) covers other clients.
+Open `http://127.0.0.1:5500/`, pair from Claude Code with the widget's code as in the [Quick start](02-quick-start.md#connect-pair-and-call), and ask it to submit order A-1. Other clients and scripts pair as [Connect clients](05-connect-clients.md#any-mcp-client) and [Scripts and the widget](24-scripts-and-the-widget.md) show.
 
 Call `attach()` once per page load, in browser code only (a client-only module in a server-rendered framework), and keep the handle it returns inside your own code: it approves attachments and answers prompts. It throws a `TypeError` for a bad relay URL or policy value and silently drops a misspelled key, which TypeScript catches ([Adapter reference](04-adapter-reference.md#attachoptions)).
 

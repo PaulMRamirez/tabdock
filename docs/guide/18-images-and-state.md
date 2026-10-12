@@ -20,7 +20,9 @@ const dock = attach({
 
 /** The board as a WebP data URL within the relay's cap; throws, in words a model can act on, when none fits. */
 function capture(board: HTMLCanvasElement): string {
-  const cap = dock.state.maxImageBytes ?? 0;
+  // Null until the relay's welcome names its cap, and 0 for a relay that takes no images.
+  const cap = dock.state.maxImageBytes;
+  if (cap === null) throw new Error('not linked to a relay yet; try again in a moment');
   const copy = document.createElement('canvas');
   const context = copy.getContext('2d');
   if (cap === 0 || context === null) throw new Error('this relay takes no images');
@@ -52,7 +54,9 @@ await document.modelContext?.registerTool({
 });
 ```
 
-The `document.modelContext` declaration is the one in [Add to your app](03-add-to-your-app.md#a-webmcp-runtime). A WebGL canvas clears its drawing buffer once a frame is shown, so capture in the same task as a render, or create the context with `preserveDrawingBuffer: true`. A canvas that drew a cross-origin image without CORS refuses `toDataURL` with a `SecurityError`, so serve map tiles with CORS and load them with the `crossorigin` attribute. Draw a stored photo through a canvas too, rather than passing its file on: that sizes it, and leaves its metadata, a camera's location among it, behind.
+The `document.modelContext` declaration is the one in [Add to your app](03-add-to-your-app.md#a-webmcp-runtime). This board's tool takes no arguments and answers WebP; a map page's `capture_view` follows [the profile](16-map-pages.md#capture_view) instead, PNG unless asked `format: 'jpeg'`, and [the CI check](17-check-from-ci.md) asks it for PNG.
+
+A WebGL canvas clears its drawing buffer once a frame is shown, so capture in the same task as a render, or create the context with `preserveDrawingBuffer: true`. A canvas that drew a cross-origin image without CORS refuses `toDataURL` with a `SecurityError`, so serve map tiles with CORS and load them with the `crossorigin` attribute. Draw a stored photo through a canvas too, rather than passing its file on: that sizes it, and leaves its metadata, a camera's location among it, behind.
 
 A declared tool that returns words sends them as text, and every other tool's result stays text whatever it holds, an envelope included. Image calls start on the page one at a time, 250 ms apart, with at most 8 waiting, so a room asking for pictures cannot keep the projected tab drawing; the gate comes after any consequential prompt, so an image call waits its turn only once allowed, and runs after it only if its tool is still the kind it was, read or write. The activity list shows each image's type and size, and the relay's audit line its type, size and SHA-256, never the image.
 

@@ -30,6 +30,11 @@ const SHAPES: Record<string, ObjectSchema> = {
   MapViewpoint: profile.MapViewpointSchema,
   MapObservation: profile.MapObservationSchema,
   MapPageState: profile.MapPageStateSchema,
+  ListWalkthroughsResult: profile.ListWalkthroughsResultSchema,
+  GoToStopResult: profile.GoToStopResultSchema,
+  ViewFromObservationResult: profile.ViewFromObservationResultSchema,
+  CaptureViewText: profile.CaptureImageTextSchema,
+  CaptureViewDescription: profile.CaptureTextSchema,
 };
 
 /** Each key of a schema's shape, with ? where the key may be left out, which is where it takes undefined. */
@@ -55,6 +60,17 @@ function pageInterfaces(): Map<string, string[]> {
     }
   }
   return found;
+}
+
+/** The argument names a cell gives in code spans: identifiers, not quoted values such as 'png'. */
+function namesIn(cell: string): string[] {
+  return [...cell.matchAll(/`([A-Za-z][A-Za-z0-9]*)`/g)].map((match) => match[1] ?? '');
+}
+
+/** The keys a tool's argument schema takes. */
+function inputKeys(tool: string): string[] {
+  const inputs = profile.mapInputs() as unknown as Record<string, { shape: object } | undefined>;
+  return Object.keys(inputs[tool]?.shape ?? {}).sort();
 }
 
 /** Every whole number a cell states, commas and units dropped. */
@@ -87,6 +103,41 @@ describe('guide page 16, map and globe pages', () => {
           : 'write',
       })),
     );
+  });
+
+  it('names each argument in code, exactly as the tool takes it, and every one it takes', () => {
+    const table = tables(text).find((candidate) => candidate.header.includes('Annotation'));
+    const viewKeys = Object.keys(profile.MapViewSchema.shape);
+    const problems = (table?.rows ?? []).flatMap(({ cells }) => {
+      const tool = (cells.Tool ?? '').replace(/`/g, '');
+      const named = namesIn(cells.Arguments ?? '');
+      const keys = inputKeys(tool);
+      // set_view takes "any of the view's fields but profile and bounds", naming those two by the view's keys.
+      const unknown = named.filter(
+        (name) => !keys.includes(name) && !(tool === 'set_view' && viewKeys.includes(name)),
+      );
+      const unnamed = tool === 'set_view' ? [] : keys.filter((key) => !named.includes(key));
+      return [
+        ...unknown.map((name) => `${tool} takes no ${name}`),
+        ...unnamed.map((key) => `${tool}'s ${key} is not named in code`),
+      ];
+    });
+    expect(problems).toEqual([]);
+    // The rule would catch an argument left as plain words, as the table once gave them.
+    expect(namesIn('id, with visible or opacity')).toEqual([]);
+    expect(namesIn("`format` `'png'` or `'jpeg'`")).toEqual(['format']);
+  });
+
+  it("gives set_view's example a description that names exactly the fields its schema takes", () => {
+    const example = codeBlocks(text).find((block) => block.body.includes("name: 'set_view'"));
+    const body = example?.body.slice(example.body.indexOf("name: 'set_view'")) ?? '';
+    const description = /description:\s*'([^']*)'/.exec(body)?.[1] ?? '';
+    const properties = /properties: \{([\s\S]*?)\n {4}\},/.exec(body)?.[1] ?? '';
+    const keys = [...properties.matchAll(/^\s+([A-Za-z]+):/gm)].map((match) => match[1] ?? '');
+    expect(keys.length).toBeGreaterThan(0);
+    const fields = Object.keys(profile.MapViewSchema.shape);
+    const said = fields.filter((field) => new RegExp(`\\b${field}\\b`).test(description));
+    expect(said.sort()).toEqual([...keys].sort());
   });
 
   it('shows each result shape with the keys and optional markers of its schema', () => {

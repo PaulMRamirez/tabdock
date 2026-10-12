@@ -1,6 +1,6 @@
 # Run a relay
 
-The relay is one Node process with two doors, `/mcp`, the URL clients add, and `/page`, the socket pages dial, plus `/g/mcp` for agent tokens while `TABDOCK_AGENT_TOKENS` is on. It never runs a tool, but it sees every call and result in plain text, as does anything that terminates TLS in front of it, so run your own. This page helps you pick a mode and run it; [Relay settings](08-relay-settings.md) lists every setting, and [the reference deployment](../deploy.md) runs hosted mode on Fly.io with WorkOS AuthKit.
+The relay is one Node process with three doors: `/mcp`, the URL clients add; `/page`, the socket pages dial; and `/g/mcp` for agent tokens, while `TABDOCK_AGENT_TOKENS` is on. It never runs a tool, but it sees every call and result in plain text, as does anything that terminates TLS in front of it, so run your own. This page picks a mode and runs it; [Relay settings](08-relay-settings.md) lists every setting, and [the reference deployment](../deploy.md) runs hosted mode on Fly.io with WorkOS AuthKit.
 
 The commands below run in a clone (`git clone`, then `pnpm install`). Once 0.1.0 is on npm, `npx @tabdock/relay` runs the same command, `tabdock-relay`, on Node 22.18 or later, reading settings from the environment alone, never a `.env` file; the [settings for rooms, images and state](14-settings-for-rooms.md) come with the release after 0.1.0.
 
@@ -8,14 +8,14 @@ The commands below run in a clone (`git clone`, then `pnpm install`). Once 0.1.0
 
 The relay picks its mode from its settings at start:
 
-| Mode       | Selected by                                                                                 | Clients from        | Pages from                  | Sign-in        | QR and invites                       | Audit log on disk             |
-| ---------- | ------------------------------------------------------------------------------------------- | ------------------- | --------------------------- | -------------- | ------------------------------------ | ----------------------------- |
-| Local      | no sign-in setting, `TABDOCK_ENV` not `production`                                          | this computer       | this computer               | an owner token | no                                   | yes, beside the token         |
-| Dev tokens | `TABDOCK_DEV_TOKENS`                                                                        | this computer       | this computer               | named tokens   | no                                   | only with `TABDOCK_AUDIT_DIR` |
-| Public URL | `TABDOCK_PUBLIC_URL` with an identity provider                                              | anywhere, by tunnel | the relay's computer only   | the provider's | QR; invites with `TABDOCK_INVITES=1` | only with `TABDOCK_AUDIT_DIR` |
-| Hosted     | public URL, `TABDOCK_ENV=production` and `TABDOCK_CLIENT_ADDRESS_HEADER`, behind a TLS edge | anywhere            | anywhere, on listed origins | the provider's | QR; invites with `TABDOCK_INVITES=1` | required                      |
+| Mode       | Selected by                                                                                 | What it gives                                                                                                                                                                                                                                 |
+| ---------- | ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Local      | no sign-in setting, `TABDOCK_ENV` not `production`                                          | Clients and pages on this computer, signed in by an owner token; no QR or invites; an audit log beside the token                                                                                                                              |
+| Dev tokens | `TABDOCK_DEV_TOKENS`                                                                        | Clients and pages on this computer, signed in by named tokens; invites and agent tokens may be turned on to test `g_` invitees, but links, observers' sessions and agent tokens need a public URL; an audit log only with `TABDOCK_AUDIT_DIR` |
+| Public URL | `TABDOCK_PUBLIC_URL` with an identity provider                                              | Clients from anywhere by tunnel, pages from the relay's computer only, the provider's sign-in, the QR code, invites with `TABDOCK_INVITES=1`; an audit log only with `TABDOCK_AUDIT_DIR`                                                      |
+| Hosted     | public URL, `TABDOCK_ENV=production` and `TABDOCK_CLIENT_ADDRESS_HEADER`, behind a TLS edge | Clients from anywhere, pages from anywhere on listed origins, the provider's sign-in, the QR code, invites with `TABDOCK_INVITES=1`; an audit log, required                                                                                   |
 
-Clients on your computer, such as Claude Code, need only local mode. Claude on the web, desktop and phone connects from Anthropic's cloud, so it needs a public https URL, through a tunnel or on a host. Pages on other people's computers need hosted mode.
+Claude Code on your computer needs only local mode; Claude on the web, desktop and phone connects from Anthropic's cloud and needs a public https URL, through a tunnel or on a host; pages on other people's computers need hosted mode.
 
 ## Local mode
 
@@ -29,11 +29,11 @@ To rotate the token, stop the relay and run `pnpm relay --new-token`; the old to
 
 ## Dev tokens
 
-For several named people on one computer, as in testing, set `TABDOCK_DEV_TOKENS=alice=<token>,bob=<token>`, each token 24 or more printable characters without spaces, for example from `node -e "console.log(require('node:crypto').randomBytes(24).toString('base64url'))"`. Clients send `Authorization: Bearer <token>`, and the relay stays on loopback. With the tokens in `.env`, `pnpm dev` prints a Claude Code line to fill in; `pnpm relay` prints only the MCP URL. Dev tokens turn local mode off, so a `tabdock-local` entry answers 401 until you return to it. [Sharing](06-sharing.md#try-sharing-on-one-computer) walks two people through one page.
+For several named people on one computer, set `TABDOCK_DEV_TOKENS=alice=<token>,bob=<token>`, each token 24 or more printable characters without spaces, for example from `node -e "console.log(require('node:crypto').randomBytes(24).toString('base64url'))"`. Clients send `Authorization: Bearer <token>`, and the relay stays on loopback. With the tokens in `.env`, `pnpm dev` prints a Claude Code line to fill in; `pnpm relay` prints only the MCP URL. Dev tokens turn local mode off, so a `tabdock-local` entry answers 401 until you return to it. [Sharing](06-sharing.md#try-sharing-on-one-computer) walks two people through one page.
 
 ## Public URL through a tunnel
 
-You need a tunnel with a fixed https name, an identity provider, and six settings. The provider must offer the following, which WorkOS AuthKit does ([the reference deployment](../deploy.md#workos-authkit-production-workos) shows its switches); any other provider that does the same works without code changes.
+You need a tunnel with a fixed https name, an identity provider, and six settings. The provider must offer the following, as WorkOS AuthKit does ([its switches](../deploy.md#workos-authkit-production-workos)); any provider that does works unchanged.
 
 | At the provider       | What the relay needs                                                                                                                                              |
 | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -56,7 +56,7 @@ TABDOCK_ALLOWED_ORIGINS=http://127.0.0.1:5173
 
 A [members file](14-settings-for-rooms.md#members-agents-and-restarts) at `TABDOCK_MEMBERS_FILE` may stand in for `TABDOCK_OAUTH_USERS`, never beside it. `pnpm dev:public` starts this mode with the demo board, takes either list (its banner then counts the file's members), names any setting that is missing, and prints the values to register at the provider (never the secret); `pnpm relay` starts the relay alone. Point the tunnel at `127.0.0.1:8787`. Keep the public `Host` header, pick a tunnel that streams responses (Cloudflare's quick tunnels do not carry server-sent events), and turn off any request inspector, which would show bearer tokens; with ngrok that is `ngrok http 127.0.0.1:8787 --url https://<your domain> --inspect=false`.
 
-Pages still attach only from the relay's computer: `/page` refuses anything that came through the tunnel. Add the connector `https://relay.example/mcp` in Claude and Claude Code ([Connect clients](05-connect-clients.md)). The project has tested this mode against a stand-in tunnel and provider only.
+Pages still attach only from the relay's computer: `/page` refuses anything that came through the tunnel, so a page dials `ws://127.0.0.1:8787/page`. Add the connector `https://relay.example/mcp` in Claude and Claude Code ([Connect clients](05-connect-clients.md)). The project has tested it only against a stand-in tunnel and provider, as `pnpm demo:m6` runs them ([Run a class](21-run-a-class.md#rehearse-on-one-computer)).
 
 ## Hosted on your own host
 
@@ -153,11 +153,11 @@ PrivateTmp=yes
 WantedBy=multi-user.target
 ```
 
-The image's 192 MiB heap cap is sized for four default budgets: `TABDOCK_MAX_TOOL_BYTES` and `TABDOCK_MAX_REQUEST_BYTES`, with which tests filled it, and `TABDOCK_MAX_STATE_BYTES` and `TABDOCK_MAX_PROPOSAL_BYTES`, whose charges tests measure. Raising any of them calls for a larger heap: arguments after the image name replace its command, as in `docker run ... tabdock --max-old-space-size=384 packages/relay/src/main.ts`. Unread answers, bounded by `TABDOCK_MAX_RESPONSE_BYTES` (96 MiB), sit beside the heap. Plain `node` sets no heap cap.
+The image's 192 MiB heap cap is sized for the default `TABDOCK_MAX_TOOL_BYTES`, `TABDOCK_MAX_REQUEST_BYTES`, `TABDOCK_MAX_STATE_BYTES` and `TABDOCK_MAX_PROPOSAL_BYTES`. Raising any of them calls for a larger heap: arguments after the image name replace its command, as in `docker run ... tabdock --max-old-space-size=384 packages/relay/src/main.ts`. Unread answers, bounded by `TABDOCK_MAX_RESPONSE_BYTES` (96 MiB), sit beside the heap. Plain `node` sets no heap cap.
 
 ## Operating it
 
-Run one relay per URL; a second on the same audit directory refuses to start. Stop it with SIGTERM (Ctrl-C, `docker stop`, `systemctl stop`): it closes within about a second and releases its locks. With `TABDOCK_RESTART_SNAPSHOT` on, the snapshot's write took up to 8.7 s at a small shared CPU's baseline, so allow 30 s (`docker stop -t 30`; the unit above already does).
+Run one relay per URL; a second on the same audit directory refuses to start. Stop it with Ctrl-C (SIGINT) or SIGTERM (`docker stop`, `systemctl stop`): it closes within about a second and releases its locks. pnpm's `ELIFECYCLE Command failed.` after Ctrl-C is expected; the `relay closed` line above it shows a clean stop. With `TABDOCK_RESTART_SNAPSHOT` on, the snapshot's write took up to 8.7 s at a small shared CPU's baseline, so allow 30 s (`docker stop -t 30`; the unit above already does).
 
 Without the snapshot, a restart forgets pages, attachments, invites, agent tokens (whose clients then get 404 at `/g/mcp`) and time-boxed sessions; with it, they return after a graceful stop of under 10 minutes. The snapshot carries no pairing codes, pending requests, proposals, sign-ins in progress or published state, which each page sends again; clients stay signed in. [Larger rooms](20-larger-rooms.md) sizes one for a class.
 

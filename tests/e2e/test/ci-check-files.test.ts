@@ -480,13 +480,41 @@ describe('the runner, interrupted', () => {
   );
 });
 
-describe('guide page 17', () => {
-  it('names in its helper table exactly what @tabdock/adapter/testing exports', async () => {
-    const page = readRepo('docs/guide/17-check-from-ci.md');
+describe('guide page 24, the testing helper', () => {
+  const page = readRepo('docs/guide/24-scripts-and-the-widget.md');
+
+  it('names in its helper table exactly what @tabdock/adapter/testing exports, each with its call', async () => {
     const section = page.slice(page.indexOf('## The testing helper'));
-    const named = [...section.matchAll(/^\| `([A-Za-z_]+)(?:\(\))?`/gm)].map((match) => match[1]);
+    const rows = [...section.matchAll(/^\| `([A-Za-z_]+)(?:\(\))?`\s*\|([^|]*)\|/gm)];
+    const named = rows.map((match) => match[1]);
     const exported = Object.keys(await import('@tabdock/adapter/testing'));
     expect(named.length).toBeGreaterThan(0);
     expect([...named].sort()).toEqual([...exported].sort());
+    // Each function's call gives its arguments, so a reader need not open the source;
+    // every one but maskCode takes the DevTools session first.
+    const functions = rows.filter((match) => /\(\)`/.test(match[0]));
+    expect(functions.length).toBeGreaterThan(5);
+    for (const match of functions) {
+      const name = match[1] ?? '';
+      expect(match[2], name).toContain(name === 'maskCode' ? 'maskCode(code)' : `${name}(cdp`);
+    }
+  });
+
+  it('uses only actions and roles the widget has', async () => {
+    const { WIDGET_ACTIONS, WIDGET_ROLES } = await import('@tabdock/adapter/testing');
+    const actions = new Set<string>(WIDGET_ACTIONS);
+    const roles = new Set<string>(WIDGET_ROLES);
+    const usedActions = [...page.matchAll(/action: '([a-z-]+)'/g)].map((match) => match[1] ?? '');
+    const usedRoles = [...page.matchAll(/widgetText\(cdp, '([a-z-]+)'\)/g)].map(
+      (match) => match[1] ?? '',
+    );
+    // The prose names actions in code spans after the pointer to widget-names.ts.
+    const prose = page.slice(page.indexOf('widget-names.ts'));
+    const listed = [...prose.matchAll(/`([a-z]+(?:-[a-z0-9]+)+)`/g)].map((match) => match[1] ?? '');
+    expect(usedActions.length).toBeGreaterThan(3);
+    expect(usedRoles.length).toBeGreaterThan(1);
+    expect(listed.length).toBeGreaterThan(5);
+    expect([...usedActions, ...listed].filter((action) => !actions.has(action))).toEqual([]);
+    expect(usedRoles.filter((role) => !roles.has(role))).toEqual([]);
   });
 });

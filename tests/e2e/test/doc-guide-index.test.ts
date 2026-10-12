@@ -3,9 +3,10 @@
 // The Every page list links each numbered page once, in page order, its item
 // numbers the pages' own (the numbers in the URLs readers see); the Where to
 // start table reaches every page from some task, since a page no row names
-// is found only by scrolling (page 15 once was); and README.md's You want to
-// table is the guide's, row for row, by task and by the set of guide pages
-// each row links, so the copy cannot drift from the original again.
+// is found only by scrolling (page 15 once was); and README.md keeps no copy
+// of that table but links it: a copy row for row once had to be edited with
+// the original every time, and made the front page longer than any guide
+// page may be (the walkthrough pass after M6).
 
 import { describe, expect, it } from 'vitest';
 import { guidePages, readRepo, type Table, tables, withoutCodeBlocks } from '../src/doc-files.ts';
@@ -97,9 +98,10 @@ describe("the guide's indexes", () => {
     expect(unreached(taskTable(start), pages)).toEqual([]);
   });
 
-  it("hold README.md's table to the guide's, row for row", () => {
-    const start = sectionUnder(index, 'Where to start');
-    expect(rowsOf(taskTable(readRepo(FRONT)))).toEqual(rowsOf(taskTable(start)));
+  it("are linked from README.md, which keeps no copy of the guide's table", () => {
+    const front = readRepo(FRONT);
+    expect(tables(front).some((table) => table.header[0] === 'You want to')).toBe(false);
+    expect(front).toContain('](docs/guide/README.md#where-to-start)');
   });
 
   it('would fail a page left out, a list out of order, a misnumbered item and a drifted row', () => {

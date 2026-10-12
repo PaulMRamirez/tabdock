@@ -50,7 +50,7 @@ A wall-screen dashboard registers only read-only tools and sets `autoApprove: 'o
 
 A teacher projects a page that follows the [map profile](16-map-pages.md), starts a time-boxed session and hands out its watch link; each student's Claude reads and captures the view, waits on its state and proposes stops, which the teacher accepts.
 
-**Needs settings; not yet run live with a class.** Public URL mode with invites. `pnpm demo:m6` runs every leg on one machine in about 45 s against a stand-in provider, and `pnpm measure:room` sized a 512 MiB relay for classes of 40 and 80; a session with 40 observers mints two watch links. [Run a class](21-run-a-class.md) gives the steps.
+**Needs settings; not yet run live with a class.** Public URL mode with invites. `pnpm demo:m6` rehearses a lesson in about 45 s against a stand-in provider, its join limits raised, and `pnpm measure:room` sized a 512 MiB relay for classes of 40 and 80. [Run a class](21-run-a-class.md) gives the steps.
 
 ## Check a walkthrough on every change
 

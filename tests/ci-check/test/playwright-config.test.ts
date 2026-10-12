@@ -7,7 +7,7 @@
 // repository variable reaches a workflow's env as an empty string. Playwright
 // probes a server's URL before it runs the command, and a URL that answers
 // stops the run as "already used", so the address the config falls back on
-// must be one no page is served at: never a port guide page 17's workflow
+// must be one no page is served at: never a port guide page 23's workflow
 // or this repository's own check serves the page or the relay on.
 
 import { spawnSync } from 'node:child_process';
@@ -60,7 +60,7 @@ describe("the copied check's page server", () => {
   it('falls back on an address no page or relay of the guide or this repository is served at', async () => {
     const fallback = new URL((await pageServer({ CI_CHECK_PAGE_URL: '' })).url ?? '');
     const guide = readFileSync(
-      new URL('../../../docs/guide/17-check-from-ci.md', import.meta.url),
+      new URL('../../../docs/guide/23-copy-the-ci-check.md', import.meta.url),
       'utf8',
     );
     // The guide's workflow: the page's --port and its URL, read so a new example is held too.

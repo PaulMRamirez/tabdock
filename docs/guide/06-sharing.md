@@ -40,7 +40,7 @@ Connect the board, pair alice with one code and bob with the next, and Allow ali
 
 ## Invites
 
-An invite admits someone off the member list. It needs a relay with a public URL and `TABDOCK_INVITES=1`, a page whose `policy.invites` allows it (`'watch'`, the default, or `'all'`), a member attached to sponsor it, and a secure context (https or localhost) for WebCrypto. In the widget choose Invite someone, give a label of up to 60 characters, pick Can watch or Can control and a lifetime (15 minutes, 1 hour, or while the page is open), and choose Create link. The link shows once, with a QR code, and the relay keeps only a hash of its secret.
+An invite admits someone off the member list. It needs a relay with a public URL and `TABDOCK_INVITES=1`, a page whose `policy.invites` allows it (`'watch'`, the default, or `'all'`), a member attached to sponsor it, and a secure context (https or localhost) for WebCrypto. In the widget choose Invite someone, give a label of up to 60 characters, pick Can watch (or Can control, under `invites: 'all'`) and a lifetime (15 minutes, 1 hour, or while the page is open), and choose Create link. The link shows once, with a QR code, and the relay keeps only a hash of its secret.
 
 |            | Can watch                           | Can control                                       |
 | ---------- | ----------------------------------- | ------------------------------------------------- |

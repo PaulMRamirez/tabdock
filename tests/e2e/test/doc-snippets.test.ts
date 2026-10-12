@@ -129,6 +129,24 @@ describe('code in the guide and READMEs', () => {
     expect(declaring).not.toEqual([]);
   });
 
+  it('declare every annotation the guide tells a page to register', () => {
+    // The guide's declaration once lacked untrustedContentHint, which the map
+    // profile's page tells read-only tools to carry, so a page that followed
+    // both failed to compile; no block used the hint, so the typecheck below
+    // never met it.
+    const guide = markdownIn('docs/guide').map(readRepo).join('\n');
+    const named = new Set(
+      [...guide.matchAll(/\b([a-z][A-Za-z]*Hint)\b/g)].map((match) => match[1] ?? ''),
+    );
+    const declaration = markdownIn('docs/guide')
+      .flatMap((doc) => codeBlocks(readRepo(doc)))
+      .find((block) => DECLARES_MODEL_CONTEXT.test(block.body));
+    const annotations = /annotations\?:\s*\{([^}]*)\}/.exec(declaration?.body ?? '')?.[1] ?? '';
+    const declared = new Set([...annotations.matchAll(/(\w+Hint)\?:/g)].map((match) => match[1]));
+    expect(named.has('untrustedContentHint')).toBe(true);
+    expect([...named].filter((hint) => !declared.has(hint))).toEqual([]);
+  });
+
   it('typechecks against the workspace packages under strict settings', () => {
     expect(diagnosticsFor(snippets)).toEqual([]);
   }, 120_000);

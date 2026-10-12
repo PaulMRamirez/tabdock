@@ -4,7 +4,7 @@ Every relay setting is an optional environment variable starting `TABDOCK_`; wit
 
 ## How the relay reads them
 
-The relay reads its settings once, at start, so any change needs a restart. In a clone, `pnpm relay`, `pnpm dev`, `pnpm dev:public` and `pnpm audit:log` also load the root `.env`, where a variable already set wins. The container image holds no `.env`, and `tabdock-relay`, the command `npx @tabdock/relay` runs once 0.1.0 is on npm, reads none. An empty value counts as unset. [`.env.example`](../../.env.example) holds the same list as a commented template for `.env`.
+The relay reads its settings once, at start, so any change needs a restart. In a clone, `pnpm relay`, `pnpm dev`, `pnpm dev:public` and `pnpm audit:log` also load the root `.env`, where a variable already set wins, even an empty one. An empty value counts as unset, so `VAR= pnpm relay` turns a `.env` setting off. The container image holds no `.env`, and `tabdock-relay`, the command `npx @tabdock/relay` runs once 0.1.0 is on npm, reads none. [`.env.example`](../../.env.example) holds the same list as a commented template for `.env`.
 
 ## Value rules
 

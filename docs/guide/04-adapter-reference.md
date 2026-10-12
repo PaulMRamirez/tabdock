@@ -140,7 +140,7 @@ Never log or send on `state.pairing.code`, `state.pairing.url` (its fragment is 
 | `sessionRecordMarkdown` | `sessionRecordMarkdown(record)` gives the Markdown summary Save summary writes                                                                                 |
 | `sessionRecordFileName` | `sessionRecordFileName(record, 'json')`, or `'md'`, gives the name the widget saves under: `tabdock-record-`, the start's date and time, and a session's label |
 
-It also exports the TypeScript types of the handle, its state, the policy and the results. A separate entry, `@tabdock/adapter/testing`, drives the widget from a test through the DevTools protocol ([Check a page from CI](17-check-from-ci.md#the-testing-helper)).
+It also exports the TypeScript types of the handle, its state, the policy and the results. A separate entry, `@tabdock/adapter/testing`, drives the widget from a test through the DevTools protocol ([Scripts and the widget](24-scripts-and-the-widget.md#the-testing-helper)).
 
 ## What counts as one page
 
