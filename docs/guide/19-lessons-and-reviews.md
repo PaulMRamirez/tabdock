@@ -18,7 +18,7 @@ Start a session in the widget, or with `dock.startSession()`: a label, a length 
 
 While it runs the block counts down and the badge shows the minutes left, with a notice at 5 minutes and at 1. The observers' links come one watch invite for every 20 observers, and Show QR shows one at a time, the first with uses left, so a projected QR always works; links show once and a reload keeps none, so New link mints another. Extend adds 15 minutes, up to 4 hours from the start, and End session asks first, saying how many guests leave. The sponsor's line warns when their attachment may time out before the session ends, taking their guests with it.
 
-A session ends on the relay's clock and, 5 s later if the relay has not, on the page's own. Its end closes every attachment an invite or agent token made on the page, every live invite and every agent token, those from before it included, and the page's own policy returns. A page asks the relay to end a session the relay lists but the page holds no record of, such as one it ended while the link was down. In local mode a session is a time box only, with no invites.
+A session ends on the relay's clock and on the page's own, whichever comes first; the page drops its guests at once and tells the relay 5 s later if the relay has not ended it. Its end closes every attachment an invite or agent token made on the page, every live invite and every agent token, those from before it included, and the page's own policy returns. A page asks the relay to end a session the relay lists but the page holds no record of, such as one it ended while the link was down. In local mode a session is a time box only, with no invites.
 
 ## The session record
 
