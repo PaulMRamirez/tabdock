@@ -2,11 +2,11 @@
 // part a later wave built and marked each stub, so this fails while any part
 // is still a stub, and while any sentence the documents wrote ahead of the
 // code is still a promise. No seam marker is left in the sources, tests or
-// scripts but the one constant that names it for packages/relay's
-// foundation test; first-class tools carry SPEC section 7's prefix word for
-// word; every setting guide page 14 lists is read by the relay outside
-// config.ts, where it is only parsed; and no setting is refused as one the
-// relay does not read, serve or write yet.
+// scripts but the constant that names it, in packages/relay's foundation
+// test and in this file; first-class tools carry SPEC section 7's prefix
+// word for word; every setting guide page 14 lists is read by the relay
+// outside config.ts, where it is only parsed; and no setting is refused as
+// one the relay does not read, serve or write yet.
 
 import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
