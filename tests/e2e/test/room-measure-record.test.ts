@@ -3,13 +3,14 @@
 // wrote, docs/notes/m6/room-measure.raw.json, against the code as it stands.
 // Every room's figures must pass the bars bars.ts scores today, the class of
 // 40 must have run on the shipped defaults with no setting named, the limits
-// and rates the run recorded must be the ones config.ts ships now, and the
-// relay must have run as the image runs it. A default changed later, a bar
-// moved, or a heap flag the Dockerfile no longer uses fails here until
-// pnpm measure:room is run again and its file committed, so the audit's
-// claim that the shipped defaults pass the bars cannot go stale unseen.
+// and rates the run recorded, hosted mode's among them, must be the ones
+// config.ts ships now, and the relay must have run as the image runs it.
+// A default changed later, a bar moved, or a heap flag the Dockerfile no
+// longer uses fails here until pnpm measure:room is run again and its file
+// committed, so the audit's claim that the shipped defaults pass the bars
+// cannot go stale unseen.
 
-import { DEFAULT_LIMITS, DEFAULT_RATE_LIMITS } from '@tabdock/relay';
+import { DEFAULT_LIMITS, DEFAULT_RATE_LIMITS, HOSTED_LIMITS } from '@tabdock/relay';
 import { describe, expect, it } from 'vitest';
 import { readRepo } from '../src/doc-files.ts';
 import { type Bar, BARS, barsOf, type ScoredPhase } from '../src/measure-room/bars.ts';
@@ -17,6 +18,17 @@ import { type ConfinementKind, MEMORY_LIMIT_BYTES } from '../src/measure-room/co
 import { imageHeapFlag } from '../src/measure-room/room.ts';
 
 const RAW = 'docs/notes/m6/room-measure.raw.json';
+
+/**
+ * HOSTED_LIMITS at the recorded run's commit (`db9a115`), which every room
+ * ran under, since the relay was in hosted mode; that run's file recorded
+ * only the defaults beneath them. A run made since records its own.
+ */
+const HOSTED_LIMITS_AT_RUN = {
+  pageSessions: 100,
+  pageSocketsPerAddress: 5,
+  pageSessionsPerAddress: 5,
+};
 
 /** The settings the guide tells a larger room to name (guide page 14); nothing else may differ. */
 const ROOM_SETTINGS = ['TABDOCK_MAX_OBSERVERS_PER_PAGE', 'TABDOCK_MAX_INVITEE_SESSIONS'];
@@ -42,6 +54,8 @@ interface RoomRecord {
     uncommitted: boolean;
     heapFlag: string;
     limits: Record<string, number>;
+    /** Hosted mode's replacements, recorded from Wave 3's cross review on. */
+    hostedLimits?: Record<string, number>;
     rateLimits: Record<string, number>;
   };
   bars: Record<string, number>;
@@ -123,6 +137,11 @@ describe("the room measurement's record (A6.22, ADR 0044)", () => {
     expect(
       changed(record.machine.rateLimits, DEFAULT_RATE_LIMITS),
       'DEFAULT_RATE_LIMITS changed since the run: run pnpm measure:room again',
+    ).toEqual([]);
+    // Every room ran in hosted mode, so what replaced the defaults there must not have moved either.
+    expect(
+      changed(record.machine.hostedLimits ?? HOSTED_LIMITS_AT_RUN, HOSTED_LIMITS),
+      'HOSTED_LIMITS changed since the run: run pnpm measure:room again',
     ).toEqual([]);
   });
 

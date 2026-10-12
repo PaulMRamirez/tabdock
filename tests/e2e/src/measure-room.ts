@@ -20,7 +20,7 @@ import { writeFileSync } from 'node:fs';
 import { cpus, release, totalmem } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
-import { DEFAULT_LIMITS, DEFAULT_RATE_LIMITS } from '@tabdock/relay';
+import { DEFAULT_LIMITS, DEFAULT_RATE_LIMITS, HOSTED_LIMITS } from '@tabdock/relay';
 import { RESPONSE_CEILING_LINE } from '../../../packages/relay/src/response-stalls.ts';
 import { type Bar, BARS, barsOf } from './measure-room/bars.ts';
 import {
@@ -230,8 +230,13 @@ const machine = {
   heapFlag: imageHeapFlag(),
   harnessCpus: harnessCpu,
   network: narrow,
-  /** The relay's limits as this checkout ships them; each room's settings add to them. */
+  /**
+   * The relay's default limits and rates as this checkout ships them. Every
+   * room runs in hosted mode, where `hostedLimits` replace three of them
+   * (ADR 0018); each room's settings add to both.
+   */
   limits: DEFAULT_LIMITS,
+  hostedLimits: HOSTED_LIMITS,
   rateLimits: DEFAULT_RATE_LIMITS,
 };
 say(
