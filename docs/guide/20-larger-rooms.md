@@ -22,6 +22,8 @@ Save a change by writing a new file beside the old one and renaming it over it, 
 
 Adding someone takes effect within about 4 s. Removing someone, or giving their subject another user id, ends at that moment every attachment, pending request, `/pair` sign-in and MCP session held under the old id, with what they sponsored: a request still in flight is refused, and a session still sending answers closes within a second. With `TABDOCK_RESTART_SNAPSHOT` on, a graceful restart within 10 minutes resumes pages, attachments and invites, and anyone the list no longer gives the same account comes back with nothing ([Settings for rooms](14-settings-for-rooms.md#members-agents-and-restarts)).
 
+A revoke that barred someone from an invite link stays with their account whatever the file later says, and never passes to whoever takes a freed id.
+
 ## Agent tokens
 
 An agent token lets a program that cannot sign in, Claude Code in a script or a CI job, watch one page. The relay needs `TABDOCK_AGENT_TOKENS=1`, invites on and a public URL, and a member attached to sponsor the token. In the widget choose Invite someone, then Agent (Claude Code, no sign-in), a label and a lifetime of 1, 4 or 8 hours, and Create command. The widget shows a ready command once, with Copy and Done, each taking a click only once the box has held still; nothing keeps the token but the program you give it to.

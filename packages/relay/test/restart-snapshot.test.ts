@@ -91,10 +91,12 @@ import {
   attachMember,
   call,
   emailClaims,
+  joinAtI,
   latest,
   MEMBERS,
   mintOk,
   redeem,
+  signedInAtI,
 } from './helpers/invites.ts';
 import {
   connectPage,
@@ -654,6 +656,45 @@ describe('a graceful restart with TABDOCK_RESTART_SNAPSHOT on (A6.18)', () => {
     // Carol signs in as bob now, and holds none of the page.
     const carol = await second.claude('sub-carol');
     expect((await call(carol, 'call_page_tool', getView(page.pageId))).isError).toBe(true);
+  });
+
+  it("keeps a revoke bar on the account when the list in force moves the barred member's id (S14)", async () => {
+    const idp = await provider();
+    const dir = auditDir();
+    const members = join(privateDir(), 'members.txt');
+    const save = (lines: string[]): void => {
+      writeFileSync(`${members}.new`, `${lines.join('\n')}\n`, { mode: 0o600 });
+      renameSync(`${members}.new`, members);
+    };
+    save(['sub-alice=alice:Alice', 'sub-carol=carol:Carol']);
+    const first = await startRun(dir, idp, { membersFile: members });
+    const page = await first.page();
+    await attachMember(await first.claude('sub-alice'), page);
+    const { secret, inviteId } = await mintOk(page, { uses: 5 });
+    const carol = await signedInAtI({ relay: first.relay, provider: idp }, 'sub-carol', null);
+    const joined = await joinAtI(carol, page, secret, { allow: true, role: 'observer' });
+    expect(joined.request.user.userId).toBe('carol');
+    // Revoked with the link kept open, as the widget does with its box unticked.
+    page.send({ t: 'revoke', userId: 'carol' });
+    await latest(page, 'roster');
+    expect(rosterIds(page)).toEqual(['alice']);
+    await first.close();
+
+    // While the relay is down, Carol's subject is given another id.
+    save(['sub-alice=alice:Alice', 'sub-carol=carol2:Carol']);
+    const second = await startRun(dir, idp, { membersFile: members });
+    const back = await resumeOn(second, page);
+    expect(back.welcome?.resumed).toBe(true);
+    expect((await latest(back, 'invites')).invites.map((invite) => invite.inviteId)).toEqual([
+      inviteId,
+    ]);
+    const again = await signedInAtI({ relay: second.relay, provider: idp }, 'sub-carol', null);
+    expect(await again.post('/i/claim', { secret })).toMatchObject({
+      status: 403,
+      data: { error: 'denied_by_operator' },
+    });
+    await back.sync();
+    expect(back.all('attach_request')).toEqual([]);
   });
 
   it('writes no snapshot while a member list change is still owed, so what it ends never comes back (S8, S13)', async () => {

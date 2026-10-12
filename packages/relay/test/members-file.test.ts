@@ -954,6 +954,92 @@ describe('a user id the file moves (S13)', () => {
   });
 });
 
+describe("an invite's revoke bar across a member list change (S14)", () => {
+  const CAROL = 'sub-carol=carol:Carol';
+
+  /**
+   * Alice shares a five-use watch link, `sub` joins by it at /i, and the
+   * operator revokes them with the link kept open (the widget's box left
+   * unticked): the relay bars them from it, and a claim by the same
+   * account is refused before the page hears of it.
+   */
+  async function revokedFromLink(
+    members: MembersRelay,
+    sub: string,
+    email: string | null,
+  ): Promise<{ page: TestPage; secret: string; inviteId: string; userId: string }> {
+    const { relay } = members;
+    const page = await relay.page();
+    const alice = await relay.claude('sub-alice');
+    await attachMember(alice, page);
+    const invite = await mintOk(page, { uses: 5 });
+    const phone = await signedInAtI(relay, sub, email);
+    const joined = await joinAtI(phone, page, invite.secret, { allow: true, role: 'observer' });
+    expect(joined.settled.status).toBe('approved');
+    const { userId } = joined.request.user;
+    page.send({ t: 'revoke', userId });
+    expect((await latest(page, 'roster')).attachments.map((listed) => listed.userId)).toEqual([
+      'alice',
+    ]);
+    expect((await latest(page, 'invites')).invites.map((listed) => listed.inviteId)).toEqual([
+      invite.inviteId,
+    ]);
+    const again = await phone.post('/i/claim', { secret: invite.secret });
+    expect(again).toMatchObject({ status: 403, data: { error: 'denied_by_operator' } });
+    return { page, secret: invite.secret, inviteId: invite.inviteId, userId };
+  }
+
+  /** A claim by `sub` signed in now, which the bar must refuse before any request reaches the page. */
+  async function refusedAfterChange(
+    relay: InviteRelay,
+    page: TestPage,
+    secret: string,
+    sub: string,
+    email: string | null,
+  ): Promise<void> {
+    const asked = page.all('attach_request').length;
+    const phone = await signedInAtI(relay, sub, email);
+    const claimed = await phone.post('/i/claim', { secret });
+    expect(claimed).toMatchObject({ status: 403, data: { error: 'denied_by_operator' } });
+    await page.sync();
+    expect(page.all('attach_request')).toHaveLength(asked);
+    expect((await latest(page, 'roster')).attachments.map((listed) => listed.userId)).toEqual([
+      'alice',
+    ]);
+  }
+
+  it('holds for a revoked member the file removes, now signing in as an invitee', async () => {
+    const members = await membersRelay([ALICE, BOB, CAROL]);
+    const { page, secret, userId } = await revokedFromLink(members, 'sub-carol', null);
+    expect(userId).toBe('carol');
+    members.save([ALICE, BOB]);
+    expect(await members.relay.relay.reloadMembers()).toBe('applied');
+    await refusedAfterChange(members.relay, page, secret, 'sub-carol', 'carol@example.com');
+  });
+
+  it('holds for a revoked member the file moves to another id, and spares whoever takes the old one', async () => {
+    const members = await membersRelay([ALICE, BOB, CAROL]);
+    const { page, secret } = await revokedFromLink(members, 'sub-carol', null);
+    members.save([ALICE, BOB, 'sub-carol=carol2:Carol', 'sub-erin=carol:Erin']);
+    expect(await members.relay.relay.reloadMembers()).toBe('applied');
+    await refusedAfterChange(members.relay, page, secret, 'sub-carol', null);
+    // The bar is Carol's, not her old id's: Erin, who holds it now, may redeem.
+    const erin = await signedInAtI(members.relay, 'sub-erin', null);
+    const joined = await joinAtI(erin, page, secret, { allow: true, role: 'observer' });
+    expect(joined.request.user.userId).toBe('carol');
+    expect(joined.settled.status).toBe('approved');
+  });
+
+  it('holds for a revoked invitee the file adds as a member', async () => {
+    const members = await membersRelay([ALICE, BOB]);
+    const { page, secret, userId } = await revokedFromLink(members, 'sub-dan', 'dan@example.com');
+    expect(userId).toBe(inviteeId('sub-dan'));
+    members.save([ALICE, BOB, 'sub-dan=dan:Dan']);
+    expect(await members.relay.relay.reloadMembers()).toBe('applied');
+    await refusedAfterChange(members.relay, page, secret, 'sub-dan', null);
+  });
+});
+
 describe('what a reload leaves alone (ADR 0043)', () => {
   const pause = (ms: number): Promise<void> =>
     new Promise((resolve) => {

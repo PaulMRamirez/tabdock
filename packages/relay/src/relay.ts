@@ -708,6 +708,11 @@ export async function createRelay(options: RelayOptions): Promise<Relay> {
   };
   const spike = config.spike ? new Spike(log, MAX_MCP_BODY_BYTES) : null;
   const hub = new PageHub(config, store, log, spike);
+  // A revoke bar names the account, found through the list the plugin maps subjects with (S14).
+  const accountList = auth.members;
+  if (accountList !== undefined) {
+    hub.useAccountIds((userId) => accountList.accountIdOf(userId));
+  }
   if (taken?.kind === 'loaded') {
     const unfit = fitProblem(taken.snapshot, config);
     if (unfit !== null) {

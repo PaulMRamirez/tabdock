@@ -1453,6 +1453,12 @@ export class PageHub {
   readonly #firstClassLists = new Map<string, FirstClassSnapshot>();
   /** Told the users whose first-class list may have changed; the notifier reads it later. */
   #firstClassListener: ((userId: string) => void) | null = null;
+  /**
+   * The id that stands for a user id's account whatever id the member list
+   * gives it (members.ts, accountIdOf), which an invite's revoke bar holds;
+   * each id stands for itself with no list (useAccountIds).
+   */
+  #accountIdOf: (userId: string) => string = (userId) => userId;
   /** The only place CfWorker runs: a worker thread with a time budget per check (ADR 0010). */
   readonly #checker: ArgumentChecker;
   /** When each page last got a roster, for EXPIRY_ROSTER_REFRESH_MS. */
@@ -2455,9 +2461,17 @@ export class PageHub {
     if (send) this.#sendInvites(pageId);
   }
 
-  /** Bars an account, and its verified email when it has one, from an invite for the invite's life. */
+  /**
+   * Bars an account, and its verified email when it has one, from an invite
+   * for the invite's life. The bar names the account, never a member id the
+   * file assigned (#accountIdOf): a member list change that removes the
+   * account, moves its id or makes a barred invitee a member clears nothing,
+   * since no redemption clears a revoke, and bars nobody the file gives the
+   * old id to next (S14, ADR 0017).
+   */
   #bar(invite: InviteRecord, userId: string, emailHash: string | null): void {
-    if (!invite.barredUserIds.includes(userId)) invite.barredUserIds.push(userId);
+    const accountId = this.#accountIdOf(userId);
+    if (!invite.barredUserIds.includes(accountId)) invite.barredUserIds.push(accountId);
     if (emailHash !== null && !invite.barredEmailHashes.includes(emailHash)) {
       invite.barredEmailHashes.push(emailHash);
     }
@@ -2465,7 +2479,11 @@ export class PageHub {
   }
 
   #barred(invite: InviteRecord, userId: string, account: UserAccount): boolean {
-    if (invite.barredUserIds.includes(userId)) return true;
+    // The id as given too, so a bar a relay without the account rule saved still holds.
+    const { barredUserIds } = invite;
+    if (barredUserIds.includes(userId) || barredUserIds.includes(this.#accountIdOf(userId))) {
+      return true;
+    }
     return (
       account.kind === 'invitee' &&
       account.email !== null &&
@@ -3269,6 +3287,16 @@ export class PageHub {
    */
   onAgentClosed(listener: (userId: string) => void): void {
     this.#agentListener = listener;
+  }
+
+  /**
+   * How to find the account behind a user id under the member list in force
+   * (relay.ts hands it MemberList.accountIdOf when there is a list), so an
+   * invite's revoke bar follows the account across member list changes and
+   * restarts (#bar, S14). It must answer from the list alone.
+   */
+  useAccountIds(accountIdOf: (userId: string) => string): void {
+    this.#accountIdOf = accountIdOf;
   }
 
   /**
