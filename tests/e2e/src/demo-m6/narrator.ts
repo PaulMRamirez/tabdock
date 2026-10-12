@@ -1,15 +1,29 @@
 // The voice of pnpm demo:m6, and its guard (S11): every line the demo prints
 // goes through say(), which first looks for each secret the run has met
-// (bearer tokens, pairing codes, invite and session link secrets and their
-// digests, the agent token and the relay's own client secret) and hides any
-// it finds, counting the step as unexpected so the run fails. Codes and
-// links reach the narration only masked, so a clean run hides nothing.
+// (bearer tokens, the pairing codes it read, invite and session link secrets
+// and their digests, the agent token, each phone's sign-in cookies and the
+// authorization code, state and nonce of its sign-in, and the relay's own
+// client secret) and hides any it finds, counting the step as unexpected so
+// the run fails. Codes and links reach the narration only masked, so a clean
+// run hides nothing. A pairing code the widget showed and the run never read
+// is not among them.
 
 import { createHash } from 'node:crypto';
 import { maskCode } from '@tabdock/adapter/testing';
 import type { AuditLine } from '@tabdock/protocol';
 
 export { maskCode };
+
+/** What a phone kept of its sign-in at /pair or /i, as the relay tests' Phone keeps it. */
+export interface SignedInPhone {
+  /** Every cookie the relay set it. */
+  readonly setCookies: readonly { readonly value: string }[];
+  /** Every URL it requested, at the relay and at the provider. */
+  readonly requested: readonly string[];
+}
+
+/** The query parameters of a sign-in that would let someone finish or replay it. */
+const SIGN_IN_PARAMETERS = ['code', 'state', 'nonce'];
 
 export class Narrator {
   /** Everything that must never be printed. */
@@ -37,6 +51,19 @@ export class Narrator {
     const secret = link.slice(link.indexOf('#') + 1);
     this.remember(secret);
     this.remember(createHash('sha256').update(secret, 'utf8').digest('hex'));
+  }
+
+  /**
+   * A phone's sign-in: each cookie value the relay set it (the session's
+   * secret and the sign-in in progress) and the authorization code, state
+   * and nonce its sign-in carried through the provider and back.
+   */
+  rememberSignIn(phone: SignedInPhone): void {
+    for (const cookie of phone.setCookies) this.remember(cookie.value);
+    for (const url of phone.requested) {
+      const params = URL.parse(url)?.searchParams;
+      for (const name of SIGN_IN_PARAMETERS) this.remember(params?.get(name));
+    }
   }
 
   /** Every secret met so far, for scanning text the demo does not print itself. */

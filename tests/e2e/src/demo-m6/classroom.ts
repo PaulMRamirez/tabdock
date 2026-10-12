@@ -29,6 +29,7 @@ import {
 } from '@tabdock/relay';
 import { PAIR_CLIENT, startProvider, type TestProvider } from '@tabdock/relay/test/provider';
 import { PUBLIC_MCP_URL, PUBLIC_ORIGIN, tunnelFetch } from '@tabdock/relay/test/tunnel';
+import { studentAtI } from '../room-harness.ts';
 import type { Narrator } from './narrator.ts';
 
 export { PUBLIC_MCP_URL, PUBLIC_ORIGIN };
@@ -68,6 +69,16 @@ export interface Classroom {
    * when given one, as an invitee's provider sends it (ADR 0020).
    */
   claude(name: string, sub: string, email?: string): Promise<Client>;
+  /**
+   * Student `index` signs in at /i on a phone of their own and joins by a
+   * watch link's secret, as room-harness's joinAtI does, resolving with the
+   * claim's last status or the refusal; what the phone kept of its sign-in
+   * goes to the narrator as secrets.
+   */
+  joinAtI(
+    index: number,
+    secret: string,
+  ): Promise<{ status: number; data: Record<string, unknown> }>;
   close(): Promise<void>;
 }
 
@@ -155,6 +166,22 @@ export async function startClassroom(narrator: Narrator, scratch: string): Promi
       );
       clients.push(client);
       return client;
+    },
+    async joinAtI(index, secret) {
+      const phone = await studentAtI({ relay, provider }, index);
+      try {
+        const claimed = await phone.post('/i/claim', { secret });
+        if (claimed.status !== 200) return claimed;
+        const claim = String(claimed.data.claim);
+        for (let attempt = 0; attempt < 200; attempt += 1) {
+          const answer = await phone.post('/i/status', { claim });
+          if (answer.data.status !== 'pending') return answer;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        throw new Error(`student ${String(index)}'s claim never settled`);
+      } finally {
+        narrator.rememberSignIn(phone);
+      }
     },
     async close() {
       for (const client of clients.splice(0)) await client.close().catch(() => undefined);

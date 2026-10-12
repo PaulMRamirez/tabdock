@@ -13,7 +13,8 @@
 // snapshot (0046), the record held to the log (0045), and `pnpm ci-check`
 // (0041). Every code, token and link is masked, every line is checked
 // against the secrets the run has met before it is printed, and at the end
-// the relay's log and the pages' consoles are scanned for them too (S11).
+// the relay's log and the pages' consoles are scanned for them too (S11);
+// demo-m6/narrator.ts lists what those secrets are, and what they leave out.
 
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -88,7 +89,7 @@ try {
     "a page's console held a secret this run met",
   );
   narrator.say(
-    `\nOf the ${String(classroom.logLines.length)} lines the relay logged and the ${String(pageConsole.length)} the pages wrote to their consoles, none holds a token, code or link secret.`,
+    `\nOf the ${String(classroom.logLines.length)} lines the relay logged and the ${String(pageConsole.length)} the pages wrote to their consoles, none holds a secret this run read: a bearer token, a pairing code it used, a link secret or its digest, the agent token, a phone's sign-in cookie or code, or the relay's client secret.`,
   );
   if (headed) {
     narrator.say('The browser stays open for 30 s so you can look at the map.');

@@ -9,7 +9,7 @@
 // offers the session's record and saves nothing unasked (ADR 0045).
 
 import type { Client } from '@modelcontextprotocol/client';
-import { joinAtI, student } from '../room-harness.ts';
+import { student } from '../room-harness.ts';
 import { fillSessionForm, sessionLinkInWidget } from '../session-helpers.ts';
 import { callTool, clickInWidget, errorCode } from '../tabdock-harness.ts';
 import { auditLines, bind, inFlight, type Lesson, until } from './lesson.ts';
@@ -75,7 +75,7 @@ export async function session(lesson: Lesson): Promise<void> {
     const guests: Client[] = [];
     for (const index of GUESTS) {
       const { sub, email } = student(index);
-      const joined = await joinAtI(room, index, link.slice(link.indexOf('#') + 1));
+      const joined = await room.joinAtI(index, link.slice(link.indexOf('#') + 1));
       check(
         joined.data.status === 'approved' && joined.data.role === 'observer',
         `${email} should join by the session link`,

@@ -65,6 +65,36 @@ describe("demo:m6's narrator", () => {
     expect(narrator.unexpected).toBe(1);
   });
 
+  it("hides a phone's sign-in cookies and the code, state and nonce its sign-in carried", () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const narrator = new Narrator();
+    const session = 'c2Vzc2lvbi1zZWNyZXQtb2YtYS1waG9uZQ';
+    const login = 'bG9naW4taW4tcHJvZ3Jlc3M';
+    narrator.rememberSignIn({
+      setCookies: [{ value: login }, { value: '' }, { value: session }],
+      requested: [
+        'https://relay.test/pair/login?to=i',
+        'https://issuer.test/authorize?client_id=tabdock-pair&state=c3RhdGUtdmFsdWU&nonce=bm9uY2UtdmFsdWU',
+        'https://relay.test/pair/callback?code=Y29kZS1mcm9tLXByb3ZpZGVy&state=c3RhdGUtdmFsdWU',
+      ],
+    });
+    const line = `cookie ${session} ${login}, code Y29kZS1mcm9tLXByb3ZpZGVy, state c3RhdGUtdmFsdWU, nonce bm9uY2UtdmFsdWU`;
+    narrator.say(line);
+    const text = printed().join('\n');
+    for (const secret of [
+      session,
+      login,
+      'Y29kZS1mcm9tLXByb3ZpZGVy',
+      'c3RhdGUtdmFsdWU',
+      'bm9uY2UtdmFsdWU',
+    ]) {
+      expect(text).not.toContain(secret);
+    }
+    expect(narrator.leakIn(`the relay logged ${session}`)).not.toBeNull();
+    // What a sign-in names openly, its client and where it goes, is no secret.
+    expect(narrator.leakIn('client tabdock-pair returned to i')).toBeNull();
+  });
+
   it('names a leak in text it scans without quoting the secret', () => {
     const narrator = new Narrator();
     narrator.remember(CODE);

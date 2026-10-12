@@ -8,7 +8,7 @@
 // still has a use. The teacher then revokes one student from the compact
 // Watching section, which frees the seat the next leg's agent takes.
 
-import { joinAtI, student } from '../room-harness.ts';
+import { student } from '../room-harness.ts';
 import { clickInWidget, widgetEvaluate } from '../tabdock-harness.ts';
 import { JOIN_LIMITS } from './classroom.ts';
 import { bind, type Lesson } from './lesson.ts';
@@ -33,7 +33,7 @@ export async function room(lesson: Lesson): Promise<void> {
   const join = async (from: number, to: number, link: string): Promise<number> => {
     let approved = 0;
     for (let index = from; index < to; index += 1) {
-      const joined = await joinAtI(lesson.room, index, secretOf(link));
+      const joined = await lesson.room.joinAtI(index, secretOf(link));
       if (joined.data.status === 'approved' && joined.data.role === 'observer') approved += 1;
     }
     return approved;
@@ -52,7 +52,7 @@ export async function room(lesson: Lesson): Promise<void> {
   await watchingTitle(operator.page, 'Watching by invite: 40 of 40');
   say(`   Nine more join by Class B: "Watching by invite: 40 of 40".`);
 
-  const late = await joinAtI(lesson.room, 39, secretOf(classB));
+  const late = await lesson.room.joinAtI(39, secretOf(classB));
   say(
     `   The forty-first watcher, ${student(39).email}, by Class B's last use: /i answers ${String(late.status)} ${String(late.data.error)}`,
   );
