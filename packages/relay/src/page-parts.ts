@@ -8,6 +8,13 @@
 
 import type { HubError } from './hub.ts';
 
+/**
+ * How an attachment ended: `client` for its holder's own detach_page, which
+ * withdraws whatever they held there, and `revoked` for every other end
+ * (the operator, a sponsor's or a session's end, the member list, expiry).
+ */
+export type AttachmentEnd = 'revoked' | 'client';
+
 export interface PagePart {
   /** The page's socket closed and it sleeps within its resume window; nothing reaches it meanwhile. */
   sleep(pageId: string): void;
@@ -15,8 +22,13 @@ export interface PagePart {
   resumed(pageId: string): void;
   /** The page is gone for good: forget it. A page that detached on purpose goes with no sleep first. */
   gone(pageId: string): void;
-  /** These users' attachments to the page ended; whatever they hold there answers `outcome` now (S8). */
-  attachmentsEnded(pageId: string, users: ReadonlySet<string>, outcome: HubError): void;
+  /** These users' attachments to the page ended, as `by` says; whatever they hold there answers `outcome` now (S8). */
+  attachmentsEnded(
+    pageId: string,
+    users: ReadonlySet<string>,
+    outcome: HubError,
+    by: AttachmentEnd,
+  ): void;
   /** What the page allows changed, as a time-boxed session's start or end narrows or widens it (ADR 0043). */
   policyChanged(pageId: string): void;
   /** The relay is shutting down: answer every waiter and stop every timer, writing no lines. */
@@ -43,8 +55,13 @@ export class PageParts implements PagePart {
     for (const part of this.#parts) part.gone(pageId);
   }
 
-  attachmentsEnded(pageId: string, users: ReadonlySet<string>, outcome: HubError): void {
-    for (const part of this.#parts) part.attachmentsEnded(pageId, users, outcome);
+  attachmentsEnded(
+    pageId: string,
+    users: ReadonlySet<string>,
+    outcome: HubError,
+    by: AttachmentEnd,
+  ): void {
+    for (const part of this.#parts) part.attachmentsEnded(pageId, users, outcome, by);
   }
 
   policyChanged(pageId: string): void {

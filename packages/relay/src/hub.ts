@@ -132,7 +132,7 @@ import { type AgentCloseReason, AgentTokens } from './agents.ts';
 import { type HeldTally, holdValue } from './held-tally.ts';
 import type { LogFields, Logger, LogLevel } from './log.ts';
 import type { MemberChange } from './members.ts';
-import { PageParts } from './page-parts.ts';
+import { type AttachmentEnd, PageParts } from './page-parts.ts';
 import { PageStates, type StateView } from './page-state.ts';
 import {
   madeByAgentToken,
@@ -1088,7 +1088,7 @@ const WAIT_REFUSALS: Record<'user' | 'page' | 'invitee', string> = {
 const PROPOSAL_REFUSALS: Record<'user' | 'page' | 'recent' | 'share' | 'relay', string> = {
   user: `you already have ${String(MAX_PENDING_PROPOSALS_PER_USER)} proposals waiting on this page; wait for the operator, or withdraw one with withdraw_proposal`,
   page: `this page already has ${String(MAX_PENDING_PROPOSALS_PER_PAGE)} proposals waiting for its operator; try again later`,
-  recent: `proposals withdrawn or refused on this page keep their places for ${formatDuration(PROPOSAL_PLACE_HOLD_MS)}, so the page is not asked too often; try again shortly`,
+  recent: `proposals withdrawn, left by a detach or refused on this page keep their places for ${formatDuration(PROPOSAL_PLACE_HOLD_MS)}, so the page is not asked too often; try again shortly`,
   share:
     "your proposals waiting across pages already hold as much of the relay's memory as one user's may; wait for their operators, or withdraw one with withdraw_proposal",
   relay: 'the relay holds as many proposals as it can; try again later',
@@ -4812,7 +4812,7 @@ export class PageHub {
   #endAttachments(
     pageId: string,
     users: ReadonlySet<string>,
-    reason: 'revoked' | 'client',
+    reason: AttachmentEnd,
     message: string,
   ): void {
     for (const userId of users) {
@@ -4825,7 +4825,7 @@ export class PageHub {
     // and a 2025-era call waiting on its question answers now (S8).
     this.#confirmations.drop(pageId, users, outcome);
     // Nor a wait, a proposal or an agent token's hold (S8, page-parts.ts).
-    this.#parts.attachmentsEnded(pageId, users, outcome);
+    this.#parts.attachmentsEnded(pageId, users, outcome, reason);
     // Queued calls first, so a running one settling does not hand the page a call that is ending.
     for (const call of [...(this.#queues.get(pageId)?.waiting ?? [])]) {
       if (users.has(call.caller.userId)) call.settle(outcome);

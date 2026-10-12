@@ -210,6 +210,37 @@ describe('PageProposals', () => {
     proposals.close();
   });
 
+  it("keeps the places of proposals its proposer's own detach cancelled, and frees those any other end took", () => {
+    const why = { kind: 'error', code: 'not_attached', message: 'ended' } as const;
+    const detached = held();
+    for (let n = 0; n < MAX_PENDING_PROPOSALS_PER_USER; n += 1) detached.made('pg_1', 'bob');
+    detached.proposals.attachmentsEnded('pg_1', new Set(['bob']), why, 'client');
+    expect(detached.ended.map(([, reason, frame]) => [reason, frame])).toEqual(
+      Array.from({ length: MAX_PENDING_PROPOSALS_PER_USER }, () => [
+        'cancelled',
+        'attachment_ended',
+      ]),
+    );
+    // Paired again at once, Bob has no place on that page for a minute.
+    expect(detached.make('pg_1', 'bob')).toBe('recent');
+    const charge = proposalCharge(ARGS);
+    const later = detached.proposals.reserve(
+      'pg_1',
+      'bob',
+      charge,
+      Date.now() + PROPOSAL_PLACE_HOLD_MS + 1,
+    );
+    expect(later).toMatchObject({ pageId: 'pg_1', userId: 'bob' });
+    if (typeof later !== 'string') detached.proposals.release(later);
+    detached.proposals.close();
+    // The operator's revoke, or any end but the proposer's own, frees them at once.
+    const revoked = held();
+    for (let n = 0; n < MAX_PENDING_PROPOSALS_PER_USER; n += 1) revoked.made('pg_1', 'bob');
+    revoked.proposals.attachmentsEnded('pg_1', new Set(['bob']), why, 'revoked');
+    expect(revoked.make('pg_1', 'bob')).toMatchObject({ proposer: { userId: 'bob' } });
+    revoked.proposals.close();
+  });
+
   it("keeps the page's places too, but frees a place the operator dismissed at once", () => {
     const { proposals, make, made } = held();
     // Twenty places, every one withdrawn by its proposer within the minute.
@@ -261,7 +292,7 @@ describe('PageProposals', () => {
     const bobWaits = proposals.wait(bobs, 60_000, never);
     const carolWaits = proposals.wait(carols, 50, never);
     const why = { kind: 'error', code: 'not_attached', message: 'revoked' } as const;
-    proposals.attachmentsEnded('pg_1', new Set(['bob']), why);
+    proposals.attachmentsEnded('pg_1', new Set(['bob']), why, 'revoked');
     expect(await bobWaits).toEqual(why);
     expect(await carolWaits).toEqual({ kind: 'timeout' });
     proposals.close();
