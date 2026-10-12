@@ -1935,12 +1935,12 @@ describe('what ran out while the relay was down (S7, ADR 0046)', () => {
       .filter((record) => record.type !== 'snapshot_loaded')
       .map((record) => {
         const named =
-          'tokenId' in record
-            ? record.tokenId
-            : 'inviteId' in record
-              ? record.inviteId
-              : 'sessionId' in record
-                ? `${record.sessionId} attachments=${String(record.attachments)}`
+          record.type === 'session_end'
+            ? `${record.sessionId} attachments=${String(record.attachments)}`
+            : 'tokenId' in record
+              ? record.tokenId
+              : 'inviteId' in record
+                ? record.inviteId
                 : 'userId' in record
                   ? record.userId
                   : 'sponsor' in record
