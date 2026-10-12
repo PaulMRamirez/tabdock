@@ -150,6 +150,10 @@ describe('pnpm dev:public', () => {
     expect(printed).toContain(
       'Page origins allowed (TABDOCK_ALLOWED_ORIGINS): http://127.0.0.1:5173',
     );
+    // A class needs all three, so the banner says each is off rather than leave them out.
+    expect(printed).toContain(
+      'Invites off (TABDOCK_INVITES), agent tokens off (TABDOCK_AGENT_TOKENS), restart snapshot off (TABDOCK_RESTART_SNAPSHOT)',
+    );
     for (const secret of [PAIR_CLIENT.clientSecret, PAIR_CLIENT.clientId, SUBJECT]) {
       expect(printed).not.toContain(secret);
       expect(started.stderr()).not.toContain(secret);
@@ -186,7 +190,9 @@ describe('pnpm dev:public', () => {
     const dir = realpathSync(mkdtempSync(join(tmpdir(), 'tabdock-dev-members-')));
     scratches.push(dir);
     const file = join(dir, 'members.txt');
-    writeFileSync(file, `${SUBJECT}=alice:Alice\nuser_02=bob:Bob\n`, { mode: 0o600 });
+    // One member, so the banner's count is held to the singular.
+    writeFileSync(file, `${SUBJECT}=alice:Alice\n`, { mode: 0o600 });
+    const audit = join(dir, 'audit');
     const started = run({
       ...blankEnv(),
       TABDOCK_PORT: '0',
@@ -194,6 +200,10 @@ describe('pnpm dev:public', () => {
       TABDOCK_PUBLIC_URL: PUBLIC_URL,
       TABDOCK_OAUTH_ISSUER: provider.issuer,
       TABDOCK_MEMBERS_FILE: file,
+      TABDOCK_INVITES: '1',
+      TABDOCK_AGENT_TOKENS: '1',
+      TABDOCK_AUDIT_DIR: audit,
+      TABDOCK_RESTART_SNAPSHOT: '1',
       TABDOCK_PAIR_CLIENT_ID: PAIR_CLIENT.clientId,
       TABDOCK_PAIR_CLIENT_SECRET: PAIR_CLIENT.clientSecret,
       TABDOCK_ALLOWED_ORIGINS: 'http://127.0.0.1:5173',
@@ -207,7 +217,10 @@ describe('pnpm dev:public', () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     const printed = started.stdout();
-    expect(printed).toContain('Accounts allowed (TABDOCK_MEMBERS_FILE): 2 members');
+    expect(printed).toContain('Accounts allowed (TABDOCK_MEMBERS_FILE): 1 member\n');
+    expect(printed).toContain(
+      'Invites on (TABDOCK_INVITES), agent tokens on (TABDOCK_AGENT_TOKENS), restart snapshot on (TABDOCK_RESTART_SNAPSHOT)',
+    );
     expect(printed).not.toContain(file);
     expect(printed).not.toContain(SUBJECT);
     expect(started.stderr()).not.toContain(file);

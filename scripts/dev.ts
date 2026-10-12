@@ -65,6 +65,8 @@ let allowedOrigins: readonly string[] | undefined;
 let localMode: LocalModeInfo | undefined;
 /** How many members the members file lists, when public URL mode reads one (ADR 0043). */
 let fileMembers: number | undefined;
+/** The settings a class needs, each on or off (ADRs 0016, 0044 and 0046). */
+let classFlags: { invites: boolean; agentTokens: boolean; restartSnapshot: boolean } | undefined;
 try {
   // Config and owner token errors name the variable or path at fault, never a
   // secret, so they are safe to print.
@@ -72,6 +74,11 @@ try {
   allowedOrigins = config.allowedOrigins;
   localMode = config.localMode;
   fileMembers = config.membersFile === undefined ? undefined : config.auth.members?.size;
+  classFlags = {
+    invites: config.invites === true,
+    agentTokens: config.agentTokens === true,
+    restartSnapshot: config.restartSnapshot === true,
+  };
   relay = await createRelay(config);
   // The board's ?e2e hook skips its Connect click, so pnpm dev offers it only
   // under a key a script names (demo:m4, demo:m5) and never prints it: a link
@@ -143,7 +150,11 @@ function publicLines(live: Relay, publicUrl: string): string[] {
         )
           .map((user) => `${user.userId} (${user.displayName})`)
           .join(', ')}`
-      : `Accounts allowed (TABDOCK_MEMBERS_FILE): ${String(fileMembers)} members`;
+      : `Accounts allowed (TABDOCK_MEMBERS_FILE): ${String(fileMembers)} ${fileMembers === 1 ? 'member' : 'members'}`;
+  // A teacher checks these before a class, which needs all three (guide page 21).
+  const flags = classFlags ?? { invites: false, agentTokens: false, restartSnapshot: false };
+  const onOff = (on: boolean): string => (on ? 'on' : 'off');
+  const forClasses = `Invites ${onOff(flags.invites)} (TABDOCK_INVITES), agent tokens ${onOff(flags.agentTokens)} (TABDOCK_AGENT_TOKENS), restart snapshot ${onOff(flags.restartSnapshot)} (TABDOCK_RESTART_SNAPSHOT)`;
   return [
     'Tabdock dev, public URL mode (ADR 0014): relay and demo board',
     '',
@@ -157,6 +168,7 @@ function publicLines(live: Relay, publicUrl: string): string[] {
     '',
     people,
     `Page origins allowed (TABDOCK_ALLOWED_ORIGINS): ${(allowedOrigins ?? []).join(', ')}`,
+    forClasses,
     'Dev tokens are refused in this mode, and pages attach only from this machine.',
     '',
     'Add the connector URL in Claude as a custom connector and sign in with an allowed account.',
