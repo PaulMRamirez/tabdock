@@ -385,14 +385,18 @@ describe('the write queue', () => {
         throw new Error('the page refused');
       });
       const socket = await link(h);
-      // wipe is consequential, so the operator's prompt leaves time for the page to drop it.
       const first = how === 'its handler throws' ? 'set_value' : 'wipe';
       socket.deliver(invoke(first, { callId: 'first' }));
       socket.deliver(invoke('add_item', { callId: 'second' }));
       await flush();
       if (first === 'wipe') {
-        h.context.unregister('wipe');
-        await flush();
+        // The page drops wipe just as the runtime starts the call, after the
+        // adapter's last read of the list (the one that follows the prompt).
+        const execute = h.context.executeTool.bind(h.context);
+        h.context.executeTool = (tool, input, options) => {
+          if (tool.name === 'wipe') h.context.unregister('wipe');
+          return execute(tool, input, options);
+        };
         expect(h.dock.confirm('first', true)).toBe(true);
       }
       await flush();
@@ -407,6 +411,30 @@ describe('the write queue', () => {
       expect(outcomes(socket)).toEqual({ first: code, second: 'ok' });
     },
   );
+
+  it('on the polyfill, a write whose tool the page drops while its prompt is up is refused without the runtime, and the next write goes at once', async () => {
+    const h = setup({ polyfill: true, tools: queueTools() });
+    const held = holdHandlers(h, ['add_item']);
+    const socket = await link(h);
+    socket.deliver(invoke('wipe', { callId: 'first' }));
+    socket.deliver(invoke('add_item', { callId: 'second' }));
+    await flush();
+    h.context.unregister('wipe');
+    await flush();
+    expect(h.dock.confirm('first', true)).toBe(true);
+    await flush();
+    // The adapter reads the list again once the operator answers (A6.28), so the runtime is never asked.
+    expect(results(socket)).toEqual([
+      expect.objectContaining({
+        callId: 'first',
+        ok: false,
+        error: { code: 'tool_not_found', message: 'no tool named wipe' },
+      }),
+    ]);
+    expect(h.context.attempts.map((attempt) => attempt.tool)).toEqual(['add_item']);
+    await held.release('add_item');
+    expect(outcomes(socket)).toEqual({ first: 'tool_not_found', second: 'ok' });
+  });
 });
 
 describe('call ids a relay reuses', () => {
