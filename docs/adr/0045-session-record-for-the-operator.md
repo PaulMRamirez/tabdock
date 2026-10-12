@@ -1,6 +1,6 @@
 # 0045: A session record for the operator
 
-Status: Accepted, 10 October 2026, under the owner's standing instruction. Option B. Changes SPEC sections 8 (the record and its save), 9 (S7's `callId`) and 10 (A6.25); no relay server change beyond the audit `call` record's `callId`, while the audit reader in the relay package gains `--call` and `--match`. Adds a note to ADR 0019. Priority 8 in `docs/plans/backlog.md`; built in M6.
+Status: Accepted, 10 October 2026, under the owner's standing instruction. Option B. Changes SPEC sections 8 (the record and its save), 9 (S7's `callId`) and 10 (A6.25); no relay server change beyond the audit `call` record's `callId`, while the audit reader in the relay package gains `--call` and `--match`. Adds a note to ADR 0019. Priority 8 in `docs/plans/backlog.md`; built in M6. Its notes and SPEC's M6 edits also change S9 (the calls, attachments and proposals a record holds) and S11 (the record holds no secret).
 
 ## Context
 
@@ -75,7 +75,7 @@ Conflicts between the M6 records, settled by the plan, that touch this one:
 
 **Open questions.** Settled under Decisions: the caps (1), the offer at a session's end (3) and a summary grouped by person (4).
 
-## Notes from the review of the recorder and matcher (10 October 2026)
+## Notes from the review of the recorder and matcher (10 and 11 October 2026)
 
 **Budget (decision 23).** Built in full, the record's modules measure 12,375 bytes of the script-tag build in an esbuild metafile with the script-tag options: `session-record.ts` 2,840, once its reader's list of field names is built on first use so the adapter drops it; `record.ts` 6,247, of which `NOOP_RECORDER` is 303 and goes once the recorder is the default; and `record-markdown.ts` 3,288. The strict schema a record is checked by before it is saved (decision 19) and the logic decisions 1 to 5, 8, 17 and 26 ask for make up nearly all of it, so meeting 7,000 would mean dropping one of them. On 11 October 2026, under the owner's standing instruction to take the recommendation, decision 23 was raised to 13,000 bytes for those three modules, held by the same metafile test and leaving about 600 for wiring them in; SPEC A6.26 and ADR 0048 say the same, and `adapter-size.test.ts` holds the three to one number. The owner may still choose a decision to give way instead, which would lower the budget again by a note here. The widget's record block lives in `widget.ts` and counts toward the Wave 3 checkpoint, not this budget. ADR 0048's 200,000 ceiling and its checkpoints are unchanged either way.
 
@@ -94,3 +94,7 @@ Conflicts between the M6 records, settled by the plan, that touch this one:
 ## Note from Wave 3's cross review (12 October 2026)
 
 **What the warning says.** The Context says the widget tells the operator, before a download, that the export holds other people's names and invitees' emails, and the wiring's notes settled that the warning counts them: "This record names 3 people, 2 of them by email address, and every call they made on this page". SPEC's letter had drifted from both: section 8 said the box "says whom the file names" and A6.25 asked for "a warning naming everyone in it", which read as a list of names the widget never shows, while guide pages 13 and 19 described the counts. The code is right, since listing names in the box would cost script-tag bytes and show nothing the file's own People section does not; SPEC section 8 now says the box "says how many people the file names, and how many of them by email address", A6.25 reads "after a warning saying how many people the file names, and how many by email address", and the plan's D8, the CHANGELOG, the acceptance audit's row and the comments in `widget.ts`, `session-record.spec.ts` and the demo's record leg say the same. Section 9 is unchanged, since no S rule sets the warning's words; S11 asks only that the record hold no secret.
+
+## Notes from the docs pass (12 October 2026)
+
+**What was owed is paid.** The notes of the wiring's review and of Wave 3's merge each say their rules are "owed to SPEC section 8 and guide page 13". Both now say them: SPEC section 8 has the record reach a session only once the relay lists it, seal only a record that holds something, re-arm the save box when its slot's record is replaced, count people by an email address and record an end given while the link is down as on a live link, and guide page 13's "Session records" section says the same.

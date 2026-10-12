@@ -8,7 +8,9 @@
 // as much more text as the frame holds, so the relay's truncation marker, with
 // the most digits it can carry, is in the answer too: should either constant
 // or the marker grow past that sizing, this fails before the memory bound moves.
-// The figures are in docs/notes/m6/image-answers.md.
+// The figures are in docs/notes/m6/image-answers.md. Last, an animated PNG
+// or WebP is answered tool_error in relay words and recorded as such, since
+// ADR 0039 promises one still image (its note of 12 October).
 
 import type { Client } from '@modelcontextprotocol/client';
 import {
@@ -17,13 +19,15 @@ import {
   MAX_IMAGE_BYTES,
   MAX_IMAGE_TEXT_CHARS,
   MAX_RESULT_CHARS,
+  untrustedHeader,
 } from '@tabdock/protocol';
 import { afterEach, describe, expect, it } from 'vitest';
 import { answerWithImage, base64, CAPTURE_TOOL, padTo, pngHeader } from './helpers/images.ts';
-import { connectPage, READ_TOOL, type TestPage } from './helpers/page-client.ts';
+import { connectPage, PAGE_ORIGIN, READ_TOOL, type TestPage } from './helpers/page-client.ts';
 import { openSession, rawCall } from './helpers/raw-mcp.ts';
 import {
   ALICE,
+  callTool,
   connectClient,
   pairAndApprove,
   startRelay,
@@ -127,4 +131,72 @@ describe('an image answer on the wire (ADR 0030 re-measured for ADR 0039)', () =
     expect(bytes.legacyText).toBeLessThan(730_000);
     expect(bytes.modernText).toBeLessThan(730_000);
   }, 60_000);
+});
+
+function ascii(text: string): number[] {
+  return Array.from({ length: text.length }, (_, index) => text.charCodeAt(index));
+}
+
+function u32(value: number, little = false): number[] {
+  const big = [(value >>> 24) & 0xff, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff];
+  return little ? big.reverse() : big;
+}
+
+/** An APNG: the header, then acTL (two frames, played forever) before the first IDAT. */
+const APNG = new Uint8Array([
+  ...pngHeader(64, 64),
+  ...[...u32(8), ...ascii('acTL'), ...u32(2), ...u32(0), ...u32(0)],
+  ...[...u32(1), ...ascii('IDAT'), 0, ...u32(0)],
+]);
+
+/** An extended WebP of 64 by 64 whose VP8X flags byte sets the animation bit. */
+const ANIMATED_WEBP = new Uint8Array([
+  ...ascii('RIFF'),
+  ...u32(22, true),
+  ...ascii('WEBP'),
+  ...ascii('VP8X'),
+  ...u32(10, true),
+  ...[0x02, 0, 0, 0, 63, 0, 0, 63, 0, 0],
+]);
+
+describe('an animated image (ADR 0039, its note of 12 October)', () => {
+  for (const [what, mimeType, bytes] of [
+    ['an APNG', 'image/png', APNG],
+    ['a WebP with the animation flag', 'image/webp', ANIMATED_WEBP],
+  ] as const) {
+    it(`answers ${what} with tool_error in relay words and records imageRefused animated`, async () => {
+      relay = await startRelay({ limits: { imageBytes: MAX_IMAGE_BYTES } });
+      const page = await connectPage(relay.relay.pageUrl, {
+        tools: [CAPTURE_TOOL, READ_TOOL],
+        policy: { imageTools: [CAPTURE_TOOL.name] },
+      });
+      pages.push(page);
+      const alice = await connectClient(relay.relay, ALICE);
+      clients.push(alice);
+      await pairAndApprove(alice, page);
+      answerWithImage(page, { mimeType, data: base64(bytes) }, 'two frames of the board');
+      const result = await alice.callTool({
+        name: 'call_page_tool',
+        arguments: { page: page.pageId, tool: CAPTURE_TOOL.name, arguments: {} },
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content).toEqual([
+        {
+          type: 'text',
+          text: `${untrustedHeader(PAGE_ORIGIN, CAPTURE_TOOL.name)}\ntabdock refused this tool's image: the image is animated; only a still image passes`,
+        },
+      ]);
+      const [record] = relay.relay.audit.records();
+      expect(record).toMatchObject({ outcome: 'tool_error', imageRefused: 'animated' });
+      expect(record).not.toHaveProperty('image');
+      // The link stays open for the next call.
+      page.onInvoke = () => ({ ok: true, content: 'words only' });
+      const next = await callTool(alice, 'call_page_tool', {
+        page: page.pageId,
+        tool: READ_TOOL.name,
+        arguments: {},
+      });
+      expect(next.isError, next.text).toBe(false);
+    });
+  }
 });

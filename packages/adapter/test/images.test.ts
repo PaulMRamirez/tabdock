@@ -1,8 +1,9 @@
 // The adapter's half of image results (ADR 0039, A6.3 and A6.4): only a tool
 // the page declares in policy.imageTools has its result read as an envelope,
 // unwrapped once more where MCP-B 6 quotes a string; the image is checked
-// here with the protocol's checkImage before any frame goes out, against the
-// welcome's maxImageBytes held to the ceiling; it is never cut, while the
+// here with the protocol's checkImage before any frame goes out (an animated
+// one among those refused), against the welcome's maxImageBytes held to the
+// ceiling; it is never cut, while the
 // words beside it are; and image calls pass one at a time through the gate,
 // IMAGE_CALL_SPACING_MS apart with MAX_WAITING_IMAGE_CALLS waiting, each
 // answered without its handler running when a pause, revoke, cancel or
@@ -61,6 +62,20 @@ function base64(bytes: Uint8Array): string {
   }
   return btoa(binary);
 }
+
+/** An APNG: the header and IHDR, then acTL (two frames, played forever) before the first IDAT. */
+function apng(): Uint8Array {
+  const acTL = [0, 0, 0, 8, 0x61, 0x63, 0x54, 0x4c, ...u32be(2), ...u32be(0), ...u32be(0)];
+  const idat = [0, 0, 0, 1, 0x49, 0x44, 0x41, 0x54, 0, ...u32be(0)];
+  return new Uint8Array([...png(64, 64, 33), ...acTL, ...idat]);
+}
+
+/** A 64 by 64 extended WebP whose VP8X flags byte sets the animation bit. */
+const ANIMATED_WEBP = new Uint8Array([
+  ...[0x52, 0x49, 0x46, 0x46, 22, 0, 0, 0, 0x57, 0x45, 0x42, 0x50],
+  ...[0x56, 0x50, 0x38, 0x58, 10, 0, 0, 0],
+  ...[0x02, 0, 0, 0, 63, 0, 0, 63, 0, 0],
+]);
 
 const PNG = png(640, 480);
 const DATA = base64(PNG);
@@ -219,6 +234,16 @@ describe('an image the adapter refuses before sending (A6.4)', () => {
       'one byte over the cap',
       { image: { mimeType: 'image/png', data: base64(png(10, 10, DEFAULT_IMAGE_BYTES + 1)) } },
       `over the cap of ${String(DEFAULT_IMAGE_BYTES)} bytes`,
+    ],
+    [
+      'an animated PNG',
+      { image: { mimeType: 'image/png', data: base64(apng()) } },
+      'the image is animated; only a still image passes',
+    ],
+    [
+      'an animated WebP',
+      { image: { mimeType: 'image/webp', data: base64(ANIMATED_WEBP) } },
+      'the image is animated; only a still image passes',
     ],
     ['extra keys', { ...ENVELOPE, structuredContent: {} }, 'does not take'],
     ['bare base64 with no type', { image: { data: DATA } }, 'image.mimeType is required'],

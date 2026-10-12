@@ -1,14 +1,16 @@
 // The MCP-B 6 leg's wiring (A5.4 and A6.26; ADR 0047 moved it from the beta
 // of ADR 0031 to 6.0.0). Its specs prove the runtime in the browser before
 // they trust a result; these checks keep the leg running at all: `pnpm
-// test:e2e` must reach specs/mcpb6.spec.ts in a project of its own, with no
-// flag that could turn native WebMCP on and make the polyfill keep Chrome's
-// context, while every other spec keeps the flag; and the init script must
+// test:e2e` must reach specs/mcpb6.spec.ts and, from M6, A6.3's
+// specs/mcpb6-images.spec.ts in a project of its own, with no flag that could
+// turn native WebMCP on and make the polyfill keep Chrome's context, while
+// every other spec keeps the flag (a narrowed pattern would move the image
+// spec back to chromium unnoticed); and the init script must
 // carry 6.0.0's ESM entry, reached through @tabdock/mcpb6 (ADR 0032), never
 // 5.1.0's, and call installWebMCP() itself, since importing 6.0.0 installs
 // nothing.
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MCPB6_POLYFILL_MODULE, MCPB6_POLYFILL_SCRIPT, mcpb6ModuleScript } from '@tabdock/mcpb6';
@@ -38,16 +40,25 @@ function matches(pattern: unknown, file: string): boolean {
 }
 
 describe('the MCP-B 6.0.0 leg (ADRs 0031 and 0047)', () => {
-  it('runs specs/mcpb6.spec.ts in its own project and no other spec there', () => {
+  it('runs specs/mcpb6.spec.ts and specs/mcpb6-images.spec.ts in their own project and no other spec there', () => {
     const leg = project('mcpb6');
     const main = project('chromium');
-    expect(matches(leg.testMatch, 'mcpb6.spec.ts')).toBe(true);
-    expect(matches(main.testIgnore, 'mcpb6.spec.ts')).toBe(true);
+    for (const spec of ['mcpb6.spec.ts', 'mcpb6-images.spec.ts']) {
+      expect(existsSync(join(SPECS, spec)), spec).toBe(true);
+      expect(matches(leg.testMatch, spec), spec).toBe(true);
+      expect(matches(main.testIgnore, spec), spec).toBe(true);
+    }
     for (const other of ['tabdock-relay.spec.ts', 'widget.spec.ts', 'mcpb-relay.spec.ts']) {
       expect(matches(leg.testMatch, other), other).toBe(false);
       expect(matches(main.testIgnore, other), other).toBe(false);
     }
     expect(config.projects?.map((p) => p.name)).toEqual(['chromium', 'mcpb6']);
+  });
+
+  it('would fail a pattern narrowed to mcpb6.spec.ts alone', () => {
+    const narrowed = /mcpb6\.spec\.ts$/;
+    expect(matches(narrowed, 'mcpb6.spec.ts')).toBe(true);
+    expect(matches(narrowed, 'mcpb6-images.spec.ts')).toBe(false);
   });
 
   it('launches the leg without the flag that turns native WebMCP on, and the rest with it', () => {

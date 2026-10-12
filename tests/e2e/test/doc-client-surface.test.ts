@@ -4,22 +4,86 @@
 // there names a code nothing sends; SPEC.md
 // section 7 lists the same codes; the guide's table of fixed tools names
 // each tool the relay serves with each of its inputs, as the golden capture
-// of the relay's tools/list holds them; and the untrusted label the guide
-// quotes is the one the relay writes.
+// of the relay's tools/list holds them; the untrusted label the guide
+// quotes is the one the relay writes; the troubleshooting page links every
+// guide page's own "When it goes wrong" section, so a reader who starts there
+// reaches each; and every reason the shared image check can refuse an image
+// for is named both there and on the images page, so a new reason (animated,
+// from the docs pass after M6) cannot ship undocumented.
 
 import {
   AGENT_PATH,
   AttachAgentSchema,
   AttachInviteSchema,
   ERROR_CODES,
+  type ImageRefusal,
+  ImageRefusalSchema,
   PAGE_ERROR_CODES,
   untrustedHeader,
 } from '@tabdock/protocol';
 import { describe, expect, it } from 'vitest';
-import { markdownIn, readRepo, type Table, tables, withoutCodeBlocks } from '../src/doc-files.ts';
+import {
+  guidePages,
+  markdownIn,
+  readRepo,
+  type Table,
+  tables,
+  withoutCodeBlocks,
+} from '../src/doc-files.ts';
 
 const TROUBLESHOOTING = 'docs/guide/11-troubleshooting.md';
 const CLIENTS = 'docs/guide/05-connect-clients.md';
+const IMAGES = 'docs/guide/18-images-and-state.md';
+const WHEN_WRONG = /^#{2,3} When it goes wrong$/m;
+
+/**
+ * Words each image refusal must be named by, on the images page's When it
+ * goes wrong and in the troubleshooting page's tool_error section; a pattern
+ * takes either page's wording. A reason missing here fails the test, so a new
+ * one is documented before it ships.
+ */
+const IMAGE_REFUSAL_WORDS: Readonly<Partial<Record<ImageRefusal, RegExp>>> = {
+  undeclared: /`imageTools`|not declared/,
+  off: /takes no images|images are off/,
+  type: /PNG, JPEG or WebP/,
+  encoding: /canonical/,
+  size: /over the cap/,
+  signature: /first bytes/,
+  dimensions: /pixels a side|dimensions/,
+  animated: /animated/,
+};
+
+/** The part of `text` from the heading `start` matches to the next heading of the same level or higher. */
+function sectionOf(text: string, start: RegExp, level: number): string {
+  const body = withoutCodeBlocks(text);
+  const match = start.exec(body);
+  if (match === null) return '';
+  const rest = body.slice(match.index + match[0].length);
+  const end = new RegExp(`^#{1,${String(level)}} `, 'm').exec(rest);
+  return end === null ? rest : rest.slice(0, end.index);
+}
+
+/** The refusals a pair of sections leaves unnamed, a refusal with no words at all among them. */
+function unnamedRefusals(
+  sections: Readonly<Record<string, string>>,
+  table: Readonly<Partial<Record<ImageRefusal, RegExp>>> = IMAGE_REFUSAL_WORDS,
+): string[] {
+  return ImageRefusalSchema.options.flatMap((reason) => {
+    const words = table[reason];
+    if (words === undefined) return [`${reason} has no words in this test`];
+    return Object.entries(sections)
+      .filter(([, text]) => !words.test(text))
+      .map(([where]) => `${reason} is not named in ${where}`);
+  });
+}
+
+/** The guide pages with a When it goes wrong section that `text` does not link to. */
+function unlinkedFailurePages(text: string, pages: readonly string[]): string[] {
+  return pages.filter((page) => {
+    const name = page.replace('docs/guide/', '');
+    return !text.includes(`](${name}#when-it-goes-wrong)`);
+  });
+}
 
 function tableHeaded(path: string, first: string): Table {
   const table = tables(readRepo(path)).find((candidate) => candidate.header[0] === first);
@@ -83,6 +147,46 @@ describe('error codes', () => {
     const sentence = /with one of these codes in the text: ([^.]+)\./.exec(section)?.[1] ?? '';
     const listed = [...sentence.matchAll(/`([a-z_]+)`/g)].map((match) => match[1]);
     expect(listed).toEqual([...ERROR_CODES]);
+  });
+});
+
+describe('the troubleshooting page', () => {
+  const text = readRepo(TROUBLESHOOTING);
+
+  it("links every guide page's When it goes wrong section", () => {
+    const pages = guidePages().filter(
+      (page) => page !== TROUBLESHOOTING && WHEN_WRONG.test(withoutCodeBlocks(readRepo(page))),
+    );
+    expect(pages.length).toBeGreaterThanOrEqual(3);
+    expect(unlinkedFailurePages(text, pages)).toEqual([]);
+  });
+
+  it('and the images page name every reason an image is refused for', () => {
+    const sections = {
+      [`${IMAGES} When it goes wrong`]: sectionOf(readRepo(IMAGES), WHEN_WRONG, 2),
+      [`${TROUBLESHOOTING} tool_error`]: sectionOf(text, /^### `tool_error`$/m, 3),
+    };
+    for (const [where, section] of Object.entries(sections)) {
+      expect(section.length, where).toBeGreaterThan(100);
+    }
+    expect(unnamedRefusals(sections)).toEqual([]);
+  });
+
+  it('would fail a page left unlinked, a reason left unnamed and a reason with no words', () => {
+    expect(
+      unlinkedFailurePages('See [it](18-images-and-state.md#when-it-goes-wrong).', [
+        'docs/guide/18-images-and-state.md',
+        'docs/guide/22-join-a-shared-page.md',
+      ]),
+    ).toEqual(['docs/guide/22-join-a-shared-page.md']);
+    const all =
+      'imageTools` images are off PNG, JPEG or WebP canonical over the cap first bytes dimensions';
+    expect(unnamedRefusals({ page: `\`${all}` })).toEqual(['animated is not named in page']);
+    const withoutAnimated = { ...IMAGE_REFUSAL_WORDS };
+    delete withoutAnimated.animated;
+    expect(unnamedRefusals({ page: `\`${all} animated` }, withoutAnimated)).toEqual([
+      'animated has no words in this test',
+    ]);
   });
 });
 

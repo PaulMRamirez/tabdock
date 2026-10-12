@@ -89,6 +89,7 @@ import type {
   PendingProposal,
   PendingRequest,
   SessionLink,
+  SessionResult,
 } from './core.ts';
 import { sessionSeats } from './core.ts';
 import { type BoxRect, takeDom } from './dom.ts';
@@ -155,6 +156,32 @@ const REFUSAL_TEXT: Record<InviteRefusal, string> = {
   unavailable:
     'No link came back: the relay did not answer, or this page cannot make one (it needs https).',
   cancelled: 'The invite was closed before the relay answered.',
+};
+
+/**
+ * Promotions and minted invites one page may make a minute at the relay
+ * (OPERATOR_GRANTS_PER_PAGE in the relay's hub.ts), named when a session's
+ * start is refused for it.
+ */
+const RELAY_GRANTS_PER_MINUTE = 10;
+
+/**
+ * A sentence for each reason startSession gives, read from its branches in
+ * core.ts; unavailable and invalid have more than one cause, so sessionText
+ * names the one the form shows. unknown and length answer an extend, never a
+ * start, and are here so every reason has its words.
+ */
+const SESSION_TEXT: Record<Extract<SessionResult, { ok: false }>['reason'], string> = {
+  invalid: 'Give it a label, a length of 30 to 240 whole minutes and whole numbers of seats.',
+  policy:
+    "A session only narrows this page's policy: no more driver seats or wider proposals than it allows, and observers only where it makes invites.",
+  active: 'A session is already running on this page. End it first.',
+  link_down: REFUSAL_TEXT.link_down,
+  unavailable:
+    'The relay did not answer in time, or this page cannot make invite links (they need https). Try again.',
+  limit: `This page is at a limit: ${String(MAX_LIVE_INVITES_PER_PAGE)} live invites, counting the links this session needs, or ${String(RELAY_GRANTS_PER_MINUTE)} promotions and new invites a minute at the relay. Cancel an invite or wait a minute.`,
+  unknown: 'The relay no longer holds this session.',
+  length: 'The relay already holds this session at least that long.',
 };
 
 // The M6 blocks' rules, a labelled section each with its own dark-mode
@@ -2298,6 +2325,8 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
   const renew = boxButton(runningBox, 'New link', 'session-renew', () => {
     void renewLink();
   });
+  // renewSessionLink cancels the session's invites first, a QR already projected among them.
+  const renewNote = element('p', 'muted', "New link closes the session's earlier links.");
   const extend = boxButton(runningBox, 'Extend 15 min', 'session-extend', () => {
     dock.extendSession(SESSION_EXTEND_MS / 60_000);
   });
@@ -2336,6 +2365,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     sQrBox,
     sLinkText,
     runningButtons,
+    renewNote,
     endRow,
   );
   const sHeading = element('div', 'label');
@@ -2388,6 +2418,7 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     dom.flag(qrToggle, 'hidden', shown === undefined);
     setText(qrToggle, qrOpen ? 'Hide QR' : 'Show QR');
     dom.flag(renew, 'hidden', shown !== undefined || live.observers === 0);
+    dom.flag(renewNote, 'hidden', dom.has(renew, 'hidden'));
     dom.flag(endRow, 'hidden', !ending);
     setText(endText, `End now? ${counted(guests, 'guest leaves.', 'guests leave.')} `);
   }
@@ -2447,11 +2478,12 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
     sessionStarting = true;
     render(dock.state);
     const hidden = (field: { label: HTMLElement }): boolean => dom.has(field.label, 'hidden');
+    const observers = hidden(sObservers) ? 0 : Number(dom.value(sObservers.input));
     const result = await dock.startSession({
       label: dom.value(sLabel.input).trim(),
       lengthMinutes: Number(dom.value(sLength.input)),
       drivers: hidden(sDrivers) ? 1 : Number(dom.value(sDrivers.input)),
-      observers: hidden(sObservers) ? 0 : Number(dom.value(sObservers.input)),
+      observers,
       proposals: proposalChoices.find(([, made]) => dom.checked(made.input))?.[0] ?? 'off',
     });
     sessionStarting = false;
@@ -2463,9 +2495,28 @@ export function mountWidget(dock: Dock, doc: Document = document): () => void {
       dom.setValue(sLabel.input, '');
       setText(sAlert, result.inviteRefusal === undefined ? '' : REFUSAL_TEXT[result.inviteRefusal]);
     } else {
-      sessionError = `The session did not start (${result.reason}).`;
+      sessionError = sessionText(result.reason, observers);
     }
     render(dock.state);
+  }
+
+  /** Why the session did not start, naming the cause the page can see where a reason has several. */
+  function sessionText(
+    reason: Extract<SessionResult, { ok: false }>['reason'],
+    observers: number,
+  ): string {
+    const state = dock.state;
+    const seats = sessionSeats(state.seatLimits);
+    if (reason === 'invalid' && observers > seats) {
+      return `This relay seats at most ${String(seats)} observers on a page; its owner sets its watching seats with TABDOCK_MAX_OBSERVERS_PER_PAGE.`;
+    }
+    if (reason === 'unavailable' && observers > 0) {
+      if ((state.invitesOffered?.linkBase ?? null) === null) return REFUSAL_TEXT.no_public_url;
+      if (!state.roster.some((entry) => entry.kind === 'member')) {
+        return 'Observers need a member attached to sponsor their invites. Pair one first.';
+      }
+    }
+    return SESSION_TEXT[reason];
   }
 
   async function renewLink(): Promise<void> {

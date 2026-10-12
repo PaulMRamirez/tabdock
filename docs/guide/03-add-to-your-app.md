@@ -4,7 +4,7 @@ From "my app has functions" to "Claude can call them safely": a WebMCP runtime, 
 
 ## A WebMCP runtime
 
-Tools live on `document.modelContext`, only in a secure context (https, or http on `localhost` and `127.0.0.1`). Chrome's own WebMCP is an origin trial, off by default even on localhost (`--enable-features=WebMCPTesting` turns it on for testing), so most pages load MCP-B's polyfill, which installs `document.modelContext` only where the browser has none. With a bundler, install it pinned (`npm install --save-exact @mcp-b/webmcp-polyfill@5.1.0`, since this guide relies on 5.1.0's behaviour) and run it first:
+Tools live on `document.modelContext`, only in a secure context (https, or http on `localhost` and `127.0.0.1`). Chrome's own WebMCP is an origin trial, off by default even on localhost (`--enable-features=WebMCPTesting` turns it on for testing), so most pages load MCP-B's polyfill, which installs `document.modelContext` only where the browser has none. With a bundler, install it pinned (`npm install --save-exact @mcp-b/webmcp-polyfill@5.1.0`) and run it first:
 
 <!-- fragment -->
 
@@ -13,6 +13,8 @@ import { initializeWebMCPPolyfill } from '@mcp-b/webmcp-polyfill';
 
 initializeWebMCPPolyfill(); // on 6.0.0, call installWebMCP() instead: importing it installs nothing
 ```
+
+This guide pins exact 5.1.0, which the demo and the map test page keep so a runtime that drops `consequentialHint` stays tested. MCP-B 6.0.0 keeps the hint and passes the call, cancel, consequential and image specs on its own leg, but importing it installs nothing: call `installWebMCP()` (ADR 0047).
 
 Without a bundler, load the package's `dist/index.iife.js` in a classic script tag before the adapter; it installs itself. The adapter looks for `document.modelContext` once, at `attach()`; if it is missing, the adapter logs how to add a polyfill, puts that text in `state.error` and stays idle.
 
@@ -114,13 +116,13 @@ attach({
 
 ## Read-only, write or consequential
 
-| Mark                                                             | Who may call it       | How it runs                              | Prompt                                                                                       |
-| ---------------------------------------------------------------- | --------------------- | ---------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `readOnlyHint: true`                                             | observers and drivers | beside other calls                       | none                                                                                         |
-| anything else, a write                                           | drivers               | one at a time per page, in arrival order | none                                                                                         |
-| also `consequentialHint: true`, or named in `consequentialTools` | as above              | as above, once confirmed                 | the operator, under `consequential: 'confirm'`; refused under `'deny'`; none under `'allow'` |
+| Mark                                                             | Who may call it                                                                                                            | How it runs                              | Prompt                                                                                       |
+| ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `readOnlyHint: true`                                             | observers and drivers                                                                                                      | beside other calls                       | none                                                                                         |
+| anything else, a write                                           | drivers; observers may propose one where `policy.proposals` admits them ([proposals](19-lessons-and-reviews.md#proposals)) | one at a time per page, in arrival order | none                                                                                         |
+| also `consequentialHint: true`, or named in `consequentialTools` | as above                                                                                                                   | as above, once confirmed                 | the operator, under `consequential: 'confirm'`; refused under `'deny'`; none under `'allow'` |
 
-Only the page's own `readOnlyHint: true` makes a tool read-only. Set `consequentialHint` and also name the tool in `policy.consequentialTools` (`data-consequential-tools` on a script tag): MCP-B 5.x and Chrome 153 drop the hint, and there, on a page whose tools carry annotations but whose list names none, every tool that is not read-only prompts, and the widget's notice says to list them there (ADRs 0002 and 0034). A page whose tools carry no annotations at all gets no such fallback, since the adapter cannot tell a hint was dropped. `untrustedContentHint` changes nothing, as every result is labelled anyway. Under `confirmVia: 'client'` a member driver confirms in their own client ([Sharing](06-sharing.md)).
+Only the page's own `readOnlyHint: true` makes a tool read-only. Set `consequentialHint` and also name the tool in `policy.consequentialTools` (`data-consequential-tools` on a script tag): MCP-B 5.x and Chrome 153 drop the hint, and there, on a page whose tools carry annotations but whose list names none, every tool that is not read-only prompts (ADRs 0002 and 0034). A page whose tools carry no annotations at all gets no such fallback, since the adapter cannot tell a hint was dropped. `untrustedContentHint` changes nothing, as every result is labelled anyway. Under `confirmVia: 'client'` a member driver confirms in their own client ([Sharing](06-sharing.md)).
 
 ## Add the adapter
 
@@ -176,7 +178,9 @@ A page with no build step loads the polyfill, then the adapter's script-tag file
 ></script>
 ```
 
-It reads `data-relay` and the policy attributes the [adapter reference](04-adapter-reference.md#the-script-tag) lists, and attaches once the document has parsed, so a polyfill loaded as a module script is ready first. It gives no handle: the widget is the only control, with no `ui: false` or `modelContext`. A bad value logs `[tabdock] invalid data attributes for <fields>`, naming policy fields (`maxDrivers` for `data-max-drivers`), a `data-relay` other than `ws:` or `wss:` logs `[tabdock] data-relay must be a ws: or wss: URL ...`, and nothing attaches; a misspelled attribute is silently ignored. Once 0.1.0 is on npm, jsDelivr serves the file pinned to a version, with the digest from the release asset `tabdock-adapter.integrity.txt`, which also holds a ready tag:
+It reads `data-relay` and the policy attributes the [adapter reference](04-adapter-reference.md#the-script-tag) lists, and attaches once the document has parsed, so a polyfill loaded as a module script is ready first. It gives no handle: the widget is the only control, with no `ui: false` or `modelContext`. A bad value logs `[tabdock] invalid data attributes for <fields>`, a bad `data-relay` says so too, and nothing attaches; a misspelled attribute is silently ignored.
+
+The page publishes its state by dispatching on `document` a `tabdock:state` CustomEvent whose `detail` is the object. Once 0.1.0 is on npm, jsDelivr serves the file pinned to a version (the release after 0.1.0 for state, images and proposals), with the digest from the release asset `tabdock-adapter.integrity.txt`, which also holds a ready tag:
 
 ```html
 <!-- once 0.1.0 is on npm -->
@@ -200,20 +204,16 @@ It reads `data-relay` and the policy attributes the [adapter reference](04-adapt
 
 ## Writing handlers
 
-Always return a value. It reaches the client as text, an object as JSON and a string as it is, though MCP-B 6 quotes strings, under a `[tabdock: untrusted content from <origin>, tool <name>]` line, cut at 120,000 characters with a marker, never as structured content. On MCP-B 5.1, `undefined` arrives as the text `undefined`; on MCP-B 6 it fails.
+Always return a value. It reaches the client as text, an object as JSON and a string as it is, though MCP-B 6 quotes strings, under a `[tabdock: untrusted content from <origin>, tool <name>]` line, cut at 120,000 characters with a marker, never as structured content. On MCP-B 5.1, `undefined` arrives as the text `undefined`; on MCP-B 6 it fails. A tool named in `policy.imageTools` may instead return `{ image: { mimeType, data }, text }`, one PNG, JPEG or WebP within `dock.state.maxImageBytes`, which reaches the client as a text block and then the image ([Images and page state](18-images-and-state.md)).
 
 A thrown error becomes an error result under the same label. On 5.1 its text is `Tool was executed but the invocation failed. For example, the script function threw an error: ` and then your message; native WebMCP drops your message, and MCP-B 6 says `Tool execution failed`. So return errors the agent should read, as `{ error: 'no such order' }` does above.
 
-Check your own input: the relay checks arguments against `inputSchema` but leaves out `pattern`, `format` and `uniqueItems`, and a check that cannot start within 50 ms, or runs past 50 ms, lets the call through unchecked, so the check holds a call about 100 ms at most (ADRs 0008 and 0010). A call has about 45 s from when the relay receives it, its wait in the write queue and the operator's prompt included; an unanswered prompt is `denied_by_operator`. The handler's `signal` fires on a cancel, a revoke or the deadline on native WebMCP and MCP-B 6; MCP-B 5.1 never tells the handler, and a write holds the page until its handler returns (ADR 0001).
+Check your own input: the relay checks arguments against `inputSchema` but leaves out `pattern`, `format` and `uniqueItems`, and a check that cannot start within 50 ms, or runs past 50 ms, lets the call through unchecked (ADRs 0008 and 0010). A call has about 45 s from when the relay receives it, its wait in the write queue and the operator's prompt included; an unanswered prompt is `denied_by_operator`. The handler's `signal` fires on a cancel, a revoke or the deadline on native WebMCP and MCP-B 6; MCP-B 5.1 never tells the handler, and a write holds the page until its handler returns (ADR 0001).
 
 Limits: 128 tools per page, names matching `^[A-Za-z0-9_.-]{1,128}$`, descriptions cut to 1,000 characters, and input schemas over 8,192 characters or 64 levels deep replaced by a stub. First-class names, `<page id>__<tool>`, stop at 64 characters, which leaves 49 for yours (`.` becomes `_`); a longer one is reachable only through `call_page_tool`.
 
 ## Designing tools
 
-Keep tools small, one job each, with a verb_noun name that says it. Describe what a tool returns and when to use it; return only the fields an agent needs and never secrets, since results cross the relay in plain text into a model's context. Make writes safe to repeat, as `submit_order` reports an order already submitted rather than charging twice, and take ids, not positions on screen. Mark consequential whatever cannot be undone, spends money or sends something. [Security](10-security.md) says more.
-
-## What counts as one page
-
-The adapter keeps its resume token, grants, invite records and pause switch in the tab's `sessionStorage`, keyed by relay URL and the page's origin and path, read once at `attach()`. A reload of the same path in the same tab within 10 minutes resumes with the same page id and attachments; a new tab, or a full load of another path, is a new page for the operator to approve. A single-page app that changes its path through the History API stays one page, under the path it attached with.
+Keep tools small, one job each, with a verb_noun name that says it. Describe what a tool returns and when to use it; return only the fields an agent needs and never secrets, since results cross the relay in plain text into a model's context. Make writes safe to repeat, as `submit_order` reports an order already submitted rather than charging twice, and take ids, not positions on screen. Mark consequential whatever cannot be undone, spends money or sends something. Map and globe pages follow the shared profile on [Map and globe pages](16-map-pages.md), so every client drives them alike. [Security](10-security.md) says more.
 
 Next: [Adapter reference](04-adapter-reference.md).

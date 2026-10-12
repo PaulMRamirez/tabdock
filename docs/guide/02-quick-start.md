@@ -2,7 +2,7 @@
 
 From a clone to Claude Code calling a tool on a live page in about ten minutes, then a page of your own, all on one computer in local mode. [Concepts](01-concepts.md) explains the parts first if you prefer, and [Connect clients](05-connect-clients.md) covers Claude on the web and the phone.
 
-Tabdock 0.1.0 is prepared but not yet on npm, so today you start from a clone. Once 0.1.0 is on npm, `npx @tabdock/relay` starts the same relay without one.
+Tabdock 0.1.0 is prepared but not yet on npm, so today you start from a clone. Once 0.1.0 is on npm, `npx @tabdock/relay` starts a relay without one, though the picture and page state below come only with the release after 0.1.0.
 
 ## What you need
 
@@ -53,6 +53,8 @@ sequenceDiagram
 Ask Claude Code to pair with the Tabdock page using the code. Claude Code first asks its own permission to use each `tabdock-local` tool; allow it (a headless `claude -p` run needs `--allowedTools 'mcp__tabdock-local__*'`, or it calls nothing). That question is Claude Code's, not the page's.
 
 The widget then asks "You want to attach via code" with Allow as driver, Allow as observer and Deny; you have 60 seconds, and silence denies. Click Allow as driver. Then ask Claude to list the page's tools, add an item labelled Hello, and clear the board. `clear_board` is consequential, so the widget asks again ("You want to run clear_board"). Click Deny once, and Claude reports `denied_by_operator`; ask again and click Allow. Each call appears in the widget's activity list, and every result Claude reads starts with a line such as `[tabdock: untrusted content from http://127.0.0.1:5173, tool add_item]`.
+
+Then ask Claude Code to capture the board. `capture_board` is the demo's image tool, named in its `policy.imageTools`, so its result is one text block (that label, a relay line calling the picture untrusted, and a line naming the view) and then a WebP of the board, which Claude Code hands its model; whether the model reads the picture has not yet been checked with a live model. Ask too what the page's state says, or to wait for it to change: the board publishes its view, item count and highlighted items on each change, which `get_page_state` reads and `wait_for_page_state` waits on without running a page tool ([Images and page state](18-images-and-state.md)).
 
 ## A page of your own
 
@@ -106,7 +108,9 @@ Keep `pnpm dev` running, serve the folder on localhost with any static server, f
 
 ## Stopping and rotating the token
 
-The relay keeps pages, codes and attachments in memory, so after a restart each page shows a new code and clients pair again; only the audit log and the owner token survive. To replace the owner token, stop `pnpm dev` and run `pnpm relay --new-token`, which draws a new token and starts the relay without the board. Its banner says Claude Code's entry needs no change, and `claude mcp list` stays connected, since the helper reads the new token at the next connection; a PowerShell `--header` entry must be removed and added again. Stop it and run `pnpm dev` to get the board back.
+The relay keeps pages, codes and attachments in memory, so after a restart each page shows a new code and clients pair again; only the audit log and the owner token survive, unless `TABDOCK_RESTART_SNAPSHOT=1` carries pages and attachments across a graceful restart, which local mode allows since it keeps an audit directory ([Settings for rooms](14-settings-for-rooms.md#members-agents-and-restarts)).
+
+To replace the owner token, stop `pnpm dev` and run `pnpm relay --new-token`, which draws a new token and starts the relay without the board. Its banner says Claude Code's entry needs no change, and `claude mcp list` stays connected, since the helper reads the new token at the next connection; a PowerShell `--header` entry must be removed and added again. Stop it and run `pnpm dev` to get the board back.
 
 ## Where next
 

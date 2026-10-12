@@ -1,7 +1,8 @@
 // ADR 0039's image checks, shared by the adapter and the relay: crafted PNG,
 // JPEG and WebP headers at and past every bound, the types and encodings
-// that must never pass, and the envelope a declared image tool returns. Each
-// case would pass a check that was missing or off by one.
+// that must never pass, the chunks that mark an image animated, and the
+// envelope a declared image tool returns. Each case would pass a check that
+// was missing or off by one.
 
 import { describe, expect, it } from 'vitest';
 import {
@@ -115,10 +116,45 @@ function riff(chunk: string, body: number[]): Uint8Array {
   ]);
 }
 
-/** The extended format's canvas size, each side stored less one. */
-function webpVp8x(width: number, height: number): Uint8Array {
-  return riff('VP8X', [0, 0, 0, 0, ...u24le(width - 1), ...u24le(height - 1)]);
+/** The extended format's flags byte, three reserved bytes, then the canvas size, each side stored less one. */
+function vp8xBody(width: number, height: number, flags = 0): number[] {
+  return [flags, 0, 0, 0, ...u24le(width - 1), ...u24le(height - 1)];
 }
+
+function webpVp8x(width: number, height: number): Uint8Array {
+  return riff('VP8X', vp8xBody(width, height));
+}
+
+/** A RIFF WebP of several chunks, each payload padded to an even length as the format lays it out. */
+function riffChunks(chunks: readonly (readonly [string, readonly number[]])[]): Uint8Array {
+  const payload = chunks.flatMap(([fourCc, body]) => [
+    ...ascii(fourCc),
+    ...u32le(body.length),
+    ...body,
+    ...(body.length % 2 === 1 ? [0] : []),
+  ]);
+  return new Uint8Array([
+    ...ascii('RIFF'),
+    ...u32le(payload.length + 4),
+    ...ascii('WEBP'),
+    ...payload,
+  ]);
+}
+
+/** One PNG chunk: length, type, data and a CRC left zero, which nothing here reads. */
+function pngChunk(type: string, data: number[] = [], length = data.length): number[] {
+  return [...u32be(length), ...ascii(type), ...data, ...u32be(0)];
+}
+
+/** A PNG's header, then these chunks. */
+function pngWith(width: number, height: number, ...chunks: number[][]): Uint8Array {
+  return new Uint8Array([...pngHeader(width, height), ...chunks.flat()]);
+}
+
+/** acTL's body: two frames, played forever. */
+const ACTL = pngChunk('acTL', [...u32be(2), ...u32be(0)]);
+const IDAT = pngChunk('IDAT', [0x78, 0x9c, 0x63, 0x00, 0x00]);
+const IEND = pngChunk('IEND');
 
 /** A lossy key frame: its tag, start code and 14-bit sides. */
 function webpVp8(width: number, height: number): Uint8Array {
@@ -319,6 +355,114 @@ describe('checkImage', () => {
     expect(checkImage(wire('image/png', padTo(pngHeader(4, 4), MAX_IMAGE_BYTES)), 2 ** 31).ok).toBe(
       true,
     );
+  });
+});
+
+describe('checkImage and animation', () => {
+  const animated = {
+    ok: false,
+    reason: 'animated',
+    message: 'the image is animated; only a still image passes',
+  };
+
+  it('refuses a PNG with an acTL chunk before its first IDAT, wherever it sits before it', () => {
+    expect(checkImage(wire('image/png', pngWith(64, 64, ACTL, IDAT, IEND)), CAP)).toEqual(animated);
+    const text = pngChunk('tEXt', ascii('Comment\0board'));
+    // An odd length, so a walk that misread a chunk's size would land off the next header.
+    const odd = pngChunk('zzZz', [1, 2, 3]);
+    expect(
+      checkImage(wire('image/png', pngWith(64, 64, text, odd, ACTL, IDAT, IEND)), CAP),
+    ).toEqual(animated);
+  });
+
+  it('passes a PNG whose acTL comes after the first IDAT, which decoders ignore, and one with none', () => {
+    expect(checkImage(wire('image/png', pngWith(64, 64, IDAT, ACTL, IEND)), CAP)).toMatchObject({
+      ok: true,
+      width: 64,
+      height: 64,
+    });
+    expect(checkImage(wire('image/png', pngWith(64, 64, IEND, ACTL)), CAP).ok).toBe(true);
+    expect(checkImage(wire('image/png', pngWith(64, 64, IDAT, IEND)), CAP).ok).toBe(true);
+  });
+
+  it('refuses a WebP whose VP8X flags set the animation bit, and passes other flags', () => {
+    const flagged = riffChunks([['VP8X', vp8xBody(64, 64, 0x02)]]);
+    expect(checkImage(wire('image/webp', flagged), CAP)).toEqual(animated);
+    // Alpha (0x10), EXIF (0x08) and XMP (0x04) leave a still image still.
+    const still = riffChunks([['VP8X', vp8xBody(64, 64, 0x1c)]]);
+    expect(checkImage(wire('image/webp', still), CAP)).toMatchObject({ ok: true, width: 64 });
+  });
+
+  it('refuses a WebP holding an ANIM or ANMF chunk, after chunks of odd size', () => {
+    const vp8x = ['VP8X', vp8xBody(64, 64)] as const;
+    const iccp = ['ICCP', [1, 2, 3]] as const;
+    for (const [what, bytes] of [
+      ['ANIM', riffChunks([vp8x, iccp, ['ANIM', [0, 0, 0, 0, 0, 0]]])],
+      ['ANMF', riffChunks([vp8x, ['ANMF', new Array<number>(16).fill(0)]])],
+      [
+        'ANMF after a lossless image',
+        riffChunks([
+          ['VP8L', [0x2f, ...u32le(63 | (63 << 14))]],
+          ['ANMF', [0]],
+        ]),
+      ],
+    ] as const) {
+      expect(checkImage(wire('image/webp', bytes), CAP), what).toEqual(animated);
+    }
+    expect(checkImage(wire('image/webp', riffChunks([vp8x, iccp, ['EXIF', [0]]])), CAP).ok).toBe(
+      true,
+    );
+  });
+
+  it('passes every still sample and a JPEG, whose format has no animation', () => {
+    for (const [what, type, header] of SAMPLES) {
+      expect(checkImage(wire(type, padTo(header, 200)), CAP).ok, what).toBe(true);
+    }
+    // acTL's letters inside a JPEG mean nothing.
+    const jpeg = new Uint8Array([...jpegWithSof(64, 64), ...ascii('acTLANIMANMF')]);
+    expect(checkImage(wire('image/jpeg', jpeg), CAP).ok).toBe(true);
+  });
+
+  it('checks the dimensions first, so an animated image too large answers dimensions', () => {
+    const huge = pngWith(50_000, 50_000, ACTL, IDAT);
+    expect(reason(checkImage(wire('image/png', huge), CAP))).toBe('dimensions');
+  });
+
+  it('never throws or reads past the end of a truncated or lying chunk stream', () => {
+    const png = pngWith(64, 64, ACTL, IDAT);
+    for (let length = 24; length < png.length; length += 1) {
+      const cut = png.subarray(0, length);
+      // The acTL header ends at byte 41: from there on the walk sees it.
+      const expected = length >= 41 ? 'animated' : null;
+      expect(reason(checkImage(wire('image/png', cut), CAP)), String(length)).toBe(expected);
+    }
+    const lying = pngWith(64, 64, pngChunk('tEXt', [1], 0xffff_ffff), ACTL, IDAT);
+    expect(checkImage(wire('image/png', lying), CAP).ok).toBe(true);
+    const webp = riffChunks([
+      ['VP8X', vp8xBody(64, 64)],
+      ['ANIM', [0, 0, 0, 0, 0, 0]],
+    ]);
+    for (let length = 30; length < webp.length; length += 1) {
+      const cut = webp.subarray(0, length);
+      // ANIM's fourCC and size end at byte 38.
+      const expected = length >= 38 ? 'animated' : null;
+      expect(reason(checkImage(wire('image/webp', cut), CAP)), String(length)).toBe(expected);
+    }
+    // A size that runs past the end ends the walk: what follows is never read.
+    const lyingWebp = new Uint8Array([
+      ...webp.subarray(0, 30),
+      ...ascii('EXIF'),
+      ...u32le(0xffff_ffff),
+      ...webp.subarray(30),
+    ]);
+    expect(checkImage(wire('image/webp', lyingWebp), CAP).ok).toBe(true);
+  });
+
+  it('walks a stream of many empty chunks to the end of the buffer, one header at a time', () => {
+    const empties = Array.from({ length: 5_000 }, () => pngChunk('tEXt'));
+    const png = pngWith(64, 64, ...empties, ACTL, IDAT);
+    expect(png.length).toBeLessThan(MAX_IMAGE_BYTES);
+    expect(checkImage(wire('image/png', png), MAX_IMAGE_BYTES)).toEqual(animated);
   });
 });
 

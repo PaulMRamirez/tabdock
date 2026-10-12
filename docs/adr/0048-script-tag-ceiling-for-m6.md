@@ -20,6 +20,6 @@ The foundation left `SCRIPT_TAG_LIMIT_BYTES` and the size test at 150,000 while 
 
 Later the same day the protocol's `package.json` named `zod-config` as its only side effect (`"sideEffects": ["./src/zod-config.ts", "./dist/zod-config.js"]`), so a bundler may drop the protocol modules a page never imports while every module still runs `zod-config` first. The script-tag build dropped the audit, members and session record schemas and measured 136,645 bytes, under Wave 1's checkpoint, with no check, style or word removed. A protocol test holds the list, and the release check refuses a packed protocol whose list leaves out `./dist/zod-config.js`. This amends ADR 0028's sentence that neither package declares `sideEffects`; neither declares `sideEffects: false`.
 
-## Notes from ADR 0045 (10 October 2026)
+## Notes from ADR 0045 (10 and 11 October 2026)
 
 Built in full the session record's modules measure 12,375 bytes, nearly all of it the strict schema a record is checked by and the logic ADR 0045's decisions ask for, so on 11 October 2026, under the owner's standing instruction, ADR 0045's decision 23 and the decision above were raised from 7,000 to 13,000. The ceiling and the checkpoints above are unchanged either way.

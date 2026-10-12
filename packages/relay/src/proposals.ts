@@ -68,7 +68,7 @@ export const MAX_PROPOSAL_CHARGE =
 /**
  * One user's proposals that may still run, across every page, hold at most
  * this part of limits.proposalBytes, or one proposal at the caps where that
- * is less. The per-page caps alone let one member running pages of their
+ * is more. The per-page caps alone let one member running pages of their
  * own, approving themselves as observer, hold the whole budget, refusing
  * every proposal on the relay and dropping everyone's kept results; now
  * that takes eight accounts. Three proposals on a page at the caps are

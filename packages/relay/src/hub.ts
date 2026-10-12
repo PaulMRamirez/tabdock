@@ -371,7 +371,9 @@ type GrantDoor = Pick<InviteRecord, 'inviteId' | 'role' | 'sponsor'> & { readonl
 /**
  * What an attach request came through and the page must check against its
  * own record: an invite being redeemed, or an agent token's first request.
- * The secret is the one presented, forwarded once and never kept.
+ * The secret is the one presented, sent in each attach_request raised for
+ * it, and only to the page that minted the invite or token; the relay never
+ * keeps it (ADR 0044's section 9 note).
  */
 type Door =
   | { inviteId: string; secret: string; label: string }
@@ -840,7 +842,7 @@ const RESTORED_ADDRESS = '(restored from a snapshot)';
  * and the page waits SESSION_END_GRACE_MS before telling; a minute covers
  * that, and a claim made earlier is recorded as the operator's.
  */
-const SESSION_CLOCK_SLACK_MS = 60_000;
+export const SESSION_CLOCK_SLACK_MS = 60_000;
 
 function firstOf(set: ReadonlySet<string> | undefined): string | undefined {
   return set?.values().next().value;

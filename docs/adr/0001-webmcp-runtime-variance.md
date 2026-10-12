@@ -34,6 +34,6 @@ ADR 0039 amends this rule for declared image tools only. For a tool the hello's 
 
 As built, the adapter's image gate (ADR 0039, decision 18) comes after the consequential check and the operator's prompt, so this rule and the envelope decide only what an allowed call returns, never whether it is asked about. The `mcpb6` Playwright project runs the envelope on exact 6.0.0, where a string arrives quoted (`mcpb6-images.spec.ts`), and the `chromium` project on 5.1.0, or on native WebMCP where the browser has it (`image-results.spec.ts`). Guide page 18 gives the envelope and its fit loop.
 
-## Notes from the A6.28 review (12 October 2026)
+## Notes from the section 9 review (A6.28, 12 October 2026)
 
 The hold for a 5.1 write now covers the call holding ADR 0039's image gate as well. Its `executeTool` gets a signal nothing aborts, so a cancel, deadline or revoke answers the relay at once while the gate stays held until the handler ends, or until the call's deadline plus 2 s; before, the 5.1 race against the caller's signal settled the call and freed the gate under a capture still drawing. A 'Tool unregistered' rejection of that call leaves the gate to the same bound. Native WebMCP and MCP-B 6 are unchanged: the abort reaches the handler, and the gate frees when it lands.

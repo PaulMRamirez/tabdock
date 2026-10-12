@@ -355,7 +355,7 @@ describe('the first request (S4)', () => {
     expect(request).not.toHaveProperty('invite');
     // Nothing is granted before the operator answers; later requests join the prompt.
     const listed = await call(agent, 'list_pages');
-    expect(listed.text).toMatch(/not attached to any page/);
+    expect(listed.text).toMatch(/not attached yet/);
     await call(agent, 'list_pages');
     await page.sync();
     expect(page.all('attach_request')).toHaveLength(2);

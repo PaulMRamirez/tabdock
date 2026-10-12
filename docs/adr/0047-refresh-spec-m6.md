@@ -1,6 +1,6 @@
 # 0047: Refresh SPEC section 3 for M6, and move the MCP-B 6 leg to 6.0.0
 
-Status: Accepted, 10 October 2026, under the owner's standing instruction. Changes SPEC's dated line, section 3 (its heading, the WebMCP, MCP-B, MCP SDK, Claude, Claude Code, WorkOS and Fly rows, the sentence under the table and the unverified paragraph) and section 4 (the `tests/mcpb6` line). Amends ADR 0031's decision D4 for the test leg only, and adds a note to ADR 0001. The research is the set of `docs/notes/verified.md` rows dated 10 October.
+Status: Accepted, 10 October 2026, under the owner's standing instruction. Changes SPEC's dated line, section 3 (its heading, the WebMCP, MCP-B, MCP SDK, Claude, Claude Code, WorkOS and Fly rows, the sentence under the table and the unverified paragraph) and section 4 (the `tests/mcpb6` line). Amends ADR 0031's decision D4 for the test leg only, and adds a note to ADR 0001. The research is the set of `docs/notes/verified.md` rows dated 10 October. Its notes also change section 10 (A6.26 names the 6.0.0 leg, the beta pin gone).
 
 ## Context
 
@@ -25,3 +25,7 @@ The 6 leg tests the release pages will meet, not a beta, and the demo still show
 ## Notes from building the 6.0.0 leg (10 October 2026)
 
 6.0.0 did not break the leg, so the beta pin is gone. `tests/mcpb6` pins `@mcp-b/webmcp-polyfill` and `@mcp-b/webmcp-local-relay` at exactly 6.0.0 under the aliases `webmcp-polyfill-6` and `webmcp-local-relay-6`. Since an init script cannot be a module, the harness has esbuild wrap the polyfill's ESM entry as a classic script, unminified, and calls `installWebMCP()` after it, which is what an npm page does (esbuild is a development dependency there, as everywhere in the workspace, since Dependabot would count it as production, and group its bumps under `runtime`, if one manifest listed it under `dependencies`); the script-tag build, which still installs itself as it loads, is not used, so the leg can see that the import alone installs nothing. The call, cancel and consequential specs passed unchanged apart from that new check, and the baseline re-run (`docs/notes/baseline.raw.mcpb6.json`) matched the beta's every shape.
+
+## Note from the docs pass (12 October 2026)
+
+SPEC's dated line now follows ADR 0049, which refreshed it to 12 October and to ADRs 0038 to 0049 and their notes; the line this record set, "last amended 10 October 2026 by ADRs 0038 to 0048", is history.

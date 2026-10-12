@@ -103,3 +103,7 @@ Conflicts between the M6 records, settled by the plan, that touch this one:
 **From ADR 0041.** A write that moves the camera resolves once the camera has arrived, so a walker reads the view it asked for. The one walker is `tests/ci-check/src/walk.ts`, and the design's `tests/e2e/src/map-walk.ts` is dropped (C4).
 
 **Open questions.** Each is settled under Decisions: the names (1), the groups (2), one view shape (3) and a capped `features_in_view` (4).
+
+## Notes from the docs pass (12 October 2026)
+
+**Two phrases that are history.** The Decision table's `capture_view` row says "an image of the view (ADR 0039); until then, a text description". ADR 0039 was built in M6, so "until then" no longer applies: `capture_view` returns ADR 0039's envelope, as the notes above say, and on a relay that takes no images its image is refused like any other. Decision 23's "this plan" is `docs/plans/M6.md`, the plan these decisions were copied from.

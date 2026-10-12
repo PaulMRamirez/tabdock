@@ -6,7 +6,10 @@
 // changed in code fails here until the page says the new number. Times must
 // be in ms (for a spacing under a second), s, min or h, character caps in
 // characters and byte caps in bytes, and the named file must export the
-// constant.
+// constant. The docs pass after M6 added the restart snapshot's cap, what an
+// agent token's first request is read for its client, and the slack a page's
+// own end of a session is believed within, which hub.ts and relay.ts export
+// for this.
 
 import * as protocol from '@tabdock/protocol';
 import { dirname, join, normalize } from 'node:path';
@@ -15,6 +18,8 @@ import * as adapterCore from '../../../packages/adapter/src/core.ts';
 import * as auth from '../../../packages/relay/src/auth.ts';
 import * as config from '../../../packages/relay/src/config.ts';
 import * as confirm from '../../../packages/relay/src/confirm.ts';
+import * as hub from '../../../packages/relay/src/hub.ts';
+import * as relay from '../../../packages/relay/src/relay.ts';
 import { readRepo, type TableRow, tables } from '../src/doc-files.ts';
 
 const PAGE = 'docs/guide/12-setup-and-limits.md';
@@ -89,6 +94,10 @@ const REQUIRED = [
   'SESSION_RECORD_MAX_ROLE_CHANGES',
   'SESSION_RECORD_MAX_DROPPED_USERS',
   'SESSION_RECORD_MAX_BYTES',
+  // From the docs pass after M6 (ADRs 0043, 0044 and 0046).
+  'MAX_SNAPSHOT_BYTES',
+  'MAX_AGENT_NAMING_BYTES',
+  'SESSION_CLOCK_SLACK_MS',
 ];
 const MODULES: readonly Readonly<Record<string, unknown>>[] = [
   protocol,
@@ -96,6 +105,8 @@ const MODULES: readonly Readonly<Record<string, unknown>>[] = [
   confirm,
   auth,
   adapterCore,
+  hub,
+  relay,
 ];
 const TIME_UNITS: Readonly<Record<string, number>> = {
   ms: 1,
@@ -115,6 +126,11 @@ const WORDS: Readonly<Record<string, number>> = {
   nine: 9,
   ten: 10,
 };
+
+/** The required constants no row names. */
+function missingRequired(named: readonly (string | undefined)[]): string[] {
+  return REQUIRED.filter((constant) => !named.includes(constant));
+}
 
 function constantValue(name: string): number | undefined {
   for (const module of MODULES) {
@@ -212,7 +228,7 @@ describe("the guide's limits tables", () => {
         [...(row.cells.Constant ?? '').matchAll(/`([A-Z0-9_]+)`/g)].map((match) => match[1]),
       ),
     );
-    expect(REQUIRED.filter((constant) => !named.includes(constant))).toEqual([]);
+    expect(missingRequired(named)).toEqual([]);
     expect(named.filter((constant, index) => named.indexOf(constant) !== index)).toEqual([]);
   });
 
@@ -232,5 +248,14 @@ describe("the guide's limits tables", () => {
     expect(partProblem('MAX_FRAME_BYTES', '1 MiB')).not.toBeNull();
     expect(partProblem('MAX_RESULT_CHARS', '120,000 bytes')).not.toBeNull();
     expect(partProblem('MAX_PENDING_CONFIRMATIONS', 'four at once per user')).toBeNull();
+    expect(partProblem('SESSION_CLOCK_SLACK_MS', '60 s')).toBeNull();
+    expect(partProblem('SESSION_CLOCK_SLACK_MS', '30 s')).not.toBeNull();
+    expect(partProblem('MAX_AGENT_NAMING_BYTES', '16 KiB')).not.toBeNull();
+    expect(partProblem('MAX_SNAPSHOT_BYTES', '16,777,216 bytes')).toBeNull();
+  });
+
+  it('would fail a required constant the tables leave out', () => {
+    const named = REQUIRED.filter((constant) => constant !== 'SESSION_CLOCK_SLACK_MS');
+    expect(missingRequired(named)).toEqual(['SESSION_CLOCK_SLACK_MS']);
   });
 });

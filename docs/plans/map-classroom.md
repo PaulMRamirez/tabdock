@@ -1,5 +1,7 @@
 # Target scenario: a map and globe page in a classroom
 
+**Note of 12 October 2026.** This plan was written on 9 October, before any of its records was decided. ADRs 0038 to 0045 were accepted on 10 October with ADRs 0046 to 0048 beside them, and M6 built all eleven (`docs/plans/M6.md`). So "Each ADR is Proposed" below is history, and so is the limit in "What works today": with invites on, invitees watching by invite now sit in up to 40 watching seats a page by default, apart from the ten people the page holds, and each step of the walk below now has the feature it names, while what hosted Claude does with images, long waits and proposals waits on the owner's runs (`docs/checklists/M6.md`). The user guide's [Run a class](../guide/21-run-a-class.md) is the walk as a teacher follows it.
+
 This is the design Tabdock is heading toward for its first integration outside its own demo: a public map and globe viewer that teachers project in class. It describes the kind of page, not any one product, so the work it drives stays useful to every map page. ADRs 0038 to 0045 propose what it needs, and `docs/plans/backlog.md` gives their order.
 
 ## The page

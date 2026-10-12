@@ -263,7 +263,7 @@ const MAX_LISTEN_BODY_BYTES = 16 * 1024;
  * An initialize or a discover naming one is a few hundred bytes, and only
  * the leg past the per-user heap measure parses anything larger (ADR 0044).
  */
-const MAX_AGENT_NAMING_BYTES = 16 * 1024;
+export const MAX_AGENT_NAMING_BYTES = 16 * 1024;
 
 /** A JSON-RPC error answer, shaped as the SDK shapes its own. */
 function jsonRpcError(status: number, code: number, message: string, id: unknown = null): Response {

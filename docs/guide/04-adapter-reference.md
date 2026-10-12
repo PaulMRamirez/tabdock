@@ -1,6 +1,6 @@
 # Adapter reference
 
-`@tabdock/adapter` exports one function, `attach()`, which links the page's WebMCP tools to a relay, mounts the widget and returns the only control handle. This page and [The control handle](13-the-control-handle.md) list all of it as [core.ts](../../packages/adapter/src/core.ts), [script-options.ts](../../packages/adapter/src/script-options.ts) and the protocol's `PolicySchema` ([page-link.ts](../../packages/protocol/src/page-link.ts)) declare it; [Add to your app](03-add-to-your-app.md) explains when to use what.
+`@tabdock/adapter` exports `attach()`, which links the page's WebMCP tools to a relay, mounts the widget and returns the only control handle, and a few values [listed below](#what-the-package-exports). This page and [The control handle](13-the-control-handle.md) list all of it as [core.ts](../../packages/adapter/src/core.ts), [script-options.ts](../../packages/adapter/src/script-options.ts) and the protocol's `PolicySchema` ([page-link.ts](../../packages/protocol/src/page-link.ts)) declare it; [Add to your app](03-add-to-your-app.md) explains when to use what.
 
 ## attach(options)
 
@@ -50,7 +50,7 @@ An absent attribute keeps the default, and so does a misspelled one, which is ig
 
 ## The handle
 
-`attach()` returns a frozen `Dock`, the only control handle. With it your code approves and denies attach requests, answers prompts, switches roles, revokes, mints invites and pauses, and from M6 publishes the page's state, decides proposals, runs time-boxed sessions, mints agent tokens and saves session records. [The control handle](13-the-control-handle.md) lists every member, every `DockState` field and the invite options.
+`attach()` returns a frozen `Dock`, the only control handle. With it your code approves and denies attach requests, answers prompts, switches roles, revokes, mints invites and pauses, publishes the page's state, decides proposals, runs time-boxed sessions, mints agent tokens, and reads and discards session records; saving one as a file is the widget's Save JSON or Save summary, or page code using `sessionRecordJson` and `sessionRecordMarkdown`. [The control handle](13-the-control-handle.md) lists every member, every `DockState` field and the invite options.
 
 ## Your own operator UI
 
@@ -116,12 +116,34 @@ render(dock.state);
 
 Your UI takes on what the widget did: it should take only trusted clicks, keep the code and links off logs, and, against clickjacking, refuse to be framed; the widget also ignores clicks on a prompt until it has held still for half a second.
 
+What the example leaves out is yours too. A page that takes proposals renders `state.proposals` and calls `acceptProposal` and `dismissProposal`; unanswered, a proposal expires after 10 minutes. A page that runs sessions shows `state.session`'s time left and `state.sessionEnded`, as the widget warns at 5 minutes and at 1. An agent token's first request arrives in `pendingRequests` with `via` set to `'agent'` and `agent` naming its label. And a page that keeps records offers `state.records` for saving.
+
 ## Timeouts and limits
 
 An attach request waits 60 s for the operator, and silence denies it. A consequential prompt waits until the call's deadline, about 45 s from the relay's receipt of the call, and silence denies it too. `invite()` waits 10 s for the relay. The page remembers its last 1,000 prompted call ids and takes no new call under any of them, so a late `confirm()` from a stale dialog answers nothing. After a dropped link the adapter reconnects with backoff from 0.5 s to 30 s.
 
 ## Secrets
 
-Never log or send on `state.pairing.code`, `state.pairing.url` (its fragment is a single-use nonce), an invite link or the resume token in `sessionStorage`: anyone who sees a live code can ask to attach. The adapter's own log lines name invitees by a short id, never by email.
+Never log or send on `state.pairing.code`, `state.pairing.url` (its fragment is a single-use nonce), an invite link, the agent token and command `agentToken()` resolves with, the observers' links `startSession()` and `renewSessionLink()` resolve with, or the resume token in `sessionStorage`: anyone who sees a live code can ask to attach, and anyone holding a link or token can use it. The adapter's own log lines name invitees by a short id, never by email.
+
+## What the package exports
+
+| Export                  | What it is for                                                                                                                                                 |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `attach`                | Links the page's tools to a relay and returns the handle, as above                                                                                             |
+| `ADAPTER_VERSION`       | The adapter's version, which it sends the relay in its first frame                                                                                             |
+| `INVITE_LIFETIMES`      | The lifetimes `invite()` takes: `'15m'`, `'1h'` and `'open'`                                                                                                   |
+| `STATE_EVENT`           | `'tabdock:state'`, the event a script-tag page dispatches on `document` to publish its state                                                                   |
+| `DEFAULT_IMAGE_BYTES`   | 65,536, a relay's image cap unless `TABDOCK_MAX_IMAGE_BYTES` changes it; `state.maxImageBytes` says what this page's relay takes                               |
+| `MAX_IMAGE_BYTES`       | 524,288, the most any relay takes                                                                                                                              |
+| `sessionRecordJson`     | `sessionRecordJson(record)` gives the JSON file Save JSON writes, for a record from `dock.sessionRecord()`                                                     |
+| `sessionRecordMarkdown` | `sessionRecordMarkdown(record)` gives the Markdown summary Save summary writes                                                                                 |
+| `sessionRecordFileName` | `sessionRecordFileName(record, 'json')`, or `'md'`, gives the name the widget saves under: `tabdock-record-`, the start's date and time, and a session's label |
+
+It also exports the TypeScript types of the handle, its state, the policy and the results. A separate entry, `@tabdock/adapter/testing`, drives the widget from a test through the DevTools protocol ([Check a page from CI](17-check-from-ci.md#the-testing-helper)).
+
+## What counts as one page
+
+The adapter keeps its resume token, grants, revoked list, invite records, pause switch, running time-boxed session and agent token records (hashes, never a token or invite secret) in the tab's `sessionStorage`, keyed by relay URL and the page's origin and path, read once at `attach()`. A reload of the same path in the same tab within 10 minutes resumes with the same page id and attachments; a new tab, or a full load of another path, is a new page for the operator to approve. A single-page app that changes its path through the History API stays one page, under the path it attached with.
 
 Next: [Connect clients](05-connect-clients.md).

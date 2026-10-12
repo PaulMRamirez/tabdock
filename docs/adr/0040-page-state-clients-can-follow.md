@@ -86,6 +86,12 @@ Conflicts between the M6 records, settled by the plan, that touch this one:
 
 **Open questions.** Settled under Decisions: the names (1), the wait's answer (2), the size (3), the limits (6, 7) and latest value only (5).
 
-## Notes after the build
+## Notes after the build (11 October 2026)
 
 **A withheld value stays withheld until the page moves.** Past `TABDOCK_MAX_STATE_BYTES` the relay withholds a value without telling the page (decision 13), and the adapter never sends an equal value again (decision 9). A withheld page therefore reads null, at a raised version, until it publishes a different value, its operator pauses and resumes it, or its link comes back with a new welcome; room that other pages free does not bring the value back by itself, and a page that publishes only on discrete changes stays null until its next one. This is accepted rather than given a frame of its own: at the defaults a hosted relay never withholds, since every page it admits fits at the largest state (`state-heap.test.ts`), and resending an equal value on a timer would spend every page's frame budget to serve a relay set below its default. The relay's warn line, "page state withheld", is the operator's sign to raise the setting.
+
+## Notes from the docs pass (12 October 2026)
+
+**Waits per page, with invites off.** Decision 7 and C2 size a page's waits as `usersPerPage` plus `observersPerPage`. As built, the watching seats count only with invites on: with them off nobody can hold one, so a page's waits are `usersPerPage` alone, and invitees' share is that less `MEMBER_RESERVED_SEATS` as before (`waitLimitsOf` in `packages/relay/src/waits.ts`). SPEC section 7 says "its people limit plus, with invites on, its watching seats" (ADR 0049). The same reading holds for C2's copies in ADRs 0042 and 0044.
+
+**A wait answers on any difference.** Decision 8's "an `after` ahead of the version answers at once" is the relay's general rule: `wait_for_page_state` answers as soon as the version differs from `after`, ahead or behind (`now.version !== after` in `packages/relay/src/hub.ts`), so a client that missed a resume or holds a version from another page session hears the current one at once. SPEC section 7 now says so (ADR 0049).

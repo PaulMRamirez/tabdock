@@ -96,7 +96,7 @@ export function indexPage(pages: readonly PageLink[], repository: Repository): s
 <ol class="pages">
 ${items}
 </ol>
-<p>The <a href="../">demo board</a> beside this tour is the page the explainers attach to. It dials a relay only after you choose one and click to connect.</p>
+<p>The <a href="../">demo board</a> beside this tour is the page most explainers attach to; 06 uses the canvas map page, which <code>pnpm dev:map</code> serves from a clone. The board dials a relay only after you choose one and click to connect.</p>
 `;
   return shell('tour', 'The Tabdock tour', main, builtFrom(repository));
 }

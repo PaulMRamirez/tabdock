@@ -5,9 +5,12 @@
 // sees it. Both sides run the same checks from this module, so they refuse
 // exactly the same inputs: one strict base64 decoder (Buffer and atob skip or
 // forgive characters, so two decoders could disagree on what a page sent),
-// the type allowlist, the first bytes and the header dimensions. Nothing here
-// draws, decodes pixels or re-encodes an image, and no message repeats
-// anything the page wrote, its declared type included.
+// the type allowlist, the first bytes, the header dimensions and the chunk
+// headers that mark a PNG or WebP as animated (the ADR promises one still
+// image, and a small animated file can decode on a client to far more than
+// MAX_IMAGE_PIXELS). Nothing here draws, decodes pixels or re-encodes an
+// image, and no message repeats anything the page wrote, its declared type
+// included.
 
 // First, before zod builds anything: no eval probe on Trusted Types pages.
 import './zod-config.ts';
@@ -27,8 +30,10 @@ export type ImageMimeType = (typeof IMAGE_MIME_TYPES)[number];
  * name the tool (the relay's check); off: the cap is 0; type: not one of
  * IMAGE_MIME_TYPES; encoding: not canonical base64; size: over the cap;
  * signature: the first bytes are not its type's; dimensions: the header
- * cannot be read or declares too many pixels. Marked pure, so a page's
- * bundle, which never reads it, leaves it out (ADR 0048).
+ * cannot be read or declares too many pixels; animated: a PNG with an acTL
+ * chunk before its first IDAT, or a WebP whose VP8X flags or chunks mark an
+ * animation. Marked pure, so a page's bundle, which never reads it, leaves it
+ * out (ADR 0048).
  */
 export const ImageRefusalSchema = /* @__PURE__ */ z.enum([
   'undeclared',
@@ -38,6 +43,7 @@ export const ImageRefusalSchema = /* @__PURE__ */ z.enum([
   'size',
   'signature',
   'dimensions',
+  'animated',
 ]);
 export type ImageRefusal = z.infer<typeof ImageRefusalSchema>;
 
@@ -233,6 +239,51 @@ export function imageSize(
   return isWebp(bytes) ? webpSize(bytes) : null;
 }
 
+// Animation. Both walks read chunk headers only: each step moves past at
+// least one whole header, and a length that runs past the buffer ends the
+// walk, so a crafted file costs at most one step per 8 bytes it holds.
+
+/**
+ * Whether a PNG holds an acTL chunk before its first IDAT, which is what makes
+ * it an APNG: decoders ignore an acTL after the image data, so the walk stops
+ * quietly there, at IEND, or where the bytes end. Each chunk is a 4-byte
+ * big-endian length, a 4-byte type, the data and a 4-byte CRC.
+ */
+function isAnimatedPng(bytes: Uint8Array): boolean {
+  let offset = PNG_SIGNATURE.length;
+  while (offset + 8 <= bytes.length) {
+    if (hasAscii(bytes, offset + 4, 'acTL')) return true;
+    if (hasAscii(bytes, offset + 4, 'IDAT') || hasAscii(bytes, offset + 4, 'IEND')) return false;
+    offset += 12 + readUint(bytes, offset, 4);
+  }
+  return false;
+}
+
+/** The VP8X flags byte's animation bit, in the byte after the chunk's header. */
+const WEBP_ANIMATION_FLAG = 0x02;
+
+/**
+ * Whether a WebP is animated: its VP8X flags set the animation bit, or any
+ * RIFF chunk from offset 12 on is ANIM or ANMF. Each chunk is a fourCC, a
+ * 4-byte little-endian size and the payload, padded to an even length.
+ */
+function isAnimatedWebp(bytes: Uint8Array): boolean {
+  if (hasAscii(bytes, 12, 'VP8X') && ((bytes[20] ?? 0) & WEBP_ANIMATION_FLAG) !== 0) return true;
+  let offset = 12;
+  while (offset + 8 <= bytes.length) {
+    if (hasAscii(bytes, offset, 'ANIM') || hasAscii(bytes, offset, 'ANMF')) return true;
+    const size = readUint(bytes, offset + 4, 4, true);
+    offset += 8 + size + (size % 2);
+  }
+  return false;
+}
+
+function isAnimated(bytes: Uint8Array, type: ImageMimeType): boolean {
+  if (type === 'image/png') return isAnimatedPng(bytes);
+  if (type === 'image/webp') return isAnimatedWebp(bytes);
+  return false;
+}
+
 export type CheckedImage =
   | { ok: true; mimeType: ImageMimeType; bytes: Uint8Array; width: number; height: number }
   | { ok: false; reason: ImageRefusal; message: string };
@@ -249,8 +300,8 @@ function isImageMimeType(type: string): type is ImageMimeType {
  * Checks one image against a cap of `maxBytes` decoded bytes, never more than
  * MAX_IMAGE_BYTES, in a fixed order: off, type, size by base64 length (before
  * any scan, so an oversized image costs no decoding), encoding, size by
- * decoded length, first bytes, then the header's dimensions. Its messages are
- * fixed words with numbers; none repeats the page's type or data.
+ * decoded length, first bytes, the header's dimensions, then animation. Its
+ * messages are fixed words with numbers; none repeats the page's type or data.
  */
 export function checkImage(image: WireImage, maxBytes: number): CheckedImage {
   const cap = Math.min(maxBytes, MAX_IMAGE_BYTES);
@@ -290,6 +341,9 @@ export function checkImage(image: WireImage, maxBytes: number): CheckedImage {
       'dimensions',
       `the image is ${String(width)} by ${String(height)} pixels; at most ${String(MAX_IMAGE_SIDE)} a side and ${String(MAX_IMAGE_PIXELS)} in all`,
     );
+  }
+  if (isAnimated(bytes, mimeType)) {
+    return refused('animated', 'the image is animated; only a still image passes');
   }
   return { ok: true, mimeType, bytes, width, height };
 }

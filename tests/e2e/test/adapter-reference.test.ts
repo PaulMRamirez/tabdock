@@ -8,17 +8,84 @@
 // script-tag build reads. The policy's defaults must be what
 // PolicySchema fills in, every value the page lists must parse, and the
 // stated range for maxDrivers must be the schema's. The adapter README's
-// at-a-glance paragraph names the same handle members.
+// at-a-glance paragraph names the same handle members. Every reason a
+// handle method can answer with (startSession, invite, agentToken and
+// publishState, and the state's published status) is named in backticks on
+// the handle page, read from core.ts's types with the compiler API and from
+// the protocol's enums those types name, so a new refusal cannot ship with
+// no words for a page author; SessionResult's inviteRefusal is named too.
 
-import { PolicySchema } from '@tabdock/protocol';
+import {
+  InviteRefusalReasonSchema,
+  PolicySchema,
+  SessionRefusalReasonSchema,
+} from '@tabdock/protocol';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import { INVITE_LIFETIMES } from '../../../packages/adapter/src/core.ts';
+import { OPERATOR_GRANTS_PER_PAGE } from '../../../packages/relay/src/hub.ts';
 import { readScriptOptions } from '../../../packages/adapter/src/script-options.ts';
 import { datasetKey, readRepo, scriptTagAttributes, type Table, tables } from '../src/doc-files.ts';
 
 const PAGE = 'docs/guide/04-adapter-reference.md';
 const HANDLE = 'docs/guide/13-the-control-handle.md';
+const CORE = 'packages/adapter/src/core.ts';
+
+/** The protocol's enums core.ts's result types name, read from the schemas themselves. */
+const PROTOCOL_REASONS: Readonly<Record<string, readonly string[]>> = {
+  InviteRefusalReason: InviteRefusalReasonSchema.options,
+  SessionRefusalReason: SessionRefusalReasonSchema.options,
+};
+
+/** The handle's result types whose string literals a page author may be answered with. */
+const RESULT_TYPES = [
+  'SessionResult',
+  'InviteResult',
+  'InviteRefusal',
+  'AgentTokenResult',
+  'PublishResult',
+  'PublishStatus',
+];
+
+/**
+ * Every string literal a type alias in `source` holds, following the aliases
+ * it names in the same file and the protocol enums PROTOCOL_REASONS lists. A
+ * name ending in Reason or Refusal that is neither throws, so a new enum
+ * from elsewhere is never passed over in silence.
+ */
+function literalsOf(source: ts.SourceFile, name: string, seen = new Set<string>()): string[] {
+  if (seen.has(name)) return [];
+  seen.add(name);
+  const alias = source.statements.find(
+    (statement): statement is ts.TypeAliasDeclaration =>
+      ts.isTypeAliasDeclaration(statement) && statement.name.text === name,
+  );
+  if (alias === undefined) {
+    const known = PROTOCOL_REASONS[name];
+    if (known !== undefined) return [...known];
+    if (/(?:Reason|Refusal)$/.test(name)) throw new Error(`no literals known for ${name}`);
+    return [];
+  }
+  const found: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isLiteralTypeNode(node) && ts.isStringLiteral(node.literal))
+      found.push(node.literal.text);
+    if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName)) {
+      found.push(...literalsOf(source, node.typeName.text, seen));
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(alias.type);
+  return found;
+}
+
+/** The literals `page` never shows in backticks, bare or quoted. */
+function unnamedReasons(page: string, literals: readonly string[]): string[] {
+  const spans = new Set(
+    [...page.matchAll(/`([^`]+)`/g)].map((match) => (match[1] ?? '').replace(/^'|'$/g, '')),
+  );
+  return [...new Set(literals)].filter((literal) => !spans.has(literal));
+}
 
 /** The member names an interface declares in a source file, in order. */
 function membersOf(path: string, name: string): string[] {
@@ -212,5 +279,40 @@ describe("the adapter README's at-a-glance paragraph", () => {
     const sentence = /whose members are ([^.]+)\./.exec(readme)?.[1] ?? '';
     const named = [...sentence.matchAll(/`([^`]+)`/g)].map((match) => match[1]);
     expect(named).toEqual(membersOf('packages/adapter/src/core.ts', 'Dock'));
+  });
+});
+
+describe("the handle's answers", () => {
+  const source = ts.createSourceFile(CORE, readRepo(CORE), ts.ScriptTarget.Latest, true);
+  const handle = readRepo(HANDLE);
+
+  it('are each named in backticks on the handle page, inviteRefusal among them', () => {
+    const literals = RESULT_TYPES.flatMap((name) => literalsOf(source, name));
+    // The session's own refusals and the relay's, which it passes on, are both read.
+    for (const reason of ['active', 'link_down', 'unknown', 'length', 'no_sponsor', 'too_large']) {
+      expect(literals, reason).toContain(reason);
+    }
+    expect(unnamedReasons(handle, literals)).toEqual([]);
+    expect(unnamedReasons(handle, ['inviteRefusal'])).toEqual([]);
+  });
+
+  it("give the widget's words for limit the relay's grant limit, which the adapter cannot import", () => {
+    const widget = readRepo('packages/adapter/src/widget.ts');
+    const stated = /const RELAY_GRANTS_PER_MINUTE = (\d+);/.exec(widget)?.[1];
+    expect(Number(stated)).toBe(OPERATOR_GRANTS_PER_PAGE);
+  });
+
+  it('would fail a reason the page leaves out, and an enum the test cannot read', () => {
+    expect(unnamedReasons('`active`, `policy` or `link_down`', ['active', 'length'])).toEqual([
+      'length',
+    ]);
+    expect(unnamedReasons("`'shared'` or `'paused'`", ['shared', 'paused'])).toEqual([]);
+    const made = ts.createSourceFile(
+      'made.ts',
+      "type Result = { ok: false; reason: 'gone' | NewRefusal };",
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    expect(() => literalsOf(made, 'Result')).toThrow(/NewRefusal/);
   });
 });

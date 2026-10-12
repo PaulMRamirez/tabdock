@@ -13,7 +13,9 @@
 // message, as McpServer did. Every wording change since is deliberate and
 // recorded in the fixture's _comment: M6 recaptured both lists once, with
 // four tools after M4's five (ADRs 0040 and 0042) and three of M4's
-// descriptions changed (ADRs 0042 and 0043). So the old entries never move,
+// descriptions changed (ADRs 0042 and 0043), and the docs pass after M6
+// changed the instructions and pair_page's and detach_page's descriptions
+// for agent tokens (ADR 0049 decision 4). So the old entries never move,
 // M4's five still lead every list in M4's order, each with M4's name, input
 // schema and annotations, which the fixture keeps apart as m4Structure.
 

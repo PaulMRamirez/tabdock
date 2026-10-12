@@ -12,26 +12,26 @@ A view's bounds are `west`, `south`, `east` and `north`, with west greater than 
 
 ## The tools
 
-| Group        | Tool                    | Annotation                   | Arguments                                                                          | Returns                                                                     |
-| ------------ | ----------------------- | ---------------------------- | ---------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| view         | `get_view`              | read-only                    | none                                                                               | `MapView`                                                                   |
-| view         | `set_view`              | write                        | any of the view's fields but profile and bounds; `widthM` or `altitudeM`, not both | the `MapView` it set                                                        |
-| capture      | `capture_view`          | read-only, untrusted content | `maxWidthPx` 64 to 2048 (1024), format png or jpeg (png)                           | an image and the view as JSON, or that JSON with a one-line description     |
-| clock        | `get_clock`             | read-only                    | none                                                                               | `MapClock`                                                                  |
-| clock        | `set_clock`             | write                        | time, rate or playing                                                              | the `MapClock` it set                                                       |
-| layers       | `list_layers`           | read-only, untrusted content | none                                                                               | `{ layers }`, each a `MapLayer`                                             |
-| layers       | `set_layer`             | write                        | id, with visible or opacity; showing a base layer hides the other base layers      | id, visible and opacity                                                     |
-| features     | `features_in_view`      | read-only, untrusted content | limit 1 to 200 (50), kind                                                          | `{ features, total, truncated }`, most prominent first, then nearest        |
-| walkthroughs | `list_walkthroughs`     | read-only, untrusted content | none                                                                               | each `WalkthroughSummary`, and the current `walkthroughId` and `stopIndex`  |
-| walkthroughs | `get_stop`              | read-only, untrusted content | `walkthroughId` and index, the current stop by default                             | `MapStop`                                                                   |
-| walkthroughs | `go_to_stop`            | write                        | index, and `walkthroughId` unless the current one                                  | the stop's index and `stopCount`, the new view and clock, its observation   |
-| observations | `list_observations`     | read-only, untrusted content | `walkthroughId`, from, to, limit 1 to 150 (100)                                    | `{ observations, total, truncated }`, each an `ObservationSummary`, by time |
-| observations | `get_observation`       | read-only, untrusted content | id                                                                                 | `MapObservation`                                                            |
-| observations | `view_from_observation` | write                        | id                                                                                 | the `observationId` and the new view, on the globe where the page has one   |
+| Group        | Tool                    | Annotation                   | Arguments                                                                          | Returns                                                                                                        |
+| ------------ | ----------------------- | ---------------------------- | ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| view         | `get_view`              | read-only                    | none                                                                               | `MapView`                                                                                                      |
+| view         | `set_view`              | write                        | any of the view's fields but profile and bounds; `widthM` or `altitudeM`, not both | the `MapView` it set                                                                                           |
+| capture      | `capture_view`          | read-only, untrusted content | `maxWidthPx` 64 to 2048 (1024), format png or jpeg (png)                           | an image and the view as JSON, or the view and a description as JSON                                           |
+| clock        | `get_clock`             | read-only                    | none                                                                               | `MapClock`                                                                                                     |
+| clock        | `set_clock`             | write                        | time, rate or playing                                                              | the `MapClock` it set                                                                                          |
+| layers       | `list_layers`           | read-only, untrusted content | none                                                                               | `{ layers }`, each a `MapLayer`                                                                                |
+| layers       | `set_layer`             | write                        | id, with visible or opacity; showing a base layer hides the other base layers      | id, visible and opacity                                                                                        |
+| features     | `features_in_view`      | read-only, untrusted content | limit 1 to 200 (50), kind                                                          | `{ features, total, truncated }`, most prominent first, then nearest                                           |
+| walkthroughs | `list_walkthroughs`     | read-only, untrusted content | none                                                                               | `{ walkthroughs, current }`: each a `WalkthroughSummary`, and `current` `{ walkthroughId, stopIndex }` or null |
+| walkthroughs | `get_stop`              | read-only, untrusted content | `walkthroughId` and index, the current stop by default                             | `MapStop`                                                                                                      |
+| walkthroughs | `go_to_stop`            | write                        | index, and `walkthroughId` unless the current one                                  | the stop's index and `stopCount`, the new view and clock, its observation                                      |
+| observations | `list_observations`     | read-only, untrusted content | `walkthroughId`, from, to, limit 1 to 150 (100)                                    | `{ observations, total, truncated }`, each an `ObservationSummary`, by time                                    |
+| observations | `get_observation`       | read-only, untrusted content | id                                                                                 | `MapObservation`                                                                                               |
+| observations | `view_from_observation` | write                        | id                                                                                 | the `observationId` and the new view, on the globe where the page has one                                      |
 
 Every result is JSON text behind the relay's label, never structured content. A handler refuses by throwing, so the call ends as `tool_error`, and the schemas carry every fixed bound, so the relay names most mistakes itself as `invalid_arguments` before the page sees them. Rules that depend on state, such as an index past `stopCount` or a time outside the clock's start and end, are in the descriptions and readable from `list_walkthroughs` and `get_clock`. Each write resolves with the state it produced, and `get_view` reports the target view at once, even while the page still animates toward it. `go_to_stop` takes an index only, so a call repeated, or two accepted proposals, land on the same stop.
 
-Only MCP-B 5.1 passes a handler's words on, after its own sentence. Native WebMCP keeps only that sentence, and MCP-B 6 answers `Tool execution failed` to every refusal (page 03), so there a client learns why from the descriptions and from the relay's `invalid_arguments`, which names a broken bound before the page sees the call.
+Each Annotation word registers fixed keys (`mapAnnotations()` in `packages/sim-page/src/map/profile.ts`): read-only is `{ readOnlyHint: true }`, untrusted content adds `untrustedContentHint: true`, and write is `{ readOnlyHint: false, consequentialHint: false }`. Only MCP-B 5.1 passes a handler's words on, after its own sentence; native WebMCP keeps only that sentence, and MCP-B 6 answers `Tool execution failed` to every refusal (page 03), so there a client learns why from the descriptions and the relay's `invalid_arguments`.
 
 ## Shapes
 
@@ -136,9 +136,85 @@ interface MapPageState {
 
 `get_view` and `set_view` are the core. Capture, clock, layers, features, walkthroughs and observations are optional groups, each registered whole or not at all, so a client that finds `list_walkthroughs` in `list_page_tools` can rely on `go_to_stop`, and a static 2D map with no clock simply has no clock group. `get_view` carries `profile: 'tabdock.map.v1'`, since a name alone cannot prove a page follows the profile. A page may add result fields and optional arguments within v1; any change of meaning makes v2. Each description is one ASCII line of at most 200 characters, so a first-class listing shows it whole.
 
+A 2D map's core takes little more than this, with the declaration from [Add to your app](03-add-to-your-app.md#a-webmcp-runtime); a globe adds `altitudeM` and `fovDeg`:
+
+```ts
+/** The page's own 2D map library, as far as these two tools use it. */
+declare const map: {
+  body: string;
+  projection: string;
+  lon: number;
+  lat: number;
+  widthM: number;
+  headingDeg: number;
+  pitchDeg: number;
+  bounds(): { west: number; south: number; east: number; north: number } | null;
+  moveTo(
+    target: Partial<Record<'lon' | 'lat' | 'widthM' | 'headingDeg' | 'pitchDeg', number>>,
+  ): void;
+};
+
+/** The target view, as get_view and set_view return it. */
+function view() {
+  const { body, projection, lon, lat, widthM, headingDeg, pitchDeg } = map;
+  return {
+    profile: 'tabdock.map.v1',
+    body,
+    projection,
+    lon,
+    lat,
+    widthM,
+    headingDeg,
+    pitchDeg,
+    bounds: map.bounds(),
+  };
+}
+
+await document.modelContext?.registerTool({
+  name: 'get_view',
+  title: 'Get view',
+  description:
+    'Return the camera view: body, projection, centre lon and lat in degrees, widthM, headingDeg, pitchDeg and bounds.',
+  inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  annotations: { readOnlyHint: true },
+  execute: async () => view(),
+});
+
+await document.modelContext?.registerTool({
+  name: 'set_view',
+  title: 'Set view',
+  description:
+    "Move the camera to any of get_view's fields but profile and bounds. Returns the view it set.",
+  inputSchema: {
+    type: 'object',
+    properties: {
+      lon: { type: 'number', minimum: -180, maximum: 180 },
+      lat: { type: 'number', minimum: -90, maximum: 90 },
+      widthM: { type: 'number', exclusiveMinimum: 0, maximum: 1e10 },
+      headingDeg: { type: 'number', minimum: 0, exclusiveMaximum: 360 },
+      pitchDeg: { type: 'number', minimum: -90, maximum: 90 },
+    },
+    minProperties: 1,
+    additionalProperties: false,
+  },
+  annotations: { readOnlyHint: false, consequentialHint: false },
+  execute: async (input: unknown) => {
+    const target: Partial<Record<'lon' | 'lat' | 'widthM' | 'headingDeg' | 'pitchDeg', number>> =
+      {};
+    for (const key of ['lon', 'lat', 'widthM', 'headingDeg', 'pitchDeg'] as const) {
+      const value: unknown =
+        typeof input === 'object' && input !== null ? Reflect.get(input, key) : undefined;
+      if (typeof value === 'number' && Number.isFinite(value)) target[key] = value;
+    }
+    map.moveTo(target);
+    return view();
+  },
+});
+```
+
 ## Consequential tools
 
-The profile marks no tool consequential: a camera, clock, layer or stop move by an approved driver is reversible. But MCP-B 5.x and Chrome 153 drop `consequentialHint`, and there a page that names no consequential tool has every write prompt (ADR 0034), so the operator would be asked at every camera move. Name your irreversible tools in `consequentialTools`, never an empty list, which names none; `consequential: 'allow'` is only for a page that has none.
+The profile marks no tool consequential: a camera, clock, layer or stop move by an approved driver is reversible. But MCP-B 5.1 and Chrome 153 drop `consequentialHint`, and there a page that names no consequential tool has every write prompt (ADR 0034), the operator asked at every camera move. So a profile page names its own irreversible tools in `consequentialTools`, never an empty list; `consequential: 'allow'` is only for a page that has none.
 
 ```ts
 import { attach } from '@tabdock/adapter';
@@ -151,7 +227,7 @@ attach({
 
 ## capture_view
 
-A page that names `capture_view` in `imageTools` returns ADR 0039's envelope, `{ image: { mimeType, data }, text }`, with the view, `visibleLayers`, `observationId`, `widthPx` and `heightPx` as JSON in its text. A page that does not returns that JSON with a description, as text.
+A page that names `capture_view` in `imageTools` returns ADR 0039's envelope, `{ image: { mimeType, data }, text }`, with the view, `visibleLayers`, `observationId`, `widthPx` and `heightPx` as JSON in its text ([Images and page state](18-images-and-state.md)). A page that does not returns `{ description, view, visibleLayers, observationId }` as text, with no size and no `visibleLayersOmitted`.
 
 The text beside an image stays within 1,800 characters, so no adapter cuts it: where the visible layers' ids would not fit, the list stops and `visibleLayersOmitted` counts the rest, which `list_layers` names. Capture only the page's own canvas, never the tab, which shows the pairing code, with `toDataURL` and `image/png` or `image/jpeg`. A WebGL canvas captures in the same task as its render, or keeps `preserveDrawingBuffer`; tiles from another origin need CORS, or the canvas cannot be read at all. Refuse a `"data:,"` result, or one of another type than you asked for. `maxWidthPx` lets a client retry smaller when a capture is refused as too large.
 
@@ -206,9 +282,9 @@ Titles, names, notes, texts and URLs hold no control character but tab and line 
 
 ## Worked examples
 
-The profile's names, schemas and limits are in `packages/sim-page/src/map/profile.ts`, as zod schemas that both check a handler's arguments and become the JSON Schema clients see. `packages/sim-page/src/map/tools.ts` registers the fourteen tools over a map world of the Moon with `createMapTools()`, beside two editing tools that are not part of the profile: `edit_stop`, a write, and `reset_edits`, the one consequential tool. `startMapSimPage()` runs them on the sim page for relay tests.
+The profile's names, schemas and limits are in `packages/sim-page/src/map/profile.ts`, as zod schemas that both check a handler's arguments and become the JSON Schema clients see. `@tabdock/sim-page` is private, and ADR 0038 defers a published schema package until a real map page has used the profile, so copy that file (Apache-2.0; it needs `zod` and one type from `@tabdock/protocol`) or write the shapes yourself; `geometry.ts` beside it holds the math for `widthM`, bounds and the antimeridian. `map/tools.ts` registers the fourteen tools over the Moon with `createMapTools()`, beside two outside the profile: `edit_stop`, a write, and `reset_edits`, the one consequential tool.
 
-[tests/map-page](../../tests/map-page/README.md) is a canvas page with no map library, the same tools in a browser, which `pnpm dev:map` serves at http://127.0.0.1:5174/ and tests serve with `startMapPageServer()`. It reads nothing from its URL, and dials a relay only on a click on its Connect button or from its own script, as the tests connect it.
+[tests/map-page](../../tests/map-page/README.md) is a canvas page with no map library, which `pnpm dev:map` serves at `http://127.0.0.1:5174/`. It reads nothing from its URL and dials a relay only on a click on Connect, always with `MAP_PAGE_POLICY` and `capture_view` as its image tool, so with proposals off, or from its own script: `window.__tabdockMapPage.connect(url, policy)` takes a wider policy, as the tests use it. Rehearse proposals on the demo board instead ([Lessons and reviews](19-lessons-and-reviews.md#proposals)).
 
 To teach a client the profile, one line will do: "this page follows the Tabdock map profile, `tabdock.map.v1`", with this page beside it. An observation's source URL is page text too, so a client should not fetch it on a page's say-so alone.
 

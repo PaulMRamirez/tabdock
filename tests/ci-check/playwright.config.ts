@@ -9,6 +9,7 @@
 import { defineConfig } from '@playwright/test';
 
 const port = process.env.TABDOCK_PORT ?? '8787';
+const pageUrl = process.env.CI_CHECK_PAGE_URL;
 const executablePath = process.env.CHROMIUM_EXECUTABLE;
 const browser = executablePath ? { executablePath } : {};
 
@@ -31,9 +32,13 @@ export default defineConfig({
     },
     {
       name: 'page',
-      // Required: with none set, the run stops here saying so.
-      command: process.env.CI_CHECK_PAGE_COMMAND ?? 'echo set CI_CHECK_PAGE_COMMAND >&2; exit 1',
-      url: process.env.CI_CHECK_PAGE_URL ?? 'http://127.0.0.1:5180/',
+      // Both required: with either unset, the run stops here saying so, rather
+      // than wait on a URL the specs' own settings check refuses later.
+      command:
+        pageUrl === undefined
+          ? 'echo set CI_CHECK_PAGE_URL >&2; exit 1'
+          : (process.env.CI_CHECK_PAGE_COMMAND ?? 'echo set CI_CHECK_PAGE_COMMAND >&2; exit 1'),
+      url: pageUrl ?? 'http://127.0.0.1:5180/',
       reuseExistingServer: false,
       gracefulShutdown: { signal: 'SIGINT', timeout: 5_000 },
       stdout: 'ignore',

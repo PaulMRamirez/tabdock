@@ -1,5 +1,6 @@
-// The canvas map page (ADR 0038): the profile's sixteen tools over a MapWorld,
-// registered through WebMCP and drawn on a plain canvas, with capture_view
+// The canvas map page (ADR 0038): the profile's fourteen tools and the
+// worked examples' two editing tools over a MapWorld, registered through
+// WebMCP and drawn on a plain canvas, with capture_view
 // returning a picture of the view (ADR 0039) and the page's state published
 // on each change once linked (ADR 0040). It dials a relay only
 // on a trusted click on its Connect button, or when page script calls

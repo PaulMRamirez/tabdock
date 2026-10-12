@@ -91,3 +91,7 @@ A5.2's Claude Code half runs in the sandbox rather than in CI, since it needs a 
 ## Notes from the M5 Step 3 review (5 October 2026)
 
 ADR 0027's notes from the same review change A5.2's clause on what a conformance baseline may excuse: beside the referee's fixture scenarios and SHOULD-level warnings, checks the suite cannot run against the relay for want of a tool or capability the relay does not serve, and scenarios of extensions the relay does not offer that the set leaves unscored, with `server-session-lifecycle` joining the scenarios no baseline may name. SPEC section 10 carries the new clause.
+
+## Note from M6's docs pass (12 October 2026)
+
+ADR 0047 moved the `tests/mcpb6` leg from the 6.0 beta to exact 6.0.0 once 6.0.0 became npm `latest` on 8 October, while the demo stays on exact 5.1.0 under its own backlog row, so decision D4's "the day 6.x becomes npm `latest`, the demo moves" waits on that row. The Consequences' "since notes cannot change SPEC" gives way to ADR 0049's decision 2: a dated note may change SPEC when it names the line it changes.

@@ -73,3 +73,7 @@ ADR 0035 amends this record: the site gains a third part, a user guide built fro
 ## Note of 8 October 2026: the site as a pnpm project of its own
 
 Dependabot's pull requests changed `apps/site/package.json` without its lockfile, and the frozen install then failed. Two things combined. Dependabot expands the workspace's globs without pnpm's `!` negation (`docs/notes/verified.md`), so `apps/*` with `!apps/site` handed the site to the root's job too; and in the site's own job pnpm took the site for part of the parent workspace, which Dependabot cannot override with `--ignore-workspace`. The root `pnpm-workspace.yaml` now names `apps/demo` instead of `apps/*`, and `apps/site/pnpm-workspace.yaml` makes the site a workspace root of its own, so pnpm, and any tool that runs it there, uses the site's lockfile. `pnpm site:build` keeps `--ignore-workspace`, now redundant and harmless. The tools the workspace and the site share (TypeScript, `@types/node`, Playwright) are bumped by hand in both places at once (`docs/develop.md`, "Dependency updates").
+
+## Note of 12 October 2026: `?proposals` on the board
+
+The site review's quoted demo paragraph names `?confirm` and `?invites`; since M6 the board also reads `?proposals`, names it on the Connect bar and offers it on the Connect form, as ADR 0042's note from Wave 3's cross review records, and SPEC section 4 names all three.

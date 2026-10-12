@@ -65,4 +65,4 @@ The two branches conflicted only in documents: ADR 0044's notes from both fixers
 
 ## Still open
 
-The animated image question above, for the owner to decide whether `checkImage` should refuse an animated PNG or WebP. The relay hub's comments that a token is "forwarded once" are true of each request and were left as they are.
+Nothing, since the docs pass of 12 October. The animated image question above was decided that day under the owner's standing instruction: `checkImage` now refuses an animated PNG (an `acTL` chunk before its first `IDAT`) or WebP (the VP8X animation flag, or an `ANIM` or `ANMF` chunk) with the reason `animated`, in the adapter and the relay alike (ADR 0039's notes from the docs pass, threat model row B11, SPEC S9). And the relay hub's comment on `Door`, which said a token is "forwarded once", true of each request alone, now says the secret goes in each `attach_request` the relay raises for it, as S11 does.

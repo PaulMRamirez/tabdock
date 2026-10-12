@@ -136,6 +136,32 @@ export function readFlyToml(text: string): { tables: Map<string, TomlTable[]>; t
   return { tables, top };
 }
 
+/**
+ * What fly.toml's [env] must never set: secrets and the owner's own values,
+ * which deploy.yml stages from the production environment, and
+ * TABDOCK_MEMBERS_FILE, which deploy.yml manages from that environment's
+ * variable beside TABDOCK_OAUTH_USERS: set in [env] as well, deploy.yml would
+ * still stage TABDOCK_OAUTH_USERS, and config.ts refuses the two together, so
+ * the relay would not start.
+ */
+const NEVER_IN_ENV = [
+  'TABDOCK_PUBLIC_URL',
+  'TABDOCK_ALLOWED_ORIGINS',
+  'TABDOCK_OAUTH_ISSUER',
+  'TABDOCK_OAUTH_USERS',
+  'TABDOCK_MEMBERS_FILE',
+  'TABDOCK_PAIR_CLIENT_ID',
+  'TABDOCK_PAIR_CLIENT_SECRET',
+  'TABDOCK_DEV_TOKENS',
+  'TABDOCK_SPIKE',
+  'TABDOCK_DEV_ALLOW_NO_ORIGIN',
+];
+
+/** The names of NEVER_IN_ENV that `env` sets. */
+function setInEnv(env: Readonly<Record<string, unknown>>): string[] {
+  return NEVER_IN_ENV.filter((name) => env[name] !== undefined);
+}
+
 describe('deploy/fly/fly.toml (ADR 0018)', () => {
   const { tables, top } = readFlyToml(read('deploy/fly/fly.toml'));
   const one = (name: string): TomlTable => {
@@ -180,19 +206,13 @@ describe('deploy/fly/fly.toml (ADR 0018)', () => {
       TABDOCK_INVITES: '1',
     });
     expect(top.app).toBeUndefined();
-    for (const secret of [
-      'TABDOCK_PUBLIC_URL',
-      'TABDOCK_ALLOWED_ORIGINS',
-      'TABDOCK_OAUTH_ISSUER',
-      'TABDOCK_OAUTH_USERS',
-      'TABDOCK_PAIR_CLIENT_ID',
-      'TABDOCK_PAIR_CLIENT_SECRET',
-      'TABDOCK_DEV_TOKENS',
-      'TABDOCK_SPIKE',
-      'TABDOCK_DEV_ALLOW_NO_ORIGIN',
-    ]) {
-      expect(env[secret], secret).toBeUndefined();
-    }
+    expect(setInEnv(env)).toEqual([]);
+  });
+
+  it('would fail an [env] that sets the members file', () => {
+    expect(
+      setInEnv({ TABDOCK_ENV: 'production', TABDOCK_MEMBERS_FILE: '/data/members.json' }),
+    ).toEqual(['TABDOCK_MEMBERS_FILE']);
   });
 
   it('reads only the forms it knows', () => {

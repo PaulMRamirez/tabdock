@@ -1,6 +1,6 @@
 # Setup problems and limits
 
-What to do when the relay, a page or a client misbehaves before a call gets anywhere, and the fixed limits behind the codes on [Troubleshooting](11-troubleshooting.md). The relay's log, which names each refusal but never a token, code or argument, says most; the widget's notice line the rest. [Images and state](18-images-and-state.md#when-it-goes-wrong), [lessons](19-lessons-and-reviews.md#when-it-goes-wrong) and [larger rooms](20-larger-rooms.md) have their own.
+What to do when the relay, a page or a client misbehaves before a call gets anywhere, and the fixed limits behind the codes on [Troubleshooting](11-troubleshooting.md). The relay's log, which names each refusal but never a token, code or argument, says most; the widget's notice line the rest. [Images and state](18-images-and-state.md#when-it-goes-wrong), [lessons](19-lessons-and-reviews.md#when-it-goes-wrong) and [joining](22-join-a-shared-page.md#when-it-goes-wrong) have their own, and [the members file](20-larger-rooms.md#the-members-file) explains its refusals.
 
 ## Setup problems
 
@@ -8,7 +8,7 @@ What to do when the relay, a page or a client misbehaves before a call gets anyw
 
 **Claude Code says `tabdock-local` already exists.** It never replaces an entry: run `claude mcp remove --scope user tabdock-local`, paste the line the banner printed, and check with `claude mcp list`, never `claude mcp get`, which prints a stored header in full. After `pnpm relay --new-token`, an entry from the `claude mcp add-json` line needs no change, since its `claude-headers` helper reads the new token at each connection; only an entry from the `--header` line (PowerShell, or a token directory whose path holds a quote, backslash, `$` or backtick) answers 401 until you replace it.
 
-**The relay stops before it starts.** It names the problem and the setting, never the value ([value rules](08-relay-settings.md#value-rules)). For the owner token, whose directory defaults to `~/.config/tabdock` (or `$XDG_CONFIG_HOME/tabdock`) on Linux, `~/Library/Application Support/Tabdock` on macOS and `%LOCALAPPDATA%\Tabdock` on Windows, the line reads `local mode refuses <path> ...`, or `local mode refuses the path TABDOCK_HOME gives ...` when `TABDOCK_HOME` chose the directory, with a directory above it named by how many levels up it lies, and names its fix:
+**The relay stops before it starts.** It names the problem and the setting, never the value ([value rules](08-relay-settings.md#value-rules)). For the owner token's directory ([Local mode](07-run-a-relay.md#local-mode)), the line reads `local mode refuses <path> ...`, or `local mode refuses the path TABDOCK_HOME gives ...` when `TABDOCK_HOME` chose the directory, with a directory above it named by how many levels up it lies, and names its fix:
 
 | Refused because                                                                                                        | Fix                                                                                   |
 | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
@@ -42,7 +42,7 @@ Other refusals name a setting: one outside its mode (`TABDOCK_INVITES does not a
 
 ## Limits
 
-Fixed numbers, each from the named constant, M6's on [their own page](15-limits-for-rooms.md); rate limits, users per page, queue depth and byte budgets are [settings](08-relay-settings.md).
+Fixed numbers, each from the named constant; those for rooms, images and state are on [their own page](15-limits-for-rooms.md), and rate limits, users per page, queue depth and byte budgets are [settings](08-relay-settings.md).
 
 | Limit                                                          | Value                        | Constant                                                           | In                                                       |
 | -------------------------------------------------------------- | ---------------------------- | ------------------------------------------------------------------ | -------------------------------------------------------- |

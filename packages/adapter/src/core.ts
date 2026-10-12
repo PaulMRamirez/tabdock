@@ -722,8 +722,10 @@ export interface DockState {
    */
   readonly joins: readonly InviteJoin[];
   /**
-   * Who the driver limit seated as an observer after the operator chose
-   * driver, newest first, while the roster still lists them as one.
+   * Who the relay seated as an observer after the operator chose driver,
+   * newest first, while the roster still lists them as one: held by the
+   * driver limit, or by the people limit when a watcher made a driver found
+   * no seat among the page's people (heldBy 'people', ADR 0044).
    */
   readonly observerSeats: readonly ObserverSeat[];
   /**
@@ -774,8 +776,9 @@ export interface Dock {
   /**
    * The operator's role switch, for a user the roster lists and the operator
    * approved on this page (or autoApprove let in). The relay may still hold a
-   * new driver at maxDrivers; the page runs calls under the lesser of this
-   * choice and the relay's roster either way.
+   * new driver an observer, at maxDrivers or, for a watcher, when the page's
+   * people have no seat left (state.observerSeats says which); the page runs
+   * calls under the lesser of this choice and the relay's roster either way.
    */
   setRole(userId: string, role: Role): boolean;
   /**
