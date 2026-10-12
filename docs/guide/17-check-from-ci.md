@@ -25,7 +25,7 @@ From a clone, `pnpm ci-check` runs the example in `tests/ci-check` against the c
 npm install --save-dev --save-exact @tabdock/relay@<version> @tabdock/adapter@<version> @playwright/test@1.56.1 @modelcontextprotocol/client@2.3.1 zod@4.6.5
 ```
 
-Copy the `tests/ci-check` directory and change the four things its README lists: `connectPage()` in `src/tabdock.ts`; `CI_CHECK_PAGE_COMMAND`, which serves your page, and `CI_CHECK_PAGE_URL`, its required http address on 127.0.0.1 or localhost, without which the run stops; `CI_CHECK_RELAY_COMMAND`, `npx --no-install tabdock-relay` unless set, so `@tabdock/relay` is installed beside it; and `REQUIRE_TOOLS` in `specs/walk.spec.ts`, the optional tools your page has. The canvas page links when its own script asks, never from its URL, so the fixture calls that script:
+Copy the `tests/ci-check` directory and change the four things its README lists: `connectPage()` in `src/tabdock.ts`; `CI_CHECK_PAGE_COMMAND`, which serves your page, and `CI_CHECK_PAGE_URL`, its required http address on 127.0.0.1 or localhost, without which, or with it empty, the run stops at once; `CI_CHECK_RELAY_COMMAND`, `npx --no-install tabdock-relay` unless set, so `@tabdock/relay` is installed beside it; and `REQUIRE_TOOLS` in `specs/walk.spec.ts`, the optional tools your page has. The canvas page links when its own script asks, never from its URL, so the fixture calls that script:
 
 ```ts
 import type { Page } from '@playwright/test';

@@ -2,14 +2,14 @@
 
 A check you can copy into another repository: Playwright starts a Tabdock relay in local mode and the page under test, `@tabdock/adapter/testing` reads the widget's pairing code and clicks Allow as driver through the DevTools protocol as a person would, and an MCP client walks every stop of every walkthrough and every observation of a page that follows the map profile ([Map and globe pages](../../docs/guide/16-map-pages.md)), checking each view, clock, published state and `capture_view` picture. [Check a page from CI](../../docs/guide/17-check-from-ci.md) explains it; ADR 0041 decided it. It is private and never published.
 
-In this repository `pnpm ci-check` runs it against the canvas map page in `tests/map-page`, as CI's `ci-check` job does. That runner, `scripts/ci-check.ts`, gives it a fresh `TABDOCK_HOME`, withholds output that holds the owner token or an unmasked pairing code, and then verifies the audit chain and holds its call records to the walk's page calls. `pnpm test` runs the walker's own tests, in `test/`, against a scripted page. The package exports two of its modules, `./profile` and `./walk`, only so that `tests/e2e/test/ci-check-files.test.ts` can hold the copied schemas and the walk's optional tools to the originals.
+In this repository `pnpm ci-check` runs it against the canvas map page in `tests/map-page`, as CI's `ci-check` job does. That runner, `scripts/ci-check.ts`, gives it a fresh `TABDOCK_HOME`, withholds output that holds the owner token or an unmasked pairing code, and then verifies the audit chain and holds its call records to the walk's page calls. `pnpm test` runs the walker's own tests, in `test/`, against a scripted page, and holds the config's page server to its two settings. The package exports two of its modules, `./profile` and `./walk`, only so that `tests/e2e/test/ci-check-files.test.ts` can hold the copied schemas and the walk's optional tools to the originals.
 
 ## Copying it
 
 Copy this directory and change four things. In the copy's `package.json`, replace `@tabdock/adapter`'s `workspace:*` with the exact version of the release after 0.1.0, which carries `@tabdock/adapter/testing`, once it is on npm (until then the helper works only from a clone), and install `@tabdock/relay` at the same version beside it, since the check starts its `tabdock-relay` command.
 
 1. `connectPage()` in `src/tabdock.ts`: how your page links to a relay when its own script asks. Never give a page a way to link from its URL.
-2. `CI_CHECK_PAGE_COMMAND` and `CI_CHECK_PAGE_URL`: the command that serves your page, and its http address on 127.0.0.1 or localhost. Both are required; without `CI_CHECK_PAGE_URL` the run stops at once saying so.
+2. `CI_CHECK_PAGE_COMMAND` and `CI_CHECK_PAGE_URL`: the command that serves your page, and its http address on 127.0.0.1 or localhost. Both are required; with `CI_CHECK_PAGE_URL` unset or empty the run stops at once saying so, and `test/playwright-config.test.ts` holds that.
 3. `CI_CHECK_RELAY_COMMAND`, which is `npx --no-install tabdock-relay` unless set, once `@tabdock/relay` is installed beside it.
 4. `REQUIRE_TOOLS` in `specs/walk.spec.ts`: the clock, capture and observation tools your page registers. The walk checks those groups only where the page lists them, so naming them makes a page that stops registering one fail rather than skip its checks.
 

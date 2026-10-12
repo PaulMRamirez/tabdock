@@ -9,7 +9,8 @@
 import { defineConfig } from '@playwright/test';
 
 const port = process.env.TABDOCK_PORT ?? '8787';
-const pageUrl = process.env.CI_CHECK_PAGE_URL;
+// Unset and empty alike stop the run: an unset repository variable reaches env as ''.
+const pageUrl = process.env.CI_CHECK_PAGE_URL ?? '';
 const executablePath = process.env.CHROMIUM_EXECUTABLE;
 const browser = executablePath ? { executablePath } : {};
 
@@ -35,10 +36,11 @@ export default defineConfig({
       // Both required: with either unset, the run stops here saying so, rather
       // than wait on a URL the specs' own settings check refuses later.
       command:
-        pageUrl === undefined
+        pageUrl === ''
           ? 'echo set CI_CHECK_PAGE_URL >&2; exit 1'
           : (process.env.CI_CHECK_PAGE_COMMAND ?? 'echo set CI_CHECK_PAGE_COMMAND >&2; exit 1'),
-      url: pageUrl ?? 'http://127.0.0.1:5180/',
+      // Playwright needs an address even while the command above stops the run.
+      url: pageUrl === '' ? 'http://127.0.0.1:5180/' : pageUrl,
       reuseExistingServer: false,
       gracefulShutdown: { signal: 'SIGINT', timeout: 5_000 },
       stdout: 'ignore',
