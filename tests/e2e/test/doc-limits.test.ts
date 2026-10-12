@@ -99,6 +99,8 @@ const REQUIRED = [
   'MAX_AGENT_NAMING_BYTES',
   'SESSION_CLOCK_SLACK_MS',
 ];
+/** The required limits page 15 states, for rooms, images and state: the rest are page 12's. */
+const ROOMS_REQUIRED = REQUIRED.slice(REQUIRED.indexOf('MAX_IMAGE_BYTES'));
 const MODULES: readonly Readonly<Record<string, unknown>>[] = [
   protocol,
   config,
@@ -230,6 +232,20 @@ describe("the guide's limits tables", () => {
     );
     expect(missingRequired(named)).toEqual([]);
     expect(named.filter((constant, index) => named.indexOf(constant) !== index)).toEqual([]);
+  });
+
+  it('state the limits for rooms, images and state on page 15, and the rest on page 12', () => {
+    const on = (page: string): string[] =>
+      (pages.find((candidate) => candidate.page === page)?.rows ?? []).flatMap((row) =>
+        [...(row.cells.Constant ?? '').matchAll(/`([A-Z0-9_]+)`/g)].map((match) => match[1] ?? ''),
+      );
+    expect(ROOMS_REQUIRED).toContain('SESSION_CLOCK_SLACK_MS');
+    expect(ROOMS_REQUIRED.filter((constant) => !on(ROOMS_PAGE).includes(constant))).toEqual([]);
+    expect(
+      REQUIRED.filter((constant) => !ROOMS_REQUIRED.includes(constant)).filter(
+        (constant) => !on(PAGE).includes(constant),
+      ),
+    ).toEqual([]);
   });
 
   it('state each value in its unit, as the named file exports it', () => {

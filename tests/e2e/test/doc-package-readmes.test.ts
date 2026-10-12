@@ -78,6 +78,14 @@ function namesWord(text: string, word: string): boolean {
   return new RegExp(`(?<![A-Za-z0-9_])${word}(?![A-Za-z0-9_])`).test(text);
 }
 
+/**
+ * Whether `text` names the file `name` whole, alone or after a directory, so
+ * `tools.ts` is not found in `proposal-tools.ts`.
+ */
+function namesFile(text: string, name: string): boolean {
+  return new RegExp(`(?<![A-Za-z0-9_-])${name.replaceAll('.', '\\.')}(?![A-Za-z0-9_])`).test(text);
+}
+
 /** The files in a directory whose names end with `suffix`. */
 function filesEnding(dir: string, suffix: string): string[] {
   return readdirSync(join(ROOT, dir))
@@ -101,7 +109,7 @@ describe('the package READMEs', () => {
     it(`name each module in ${dir}/src`, () => {
       const modules = modulesOf(dir);
       expect(modules.length).toBeGreaterThan(0);
-      expect(modules.filter((module) => !readme.includes(module))).toEqual([]);
+      expect(modules.filter((module) => !namesFile(readme, module))).toEqual([]);
     });
 
     it(`name each subpath ${dir}/package.json exports`, () => {
@@ -132,7 +140,7 @@ describe('the test READMEs', () => {
       ...filesEnding('tests/e2e/specs', '.spec.ts'),
     ];
     expect(files.length).toBeGreaterThan(50);
-    expect(files.filter((file) => !readme.includes(file))).toEqual([]);
+    expect(files.filter((file) => !namesFile(readme, file))).toEqual([]);
   });
 
   it('are there for every directory under apps/ and tests/', () => {
@@ -151,6 +159,9 @@ describe('these checks', () => {
     expect(namesSubpath('Import the adapter.', '@tabdock/adapter', './testing')).toBe(false);
     expect(namesWord('`sessionRecordJson` writes JSON', 'sessionRecord')).toBe(false);
     expect(namesWord('`sessionRecord()` reads it', 'sessionRecord')).toBe(true);
+    expect(namesFile('`proposal-tools.ts` holds them', 'tools.ts')).toBe(false);
+    expect(namesFile('`src/tools.ts` holds them', 'tools.ts')).toBe(true);
+    expect(namesFile('see state-freeze.spec.ts', 'freeze.spec.ts')).toBe(false);
     expect(
       subpathsOf({
         name: '@tabdock/x',

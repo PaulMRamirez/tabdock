@@ -92,12 +92,14 @@ describe("the guide's indexes", () => {
   });
 
   it('reach every page from the Where to start table', () => {
-    expect(sectionUnder(index, 'Where to start')).not.toBe('');
-    expect(unreached(taskTable(index), pages)).toEqual([]);
+    const start = sectionUnder(index, 'Where to start');
+    expect(start).not.toBe('');
+    expect(unreached(taskTable(start), pages)).toEqual([]);
   });
 
   it("hold README.md's table to the guide's, row for row", () => {
-    expect(rowsOf(taskTable(readRepo(FRONT)))).toEqual(rowsOf(taskTable(index)));
+    const start = sectionUnder(index, 'Where to start');
+    expect(rowsOf(taskTable(readRepo(FRONT)))).toEqual(rowsOf(taskTable(start)));
   });
 
   it('would fail a page left out, a list out of order, a misnumbered item and a drifted row', () => {

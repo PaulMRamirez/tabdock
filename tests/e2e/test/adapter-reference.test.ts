@@ -11,9 +11,10 @@
 // at-a-glance paragraph names the same handle members. Every reason a
 // handle method can answer with (startSession, invite, agentToken and
 // publishState, and the state's published status) is named in backticks on
-// the handle page, read from core.ts's types with the compiler API and from
-// the protocol's enums those types name, so a new refusal cannot ship with
-// no words for a page author; SessionResult's inviteRefusal is named too.
+// the handle page, read with the compiler API from the types Dock and
+// DockState declare for them in core.ts, the aliases those name and the
+// protocol's enums, so a new refusal cannot ship with no words for a page
+// author; SessionResult's inviteRefusal is named too.
 
 import {
   InviteRefusalReasonSchema,
@@ -37,22 +38,58 @@ const PROTOCOL_REASONS: Readonly<Record<string, readonly string[]>> = {
   SessionRefusalReason: SessionRefusalReasonSchema.options,
 };
 
-/** The handle's result types whose string literals a page author may be answered with. */
-const RESULT_TYPES = [
-  'SessionResult',
-  'InviteResult',
-  'InviteRefusal',
-  'AgentTokenResult',
-  'PublishResult',
-  'PublishStatus',
+/** The handle members whose answers a page author reads: four methods and the state's published status. */
+const ANSWERS: readonly (readonly [string, string])[] = [
+  ['Dock', 'startSession'],
+  ['Dock', 'invite'],
+  ['Dock', 'agentToken'],
+  ['Dock', 'publishState'],
+  ['DockState', 'published'],
 ];
 
+/** The type a member of an interface in `source` declares: a method's return type or a field's type. */
+function memberType(source: ts.SourceFile, name: string, member: string): ts.TypeNode {
+  const found = source.statements.find(
+    (statement): statement is ts.InterfaceDeclaration =>
+      ts.isInterfaceDeclaration(statement) && statement.name.text === name,
+  );
+  const declared = found?.members.find(
+    (candidate) =>
+      candidate.name !== undefined &&
+      ts.isIdentifier(candidate.name) &&
+      candidate.name.text === member,
+  );
+  if (
+    declared === undefined ||
+    !(ts.isMethodSignature(declared) || ts.isPropertySignature(declared)) ||
+    declared.type === undefined
+  ) {
+    throw new Error(`${source.fileName} declares no typed ${name}.${member}`);
+  }
+  return declared.type;
+}
+
 /**
- * Every string literal a type alias in `source` holds, following the aliases
- * it names in the same file and the protocol enums PROTOCOL_REASONS lists. A
- * name ending in Reason or Refusal that is neither throws, so a new enum
- * from elsewhere is never passed over in silence.
+ * Every string literal a type node holds, following the aliases it names in
+ * the same file and the protocol enums PROTOCOL_REASONS lists. A name ending
+ * in Reason or Refusal that is neither throws, so a new enum from elsewhere
+ * is never passed over in silence.
  */
+function literalsIn(source: ts.SourceFile, type: ts.Node, seen = new Set<string>()): string[] {
+  const found: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isLiteralTypeNode(node) && ts.isStringLiteral(node.literal))
+      found.push(node.literal.text);
+    if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName)) {
+      found.push(...literalsOf(source, node.typeName.text, seen));
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(type);
+  return found;
+}
+
+/** Every string literal the type alias `name` in `source` holds (see literalsIn). */
 function literalsOf(source: ts.SourceFile, name: string, seen = new Set<string>()): string[] {
   if (seen.has(name)) return [];
   seen.add(name);
@@ -66,17 +103,19 @@ function literalsOf(source: ts.SourceFile, name: string, seen = new Set<string>(
     if (/(?:Reason|Refusal)$/.test(name)) throw new Error(`no literals known for ${name}`);
     return [];
   }
-  const found: string[] = [];
+  return literalsIn(source, alias.type, seen);
+}
+
+/** The type names a type node refers to, Promise<...> looked through. */
+function namedTypes(type: ts.Node): string[] {
+  const names: string[] = [];
   const visit = (node: ts.Node): void => {
-    if (ts.isLiteralTypeNode(node) && ts.isStringLiteral(node.literal))
-      found.push(node.literal.text);
-    if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName)) {
-      found.push(...literalsOf(source, node.typeName.text, seen));
-    }
+    if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName))
+      names.push(node.typeName.text);
     ts.forEachChild(node, visit);
   };
-  visit(alias.type);
-  return found;
+  visit(type);
+  return names.filter((name) => name !== 'Promise');
 }
 
 /** The literals `page` never shows in backticks, bare or quoted. */
@@ -286,8 +325,22 @@ describe("the handle's answers", () => {
   const source = ts.createSourceFile(CORE, readRepo(CORE), ts.ScriptTarget.Latest, true);
   const handle = readRepo(HANDLE);
 
+  it('are read from the types the handle declares for them', () => {
+    expect(
+      ANSWERS.flatMap(([name, member]) => namedTypes(memberType(source, name, member))),
+    ).toEqual([
+      'SessionResult',
+      'InviteResult',
+      'AgentTokenResult',
+      'PublishResult',
+      'PublishStatus',
+    ]);
+  });
+
   it('are each named in backticks on the handle page, inviteRefusal among them', () => {
-    const literals = RESULT_TYPES.flatMap((name) => literalsOf(source, name));
+    const literals = ANSWERS.flatMap(([name, member]) =>
+      literalsIn(source, memberType(source, name, member)),
+    );
     // The session's own refusals and the relay's, which it passes on, are both read.
     for (const reason of ['active', 'link_down', 'unknown', 'length', 'no_sponsor', 'too_large']) {
       expect(literals, reason).toContain(reason);

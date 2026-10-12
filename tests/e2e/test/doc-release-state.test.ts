@@ -11,7 +11,11 @@
 // release after" the newest one, and no section that names a package
 // subpath the newest release lacks (0.1.0's published subpaths are pinned
 // here, as doc-changelog.test.ts pins its surface) pins an install to that
-// release, which would install a package without it.
+// release, which would install a package without it. A guide page is one
+// task read top to bottom, so it is one section: guide 17 once pinned 0.1.0
+// under Set it up while its diagram and its last section named the testing
+// helper 0.1.0 lacks. README.md and the package READMEs, which cover many
+// tasks, are cut at each H2, an H3 staying with its H2.
 
 import { describe, expect, it } from 'vitest';
 import {
@@ -61,11 +65,11 @@ function newSubpaths(
   return now.filter((subpath) => !before.has(subpath) && !subpath.endsWith('/package.json'));
 }
 
-/** `text` cut at each heading outside code blocks, each part keeping its code blocks. */
+/** `text` cut at each H1 and H2 outside code blocks, each part keeping its code blocks and H3s. */
 function sectionsOf(text: string): { heading: string; text: string }[] {
   const lines = text.split('\n');
   const outside = withoutCodeBlocks(text).split('\n');
-  const starts = outside.flatMap((line, index) => (/^#{1,6} /.test(line) ? [index] : []));
+  const starts = outside.flatMap((line, index) => (/^#{1,2} /.test(line) ? [index] : []));
   const bounds = [0, ...starts.filter((start) => start > 0), lines.length];
   return bounds.slice(0, -1).map((start, index) => ({
     heading: (lines[start] ?? '').trim(),
@@ -81,7 +85,10 @@ function pinnedWithout(
   missing: readonly string[],
 ): string[] {
   const pin = new RegExp(`@tabdock/[a-z-]+@${version.replaceAll('.', '\\.')}(?![\\d.])`);
-  return sectionsOf(text)
+  const sections = doc.startsWith('docs/guide/')
+    ? [{ heading: '(the page)', text }]
+    : sectionsOf(text);
+  return sections
     .filter((section) => missing.some((subpath) => section.text.includes(subpath)))
     .filter((section) => pin.test(section.text))
     .map((section) => `${doc}: ${section.heading || '(before the first heading)'}`);
@@ -242,6 +249,13 @@ describe('work past the newest release', () => {
     ).toEqual([]);
     const apart = `${pinned.split('\n').slice(0, 2).join('\n')}\n\n## Install\n\nnpm install @tabdock/adapter@0.1.0`;
     expect(pinnedWithout('x.md', apart, '0.1.0', lacks)).toEqual([]);
+    // An H3 stays with its H2; a guide page is one section, as guide 17 once was.
+    expect(
+      pinnedWithout('x.md', apart.replace('## Install', '### Install'), '0.1.0', lacks),
+    ).toEqual(['x.md: ## Copy the check']);
+    expect(pinnedWithout('docs/guide/17-check-from-ci.md', apart, '0.1.0', lacks)).toEqual([
+      'docs/guide/17-check-from-ci.md: (the page)',
+    ]);
     expect(pinnedWithout('x.md', pinned.replaceAll('0.1.0', '0.1.01'), '0.1.0', lacks)).toEqual([]);
     expect(newSubpaths(['@tabdock/adapter', '@tabdock/adapter/testing'], PUBLISHED_0_1_0)).toEqual(
       lacks,

@@ -4,14 +4,15 @@
 // once said five fixed tools, sixteen profile tools or 13 codes after M6
 // moved each. So, across the guide, the READMEs (root, package, app and
 // test), SPEC.md, the threat model and the CHANGELOG's Unreleased section:
-// a number before "fixed tools" is FIXED_TOOL_NAMES' size, unless the
-// sentence names a milestone before M6 or 0.1.0 (as "M4's five fixed tools")
-// or the paragraph is a milestone's own (SPEC's "**M1 ...**"); "the
-// profile's N tools" and "N profile tools" are MAP_TOOL_NAMES' length, the map
+// a number before "fixed tools" is FIXED_TOOL_NAMES' size, unless a
+// milestone before M6 or 0.1.0 owns the list ("M4's five fixed tools") or the
+// paragraph is a milestone's own (SPEC's "**M1 ...**"); "the profile's N"
+// (tools or not) and "N profile tools" are MAP_TOOL_NAMES' length, the map
 // page's own header included; "the N codes" in the protocol's README is
-// ERROR_CODES' length; the demo board's README counts the board's tools; and
-// "N handle members" counts Dock's members ("N new handle members" those
-// past 0.1.0's twelve, which doc-changelog.test.ts pins by name).
+// ERROR_CODES' length; "N WebMCP tools" in the demo board's README counts the
+// board's tools; and "N handle members" counts Dock's members ("N new handle
+// members" those past 0.1.0's twelve, which doc-changelog.test.ts pins by
+// name).
 
 import { ERROR_CODES } from '@tabdock/protocol';
 import ts from 'typescript';
@@ -75,13 +76,6 @@ function lineAt(text: string, index: number): number {
   return text.slice(0, index).split('\n').length;
 }
 
-/** The sentence `index` falls in, from its start up to `index`. */
-function sentenceBefore(text: string, index: number): string {
-  const before = text.slice(0, index);
-  const start = Math.max(before.lastIndexOf('. '), before.lastIndexOf('\n\n'), 0);
-  return before.slice(start);
-}
-
 /** The paragraph `index` falls in, from its start. */
 function paragraphStart(text: string, index: number): string {
   const start = text.lastIndexOf('\n\n', index);
@@ -96,9 +90,13 @@ interface Rule {
   readonly past?: (text: string, index: number) => boolean;
 }
 
-/** A count of an earlier list: "M4's five", "0.1.0 had five", or a milestone's own paragraph. */
+/**
+ * A count of an earlier list: one a milestone before M6 or 0.1.0 owns ("M4's
+ * five"), or one in a milestone's own paragraph. A milestone named elsewhere in
+ * the sentence ("Since M4 the relay serves five") excuses nothing.
+ */
 function earlierList(text: string, index: number): boolean {
-  if (/\bM[0-5]\b|\b0\.1\.0\b/.test(sentenceBefore(text, index))) return true;
+  if (/(?:\bM[0-5]|\b0\.1\.0)'s\s+$/.test(text.slice(Math.max(0, index - 12), index))) return true;
   return /^\*\*M[0-5]\b/.test(paragraphStart(text, index));
 }
 
@@ -131,16 +129,18 @@ function dockMembers(): string[] {
 }
 
 const WORD = '([A-Za-z]+(?:-[a-z]+)?|\\d+)';
+/** Emphasis a count may sit outside of, as in "nine **fixed tools**". */
+const MARK = '(?:\\*{1,2}|_{1,2})?';
 const members = dockMembers().length;
 const FIXED_RULE: Rule = {
   what: 'FIXED_TOOL_NAMES.size',
-  pattern: new RegExp(`\\b${WORD} fixed tools\\b`, 'g'),
+  pattern: new RegExp(`\\b${WORD} ${MARK}fixed tools\\b`, 'g'),
   expected: FIXED_TOOL_NAMES.size,
   past: earlierList,
 };
 const PROFILE_RULES: readonly Rule[] = [
-  `\\bprofile's ${WORD} tools\\b`,
-  `\\b${WORD} profile tools\\b`,
+  `\\bprofile's ${WORD}\\b`,
+  `\\b${WORD} ${MARK}profile tools\\b`,
 ].map((source) => ({
   what: 'MAP_TOOL_NAMES.length',
   pattern: new RegExp(source, 'g'),
@@ -149,12 +149,12 @@ const PROFILE_RULES: readonly Rule[] = [
 const HANDLE_RULES: readonly Rule[] = [
   {
     what: "Dock's member count",
-    pattern: new RegExp(`\\b${WORD} handle members\\b`, 'g'),
+    pattern: new RegExp(`\\b${WORD} ${MARK}handle members\\b`, 'g'),
     expected: members,
   },
   {
     what: "Dock's members past 0.1.0",
-    pattern: new RegExp(`\\b${WORD} new handle members\\b`, 'g'),
+    pattern: new RegExp(`\\b${WORD} ${MARK}new handle members\\b`, 'g'),
     expected: members - HANDLE_0_1_0_MEMBERS,
   },
 ];
@@ -176,7 +176,7 @@ describe('counts the docs state', () => {
   it("match the profile's tools in the map page's own header", () => {
     const path = 'tests/map-page/src/main.ts';
     const header = /^(?:\/\/.*\n)+/.exec(readRepo(path))?.[0] ?? '';
-    expect(header).toMatch(/profile's \w+ tools/);
+    expect(header).toMatch(/profile's \w+/);
     expect(wrongCounts(path, header.replace(/\n\/\/ /g, ' '), PROFILE_RULES)).toEqual([]);
   });
 
@@ -195,7 +195,7 @@ describe('counts the docs state', () => {
     const path = 'apps/demo/README.md';
     const rule: Rule = {
       what: "the board's tool count",
-      pattern: new RegExp(`\\bwith ${WORD} WebMCP tools\\b`, 'g'),
+      pattern: new RegExp(`\\b${WORD} WebMCP tools\\b`, 'g'),
       expected: TOOL_FACTORIES.length,
     };
     expect(readRepo(path)).toMatch(rule.pattern);
@@ -206,13 +206,25 @@ describe('counts the docs state', () => {
     const fixed = FIXED_RULE;
     expect(wrongCounts('x.md', 'Clients see five fixed tools.', [fixed])).toHaveLength(1);
     expect(wrongCounts('x.md', 'Clients see 9 fixed tools.', [fixed])).toEqual([]);
+    expect(wrongCounts('x.md', 'Every relay offers five **fixed tools**.', [fixed])).toHaveLength(
+      1,
+    );
     expect(wrongCounts('x.md', "After M4's five fixed tools come four more.", [fixed])).toEqual([]);
+    expect(wrongCounts('x.md', 'Since M4 the relay has five fixed tools.', [fixed])).toHaveLength(
+      1,
+    );
     expect(
       wrongCounts('x.md', '**M1 Walking skeleton.** A relay with the five fixed tools.', [fixed]),
     ).toEqual([]);
     expect(
       wrongCounts('x.md', "It has sixteen tools: the profile's sixteen tools.", PROFILE_RULES),
     ).toHaveLength(1);
+    expect(
+      wrongCounts('x.md', "It registers sixteen: the profile's sixteen (and two).", PROFILE_RULES),
+    ).toHaveLength(1);
+    expect(wrongCounts('x.md', "The profile's own tools and its fourteen.", PROFILE_RULES)).toEqual(
+      [],
+    );
     expect(wrongCounts('x.md', 'The handle has twelve handle members.', ALL_RULES)).toHaveLength(1);
   });
 });
