@@ -12,7 +12,8 @@
 // minute (30, S14) and the sign-ins the relay takes a minute (60), raised as
 // tests/e2e/src/room-harness.ts raises them, so a class of forty joins in
 // seconds and what turns the forty-first away is the seats alone. A real
-// class arrives at 30 a minute (docs/notes/m6/room-measure.md).
+// class arrives at 30 a minute (docs/notes/m6/room-measure.md), and the
+// narration says so where the relay is introduced and again in leg 6.
 
 import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -21,6 +22,7 @@ import { type MapPageServer, startMapPageServer } from '@tabdock/map-page/server
 import {
   createOAuthAuth,
   createRelay,
+  DEFAULT_RATE_LIMITS,
   EMAIL_CLAIM,
   EMAIL_VERIFIED_CLAIM,
   type Relay,
@@ -36,6 +38,12 @@ export interface Member {
   userId: string;
   displayName: string;
 }
+
+/** The two join limits this relay raises, beside what a deployed relay takes a minute. */
+export const JOIN_LIMITS = {
+  pairAttemptsPerPage: { demo: 500, deployed: DEFAULT_RATE_LIMITS.pairAttemptsPerPage },
+  pairSignIns: { demo: 500, deployed: DEFAULT_RATE_LIMITS.pairSignIns },
+} as const;
 
 /** The teacher, whose Claude drives the projected map. */
 export const ALICE: Member = { sub: 'sub-alice-teacher', userId: 'alice', displayName: 'Alice' };
@@ -97,7 +105,10 @@ export async function startClassroom(narrator: Narrator, scratch: string): Promi
       agentTokens: true,
       restartSnapshot: true,
       audit: { dir: auditDir },
-      rateLimits: { pairAttemptsPerPage: 500, pairSignIns: 500 },
+      rateLimits: {
+        pairAttemptsPerPage: JOIN_LIMITS.pairAttemptsPerPage.demo,
+        pairSignIns: JOIN_LIMITS.pairSignIns.demo,
+      },
       port,
       logSink: (line) => {
         logLines.push(line);

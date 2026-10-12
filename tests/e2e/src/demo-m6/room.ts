@@ -10,6 +10,7 @@
 
 import { joinAtI, student } from '../room-harness.ts';
 import { clickInWidget, widgetEvaluate } from '../tabdock-harness.ts';
+import { JOIN_LIMITS } from './classroom.ts';
 import { bind, type Lesson } from './lesson.ts';
 import { maskLink } from './narrator.ts';
 import { mintWatchLink, openPanel, watchingTitle, watchingView } from './operator.ts';
@@ -21,6 +22,10 @@ function secretOf(link: string): string {
 export async function room(lesson: Lesson): Promise<void> {
   const { narrator, operator } = lesson;
   const { say, check } = bind(narrator);
+  const { pairAttemptsPerPage } = JOIN_LIMITS;
+  say(
+    `   This relay takes ${String(pairAttemptsPerPage.demo)} joins a minute on one page so the class joins in seconds. A deployed relay takes ${String(pairAttemptsPerPage.deployed)}, the teacher's own pairings among them (S14), and past that /i answers rate_limited until the minute turns, so a teacher hands the link out a few minutes early.`,
+  );
   const classA = await mintWatchLink(operator.page, narrator, 'Class A', 20);
   const classB = await mintWatchLink(operator.page, narrator, 'Class B', 20);
   say(`   Two watch links of 20 uses: ${maskLink(classA)} and ${maskLink(classB)}`);

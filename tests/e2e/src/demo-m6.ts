@@ -22,7 +22,7 @@ import { privateTempRoot } from '@tabdock/relay/test/private-tmp';
 import { agent } from './demo-m6/agent.ts';
 import { capture } from './demo-m6/capture.ts';
 import { ciCheck } from './demo-m6/ci-check.ts';
-import { type Classroom, startClassroom } from './demo-m6/classroom.ts';
+import { type Classroom, JOIN_LIMITS, startClassroom } from './demo-m6/classroom.ts';
 import type { Lesson, Stage } from './demo-m6/lesson.ts';
 import { members } from './demo-m6/members.ts';
 import { Narrator } from './demo-m6/narrator.ts';
@@ -52,6 +52,10 @@ try {
   );
   narrator.say(
     '  invites, agent tokens and the restart snapshot on, members from a file, an audit directory.',
+  );
+  const { pairAttemptsPerPage, pairSignIns } = JOIN_LIMITS;
+  narrator.say(
+    `  One setting is not a deployment's: this relay takes ${String(pairAttemptsPerPage.demo)} pairings a minute on one page and ${String(pairSignIns.demo)} sign-ins a minute, where a deployed one takes ${String(pairAttemptsPerPage.deployed)} (S14) and ${String(pairSignIns.deployed)} (ADR 0016), so leg 6's class joins in seconds.`,
   );
   narrator.say(`Chromium ${browser.version()}, headless${headed ? ' off' : ''}.`);
   const stage: Stage = { narrator, room: classroom, browser, scratch, startedAt, pageConsole };
