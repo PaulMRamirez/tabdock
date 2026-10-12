@@ -3089,8 +3089,10 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
       outcome = { ok: false, code: 'tool_error', message: errorParts(error).message };
       unwatched = await lostSightOfHandler(call, tool, error);
     }
-    // The runtime has settled the call, so the next image call may start.
-    freeImageSlot(call);
+    // The runtime has settled the call, so the next image call may start;
+    // unless it only stopped watching a handler still running, whose hold on
+    // the gate imageHold then bounds, as holdUnwatched bounds a write's.
+    if (!unwatched) freeImageSlot(call);
     if (unwatched) {
       holdUnwatched(call);
       // The relay still hears the runtime's answer, unless something answered first.
@@ -3109,19 +3111,20 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   }
 
   /**
-   * Whether a write's rejection says only that the runtime stopped watching a
-   * handler that may still be running. On the polyfill a write's executeTool
-   * gets a signal nothing aborts, so it settles early only when the page ends
-   * the tool's registration mid-run: its 'Tool unregistered', or, should
-   * that text change, a tool missing from the list afterwards. A tool
-   * already missing when the call started never ran its handler.
+   * Whether the rejection of a write, or of the call holding the image gate,
+   * says only that the runtime stopped watching a handler that may still be
+   * running. On the polyfill such a call's executeTool gets a signal nothing
+   * aborts, so it settles early only when the page ends the tool's
+   * registration mid-run: its 'Tool unregistered', or, should that text
+   * change, a tool missing from the list afterwards. A tool already missing
+   * when the call started never ran its handler.
    */
   async function lostSightOfHandler(
     call: CallRecord,
     tool: NormalisedTool,
     error: unknown,
   ): Promise<boolean> {
-    if (abortReachesHandlers || writing !== call) return false;
+    if (abortReachesHandlers || (writing !== call && imageRunning !== call)) return false;
     const { name, message } = errorParts(error);
     if (name === 'UnknownError' && message === POLYFILL_UNREGISTERED) return true;
     if (name === 'UnknownError' && POLYFILL_NOT_FOUND.test(message)) return false;
@@ -3163,9 +3166,12 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
   ): Promise<unknown> {
     if (!context?.executeTool) throw new Error('this WebMCP runtime has no executeTool');
     // A write on the polyfill gets a signal nothing aborts, so the runtime
-    // settles it when the handler ends and the page stays held until then.
+    // settles it when the handler ends and the page stays held until then;
+    // so does the image call holding the gate, which a cancel, deadline or
+    // revoke would otherwise free while its handler, which never sees the
+    // signal there, still draws (A6.28). imageHold bounds the gate's wait.
     const signal =
-      writing === call && !abortReachesHandlers
+      (writing === call || imageRunning === call) && !abortReachesHandlers
         ? new AbortController().signal
         : call.controller.signal;
     const run = (format: InputFormat): Promise<unknown> =>
@@ -4329,7 +4335,10 @@ export function createAdapterCore(options: CoreOptions): AdapterCore {
     imageWaiting.shift();
     imageRunning = next.call;
     imageStartedAt = clock();
-    // A handler the runtime never settles (a polyfill 5.1 read) holds the gate no longer than this.
+    // On the polyfill 5.1 the call holding the gate runs under a signal
+    // nothing aborts (execute), so the gate waits for its handler; one that
+    // never ends, or that the runtime stopped watching, holds it no longer
+    // than this. Elsewhere the gate frees when the abort lands (ADR 0001).
     imageHold = timers.setTimeout(
       () => {
         freeImageSlot(next.call);
