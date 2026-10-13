@@ -245,6 +245,21 @@ describe('the image (Dockerfile, .dockerignore)', () => {
     expect(dockerfile).toContain('--frozen-lockfile');
   });
 
+  // volume-owner.yml's helper is the build base itself (docs/deploy.md), and
+  // Dependabot moves only the FROM line, so a bump that leaves the helper
+  // behind fails here rather than in a production fallback.
+  it('is the base the volume-owner helper runs, digest and all', () => {
+    const base = /^FROM (node:22-bookworm-slim@sha256:[0-9a-f]{64}) AS build$/m.exec(
+      dockerfile,
+    )?.[1];
+    expect(base).toBeDefined();
+    const helpers = [
+      ...read('.github/workflows/volume-owner.yml').matchAll(/node:\S*@sha256:[0-9a-f]{64}/g),
+    ].map((found) => found[0]);
+    expect(helpers.length).toBeGreaterThan(0);
+    expect(new Set(helpers)).toEqual(new Set([base]));
+  });
+
   it('creates /app in the runtime stage by a root-owned COPY, before any WORKDIR names it', () => {
     // BuildKit makes a missing WORKDIR as the stage's user, which the
     // distroless :nonroot base sets to 65532, and a COPY onto an existing
