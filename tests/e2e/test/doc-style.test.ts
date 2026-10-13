@@ -27,6 +27,9 @@ const DASHES = /[\u2013\u2014]/;
 /** Hosts the docs may send a reader to. */
 const HOSTS = new Set([
   'github.com',
+  // The project's Pages site by its fallback name, which redirects to the
+  // owner's custom domain once one is set (ADR 0050's notes).
+  'paulmramirez.github.io',
   'modelcontextprotocol.io',
   'spec.modelcontextprotocol.io',
   'webmachinelearning.github.io',
