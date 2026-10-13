@@ -245,6 +245,21 @@ describe('the image (Dockerfile, .dockerignore)', () => {
     expect(dockerfile).toContain('--frozen-lockfile');
   });
 
+  // volume-owner.yml's helper is the build base itself (docs/deploy.md), and
+  // Dependabot moves only the FROM line, so a bump that leaves the helper
+  // behind fails here rather than in a production fallback.
+  it('is the base the volume-owner helper runs, digest and all', () => {
+    const base = /^FROM (node:22-bookworm-slim@sha256:[0-9a-f]{64}) AS build$/m.exec(
+      dockerfile,
+    )?.[1];
+    expect(base).toBeDefined();
+    const helpers = [
+      ...read('.github/workflows/volume-owner.yml').matchAll(/node:\S*@sha256:[0-9a-f]{64}/g),
+    ].map((found) => found[0]);
+    expect(helpers.length).toBeGreaterThan(0);
+    expect(new Set(helpers)).toEqual(new Set([base]));
+  });
+
   it('creates /app in the runtime stage by a root-owned COPY, before any WORKDIR names it', () => {
     // BuildKit makes a missing WORKDIR as the stage's user, which the
     // distroless :nonroot base sets to 65532, and a COPY onto an existing
@@ -388,6 +403,14 @@ describe('the workflows', () => {
       // security updates from reading the entry at all.
       expect(text, where).not.toMatch(/open-pull-requests-limit:\s*0\b|target-branch:/);
     }
+    // MCP-B moves across a major only by a person's change (ADR 0047), and
+    // within one as Dependabot proposes.
+    const workspace = entries.find(
+      ({ ecosystem, directory }) => `${ecosystem ?? ''} ${directory ?? ''}` === 'npm /',
+    );
+    expect(workspace?.text).toMatch(
+      /^ {6}- dependency-name: '@mcp-b\/\*'\n {8}update-types: \['version-update:semver-major'\]$/m,
+    );
     // Ignoring a package the published three run on would hide the very
     // pull requests that prompt a release of the relay.
     const runtime = new Set(Object.values(RUNTIME_DEPENDENCIES).flat());
@@ -567,7 +590,7 @@ describe('the image and the workflows, as they run (comments left out)', () => {
       /^ {6}- uses: actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n {8}with:\n {10}persist-credentials: false$/m,
     );
     expect(stepWith(build, 'uses: actions/setup-node@')).toContain(
-      'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
+      'actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1',
     );
     expect(stepWith(build, 'pnpm site:build')).toMatch(/^ {6}- run: pnpm site:build$/m);
     // The board and the map demo (ADR 0050) both build from the workspace, so
