@@ -345,8 +345,8 @@ interface ViewportPlace {
   /**
    * On each axis, how far the hit test would sit from the press if an element
    * scrolled to its very end in the document's place were counted as the
-   * document's scroll: the whole scroll range where the readings matched it,
-   * else 0. See viewportPlace.
+   * document's scroll: the gap between the two readings where it matched the
+   * scroll range (within RANGE_SLACK_PX), else 0. See viewportPlace.
    */
   farEnd: { x: number; y: number };
 }
@@ -434,9 +434,10 @@ async function hitsButton(
  * That place is read before the box and again after the hit test; when a
  * scroll between them has moved one off the other, the button is not clickable
  * yet. Where the readings leave an element scrolled to its very end possible
- * (see viewportPlace) and its range is under half the button, the point that
- * would then be the press is checked too: a larger range would take the check
- * off the button anyway.
+ * (see viewportPlace), the point that would then be the press is checked too,
+ * unless that gap is longer than the button's border box (the area a hit test
+ * counts as the button) reaches from the press, plus a pixel for rounding: the
+ * first check would then have missed the button, so the gap is a document's.
  */
 async function clickable(
   cdp: DevToolsSession,
@@ -455,6 +456,7 @@ async function clickable(
   const box = await askOrNull(cdp, 'DOM.getBoxModel', { backendNodeId }, DevToolsBoxModelSchema);
   if (box === null) return null;
   const [x1 = 0, y1 = 0, , , x3 = 0, y3 = 0] = box.model.content;
+  const { border } = box.model;
   // The hit test takes whole pixels of the document and the press any point of
   // the viewport, so the press goes to the very point the hit test checks.
   const page = {
@@ -466,9 +468,18 @@ async function clickable(
   // still find the button in the document.
   if (at.x < 0 || at.y < 0 || at.x >= before.width || at.y >= before.height) return null;
   if (!(await hitsButton(cdp, button, page))) return null;
-  const near = (distance: number, size: number): number =>
-    Math.abs(distance) < Math.abs(size) / 2 ? Math.round(distance) : 0;
-  const shift = { x: near(before.farEnd.x, x3 - x1), y: near(before.farEnd.y, y3 - y1) };
+  // How far the border box reaches from the press on each axis, taken over all
+  // four corners, so that a turned box is measured by what it can cover.
+  const reach = (from: number, corners: number[]): number =>
+    Math.max(from - Math.min(...corners), Math.max(...corners) - from);
+  const xs = border.filter((_, i) => i % 2 === 0);
+  const ys = border.filter((_, i) => i % 2 === 1);
+  const near = (distance: number, within: number): number =>
+    Math.abs(distance) <= within + 1 ? Math.round(distance) : 0;
+  const shift = {
+    x: near(before.farEnd.x, reach(at.x, xs)),
+    y: near(before.farEnd.y, reach(at.y, ys)),
+  };
   if (shift.x !== 0 || shift.y !== 0) {
     const alsoAt = { x: page.x + shift.x, y: page.y + shift.y };
     if (!(await hitsButton(cdp, button, alsoAt))) return null;

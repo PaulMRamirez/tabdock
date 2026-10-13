@@ -127,7 +127,7 @@ describe('the DevTools reply schemas', () => {
     const cut = { backendNodeId: 1, nodeType: 3, nodeValue: `${'x'.repeat(10_000)}\u2026` };
     expect(DevToolsNodeSchema.parse(cut)).toEqual(cut);
     expect(DevToolsBoxModelSchema.parse(BOX_MODEL)).toEqual({
-      model: { content: BOX_MODEL.model.content },
+      model: { content: BOX_MODEL.model.content, border: BOX_MODEL.model.border },
     });
     expect(DevToolsNodeAtSchema.parse({ backendNodeId: 14, frameId: 'F1', nodeId: 0 })).toEqual({
       backendNodeId: 14,
@@ -158,13 +158,21 @@ describe('the DevTools reply schemas', () => {
     const span = deep.root.children?.[1]?.children?.[0]?.shadowRoots?.[0]?.children?.[0];
     if (span !== undefined) span.attributes = ['data-role'];
     expect(DevToolsDocumentSchema.safeParse(deep).success).toBe(false);
-    const quad = (content: unknown[]): boolean =>
-      DevToolsBoxModelSchema.safeParse({ model: { content } }).success;
-    expect(quad([1, 2, 3, 4, 5, 6, 7])).toBe(false);
-    expect(quad([1, 2, 3, 4, 5, 6, 7, 8, 9])).toBe(false);
-    expect(quad([1, 2, 3, 4, 5, 6, 7, Number.POSITIVE_INFINITY])).toBe(false);
-    expect(quad([1, 2, 3, 4, 5, 6, 7, Number.NaN])).toBe(false);
-    expect(quad([1, 2, 3, 4, 5, 6, 7, '8'])).toBe(false);
+    const square = [0, 0, 8, 0, 8, 8, 0, 8];
+    for (const side of ['content', 'border'] as const) {
+      const quad = (corners: unknown[]): boolean =>
+        DevToolsBoxModelSchema.safeParse({
+          model: { content: square, border: square, [side]: corners },
+        }).success;
+      expect(quad(square)).toBe(true);
+      expect(quad([1, 2, 3, 4, 5, 6, 7])).toBe(false);
+      expect(quad([1, 2, 3, 4, 5, 6, 7, 8, 9])).toBe(false);
+      expect(quad([1, 2, 3, 4, 5, 6, 7, Number.POSITIVE_INFINITY])).toBe(false);
+      expect(quad([1, 2, 3, 4, 5, 6, 7, Number.NaN])).toBe(false);
+      expect(quad([1, 2, 3, 4, 5, 6, 7, '8'])).toBe(false);
+    }
+    // The border quad is what the far-end check measures, so a reply without one is refused.
+    expect(DevToolsBoxModelSchema.safeParse({ model: { content: square } }).success).toBe(false);
     expect(DevToolsNodeAtSchema.safeParse({}).success).toBe(false);
     const layout = { pageX: 0, pageY: 100, clientWidth: 1280, clientHeight: 720 };
     const content = { x: 0, y: 0, width: 1280, height: 4000 };

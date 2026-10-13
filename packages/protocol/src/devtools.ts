@@ -69,9 +69,15 @@ export const DevToolsNodeSchema: z.ZodMiniType<DevToolsNode> = z.object({
 export const DevToolsDocumentSchema = z.object({ root: DevToolsNodeSchema });
 export type DevToolsDocument = z.infer<typeof DevToolsDocumentSchema>;
 
-/** DOM.getBoxModel: the content quad as four x, y pairs. */
+// Four x, y pairs, corner by corner.
+const QuadSchema = z.array(z.number()).check(z.length(8));
+
+/**
+ * DOM.getBoxModel: the content quad, whose centre the helper presses, and the
+ * border quad, the area a hit test counts as the element.
+ */
 export const DevToolsBoxModelSchema = z.object({
-  model: z.object({ content: z.array(z.number()).check(z.length(8)) }),
+  model: z.object({ content: QuadSchema, border: QuadSchema }),
 });
 export type DevToolsBoxModel = z.infer<typeof DevToolsBoxModelSchema>;
 

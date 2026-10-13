@@ -150,84 +150,107 @@ for (const axis of ['down', 'across'] as const) {
   });
 }
 
-// A right-to-left element scrolled to the very end of a range under half the
-// button reads like a right-to-left document, so no reading tells the two
-// apart; a check at the visual viewport's place would land beside the press
-// but still on Allow. The helper checks the press point itself too.
-test('presses nothing through a cover where an element scrolled to its very end stands in for the document', async ({
-  page,
-}) => {
-  await page.goto(tabdock.pageUrl);
-  await page.waitForSelector('html[data-tools="ready"]');
-  const { code } = await waitForLink(page);
-  const cdp = await page.context().newCDPSession(page);
-  await page.evaluate(() => {
-    const { documentElement: html, body } = document;
-    Object.assign(html.style, { height: '100%', overflow: 'hidden' });
-    Object.assign(body.style, { height: '100%', overflow: 'hidden', margin: '0' });
-    const scroller = document.createElement('div');
-    scroller.id = 'scroller';
-    scroller.dir = 'rtl';
-    Object.assign(scroller.style, {
-      position: 'absolute',
-      left: '0',
-      top: '0',
-      width: '100%',
-      height: '100%',
-      overflow: 'auto',
-    });
-    const wide = document.createElement('div');
-    Object.assign(wide.style, { width: 'calc(100% + 28px)', height: '100%' });
-    scroller.append(wide);
-    body.append(scroller);
+// An element scrolled to the very end of a short range, right to left or up
+// from the bottom, gives the readings of a document of that kind, so no
+// reading tells the two apart; a check at the visual viewport's place would
+// land beside the press but still on Allow, in its content box or in the
+// padding and border around it, which a hit test counts as the button too.
+// The helper checks the press point itself as well.
+/** A range past half Allow's content box and within half its border box: the check lands in its padding. */
+const IN_PADDING = (content: number, border: number): number => Math.round((content + border) / 2);
+for (const [axis, range, size] of [
+  ['across', '28 px', () => 28],
+  ['across', 'a range inside the button’s padding', IN_PADDING],
+  ['down', 'a range inside the button’s padding', IN_PADDING],
+] as const) {
+  test(`presses nothing through a cover where an element scrolled ${axis} to the very end of ${range} stands in for the document`, async ({
+    page,
+  }) => {
+    await page.goto(tabdock.pageUrl);
+    await page.waitForSelector('html[data-tools="ready"]');
+    const { code } = await waitForLink(page);
+    const cdp = await page.context().newCDPSession(page);
+    const client = await connectMcp(tabdock.relay, tabdock.users.alice, CI);
+    try {
+      const pending = callTool(client, 'pair_page', { code });
+      const requestId = await waitForDock(page, (s) => s.pendingRequests[0]?.requestId);
+      const target = { action: 'approve-driver', requestId } as const;
+      const at = await widgetButton(cdp, target);
+      const { model } = await cdp.send('DOM.getBoxModel', { backendNodeId: at.backendNodeId });
+      const half = (quad: number[], from: number): number =>
+        Math.abs((quad[from + 4] ?? 0) - (quad[from] ?? 0)) / 2;
+      const from = axis === 'across' ? 0 : 1;
+      const by = size(half(model.content, from), half(model.border, from));
+
+      await page.evaluate(
+        ({ across, by }) => {
+          const { documentElement: html, body } = document;
+          Object.assign(html.style, { height: '100%', overflow: 'hidden' });
+          Object.assign(body.style, { height: '100%', overflow: 'hidden', margin: '0' });
+          const scroller = document.createElement('div');
+          scroller.id = 'scroller';
+          if (across) scroller.dir = 'rtl';
+          else scroller.style.writingMode = 'sideways-lr';
+          Object.assign(scroller.style, {
+            position: 'absolute',
+            left: '0',
+            top: '0',
+            width: '100%',
+            height: '100%',
+            overflow: 'auto',
+          });
+          const long = document.createElement('div');
+          Object.assign(
+            long.style,
+            across
+              ? { width: `calc(100% + ${String(by)}px)`, height: '100%' }
+              : { width: '100%', height: `calc(100% + ${String(by)}px)` },
+          );
+          scroller.append(long);
+          body.append(scroller);
+          if (across) scroller.scrollLeft = -by;
+          else scroller.scrollTop = -by;
+        },
+        { across: axis === 'across', by },
+      );
+      // The readings of a document scrolled to its very end, the case this
+      // test exists for.
+      await expect
+        .poll(async () => {
+          const metrics = await cdp.send('Page.getLayoutMetrics');
+          const { cssVisualViewport: view, cssLayoutViewport: layout } = metrics;
+          return axis === 'across'
+            ? [view.pageX, layout.pageX, metrics.cssContentSize.width - layout.clientWidth]
+            : [view.pageY, layout.pageY, metrics.cssContentSize.height - layout.clientHeight];
+        })
+        .toEqual([-by, 0, by]);
+
+      await page.evaluate(({ x, y }) => {
+        const over = document.createElement('div');
+        over.id = 'cover';
+        Object.assign(over.style, {
+          position: 'fixed',
+          left: `${String(x - 2)}px`,
+          top: `${String(y - 2)}px`,
+          width: '4px',
+          height: '4px',
+          zIndex: '2147483647',
+          pointerEvents: 'none',
+        });
+        document.documentElement.append(over);
+      }, at);
+      await expect(clickInWidget(cdp, target, { timeoutMs: 1500 })).rejects.toThrow(
+        WidgetTestError,
+      );
+      expect((await waitingPrompts(cdp)).attach).toEqual([{ requestId, client: CI }]);
+
+      // Uncovered, it approves where it stands.
+      await page.evaluate(() => document.getElementById('cover')?.remove());
+      expect(await allowAttach(cdp, { as: 'driver', requestId })).toBe(requestId);
+      expect((await pending).structured).toMatchObject({ role: 'driver' });
+    } finally {
+      await client.close();
+      await cdp.detach();
+    }
   });
-  const client = await connectMcp(tabdock.relay, tabdock.users.alice, CI);
-  try {
-    const pending = callTool(client, 'pair_page', { code });
-    const requestId = await waitForDock(page, (s) => s.pendingRequests[0]?.requestId);
-    const target = { action: 'approve-driver', requestId } as const;
-    const at = await widgetButton(cdp, target);
-
-    await page.evaluate(() => {
-      const scroller = document.getElementById('scroller');
-      if (scroller === null) throw new Error('no scroller');
-      scroller.scrollLeft = -28;
-    });
-    // The readings of a right-to-left document scrolled to its very end.
-    await expect
-      .poll(async () => {
-        const metrics = await cdp.send('Page.getLayoutMetrics');
-        return [
-          metrics.cssVisualViewport.pageX,
-          metrics.cssLayoutViewport.pageX,
-          metrics.cssContentSize.width - metrics.cssLayoutViewport.clientWidth,
-        ];
-      })
-      .toEqual([-28, 0, 28]);
-
-    await page.evaluate(({ x, y }) => {
-      const over = document.createElement('div');
-      over.id = 'cover';
-      Object.assign(over.style, {
-        position: 'fixed',
-        left: `${String(x - 2)}px`,
-        top: `${String(y - 2)}px`,
-        width: '4px',
-        height: '4px',
-        zIndex: '2147483647',
-        pointerEvents: 'none',
-      });
-      document.documentElement.append(over);
-    }, at);
-    await expect(clickInWidget(cdp, target, { timeoutMs: 1500 })).rejects.toThrow(WidgetTestError);
-    expect((await waitingPrompts(cdp)).attach).toEqual([{ requestId, client: CI }]);
-
-    // Uncovered, it approves where it stands.
-    await page.evaluate(() => document.getElementById('cover')?.remove());
-    expect(await allowAttach(cdp, { as: 'driver', requestId })).toBe(requestId);
-    expect((await pending).structured).toMatchObject({ role: 'driver' });
-  } finally {
-    await client.close();
-    await cdp.detach();
-  }
-});
+}

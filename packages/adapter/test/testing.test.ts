@@ -35,7 +35,10 @@ interface FakeNode {
   shadowRoots?: FakeNode[];
   shadowRootType?: 'user-agent' | 'open' | 'closed';
   contentDocument?: FakeNode;
+  /** The border box, which a hit test counts as the node. */
   box?: Box;
+  /** Padding and border inside the box on each side, which the content box leaves out. */
+  inset?: { x: number; y: number };
 }
 
 let nextId = 1;
@@ -220,13 +223,23 @@ class FakeSession implements DevToolsSession {
       case 'Input.dispatchMouseEvent':
         return Promise.resolve({});
       case 'DOM.getBoxModel': {
-        const box = this.node(Number(p.backendNodeId))?.box;
+        const node = this.node(Number(p.backendNodeId));
+        const box = node?.box;
         if (!box) return Promise.reject(new Error('Could not compute box model.'));
+        const quad = ({ x, y, width, height }: Box): number[] => {
+          const left = x - this.scroll.x;
+          const top = y - this.scroll.y;
+          return [left, top, left + width, top, left + width, top + height, left, top + height];
+        };
+        const inset = node.inset ?? { x: 0, y: 0 };
+        const content = quad({
+          x: box.x + inset.x,
+          y: box.y + inset.y,
+          width: box.width - 2 * inset.x,
+          height: box.height - 2 * inset.y,
+        });
         const { width, height } = box;
-        const x = box.x - this.scroll.x;
-        const y = box.y - this.scroll.y;
-        const quad = [x, y, x + width, y, x + width, y + height, x, y + height];
-        return Promise.resolve({ model: { content: quad, width, height } });
+        return Promise.resolve({ model: { content, border: quad(box), width, height } });
       }
       case 'Page.getLayoutMetrics': {
         const size = { clientWidth: this.viewport.width, clientHeight: this.viewport.height };
@@ -394,7 +407,9 @@ describe('replies in the wrong shape', () => {
       'a box of seven numbers',
       (cdp) => {
         cdp.answer = (method) =>
-          method === 'DOM.getBoxModel' ? { model: { content: [0, 0, 1, 0, 1, 1, 0] } } : undefined;
+          method === 'DOM.getBoxModel'
+            ? { model: { content: [0, 0, 1, 0, 1, 1, 0], border: [0, 0, 1, 0, 1, 1, 0, 1] } }
+            : undefined;
       },
     ],
     [
@@ -788,6 +803,66 @@ describe('arming and the hit test', () => {
     covered.root.children.pop();
     await clickInWidget(covered, { action: 'deny', requestId: 'req-1' });
     expect(covered.presses()).toBe(1);
+  });
+
+  for (const [axis, range, checked] of [
+    // Deny's border box is 60 by 20 px around (260, 450), its content box 42 by
+    // 10 inside 9 and 5 px of padding and border: these ranges pass half the
+    // content box and stay within half the border box, so the check at the
+    // visual viewport's place still lands on Deny.
+    ['across, right to left', { x: 26, y: 0 }, { x: 234, y: 450 }],
+    ['up from the bottom', { x: 0, y: 8 }, { x: 260, y: 442 }],
+  ] as const) {
+    it(`measures the far end against the button’s border box, which a hit test counts, scrolled ${axis}`, async () => {
+      const covered = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+      const deny = [...everyNode(covered.root)].find(
+        (node) => attr(node, 'data-action') === 'deny',
+      );
+      if (deny === undefined) throw new Error('no Deny');
+      deny.inset = { x: 9, y: 5 };
+      covered.range = { ...range };
+      covered.rootScroll = { x: -range.x, y: -range.y };
+      covered.root.children.push(
+        el('div', { id: 'cover' }, [], { x: 257, y: 447, width: 6, height: 6 }),
+      );
+      await expect(
+        clickInWidget(covered, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 300 }),
+      ).rejects.toThrow(WidgetTestError);
+      expect(covered.mouse()).toEqual([]);
+      expect(new Set(covered.hitTests().map((at) => JSON.stringify(at)))).toEqual(
+        new Set([JSON.stringify(checked), JSON.stringify({ x: 260, y: 450 })]),
+      );
+
+      covered.root.children.pop();
+      await clickInWidget(covered, { action: 'deny', requestId: 'req-1' });
+      expect(covered.presses()).toBe(1);
+    });
+  }
+
+  it('checks the press point a gap short of the range away, where rounding left it short', async () => {
+    // The element is 2 px short of its 28 px range's end, within the slack the
+    // readings allow: the press would land 26 px from the first check, not 28.
+    const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+    cdp.range = { x: 28, y: 0 };
+    cdp.rootScroll = { x: -26, y: 0 };
+    await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
+    expect(new Set(cdp.hitTests().map((at) => JSON.stringify(at)))).toEqual(
+      new Set([JSON.stringify({ x: 234, y: 450 }), JSON.stringify({ x: 260, y: 450 })]),
+    );
+  });
+
+  it('takes a document’s far end as it is once the gap passes what the border box reaches', async () => {
+    // A right-to-left document 32 px wider than the viewport, at its start: the
+    // gap is the whole range, past Deny's 30 px reach and the pixel beside it,
+    // so the first check is where the press lands and is the only one.
+    const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+    cdp.range = { x: 32, y: 0 };
+    cdp.origin = { x: 32, y: 0 };
+    await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
+    expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: 260, y: 450 });
+    expect(new Set(cdp.hitTests().map((at) => JSON.stringify(at)))).toEqual(
+      new Set([JSON.stringify({ x: 260, y: 450 })]),
+    );
   });
 
   for (const axis of ['x', 'y'] as const) {
