@@ -8,6 +8,7 @@ import manifest from '../package.json' with { type: 'json' };
 import * as exported from './index.ts';
 import {
   DevToolsBoxModelSchema,
+  DevToolsContentQuadsSchema,
   DevToolsDocumentSchema,
   DevToolsLayoutMetricsSchema,
   type DevToolsNode,
@@ -173,6 +174,15 @@ describe('the DevTools reply schemas', () => {
     }
     // The border quad is what the far-end check measures, so a reply without one is refused.
     expect(DevToolsBoxModelSchema.safeParse({ model: { content: square } }).success).toBe(false);
+    // A node's quads: each one eight finite numbers, and no more than a thousand.
+    const quads = (list: unknown): boolean =>
+      DevToolsContentQuadsSchema.safeParse({ quads: list }).success;
+    expect(quads([square, square])).toBe(true);
+    expect(quads([])).toBe(true);
+    expect(quads([[1, 2, 3, 4, 5, 6, 7]])).toBe(false);
+    expect(quads([[1, 2, 3, 4, 5, 6, 7, Number.NaN]])).toBe(false);
+    expect(quads(Array.from({ length: 1001 }, () => square))).toBe(false);
+    expect(quads(undefined)).toBe(false);
     expect(DevToolsNodeAtSchema.safeParse({}).success).toBe(false);
     const layout = { pageX: 0, pageY: 100, clientWidth: 1280, clientHeight: 720 };
     const content = { x: 0, y: 0, width: 1280, height: 4000 };
@@ -236,6 +246,7 @@ describe('the devtools subpath', () => {
     const devtools = await import('./devtools.ts');
     expect(Object.keys(devtools).sort()).toEqual([
       'DevToolsBoxModelSchema',
+      'DevToolsContentQuadsSchema',
       'DevToolsDocumentSchema',
       'DevToolsLayoutMetricsSchema',
       'DevToolsNodeAtSchema',

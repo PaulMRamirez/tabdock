@@ -208,7 +208,7 @@ A button inside a repeated row needs the row as well as the action, such as `{ a
 
 The helper hit-tests the very point it presses, on a scrolled, pinch-zoomed, right-to-left or vertical page and at a fractional device scale too, and presses nothing out of view. It aims for the target's centre, but on a right-to-left or bottom-up page that overflows by less than most of the button it presses beside the centre and checks a second spot on the button as well, so that spot must be clear too.
 
-Chrome on Android lets an element that fills the screen scroll in the document's place (its implicit root scroller), and the hit test does not count that scroll. Once such an element has scrolled, the helper throws rather than press, or, at the very end of a short range, where it reads like such a page, checks both places the press could land. One arrangement still reads like an ordinary scrolled page: a right-to-left page overflowing sideways under such an element scrolled as far. So test on desktop Chromium, as a CI check does, where that behaviour is off.
+Chrome on Android lets an element that fills the screen scroll in the document's place (its implicit root scroller), and the hit test does not count that scroll. Once such an element has scrolled, the helper throws rather than press, or, at the very end of a range within about a third of the button, where it reads like such a page, checks both places the press could land, and past that waits. One arrangement still reads like an ordinary scrolled page: a right-to-left page overflowing sideways under such an element scrolled as far. So test on desktop Chromium, as a CI check does, where that behaviour is off.
 
 A target is the action and, inside one box, at most the box's id:
 

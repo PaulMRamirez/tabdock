@@ -36,6 +36,7 @@
 import { PairingCodeSchema, type Role, RoleSchema } from '@tabdock/protocol';
 import {
   DevToolsBoxModelSchema,
+  DevToolsContentQuadsSchema,
   DevToolsDocumentSchema,
   DevToolsLayoutMetricsSchema,
   type DevToolsNode,
@@ -425,18 +426,23 @@ async function hitsButton(
 /**
  * Where on one axis to press, and how far beside that point to hit-test as
  * well. `gap` is the axis's farEnd, `centre` the content box's middle and
- * `corners` the border box's four corners on this axis, all in the viewport.
+ * `corners` the corners on this axis of the area a hit test counts as the
+ * button (its border box and any label reaching past it), all in the
+ * viewport.
  *
  * With no gap the press goes to the centre. With one, a press lands where the
  * readings say (a document scrolled from its far end) or `gap` on from there
  * (an element scrolled to its very end in the document's place), and in the
  * second case a check at the first point sits `gap` before the press. A gap
- * more than halfway from the border box's reach that way to its whole extent
+ * more than halfway from that area's reach that way to its whole extent
  * takes that check off the button with room to spare, so the press goes to
  * the centre and one check settles it. A shorter gap fits both points in the
- * border box (the area a hit test counts as the button), set about its middle
- * and clear of its edges, and both are checked: wherever the press lands was
- * hit-tested, and a document's far end never pushes the second off the edge.
+ * area, set about its middle and clear of its edges, and both are checked:
+ * wherever the press lands was hit-tested, and a document's far end never
+ * pushes the second off the edge. Under such an element the first check sits
+ * the gap before the pair's near end, still on the button only while the gap
+ * is under about a third of the area, so past that the helper waits there
+ * rather than press.
  */
 function aimAlong(gap: number, centre: number, corners: number[]): { at: number; shift: number } {
   if (gap === 0) return { at: centre, shift: 0 };
@@ -461,8 +467,8 @@ function aimAlong(gap: number, centre: number, corners: number[]): { at: number;
  * scroll between them has moved one off the other, the button is not clickable
  * yet. Where the readings leave an element scrolled to its very end possible
  * (see viewportPlace), the press may land where the readings say or a gap
- * further on, so aimAlong picks the point and both are checked (on both axes,
- * every pairing of the two).
+ * further on, so aimAlong picks the point; under its threshold both are
+ * checked (on both axes, every pairing of the two), past it one.
  */
 async function clickable(
   cdp: DevToolsSession,
@@ -481,16 +487,32 @@ async function clickable(
   const box = await askOrNull(cdp, 'DOM.getBoxModel', { backendNodeId }, DevToolsBoxModelSchema);
   if (box === null) return null;
   const [x1 = 0, y1 = 0, , , x3 = 0, y3 = 0] = box.model.content;
-  const { border } = box.model;
+  // Where a far end leaves two places a press could land, the area a check may
+  // find the button in decides the aim: its border box and everything under
+  // it, since a hit test names the button on a label that reaches past its
+  // border (as a page's line-height on the host can make one do).
+  const corners = [...box.model.border];
+  if (before.farEnd.x !== 0 || before.farEnd.y !== 0) {
+    for (const inner of widgetNodes(button)) {
+      const covered = await askOrNull(
+        cdp,
+        'DOM.getContentQuads',
+        { backendNodeId: inner.backendNodeId },
+        DevToolsContentQuadsSchema,
+      );
+      if (covered === null) return null;
+      for (const quad of covered.quads) corners.push(...quad);
+    }
+  }
   const across = aimAlong(
     before.farEnd.x,
     (x1 + x3) / 2,
-    border.filter((_, i) => i % 2 === 0),
+    corners.filter((_, i) => i % 2 === 0),
   );
   const down = aimAlong(
     before.farEnd.y,
     (y1 + y3) / 2,
-    border.filter((_, i) => i % 2 === 1),
+    corners.filter((_, i) => i % 2 === 1),
   );
   // The hit test takes whole pixels of the document and the press any point of
   // the viewport, so the press goes to the very point the hit test checks.

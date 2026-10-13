@@ -267,7 +267,33 @@ class FakeSession implements DevToolsSession {
           },
         });
       }
+      case 'DOM.getContentQuads': {
+        const node = this.node(Number(p.backendNodeId));
+        if (!node) return Promise.reject(new Error('Could not compute content quads.'));
+        const at = node.box;
+        if (!at) return Promise.resolve({ quads: [] });
+        const left = at.x - this.scroll.x;
+        const top = at.y - this.scroll.y;
+        return Promise.resolve({
+          quads: [
+            [
+              left,
+              top,
+              left + at.width,
+              top,
+              left + at.width,
+              top + at.height,
+              left,
+              top + at.height,
+            ],
+          ],
+        });
+      }
       case 'DOM.getNodeForLocation': {
+        // Chromium takes whole pixels here and refuses any other point.
+        if (!Number.isInteger(p.x) || !Number.isInteger(p.y)) {
+          return Promise.reject(new Error('Invalid parameters'));
+        }
         const id = this.hit(Number(p.x), Number(p.y));
         if (id === null) return Promise.reject(new Error('No node found at given location'));
         return Promise.resolve({ backendNodeId: id, frameId: 'main' });
@@ -825,22 +851,69 @@ describe('arming and the hit test', () => {
     });
   }
 
-  it('checks every pairing of the two points where both axes may stand in for the document', async () => {
-    const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
-    padded(cdp, { x: 15, y: 5 });
-    cdp.range = { x: 18, y: 6 };
-    cdp.rootScroll = { x: -18, y: -6 };
-    await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
-    expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: 251, y: 447 });
-    expect(asText(cdp.hitTests())).toEqual(
-      asText([
-        { x: 233, y: 441 },
-        { x: 233, y: 447 },
-        { x: 251, y: 441 },
-        { x: 251, y: 447 },
-      ]),
-    );
-  });
+  for (const [kind, setup, checked] of [
+    [
+      'a document scrolled from its far end on both axes',
+      (cdp: FakeSession) => {
+        cdp.origin = { x: 18, y: 6 };
+      },
+      [
+        [251, 447],
+        [251, 453],
+        [269, 447],
+        [269, 453],
+      ],
+    ],
+    [
+      'a document scrolled from its far end across and an element at its end down',
+      (cdp: FakeSession) => {
+        cdp.origin = { x: 18, y: 0 };
+        cdp.rootScroll = { x: 0, y: -6 };
+      },
+      [
+        [251, 441],
+        [251, 447],
+        [269, 441],
+        [269, 447],
+      ],
+    ],
+    [
+      'an element scrolled to its end on both axes',
+      (cdp: FakeSession) => {
+        cdp.rootScroll = { x: -18, y: -6 };
+      },
+      [
+        [233, 441],
+        [233, 447],
+        [251, 441],
+        [251, 447],
+      ],
+    ],
+  ] as const) {
+    it(`checks every pairing of the two points on ${kind}, and presses nothing a cover holds where the press lands`, async () => {
+      const page = (): FakeSession => {
+        const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+        padded(cdp, { x: 15, y: 5 });
+        cdp.range = { x: 18, y: 6 };
+        setup(cdp);
+        return cdp;
+      };
+      const open = page();
+      await clickInWidget(open, { action: 'deny', requestId: 'req-1' });
+      expect(open.mouse()[1]).toEqual({ type: 'mousePressed', x: 251, y: 447 });
+      expect(asText(open.hitTests())).toEqual(asText(checked.map(([x, y]) => ({ x, y }))));
+
+      // A cover over the press point alone, which only one pairing reaches.
+      const covered = page();
+      covered.root.children.push(
+        el('div', { id: 'cover' }, [], { x: 249, y: 445, width: 4, height: 4 }),
+      );
+      await expect(
+        clickInWidget(covered, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 300 }),
+      ).rejects.toThrow(WidgetTestError);
+      expect(covered.mouse()).toEqual([]);
+    });
+  }
 
   for (const range of [28, 50]) {
     it(`presses nothing where an element scrolled to the very end of ${String(range)} px leaves the first check off the button`, async () => {
@@ -856,6 +929,40 @@ describe('arming and the hit test', () => {
       expect(cdp.hitTests().every(({ x }) => Number(x) < 230)).toBe(true);
     });
   }
+
+  it('measures the button by its label too where the label reaches past the border box', async () => {
+    // A page's line-height on the host can shrink Deny's border box to 10 px
+    // while its label stays 18 px tall, and a hit test on the label names
+    // Deny. An element scrolled 8 px to its end down: measured on the border
+    // box alone, the one check 8 px above the centre would land on the label
+    // and the press go to the centre, through the cover there.
+    const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+    const deny = [...everyNode(cdp.root)].find((node) => attr(node, 'data-action') === 'deny');
+    const label = deny?.children[0];
+    if (deny === undefined || label === undefined) throw new Error('no Deny');
+    deny.box = { x: 230, y: 445, width: 60, height: 10 };
+    label.box = { x: 232, y: 441, width: 56, height: 18 };
+    cdp.range = { x: 0, y: 8 };
+    cdp.rootScroll = { x: 0, y: -8 };
+    cdp.root.children.push(el('div', { id: 'cover' }, [], { x: 257, y: 447, width: 6, height: 6 }));
+    await expect(
+      clickInWidget(cdp, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 300 }),
+    ).rejects.toThrow(WidgetTestError);
+    expect(cdp.mouse()).toEqual([]);
+    expect(cdp.sent.some((sent) => sent.method === 'DOM.getContentQuads')).toBe(true);
+  });
+
+  it('presses nothing where a part of the button cannot be measured', async () => {
+    const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+    cdp.range = { x: 18, y: 0 };
+    cdp.origin = { x: 18, y: 0 };
+    cdp.answer = (method) =>
+      method === 'DOM.getContentQuads' ? { quads: [[0, 0, 1, 0, 1, 1, 0]] } : undefined;
+    await expect(
+      clickInWidget(cdp, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 300 }),
+    ).rejects.toThrow(WidgetTestError);
+    expect(cdp.mouse()).toEqual([]);
+  });
 
   it('checks the second point the gap away, not the range, where rounding left the element short of its end', async () => {
     // The element is 2 px short of its 16 px range's end, within the slack the
@@ -893,6 +1000,58 @@ describe('arming and the hit test', () => {
       );
     });
   }
+
+  for (const [axis, range, aimed, beside] of [
+    // At three quarters of Deny's border box, the most that still takes two checks.
+    ['across', { x: 45, y: 0 }, [238, 450], [283, 450]],
+    ['down', { x: 0, y: 15 }, [260, 443], [260, 458]],
+  ] as const) {
+    it(`presses a document’s far end ${axis} beside the centre up to three quarters of the button`, async () => {
+      const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+      cdp.range = { ...range };
+      cdp.origin = { ...range };
+      await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
+      expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: aimed[0], y: aimed[1] });
+      expect(asText(cdp.hitTests())).toEqual(
+        asText([
+          { x: aimed[0], y: aimed[1] },
+          { x: beside[0], y: beside[1] },
+        ]),
+      );
+    });
+  }
+
+  it('hit-tests whole pixels where rounding leaves a far end’s gap a fraction', async () => {
+    // A document 18 px wider than the viewport, its readings 0.6 px apart
+    // more than that: both checks still go to whole pixels, as Chromium needs.
+    const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+    cdp.range = { x: 18, y: 0 };
+    cdp.origin = { x: 18, y: 0 };
+    cdp.layoutNudge = { x: 0.6, y: 0 };
+    await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
+    expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: 251, y: 450 });
+    expect(asText(cdp.hitTests())).toEqual(
+      asText([
+        { x: 251, y: 450 },
+        { x: 270, y: 450 },
+      ]),
+    );
+  });
+
+  it('presses nothing where the point it aims for is out of view, though the centre shows', async () => {
+    // Deny straddles the left edge, its centre 5 px in; a document's 18 px far
+    // end puts the press 4 px out, where it would reach nothing.
+    const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+    const deny = [...everyNode(cdp.root)].find((node) => attr(node, 'data-action') === 'deny');
+    if (deny === undefined) throw new Error('no Deny');
+    deny.box = { x: -25, y: 440, width: 60, height: 20 };
+    cdp.range = { x: 18, y: 0 };
+    cdp.origin = { x: 18, y: 0 };
+    await expect(
+      clickInWidget(cdp, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 300 }),
+    ).rejects.toThrow(WidgetTestError);
+    expect(cdp.mouse()).toEqual([]);
+  });
 
   for (const [axis, range] of [
     ['across', { x: 46, y: 0 }],
@@ -1084,6 +1243,7 @@ describe('what it sends', () => {
     'DOM.getDocument',
     'DOM.scrollIntoViewIfNeeded',
     'DOM.getBoxModel',
+    'DOM.getContentQuads',
     'DOM.getNodeForLocation',
     'Page.getLayoutMetrics',
     'Input.dispatchMouseEvent',

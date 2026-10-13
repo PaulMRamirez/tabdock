@@ -154,20 +154,23 @@ for (const axis of ['down', 'across'] as const) {
 // from the bottom, gives the readings of a document of that kind, so no
 // reading tells the two apart, and a press may land where the readings say or
 // the range further on. Within a third of the button both fit on it, and the
-// helper presses only where both hit-test as Allow; past that, the check
-// where the readings say lands off the button under such an element, so the
-// helper waits rather than press, even through padding and border, which a
-// hit test counts as the button too.
+// helper presses only where both hit-test as Allow, so a cover where the press
+// would land stops it. Past a third, the check where the readings say lands
+// off the button under such an element (in its padding at first, which a hit
+// test counts as the button too), so the helper waits even with nothing over
+// Allow.
 /** A range past half Allow's content box and within half its border box. */
 const IN_PADDING = (content: number, border: number): number => Math.round((content + border) / 2);
-for (const [axis, range, size, pressesAtEnd] of [
+for (const [axis, range, size, presses] of [
   ['across', '28 px', () => 28, true],
+  ['down', '7 px', () => 7, true],
   ['across', 'a range inside the button’s padding', IN_PADDING, false],
   ['down', 'a range inside the button’s padding', IN_PADDING, false],
 ] as const) {
-  test(`presses nothing through a cover where an element scrolled ${axis} to the very end of ${range} stands in for the document`, async ({
-    page,
-  }) => {
+  const title = presses
+    ? `presses nothing through a cover where the press would land, where an element scrolled ${axis} to the very end of ${range} stands in for the document`
+    : `waits, with nothing over Allow, where an element scrolled ${axis} to the very end of ${range} stands in for the document`;
+  test(title, async ({ page }) => {
     await page.goto(tabdock.pageUrl);
     await page.waitForSelector('html[data-tools="ready"]');
     const { code } = await waitForLink(page);
@@ -229,32 +232,36 @@ for (const [axis, range, size, pressesAtEnd] of [
         })
         .toEqual([-by, 0, by]);
 
-      // A cover where the press would land: beside the centre, where the
-      // helper aims at the end of a short range, else on the centre itself.
-      const aimed = pressesAtEnd ? await widgetButton(cdp, target) : centre;
-      await page.evaluate(({ x, y }) => {
-        const over = document.createElement('div');
-        over.id = 'cover';
-        Object.assign(over.style, {
-          position: 'fixed',
-          left: `${String(x - 2)}px`,
-          top: `${String(y - 2)}px`,
-          width: '4px',
-          height: '4px',
-          zIndex: '2147483647',
-          pointerEvents: 'none',
-        });
-        document.documentElement.append(over);
-      }, aimed);
+      if (presses) {
+        // Where the helper would press: beside the centre, both places on Allow.
+        const aimed = await widgetButton(cdp, target);
+        expect(axis === 'across' ? aimed.x : aimed.y).not.toBe(
+          axis === 'across' ? centre.x : centre.y,
+        );
+        await page.evaluate(({ x, y }) => {
+          const over = document.createElement('div');
+          over.id = 'cover';
+          Object.assign(over.style, {
+            position: 'fixed',
+            left: `${String(x - 2)}px`,
+            top: `${String(y - 2)}px`,
+            width: '4px',
+            height: '4px',
+            zIndex: '2147483647',
+            pointerEvents: 'none',
+          });
+          document.documentElement.append(over);
+        }, aimed);
+      }
       await expect(clickInWidget(cdp, target, { timeoutMs: 1500 })).rejects.toThrow(
         WidgetTestError,
       );
       expect((await waitingPrompts(cdp)).attach).toEqual([{ requestId, client: CI }]);
 
-      // Uncovered, it approves: where it stands at the end of a short range,
-      // else once the element is back at its start.
+      // Uncovered at the end of a short range it approves where it stands;
+      // past a third it does once the element is back at its start.
       await page.evaluate(() => document.getElementById('cover')?.remove());
-      if (!pressesAtEnd) await scrollTo(page, axis, 0);
+      if (!presses) await scrollTo(page, axis, 0);
       expect(await allowAttach(cdp, { as: 'driver', requestId })).toBe(requestId);
       expect((await pending).structured).toMatchObject({ role: 'driver' });
     } finally {
@@ -263,3 +270,88 @@ for (const [axis, range, size, pressesAtEnd] of [
     }
   });
 }
+
+// A page's line-height on the widget's host reaches its buttons, so Allow's
+// border box shrinks to a sliver while its label keeps its height, and a hit
+// test on the label still names Allow. Measured on the border box alone, a
+// range just past three quarters of it took one check, which landed on the
+// label, and the press went to the centre unchecked.
+test('presses nothing through a cover where a page squeezes Allow’s box below its label, at the very end of a short range', async ({
+  page,
+}) => {
+  await page.goto(tabdock.pageUrl);
+  await page.waitForSelector('html[data-tools="ready"]');
+  await page.addStyleTag({ content: 'tabdock-dock { line-height: 0; }' });
+  const { code } = await waitForLink(page);
+  const cdp = await page.context().newCDPSession(page);
+  const client = await connectMcp(tabdock.relay, tabdock.users.alice, CI);
+  try {
+    const pending = callTool(client, 'pair_page', { code });
+    const requestId = await waitForDock(page, (s) => s.pendingRequests[0]?.requestId);
+    const target = { action: 'approve-driver', requestId } as const;
+    const centre = await widgetButton(cdp, target);
+    const { model } = await cdp.send('DOM.getBoxModel', { backendNodeId: centre.backendNodeId });
+    const height = Math.abs((model.border[5] ?? 0) - (model.border[1] ?? 0));
+    const by = Math.floor(height * 0.75) + 1;
+    // The label reaches past the border box, the case this test exists for.
+    const label = await page.evaluate(() => {
+      const host = document.querySelector('tabdock-dock');
+      return host === null ? null : getComputedStyle(host).lineHeight;
+    });
+    expect(label).toBe('0px');
+
+    await page.evaluate((by) => {
+      const { documentElement: html, body } = document;
+      Object.assign(html.style, { height: '100%', overflow: 'hidden' });
+      Object.assign(body.style, { height: '100%', overflow: 'hidden', margin: '0' });
+      const scroller = document.createElement('div');
+      scroller.id = 'scroller';
+      scroller.style.writingMode = 'sideways-lr';
+      Object.assign(scroller.style, {
+        position: 'absolute',
+        left: '0',
+        top: '0',
+        width: '100%',
+        height: '100%',
+        overflow: 'auto',
+      });
+      const long = document.createElement('div');
+      Object.assign(long.style, { width: '100%', height: `calc(100% + ${String(by)}px)` });
+      scroller.append(long);
+      body.append(scroller);
+      scroller.scrollTop = -by;
+    }, by);
+    await expect
+      .poll(async () => {
+        const metrics = await cdp.send('Page.getLayoutMetrics');
+        const { cssVisualViewport: view, cssLayoutViewport: layout } = metrics;
+        return [view.pageY, layout.pageY, metrics.cssContentSize.height - layout.clientHeight];
+      })
+      .toEqual([-by, 0, by]);
+
+    await page.evaluate(({ x, y }) => {
+      const over = document.createElement('div');
+      over.id = 'cover';
+      Object.assign(over.style, {
+        position: 'fixed',
+        left: `${String(x - 2)}px`,
+        top: `${String(y - 2)}px`,
+        width: '4px',
+        height: '4px',
+        zIndex: '2147483647',
+        pointerEvents: 'none',
+      });
+      document.documentElement.append(over);
+    }, centre);
+    await expect(clickInWidget(cdp, target, { timeoutMs: 1500 })).rejects.toThrow(WidgetTestError);
+    expect((await waitingPrompts(cdp)).attach).toEqual([{ requestId, client: CI }]);
+
+    await page.evaluate(() => document.getElementById('cover')?.remove());
+    await scrollTo(page, 'down', 0);
+    expect(await allowAttach(cdp, { as: 'driver', requestId })).toBe(requestId);
+    expect((await pending).structured).toMatchObject({ role: 'driver' });
+  } finally {
+    await client.close();
+    await cdp.detach();
+  }
+});

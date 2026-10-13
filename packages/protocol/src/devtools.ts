@@ -81,6 +81,17 @@ export const DevToolsBoxModelSchema = z.object({
 });
 export type DevToolsBoxModel = z.infer<typeof DevToolsBoxModelSchema>;
 
+/**
+ * DOM.getContentQuads (marked experimental; Puppeteer's click reads it too):
+ * the quads a node covers, in the viewport's coordinates, one per line for
+ * text. A button's label can reach past the button's border box, and a hit
+ * test there still names the button.
+ */
+export const DevToolsContentQuadsSchema = z.object({
+  quads: z.array(QuadSchema).check(z.maxLength(1000)),
+});
+export type DevToolsContentQuads = z.infer<typeof DevToolsContentQuadsSchema>;
+
 /** DOM.getNodeForLocation: the node a hit test found. */
 export const DevToolsNodeAtSchema = z.object({ backendNodeId: NodeIdSchema });
 export type DevToolsNodeAt = z.infer<typeof DevToolsNodeAtSchema>;
