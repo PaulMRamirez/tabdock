@@ -1,9 +1,15 @@
 import assert from 'node:assert/strict';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import {
+  MAP_DEMO_BUDGET,
+  SCRIPTED_SCRIPT,
+  scriptedDirProblems,
+  scriptedPageProblems,
+  scriptedPolicy,
   svgProblems,
   TOUR_POLICY,
   TOUR_POLICY_META,
@@ -220,6 +226,219 @@ describe('tourDirProblems, the read-back of the built tour', () => {
         'img/evil.SVGZ: a .svgz file has no place in the tour',
         'img/link.png: is neither a file nor a directory',
         'tour.js: a .js file has no place in the tour',
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// The site's pages with script (ADR 0050): the board at / and the map demo
+// at /map/, each shaped as staticIndexHtml writes it.
+const STYLE = '\n      body { margin: 0; }\n    ';
+const styleHash = createHash('sha256').update(STYLE, 'utf8').digest('base64');
+
+function scripted(worker: boolean, body: string, style = STYLE): string {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="${scriptedPolicy(styleHash, worker)}" />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>T</title>
+    <style>${style}</style>
+  </head>
+  <body>
+    ${body}
+    <!-- Relative, so a copy served under <user>.github.io/<repository>/ finds its script too. -->
+    ${SCRIPTED_SCRIPT}
+  </body>
+</html>
+`;
+}
+
+const board = scripted(true, '<nav><a href="tour/">The tour</a> <a href="map/">The map</a></nav>');
+const map = scripted(
+  false,
+  '<nav><a href="../">The board</a> <a href="../guide/16-map-pages.html">Map pages</a></nav><canvas aria-label="Map; drag to pan, or use the buttons"></canvas>',
+);
+
+describe('scriptedPageProblems (ADR 0050)', () => {
+  it("passes the board's page and the map demo's, each under its own policy", () => {
+    assert.deepEqual(scriptedPageProblems(board, { worker: true }), []);
+    assert.deepEqual(scriptedPageProblems(map, { worker: false }), []);
+    // The board's static policy, word for word (apps/demo/scripts/server.ts), and the map's without worker-src.
+    assert.equal(
+      scriptedPolicy('H', true),
+      "default-src 'none'; script-src 'self'; style-src 'self' 'sha256-H'; img-src 'self'; connect-src wss: ws:; worker-src blob:; base-uri 'none'; form-action 'none'",
+    );
+    assert.equal(
+      scriptedPolicy('H', false),
+      scriptedPolicy('H', true).replace(' worker-src blob:;', ''),
+    );
+  });
+
+  it('refuses a page without its policy, with it twice, after what it governs, or looser than the rule', () => {
+    const meta =
+      /\s*<meta http-equiv="Content-Security-Policy" content="[^"]*" \/>/.exec(map)?.[0] ?? '';
+    assert.ok(meta.length > 0);
+    const has = (html: string, problem: string, worker = false): void => {
+      assert.ok(scriptedPageProblems(html, { worker }).includes(problem), problem);
+    };
+    has(map.replace(meta, ''), 'lacks its policy, or holds it more than once');
+    has(map.replace(meta, `${meta}${meta}`), 'lacks its policy, or holds it more than once');
+    has(
+      map.replace(meta, '').replace('</style>', `</style>${meta}`),
+      'has <style ahead of its policy',
+    );
+    // The board's worker on the map, or none on the board, is not the page's policy.
+    has(map, "its policy is not the site's for a page with script and a worker", true);
+    has(board, "its policy is not the site's for a page with script and no worker");
+    has(
+      map.replace("script-src 'self'", "script-src 'self' 'unsafe-inline'"),
+      "its policy is not the site's for a page with script and no worker",
+    );
+    // A style edited after its hash was taken.
+    has(
+      scripted(false, '', `${STYLE}p{}`).replace(/sha256-[^']+/, `sha256-${styleHash}`),
+      "its policy is not the site's for a page with script and no worker",
+    );
+    has(
+      map.replace('<meta name="referrer" content="no-referrer" />', ''),
+      'lacks the no-referrer meta',
+    );
+    has(
+      map.replace(
+        '<title>',
+        '<meta http-equiv="refresh" content="0;url=https://evil.example"><title>',
+      ),
+      'holds another http-equiv meta',
+    );
+  });
+
+  it('refuses an inline script, any script but its bundle, and anything that runs or loads besides', () => {
+    const script = 'loads other than its one bundle, ./main.js, or holds an inline script';
+    for (const [extra, problem] of [
+      ['<script>alert(1)</script>', script],
+      ['<SCRIPT type="module" src="./other.js"></SCRIPT>', script],
+      ['<script src="https://cdn.example/x.js"></script>', script],
+      ['<img src="x.png" onerror="alert(1)">', 'holds an on* event handler attribute'],
+      ['<button/onclick="x">b</button>', 'holds an on* event handler attribute'],
+      ['<p style="color:red">x</p>', 'holds a style attribute'],
+      ['<iframe src="x.html"></iframe>', 'holds a <iframe> element'],
+      ['<form action="x"></form>', 'holds a <form> element'],
+      ['<base href="../">', 'holds a <base> element'],
+      ['<link rel="stylesheet" href="x.css">', 'holds a <link> element'],
+      [
+        '<a href="https://evil.example/">x</a>',
+        'names a URL outside the site, or from its root: https://evil.example/',
+      ],
+      [
+        '<a href="//evil.example/">x</a>',
+        'names a URL outside the site, or from its root: //evil.example/',
+      ],
+      ['<a href="/x">x</a>', 'names a URL outside the site, or from its root: /x'],
+      [
+        '<a href="javascript&#58;alert(1)">x</a>',
+        'names a URL outside the site, or from its root: javascript&#58;alert(1)',
+      ],
+      ["<a href='x.html'>x</a>", 'has an unquoted or single-quoted href'],
+    ] as const) {
+      const html = map.replace('<canvas', `${extra}<canvas`);
+      assert.ok(scriptedPageProblems(html, { worker: false }).includes(problem), extra);
+    }
+  });
+});
+
+describe('scriptedDirProblems, the read-back of the board and the map demo', () => {
+  /** A built site: the board at its root with the tour and guide beside it, and the map demo at map/. */
+  function site(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'tabdock-site-scripted-'));
+    for (const sub of ['tour', 'guide', 'map']) mkdirSync(join(dir, sub));
+    writeFileSync(join(dir, 'index.html'), board);
+    writeFileSync(join(dir, 'tour', 'index.html'), good);
+    writeFileSync(join(dir, 'guide', '16-map-pages.html'), good);
+    writeFileSync(join(dir, 'map', 'index.html'), map);
+    for (const at of ['', 'map']) {
+      writeFileSync(
+        join(dir, at, 'main.js'),
+        'document.title;\n//# sourceMappingURL=main.js.map\n',
+      );
+      writeFileSync(join(dir, at, 'main.js.map'), '{}');
+    }
+    return dir;
+  }
+  const ROOT = { worker: true, subdirs: ['tour', 'guide', 'map'], links: ['map/'] };
+  const MAP = { worker: false, subdirs: [], budget: MAP_DEMO_BUDGET };
+
+  it("passes the site's own shape, with ADR 0050's budget", async () => {
+    assert.deepEqual(MAP_DEMO_BUDGET, { indexHtml: 16_000, mainJs: 800_000, mainJsGzip: 200_000 });
+    const dir = site();
+    try {
+      assert.deepEqual(await scriptedDirProblems(dir, '', ROOT), []);
+      assert.deepEqual(await scriptedDirProblems(dir, 'map', MAP), []);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('names an extra file, a missing one, a test hook, a link to nowhere and a missing link to the map', async () => {
+    const dir = site();
+    try {
+      writeFileSync(join(dir, 'map', 'extra.js'), 'alert(1)');
+      mkdirSync(join(dir, 'map', 'tiles'));
+      symlinkSync('/etc/hostname', join(dir, 'map', 'world.png'));
+      rmSync(join(dir, 'map', 'main.js.map'));
+      writeFileSync(join(dir, 'main.js'), 'window.__tabdockDock = dock;');
+      rmSync(join(dir, 'guide', '16-map-pages.html'));
+      writeFileSync(join(dir, 'index.html'), board.replace('<a href="map/">The map</a>', ''));
+      assert.deepEqual(await scriptedDirProblems(dir, 'map', MAP), [
+        'map/extra.js: has no place beside a page with script',
+        'map/index.html: links ../guide/16-map-pages.html, which the site does not hold',
+        'map/main.js.map: is missing',
+        'map/tiles/: has no place beside a page with script',
+        'map/world.png: is neither a file nor a directory',
+      ]);
+      assert.deepEqual(await scriptedDirProblems(dir, '', ROOT), [
+        'index.html: does not link map/',
+        'main.js: holds a test hook',
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a page with script holding a bad page, or a bundle over budget', async () => {
+    const dir = site();
+    try {
+      writeFileSync(
+        join(dir, 'map', 'index.html'),
+        map.replace('<canvas', '<script>alert(1)</script><canvas'),
+      );
+      // Bytes that do not compress, one over the budget either way.
+      writeFileSync(join(dir, 'map', 'main.js'), randomBytes(MAP_DEMO_BUDGET.mainJs + 1));
+      const problems = await scriptedDirProblems(dir, 'map', MAP);
+      assert.equal(problems.length, 3, problems.join('\n'));
+      assert.ok(
+        problems.includes(
+          'map/index.html: loads other than its one bundle, ./main.js, or holds an inline script',
+        ),
+      );
+      assert.ok(problems.includes('map/main.js: 800,001 bytes, over its budget of 800,000'));
+      assert.ok(
+        problems.some((line) =>
+          /^map\/main\.js: [\d,]+ bytes gzipped, over its budget of 200,000$/.test(line),
+        ),
+      );
+      // An index.html past its own budget, though every byte is a rule-abiding comment.
+      writeFileSync(
+        join(dir, 'map', 'index.html'),
+        map.replace('<body>', `<body><!--${'x'.repeat(16_000)}-->`),
+      );
+      writeFileSync(join(dir, 'map', 'main.js'), 'ok');
+      assert.deepEqual(await scriptedDirProblems(dir, 'map', MAP), [
+        `map/index.html: ${(Buffer.byteLength(map) + 16_007).toLocaleString('en')} bytes, over its budget of 16,000`,
       ]);
     } finally {
       rmSync(dir, { recursive: true, force: true });

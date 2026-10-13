@@ -1,10 +1,10 @@
 // The HTML around each page of the tour and the guide, and their indexes.
 // Every page opens its <head> with the site policy and a no-referrer meta,
 // loads its collection's copy of tour.css and nothing else, and links to the
-// guide, the tour and the demo board at the site's root by relative paths,
-// so the site works on a custom domain and under
-// <user>.github.io/<repository>/ alike. The guide and the tour are held to
-// the same checks (ADR 0035), so they share this one shell.
+// guide, the tour, the demo board at the site's root and the map demo at
+// /map/ (ADR 0050) by relative paths, so the site works on a custom domain
+// and under <user>.github.io/<repository>/ alike. The guide and the tour are
+// held to the same checks (ADR 0035), so they share this one shell.
 
 import { NO_REFERRER_META, TOUR_POLICY_META } from './checks.ts';
 import type { Repository } from './links.ts';
@@ -27,7 +27,7 @@ const SECTION_NAMES: Readonly<Record<Section, string>> = {
 function nav(section: Section): string {
   const to = (target: Section): string =>
     target === section ? 'index.html' : `../${target}/index.html`;
-  return `<nav><a href="${to('guide')}">The guide</a> <a href="${to('tour')}">The tour</a> <a href="../">The demo board</a></nav>`;
+  return `<nav><a href="${to('guide')}">The guide</a> <a href="${to('tour')}">The tour</a> <a href="../">The demo board</a> <a href="../map/">The map demo</a></nav>`;
 }
 
 function shell(section: Section, title: string, main: string, footer: string): string {
@@ -97,6 +97,7 @@ export function indexPage(pages: readonly PageLink[], repository: Repository): s
 ${items}
 </ol>
 <p>The <a href="../">demo board</a> beside this tour is the page most explainers attach to; 06 uses the canvas map page, which <code>pnpm dev:map</code> serves from a clone. The board dials a relay only after you choose one and click to connect.</p>
+<p>The <a href="../map/">map demo</a> beside it is Earth as a flat map and a globe that a client you pair can move, capture and follow; it dials only a relay you choose, as the board does.</p>
 `;
   return shell('tour', 'The Tabdock tour', main, builtFrom(repository));
 }
