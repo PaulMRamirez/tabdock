@@ -152,16 +152,18 @@ for (const axis of ['down', 'across'] as const) {
 
 // An element scrolled to the very end of a short range, right to left or up
 // from the bottom, gives the readings of a document of that kind, so no
-// reading tells the two apart; a check at the visual viewport's place would
-// land beside the press but still on Allow, in its content box or in the
-// padding and border around it, which a hit test counts as the button too.
-// The helper checks the press point itself as well.
-/** A range past half Allow's content box and within half its border box: the check lands in its padding. */
+// reading tells the two apart, and a press may land where the readings say or
+// the range further on. Within a third of the button both fit on it, and the
+// helper presses only where both hit-test as Allow; past that, the check
+// where the readings say lands off the button under such an element, so the
+// helper waits rather than press, even through padding and border, which a
+// hit test counts as the button too.
+/** A range past half Allow's content box and within half its border box. */
 const IN_PADDING = (content: number, border: number): number => Math.round((content + border) / 2);
-for (const [axis, range, size] of [
-  ['across', '28 px', () => 28],
-  ['across', 'a range inside the button’s padding', IN_PADDING],
-  ['down', 'a range inside the button’s padding', IN_PADDING],
+for (const [axis, range, size, pressesAtEnd] of [
+  ['across', '28 px', () => 28, true],
+  ['across', 'a range inside the button’s padding', IN_PADDING, false],
+  ['down', 'a range inside the button’s padding', IN_PADDING, false],
 ] as const) {
   test(`presses nothing through a cover where an element scrolled ${axis} to the very end of ${range} stands in for the document`, async ({
     page,
@@ -175,8 +177,10 @@ for (const [axis, range, size] of [
       const pending = callTool(client, 'pair_page', { code });
       const requestId = await waitForDock(page, (s) => s.pendingRequests[0]?.requestId);
       const target = { action: 'approve-driver', requestId } as const;
-      const at = await widgetButton(cdp, target);
-      const { model } = await cdp.send('DOM.getBoxModel', { backendNodeId: at.backendNodeId });
+      const centre = await widgetButton(cdp, target);
+      const { model } = await cdp.send('DOM.getBoxModel', {
+        backendNodeId: centre.backendNodeId,
+      });
       const half = (quad: number[], from: number): number =>
         Math.abs((quad[from + 4] ?? 0) - (quad[from] ?? 0)) / 2;
       const from = axis === 'across' ? 0 : 1;
@@ -225,6 +229,9 @@ for (const [axis, range, size] of [
         })
         .toEqual([-by, 0, by]);
 
+      // A cover where the press would land: beside the centre, where the
+      // helper aims at the end of a short range, else on the centre itself.
+      const aimed = pressesAtEnd ? await widgetButton(cdp, target) : centre;
       await page.evaluate(({ x, y }) => {
         const over = document.createElement('div');
         over.id = 'cover';
@@ -238,14 +245,16 @@ for (const [axis, range, size] of [
           pointerEvents: 'none',
         });
         document.documentElement.append(over);
-      }, at);
+      }, aimed);
       await expect(clickInWidget(cdp, target, { timeoutMs: 1500 })).rejects.toThrow(
         WidgetTestError,
       );
       expect((await waitingPrompts(cdp)).attach).toEqual([{ requestId, client: CI }]);
 
-      // Uncovered, it approves where it stands.
+      // Uncovered, it approves: where it stands at the end of a short range,
+      // else once the element is back at its start.
       await page.evaluate(() => document.getElementById('cover')?.remove());
+      if (!pressesAtEnd) await scrollTo(page, axis, 0);
       expect(await allowAttach(cdp, { as: 'driver', requestId })).toBe(requestId);
       expect((await pending).structured).toMatchObject({ role: 'driver' });
     } finally {

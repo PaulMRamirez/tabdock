@@ -173,6 +173,67 @@ test.describe('on a scrolled page', () => {
     });
   });
 
+  // A page that overflows by just over half of Allow's border box, from its
+  // far end, so the readings differ by that range everywhere: a second check
+  // that far from Allow's centre would fall off its edge, and the helper would
+  // never find it.
+  for (const [shape, style, axis] of [
+    ['a right-to-left page', 'direction: rtl', 'across'],
+    ['a page that scrolls up from the bottom', 'writing-mode: vertical-lr; direction: rtl', 'down'],
+  ] as const) {
+    test(`pairs on ${shape} that overflows by about half of Allow`, async ({ page }) => {
+      const { pageId, code, cdp } = await openBoard(page);
+      const client = await connectMcp(tabdock.relay, tabdock.users.alice, CI);
+      try {
+        const pending = callTool(client, 'pair_page', { code });
+        const requestId = await waitForDock(page, (s) => s.pendingRequests[0]?.requestId);
+        const at = await widgetButton(cdp, { action: 'approve-driver', requestId });
+        const { model } = await cdp.send('DOM.getBoxModel', { backendNodeId: at.backendNodeId });
+        const from = axis === 'across' ? 0 : 1;
+        const half = Math.abs((model.border[from + 4] ?? 0) - (model.border[from] ?? 0)) / 2;
+        const range = Math.round(half) + 1;
+
+        // Only the widget and one block, sized so the page overflows by `range`
+        // whatever padding the board's own styles leave around it.
+        await page.evaluate(
+          ({ css, across, range }) => {
+            const { documentElement: html, body } = document;
+            const hide = document.createElement('style');
+            hide.textContent = 'body > :not(tabdock-dock, #extent) { display: none !important; }';
+            document.head.append(hide);
+            html.setAttribute('style', css);
+            const extent = document.createElement('div');
+            extent.id = 'extent';
+            Object.assign(extent.style, { display: 'block', blockSize: '1px' });
+            body.append(extent);
+            const client = across ? html.clientWidth : html.clientHeight;
+            const overflow = (): number => (across ? html.scrollWidth : html.scrollHeight) - client;
+            extent.style.inlineSize = `${String(client + range)}px`;
+            extent.style.inlineSize = `${String(client + 2 * range - overflow())}px`;
+          },
+          { css: style, across: axis === 'across', range },
+        );
+        await expect
+          .poll(async () => {
+            const metrics = await cdp.send('Page.getLayoutMetrics');
+            const { cssVisualViewport: view, cssLayoutViewport: layout } = metrics;
+            return axis === 'across'
+              ? [metrics.cssContentSize.width - layout.clientWidth, layout.pageX - view.pageX]
+              : [metrics.cssContentSize.height - layout.clientHeight, layout.pageY - view.pageY];
+          })
+          .toEqual([range, range]);
+
+        expect(await allowAttach(cdp, { as: 'driver', requestId })).toBe(requestId);
+        const paired = await pending;
+        expect(paired.isError, paired.text).toBe(false);
+        expect(paired.structured).toMatchObject({ page: pageId, role: 'driver' });
+      } finally {
+        await client.close();
+        await cdp.detach();
+      }
+    });
+  }
+
   // A cover that takes clicks catches the press; one that lets clicks through
   // (pointer-events: none) passes it to Allow, which would approve.
   for (const cover of [

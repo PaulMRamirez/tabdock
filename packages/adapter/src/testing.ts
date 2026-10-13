@@ -2,12 +2,13 @@
 // and answers its prompts through the DevTools protocol, as a person at the
 // page would. The widget lives in a closed shadow root that page script and a
 // browser driver's selectors cannot reach, by design; the DevTools protocol
-// can, so this finds a button there and clicks its centre with trusted input.
+// can, so this finds a button there and clicks it with trusted input.
 //
 // It approves nothing a person could not: it clicks only a button whose box
 // has held still (data-armed, the widget's 500 ms wait) and that a hit test
-// says a click at its centre would reach, and checks both again just before
-// the press. It presses nothing when more than one button matches what it was
+// says a click at the point it aims for (its centre, unless a page's scroll
+// leaves two places a press could land) would reach, and checks both again
+// just before the press. It presses nothing when more than one button matches what it was
 // asked for, so a click naming no request never approves whichever of two
 // prompts comes first, and allowAttach approves an attach request only when
 // exactly one waiting request carries the client name or request id it was
@@ -422,6 +423,31 @@ async function hitsButton(
 }
 
 /**
+ * Where on one axis to press, and how far beside that point to hit-test as
+ * well. `gap` is the axis's farEnd, `centre` the content box's middle and
+ * `corners` the border box's four corners on this axis, all in the viewport.
+ *
+ * With no gap the press goes to the centre. With one, a press lands where the
+ * readings say (a document scrolled from its far end) or `gap` on from there
+ * (an element scrolled to its very end in the document's place), and in the
+ * second case a check at the first point sits `gap` before the press. A gap
+ * more than halfway from the border box's reach that way to its whole extent
+ * takes that check off the button with room to spare, so the press goes to
+ * the centre and one check settles it. A shorter gap fits both points in the
+ * border box (the area a hit test counts as the button), set about its middle
+ * and clear of its edges, and both are checked: wherever the press lands was
+ * hit-tested, and a document's far end never pushes the second off the edge.
+ */
+function aimAlong(gap: number, centre: number, corners: number[]): { at: number; shift: number } {
+  if (gap === 0) return { at: centre, shift: 0 };
+  const low = Math.min(...corners);
+  const high = Math.max(...corners);
+  const reach = gap > 0 ? centre - low : high - centre;
+  if (Math.abs(gap) > (reach + high - low) / 2) return { at: centre, shift: 0 };
+  return { at: (low + high - gap) / 2, shift: Math.round(gap) };
+}
+
+/**
  * The target button and the point a click would take, if it is armed now,
  * that point shows in the viewport, and a hit test at that point lands on it
  * (or on a label inside it); null if not yet. `guard` sees the widget first
@@ -434,10 +460,9 @@ async function hitsButton(
  * That place is read before the box and again after the hit test; when a
  * scroll between them has moved one off the other, the button is not clickable
  * yet. Where the readings leave an element scrolled to its very end possible
- * (see viewportPlace), the point that would then be the press is checked too,
- * unless that gap is longer than the button's border box (the area a hit test
- * counts as the button) reaches from the press, plus a pixel for rounding: the
- * first check would then have missed the button, so the gap is a document's.
+ * (see viewportPlace), the press may land where the readings say or a gap
+ * further on, so aimAlong picks the point and both are checked (on both axes,
+ * every pairing of the two).
  */
 async function clickable(
   cdp: DevToolsSession,
@@ -457,32 +482,30 @@ async function clickable(
   if (box === null) return null;
   const [x1 = 0, y1 = 0, , , x3 = 0, y3 = 0] = box.model.content;
   const { border } = box.model;
+  const across = aimAlong(
+    before.farEnd.x,
+    (x1 + x3) / 2,
+    border.filter((_, i) => i % 2 === 0),
+  );
+  const down = aimAlong(
+    before.farEnd.y,
+    (y1 + y3) / 2,
+    border.filter((_, i) => i % 2 === 1),
+  );
   // The hit test takes whole pixels of the document and the press any point of
   // the viewport, so the press goes to the very point the hit test checks.
   const page = {
-    x: Math.round((x1 + x3) / 2 + before.pageX),
-    y: Math.round((y1 + y3) / 2 + before.pageY),
+    x: Math.round(across.at + before.pageX),
+    y: Math.round(down.at + before.pageY),
   };
   const at = { x: page.x - before.pageX, y: page.y - before.pageY };
   // A press outside the viewport reaches nothing, though a hit test there may
   // still find the button in the document.
   if (at.x < 0 || at.y < 0 || at.x >= before.width || at.y >= before.height) return null;
-  if (!(await hitsButton(cdp, button, page))) return null;
-  // How far the border box reaches from the press on each axis, taken over all
-  // four corners, so that a turned box is measured by what it can cover.
-  const reach = (from: number, corners: number[]): number =>
-    Math.max(from - Math.min(...corners), Math.max(...corners) - from);
-  const xs = border.filter((_, i) => i % 2 === 0);
-  const ys = border.filter((_, i) => i % 2 === 1);
-  const near = (distance: number, within: number): number =>
-    Math.abs(distance) <= within + 1 ? Math.round(distance) : 0;
-  const shift = {
-    x: near(before.farEnd.x, reach(at.x, xs)),
-    y: near(before.farEnd.y, reach(at.y, ys)),
-  };
-  if (shift.x !== 0 || shift.y !== 0) {
-    const alsoAt = { x: page.x + shift.x, y: page.y + shift.y };
-    if (!(await hitsButton(cdp, button, alsoAt))) return null;
+  for (const dx of across.shift === 0 ? [0] : [0, across.shift]) {
+    for (const dy of down.shift === 0 ? [0] : [0, down.shift]) {
+      if (!(await hitsButton(cdp, button, { x: page.x + dx, y: page.y + dy }))) return null;
+    }
   }
   const after = await viewportPlace(cdp);
   if (after === null || after.pageX !== before.pageX || after.pageY !== before.pageY) return null;
@@ -496,8 +519,9 @@ function checkTarget(target: WidgetTarget): void {
 }
 
 /**
- * Waits until the target button is armed and is what a click on its centre
- * would hit, and returns it with that point.
+ * Waits until the target button is armed and is what a click at the point it
+ * returns would hit (its centre, or beside it where clickable says), and
+ * returns it with that point.
  */
 export async function widgetButton(
   cdp: DevToolsSession,

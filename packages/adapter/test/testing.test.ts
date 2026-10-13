@@ -781,89 +781,132 @@ describe('arming and the hit test', () => {
     expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: 160, y: 350 });
   });
 
-  it('presses no button covered where the press lands, when an element scrolled to its very end may stand in for the document', async () => {
-    // Right to left, the element's 28 px range taken in full: its readings
-    // match a right-to-left document's, and a check at the visual viewport's
-    // place lands 28 px left of the press, still on Deny.
-    const covered = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
-    covered.range = { x: 28, y: 0 };
-    covered.rootScroll = { x: -28, y: 0 };
-    const cover = el('div', { id: 'cover' }, [], { x: 257, y: 447, width: 6, height: 6 });
-    covered.root.children.push(cover);
-    await expect(
-      clickInWidget(covered, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 300 }),
-    ).rejects.toThrow(WidgetTestError);
-    expect(covered.mouse()).toEqual([]);
-    // Both the visual viewport's place and the press point itself were checked.
-    expect(new Set(covered.hitTests().map((at) => JSON.stringify(at)))).toEqual(
-      new Set([JSON.stringify({ x: 232, y: 450 }), JSON.stringify({ x: 260, y: 450 })]),
-    );
+  /** Deny with padding and a border inside its box, as the widget draws its buttons. */
+  function padded(cdp: FakeSession, inset: { x: number; y: number }): void {
+    const deny = [...everyNode(cdp.root)].find((node) => attr(node, 'data-action') === 'deny');
+    if (deny === undefined) throw new Error('no Deny');
+    deny.inset = inset;
+  }
 
-    // Uncovered, it presses.
-    covered.root.children.pop();
-    await clickInWidget(covered, { action: 'deny', requestId: 'req-1' });
-    expect(covered.presses()).toBe(1);
-  });
+  const asText = (points: { x: unknown; y: unknown }[]): Set<string> =>
+    new Set(points.map((at) => JSON.stringify(at)));
 
-  for (const [axis, range, checked] of [
-    // Deny's border box is 60 by 20 px around (260, 450), its content box 42 by
-    // 10 inside 9 and 5 px of padding and border: these ranges pass half the
-    // content box and stay within half the border box, so the check at the
-    // visual viewport's place still lands on Deny.
-    ['across, right to left', { x: 26, y: 0 }, { x: 234, y: 450 }],
-    ['up from the bottom', { x: 0, y: 8 }, { x: 260, y: 442 }],
+  for (const [axis, range, checked, aimed] of [
+    // Deny's border box is 60 by 20 px around (260, 450). Its content box is
+    // 30 by 10 here, so these ranges pass half the content box, and the check
+    // at the visual viewport's place, the range before the press, lands in
+    // Deny's padding. The press goes where both readings leave it on Deny.
+    ['across, right to left', { x: 18, y: 0 }, [233, 450], [251, 450]],
+    ['up from the bottom', { x: 0, y: 6 }, [260, 441], [260, 447]],
   ] as const) {
-    it(`measures the far end against the button’s border box, which a hit test counts, scrolled ${axis}`, async () => {
-      const covered = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
-      const deny = [...everyNode(covered.root)].find(
-        (node) => attr(node, 'data-action') === 'deny',
-      );
-      if (deny === undefined) throw new Error('no Deny');
-      deny.inset = { x: 9, y: 5 };
-      covered.range = { ...range };
-      covered.rootScroll = { x: -range.x, y: -range.y };
-      covered.root.children.push(
-        el('div', { id: 'cover' }, [], { x: 257, y: 447, width: 6, height: 6 }),
+    it(`presses where an element scrolled ${axis} to the very end of a short range would put the press, and not through a cover there`, async () => {
+      const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+      padded(cdp, { x: 15, y: 5 });
+      cdp.range = { ...range };
+      cdp.rootScroll = { x: -range.x, y: -range.y };
+      // A cover over the middle of Deny, clear of the first check.
+      cdp.root.children.push(
+        el('div', { id: 'cover' }, [], { x: 248, y: 446, width: 24, height: 8 }),
       );
       await expect(
-        clickInWidget(covered, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 300 }),
+        clickInWidget(cdp, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 300 }),
       ).rejects.toThrow(WidgetTestError);
-      expect(covered.mouse()).toEqual([]);
-      expect(new Set(covered.hitTests().map((at) => JSON.stringify(at)))).toEqual(
-        new Set([JSON.stringify(checked), JSON.stringify({ x: 260, y: 450 })]),
+      expect(cdp.mouse()).toEqual([]);
+      expect(asText(cdp.hitTests())).toEqual(
+        asText([
+          { x: checked[0], y: checked[1] },
+          { x: aimed[0], y: aimed[1] },
+        ]),
       );
 
-      covered.root.children.pop();
-      await clickInWidget(covered, { action: 'deny', requestId: 'req-1' });
-      expect(covered.presses()).toBe(1);
+      cdp.root.children.pop();
+      await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
+      expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: aimed[0], y: aimed[1] });
     });
   }
 
-  it('checks the press point a gap short of the range away, where rounding left it short', async () => {
-    // The element is 2 px short of its 28 px range's end, within the slack the
-    // readings allow: the press would land 26 px from the first check, not 28.
+  it('checks every pairing of the two points where both axes may stand in for the document', async () => {
     const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
-    cdp.range = { x: 28, y: 0 };
-    cdp.rootScroll = { x: -26, y: 0 };
+    padded(cdp, { x: 15, y: 5 });
+    cdp.range = { x: 18, y: 6 };
+    cdp.rootScroll = { x: -18, y: -6 };
     await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
-    expect(new Set(cdp.hitTests().map((at) => JSON.stringify(at)))).toEqual(
-      new Set([JSON.stringify({ x: 234, y: 450 }), JSON.stringify({ x: 260, y: 450 })]),
+    expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: 251, y: 447 });
+    expect(asText(cdp.hitTests())).toEqual(
+      asText([
+        { x: 233, y: 441 },
+        { x: 233, y: 447 },
+        { x: 251, y: 441 },
+        { x: 251, y: 447 },
+      ]),
     );
   });
 
-  it('takes a document’s far end as it is once the gap passes what the border box reaches', async () => {
-    // A right-to-left document 32 px wider than the viewport, at its start: the
-    // gap is the whole range, past Deny's 30 px reach and the pixel beside it,
-    // so the first check is where the press lands and is the only one.
+  for (const range of [28, 50]) {
+    it(`presses nothing where an element scrolled to the very end of ${String(range)} px leaves the first check off the button`, async () => {
+      // Past a third of Deny's 60 px the two points no longer both fit on it
+      // under an element's scroll, so the helper waits rather than guess.
+      const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+      cdp.range = { x: range, y: 0 };
+      cdp.rootScroll = { x: -range, y: 0 };
+      await expect(
+        clickInWidget(cdp, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 300 }),
+      ).rejects.toThrow(WidgetTestError);
+      expect(cdp.mouse()).toEqual([]);
+      expect(cdp.hitTests().every(({ x }) => Number(x) < 230)).toBe(true);
+    });
+  }
+
+  it('checks the second point the gap away, not the range, where rounding left the element short of its end', async () => {
+    // The element is 2 px short of its 16 px range's end, within the slack the
+    // readings allow: the press may land 14 px from the first check, not 16.
     const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
-    cdp.range = { x: 32, y: 0 };
-    cdp.origin = { x: 32, y: 0 };
+    cdp.range = { x: 16, y: 0 };
+    cdp.rootScroll = { x: -14, y: 0 };
     await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
-    expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: 260, y: 450 });
-    expect(new Set(cdp.hitTests().map((at) => JSON.stringify(at)))).toEqual(
-      new Set([JSON.stringify({ x: 260, y: 450 })]),
+    expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: 253, y: 450 });
+    expect(asText(cdp.hitTests())).toEqual(
+      asText([
+        { x: 239, y: 450 },
+        { x: 253, y: 450 },
+      ]),
     );
   });
+
+  for (const [axis, range, aimed, beside] of [
+    // Just past how far Deny's border box reaches from its centre, where a
+    // second point the range from the centre would fall off its edge.
+    ['across, right to left', { x: 31, y: 0 }, [245, 450], [276, 450]],
+    ['up from the bottom', { x: 0, y: 11 }, [260, 445], [260, 456]],
+  ] as const) {
+    it(`presses a document scrolled from its far end, ${axis}, at a point both readings leave on the button`, async () => {
+      const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+      cdp.range = { ...range };
+      cdp.origin = { ...range };
+      await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
+      expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: aimed[0], y: aimed[1] });
+      expect(asText(cdp.hitTests())).toEqual(
+        asText([
+          { x: aimed[0], y: aimed[1] },
+          { x: beside[0], y: beside[1] },
+        ]),
+      );
+    });
+  }
+
+  for (const [axis, range] of [
+    ['across', { x: 46, y: 0 }],
+    ['down', { x: 0, y: 16 }],
+  ] as const) {
+    it(`presses a document’s far end ${axis} at the centre once the range passes three quarters of the button`, async () => {
+      const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+      cdp.range = { ...range };
+      cdp.origin = { ...range };
+      await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
+      expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: 260, y: 450 });
+      expect(asText(cdp.hitTests())).toEqual(asText([{ x: 260, y: 450 }]));
+    });
+  }
 
   for (const axis of ['x', 'y'] as const) {
     it(`takes Chromium’s rounding across ${axis}: a pixel and a hair from nothing, three from the range, and no more`, async () => {
