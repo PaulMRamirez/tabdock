@@ -76,9 +76,27 @@ async function scrollBoard(page: Page, y: number): Promise<void> {
   expect(await page.evaluate(() => window.scrollY)).toBe(y);
 }
 
-async function pairsAsDriver(page: Page, scrollBy = 0): Promise<void> {
+/**
+ * Gives the board a writing direction or mode from `html`'s style, makes it
+ * overflow both ways, and scrolls the window to `x`, `y`; the widget stays
+ * fixed in its corner, its own text laid out as always.
+ */
+async function shapeBoard(page: Page, style: string, x: number, y: number): Promise<void> {
+  await page.evaluate(
+    ([css, left, top]) => {
+      document.documentElement.setAttribute('style', css);
+      const big = document.createElement('div');
+      Object.assign(big.style, { width: '4000px', height: '4000px' });
+      document.body.append(big);
+      window.scrollTo(left, top);
+    },
+    [style, x, y] as const,
+  );
+}
+
+async function pairsAsDriver(page: Page, shape?: (page: Page) => Promise<void>): Promise<void> {
   const { pageId, code, cdp } = await openBoard(page);
-  if (scrollBy > 0) await scrollBoard(page, scrollBy);
+  if (shape !== undefined) await shape(page);
   const client = await connectMcp(tabdock.relay, tabdock.users.alice, CI);
   try {
     // What the widget shows is what the page's own handle holds.
@@ -135,7 +153,24 @@ test.describe('on a scrolled page', () => {
   test.use({ viewport: { width: 1280, height: 600 } });
 
   test('finds Allow where the press lands and pairs as driver', async ({ page }) => {
-    await pairsAsDriver(page, 400);
+    await pairsAsDriver(page, (p) => scrollBoard(p, 400));
+  });
+
+  // These count the layout viewport's scroll from the far end, unlike the
+  // visual viewport's, which the helper must not take for an element
+  // scrolling in the document's place.
+  test('pairs on a right-to-left page scrolled left', async ({ page }) => {
+    await pairsAsDriver(page, async (p) => {
+      await shapeBoard(p, 'direction: rtl', -401, 300);
+      expect(await p.evaluate(() => [window.scrollX, window.scrollY])).toEqual([-401, 300]);
+    });
+  });
+
+  test('pairs on a page whose block axis starts at the bottom', async ({ page }) => {
+    await pairsAsDriver(page, async (p) => {
+      await shapeBoard(p, 'writing-mode: vertical-lr; direction: rtl', 10, -200);
+      expect(await p.evaluate(() => [window.scrollX, window.scrollY])).toEqual([10, -200]);
+    });
   });
 
   // A cover that takes clicks catches the press; one that lets clicks through

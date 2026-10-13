@@ -84,20 +84,28 @@ const CssSizeSchema = z.number().check(z.nonnegative());
 
 /**
  * Page.getLayoutMetrics, in CSS pixels: where the visual viewport sits in the
- * document, how much of it shows, and the layout viewport's scroll beside it.
- * DOM.getBoxModel and Input.dispatchMouseEvent count from the visual
- * viewport's corner, while DOM.getNodeForLocation counts from the document's,
- * so the helper adds pageX and pageY to hit-test the very point it will press
- * on a scrolled page. pageX is negative on a right-to-left page scrolled left.
+ * document and how much of it shows, with the layout viewport's position and
+ * the scrollable size beside it. DOM.getBoxModel and Input.dispatchMouseEvent
+ * count from the visual viewport's corner, while DOM.getNodeForLocation counts
+ * from the document's, so the helper adds pageX and pageY to hit-test the very
+ * point it will press on a scrolled page. pageX is negative on a right-to-left
+ * page scrolled left.
  */
 export const DevToolsLayoutMetricsSchema = z.object({
-  cssLayoutViewport: z.object({ pageY: z.number() }),
+  cssLayoutViewport: z.object({
+    pageX: z.number(),
+    pageY: z.number(),
+    clientWidth: CssSizeSchema,
+    clientHeight: CssSizeSchema,
+  }),
   cssVisualViewport: z.object({
+    offsetX: z.number(),
     offsetY: z.number(),
     pageX: z.number(),
     pageY: z.number(),
     clientWidth: CssSizeSchema,
     clientHeight: CssSizeSchema,
   }),
+  cssContentSize: z.object({ width: CssSizeSchema, height: CssSizeSchema }),
 });
 export type DevToolsLayoutMetrics = z.infer<typeof DevToolsLayoutMetricsSchema>;

@@ -53,9 +53,9 @@ test.afterEach(async () => {
   await tabdock.close();
 });
 
-/** Puts the board under one element that fills the viewport and scrolls in the document's place. */
-async function scrollerBoard(page: Page): Promise<void> {
-  await page.evaluate(() => {
+/** Puts the board under one element that fills the viewport and scrolls, down or across, in the document's place. */
+async function scrollerBoard(page: Page, axis: 'down' | 'across'): Promise<void> {
+  await page.evaluate((across) => {
     const { documentElement: html, body } = document;
     Object.assign(html.style, { height: '100%', overflow: 'hidden' });
     Object.assign(body.style, { height: '100%', overflow: 'hidden', margin: '0' });
@@ -69,76 +69,83 @@ async function scrollerBoard(page: Page): Promise<void> {
       height: '100%',
       overflow: 'auto',
     });
-    const tall = document.createElement('div');
-    tall.style.height = '4000px';
-    scroller.append(tall);
+    const wide = document.createElement('div');
+    Object.assign(wide.style, across ? { width: '4000px', height: '100%' } : { height: '4000px' });
+    scroller.append(wide);
     body.append(scroller);
+  }, axis === 'across');
+}
+
+async function scrollTo(page: Page, axis: 'down' | 'across', by: number): Promise<void> {
+  await page.evaluate(
+    ([across, px]) => {
+      const scroller = document.getElementById('scroller');
+      if (scroller === null) throw new Error('no scroller');
+      if (across) scroller.scrollLeft = px;
+      else scroller.scrollTop = px;
+    },
+    [axis === 'across', by] as const,
+  );
+}
+
+for (const axis of ['down', 'across'] as const) {
+  test(`refuses to press where an element scrolls ${axis} in the document’s place, and presses once it is back at its start`, async ({
+    page,
+  }) => {
+    await page.goto(tabdock.pageUrl);
+    await page.waitForSelector('html[data-tools="ready"]');
+    const { code } = await waitForLink(page);
+    const cdp = await page.context().newCDPSession(page);
+    await scrollerBoard(page, axis);
+    const client = await connectMcp(tabdock.relay, tabdock.users.alice, CI);
+    try {
+      const pending = callTool(client, 'pair_page', { code });
+      const requestId = await waitForDock(page, (s) => s.pendingRequests[0]?.requestId);
+      const target = { action: 'approve-driver', requestId } as const;
+      // At its start the element and the document agree, so the helper finds Allow.
+      const at = await widgetButton(cdp, target);
+
+      // Scrolled a few pixels, DevTools counts the element's scroll as the
+      // document's: the case this file exists for, or it proves nothing.
+      await scrollTo(page, axis, 6);
+      await expect
+        .poll(async () => {
+          const { cssVisualViewport: view, cssLayoutViewport: layout } =
+            await cdp.send('Page.getLayoutMetrics');
+          return axis === 'down' ? [view.pageY, layout.pageY] : [view.pageX, layout.pageX];
+        })
+        .toEqual([6, 0]);
+
+      // An element over the centre of Allow that lets clicks through to it.
+      await page.evaluate(({ x, y }) => {
+        const over = document.createElement('div');
+        over.id = 'cover';
+        Object.assign(over.style, {
+          position: 'fixed',
+          left: `${String(x - 2)}px`,
+          top: `${String(y - 2)}px`,
+          width: '4px',
+          height: '4px',
+          zIndex: '2147483647',
+          pointerEvents: 'none',
+        });
+        document.documentElement.append(over);
+      }, at);
+      await expect(clickInWidget(cdp, target, { timeoutMs: 1500 })).rejects.toThrow(
+        new WidgetTestError(
+          'the page scrolls an element in place of the document (an implicit root scroller), so the helper cannot tell where a press would land',
+        ),
+      );
+      expect((await waitingPrompts(cdp)).attach).toEqual([{ requestId, client: CI }]);
+
+      // Back at its start and uncovered, the helper approves as it would anywhere.
+      await page.evaluate(() => document.getElementById('cover')?.remove());
+      await scrollTo(page, axis, 0);
+      expect(await allowAttach(cdp, { as: 'driver', requestId })).toBe(requestId);
+      expect((await pending).structured).toMatchObject({ role: 'driver' });
+    } finally {
+      await client.close();
+      await cdp.detach();
+    }
   });
 }
-
-async function scrollTo(page: Page, top: number): Promise<void> {
-  await page.evaluate((y) => {
-    const scroller = document.getElementById('scroller');
-    if (scroller === null) throw new Error('no scroller');
-    scroller.scrollTop = y;
-  }, top);
-}
-
-test('refuses to press where an element scrolls in the document’s place, and presses once it is back at its top', async ({
-  page,
-}) => {
-  await page.goto(tabdock.pageUrl);
-  await page.waitForSelector('html[data-tools="ready"]');
-  const { code } = await waitForLink(page);
-  const cdp = await page.context().newCDPSession(page);
-  await scrollerBoard(page);
-  const client = await connectMcp(tabdock.relay, tabdock.users.alice, CI);
-  try {
-    const pending = callTool(client, 'pair_page', { code });
-    const requestId = await waitForDock(page, (s) => s.pendingRequests[0]?.requestId);
-    const target = { action: 'approve-driver', requestId } as const;
-    // At its top the element and the document agree, so the helper finds Allow.
-    const at = await widgetButton(cdp, target);
-
-    // Scrolled a few pixels, DevTools counts the element's scroll as the
-    // document's: the case this file exists for, or it proves nothing.
-    await scrollTo(page, 6);
-    await expect
-      .poll(async () => {
-        const metrics = await cdp.send('Page.getLayoutMetrics');
-        return [metrics.cssVisualViewport.pageY, metrics.cssLayoutViewport.pageY];
-      })
-      .toEqual([6, 0]);
-
-    // An element over the centre of Allow that lets clicks through to it.
-    await page.evaluate(({ x, y }) => {
-      const over = document.createElement('div');
-      over.id = 'cover';
-      Object.assign(over.style, {
-        position: 'fixed',
-        left: `${String(x - 2)}px`,
-        top: `${String(y - 2)}px`,
-        width: '4px',
-        height: '4px',
-        zIndex: '2147483647',
-        pointerEvents: 'none',
-      });
-      document.documentElement.append(over);
-    }, at);
-    await expect(clickInWidget(cdp, target, { timeoutMs: 1500 })).rejects.toThrow(
-      new WidgetTestError(
-        'the page scrolls an element in place of the document (an implicit root scroller), so no check can say where a press would land',
-      ),
-    );
-    expect((await waitingPrompts(cdp)).attach).toEqual([{ requestId, client: CI }]);
-
-    // Back at its top and uncovered, the helper approves as it would anywhere.
-    await page.evaluate(() => document.getElementById('cover')?.remove());
-    await scrollTo(page, 0);
-    expect(await allowAttach(cdp, { as: 'driver', requestId })).toBe(requestId);
-    expect((await pending).structured).toMatchObject({ role: 'driver' });
-  } finally {
-    await client.close();
-    await cdp.detach();
-  }
-});

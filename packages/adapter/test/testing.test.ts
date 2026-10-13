@@ -176,8 +176,14 @@ class FakeSession implements DevToolsSession {
   scroll = { x: 0, y: 0 };
   /** The visual viewport's own offset inside the layout viewport, as a pinch zoom moves it. */
   offset = { x: 0, y: 0 };
-  /** An element's scroll that Chrome counts in pageY but the hit test does not (an implicit root scroller). */
-  rootScroll = { y: 0 };
+  /** An element's scroll that Chrome counts in pageX and pageY but the hit test does not (an implicit root scroller). */
+  rootScroll = { x: 0, y: 0 };
+  /** How far the document scrolls past the viewport on each axis. */
+  range = { x: 0, y: 0 };
+  /** Where the document's scroll origin sits: 0, or the far end of the range (right to left, or a block axis from the bottom). */
+  origin = { x: 0, y: 0 };
+  /** Added to the layout viewport's pageY, as Chromium's float rounding can. */
+  layoutNudge = 0;
   viewport = { width: 1280, height: 800 };
   answer: (method: string, params: Record<string, unknown>) => unknown = () => undefined;
   onSend: (method: string, params: Record<string, unknown>) => void = () => undefined;
@@ -224,18 +230,24 @@ class FakeSession implements DevToolsSession {
         const size = { clientWidth: this.viewport.width, clientHeight: this.viewport.height };
         return Promise.resolve({
           cssLayoutViewport: {
-            pageX: this.scroll.x - this.offset.x,
-            pageY: this.scroll.y - this.offset.y,
+            pageX: this.origin.x + this.scroll.x - this.offset.x,
+            pageY: this.origin.y + this.scroll.y - this.offset.y + this.layoutNudge,
             ...size,
           },
           cssVisualViewport: {
             offsetX: this.offset.x,
             offsetY: this.offset.y,
-            pageX: this.scroll.x,
+            pageX: this.scroll.x + this.rootScroll.x,
             pageY: this.scroll.y + this.rootScroll.y,
             ...size,
             scale: 1,
             zoom: 1,
+          },
+          cssContentSize: {
+            x: 0,
+            y: 0,
+            width: this.viewport.width + this.range.x,
+            height: this.viewport.height + this.range.y,
           },
         });
       }
@@ -386,7 +398,9 @@ describe('replies in the wrong shape', () => {
       'layout metrics with no visual viewport',
       (cdp) => {
         cdp.answer = (method) =>
-          method === 'Page.getLayoutMetrics' ? { cssLayoutViewport: { pageY: 0 } } : undefined;
+          method === 'Page.getLayoutMetrics'
+            ? { cssLayoutViewport: { pageX: 0, pageY: 0, clientWidth: 1, clientHeight: 1 } }
+            : undefined;
       },
     ],
     [
@@ -691,53 +705,126 @@ describe('arming and the hit test', () => {
     );
   });
 
-  it('refuses at once, pressing nothing, where an element scrolls in the document’s place', async () => {
-    const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
-    cdp.rootScroll = { y: 6 };
-    const refusal =
-      'the page scrolls an element in place of the document (an implicit root scroller), so no check can say where a press would land';
-    await expect(
-      clickInWidget(cdp, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 2000 }),
-    ).rejects.toThrow(new WidgetTestError(refusal));
-    await expect(widgetButton(cdp, { action: 'deny', requestId: 'req-1' })).rejects.toThrow(
-      new WidgetTestError(refusal),
+  const ROOT_SCROLLER =
+    'the page scrolls an element in place of the document (an implicit root scroller), so the helper cannot tell where a press would land';
+
+  for (const [axis, rootScroll] of [
+    ['down', { x: 0, y: 6 }],
+    ['across', { x: 6, y: 0 }],
+    ['across, right to left', { x: -6, y: 0 }],
+  ] as const) {
+    it(`refuses at once, pressing nothing, where an element scrolls ${axis} in the document’s place`, async () => {
+      const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+      cdp.rootScroll = { ...rootScroll };
+      await expect(
+        clickInWidget(cdp, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 2000 }),
+      ).rejects.toThrow(new WidgetTestError(ROOT_SCROLLER));
+      await expect(widgetButton(cdp, { action: 'deny', requestId: 'req-1' })).rejects.toThrow(
+        new WidgetTestError(ROOT_SCROLLER),
+      );
+      expect(cdp.mouse()).toEqual([]);
+      expect(cdp.hitTests()).toEqual([]);
+
+      // Scrolled back to its start, the element and the document agree again.
+      cdp.rootScroll = { x: 0, y: 0 };
+      await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
+      expect(cdp.presses()).toBe(1);
+    });
+  }
+
+  it('presses on a right-to-left page scrolled left, and on one whose block axis starts at the bottom', async () => {
+    // Right to left: the scroll origin sits at the far end of a 1,720 px range,
+    // and the page is scrolled 401 px left of it.
+    const rtl = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+    rtl.range = { x: 1720, y: 0 };
+    rtl.origin = { x: 1720, y: 0 };
+    rtl.scroll = { x: -401, y: 0 };
+    await clickInWidget(rtl, { action: 'deny', requestId: 'req-1' });
+    expect(rtl.mouse()[1]).toEqual({ type: 'mousePressed', x: 661, y: 450 });
+    expect(rtl.hitTests()[0]).toEqual({ x: 260, y: 450 });
+
+    const bottom = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+    bottom.range = { x: 0, y: 4400 };
+    bottom.origin = { x: 0, y: 4400 };
+    await clickInWidget(bottom, { action: 'deny', requestId: 'req-1' });
+    expect(bottom.mouse()[1]).toEqual({ type: 'mousePressed', x: 260, y: 450 });
+  });
+
+  it('takes Chromium’s rounding of the layout viewport, a pixel and a hair, but not more', async () => {
+    const rounded = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+    rounded.layoutNudge = 1.0000019;
+    await clickInWidget(rounded, { action: 'deny', requestId: 'req-1' });
+    expect(rounded.presses()).toBe(1);
+
+    const apart = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+    apart.layoutNudge = 1.5;
+    await expect(widgetButton(apart, { action: 'deny', requestId: 'req-1' })).rejects.toThrow(
+      new WidgetTestError(ROOT_SCROLLER),
     );
-    expect(cdp.mouse()).toEqual([]);
-    expect(cdp.hitTests()).toEqual([]);
-
-    // Scrolled back to its top, the element and the document agree again.
-    cdp.rootScroll = { y: 0 };
-    await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
-    expect(cdp.presses()).toBe(1);
   });
 
-  it('presses nowhere a scroll during its check left stale, and presses where the page settles', async () => {
+  for (const [axis, from, to, pressed] of [
+    // Deny's centre, (260, 450) in the document, ends 185 px up the viewport, never 135.
+    ['down', { x: 0, y: 135 }, { x: 0, y: 185 }, { x: 260, y: 265 }],
+    // Or 40 px left of it, never 0.
+    ['across', { x: 0, y: 0 }, { x: 40, y: 0 }, { x: 220, y: 450 }],
+  ] as const) {
+    it(`presses nowhere a scroll ${axis} during its check left stale, and presses where the page settles`, async () => {
+      const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+      cdp.scroll = { ...from };
+      let hitTests = 0;
+      cdp.onSend = (method) => {
+        // The page scrolls while the check made just before the press is under way.
+        if (method === 'DOM.getNodeForLocation' && ++hitTests === 2) cdp.scroll = { ...to };
+      };
+      await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
+      const presses = cdp.mouse().filter((event) => event.type === 'mousePressed');
+      expect(presses).toEqual([{ type: 'mousePressed', ...pressed }]);
+    });
+  }
+
+  it('presses at the point just checked while a page scrolling by fractions moves it under a pixel', async () => {
     const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
-    cdp.scroll = { x: 0, y: 135 };
-    let hitTests = 0;
-    cdp.onSend = (method) => {
-      // The page scrolls 50 px while the check made just before the press is under way.
-      if (method === 'DOM.getNodeForLocation' && ++hitTests === 2) cdp.scroll = { x: 0, y: 185 };
+    cdp.scroll = { x: 0, y: 134.6 };
+    // Every move of the pointer meets a page scrolled 0.3 px further, as one
+    // scrolling every frame at a device scale of 1.25 would be.
+    cdp.onSend = (method, params) => {
+      if (method === 'Input.dispatchMouseEvent' && params.type === 'mouseMoved') {
+        cdp.scroll = { x: 0, y: cdp.scroll.y + 0.3 };
+      }
     };
-    await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
-    const presses = cdp.mouse().filter((event) => event.type === 'mousePressed');
-    // Deny's centre, (260, 450) in the document, now 185 px up the viewport, never 135.
-    expect(presses).toEqual([{ type: 'mousePressed', x: 260, y: 265 }]);
+    await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 2000 });
+    const [moved, pressed] = cdp.mouse();
+    expect(pressed?.type).toBe('mousePressed');
+    // The press lands where the last check was made, a fraction from the move.
+    expect(Number(pressed?.y) + cdp.scroll.y).toBeCloseTo(450, 9);
+    expect(Math.abs(Number(pressed?.y) - Number(moved?.y))).toBeLessThan(1);
   });
 
-  it('presses no centre on the viewport’s last edge, and one a pixel inside it', async () => {
-    // Deny's centre is 450 px down the page.
-    const edge = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
-    edge.viewport = { width: 1280, height: 450 };
-    await expect(
-      clickInWidget(edge, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 300 }),
-    ).rejects.toThrow(WidgetTestError);
-    expect(edge.mouse()).toEqual([]);
-    const inside = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
-    inside.viewport = { width: 1280, height: 451 };
-    await clickInWidget(inside, { action: 'deny', requestId: 'req-1' });
-    expect(inside.mouse()[1]).toEqual({ type: 'mousePressed', x: 260, y: 450 });
-  });
+  // Deny's centre is (260, 450) in the document.
+  for (const [edge, outside, inside] of [
+    ['left', { scroll: { x: 261, y: 0 } }, { scroll: { x: 260, y: 0 } }],
+    ['top', { scroll: { x: 0, y: 451 } }, { scroll: { x: 0, y: 450 } }],
+    ['right', { viewport: { width: 260, height: 800 } }, { viewport: { width: 261, height: 800 } }],
+    [
+      'bottom',
+      { viewport: { width: 1280, height: 450 } },
+      { viewport: { width: 1280, height: 451 } },
+    ],
+  ] as const) {
+    it(`presses no centre a pixel past the viewport’s ${edge} edge, and one on its last pixel`, async () => {
+      const past = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+      Object.assign(past, structuredClone(outside));
+      await expect(
+        clickInWidget(past, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 300 }),
+      ).rejects.toThrow(WidgetTestError);
+      expect(past.mouse()).toEqual([]);
+      const within = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+      Object.assign(within, structuredClone(inside));
+      await clickInWidget(within, { action: 'deny', requestId: 'req-1' });
+      expect(within.presses()).toBe(1);
+    });
+  }
 
   it('presses the very point it hit-tests on a page scrolled by a fraction of a pixel', async () => {
     const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));

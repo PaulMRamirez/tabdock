@@ -167,8 +167,17 @@ describe('the DevTools reply schemas', () => {
     expect(quad([1, 2, 3, 4, 5, 6, 7, '8'])).toBe(false);
     expect(DevToolsNodeAtSchema.safeParse({}).success).toBe(false);
     const layout = { pageX: 0, pageY: 100, clientWidth: 1280, clientHeight: 720 };
-    const view = (cssVisualViewport: unknown, cssLayoutViewport: unknown = layout): boolean =>
-      DevToolsLayoutMetricsSchema.safeParse({ cssLayoutViewport, cssVisualViewport }).success;
+    const content = { x: 0, y: 0, width: 1280, height: 4000 };
+    const view = (
+      cssVisualViewport: unknown,
+      cssLayoutViewport: unknown = layout,
+      cssContentSize: unknown = content,
+    ): boolean =>
+      DevToolsLayoutMetricsSchema.safeParse({
+        cssLayoutViewport,
+        cssVisualViewport,
+        cssContentSize,
+      }).success;
     const fine = {
       offsetX: 0,
       offsetY: 35.5,
@@ -180,17 +189,24 @@ describe('the DevTools reply schemas', () => {
       zoom: 1,
     };
     expect(view(fine)).toBe(true);
-    // A right-to-left page scrolled left.
-    expect(view({ ...fine, pageX: -401 })).toBe(true);
+    // A right-to-left page scrolled left, its layout viewport counted from the far end.
+    expect(view({ ...fine, pageX: -401 }, { ...layout, pageX: 2319 })).toBe(true);
     expect(view({ ...fine, pageY: Number.NaN })).toBe(false);
     expect(view({ ...fine, pageX: Number.POSITIVE_INFINITY })).toBe(false);
+    expect(view({ ...fine, offsetX: undefined })).toBe(false);
     expect(view({ ...fine, offsetY: undefined })).toBe(false);
     expect(view({ ...fine, clientHeight: -1 })).toBe(false);
     expect(view({ ...fine, clientWidth: '1280' })).toBe(false);
     expect(view({ pageX: 0, pageY: 0 })).toBe(false);
     expect(view(fine, { ...layout, pageY: '100' })).toBe(false);
+    expect(view(fine, { ...layout, clientWidth: undefined })).toBe(false);
     expect(view(fine, {})).toBe(false);
-    expect(DevToolsLayoutMetricsSchema.safeParse({ cssVisualViewport: fine }).success).toBe(false);
+    expect(view(fine, layout, { ...content, height: -1 })).toBe(false);
+    expect(view(fine, layout, {})).toBe(false);
+    expect(
+      DevToolsLayoutMetricsSchema.safeParse({ cssLayoutViewport: layout, cssVisualViewport: fine })
+        .success,
+    ).toBe(false);
   });
 });
 

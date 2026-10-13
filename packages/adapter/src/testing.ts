@@ -345,24 +345,38 @@ interface ViewportPlace {
 }
 
 /**
- * The visual viewport's place, or null if DevTools gave none. Its pageY is the
- * document's scroll plus the visual viewport's own offset, which is the very
- * offset the hit test takes away, except where Chrome has made a scrolling
- * element the page's scroller in the document's place (Android's implicit
- * root scroller): pageY then counts that element's scroll and the hit test
- * does not, so a check there could land beside the press. That throws, since
- * no point the helper can work out is sure to be where its press lands. An
- * element scrolled sideways in the document's place would do the same across,
- * which this cannot see: on a right-to-left page the layout viewport's pageX
- * is a position, not a scroll, so there is nothing to compare pageX with.
+ * How far apart Chromium's two readings of the scroll may sit and still agree:
+ * it rounds the layout viewport's position up to a whole pixel, so a gap just
+ * under one is ordinary, and float rounding under a pinch zoom adds a hair.
+ */
+const SCROLL_SLACK_PX = 1.01;
+
+/**
+ * The visual viewport's place, or null if DevTools gave none. Its pageX and
+ * pageY are the document's scroll plus the visual viewport's own offset, the
+ * very offset the hit test takes away, while the layout viewport's count from
+ * the document's scroll origin: the start, or the far end of the scroll range
+ * on a right-to-left page or one whose block axis starts at the bottom. So on
+ * each axis the two differ by nothing or by that whole range. Anything else
+ * means Chrome counts the scroll of an element that scrolls in the document's
+ * place (Android's implicit root scroller) where the hit test does not, so a
+ * check could land beside the press; that throws, since the helper cannot tell
+ * where its press would land. A right-to-left element scrolled to its very end
+ * reads like a right-to-left document, and its check then lands the whole
+ * range away, which misses the button unless the range is under half its size.
  */
 async function viewportPlace(cdp: DevToolsSession): Promise<ViewportPlace | null> {
   const metrics = await askOrNull(cdp, 'Page.getLayoutMetrics', {}, DevToolsLayoutMetricsSchema);
   if (metrics === null) return null;
-  const view = metrics.cssVisualViewport;
-  if (Math.abs(metrics.cssLayoutViewport.pageY + view.offsetY - view.pageY) > 1) {
+  const { cssLayoutViewport: layout, cssVisualViewport: view, cssContentSize: size } = metrics;
+  const agrees = (gap: number, range: number): boolean =>
+    Math.abs(gap) <= SCROLL_SLACK_PX || Math.abs(gap - range) <= SCROLL_SLACK_PX;
+  if (
+    !agrees(layout.pageX + view.offsetX - view.pageX, size.width - layout.clientWidth) ||
+    !agrees(layout.pageY + view.offsetY - view.pageY, size.height - layout.clientHeight)
+  ) {
     throw new WidgetTestError(
-      'the page scrolls an element in place of the document (an implicit root scroller), so no check can say where a press would land',
+      'the page scrolls an element in place of the document (an implicit root scroller), so the helper cannot tell where a press would land',
     );
   }
   return {
@@ -484,11 +498,15 @@ async function press(
     if (aimed !== null) {
       await mouse(cdp, 'mouseMoved', aimed);
       const now = await clickable(cdp, target, guard);
+      // Within a pixel, and at the point just checked: where the viewport's
+      // place is fractional, as at a device scale of 1.25, a scroll between the
+      // two checks moves the press point by a fraction though the button has
+      // not moved, and a page scrolling every frame would otherwise never settle.
       if (
         now !== null &&
         now.backendNodeId === aimed.backendNodeId &&
-        now.x === aimed.x &&
-        now.y === aimed.y
+        Math.abs(now.x - aimed.x) < 1 &&
+        Math.abs(now.y - aimed.y) < 1
       ) {
         await mouse(cdp, 'mousePressed', now);
         await mouse(cdp, 'mouseReleased', now);
