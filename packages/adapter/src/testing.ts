@@ -2,12 +2,13 @@
 // and answers its prompts through the DevTools protocol, as a person at the
 // page would. The widget lives in a closed shadow root that page script and a
 // browser driver's selectors cannot reach, by design; the DevTools protocol
-// can, so this finds a button there and clicks its centre with trusted input.
+// can, so this finds a button there and clicks it with trusted input.
 //
 // It approves nothing a person could not: it clicks only a button whose box
 // has held still (data-armed, the widget's 500 ms wait) and that a hit test
-// says a click at its centre would reach, and checks both again just before
-// the press. It presses nothing when more than one button matches what it was
+// says a click at the point it aims for (its centre, unless a page's scroll
+// leaves two places a press could land) would reach, and checks both again
+// just before the press. It presses nothing when more than one button matches what it was
 // asked for, so a click naming no request never approves whichever of two
 // prompts comes first, and allowAttach approves an attach request only when
 // exactly one waiting request carries the client name or request id it was
@@ -35,7 +36,9 @@
 import { PairingCodeSchema, type Role, RoleSchema } from '@tabdock/protocol';
 import {
   DevToolsBoxModelSchema,
+  DevToolsContentQuadsSchema,
   DevToolsDocumentSchema,
+  DevToolsLayoutMetricsSchema,
   type DevToolsNode,
   DevToolsNodeAtSchema,
 } from '@tabdock/protocol/devtools';
@@ -335,10 +338,137 @@ interface ButtonAt {
   y: number;
 }
 
+/** Where the visual viewport sits in the document, and how much of it shows. */
+interface ViewportPlace {
+  pageX: number;
+  pageY: number;
+  width: number;
+  height: number;
+  /**
+   * On each axis, how far the hit test would sit from the press if an element
+   * scrolled to its very end in the document's place were counted as the
+   * document's scroll: the gap between the two readings where it matched the
+   * scroll range (within RANGE_SLACK_PX), else 0. See viewportPlace.
+   */
+  farEnd: { x: number; y: number };
+}
+
 /**
- * The target button and the point a click would take, if it is armed now and
- * a hit test at that point lands on it (or on a label inside it); null if not
- * yet. `guard` sees the widget first and may throw.
+ * How far apart Chromium's readings may sit and still agree. The layout
+ * viewport's position is rounded up to a whole pixel, and float rounding under
+ * a pinch zoom adds a hair, so a gap just under a pixel is ordinary.
+ */
+const SCROLL_SLACK_PX = 1.01;
+/**
+ * The same against the scroll range, which also carries the floor of the
+ * content size and a client size that loses a pixel to rounding at a device
+ * scale such as 1.25 or 1.75: up to 1.6 px was seen on ordinary pages.
+ */
+const RANGE_SLACK_PX = 3;
+
+/**
+ * The visual viewport's place, or null if DevTools gave none. Its pageX and
+ * pageY count the document's scroll from its scroll origin, plus the visual
+ * viewport's own offset, which is the very offset the hit test takes away,
+ * while the layout viewport's count from the left and top edge of the scroll
+ * range. The origin sits at that edge, or at the far end of the range on a
+ * right-to-left page or one that scrolls up from the bottom (a vertical
+ * writing mode read bottom to top), so on each axis the two differ by nothing
+ * or by the whole range. Anything else means Chrome counts the scroll of an
+ * element that scrolls in the document's place (Android's implicit root
+ * scroller) where the hit test does not, so a check could land beside the
+ * press: that throws, since the helper cannot tell where a press would land.
+ * Such an element scrolled to its very end matches the range too, and its
+ * check would land the whole range from the press; farEnd carries that
+ * distance so clickable can check the press point itself as well.
+ */
+async function viewportPlace(cdp: DevToolsSession): Promise<ViewportPlace | null> {
+  const metrics = await askOrNull(cdp, 'Page.getLayoutMetrics', {}, DevToolsLayoutMetricsSchema);
+  if (metrics === null) return null;
+  const { cssLayoutViewport: layout, cssVisualViewport: view, cssContentSize: size } = metrics;
+  /** The gap's distance from the press if it is the range, 0 if it is nothing, or null if neither. */
+  const farEnd = (gap: number, range: number): number | null => {
+    if (Math.abs(gap) <= SCROLL_SLACK_PX) return 0;
+    if (Math.abs(gap - range) <= RANGE_SLACK_PX) return gap;
+    return null;
+  };
+  const x = farEnd(layout.pageX + view.offsetX - view.pageX, size.width - layout.clientWidth);
+  const y = farEnd(layout.pageY + view.offsetY - view.pageY, size.height - layout.clientHeight);
+  if (x === null || y === null) {
+    throw new WidgetTestError(
+      'the page scrolls an element in place of the document (an implicit root scroller), so the helper cannot tell where a press would land',
+    );
+  }
+  return {
+    pageX: view.pageX,
+    pageY: view.pageY,
+    width: view.clientWidth,
+    height: view.clientHeight,
+    farEnd: { x, y },
+  };
+}
+
+/** Whether a hit test at this document point names the button or a label inside it. */
+async function hitsButton(
+  cdp: DevToolsSession,
+  button: DevToolsNode,
+  point: { x: number; y: number },
+): Promise<boolean> {
+  const hit = await askOrNull(
+    cdp,
+    'DOM.getNodeForLocation',
+    { ...point, ignorePointerEventsNone: true },
+    DevToolsNodeAtSchema,
+  );
+  return hit !== null && contains(button, hit.backendNodeId);
+}
+
+/**
+ * Where on one axis to press, and how far beside that point to hit-test as
+ * well. `gap` is the axis's farEnd, `centre` the content box's middle and
+ * `corners` the corners on this axis of the area a hit test counts as the
+ * button (its border box and any label reaching past it), all in the
+ * viewport.
+ *
+ * With no gap the press goes to the centre. With one, a press lands where the
+ * readings say (a document scrolled from its far end) or `gap` on from there
+ * (an element scrolled to its very end in the document's place), and in the
+ * second case a check at the first point sits `gap` before the press. A gap
+ * more than halfway from that area's reach that way to its whole extent
+ * takes that check off the button with room to spare, so the press goes to
+ * the centre and one check settles it. A shorter gap fits both points in the
+ * area, set about its middle and clear of its edges, and both are checked:
+ * wherever the press lands was hit-tested, and a document's far end never
+ * pushes the second off the edge. Under such an element the first check sits
+ * the gap before the pair's near end, still on the button only while the gap
+ * is under about a third of the area, so past that the helper waits there
+ * rather than press.
+ */
+function aimAlong(gap: number, centre: number, corners: number[]): { at: number; shift: number } {
+  if (gap === 0) return { at: centre, shift: 0 };
+  const low = Math.min(...corners);
+  const high = Math.max(...corners);
+  const reach = gap > 0 ? centre - low : high - centre;
+  if (Math.abs(gap) > (reach + high - low) / 2) return { at: centre, shift: 0 };
+  return { at: (low + high - gap) / 2, shift: Math.round(gap) };
+}
+
+/**
+ * The target button and the point a click would take, if it is armed now,
+ * that point shows in the viewport, and a hit test at that point lands on it
+ * (or on a label inside it); null if not yet. `guard` sees the widget first
+ * and may throw.
+ *
+ * The box and the press count from the visual viewport's corner, the hit test
+ * from the document's, so on a scrolled page the hit test is moved by the
+ * viewport's place in the document: otherwise it checks a spot as far from
+ * the press as the page has scrolled, and may wave through a covered button.
+ * That place is read before the box and again after the hit test; when a
+ * scroll between them has moved one off the other, the button is not clickable
+ * yet. Where the readings leave an element scrolled to its very end possible
+ * (see viewportPlace), the press may land where the readings say or a gap
+ * further on, so aimAlong picks the point; under its threshold both are
+ * checked (on both axes, every pairing of the two), past it one.
  */
 async function clickable(
   cdp: DevToolsSession,
@@ -352,18 +482,55 @@ async function clickable(
   if (button === null || attribute(button, 'data-armed') === 'false') return null;
   const { backendNodeId } = button;
   await cdp.send('DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(() => undefined);
+  const before = await viewportPlace(cdp);
+  if (before === null) return null;
   const box = await askOrNull(cdp, 'DOM.getBoxModel', { backendNodeId }, DevToolsBoxModelSchema);
   if (box === null) return null;
   const [x1 = 0, y1 = 0, , , x3 = 0, y3 = 0] = box.model.content;
-  // Whole pixels, so the press lands on the very point the hit test checked.
-  const at = { x: Math.round((x1 + x3) / 2), y: Math.round((y1 + y3) / 2) };
-  const hit = await askOrNull(
-    cdp,
-    'DOM.getNodeForLocation',
-    { ...at, ignorePointerEventsNone: true },
-    DevToolsNodeAtSchema,
+  // Where a far end leaves two places a press could land, the area a check may
+  // find the button in decides the aim: its border box and everything under
+  // it, since a hit test names the button on a label that reaches past its
+  // border (as a page's line-height on the host can make one do).
+  const corners = [...box.model.border];
+  if (before.farEnd.x !== 0 || before.farEnd.y !== 0) {
+    for (const inner of widgetNodes(button)) {
+      const covered = await askOrNull(
+        cdp,
+        'DOM.getContentQuads',
+        { backendNodeId: inner.backendNodeId },
+        DevToolsContentQuadsSchema,
+      );
+      if (covered === null) return null;
+      for (const quad of covered.quads) corners.push(...quad);
+    }
+  }
+  const across = aimAlong(
+    before.farEnd.x,
+    (x1 + x3) / 2,
+    corners.filter((_, i) => i % 2 === 0),
   );
-  if (hit === null || !contains(button, hit.backendNodeId)) return null;
+  const down = aimAlong(
+    before.farEnd.y,
+    (y1 + y3) / 2,
+    corners.filter((_, i) => i % 2 === 1),
+  );
+  // The hit test takes whole pixels of the document and the press any point of
+  // the viewport, so the press goes to the very point the hit test checks.
+  const page = {
+    x: Math.round(across.at + before.pageX),
+    y: Math.round(down.at + before.pageY),
+  };
+  const at = { x: page.x - before.pageX, y: page.y - before.pageY };
+  // A press outside the viewport reaches nothing, though a hit test there may
+  // still find the button in the document.
+  if (at.x < 0 || at.y < 0 || at.x >= before.width || at.y >= before.height) return null;
+  for (const dx of across.shift === 0 ? [0] : [0, across.shift]) {
+    for (const dy of down.shift === 0 ? [0] : [0, down.shift]) {
+      if (!(await hitsButton(cdp, button, { x: page.x + dx, y: page.y + dy }))) return null;
+    }
+  }
+  const after = await viewportPlace(cdp);
+  if (after === null || after.pageX !== before.pageX || after.pageY !== before.pageY) return null;
   return { backendNodeId, ...at };
 }
 
@@ -374,8 +541,9 @@ function checkTarget(target: WidgetTarget): void {
 }
 
 /**
- * Waits until the target button is armed and is what a click on its centre
- * would hit, and returns it with that point.
+ * Waits until the target button is armed and is what a click at the point it
+ * returns would hit (its centre, or beside it where clickable says), and
+ * returns it with that point.
  */
 export async function widgetButton(
   cdp: DevToolsSession,
@@ -425,11 +593,15 @@ async function press(
     if (aimed !== null) {
       await mouse(cdp, 'mouseMoved', aimed);
       const now = await clickable(cdp, target, guard);
+      // Within a pixel, and at the point just checked: where the viewport's
+      // place is fractional, as at a device scale of 1.25, a scroll between the
+      // two checks moves the press point by a fraction though the button has
+      // not moved, and a page scrolling every frame would otherwise never settle.
       if (
         now !== null &&
         now.backendNodeId === aimed.backendNodeId &&
-        now.x === aimed.x &&
-        now.y === aimed.y
+        Math.abs(now.x - aimed.x) < 1 &&
+        Math.abs(now.y - aimed.y) < 1
       ) {
         await mouse(cdp, 'mousePressed', now);
         await mouse(cdp, 'mouseReleased', now);

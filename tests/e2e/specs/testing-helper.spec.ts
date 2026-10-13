@@ -2,8 +2,10 @@ import type { Client } from '@modelcontextprotocol/client';
 import { type CDPSession, expect, type Page, test } from '@playwright/test';
 import {
   allowAttach,
+  clickInWidget as clickWith,
   readPairingCode,
   waitingPrompts,
+  widgetButton,
   widgetText,
   WidgetTestError,
 } from '@tabdock/adapter/testing';
@@ -63,8 +65,38 @@ async function rosterOf(page: Page): Promise<[string, string][] | undefined> {
   return (await dockState(page))?.roster.map((a) => [a.userId, a.role]);
 }
 
-async function pairsAsDriver(page: Page): Promise<void> {
+/** Makes the board taller than the window and scrolls it by `y`; the widget stays fixed in its corner. */
+async function scrollBoard(page: Page, y: number): Promise<void> {
+  await page.evaluate((by) => {
+    const tall = document.createElement('div');
+    tall.style.height = '4000px';
+    document.body.append(tall);
+    window.scrollTo(0, by);
+  }, y);
+  expect(await page.evaluate(() => window.scrollY)).toBe(y);
+}
+
+/**
+ * Gives the board a writing direction or mode from `html`'s style, makes it
+ * overflow both ways, and scrolls the window to `x`, `y`; the widget stays
+ * fixed in its corner, its own text laid out as always.
+ */
+async function shapeBoard(page: Page, style: string, x: number, y: number): Promise<void> {
+  await page.evaluate(
+    ([css, left, top]) => {
+      document.documentElement.setAttribute('style', css);
+      const big = document.createElement('div');
+      Object.assign(big.style, { width: '4000px', height: '4000px' });
+      document.body.append(big);
+      window.scrollTo(left, top);
+    },
+    [style, x, y] as const,
+  );
+}
+
+async function pairsAsDriver(page: Page, shape?: (page: Page) => Promise<void>): Promise<void> {
   const { pageId, code, cdp } = await openBoard(page);
+  if (shape !== undefined) await shape(page);
   const client = await connectMcp(tabdock.relay, tabdock.users.alice, CI);
   try {
     // What the widget shows is what the page's own handle holds.
@@ -112,6 +144,161 @@ test.describe('at phone width', () => {
   }) => {
     await pairsAsDriver(page);
   });
+});
+
+// The box and the press count from the viewport's corner and the hit test
+// from the document's, so on a scrolled page the helper must move its hit
+// test by the scroll, or it checks a spot that far from where it presses.
+test.describe('on a scrolled page', () => {
+  test.use({ viewport: { width: 1280, height: 600 } });
+
+  test('finds Allow where the press lands and pairs as driver', async ({ page }) => {
+    await pairsAsDriver(page, (p) => scrollBoard(p, 400));
+  });
+
+  // On these the scroll starts at the far end of its range, so Chromium's two
+  // readings of it differ by the whole range, which the helper must not take
+  // for an element scrolling in the document's place.
+  test('pairs on a right-to-left page scrolled left', async ({ page }) => {
+    await pairsAsDriver(page, async (p) => {
+      await shapeBoard(p, 'direction: rtl', -401, 300);
+      expect(await p.evaluate(() => [window.scrollX, window.scrollY])).toEqual([-401, 300]);
+    });
+  });
+
+  test('pairs on a page that scrolls up from the bottom', async ({ page }) => {
+    await pairsAsDriver(page, async (p) => {
+      await shapeBoard(p, 'writing-mode: vertical-lr; direction: rtl', 10, -200);
+      expect(await p.evaluate(() => [window.scrollX, window.scrollY])).toEqual([10, -200]);
+    });
+  });
+
+  // A page that overflows by just over half of Allow's border box, from its
+  // far end, so the readings differ by that range everywhere: a second check
+  // that far from Allow's centre would fall off its edge, and the helper would
+  // never find it.
+  for (const [shape, style, axis] of [
+    ['a right-to-left page', 'direction: rtl', 'across'],
+    ['a page that scrolls up from the bottom', 'writing-mode: vertical-lr; direction: rtl', 'down'],
+  ] as const) {
+    test(`pairs on ${shape} that overflows by about half of Allow`, async ({ page }) => {
+      const { pageId, code, cdp } = await openBoard(page);
+      const client = await connectMcp(tabdock.relay, tabdock.users.alice, CI);
+      try {
+        const pending = callTool(client, 'pair_page', { code });
+        const requestId = await waitForDock(page, (s) => s.pendingRequests[0]?.requestId);
+        const at = await widgetButton(cdp, { action: 'approve-driver', requestId });
+        const { model } = await cdp.send('DOM.getBoxModel', { backendNodeId: at.backendNodeId });
+        const from = axis === 'across' ? 0 : 1;
+        const half = Math.abs((model.border[from + 4] ?? 0) - (model.border[from] ?? 0)) / 2;
+        const range = Math.round(half) + 1;
+
+        // Only the widget and one block, sized so the page overflows by `range`
+        // whatever padding the board's own styles leave around it.
+        await page.evaluate(
+          ({ css, across, range }) => {
+            const { documentElement: html, body } = document;
+            const hide = document.createElement('style');
+            hide.textContent = 'body > :not(tabdock-dock, #extent) { display: none !important; }';
+            document.head.append(hide);
+            html.setAttribute('style', css);
+            const extent = document.createElement('div');
+            extent.id = 'extent';
+            Object.assign(extent.style, { display: 'block', blockSize: '1px' });
+            body.append(extent);
+            const client = across ? html.clientWidth : html.clientHeight;
+            const overflow = (): number => (across ? html.scrollWidth : html.scrollHeight) - client;
+            extent.style.inlineSize = `${String(client + range)}px`;
+            extent.style.inlineSize = `${String(client + 2 * range - overflow())}px`;
+          },
+          { css: style, across: axis === 'across', range },
+        );
+        await expect
+          .poll(async () => {
+            const metrics = await cdp.send('Page.getLayoutMetrics');
+            const { cssVisualViewport: view, cssLayoutViewport: layout } = metrics;
+            return axis === 'across'
+              ? [metrics.cssContentSize.width - layout.clientWidth, layout.pageX - view.pageX]
+              : [metrics.cssContentSize.height - layout.clientHeight, layout.pageY - view.pageY];
+          })
+          .toEqual([range, range]);
+
+        expect(await allowAttach(cdp, { as: 'driver', requestId })).toBe(requestId);
+        const paired = await pending;
+        expect(paired.isError, paired.text).toBe(false);
+        expect(paired.structured).toMatchObject({ page: pageId, role: 'driver' });
+      } finally {
+        await client.close();
+        await cdp.detach();
+      }
+    });
+  }
+
+  // A cover that takes clicks catches the press; one that lets clicks through
+  // (pointer-events: none) passes it to Allow, which would approve.
+  for (const cover of [
+    { kind: 'that takes clicks', passThrough: false },
+    { kind: 'that lets clicks through to it', passThrough: true },
+  ]) {
+    test(`presses nothing while a page element ${cover.kind} covers the centre of Allow, though the spot it scrolled from is clear`, async ({
+      page,
+    }) => {
+      const { code, cdp } = await openBoard(page);
+      // A few pixels, so the spot a hit test in the viewport's coordinates
+      // would check still lies on Allow, above the cover.
+      await scrollBoard(page, 6);
+      const client = await connectMcp(tabdock.relay, tabdock.users.alice, CI);
+      try {
+        const pending = callTool(client, 'pair_page', { code });
+        const requestId = await waitForDock(page, (s) => s.pendingRequests[0]?.requestId);
+        const target = { action: 'approve-driver', requestId } as const;
+        const at = await widgetButton(cdp, target);
+
+        // A page element over the centre of Allow alone, painted above the
+        // widget, that counts the presses it takes.
+        await page.evaluate(
+          ({ x, y, passThrough }) => {
+            const over = document.createElement('div');
+            over.id = 'cover';
+            Object.assign(over.style, {
+              position: 'fixed',
+              left: `${String(x - 2)}px`,
+              top: `${String(y - 2)}px`,
+              width: '4px',
+              height: '4px',
+              zIndex: '2147483647',
+              pointerEvents: passThrough ? 'none' : 'auto',
+            });
+            Object.assign(window, { __coverClicks: 0 });
+            over.addEventListener('mousedown', () => {
+              Object.assign(window, { __coverClicks: 1 });
+            });
+            document.documentElement.append(over);
+          },
+          { ...at, passThrough: cover.passThrough },
+        );
+        const under = (x: number, y: number): Promise<string | null> =>
+          page.evaluate((p) => document.elementFromPoint(p.x, p.y)?.localName ?? null, { x, y });
+        // elementFromPoint, like a click, skips an element that lets clicks through.
+        expect(await under(at.x, at.y)).toBe(cover.passThrough ? 'tabdock-dock' : 'div');
+        expect(await under(at.x, at.y - 6)).toBe('tabdock-dock');
+
+        await expect(clickWith(cdp, target, { timeoutMs: 1500 })).rejects.toThrow(WidgetTestError);
+        expect(
+          await page.evaluate(() => (window as { __coverClicks?: number }).__coverClicks),
+        ).toBe(0);
+        expect((await waitingPrompts(cdp)).attach).toEqual([{ requestId, client: CI }]);
+
+        // Uncovered, the same press goes through.
+        await page.evaluate(() => document.getElementById('cover')?.remove());
+        expect(await allowAttach(cdp, { as: 'driver', requestId })).toBe(requestId);
+        expect((await pending).structured).toMatchObject({ role: 'driver' });
+      } finally {
+        await client.close();
+        await cdp.detach();
+      }
+    });
+  }
 });
 
 /**

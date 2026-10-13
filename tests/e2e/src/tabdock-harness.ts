@@ -291,7 +291,8 @@ export async function widgetButtonNow(
       .then(() => cdp.send('DOM.getBoxModel', { backendNodeId }))
       .then(({ model }) => {
         const [x1 = 0, y1 = 0, , , x3 = 0, y3 = 0] = model.content;
-        // Whole pixels, as the helper's widgetButton reports and presses them, so the two compare.
+        // Whole pixels, as the helper's widgetButton reports them while the page's scroll is
+        // whole, which every spec here keeps, so the two compare.
         return { x: Math.round((x1 + x3) / 2), y: Math.round((y1 + y3) / 2) };
       })
       .catch(() => null);
@@ -311,7 +312,8 @@ export async function clickInWidget(page: Page, target: WidgetTarget): Promise<v
  * after it clicks the button with trusted input. For a recording, which
  * draws no pointer: a click alone would show nothing of the press. Returns
  * whether the ring shows (the button matches :focus-visible). It never hit
- * tests, so a fixed button on a scrolled page is found where it is drawn.
+ * tests: a recording needs only the ring drawn where the button is, and
+ * clickInWidget is the check that a press would reach it.
  */
 export async function focusInWidget(
   page: Page,

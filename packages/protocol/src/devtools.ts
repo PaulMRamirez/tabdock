@@ -69,12 +69,60 @@ export const DevToolsNodeSchema: z.ZodMiniType<DevToolsNode> = z.object({
 export const DevToolsDocumentSchema = z.object({ root: DevToolsNodeSchema });
 export type DevToolsDocument = z.infer<typeof DevToolsDocumentSchema>;
 
-/** DOM.getBoxModel: the content quad as four x, y pairs. */
+// Four x, y pairs, corner by corner.
+const QuadSchema = z.array(z.number()).check(z.length(8));
+
+/**
+ * DOM.getBoxModel: the content quad, whose centre the helper presses, and the
+ * border quad, the area a hit test counts as the element.
+ */
 export const DevToolsBoxModelSchema = z.object({
-  model: z.object({ content: z.array(z.number()).check(z.length(8)) }),
+  model: z.object({ content: QuadSchema, border: QuadSchema }),
 });
 export type DevToolsBoxModel = z.infer<typeof DevToolsBoxModelSchema>;
+
+/**
+ * DOM.getContentQuads (marked experimental; Puppeteer's click reads it too):
+ * the quads a node covers, in the viewport's coordinates, one per line for
+ * text. A button's label can reach past the button's border box, and a hit
+ * test there still names the button.
+ */
+export const DevToolsContentQuadsSchema = z.object({
+  quads: z.array(QuadSchema).check(z.maxLength(1000)),
+});
+export type DevToolsContentQuads = z.infer<typeof DevToolsContentQuadsSchema>;
 
 /** DOM.getNodeForLocation: the node a hit test found. */
 export const DevToolsNodeAtSchema = z.object({ backendNodeId: NodeIdSchema });
 export type DevToolsNodeAt = z.infer<typeof DevToolsNodeAtSchema>;
+
+// z.number() takes no NaN or Infinity, so every offset here is a real place.
+const CssSizeSchema = z.number().check(z.nonnegative());
+
+/**
+ * Page.getLayoutMetrics, in CSS pixels: where the visual viewport sits in the
+ * document and how much of it shows, with the layout viewport's position and
+ * the scrollable size beside it. DOM.getBoxModel and Input.dispatchMouseEvent
+ * count from the visual viewport's corner, while DOM.getNodeForLocation counts
+ * from the document's, so the helper adds pageX and pageY to hit-test the very
+ * point it will press on a scrolled page. pageX is negative on a right-to-left
+ * page scrolled left.
+ */
+export const DevToolsLayoutMetricsSchema = z.object({
+  cssLayoutViewport: z.object({
+    pageX: z.number(),
+    pageY: z.number(),
+    clientWidth: CssSizeSchema,
+    clientHeight: CssSizeSchema,
+  }),
+  cssVisualViewport: z.object({
+    offsetX: z.number(),
+    offsetY: z.number(),
+    pageX: z.number(),
+    pageY: z.number(),
+    clientWidth: CssSizeSchema,
+    clientHeight: CssSizeSchema,
+  }),
+  cssContentSize: z.object({ width: CssSizeSchema, height: CssSizeSchema }),
+});
+export type DevToolsLayoutMetrics = z.infer<typeof DevToolsLayoutMetricsSchema>;

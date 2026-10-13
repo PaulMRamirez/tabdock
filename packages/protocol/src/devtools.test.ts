@@ -8,7 +8,9 @@ import manifest from '../package.json' with { type: 'json' };
 import * as exported from './index.ts';
 import {
   DevToolsBoxModelSchema,
+  DevToolsContentQuadsSchema,
   DevToolsDocumentSchema,
+  DevToolsLayoutMetricsSchema,
   type DevToolsNode,
   DevToolsNodeAtSchema,
   DevToolsNodeSchema,
@@ -126,7 +128,7 @@ describe('the DevTools reply schemas', () => {
     const cut = { backendNodeId: 1, nodeType: 3, nodeValue: `${'x'.repeat(10_000)}\u2026` };
     expect(DevToolsNodeSchema.parse(cut)).toEqual(cut);
     expect(DevToolsBoxModelSchema.parse(BOX_MODEL)).toEqual({
-      model: { content: BOX_MODEL.model.content },
+      model: { content: BOX_MODEL.model.content, border: BOX_MODEL.model.border },
     });
     expect(DevToolsNodeAtSchema.parse({ backendNodeId: 14, frameId: 'F1', nodeId: 0 })).toEqual({
       backendNodeId: 14,
@@ -157,14 +159,72 @@ describe('the DevTools reply schemas', () => {
     const span = deep.root.children?.[1]?.children?.[0]?.shadowRoots?.[0]?.children?.[0];
     if (span !== undefined) span.attributes = ['data-role'];
     expect(DevToolsDocumentSchema.safeParse(deep).success).toBe(false);
-    const quad = (content: unknown[]): boolean =>
-      DevToolsBoxModelSchema.safeParse({ model: { content } }).success;
-    expect(quad([1, 2, 3, 4, 5, 6, 7])).toBe(false);
-    expect(quad([1, 2, 3, 4, 5, 6, 7, 8, 9])).toBe(false);
-    expect(quad([1, 2, 3, 4, 5, 6, 7, Number.POSITIVE_INFINITY])).toBe(false);
-    expect(quad([1, 2, 3, 4, 5, 6, 7, Number.NaN])).toBe(false);
-    expect(quad([1, 2, 3, 4, 5, 6, 7, '8'])).toBe(false);
+    const square = [0, 0, 8, 0, 8, 8, 0, 8];
+    for (const side of ['content', 'border'] as const) {
+      const quad = (corners: unknown[]): boolean =>
+        DevToolsBoxModelSchema.safeParse({
+          model: { content: square, border: square, [side]: corners },
+        }).success;
+      expect(quad(square)).toBe(true);
+      expect(quad([1, 2, 3, 4, 5, 6, 7])).toBe(false);
+      expect(quad([1, 2, 3, 4, 5, 6, 7, 8, 9])).toBe(false);
+      expect(quad([1, 2, 3, 4, 5, 6, 7, Number.POSITIVE_INFINITY])).toBe(false);
+      expect(quad([1, 2, 3, 4, 5, 6, 7, Number.NaN])).toBe(false);
+      expect(quad([1, 2, 3, 4, 5, 6, 7, '8'])).toBe(false);
+    }
+    // The border quad is what the far-end check measures, so a reply without one is refused.
+    expect(DevToolsBoxModelSchema.safeParse({ model: { content: square } }).success).toBe(false);
+    // A node's quads: each one eight finite numbers, and no more than a thousand.
+    const quads = (list: unknown): boolean =>
+      DevToolsContentQuadsSchema.safeParse({ quads: list }).success;
+    expect(quads([square, square])).toBe(true);
+    expect(quads([])).toBe(true);
+    expect(quads([[1, 2, 3, 4, 5, 6, 7]])).toBe(false);
+    expect(quads([[1, 2, 3, 4, 5, 6, 7, Number.NaN]])).toBe(false);
+    expect(quads(Array.from({ length: 1001 }, () => square))).toBe(false);
+    expect(quads(undefined)).toBe(false);
     expect(DevToolsNodeAtSchema.safeParse({}).success).toBe(false);
+    const layout = { pageX: 0, pageY: 100, clientWidth: 1280, clientHeight: 720 };
+    const content = { x: 0, y: 0, width: 1280, height: 4000 };
+    const view = (
+      cssVisualViewport: unknown,
+      cssLayoutViewport: unknown = layout,
+      cssContentSize: unknown = content,
+    ): boolean =>
+      DevToolsLayoutMetricsSchema.safeParse({
+        cssLayoutViewport,
+        cssVisualViewport,
+        cssContentSize,
+      }).success;
+    const fine = {
+      offsetX: 0,
+      offsetY: 35.5,
+      pageX: 0,
+      pageY: 135.5,
+      clientWidth: 1280,
+      clientHeight: 720,
+      scale: 1,
+      zoom: 1,
+    };
+    expect(view(fine)).toBe(true);
+    // A right-to-left page scrolled left, its layout viewport counted from the far end.
+    expect(view({ ...fine, pageX: -401 }, { ...layout, pageX: 2319 })).toBe(true);
+    expect(view({ ...fine, pageY: Number.NaN })).toBe(false);
+    expect(view({ ...fine, pageX: Number.POSITIVE_INFINITY })).toBe(false);
+    expect(view({ ...fine, offsetX: undefined })).toBe(false);
+    expect(view({ ...fine, offsetY: undefined })).toBe(false);
+    expect(view({ ...fine, clientHeight: -1 })).toBe(false);
+    expect(view({ ...fine, clientWidth: '1280' })).toBe(false);
+    expect(view({ pageX: 0, pageY: 0 })).toBe(false);
+    expect(view(fine, { ...layout, pageY: '100' })).toBe(false);
+    expect(view(fine, { ...layout, clientWidth: undefined })).toBe(false);
+    expect(view(fine, {})).toBe(false);
+    expect(view(fine, layout, { ...content, height: -1 })).toBe(false);
+    expect(view(fine, layout, {})).toBe(false);
+    expect(
+      DevToolsLayoutMetricsSchema.safeParse({ cssLayoutViewport: layout, cssVisualViewport: fine })
+        .success,
+    ).toBe(false);
   });
 });
 
@@ -178,14 +238,17 @@ describe('the devtools subpath', () => {
     expect(Object.keys(exported).filter((name) => name.startsWith('DevTools'))).toEqual([]);
   });
 
-  // The helper reads DOM.getDocument, DOM.getBoxModel and DOM.getNodeForLocation
-  // replies and nothing else (it never runs a function on a node), so the
-  // subpath ships those schemas alone (checklist M6, decision 3).
+  // The helper reads DOM.getDocument, DOM.getBoxModel, Page.getLayoutMetrics
+  // and DOM.getNodeForLocation replies and nothing else (it never runs a
+  // function on a node), so the subpath ships those schemas alone (checklist
+  // M6, decision 3).
   it('ships only the replies the helper reads', async () => {
     const devtools = await import('./devtools.ts');
     expect(Object.keys(devtools).sort()).toEqual([
       'DevToolsBoxModelSchema',
+      'DevToolsContentQuadsSchema',
       'DevToolsDocumentSchema',
+      'DevToolsLayoutMetricsSchema',
       'DevToolsNodeAtSchema',
       'DevToolsNodeSchema',
     ]);
