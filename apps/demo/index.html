@@ -99,6 +99,11 @@
       .connect-error:empty {
         display: none;
       }
+      nav.meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 2px 16px;
+      }
       nav.meta a {
         color: inherit;
       }
@@ -107,6 +112,11 @@
   <body>
     <main id="board">
       <h1>Tabdock demo board</h1>
+      <!-- Under the title, so a visitor to the site's root sees where else to go. -->
+      <nav class="meta" aria-label="More from Tabdock">
+        <a href="map/">The map demo: Earth on a map and a globe your client can drive</a>
+        <a href="tour/">The tour: how Tabdock works, milestone by milestone</a>
+      </nav>
       <p class="meta" data-role="status">Loading tools...</p>
       <canvas aria-label="Board with items; drag to pan, scroll to zoom"></canvas>
       <p class="meta" data-role="view"></p>
@@ -114,9 +124,6 @@
         <h2 class="meta">Recent tool calls</h2>
         <ol data-role="log" aria-live="polite"></ol>
       </section>
-      <nav class="meta">
-        <a href="tour/">The tour: how Tabdock works, milestone by milestone</a>
-      </nav>
     </main>
     <!-- Relative, so a copy served under <user>.github.io/<repository>/ finds its script too. -->
     <script type="module" src="./main.js"></script>

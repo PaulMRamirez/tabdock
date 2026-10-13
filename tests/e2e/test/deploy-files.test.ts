@@ -570,6 +570,11 @@ describe('the image and the workflows, as they run (comments left out)', () => {
       'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
     );
     expect(stepWith(build, 'pnpm site:build')).toMatch(/^ {6}- run: pnpm site:build$/m);
+    // The board and the map demo (ADR 0050) both build from the workspace, so
+    // the job installs what each needs, and nothing more.
+    expect(stepWith(build, 'pnpm install --frozen-lockfile')).toMatch(
+      /^ {6}- run: pnpm install --frozen-lockfile --filter '@tabdock\/demo\.\.\.' --filter '@tabdock\/map-demo\.\.\.'$/m,
+    );
     expect(stepWith(build, '--ignore-workspace')).toMatch(
       /^ {6}- run: pnpm --dir apps\/site install --frozen-lockfile --ignore-workspace$/m,
     );

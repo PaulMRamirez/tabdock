@@ -245,6 +245,21 @@ async function withCdp<T>(page: Page, run: (cdp: CDPSession) => Promise<T>): Pro
   }
 }
 
+/** The target's button in the whole document, shadow roots included, within its entry when the target names one. */
+function targetButton(root: DomNode, target: WidgetTarget): DomNode | null {
+  const scope =
+    target.requestId !== undefined
+      ? findNode(root, (n) => attribute(n, 'data-request-id') === target.requestId)
+      : target.callId !== undefined
+        ? findNode(root, (n) => attribute(n, 'data-call-id') === target.callId)
+        : target.userId !== undefined
+          ? findNode(root, (n) => attribute(n, 'data-user-id') === target.userId)
+          : target.inviteId !== undefined
+            ? findNode(root, (n) => attribute(n, 'data-invite-id') === target.inviteId)
+            : root;
+  return scope && findNode(scope, (n) => attribute(n, 'data-action') === target.action);
+}
+
 /** Where a click on the target button would land, once it is armed and uncovered. */
 export async function widgetButtonCentre(
   page: Page,
@@ -268,17 +283,7 @@ export async function widgetButtonNow(
 ): Promise<{ armed: boolean; x: number; y: number } | null> {
   return withCdp(page, async (cdp) => {
     const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
-    const scope =
-      target.requestId !== undefined
-        ? findNode(root, (n) => attribute(n, 'data-request-id') === target.requestId)
-        : target.callId !== undefined
-          ? findNode(root, (n) => attribute(n, 'data-call-id') === target.callId)
-          : target.userId !== undefined
-            ? findNode(root, (n) => attribute(n, 'data-user-id') === target.userId)
-            : target.inviteId !== undefined
-              ? findNode(root, (n) => attribute(n, 'data-invite-id') === target.inviteId)
-              : root;
-    const button = scope && findNode(scope, (n) => attribute(n, 'data-action') === target.action);
+    const button = targetButton(root, target);
     if (!button) return null;
     const { backendNodeId } = button;
     const centre = await cdp
@@ -298,6 +303,44 @@ export async function widgetButtonNow(
 /** A trusted click on the target button, as the operator would make it, through the helper. */
 export async function clickInWidget(page: Page, target: WidgetTarget): Promise<void> {
   await withCdp(page, (cdp) => helper.clickInWidget(cdp, target));
+}
+
+/**
+ * Moves the keyboard's focus to the target button once it is armed, as Tab
+ * would bring it there, so the browser draws its focus ring; an Enter press
+ * after it clicks the button with trusted input. For a recording, which
+ * draws no pointer: a click alone would show nothing of the press. Returns
+ * whether the ring shows (the button matches :focus-visible). It never hit
+ * tests, so a fixed button on a scrolled page is found where it is drawn.
+ */
+export async function focusInWidget(
+  page: Page,
+  target: WidgetTarget,
+  timeoutMs = 5000,
+): Promise<boolean> {
+  return withCdp(page, async (cdp) => {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
+      const button = targetButton(root, target);
+      if (button && attribute(button, 'data-armed') !== 'false') {
+        const { object } = await cdp.send('DOM.resolveNode', {
+          backendNodeId: button.backendNodeId,
+        });
+        if (object.objectId !== undefined) {
+          const { result } = await cdp.send('Runtime.callFunctionOn', {
+            objectId: object.objectId,
+            functionDeclaration:
+              'function () { this.focus({ preventScroll: true }); return this.matches(":focus-visible"); }',
+            returnByValue: true,
+          });
+          return result.value === true;
+        }
+      }
+      if (Date.now() > deadline) throw new Error(`no armed ${target.action} button to focus`);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  });
 }
 
 /**

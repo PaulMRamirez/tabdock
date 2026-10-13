@@ -55,3 +55,4 @@ A dated note added to an accepted record may amend that record's Decision, or th
 | [0047](0047-refresh-spec-m6.md)                  | Refresh SPEC section 3 for M6, and move the MCP-B 6 leg to 6.0.0 | Accepted |
 | [0048](0048-script-tag-ceiling-for-m6.md)        | Script-tag ceiling for M6                                        | Accepted |
 | [0049](0049-refresh-spec-after-m6-docs.md)       | Refresh SPEC after M6's docs pass                                | Accepted |
+| [0050](0050-a-map-demo-on-the-pages-site.md)     | A map demo on the Pages site                                     | Accepted |
