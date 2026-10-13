@@ -435,10 +435,24 @@ test("pairs through the Connect bar and the widget, walks the tour, and its publ
   // The last stop is Madagascar on the globe; nothing lies past it.
   await expect(page.getByRole('button', { name: 'Next stop' })).toBeDisabled();
 
+  // On a wide screen the column leaves the widget's open panel a lane, so the
+  // map and its controls stay whole beside it, and no line asks to fold it.
+  const dock = await page.locator('tabdock-dock').boundingBox();
+  // Open, the panel is 360 pixels wide; folded, the dock is its chip alone.
+  expect(dock?.width ?? 0).toBeGreaterThanOrEqual(360);
+  const beside = await page.evaluate(() =>
+    Math.max(
+      ...Array.from(document.querySelectorAll('canvas, .controls button, .cards'), (element) =>
+        Math.ceil(element.getBoundingClientRect().right),
+      ),
+    ),
+  );
+  expect(dock).not.toBeNull();
+  expect(beside).toBeLessThanOrEqual(dock?.x ?? 0);
+  await expect(page.locator('.fold-hint')).toBeHidden();
+
   // The visitor's own buttons move the map, and the published state follows
-  // each. The widget's open panel lies over the right of the controls on a
-  // wide screen too, so the visitor folds it first, as on the board.
-  await clickInWidget(page, { action: 'toggle' });
+  // each.
   const before = MapPageStateSchema.parse(stateBody(await readPageState(alice, pageId)).value);
   expect(before.view.projection).toBe('globe');
   await page.getByRole('button', { name: 'Flat map' }).click();
@@ -454,6 +468,12 @@ test("pairs through the Connect bar and the widget, walks the tour, and its publ
     pageId,
     (published) => published.view.widthM < flat.view.widthM,
     'a closer view',
+  );
+  // The world keeps its last stop, and the tour card says the map has left it.
+  await expect(page.locator('[data-role="stop-place"]')).toHaveText('Stop 6 of 6, map moved');
+  await expect(page.locator('[data-role="stop-title"]')).toHaveText('Madagascar');
+  await expect(page.locator('[data-role="stop-text"]')).toHaveText(
+    'The map has left this stop. Press Next stop or Previous stop, or ask your client to go back.',
   );
   await page.getByRole('button', { name: 'Previous stop' }).click();
   await publishedState(
@@ -474,6 +494,63 @@ test("pairs through the Connect bar and the widget, walks the tour, and its publ
   expect(followed.view).toEqual((await callMapTool(alice, pageId, 'get_view')).structured);
   expect(closer.view.widthM).toBeLessThan(flat.view.widthM);
   await expectClean(page);
+});
+
+test('a plain wheel scrolls the page past the map; Ctrl with the wheel, the arrow keys and plus and minus move the map', async ({
+  page,
+}) => {
+  await openMapDemo(page, site.url);
+  const canvas = page.locator('canvas#map');
+  const view = page.locator('[data-role="view"]');
+  const start = (await view.textContent()) ?? '';
+  const box = await canvas.boundingBox();
+  if (!box) throw new Error('the map has no box');
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 3);
+  for (let notch = 0; notch < 5; notch += 1) await page.mouse.wheel(0, 100);
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
+  await page.waitForTimeout(SETTLE_MS);
+  await expect(view).toHaveText(start);
+  // Ctrl with the wheel, as a trackpad pinch arrives, zooms the map and not the page.
+  await page.evaluate(() => {
+    window.scrollTo(0, 0);
+  });
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 3);
+  await page.keyboard.down('Control');
+  await page.mouse.wheel(0, -100);
+  await page.keyboard.up('Control');
+  await expect(view).toHaveText(/^Globe, centred on 20\.0° N, 30\.0° W, 21,246 km across/);
+  expect(await page.evaluate(() => window.scrollY)).toBe(0);
+  // The map takes focus in the tab order, and its keys pan and zoom it.
+  await expect(canvas).toHaveAttribute('tabindex', '0');
+  await expect(canvas).toHaveAttribute('aria-label', /arrow keys, to pan; hold Ctrl and scroll/);
+  // Focus brings the whole map into view; the keys then scroll nothing.
+  await canvas.focus();
+  const focused = await page.evaluate(() => window.scrollY);
+  await page.keyboard.press('ArrowRight');
+  await expect(view).toHaveText(/^Globe, centred on 20\.0° N, \d+\.\d° W, 21,246 km across/);
+  expect(await view.textContent()).not.toContain('30.0° W');
+  await page.keyboard.press('ArrowDown');
+  await page.keyboard.press('-');
+  await expect(view).not.toHaveText(/21,246 km across/);
+  expect(await page.evaluate(() => window.scrollY)).toBe(focused);
+  await expectClean(page);
+});
+
+test('says what to check when a chosen relay never links, naming the origin it must list', async ({
+  page,
+}) => {
+  // A relay whose allowlist names another origin, the likeliest setup mistake.
+  tabdock = await startMapDemoRelay('http://127.0.0.1:1');
+  await openMapDemo(page, mapDemoUrl(site.url, tabdock.relay.pageUrl));
+  await clickConnect(page);
+  const status = page.locator('[data-role="status"]');
+  await expect(status).toHaveText(/^14 tools registered; Tabdock relay 127\.0\.0\.1:\d+: \w+$/);
+  await expect(status).toHaveText(
+    `14 tools registered; Tabdock relay ${new URL(tabdock.relay.pageUrl).host}: reconnecting; still not linked: check that the relay is running and lists ${site.origin} in TABDOCK_ALLOWED_ORIGINS`,
+    { timeout: 15_000 },
+  );
+  // The browser logs the refused handshake itself; the page broke no policy.
+  expect(await cspViolations(page)).toEqual([]);
 });
 
 test('capture_view draws its own map again: one view gives the same PNG twice at any window size, another other bytes', async ({
@@ -562,8 +639,11 @@ test.describe('on a 375 px phone', () => {
     await openMapDemo(page, mapDemoUrl(site.url, STAND_IN));
     await expect(page.locator('[data-role="connect-bar"]')).toBeVisible();
     expect(await scrollsSideways(page)).toBe(false);
+    // The line on folding the widget waits until there is a widget to fold.
+    await expect(page.locator('.fold-hint')).toBeHidden();
 
     await clickConnect(page);
+    await expect(page.locator('.fold-hint')).toBeVisible();
     await expect.poll(() => dialled.urls).toEqual([STAND_IN]);
     await expect.poll(() => widgetText(page, 'pairing-code')).toContain(STAND_IN_CODE);
     expect(await widgetVisible(page, 'pairing-code')).toBe(true);

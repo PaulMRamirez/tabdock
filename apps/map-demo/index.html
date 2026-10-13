@@ -19,6 +19,24 @@
         margin: 0;
         padding: 16px;
       }
+      /* The widget's panel opens on its own, 360 pixels wide and 16 from the
+         right; on a wide screen the column leaves it a lane, so the map stays
+         whole beside it. On a narrower one it covers the page, so once a relay
+         is chosen a line says how to fold it. */
+      .fold-hint {
+        display: none;
+      }
+      html[data-link='chosen'] .fold-hint {
+        display: block;
+      }
+      @media (min-width: 1100px) {
+        body {
+          padding-right: 392px;
+        }
+        html[data-link='chosen'] .fold-hint {
+          display: none;
+        }
+      }
       main {
         max-width: 960px;
         margin: 0 auto;
@@ -122,6 +140,10 @@
         touch-action: none;
         cursor: grab;
       }
+      canvas:focus-visible {
+        outline: 3px solid var(--accent);
+        outline-offset: 2px;
+      }
       .controls {
         display: flex;
         flex-wrap: wrap;
@@ -144,6 +166,18 @@
       }
       .controls .spacer {
         flex: 1 1 0;
+      }
+      /* The stop's words and what to ask side by side where they fit, the
+         stop first on a phone, next to the buttons that move it. */
+      .cards {
+        display: grid;
+        gap: 10px;
+        align-items: start;
+      }
+      @media (min-width: 720px) {
+        .cards {
+          grid-template-columns: 1fr 1fr;
+        }
       }
       .card {
         background: var(--panel);
@@ -210,13 +244,16 @@
         <p class="lede">
           Earth as a flat map and a globe, drawn on a plain canvas from Natural Earth's
           public-domain data with no map library. Connect a Tabdock relay of your own, pair Claude
-          or another MCP client in the widget, and ask it to drive the map.
+          or another MCP client in the widget, and ask it to take the tour. No relay yet? Use the
+          buttons under the map to take the tour yourself.
         </p>
       </header>
       <nav class="links" aria-label="More from Tabdock">
+        <a href="../guide/07-run-a-relay.html">Set up a relay</a>
+        <a href="#ask">What to ask</a>
         <a href="../">The demo board</a>
-        <a href="../tour/">The tour</a>
-        <a href="../guide/16-map-pages.html">Map and globe pages</a>
+        <a href="../tour/">How Tabdock was built</a>
+        <a href="../guide/16-map-pages.html">The map tools (guide)</a>
       </nav>
       <div data-role="connect-slot"></div>
       <p class="meta" data-role="status">Loading tools...</p>
@@ -225,10 +262,17 @@
         <code>TABDOCK_ALLOWED_ORIGINS</code>, and your browser may ask before a public page reaches
         a relay on your own machine.
       </p>
+      <p class="meta fold-hint">
+        Once linked, the Tabdock panel opens over the page; fold it with its chip at the bottom
+        right to watch the map.
+      </p>
       <figure class="map">
         <canvas
           id="map"
-          aria-label="Map of Earth; drag to pan, scroll to zoom, or use the buttons below"
+          tabindex="0"
+          role="application"
+          aria-roledescription="map"
+          aria-label="Map of Earth. Drag, or use the arrow keys, to pan; hold Ctrl and scroll, pinch, or press plus or minus to zoom; or use the buttons below."
         ></canvas>
         <div class="controls" role="toolbar" aria-label="Map controls">
           <button type="button" data-action="zoom-in" aria-label="Zoom in">Zoom in</button>
@@ -238,22 +282,28 @@
           <button type="button" data-action="previous-stop">Previous stop</button>
           <button type="button" data-action="next-stop">Next stop</button>
         </div>
+        <p class="meta">
+          Drag, or use the arrow keys, to pan; Ctrl and scroll, or pinch, to zoom. Orange outlines
+          mark the tour's observations, drawn from the data, not photographs.
+        </p>
         <figcaption class="meta" data-role="view"></figcaption>
       </figure>
-      <section class="card tour" aria-live="polite">
-        <p data-role="stop-place"></p>
-        <h2 data-role="stop-title"></h2>
-        <p data-role="stop-text"></p>
-      </section>
-      <section class="card prompts">
-        <h2>Try asking your client</h2>
-        <ul>
-          <li>Take this page's tour and capture each stop.</li>
-          <li>Show Lake Baikal on the globe from 2,000 km up, then capture it.</li>
-          <li>Hide the graticule and list the lakes in view.</li>
-          <li>Rewrite this stop's text for a ten-year-old.</li>
-        </ul>
-      </section>
+      <div class="cards">
+        <section class="card tour" aria-live="polite">
+          <p data-role="stop-place"></p>
+          <h2 data-role="stop-title"></h2>
+          <p data-role="stop-text"></p>
+        </section>
+        <section class="card prompts" id="ask">
+          <h2>Try asking your client</h2>
+          <ul>
+            <li>Take this page's tour and capture each stop.</li>
+            <li>Show Lake Baikal on the globe from 2,000 km up, then capture it.</li>
+            <li>Hide the graticule and list the lakes in view.</li>
+            <li>Rewrite this stop's text for a ten-year-old.</li>
+          </ul>
+        </section>
+      </div>
       <section class="card">
         <h2>Recent tool calls</h2>
         <ol data-role="calls" aria-live="polite"></ol>

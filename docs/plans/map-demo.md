@@ -36,7 +36,7 @@ Unit, in Node: decoding (a round trip, the vendored counts, closure, ranges, bud
 
 ## Docs
 
-The README gains a line and a link; guide page 16's worked examples name the demo; the tour index and site header link it; CHANGELOG under Unreleased; NOTICE credits Natural Earth (public domain); the app's README (linking only github.com, as `doc-style.test.ts` allows); `docs/develop.md` (dev, generator, recording); the threat model's B10 row; `.env.example` (`MAP_DEMO_PORT`).
+The README gains a line and a link; guide page 16's worked examples name the demo; the tour index, which `apps/site/lib/page.ts` writes, and the site header link it; CHANGELOG under Unreleased; NOTICE credits Natural Earth (public domain); the app's README (linking only github.com, as `doc-style.test.ts` allows); `docs/develop.md` (dev, generator, recording); the threat model's B10 row; `.env.example` (`MAP_DEMO_PORT`).
 
 ## Recording
 

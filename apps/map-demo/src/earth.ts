@@ -2,8 +2,8 @@
 // on a flat map and a globe, with no clock. Its features are the 24 lakes at
 // the label points the generator found, the Caspian Sea and Madagascar; its
 // one walkthrough is a six-stop tour of things the data draws, each with one
-// short fact, checked against a source on 13 October 2026 and rounded with
-// "about"; and its three observations outline the Caspian, Baikal and the
+// short fact, checked against a source on 13 October 2026, with "about"
+// before any figure that is rounded; and its three observations outline the Caspian, Baikal and the
 // Great Lakes from the data itself, marked as outlines, not photographs.
 // Nothing here names a border, a country's claim, a person or a brand, and a
 // lake whose name differs by the country on its shore carries every name in
@@ -139,26 +139,28 @@ const STOPS: readonly {
   },
   {
     title: 'The Caspian Sea',
-    text: 'The largest inland body of water on Earth, about 371,000 square kilometres. In this data it is a gap in the land rather than one of the lakes.',
+    text: 'The largest inland body of water on Earth, about 371,000 square kilometres. Natural Earth draws it as water cut out of the land, not as a lake.',
     view: flat(50.5, 41.8, 2_400_000),
     observationId: 'caspian-outline',
   },
   {
     title: 'Lake Baikal',
-    text: 'The deepest lake on Earth, about 1,642 metres at its deepest, seen on the globe from about 1,600 km up.',
+    text: 'The deepest lake on Earth, 1,642 metres at its deepest, seen on the globe from about 1,600 km up.',
     view: globe(107.9, 53.6, 1_600_000),
     observationId: 'baikal-outline',
   },
   {
     title: 'The Great Lakes',
-    text: 'Five lakes drawn from the data. Lake Superior, the largest of them, is counted alone the largest freshwater lake on Earth by area.',
+    text: 'Five lakes drawn from the data. Lake Superior, the largest of them, is the largest freshwater lake on Earth by area, unless Michigan and Huron, joined at the Straits of Mackinac, are counted as one.',
     view: flat(-84, 45, 2_000_000),
     observationId: 'great-lakes-outline',
   },
   {
     title: 'Lake Victoria',
     text: "Africa's largest lake by area. Its one outflow, the Victoria Nile, leaves from its northern shore.",
-    view: flat(33, -1.2, 900_000),
+    // Wide enough for the coarse 1:110m outline to read as a lake, with the
+    // equator and Lake Tanganyika beside it, not as a shape filling the frame.
+    view: flat(33, -1.2, 2_600_000),
     observationId: null,
   },
   {

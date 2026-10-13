@@ -1,7 +1,8 @@
-// Draws the map demo's world on a plain 2D canvas, with no map library: the
-// ocean, the land, the lakes, a 30 degree graticule, the observations'
-// outlines, the names that fit and a north arrow turned by the heading, in
-// that order, each layer at its own opacity. It always draws from straight
+// Draws the map demo's world on a plain 2D canvas, with no map library:
+// space around the globe and past the flat map's poles, the ocean, the land,
+// the lakes, a 30 degree graticule, the observations' outlines, the names
+// that fit and a north arrow turned by the heading, in that order, each
+// layer at its own opacity. It always draws from straight
 // above and leaves pitch as a number the tools report. It reads only the
 // scene it is given (the world's state, or a drag's view before it lands),
 // sets its colours, line widths and one font itself and reads no clock,
@@ -326,9 +327,30 @@ function drawGround(
     ctx.beginPath();
     traceLimb(ctx, globe);
     ctx.fill();
-  } else {
-    ctx.fillStyle = COLORS.ocean;
+  } else if (flat) {
+    // Past either pole there is no Earth to draw, so space shows there, as
+    // around the globe, and a map zoomed far out reads as a strip of world,
+    // not an endless sea. The sea is each copy's band from pole to pole, in
+    // one path, so no seam shows where two copies meet.
+    ctx.fillStyle = COLORS.space;
     ctx.fillRect(0, 0, viewport.widthPx, viewport.heightPx);
+    ctx.fillStyle = COLORS.ocean;
+    ctx.beginPath();
+    for (const copy of flat.copies) {
+      const corners: readonly LonLat[] = [
+        [-180, -90],
+        [180, -90],
+        [180, 90],
+        [-180, 90],
+      ];
+      corners.forEach(([lon, lat], index) => {
+        const at = flat.project(lon, lat, copy);
+        if (index === 0) ctx.moveTo(at.x, at.y);
+        else ctx.lineTo(at.x, at.y);
+      });
+      ctx.closePath();
+    }
+    ctx.fill();
   }
   const fillLayer = (polygons: readonly PreparedPolygon[], alpha: number, color: string): void => {
     ctx.globalAlpha = alpha;
@@ -531,8 +553,10 @@ function drawNorthArrow(
 export interface DrawOptions {
   /**
    * How many viewport pixels a screen pixel spans, at least 1: the screen
-   * passes it so names, dots and lines stay legible on a narrow canvas.
-   * Captures leave it at 1, so a capture depends on the world alone.
+   * passes it so names, dots and lines stay legible on a narrow canvas, and a
+   * capture passes one from its own width alone (captureLabelScale), so a
+   * capture still depends on the world and the width asked for, never on the
+   * window.
    */
   readonly scale?: number;
 }

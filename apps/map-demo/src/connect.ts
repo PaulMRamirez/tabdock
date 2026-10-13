@@ -47,6 +47,30 @@ export function rememberChoice(store: ChoiceStore | null, relayUrl: string): voi
   }
 }
 
+/** How long a chosen relay may go without ever linking before the status line says what to check. */
+export const LINK_HINT_MS = 10_000;
+
+/**
+ * The status line once the visitor has chosen a relay. A relay that refuses
+ * this site's origin, the likeliest setup mistake, looks the same from the
+ * page as an address with no relay at all: a socket that closes, then
+ * reconnecting. So once the link has gone LINK_HINT_MS without ever linking,
+ * the line names both causes. It names the relay's host and this page's
+ * origin, which the page already shows, and nothing secret.
+ */
+export function linkStatus(
+  registered: string,
+  host: string,
+  link: string,
+  stalled: boolean,
+  origin: string,
+): string {
+  const line = `${registered}; Tabdock relay ${host}: ${link}`;
+  return stalled
+    ? `${line}; still not linked: check that the relay is running and lists ${origin} in TABDOCK_ALLOWED_ORIGINS`
+    : line;
+}
+
 /** This tab's sessionStorage, or null where reading it throws. */
 export function tabStore(): ChoiceStore | null {
   try {

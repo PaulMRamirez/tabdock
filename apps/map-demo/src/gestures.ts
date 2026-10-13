@@ -1,7 +1,7 @@
-// The map demo's hand gestures and buttons as world writes, kept apart from
-// the DOM so a unit test can drive them. Each is one discrete change, one
-// write per drag, wheel step or button press, never per frame, so the page
-// never publishes its state per frame either. A drag shows its view as it
+// The map demo's hand gestures, keys and buttons as world writes, kept apart
+// from the DOM so a unit test can drive them. Each is one discrete change,
+// one write per drag, wheel step, key or button press, never per frame, so
+// the page never publishes its state per frame either. A drag shows its view as it
 // goes (draggedView) and writes it once, when the pointer lifts. They follow
 // tests/map-page's gestures, extended, and import nothing from it.
 
@@ -41,6 +41,60 @@ export function draggedView(
   const cosLat = Math.max(Math.cos((view.lat * Math.PI) / 180), 1e-6);
   const lon = ((((view.lon + east / (metresPerDegree * cosLat) + 180) % 360) + 360) % 360) - 180;
   return { ...view, lon, lat };
+}
+
+/**
+ * What one wheel step over the map asks for: a zoom only while Ctrl or Cmd is
+ * held, which is also how Chromium, Firefox and Safari deliver a trackpad
+ * pinch, so a plain wheel scrolls the page past the map as on any page.
+ */
+export function wheelZoom(event: {
+  readonly ctrlKey: boolean;
+  readonly metaKey: boolean;
+  readonly deltaY: number;
+}): 'in' | 'out' | null {
+  if (!(event.ctrlKey || event.metaKey) || event.deltaY === 0) return null;
+  return event.deltaY > 0 ? 'out' : 'in';
+}
+
+/** How far one arrow key moves the ground, in viewport pixels: an eighth of the map's width. */
+export const KEY_PAN_PX = 120;
+
+export type KeyAction =
+  | { readonly kind: 'pan'; readonly dx: number; readonly dy: number }
+  | { readonly kind: 'zoom'; readonly out: boolean };
+
+/**
+ * What a key does on the focused map, so a keyboard can do all a pointer
+ * can: an arrow pans toward its side, as a drag the other way would, and
+ * plus or minus zoom by a button's step. Any other key, or one held with a
+ * modifier the browser uses for its own shortcuts, does nothing here.
+ */
+export function keyAction(event: {
+  readonly key: string;
+  readonly ctrlKey: boolean;
+  readonly metaKey: boolean;
+  readonly altKey: boolean;
+}): KeyAction | null {
+  if (event.ctrlKey || event.metaKey || event.altKey) return null;
+  switch (event.key) {
+    case 'ArrowLeft':
+      return { kind: 'pan', dx: KEY_PAN_PX, dy: 0 };
+    case 'ArrowRight':
+      return { kind: 'pan', dx: -KEY_PAN_PX, dy: 0 };
+    case 'ArrowUp':
+      return { kind: 'pan', dx: 0, dy: KEY_PAN_PX };
+    case 'ArrowDown':
+      return { kind: 'pan', dx: 0, dy: -KEY_PAN_PX };
+    case '+':
+    case '=':
+      return { kind: 'zoom', out: false };
+    case '-':
+    case '_':
+      return { kind: 'zoom', out: true };
+    default:
+      return null;
+  }
 }
 
 /** One write for a whole drag; a drag that moved nothing writes nothing. */

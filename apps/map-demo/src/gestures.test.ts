@@ -1,19 +1,23 @@
-// The map demo's gestures and buttons against the world they write to: each
-// is one write or none, a drag's preview is the view its release writes, a
-// zoom stays within what a hand should reach and what the world can show and
-// never throws, the projection button keeps the centre and width, and the
-// stop buttons stop at either end of the tour.
+// The map demo's gestures, keys and buttons against the world they write
+// to: each is one write or none, a drag's preview is the view its release
+// writes, a plain wheel leaves the page to scroll, an arrow key pans the way
+// it points, a zoom stays within what a hand should reach and what the world
+// can show and never throws, the projection button keeps the centre and
+// width, and the stop buttons stop at either end of the tour.
 
 import { GLOBE, MAP_MAX_DISTANCE_M, type MapWorld } from '@tabdock/sim-page/map';
 import { describe, expect, it } from 'vitest';
 import { createEarthWorld, FLAT, TOUR_ID } from './earth.ts';
 import {
   draggedView,
+  KEY_PAN_PX,
+  keyAction,
   NARROWEST_HAND_M,
   panBy,
   stepStop,
   toggleGlobe,
   WIDEST_HAND_M,
+  wheelZoom,
   zoomBy,
 } from './gestures.ts';
 
@@ -33,6 +37,51 @@ function writes(world: MapWorld, run: () => void): number {
 }
 
 describe('the map demo gestures', () => {
+  it('zooms on a wheel only with Ctrl or Cmd held, as a pinch arrives, and leaves a plain wheel to scroll', () => {
+    const plain = { ctrlKey: false, metaKey: false };
+    expect(wheelZoom({ ...plain, deltaY: 100 })).toBeNull();
+    expect(wheelZoom({ ...plain, deltaY: -100 })).toBeNull();
+    expect(wheelZoom({ ctrlKey: true, metaKey: false, deltaY: 3 })).toBe('out');
+    expect(wheelZoom({ ctrlKey: true, metaKey: false, deltaY: -3 })).toBe('in');
+    expect(wheelZoom({ ctrlKey: false, metaKey: true, deltaY: -100 })).toBe('in');
+    expect(wheelZoom({ ctrlKey: true, metaKey: false, deltaY: 0 })).toBeNull();
+  });
+
+  it('pans the way an arrow key points, zooms on plus and minus, and leaves modified keys alone', () => {
+    const none = { ctrlKey: false, metaKey: false, altKey: false };
+    const world = createEarthWorld({ viewport: VIEWPORT });
+    world.goToStop(TOUR_ID, 1);
+    const start = world.view();
+    const pressed = (key: string): void => {
+      const action = keyAction({ ...none, key });
+      if (action?.kind !== 'pan') throw new Error(`${key} does not pan`);
+      expect(
+        writes(world, () => {
+          panBy(world, VIEWPORT.widthPx, action.dx, action.dy);
+        }),
+      ).toBe(1);
+    };
+    pressed('ArrowRight');
+    expect(world.view().lon).toBeGreaterThan(start.lon);
+    pressed('ArrowLeft');
+    expect(world.view().lon).toBeCloseTo(start.lon, 9);
+    pressed('ArrowUp');
+    expect(world.view().lat).toBeGreaterThan(start.lat);
+    pressed('ArrowDown');
+    expect(world.view().lat).toBeCloseTo(start.lat, 9);
+    // An eighth of the map's width each time.
+    expect(KEY_PAN_PX).toBe(VIEWPORT.widthPx / 8);
+    expect(keyAction({ ...none, key: '+' })).toEqual({ kind: 'zoom', out: false });
+    expect(keyAction({ ...none, key: '=' })).toEqual({ kind: 'zoom', out: false });
+    expect(keyAction({ ...none, key: '-' })).toEqual({ kind: 'zoom', out: true });
+    expect(keyAction({ ...none, key: 'a' })).toBeNull();
+    expect(keyAction({ ...none, key: 'Tab' })).toBeNull();
+    // The browser's own shortcuts, such as Ctrl and plus for its zoom, stay the browser's.
+    expect(keyAction({ ...none, ctrlKey: true, key: '+' })).toBeNull();
+    expect(keyAction({ ...none, metaKey: true, key: 'ArrowLeft' })).toBeNull();
+    expect(keyAction({ ...none, altKey: true, key: 'ArrowLeft' })).toBeNull();
+  });
+
   it('writes a drag once, at the view its preview showed, and a drag of nothing not at all', () => {
     const world = createEarthWorld({ viewport: VIEWPORT });
     world.goToStop(TOUR_ID, 1);

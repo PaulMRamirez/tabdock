@@ -1,15 +1,22 @@
 // The drawing and capture_view's picture, against a stand-in canvas that
 // records every call (ADR 0039, ADR 0050): one scene always draws the same
 // calls, so one view always captures to the same bytes, and another view
-// draws others; the screen's scale changes sizes only; the fit loop draws at
-// most the viewport wide, lowers a JPEG's quality before halving the width,
-// gives up at the profile's smallest width, and refuses an empty data URL or
-// a type the browser swapped. The page's own state goes out once per change.
+// draws others; the screen's scale changes sizes only; space, not sea, shows
+// past the flat map's poles; the fit loop draws at most the viewport wide,
+// lowers a JPEG's quality before drawing a fifth narrower, draws names larger
+// on a narrower capture, gives up at the profile's smallest width, and
+// refuses an empty data URL or a type the browser swapped. The page's own
+// state goes out once per change.
 
 import { MAP_MIN_CAPTURE_WIDTH_PX } from '@tabdock/sim-page/map';
 import { describe, expect, it } from 'vitest';
-import { type CaptureCanvas, captureMap } from './capture.ts';
-import { drawMap, prepareEarth, sceneOf } from './draw.ts';
+import {
+  CAPTURE_MAX_LABEL_SCALE,
+  type CaptureCanvas,
+  captureLabelScale,
+  captureMap,
+} from './capture.ts';
+import { COLORS, drawMap, prepareEarth, sceneOf } from './draw.ts';
 import { createEarthWorld, earthGeography, featureRanks, TOUR_ID } from './earth.ts';
 import { statePublisher } from './publish.ts';
 
@@ -84,6 +91,33 @@ describe('drawMap', () => {
     expect(shapes(scaled).slice(0, 200)).toEqual(shapes(plain).slice(0, 200));
   });
 
+  it('shows space, not sea, past the poles of a flat map zoomed far out', () => {
+    const world = createEarthWorld({ viewport: VIEWPORT });
+    /** The sea's band: the path traced after the ocean colour is set, up to its fill. */
+    const seaBand = (): { top: number; bottom: number; first: string[] } => {
+      const log = drawn(world);
+      const start = log.indexOf(`fillStyle=${COLORS.ocean}`);
+      const end = log.indexOf('fill()', start);
+      const ys = log
+        .slice(start, end)
+        .filter((call) => call.startsWith('moveTo') || call.startsWith('lineTo'))
+        .map((call) => Number(/,(-?[\d.]+)\)$/.exec(call)?.[1]));
+      return { top: Math.min(...ys), bottom: Math.max(...ys), first: log.slice(0, start) };
+    };
+    world.setView({ projection: 'equirectangular', lon: -30, lat: 20, widthM: 100_000_000 });
+    const far = seaBand();
+    // Space fills the frame first, then the sea only between the poles.
+    expect(far.first).toContain(`fillStyle=${COLORS.space}`);
+    expect(far.first).toContain('fillRect(0,0,960,540)');
+    expect(far.top).toBeGreaterThan(0);
+    expect(far.bottom).toBeLessThan(VIEWPORT.heightPx);
+    // At a stop the band runs past the frame, so the sea fills it as before.
+    world.goToStop(TOUR_ID, 1);
+    const near = seaBand();
+    expect(near.top).toBeLessThan(0);
+    expect(near.bottom).toBeGreaterThan(VIEWPORT.heightPx);
+  });
+
   it('fills a layer only while it is shown, at its opacity', () => {
     const world = createEarthWorld({ viewport: VIEWPORT });
     world.goToStop(TOUR_ID, 0);
@@ -103,9 +137,9 @@ describe('drawMap', () => {
 function standIn(options: {
   bytesFor?: (width: number, quality: number | undefined) => number;
   encode?: (type: string) => string;
-}): { canvas: CaptureCanvas; tries: string[] } {
+}): { canvas: CaptureCanvas; tries: string[]; log: string[] } {
   const tries: string[] = [];
-  const { ctx } = recorder();
+  const { ctx, log } = recorder();
   const canvas: CaptureCanvas = {
     width: 0,
     height: 0,
@@ -117,7 +151,7 @@ function standIn(options: {
       return `data:${type};base64,${'A'.repeat(Math.ceil(bytes / 3) * 4)}`;
     },
   };
-  return { canvas, tries };
+  return { canvas, tries, log };
 }
 
 describe('captureMap', () => {
@@ -151,21 +185,47 @@ describe('captureMap', () => {
     expect(wide.tries).toEqual(['960x540@undefined']);
   });
 
-  it('lowers a JPEG quality first, then halves the width, until the picture fits', () => {
+  it('lowers a JPEG quality first, then draws a fifth narrower, until the picture fits', () => {
     const { canvas, tries } = standIn({
-      bytesFor: (width, quality) => (width <= 240 && quality === 0.6 ? 9_000 : 90_000),
+      bytesFor: (width, quality) => (width <= 500 && quality === 0.6 ? 9_000 : 90_000),
     });
     expect(
       captureMap(scene, earth, VIEWPORT, { maxWidthPx: 960, format: 'jpeg' }, 10_000, () => canvas),
-    ).toMatchObject({ mimeType: 'image/jpeg', widthPx: 240, heightPx: 135 });
+    ).toMatchObject({ mimeType: 'image/jpeg', widthPx: 491, heightPx: 276 });
     expect(tries).toEqual([
       '960x540@0.85',
       '960x540@0.6',
-      '480x270@0.85',
-      '480x270@0.6',
-      '240x135@0.85',
-      '240x135@0.6',
+      '768x432@0.85',
+      '768x432@0.6',
+      '614x345@0.85',
+      '614x345@0.6',
+      '491x276@0.85',
+      '491x276@0.6',
     ]);
+  });
+
+  it("keeps a PNG just over the cap near the viewport's width, not half of it", () => {
+    // The review's stop 1: 960 wide is over the cap, 768 fits.
+    const { canvas, tries } = standIn({ bytesFor: (width) => (width > 800 ? 70_000 : 60_000) });
+    expect(
+      captureMap(scene, earth, VIEWPORT, { maxWidthPx: 1024, format: 'png' }, 65_536, () => canvas),
+    ).toMatchObject({ mimeType: 'image/png', widthPx: 768, heightPx: 432 });
+    expect(tries).toEqual(['960x540@undefined', '768x432@undefined']);
+  });
+
+  it('draws names larger on a narrower capture, up to twice, and at their own size at full width', () => {
+    expect(captureLabelScale(960, VIEWPORT)).toBe(1);
+    expect(captureLabelScale(768, VIEWPORT)).toBe(1.25);
+    expect(captureLabelScale(480, VIEWPORT)).toBe(2);
+    expect(captureLabelScale(64, VIEWPORT)).toBe(CAPTURE_MAX_LABEL_SCALE);
+    const fonts = (maxWidthPx: number): string[] => {
+      const { canvas, log } = standIn({});
+      captureMap(scene, earth, VIEWPORT, { maxWidthPx, format: 'png' }, 65_536, () => canvas);
+      return log.filter((call) => call.startsWith('font='));
+    };
+    expect(fonts(960)).toEqual(['font=13px sans-serif']);
+    expect(fonts(768)).toEqual(['font=16.25px sans-serif']);
+    expect(fonts(480)).toEqual(['font=26px sans-serif']);
   });
 
   it(`gives up at ${String(MAP_MIN_CAPTURE_WIDTH_PX)} pixels wide, saying what to try`, () => {

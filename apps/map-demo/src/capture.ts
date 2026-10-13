@@ -4,10 +4,13 @@
 // state alone, so one view gives the same bytes every time and another view
 // other bytes. The page fits its own image, since neither the adapter nor the
 // relay re-encodes one: JPEG lowers its quality first, then each format
-// halves its width, until the encoding is under the relay's cap. A canvas
+// draws a fifth narrower, until the encoding is under the relay's cap, so a
+// picture just over the cap keeps most of its width rather than half. A
+// capture narrower than the viewport draws its names, dots and lines larger,
+// up to twice, as the screen does on a phone, so they stay legible. A canvas
 // encodes nothing as "data:," and an unsupported type as PNG, so both are
 // refused rather than sent as something they are not. It follows
-// tests/map-page's fit loop and imports nothing from it.
+// tests/map-page's fit loop, which still halves, and imports nothing from it.
 
 import {
   MAP_MIN_CAPTURE_WIDTH_PX,
@@ -25,8 +28,19 @@ export interface CaptureCanvas {
   toDataURL(type: string, quality?: number): string;
 }
 
-/** JPEG tries each in turn before halving the width; PNG takes no quality, so it tries once a width. */
+/** JPEG tries each in turn before a narrower width; PNG takes no quality, so it tries once a width. */
 const JPEG_QUALITIES = [0.85, 0.6] as const;
+
+/** Each width past the first is this much of the last: 960, 768, 614, 491 and on. */
+export const CAPTURE_WIDTH_STEP = 0.8;
+
+/** The most a capture enlarges its names, dots and lines over the viewport's. */
+export const CAPTURE_MAX_LABEL_SCALE = 2;
+
+/** How much larger a capture `widthPx` wide draws its names than the viewport does. */
+export function captureLabelScale(widthPx: number, viewport: MapViewport): number {
+  return Math.min(CAPTURE_MAX_LABEL_SCALE, Math.max(1, viewport.widthPx / widthPx));
+}
 
 /** Decoded bytes of base64 text, from its length and padding alone. */
 function decodedBytes(base64: string): number {
@@ -62,7 +76,7 @@ export function captureMap(
     canvas.width = width;
     canvas.height = Math.max(1, Math.round(viewport.heightPx * scale));
     ctx.setTransform(scale, 0, 0, scale, 0, 0);
-    drawMap(ctx, scene, viewport, earth);
+    drawMap(ctx, scene, viewport, earth, { scale: captureLabelScale(width, viewport) });
     for (const quality of request.format === 'png' ? [undefined] : JPEG_QUALITIES) {
       const url = canvas.toDataURL(mimeType, quality);
       if (url === 'data:,') throw new Error('the map canvas has no size to capture');
@@ -75,7 +89,7 @@ export function captureMap(
       }
     }
     if (width <= MAP_MIN_CAPTURE_WIDTH_PX) break;
-    width = Math.max(MAP_MIN_CAPTURE_WIDTH_PX, Math.floor(width / 2));
+    width = Math.max(MAP_MIN_CAPTURE_WIDTH_PX, Math.floor(width * CAPTURE_WIDTH_STEP));
   }
   throw new Error(
     `the view does not fit in ${String(maxBytes)} bytes as ${request.format}, even ${String(MAP_MIN_CAPTURE_WIDTH_PX)} pixels wide; try jpeg`,

@@ -39,7 +39,8 @@ const SUBJECTS: readonly (readonly string[])[] = [
   ['caspian-sea'],
   ['lake-baikal'],
   [...GREAT_LAKES],
-  ['lake-victoria'],
+  // Wide enough to show the lake beside its neighbour, not filling the frame.
+  ['lake-victoria', 'lake-tanganyika'],
   ['madagascar'],
 ];
 

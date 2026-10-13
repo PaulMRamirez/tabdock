@@ -20,11 +20,27 @@ import {
   type MapViewport,
 } from '@tabdock/sim-page/map';
 import { captureMap } from './capture.ts';
-import { mountConnectBar, mountConnectForm, tabStore, wasChosen } from './connect.ts';
+import {
+  LINK_HINT_MS,
+  linkStatus,
+  mountConnectBar,
+  mountConnectForm,
+  tabStore,
+  wasChosen,
+} from './connect.ts';
 import { ATTRIBUTION } from './data/natural-earth-110m.ts';
 import { drawMap, prepareEarth, sceneOf } from './draw.ts';
 import { createEarthWorld, earthGeography, FLAT, featureRanks, TOUR_ID } from './earth.ts';
-import { BUTTON_ZOOM_STEP, draggedView, panBy, stepStop, toggleGlobe, zoomBy } from './gestures.ts';
+import {
+  BUTTON_ZOOM_STEP,
+  draggedView,
+  keyAction,
+  panBy,
+  stepStop,
+  toggleGlobe,
+  wheelZoom,
+  zoomBy,
+} from './gestures.ts';
 import { mountPanel } from './panel.ts';
 import { statePublisher } from './publish.ts';
 import './webmcp.ts';
@@ -127,16 +143,30 @@ canvas.addEventListener('pointercancel', () => {
   dragView = null;
   scheduleDraw();
 });
+// A plain wheel scrolls the page past the map; Ctrl or Cmd with it, which is
+// how a trackpad pinch arrives, zooms the map instead of the page.
 canvas.addEventListener(
   'wheel',
   (event) => {
+    const zoom = wheelZoom(event);
+    if (zoom === null) return;
     event.preventDefault();
-    if (event.deltaY !== 0) zoomBy(world, event.deltaY > 0);
+    zoomBy(world, zoom === 'out');
   },
   { passive: false },
 );
+// The focused map pans on the arrow keys and zooms on plus and minus, so a
+// keyboard reaches all a pointer does.
+canvas.addEventListener('keydown', (event) => {
+  const action = keyAction(event);
+  if (action === null) return;
+  event.preventDefault();
+  if (action.kind === 'pan') panBy(world, VIEWPORT.widthPx, action.dx, action.dy);
+  else zoomBy(world, action.out, BUTTON_ZOOM_STEP);
+});
 
-// Whatever a gesture does, a button does too, since a phone has no wheel.
+// Zoom, projection and the tour each have a button too, since a phone has
+// no wheel or keys; panning is a drag, a touch or the arrow keys.
 const actions: Record<string, () => void> = {
   'zoom-in': () => {
     zoomBy(world, false, BUTTON_ZOOM_STEP);
@@ -252,11 +282,25 @@ function attachToRelay(registered: string): void {
     publish = statePublisher(world, (state) => {
       linked.publishState(state);
     });
-    // The status line names the relay, so the person at the tab can see where it dials.
+    // The status line names the relay, so the person at the tab can see where
+    // it dials, and once a while has passed with no link, what to check.
+    let everLinked = false;
+    let stalled = false;
     const show = (): void => {
-      statusLine.textContent = `${registered}; Tabdock relay ${relay.host}: ${linked.state.link}`;
+      if (linked.state.link === 'linked') everLinked = true;
+      statusLine.textContent = linkStatus(
+        registered,
+        relay.host,
+        linked.state.link,
+        stalled && !everLinked,
+        window.location.origin,
+      );
     };
     linked.on('state', show);
+    setTimeout(() => {
+      stalled = true;
+      show();
+    }, LINK_HINT_MS);
     show();
     publish();
     document.documentElement.dataset.link = 'chosen';

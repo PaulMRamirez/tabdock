@@ -1,10 +1,11 @@
-// The words around the map: the line naming the view, the tour panel and the
-// strip of recent tool calls. Everything here is set as text, never markup:
+// The words around the map: the line naming the view, the tour panel, which
+// says so once the map has left the current stop, and the strip of recent
+// tool calls. Everything here is set as text, never markup:
 // a stop's title and text are whatever edit_stop last wrote, which any
 // driver may set, and a call's arguments may be anyone's words, so the strip
 // names only the tool and how it ended (S7).
 
-import { GLOBE, type MapView, type MapWorld } from '@tabdock/sim-page/map';
+import { GLOBE, type MapStopView, type MapView, type MapWorld } from '@tabdock/sim-page/map';
 
 /** Lines the call strip keeps. */
 export const CALLS_SHOWN = 12;
@@ -34,18 +35,42 @@ export interface StopWords {
   readonly text: string;
 }
 
-/** The current stop of the tour, edits included, or words saying the camera has left it. */
+/** What the tour card says once the map has left the current stop. */
+export const MOVED_TEXT =
+  'The map has left this stop. Press Next stop or Previous stop, or ask your client to go back.';
+
+/**
+ * Whether a view still shows a stop: the same body and projection, its
+ * centre within 0.01 degree and its width within 1 percent. The world keeps
+ * the last stop it went to however the camera moves after (the profile's
+ * own rule), so the page compares views to keep its words true.
+ */
+export function showsStop(view: MapView, stop: MapStopView): boolean {
+  if (view.body !== stop.body || view.projection !== stop.projection) return false;
+  const lon = Math.abs(((((view.lon - stop.lon) % 360) + 540) % 360) - 180);
+  return (
+    lon <= 0.01 &&
+    Math.abs(view.lat - stop.lat) <= 0.01 &&
+    Math.abs(view.widthM - stop.widthM) <= stop.widthM * 0.01
+  );
+}
+
+/**
+ * The current stop of the tour, edits included; once the map has moved off
+ * it, its place and title with words saying so; or, before any stop, how to
+ * begin.
+ */
 export function stopWords(world: MapWorld, tourId: string): StopWords {
   const current = world.current;
   if (current?.walkthroughId !== tourId) {
     return { place: 'Tour', title: 'Pick a stop', text: 'Press Next stop to begin the tour.' };
   }
   const stop = world.stop(tourId, current.stopIndex);
-  return {
-    place: `Stop ${String(stop.index + 1)} of ${String(stop.stopCount)}`,
-    title: stop.title,
-    text: stop.text,
-  };
+  const place = `Stop ${String(stop.index + 1)} of ${String(stop.stopCount)}`;
+  if (!showsStop(world.view(), stop.view)) {
+    return { place: `${place}, map moved`, title: stop.title, text: MOVED_TEXT };
+  }
+  return { place, title: stop.title, text: stop.text };
 }
 
 export interface Panel {

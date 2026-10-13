@@ -10,6 +10,8 @@ import {
   type ChoiceStore,
   choiceKey,
   connectHref,
+  LINK_HINT_MS,
+  linkStatus,
   rememberChoice,
   wasChosen,
 } from './connect.ts';
@@ -67,5 +69,23 @@ describe("the map demo's remembered choice", () => {
     expect(connectHref('https://site.example/map/?invites=all&relay=ws://x/page#top', RELAY)).toBe(
       `https://site.example/map/?relay=${encodeURIComponent(RELAY)}`,
     );
+  });
+});
+
+describe("the map demo's status line once a relay is chosen", () => {
+  const registered = '14 tools registered';
+  const origin = 'https://demo.example';
+
+  it('names the relay and its link, and after a while unlinked, what to check', () => {
+    expect(linkStatus(registered, 'relay.example', 'linked', false, origin)).toBe(
+      '14 tools registered; Tabdock relay relay.example: linked',
+    );
+    expect(linkStatus(registered, '127.0.0.1:9', 'reconnecting', false, origin)).toBe(
+      '14 tools registered; Tabdock relay 127.0.0.1:9: reconnecting',
+    );
+    expect(linkStatus(registered, '127.0.0.1:9', 'reconnecting', true, origin)).toBe(
+      '14 tools registered; Tabdock relay 127.0.0.1:9: reconnecting; still not linked: check that the relay is running and lists https://demo.example in TABDOCK_ALLOWED_ORIGINS',
+    );
+    expect(LINK_HINT_MS).toBe(10_000);
   });
 });
