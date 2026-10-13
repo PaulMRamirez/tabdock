@@ -689,12 +689,17 @@ describe('every way a token ends (S8, S14)', () => {
     const { relay, page, alice } = await room({ timings: { attachmentIdleMs: 1500 } });
     const { token, tokenId, userId } = await attachedAgent(relay, page);
     // Alice, its sponsor, keeps using the page, so her own idle end cannot close it first.
+    // Every call is settled before the test ends: one still in flight at teardown is
+    // rejected as her client closes, with nothing listening (seen on CI).
+    const keptAlive: Promise<unknown>[] = [];
     const keepAlive = setInterval(() => {
-      void call(alice, 'call_page_tool', {
-        page: page.pageId,
-        tool: READ_TOOL.name,
-        arguments: {},
-      });
+      keptAlive.push(
+        call(alice, 'call_page_tool', {
+          page: page.pageId,
+          tool: READ_TOOL.name,
+          arguments: {},
+        }).catch(() => undefined),
+      );
     }, 250);
     try {
       await expect
@@ -702,6 +707,7 @@ describe('every way a token ends (S8, S14)', () => {
         .toBe(1);
     } finally {
       clearInterval(keepAlive);
+      await Promise.all(keptAlive);
     }
     await page.sync();
     expect(records(relay, 'agent_closed').map((event) => [event.tokenId, event.reason])).toEqual([

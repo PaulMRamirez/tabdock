@@ -805,14 +805,17 @@ describe('frames that change nothing, per socket and per address (S9, ADR 0023)'
     const opened = await page();
     const alice = await client(ALICE);
     const bob = await client(BOB);
+    // Both pair_page calls are settled before the test ends, so none is still in
+    // flight when teardown closes its client.
+    const asked: Promise<unknown>[] = [];
     // Alice's request runs out on the relay before the page's own denial arrives.
-    void callTool(alice, 'pair_page', { code: opened.code });
+    asked.push(callTool(alice, 'pair_page', { code: opened.code }).catch(() => undefined));
     const timedOut = await opened.next('attach_request');
     await eventually(() => count(relay.lines, 'attach request expired unanswered') === 1);
     opened.send({ t: 'attach_decision', requestId: timedOut.requestId, allow: false });
     // Bob's ends with the operator's revoke, which the page's denial follows.
     await eventually(() => opened.all('pairing').length > 0);
-    void callTool(bob, 'pair_page', { code: opened.code });
+    asked.push(callTool(bob, 'pair_page', { code: opened.code }).catch(() => undefined));
     const revoked = await opened.next('attach_request');
     opened.send({ t: 'revoke', userId: 'bob' });
     opened.send({ t: 'attach_decision', requestId: revoked.requestId, allow: false });
@@ -829,6 +832,7 @@ describe('frames that change nothing, per socket and per address (S9, ADR 0023)'
     expect(await summaries(relay)).toEqual([
       expect.objectContaining({ repeated: 1, frames: { attach_decision: 1 } }),
     ]);
+    await Promise.all(asked);
   });
 });
 
