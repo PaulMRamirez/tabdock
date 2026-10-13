@@ -29,3 +29,7 @@ The 6 leg tests the release pages will meet, not a beta, and the demo still show
 ## Note from the docs pass (12 October 2026)
 
 SPEC's dated line now follows ADR 0049, which refreshed it to 12 October and to ADRs 0038 to 0049 and their notes; the line this record set, "last amended 10 October 2026 by ADRs 0038 to 0048", is history.
+
+## Note on Dependabot (13 October 2026)
+
+Dependabot's pull requests #25 and #27 of 11 October moved the demo, both map pages and the baseline's local relay to MCP-B 6.0.0, against this record's decision, and without updating the lockfile, so every job failed at install. Both are closed. Since a closed grouped pull request comes back with the group's next update, `.github/dependabot.yml` now takes MCP-B updates within a major only, as it already does for Node; moving the demo to 6 stays a backlog row and a person's change. `deploy-files.test.ts` holds that rule, and `mcpb-versions.test.ts` now holds the map demo's 5.1.0 pin beside the demo's.

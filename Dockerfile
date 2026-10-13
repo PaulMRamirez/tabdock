@@ -13,7 +13,7 @@
 # the audit directory needs to be writable. scripts/smoke-image.ts checks both.
 
 # node:22-bookworm-slim, the multi-platform index.
-FROM node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c AS build
+FROM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392 AS build
 WORKDIR /app
 ENV CI=true
 # Corepack installs the pnpm version packageManager names; nothing else is fetched outside the lockfile.
