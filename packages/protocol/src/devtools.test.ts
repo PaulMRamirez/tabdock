@@ -166,16 +166,31 @@ describe('the DevTools reply schemas', () => {
     expect(quad([1, 2, 3, 4, 5, 6, 7, Number.NaN])).toBe(false);
     expect(quad([1, 2, 3, 4, 5, 6, 7, '8'])).toBe(false);
     expect(DevToolsNodeAtSchema.safeParse({}).success).toBe(false);
-    const view = (cssVisualViewport: unknown): boolean =>
-      DevToolsLayoutMetricsSchema.safeParse({ cssVisualViewport }).success;
-    const fine = { pageX: 0, pageY: 135.5, clientWidth: 1280, clientHeight: 720 };
+    const layout = { pageX: 0, pageY: 100, clientWidth: 1280, clientHeight: 720 };
+    const view = (cssVisualViewport: unknown, cssLayoutViewport: unknown = layout): boolean =>
+      DevToolsLayoutMetricsSchema.safeParse({ cssLayoutViewport, cssVisualViewport }).success;
+    const fine = {
+      offsetX: 0,
+      offsetY: 35.5,
+      pageX: 0,
+      pageY: 135.5,
+      clientWidth: 1280,
+      clientHeight: 720,
+      scale: 1,
+      zoom: 1,
+    };
     expect(view(fine)).toBe(true);
+    // A right-to-left page scrolled left.
+    expect(view({ ...fine, pageX: -401 })).toBe(true);
     expect(view({ ...fine, pageY: Number.NaN })).toBe(false);
     expect(view({ ...fine, pageX: Number.POSITIVE_INFINITY })).toBe(false);
+    expect(view({ ...fine, offsetY: undefined })).toBe(false);
     expect(view({ ...fine, clientHeight: -1 })).toBe(false);
     expect(view({ ...fine, clientWidth: '1280' })).toBe(false);
     expect(view({ pageX: 0, pageY: 0 })).toBe(false);
-    expect(DevToolsLayoutMetricsSchema.safeParse({ cssLayoutViewport: fine }).success).toBe(false);
+    expect(view(fine, { ...layout, pageY: '100' })).toBe(false);
+    expect(view(fine, {})).toBe(false);
+    expect(DevToolsLayoutMetricsSchema.safeParse({ cssVisualViewport: fine }).success).toBe(false);
   });
 });
 

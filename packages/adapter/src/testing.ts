@@ -336,6 +336,43 @@ interface ButtonAt {
   y: number;
 }
 
+/** Where the visual viewport sits in the document, and how much of it shows. */
+interface ViewportPlace {
+  pageX: number;
+  pageY: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * The visual viewport's place, or null if DevTools gave none. Its pageY is the
+ * document's scroll plus the visual viewport's own offset, which is the very
+ * offset the hit test takes away, except where Chrome has made a scrolling
+ * element the page's scroller in the document's place (Android's implicit
+ * root scroller): pageY then counts that element's scroll and the hit test
+ * does not, so a check there could land beside the press. That throws, since
+ * no point the helper can work out is sure to be where its press lands. An
+ * element scrolled sideways in the document's place would do the same across,
+ * which this cannot see: on a right-to-left page the layout viewport's pageX
+ * is a position, not a scroll, so there is nothing to compare pageX with.
+ */
+async function viewportPlace(cdp: DevToolsSession): Promise<ViewportPlace | null> {
+  const metrics = await askOrNull(cdp, 'Page.getLayoutMetrics', {}, DevToolsLayoutMetricsSchema);
+  if (metrics === null) return null;
+  const view = metrics.cssVisualViewport;
+  if (Math.abs(metrics.cssLayoutViewport.pageY + view.offsetY - view.pageY) > 1) {
+    throw new WidgetTestError(
+      'the page scrolls an element in place of the document (an implicit root scroller), so no check can say where a press would land',
+    );
+  }
+  return {
+    pageX: view.pageX,
+    pageY: view.pageY,
+    width: view.clientWidth,
+    height: view.clientHeight,
+  };
+}
+
 /**
  * The target button and the point a click would take, if it is armed now,
  * that point shows in the viewport, and a hit test at that point lands on it
@@ -346,6 +383,9 @@ interface ButtonAt {
  * from the document's, so on a scrolled page the hit test is moved by the
  * viewport's place in the document: otherwise it checks a spot as far from
  * the press as the page has scrolled, and may wave through a covered button.
+ * That place is read before the box and again after the hit test; when a
+ * scroll between them has moved one off the other, the button is not clickable
+ * yet.
  */
 async function clickable(
   cdp: DevToolsSession,
@@ -359,29 +399,30 @@ async function clickable(
   if (button === null || attribute(button, 'data-armed') === 'false') return null;
   const { backendNodeId } = button;
   await cdp.send('DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(() => undefined);
+  const before = await viewportPlace(cdp);
+  if (before === null) return null;
   const box = await askOrNull(cdp, 'DOM.getBoxModel', { backendNodeId }, DevToolsBoxModelSchema);
   if (box === null) return null;
   const [x1 = 0, y1 = 0, , , x3 = 0, y3 = 0] = box.model.content;
-  // Whole pixels, so the press lands on the point the hit test checked (to
-  // within half a pixel on a page scrolled by a fraction of one).
-  const at = { x: Math.round((x1 + x3) / 2), y: Math.round((y1 + y3) / 2) };
-  const metrics = await askOrNull(cdp, 'Page.getLayoutMetrics', {}, DevToolsLayoutMetricsSchema);
-  if (metrics === null) return null;
-  const view = metrics.cssVisualViewport;
+  // The hit test takes whole pixels of the document and the press any point of
+  // the viewport, so the press goes to the very point the hit test checks.
+  const page = {
+    x: Math.round((x1 + x3) / 2 + before.pageX),
+    y: Math.round((y1 + y3) / 2 + before.pageY),
+  };
+  const at = { x: page.x - before.pageX, y: page.y - before.pageY };
   // A press outside the viewport reaches nothing, though a hit test there may
   // still find the button in the document.
-  if (at.x < 0 || at.y < 0 || at.x >= view.clientWidth || at.y >= view.clientHeight) return null;
+  if (at.x < 0 || at.y < 0 || at.x >= before.width || at.y >= before.height) return null;
   const hit = await askOrNull(
     cdp,
     'DOM.getNodeForLocation',
-    {
-      x: Math.round(at.x + view.pageX),
-      y: Math.round(at.y + view.pageY),
-      ignorePointerEventsNone: true,
-    },
+    { ...page, ignorePointerEventsNone: true },
     DevToolsNodeAtSchema,
   );
   if (hit === null || !contains(button, hit.backendNodeId)) return null;
+  const after = await viewportPlace(cdp);
+  if (after === null || after.pageX !== before.pageX || after.pageY !== before.pageY) return null;
   return { backendNodeId, ...at };
 }
 

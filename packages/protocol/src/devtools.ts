@@ -83,14 +83,17 @@ export type DevToolsNodeAt = z.infer<typeof DevToolsNodeAtSchema>;
 const CssSizeSchema = z.number().check(z.nonnegative());
 
 /**
- * Page.getLayoutMetrics, its visual viewport in CSS pixels: where it sits in
- * the document and how much of it shows. DOM.getBoxModel and
- * Input.dispatchMouseEvent count from the visual viewport's corner, while
- * DOM.getNodeForLocation counts from the document's, so the helper adds
- * pageX and pageY to hit-test the very point it will press on a scrolled page.
+ * Page.getLayoutMetrics, in CSS pixels: where the visual viewport sits in the
+ * document, how much of it shows, and the layout viewport's scroll beside it.
+ * DOM.getBoxModel and Input.dispatchMouseEvent count from the visual
+ * viewport's corner, while DOM.getNodeForLocation counts from the document's,
+ * so the helper adds pageX and pageY to hit-test the very point it will press
+ * on a scrolled page. pageX is negative on a right-to-left page scrolled left.
  */
 export const DevToolsLayoutMetricsSchema = z.object({
+  cssLayoutViewport: z.object({ pageY: z.number() }),
   cssVisualViewport: z.object({
+    offsetY: z.number(),
     pageX: z.number(),
     pageY: z.number(),
     clientWidth: CssSizeSchema,

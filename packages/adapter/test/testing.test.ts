@@ -172,8 +172,12 @@ interface Sent {
 class FakeSession implements DevToolsSession {
   readonly sent: Sent[] = [];
   root: FakeNode;
-  /** Where the viewport's corner sits in the document. */
+  /** Where the visual viewport's corner sits in the document. */
   scroll = { x: 0, y: 0 };
+  /** The visual viewport's own offset inside the layout viewport, as a pinch zoom moves it. */
+  offset = { x: 0, y: 0 };
+  /** An element's scroll that Chrome counts in pageY but the hit test does not (an implicit root scroller). */
+  rootScroll = { y: 0 };
   viewport = { width: 1280, height: 800 };
   answer: (method: string, params: Record<string, unknown>) => unknown = () => undefined;
   onSend: (method: string, params: Record<string, unknown>) => void = () => undefined;
@@ -217,17 +221,23 @@ class FakeSession implements DevToolsSession {
         return Promise.resolve({ model: { content: quad, width, height } });
       }
       case 'Page.getLayoutMetrics': {
-        const view = {
-          offsetX: 0,
-          offsetY: 0,
-          pageX: this.scroll.x,
-          pageY: this.scroll.y,
-          clientWidth: this.viewport.width,
-          clientHeight: this.viewport.height,
-          scale: 1,
-          zoom: 1,
-        };
-        return Promise.resolve({ cssVisualViewport: view, cssLayoutViewport: view });
+        const size = { clientWidth: this.viewport.width, clientHeight: this.viewport.height };
+        return Promise.resolve({
+          cssLayoutViewport: {
+            pageX: this.scroll.x - this.offset.x,
+            pageY: this.scroll.y - this.offset.y,
+            ...size,
+          },
+          cssVisualViewport: {
+            offsetX: this.offset.x,
+            offsetY: this.offset.y,
+            pageX: this.scroll.x,
+            pageY: this.scroll.y + this.rootScroll.y,
+            ...size,
+            scale: 1,
+            zoom: 1,
+          },
+        });
       }
       case 'DOM.getNodeForLocation': {
         const id = this.hit(Number(p.x), Number(p.y));
@@ -376,7 +386,7 @@ describe('replies in the wrong shape', () => {
       'layout metrics with no visual viewport',
       (cdp) => {
         cdp.answer = (method) =>
-          method === 'Page.getLayoutMetrics' ? { cssLayoutViewport: {} } : undefined;
+          method === 'Page.getLayoutMetrics' ? { cssLayoutViewport: { pageY: 0 } } : undefined;
       },
     ],
     [
@@ -667,6 +677,78 @@ describe('arming and the hit test', () => {
     cdp.scroll = { x: 0, y: 200 };
     await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
     expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: 260, y: 250 });
+  });
+
+  it('counts the visual viewport’s own offset once, since pageY already holds it', async () => {
+    const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+    // The document scrolled 100 px and a pinch zoom moved the visual viewport 35 px further.
+    cdp.scroll = { x: 0, y: 135 };
+    cdp.offset = { x: 0, y: 35 };
+    await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
+    expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: 260, y: 315 });
+    expect(new Set(cdp.hitTests().map((at) => JSON.stringify(at)))).toEqual(
+      new Set([JSON.stringify({ x: 260, y: 450 })]),
+    );
+  });
+
+  it('refuses at once, pressing nothing, where an element scrolls in the document’s place', async () => {
+    const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+    cdp.rootScroll = { y: 6 };
+    const refusal =
+      'the page scrolls an element in place of the document (an implicit root scroller), so no check can say where a press would land';
+    await expect(
+      clickInWidget(cdp, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 2000 }),
+    ).rejects.toThrow(new WidgetTestError(refusal));
+    await expect(widgetButton(cdp, { action: 'deny', requestId: 'req-1' })).rejects.toThrow(
+      new WidgetTestError(refusal),
+    );
+    expect(cdp.mouse()).toEqual([]);
+    expect(cdp.hitTests()).toEqual([]);
+
+    // Scrolled back to its top, the element and the document agree again.
+    cdp.rootScroll = { y: 0 };
+    await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
+    expect(cdp.presses()).toBe(1);
+  });
+
+  it('presses nowhere a scroll during its check left stale, and presses where the page settles', async () => {
+    const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+    cdp.scroll = { x: 0, y: 135 };
+    let hitTests = 0;
+    cdp.onSend = (method) => {
+      // The page scrolls 50 px while the check made just before the press is under way.
+      if (method === 'DOM.getNodeForLocation' && ++hitTests === 2) cdp.scroll = { x: 0, y: 185 };
+    };
+    await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
+    const presses = cdp.mouse().filter((event) => event.type === 'mousePressed');
+    // Deny's centre, (260, 450) in the document, now 185 px up the viewport, never 135.
+    expect(presses).toEqual([{ type: 'mousePressed', x: 260, y: 265 }]);
+  });
+
+  it('presses no centre on the viewport’s last edge, and one a pixel inside it', async () => {
+    // Deny's centre is 450 px down the page.
+    const edge = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+    edge.viewport = { width: 1280, height: 450 };
+    await expect(
+      clickInWidget(edge, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 300 }),
+    ).rejects.toThrow(WidgetTestError);
+    expect(edge.mouse()).toEqual([]);
+    const inside = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+    inside.viewport = { width: 1280, height: 451 };
+    await clickInWidget(inside, { action: 'deny', requestId: 'req-1' });
+    expect(inside.mouse()[1]).toEqual({ type: 'mousePressed', x: 260, y: 450 });
+  });
+
+  it('presses the very point it hit-tests on a page scrolled by a fraction of a pixel', async () => {
+    const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+    cdp.scroll = { x: 0.25, y: 134.6 };
+    await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
+    const press = cdp.mouse()[1];
+    const [hit] = cdp.hitTests();
+    expect(hit).toEqual({ x: 260, y: 450 });
+    expect(press?.type).toBe('mousePressed');
+    expect(Number(press?.x) + 0.25).toBeCloseTo(260, 9);
+    expect(Number(press?.y) + 134.6).toBeCloseTo(450, 9);
   });
 
   it('refuses an action the widget does not have', async () => {

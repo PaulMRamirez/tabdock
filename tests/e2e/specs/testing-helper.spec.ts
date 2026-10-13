@@ -138,59 +138,71 @@ test.describe('on a scrolled page', () => {
     await pairsAsDriver(page, 400);
   });
 
-  test('presses nothing while a page element covers the centre of Allow, though the spot it scrolled from is clear', async ({
-    page,
-  }) => {
-    const { code, cdp } = await openBoard(page);
-    // A few pixels, so the spot a hit test in the viewport's coordinates
-    // would check still lies on Allow, above the cover.
-    await scrollBoard(page, 6);
-    const client = await connectMcp(tabdock.relay, tabdock.users.alice, CI);
-    try {
-      const pending = callTool(client, 'pair_page', { code });
-      const requestId = await waitForDock(page, (s) => s.pendingRequests[0]?.requestId);
-      const target = { action: 'approve-driver', requestId } as const;
-      const at = await widgetButton(cdp, target);
+  // A cover that takes clicks catches the press; one that lets clicks through
+  // (pointer-events: none) passes it to Allow, which would approve.
+  for (const cover of [
+    { kind: 'that takes clicks', passThrough: false },
+    { kind: 'that lets clicks through to it', passThrough: true },
+  ]) {
+    test(`presses nothing while a page element ${cover.kind} covers the centre of Allow, though the spot it scrolled from is clear`, async ({
+      page,
+    }) => {
+      const { code, cdp } = await openBoard(page);
+      // A few pixels, so the spot a hit test in the viewport's coordinates
+      // would check still lies on Allow, above the cover.
+      await scrollBoard(page, 6);
+      const client = await connectMcp(tabdock.relay, tabdock.users.alice, CI);
+      try {
+        const pending = callTool(client, 'pair_page', { code });
+        const requestId = await waitForDock(page, (s) => s.pendingRequests[0]?.requestId);
+        const target = { action: 'approve-driver', requestId } as const;
+        const at = await widgetButton(cdp, target);
 
-      // A page element over the centre of Allow alone, painted above the
-      // widget, that counts the clicks it takes.
-      await page.evaluate(({ x, y }) => {
-        const cover = document.createElement('div');
-        cover.id = 'cover';
-        Object.assign(cover.style, {
-          position: 'fixed',
-          left: `${String(x - 2)}px`,
-          top: `${String(y - 2)}px`,
-          width: '4px',
-          height: '4px',
-          zIndex: '2147483647',
-        });
-        Object.assign(window, { __coverClicks: 0 });
-        cover.addEventListener('mousedown', () => {
-          Object.assign(window, { __coverClicks: 1 });
-        });
-        document.documentElement.append(cover);
-      }, at);
-      const under = (x: number, y: number): Promise<string | null> =>
-        page.evaluate((p) => document.elementFromPoint(p.x, p.y)?.localName ?? null, { x, y });
-      expect(await under(at.x, at.y)).toBe('div');
-      expect(await under(at.x, at.y - 6)).toBe('tabdock-dock');
+        // A page element over the centre of Allow alone, painted above the
+        // widget, that counts the presses it takes.
+        await page.evaluate(
+          ({ x, y, passThrough }) => {
+            const over = document.createElement('div');
+            over.id = 'cover';
+            Object.assign(over.style, {
+              position: 'fixed',
+              left: `${String(x - 2)}px`,
+              top: `${String(y - 2)}px`,
+              width: '4px',
+              height: '4px',
+              zIndex: '2147483647',
+              pointerEvents: passThrough ? 'none' : 'auto',
+            });
+            Object.assign(window, { __coverClicks: 0 });
+            over.addEventListener('mousedown', () => {
+              Object.assign(window, { __coverClicks: 1 });
+            });
+            document.documentElement.append(over);
+          },
+          { ...at, passThrough: cover.passThrough },
+        );
+        const under = (x: number, y: number): Promise<string | null> =>
+          page.evaluate((p) => document.elementFromPoint(p.x, p.y)?.localName ?? null, { x, y });
+        // elementFromPoint, like a click, skips an element that lets clicks through.
+        expect(await under(at.x, at.y)).toBe(cover.passThrough ? 'tabdock-dock' : 'div');
+        expect(await under(at.x, at.y - 6)).toBe('tabdock-dock');
 
-      await expect(clickWith(cdp, target, { timeoutMs: 1500 })).rejects.toThrow(WidgetTestError);
-      expect(await page.evaluate(() => (window as { __coverClicks?: number }).__coverClicks)).toBe(
-        0,
-      );
-      expect((await waitingPrompts(cdp)).attach).toEqual([{ requestId, client: CI }]);
+        await expect(clickWith(cdp, target, { timeoutMs: 1500 })).rejects.toThrow(WidgetTestError);
+        expect(
+          await page.evaluate(() => (window as { __coverClicks?: number }).__coverClicks),
+        ).toBe(0);
+        expect((await waitingPrompts(cdp)).attach).toEqual([{ requestId, client: CI }]);
 
-      // Uncovered, the same press goes through.
-      await page.evaluate(() => document.getElementById('cover')?.remove());
-      expect(await allowAttach(cdp, { as: 'driver', requestId })).toBe(requestId);
-      expect((await pending).structured).toMatchObject({ role: 'driver' });
-    } finally {
-      await client.close();
-      await cdp.detach();
-    }
-  });
+        // Uncovered, the same press goes through.
+        await page.evaluate(() => document.getElementById('cover')?.remove());
+        expect(await allowAttach(cdp, { as: 'driver', requestId })).toBe(requestId);
+        expect((await pending).structured).toMatchObject({ role: 'driver' });
+      } finally {
+        await client.close();
+        await cdp.detach();
+      }
+    });
+  }
 });
 
 /**

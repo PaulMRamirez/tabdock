@@ -197,7 +197,7 @@ A button inside a repeated row needs the row as well as the action, such as `{ a
 | `readPairingCode()` | `readPairingCode(cdp, { timeoutMs })`, 10 s unless set          | Waits for the widget to show a pairing code and returns it; never print it                                                                  |
 | `allowAttach()`     | `allowAttach(cdp, { as, client })` or `{ as, requestId }`, 20 s | Clicks Allow as `as`, driver or observer, on the one request from that client name or with that id; returns its id once the prompt has gone |
 | `clickInWidget()`   | `clickInWidget(cdp, target, { timeoutMs })`, 5 s                | Clicks the target once it is armed, its centre is in view and a hit test there reaches it, checking again just before the press             |
-| `widgetButton()`    | `widgetButton(cdp, target, { timeoutMs })`, 5 s                 | Waits until the target is armed and uncovered, and returns `{ backendNodeId, x, y }`                                                        |
+| `widgetButton()`    | `widgetButton(cdp, target, { timeoutMs })`, 5 s                 | Waits until the target is armed, in view and uncovered at its centre, and returns `{ backendNodeId, x, y }`, where a press would go         |
 | `widgetText()`      | `widgetText(cdp, role)`                                         | The text under the node with that role, or null while there is none                                                                         |
 | `waitingPrompts()`  | `waitingPrompts(cdp)`                                           | `{ attach: [{ requestId, client }], confirm: [{ callId }] }`, so a walk fails fast on a prompt it cannot see                                |
 | `maskCode()`        | `maskCode(code)`                                                | The code with its second half hidden, for narration                                                                                         |
@@ -205,6 +205,8 @@ A button inside a repeated row needs the row as well as the action, such as `{ a
 | `HOST_TAG`          | `'tabdock-dock'`                                                | The widget's element name                                                                                                                   |
 | `WIDGET_ACTIONS`    | a list                                                          | Every action a button or input carries                                                                                                      |
 | `WIDGET_ROLES`      | a list                                                          | Every role a block or line carries                                                                                                          |
+
+The helper hit-tests the very point it presses, on a scrolled or pinch-zoomed page too, and presses nothing whose centre is out of view. Chrome on Android lets an element that fills the screen scroll in the document's place (its implicit root scroller), and once that element has scrolled no check can say where a press would land, so the helper throws rather than press; desktop Chromium, which a CI check runs, keeps that behaviour off.
 
 A target is the action and, inside one box, at most the box's id:
 

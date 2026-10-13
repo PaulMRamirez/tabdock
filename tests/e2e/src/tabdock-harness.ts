@@ -311,7 +311,8 @@ export async function clickInWidget(page: Page, target: WidgetTarget): Promise<v
  * after it clicks the button with trusted input. For a recording, which
  * draws no pointer: a click alone would show nothing of the press. Returns
  * whether the ring shows (the button matches :focus-visible). It never hit
- * tests, so a fixed button on a scrolled page is found where it is drawn.
+ * tests: a recording needs only the ring drawn where the button is, and
+ * clickInWidget is the check that a press would reach it.
  */
 export async function focusInWidget(
   page: Page,
