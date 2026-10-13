@@ -2,6 +2,10 @@
 
 Tabdock lets MCP clients use the tools of a live web page. The page registers tools through WebMCP, and a small adapter on it dials out to a relay: a remote MCP server with one stable URL that Claude Code, Claude on the web, desktop and phone, or any MCP client adds once. Several people and clients can attach to one page, and the person at the tab approves each, unless the page admits members as observers by policy or that person has minted a Can watch invite, which admits guests as observers in advance.
 
+[![A scripted MCP client beside the map demo: the person at the tab presses Allow as driver, the client lists the tour and calls go_to_stop, and the map moves from the globe to the Caspian Sea](apps/map-demo/media/map-demo-loop.gif)](apps/map-demo/README.md#the-recording)
+
+Left: a script on the MCP SDK, standing in for Claude, calls the map demo's tools through a Tabdock relay on the same machine; each card is a real call and the first lines of its real answer. Right: the page as its visitor sees it, after they press Allow as driver. Captions say what a person would ask; nothing here is Claude.
+
 ## Why it is different
 
 A page's tools run inside the tab, with the user's own signed-in session and live state, so an agent can work an app that has no API, and your back end gains no endpoint or credential.
@@ -25,11 +29,9 @@ flowchart TB
 
 The relay never runs a tool: it signs clients in and checks and routes each call, and the adapter checks it again before the page's handler runs. It sees calls in plain text, so you run your own. Page origins are allowlisted, tokens and codes never reach a log, and every call is audited; [Security](docs/guide/10-security.md) has the rest. [Concepts](docs/guide/01-concepts.md) explains the parts, the flows, the three dials of roles, consequence and reach, and the words for rooms, state and records.
 
-## See it
+## The map demo
 
-[![A scripted MCP client beside the map demo: asked for the next stop, it calls go_to_stop and the map moves to Lake Baikal; asked for a picture of the view, it calls capture_view and the pane shows the PNG it got back](apps/map-demo/media/map-demo-loop.gif)](https://paulmramirez.github.io/tabdock/map/)
-
-The loop links the map demo on the project's site, live once the site is published. It is nine seconds of [a recording under a minute long](apps/map-demo/media/map-demo.mp4) that `pnpm record:map-demo` made in local mode: on the left, a script on the MCP SDK standing in for Claude shows each call it makes and the start of the relay's answer, untrusted label included, under a caption of what a person would ask; on the right, the page as its visitor sees it. The pairing code stays off camera. A recording of Claude itself is the owner's to make (`docs/checklists/map-demo.md`, step 4).
+The loop above is eight seconds of [a recording under a minute long](apps/map-demo/media/map-demo.mp4) that `pnpm record:map-demo` made in local mode, with the pairing code kept off camera; [its notes](apps/map-demo/README.md#the-recording) say how. It links those notes until the project's site is published, and the live page after. A recording of Claude itself is the owner's to make (`docs/checklists/map-demo.md`, step 4).
 
 The map demo draws Earth as a flat map and a globe on a plain canvas, from Natural Earth's public-domain data: connect a relay of your own, pair Claude in the widget, and ask it to take the six-stop tour, capture each stop or follow the page as you pan ([apps/map-demo](apps/map-demo/README.md)). It will live at `/map/` on the project's GitHub Pages site, beside the demo board at `/`, once the site is published by dispatching `.github/workflows/pages.yml` on `main`; the repository's website link will then point there. Until then, `pnpm dev:map-demo` serves it from a clone and prints a link for `pnpm relay`.
 

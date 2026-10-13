@@ -43,6 +43,8 @@ export interface MapDemoSite {
   url: string;
   /** The static host's origin, the one a visitor's relay must admit. */
   origin: string;
+  /** The temporary directory the site is built into, which close() removes; a run ended by a signal removes it itself. */
+  root: string;
   close(): Promise<void>;
 }
 
@@ -140,6 +142,7 @@ export async function serveMapDemoSite(options: { media?: boolean } = {}): Promi
   return {
     url: `${origin}${MAP_DEMO_PATH}`,
     origin,
+    root,
     async close() {
       server.closeAllConnections();
       await new Promise<void>((resolveClose) => {

@@ -231,12 +231,11 @@
         color: #c92a2a;
       }
       /* The recording plays here from its poster, fetching nothing more
-         until asked; capped so it does not tower over the map on a wide
-         screen. */
+         until asked, as wide as the column, so the client pane's text in
+         it stays as legible as the column allows. */
       .watch video {
         display: block;
         width: 100%;
-        max-width: 720px;
         height: auto;
         aspect-ratio: 16 / 9;
         background: #0d1320;
@@ -340,7 +339,8 @@
           A recording under a minute long of this page in a browser, beside a pane listing each call
           as it went. The client is a script on the MCP SDK standing in for Claude, not Claude: it
           pairs through a relay on the same machine, is allowed in as driver, and takes the tour,
-          capturing one view and reading the page's state. Every call and answer shown is real, the
+          capturing one view and reading the page's state. Every call shown is real, with the first
+          lines of its real answer; a line labelled as such is what the script read from it, the
           captions say what a person would ask, and the pairing code stays off camera.
           <a href="media/map-demo.mp4">Open the MP4</a> (under 4 MB).
         </p>
