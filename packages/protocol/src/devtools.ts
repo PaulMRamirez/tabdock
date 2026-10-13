@@ -78,3 +78,23 @@ export type DevToolsBoxModel = z.infer<typeof DevToolsBoxModelSchema>;
 /** DOM.getNodeForLocation: the node a hit test found. */
 export const DevToolsNodeAtSchema = z.object({ backendNodeId: NodeIdSchema });
 export type DevToolsNodeAt = z.infer<typeof DevToolsNodeAtSchema>;
+
+// z.number() takes no NaN or Infinity, so every offset here is a real place.
+const CssSizeSchema = z.number().check(z.nonnegative());
+
+/**
+ * Page.getLayoutMetrics, its visual viewport in CSS pixels: where it sits in
+ * the document and how much of it shows. DOM.getBoxModel and
+ * Input.dispatchMouseEvent count from the visual viewport's corner, while
+ * DOM.getNodeForLocation counts from the document's, so the helper adds
+ * pageX and pageY to hit-test the very point it will press on a scrolled page.
+ */
+export const DevToolsLayoutMetricsSchema = z.object({
+  cssVisualViewport: z.object({
+    pageX: z.number(),
+    pageY: z.number(),
+    clientWidth: CssSizeSchema,
+    clientHeight: CssSizeSchema,
+  }),
+});
+export type DevToolsLayoutMetrics = z.infer<typeof DevToolsLayoutMetricsSchema>;

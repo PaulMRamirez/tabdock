@@ -36,6 +36,7 @@ import { PairingCodeSchema, type Role, RoleSchema } from '@tabdock/protocol';
 import {
   DevToolsBoxModelSchema,
   DevToolsDocumentSchema,
+  DevToolsLayoutMetricsSchema,
   type DevToolsNode,
   DevToolsNodeAtSchema,
 } from '@tabdock/protocol/devtools';
@@ -336,9 +337,15 @@ interface ButtonAt {
 }
 
 /**
- * The target button and the point a click would take, if it is armed now and
- * a hit test at that point lands on it (or on a label inside it); null if not
- * yet. `guard` sees the widget first and may throw.
+ * The target button and the point a click would take, if it is armed now,
+ * that point shows in the viewport, and a hit test at that point lands on it
+ * (or on a label inside it); null if not yet. `guard` sees the widget first
+ * and may throw.
+ *
+ * The box and the press count from the visual viewport's corner, the hit test
+ * from the document's, so on a scrolled page the hit test is moved by the
+ * viewport's place in the document: otherwise it checks a spot as far from
+ * the press as the page has scrolled, and may wave through a covered button.
  */
 async function clickable(
   cdp: DevToolsSession,
@@ -355,12 +362,23 @@ async function clickable(
   const box = await askOrNull(cdp, 'DOM.getBoxModel', { backendNodeId }, DevToolsBoxModelSchema);
   if (box === null) return null;
   const [x1 = 0, y1 = 0, , , x3 = 0, y3 = 0] = box.model.content;
-  // Whole pixels, so the press lands on the very point the hit test checked.
+  // Whole pixels, so the press lands on the point the hit test checked (to
+  // within half a pixel on a page scrolled by a fraction of one).
   const at = { x: Math.round((x1 + x3) / 2), y: Math.round((y1 + y3) / 2) };
+  const metrics = await askOrNull(cdp, 'Page.getLayoutMetrics', {}, DevToolsLayoutMetricsSchema);
+  if (metrics === null) return null;
+  const view = metrics.cssVisualViewport;
+  // A press outside the viewport reaches nothing, though a hit test there may
+  // still find the button in the document.
+  if (at.x < 0 || at.y < 0 || at.x >= view.clientWidth || at.y >= view.clientHeight) return null;
   const hit = await askOrNull(
     cdp,
     'DOM.getNodeForLocation',
-    { ...at, ignorePointerEventsNone: true },
+    {
+      x: Math.round(at.x + view.pageX),
+      y: Math.round(at.y + view.pageY),
+      ignorePointerEventsNone: true,
+    },
     DevToolsNodeAtSchema,
   );
   if (hit === null || !contains(button, hit.backendNodeId)) return null;

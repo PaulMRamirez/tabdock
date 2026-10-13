@@ -165,10 +165,16 @@ interface Sent {
  * A DevTools session over a scripted document. Every command is recorded; a
  * test may answer one itself through `answer`, and `onSend` runs before each
  * command is answered, so a test can change the page between two commands.
+ * Boxes are in document coordinates. As Chromium does, it answers a box and
+ * takes a press in the viewport's coordinates, and hit-tests a point in the
+ * document's, so a test that scrolls the page tells the two apart.
  */
 class FakeSession implements DevToolsSession {
   readonly sent: Sent[] = [];
   root: FakeNode;
+  /** Where the viewport's corner sits in the document. */
+  scroll = { x: 0, y: 0 };
+  viewport = { width: 1280, height: 800 };
   answer: (method: string, params: Record<string, unknown>) => unknown = () => undefined;
   onSend: (method: string, params: Record<string, unknown>) => void = () => undefined;
   /** What a hit test at a point names; by default the innermost node whose box holds it. */
@@ -204,9 +210,24 @@ class FakeSession implements DevToolsSession {
       case 'DOM.getBoxModel': {
         const box = this.node(Number(p.backendNodeId))?.box;
         if (!box) return Promise.reject(new Error('Could not compute box model.'));
-        const { x, y, width, height } = box;
+        const { width, height } = box;
+        const x = box.x - this.scroll.x;
+        const y = box.y - this.scroll.y;
         const quad = [x, y, x + width, y, x + width, y + height, x, y + height];
         return Promise.resolve({ model: { content: quad, width, height } });
+      }
+      case 'Page.getLayoutMetrics': {
+        const view = {
+          offsetX: 0,
+          offsetY: 0,
+          pageX: this.scroll.x,
+          pageY: this.scroll.y,
+          clientWidth: this.viewport.width,
+          clientHeight: this.viewport.height,
+          scale: 1,
+          zoom: 1,
+        };
+        return Promise.resolve({ cssVisualViewport: view, cssLayoutViewport: view });
       }
       case 'DOM.getNodeForLocation': {
         const id = this.hit(Number(p.x), Number(p.y));
@@ -216,6 +237,18 @@ class FakeSession implements DevToolsSession {
       default:
         return Promise.reject(new Error(`unexpected ${method}`));
     }
+  }
+
+  /** What a press at a viewport point would hit. */
+  pressed(x: number, y: number): number | null {
+    return this.hit(x + this.scroll.x, y + this.scroll.y);
+  }
+
+  /** The document points the helper hit-tested. */
+  hitTests(): { x: unknown; y: unknown }[] {
+    return this.sent
+      .filter((sent) => sent.method === 'DOM.getNodeForLocation')
+      .map(({ params }) => ({ x: params.x, y: params.y }));
   }
 
   mouse(): { type: unknown; x: unknown; y: unknown }[] {
@@ -233,7 +266,7 @@ class FakeSession implements DevToolsSession {
 function approvesOnRelease(cdp: FakeSession): void {
   cdp.onSend = (method, params) => {
     if (method !== 'Input.dispatchMouseEvent' || params.type !== 'mouseReleased') return;
-    const at = cdp.hit(Number(params.x), Number(params.y));
+    const at = cdp.pressed(Number(params.x), Number(params.y));
     for (const node of everyNode(cdp.root)) {
       const gone = node.children.find(
         (child) =>
@@ -337,6 +370,13 @@ describe('replies in the wrong shape', () => {
       (cdp) => {
         cdp.answer = (method) =>
           method === 'DOM.getBoxModel' ? { model: { content: [0, 0, 1, 0, 1, 1, 0] } } : undefined;
+      },
+    ],
+    [
+      'layout metrics with no visual viewport',
+      (cdp) => {
+        cdp.answer = (method) =>
+          method === 'Page.getLayoutMetrics' ? { cssLayoutViewport: {} } : undefined;
       },
     ],
     [
@@ -586,6 +626,49 @@ describe('arming and the hit test', () => {
     expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: 50, y: 150 });
   });
 
+  it('on a scrolled page, hit-tests the document point under the button and presses its viewport point', async () => {
+    const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+    cdp.scroll = { x: 0, y: 135 };
+    await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
+    // Deny's centre is (260, 450) in the document, 135 px higher in the viewport.
+    expect(cdp.presses()).toBe(1);
+    expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: 260, y: 315 });
+    expect(new Set(cdp.hitTests().map((at) => JSON.stringify(at)))).toEqual(
+      new Set([JSON.stringify({ x: 260, y: 450 })]),
+    );
+  });
+
+  it('on a scrolled page, presses no button whose centre is covered, though the spot it scrolled from is clear', async () => {
+    const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 0)])));
+    cdp.scroll = { x: 0, y: 8 };
+    // Over Deny's centre, (260, 50) in the document, and not over (260, 42),
+    // the point a hit test made in viewport coordinates would check.
+    const cover = el('div', { id: 'cover' }, [], { x: 255, y: 46, width: 10, height: 8 });
+    cdp.root.children.push(cover);
+    await expect(
+      clickInWidget(cdp, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 300 }),
+    ).rejects.toThrow(WidgetTestError);
+    expect(cdp.mouse()).toEqual([]);
+
+    cdp.root.children.pop();
+    await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
+    expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: 260, y: 42 });
+  });
+
+  it('presses no button whose centre is outside the viewport, until the page scrolls it in', async () => {
+    const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+    cdp.viewport = { width: 1280, height: 300 };
+    await expect(
+      clickInWidget(cdp, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 300 }),
+    ).rejects.toThrow(WidgetTestError);
+    expect(cdp.mouse()).toEqual([]);
+    expect(cdp.hitTests()).toEqual([]);
+
+    cdp.scroll = { x: 0, y: 200 };
+    await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
+    expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: 260, y: 250 });
+  });
+
   it('refuses an action the widget does not have', async () => {
     const cdp = new FakeSession(documentOf(dock([])));
     const target = { action: 'approve-everyone' } as unknown as Parameters<typeof clickInWidget>[1];
@@ -639,6 +722,7 @@ describe('what it sends', () => {
     'DOM.scrollIntoViewIfNeeded',
     'DOM.getBoxModel',
     'DOM.getNodeForLocation',
+    'Page.getLayoutMetrics',
     'Input.dispatchMouseEvent',
   ]);
 

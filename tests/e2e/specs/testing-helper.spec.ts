@@ -2,8 +2,10 @@ import type { Client } from '@modelcontextprotocol/client';
 import { type CDPSession, expect, type Page, test } from '@playwright/test';
 import {
   allowAttach,
+  clickInWidget as clickWith,
   readPairingCode,
   waitingPrompts,
+  widgetButton,
   widgetText,
   WidgetTestError,
 } from '@tabdock/adapter/testing';
@@ -63,8 +65,20 @@ async function rosterOf(page: Page): Promise<[string, string][] | undefined> {
   return (await dockState(page))?.roster.map((a) => [a.userId, a.role]);
 }
 
-async function pairsAsDriver(page: Page): Promise<void> {
+/** Makes the board taller than the window and scrolls it by `y`; the widget stays fixed in its corner. */
+async function scrollBoard(page: Page, y: number): Promise<void> {
+  await page.evaluate((by) => {
+    const tall = document.createElement('div');
+    tall.style.height = '4000px';
+    document.body.append(tall);
+    window.scrollTo(0, by);
+  }, y);
+  expect(await page.evaluate(() => window.scrollY)).toBe(y);
+}
+
+async function pairsAsDriver(page: Page, scrollBy = 0): Promise<void> {
   const { pageId, code, cdp } = await openBoard(page);
+  if (scrollBy > 0) await scrollBoard(page, scrollBy);
   const client = await connectMcp(tabdock.relay, tabdock.users.alice, CI);
   try {
     // What the widget shows is what the page's own handle holds.
@@ -111,6 +125,71 @@ test.describe('at phone width', () => {
     page,
   }) => {
     await pairsAsDriver(page);
+  });
+});
+
+// The box and the press count from the viewport's corner and the hit test
+// from the document's, so on a scrolled page the helper must move its hit
+// test by the scroll, or it checks a spot that far from where it presses.
+test.describe('on a scrolled page', () => {
+  test.use({ viewport: { width: 1280, height: 600 } });
+
+  test('finds Allow where the press lands and pairs as driver', async ({ page }) => {
+    await pairsAsDriver(page, 400);
+  });
+
+  test('presses nothing while a page element covers the centre of Allow, though the spot it scrolled from is clear', async ({
+    page,
+  }) => {
+    const { code, cdp } = await openBoard(page);
+    // A few pixels, so the spot a hit test in the viewport's coordinates
+    // would check still lies on Allow, above the cover.
+    await scrollBoard(page, 6);
+    const client = await connectMcp(tabdock.relay, tabdock.users.alice, CI);
+    try {
+      const pending = callTool(client, 'pair_page', { code });
+      const requestId = await waitForDock(page, (s) => s.pendingRequests[0]?.requestId);
+      const target = { action: 'approve-driver', requestId } as const;
+      const at = await widgetButton(cdp, target);
+
+      // A page element over the centre of Allow alone, painted above the
+      // widget, that counts the clicks it takes.
+      await page.evaluate(({ x, y }) => {
+        const cover = document.createElement('div');
+        cover.id = 'cover';
+        Object.assign(cover.style, {
+          position: 'fixed',
+          left: `${String(x - 2)}px`,
+          top: `${String(y - 2)}px`,
+          width: '4px',
+          height: '4px',
+          zIndex: '2147483647',
+        });
+        Object.assign(window, { __coverClicks: 0 });
+        cover.addEventListener('mousedown', () => {
+          Object.assign(window, { __coverClicks: 1 });
+        });
+        document.documentElement.append(cover);
+      }, at);
+      const under = (x: number, y: number): Promise<string | null> =>
+        page.evaluate((p) => document.elementFromPoint(p.x, p.y)?.localName ?? null, { x, y });
+      expect(await under(at.x, at.y)).toBe('div');
+      expect(await under(at.x, at.y - 6)).toBe('tabdock-dock');
+
+      await expect(clickWith(cdp, target, { timeoutMs: 1500 })).rejects.toThrow(WidgetTestError);
+      expect(await page.evaluate(() => (window as { __coverClicks?: number }).__coverClicks)).toBe(
+        0,
+      );
+      expect((await waitingPrompts(cdp)).attach).toEqual([{ requestId, client: CI }]);
+
+      // Uncovered, the same press goes through.
+      await page.evaluate(() => document.getElementById('cover')?.remove());
+      expect(await allowAttach(cdp, { as: 'driver', requestId })).toBe(requestId);
+      expect((await pending).structured).toMatchObject({ role: 'driver' });
+    } finally {
+      await client.close();
+      await cdp.detach();
+    }
   });
 });
 

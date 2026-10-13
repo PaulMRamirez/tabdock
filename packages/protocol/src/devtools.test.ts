@@ -9,6 +9,7 @@ import * as exported from './index.ts';
 import {
   DevToolsBoxModelSchema,
   DevToolsDocumentSchema,
+  DevToolsLayoutMetricsSchema,
   type DevToolsNode,
   DevToolsNodeAtSchema,
   DevToolsNodeSchema,
@@ -165,6 +166,16 @@ describe('the DevTools reply schemas', () => {
     expect(quad([1, 2, 3, 4, 5, 6, 7, Number.NaN])).toBe(false);
     expect(quad([1, 2, 3, 4, 5, 6, 7, '8'])).toBe(false);
     expect(DevToolsNodeAtSchema.safeParse({}).success).toBe(false);
+    const view = (cssVisualViewport: unknown): boolean =>
+      DevToolsLayoutMetricsSchema.safeParse({ cssVisualViewport }).success;
+    const fine = { pageX: 0, pageY: 135.5, clientWidth: 1280, clientHeight: 720 };
+    expect(view(fine)).toBe(true);
+    expect(view({ ...fine, pageY: Number.NaN })).toBe(false);
+    expect(view({ ...fine, pageX: Number.POSITIVE_INFINITY })).toBe(false);
+    expect(view({ ...fine, clientHeight: -1 })).toBe(false);
+    expect(view({ ...fine, clientWidth: '1280' })).toBe(false);
+    expect(view({ pageX: 0, pageY: 0 })).toBe(false);
+    expect(DevToolsLayoutMetricsSchema.safeParse({ cssLayoutViewport: fine }).success).toBe(false);
   });
 });
 
@@ -178,14 +189,16 @@ describe('the devtools subpath', () => {
     expect(Object.keys(exported).filter((name) => name.startsWith('DevTools'))).toEqual([]);
   });
 
-  // The helper reads DOM.getDocument, DOM.getBoxModel and DOM.getNodeForLocation
-  // replies and nothing else (it never runs a function on a node), so the
-  // subpath ships those schemas alone (checklist M6, decision 3).
+  // The helper reads DOM.getDocument, DOM.getBoxModel, Page.getLayoutMetrics
+  // and DOM.getNodeForLocation replies and nothing else (it never runs a
+  // function on a node), so the subpath ships those schemas alone (checklist
+  // M6, decision 3).
   it('ships only the replies the helper reads', async () => {
     const devtools = await import('./devtools.ts');
     expect(Object.keys(devtools).sort()).toEqual([
       'DevToolsBoxModelSchema',
       'DevToolsDocumentSchema',
+      'DevToolsLayoutMetricsSchema',
       'DevToolsNodeAtSchema',
       'DevToolsNodeSchema',
     ]);
