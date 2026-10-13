@@ -25,6 +25,10 @@ flowchart TB
 
 The relay never runs a tool: it signs clients in and checks and routes each call, and the adapter checks it again before the page's handler runs. It sees calls in plain text, so you run your own. Page origins are allowlisted, tokens and codes never reach a log, and every call is audited; [Security](docs/guide/10-security.md) has the rest. [Concepts](docs/guide/01-concepts.md) explains the parts, the flows, the three dials of roles, consequence and reach, and the words for rooms, state and records.
 
+## See it
+
+The map demo draws Earth as a flat map and a globe on a plain canvas, from Natural Earth's public-domain data: connect a relay of your own, pair Claude in the widget, and ask it to take the six-stop tour, capture each stop or follow the page as you pan ([apps/map-demo](apps/map-demo/README.md)). It will live at `/map/` on the project's GitHub Pages site, beside the demo board at `/`, once the site is published by dispatching `.github/workflows/pages.yml` on `main`; the repository's website link will then point there. Until then, `pnpm dev:map-demo` serves it from a clone and prints a link for `pnpm relay`.
+
 ## For a room
 
 Clients see nine fixed tools: `list_pages`, `pair_page`, `list_page_tools`, `call_page_tool`, `detach_page`, `get_page_state`, `wait_for_page_state`, `get_proposal` and `withdraw_proposal`. M6, which arrives in the release after 0.1.0 ([CHANGELOG.md](CHANGELOG.md)), lets one projected tab hold a class or a review. A room needs a relay with a public URL and `TABDOCK_INVITES=1`, since guests join by invite; in local mode a time-boxed session is a time box only. `pnpm demo:m6` runs a whole lesson on this machine, [the classroom explainer](docs/tour/06-classroom.md) traces it, and [Run a class](docs/guide/21-run-a-class.md#rehearse-on-one-computer) says what a rehearsal by hand needs; `pnpm dev:map` serves the canvas map page to try the map profile.
@@ -113,7 +117,7 @@ Hosted Claude reaches a connector from the cloud, so a relay on loopback cannot 
 
 [The guide](docs/guide/README.md) is for people using Tabdock; its [Where to start](docs/guide/README.md#where-to-start) table gives a reading order for each task, from a first look to running a class.
 
-For contributors: `docs/develop.md` (every command), `SPEC.md` (the source of truth), `docs/adr/` (the decisions), `docs/threat-model.md` (each boundary and its tests), `docs/mcp-b-comparison.md`, `docs/tour/` (the build's history, a milestone a page), `docs/deploy.md` (the reference deployment), `docs/release.md`, `CHANGELOG.md`, `.env.example` (every setting), and the READMEs of `packages/adapter`, `packages/relay`, `packages/protocol`, `packages/sim-page`, `apps/demo`, `apps/site`, `tests/e2e`, `tests/map-page`, `tests/ci-check` and `tests/mcpb6`. `pnpm site:build` builds the demo board, the tour and the guide into a static site for GitHub Pages, not yet published; until it is, run the board with `pnpm dev`.
+For contributors: `docs/develop.md` (every command), `SPEC.md` (the source of truth), `docs/adr/` (the decisions), `docs/threat-model.md` (each boundary and its tests), `docs/mcp-b-comparison.md`, `docs/tour/` (the build's history, a milestone a page), `docs/deploy.md` (the reference deployment), `docs/release.md`, `CHANGELOG.md`, `.env.example` (every setting), and the READMEs of `packages/adapter`, `packages/relay`, `packages/protocol`, `packages/sim-page`, `apps/demo`, `apps/map-demo`, `apps/site`, `tests/e2e`, `tests/map-page`, `tests/ci-check` and `tests/mcpb6`. `pnpm site:build` builds the demo board, the map demo, the tour and the guide into a static site for GitHub Pages, not yet published; until it is, run the board with `pnpm dev` and the map demo with `pnpm dev:map-demo`.
 
 ## Licence
 
