@@ -149,3 +149,85 @@ for (const axis of ['down', 'across'] as const) {
     }
   });
 }
+
+// A right-to-left element scrolled to the very end of a range under half the
+// button reads like a right-to-left document, so no reading tells the two
+// apart; a check at the visual viewport's place would land beside the press
+// but still on Allow. The helper checks the press point itself too.
+test('presses nothing through a cover where an element scrolled to its very end stands in for the document', async ({
+  page,
+}) => {
+  await page.goto(tabdock.pageUrl);
+  await page.waitForSelector('html[data-tools="ready"]');
+  const { code } = await waitForLink(page);
+  const cdp = await page.context().newCDPSession(page);
+  await page.evaluate(() => {
+    const { documentElement: html, body } = document;
+    Object.assign(html.style, { height: '100%', overflow: 'hidden' });
+    Object.assign(body.style, { height: '100%', overflow: 'hidden', margin: '0' });
+    const scroller = document.createElement('div');
+    scroller.id = 'scroller';
+    scroller.dir = 'rtl';
+    Object.assign(scroller.style, {
+      position: 'absolute',
+      left: '0',
+      top: '0',
+      width: '100%',
+      height: '100%',
+      overflow: 'auto',
+    });
+    const wide = document.createElement('div');
+    Object.assign(wide.style, { width: 'calc(100% + 28px)', height: '100%' });
+    scroller.append(wide);
+    body.append(scroller);
+  });
+  const client = await connectMcp(tabdock.relay, tabdock.users.alice, CI);
+  try {
+    const pending = callTool(client, 'pair_page', { code });
+    const requestId = await waitForDock(page, (s) => s.pendingRequests[0]?.requestId);
+    const target = { action: 'approve-driver', requestId } as const;
+    const at = await widgetButton(cdp, target);
+
+    await page.evaluate(() => {
+      const scroller = document.getElementById('scroller');
+      if (scroller === null) throw new Error('no scroller');
+      scroller.scrollLeft = -28;
+    });
+    // The readings of a right-to-left document scrolled to its very end.
+    await expect
+      .poll(async () => {
+        const metrics = await cdp.send('Page.getLayoutMetrics');
+        return [
+          metrics.cssVisualViewport.pageX,
+          metrics.cssLayoutViewport.pageX,
+          metrics.cssContentSize.width - metrics.cssLayoutViewport.clientWidth,
+        ];
+      })
+      .toEqual([-28, 0, 28]);
+
+    await page.evaluate(({ x, y }) => {
+      const over = document.createElement('div');
+      over.id = 'cover';
+      Object.assign(over.style, {
+        position: 'fixed',
+        left: `${String(x - 2)}px`,
+        top: `${String(y - 2)}px`,
+        width: '4px',
+        height: '4px',
+        zIndex: '2147483647',
+        pointerEvents: 'none',
+      });
+      document.documentElement.append(over);
+    }, at);
+    await expect(clickInWidget(cdp, target, { timeoutMs: 1500 })).rejects.toThrow(WidgetTestError);
+    expect((await waitingPrompts(cdp)).attach).toEqual([{ requestId, client: CI }]);
+
+    // Uncovered, it approves where it stands.
+    await page.evaluate(() => document.getElementById('cover')?.remove());
+    expect(await allowAttach(cdp, { as: 'driver', requestId })).toBe(requestId);
+    expect((await pending).structured).toMatchObject({ role: 'driver' });
+  } finally {
+    await client.close();
+    await cdp.detach();
+  }
+});

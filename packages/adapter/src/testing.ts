@@ -342,39 +342,57 @@ interface ViewportPlace {
   pageY: number;
   width: number;
   height: number;
+  /**
+   * On each axis, how far the hit test would sit from the press if an element
+   * scrolled to its very end in the document's place were counted as the
+   * document's scroll: the whole scroll range where the readings matched it,
+   * else 0. See viewportPlace.
+   */
+  farEnd: { x: number; y: number };
 }
 
 /**
- * How far apart Chromium's two readings of the scroll may sit and still agree:
- * it rounds the layout viewport's position up to a whole pixel, so a gap just
- * under one is ordinary, and float rounding under a pinch zoom adds a hair.
+ * How far apart Chromium's readings may sit and still agree. The layout
+ * viewport's position is rounded up to a whole pixel, and float rounding under
+ * a pinch zoom adds a hair, so a gap just under a pixel is ordinary.
  */
 const SCROLL_SLACK_PX = 1.01;
+/**
+ * The same against the scroll range, which also carries the floor of the
+ * content size and a client size that loses a pixel to rounding at a device
+ * scale such as 1.25 or 1.75: up to 1.6 px was seen on ordinary pages.
+ */
+const RANGE_SLACK_PX = 3;
 
 /**
  * The visual viewport's place, or null if DevTools gave none. Its pageX and
- * pageY are the document's scroll plus the visual viewport's own offset, the
- * very offset the hit test takes away, while the layout viewport's count from
- * the document's scroll origin: the start, or the far end of the scroll range
- * on a right-to-left page or one whose block axis starts at the bottom. So on
- * each axis the two differ by nothing or by that whole range. Anything else
- * means Chrome counts the scroll of an element that scrolls in the document's
- * place (Android's implicit root scroller) where the hit test does not, so a
- * check could land beside the press; that throws, since the helper cannot tell
- * where its press would land. A right-to-left element scrolled to its very end
- * reads like a right-to-left document, and its check then lands the whole
- * range away, which misses the button unless the range is under half its size.
+ * pageY count the document's scroll from its scroll origin, plus the visual
+ * viewport's own offset, which is the very offset the hit test takes away,
+ * while the layout viewport's count from the left and top edge of the scroll
+ * range. The origin sits at that edge, or at the far end of the range on a
+ * right-to-left page or one that scrolls up from the bottom (a vertical
+ * writing mode read bottom to top), so on each axis the two differ by nothing
+ * or by the whole range. Anything else means Chrome counts the scroll of an
+ * element that scrolls in the document's place (Android's implicit root
+ * scroller) where the hit test does not, so a check could land beside the
+ * press: that throws, since the helper cannot tell where a press would land.
+ * Such an element scrolled to its very end matches the range too, and its
+ * check would land the whole range from the press; farEnd carries that
+ * distance so clickable can check the press point itself as well.
  */
 async function viewportPlace(cdp: DevToolsSession): Promise<ViewportPlace | null> {
   const metrics = await askOrNull(cdp, 'Page.getLayoutMetrics', {}, DevToolsLayoutMetricsSchema);
   if (metrics === null) return null;
   const { cssLayoutViewport: layout, cssVisualViewport: view, cssContentSize: size } = metrics;
-  const agrees = (gap: number, range: number): boolean =>
-    Math.abs(gap) <= SCROLL_SLACK_PX || Math.abs(gap - range) <= SCROLL_SLACK_PX;
-  if (
-    !agrees(layout.pageX + view.offsetX - view.pageX, size.width - layout.clientWidth) ||
-    !agrees(layout.pageY + view.offsetY - view.pageY, size.height - layout.clientHeight)
-  ) {
+  /** The gap's distance from the press if it is the range, 0 if it is nothing, or null if neither. */
+  const farEnd = (gap: number, range: number): number | null => {
+    if (Math.abs(gap) <= SCROLL_SLACK_PX) return 0;
+    if (Math.abs(gap - range) <= RANGE_SLACK_PX) return gap;
+    return null;
+  };
+  const x = farEnd(layout.pageX + view.offsetX - view.pageX, size.width - layout.clientWidth);
+  const y = farEnd(layout.pageY + view.offsetY - view.pageY, size.height - layout.clientHeight);
+  if (x === null || y === null) {
     throw new WidgetTestError(
       'the page scrolls an element in place of the document (an implicit root scroller), so the helper cannot tell where a press would land',
     );
@@ -384,7 +402,23 @@ async function viewportPlace(cdp: DevToolsSession): Promise<ViewportPlace | null
     pageY: view.pageY,
     width: view.clientWidth,
     height: view.clientHeight,
+    farEnd: { x, y },
   };
+}
+
+/** Whether a hit test at this document point names the button or a label inside it. */
+async function hitsButton(
+  cdp: DevToolsSession,
+  button: DevToolsNode,
+  point: { x: number; y: number },
+): Promise<boolean> {
+  const hit = await askOrNull(
+    cdp,
+    'DOM.getNodeForLocation',
+    { ...point, ignorePointerEventsNone: true },
+    DevToolsNodeAtSchema,
+  );
+  return hit !== null && contains(button, hit.backendNodeId);
 }
 
 /**
@@ -399,7 +433,10 @@ async function viewportPlace(cdp: DevToolsSession): Promise<ViewportPlace | null
  * the press as the page has scrolled, and may wave through a covered button.
  * That place is read before the box and again after the hit test; when a
  * scroll between them has moved one off the other, the button is not clickable
- * yet.
+ * yet. Where the readings leave an element scrolled to its very end possible
+ * (see viewportPlace) and its range is under half the button, the point that
+ * would then be the press is checked too: a larger range would take the check
+ * off the button anyway.
  */
 async function clickable(
   cdp: DevToolsSession,
@@ -428,13 +465,14 @@ async function clickable(
   // A press outside the viewport reaches nothing, though a hit test there may
   // still find the button in the document.
   if (at.x < 0 || at.y < 0 || at.x >= before.width || at.y >= before.height) return null;
-  const hit = await askOrNull(
-    cdp,
-    'DOM.getNodeForLocation',
-    { ...page, ignorePointerEventsNone: true },
-    DevToolsNodeAtSchema,
-  );
-  if (hit === null || !contains(button, hit.backendNodeId)) return null;
+  if (!(await hitsButton(cdp, button, page))) return null;
+  const near = (distance: number, size: number): number =>
+    Math.abs(distance) < Math.abs(size) / 2 ? Math.round(distance) : 0;
+  const shift = { x: near(before.farEnd.x, x3 - x1), y: near(before.farEnd.y, y3 - y1) };
+  if (shift.x !== 0 || shift.y !== 0) {
+    const alsoAt = { x: page.x + shift.x, y: page.y + shift.y };
+    if (!(await hitsButton(cdp, button, alsoAt))) return null;
+  }
   const after = await viewportPlace(cdp);
   if (after === null || after.pageX !== before.pageX || after.pageY !== before.pageY) return null;
   return { backendNodeId, ...at };

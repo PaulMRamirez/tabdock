@@ -206,7 +206,9 @@ A button inside a repeated row needs the row as well as the action, such as `{ a
 | `WIDGET_ACTIONS`    | a list                                                          | Every action a button or input carries                                                                                                      |
 | `WIDGET_ROLES`      | a list                                                          | Every role a block or line carries                                                                                                          |
 
-The helper hit-tests the very point it presses, on a scrolled, pinch-zoomed, right-to-left or vertical page too, and presses nothing whose centre is out of view. Chrome on Android lets an element that fills the screen scroll in the document's place (its implicit root scroller), and once that element has scrolled, down or across, the helper cannot tell where a press would land, so it throws rather than press; desktop Chromium, which a CI check runs, keeps that behaviour off.
+The helper hit-tests the very point it presses, on a scrolled, pinch-zoomed, right-to-left or vertical page and at a fractional device scale too, and presses nothing whose centre is out of view.
+
+Chrome on Android lets an element that fills the screen scroll in the document's place (its implicit root scroller), and the hit test does not count that scroll. Once such an element has scrolled, the helper throws rather than press, or, where it may sit at the very end of a short range, checks the press point too. One arrangement still reads like an ordinary scrolled page: a right-to-left page overflowing sideways under such an element scrolled as far. So test on desktop Chromium, as a CI check does, where that behaviour is off.
 
 A target is the action and, inside one box, at most the box's id:
 

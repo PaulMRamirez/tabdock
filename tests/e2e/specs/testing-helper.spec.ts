@@ -156,9 +156,9 @@ test.describe('on a scrolled page', () => {
     await pairsAsDriver(page, (p) => scrollBoard(p, 400));
   });
 
-  // These count the layout viewport's scroll from the far end, unlike the
-  // visual viewport's, which the helper must not take for an element
-  // scrolling in the document's place.
+  // On these the scroll starts at the far end of its range, so Chromium's two
+  // readings of it differ by the whole range, which the helper must not take
+  // for an element scrolling in the document's place.
   test('pairs on a right-to-left page scrolled left', async ({ page }) => {
     await pairsAsDriver(page, async (p) => {
       await shapeBoard(p, 'direction: rtl', -401, 300);
@@ -166,7 +166,7 @@ test.describe('on a scrolled page', () => {
     });
   });
 
-  test('pairs on a page whose block axis starts at the bottom', async ({ page }) => {
+  test('pairs on a page that scrolls up from the bottom', async ({ page }) => {
     await pairsAsDriver(page, async (p) => {
       await shapeBoard(p, 'writing-mode: vertical-lr; direction: rtl', 10, -200);
       expect(await p.evaluate(() => [window.scrollX, window.scrollY])).toEqual([10, -200]);

@@ -178,13 +178,15 @@ class FakeSession implements DevToolsSession {
   offset = { x: 0, y: 0 };
   /** An element's scroll that Chrome counts in pageX and pageY but the hit test does not (an implicit root scroller). */
   rootScroll = { x: 0, y: 0 };
-  /** How far the document scrolls past the viewport on each axis. */
-  range = { x: 0, y: 0 };
-  /** Where the document's scroll origin sits: 0, or the far end of the range (right to left, or a block axis from the bottom). */
+  /** How far the document scrolls past the viewport on each axis, as on a page that overflows both ways. */
+  range = { x: 2000, y: 3000 };
+  /** Where the document's scroll origin sits: 0, or the far end of the range (right to left, or scrolling up from the bottom). */
   origin = { x: 0, y: 0 };
-  /** Added to the layout viewport's pageY, as Chromium's float rounding can. */
-  layoutNudge = 0;
+  /** Added to the layout viewport's pageX and pageY, as Chromium's rounding can. */
+  layoutNudge = { x: 0, y: 0 };
   viewport = { width: 1280, height: 800 };
+  /** A pinch zoom: the visual viewport shows this much less than the layout viewport. */
+  pinch = 1;
   answer: (method: string, params: Record<string, unknown>) => unknown = () => undefined;
   onSend: (method: string, params: Record<string, unknown>) => void = () => undefined;
   /** What a hit test at a point names; by default the innermost node whose box holds it. */
@@ -230,8 +232,8 @@ class FakeSession implements DevToolsSession {
         const size = { clientWidth: this.viewport.width, clientHeight: this.viewport.height };
         return Promise.resolve({
           cssLayoutViewport: {
-            pageX: this.origin.x + this.scroll.x - this.offset.x,
-            pageY: this.origin.y + this.scroll.y - this.offset.y + this.layoutNudge,
+            pageX: this.origin.x + this.scroll.x - this.offset.x + this.layoutNudge.x,
+            pageY: this.origin.y + this.scroll.y - this.offset.y + this.layoutNudge.y,
             ...size,
           },
           cssVisualViewport: {
@@ -239,8 +241,9 @@ class FakeSession implements DevToolsSession {
             offsetY: this.offset.y,
             pageX: this.scroll.x + this.rootScroll.x,
             pageY: this.scroll.y + this.rootScroll.y,
-            ...size,
-            scale: 1,
+            clientWidth: this.viewport.width / this.pinch,
+            clientHeight: this.viewport.height / this.pinch,
+            scale: this.pinch,
             zoom: 1,
           },
           cssContentSize: {
@@ -732,7 +735,7 @@ describe('arming and the hit test', () => {
     });
   }
 
-  it('presses on a right-to-left page scrolled left, and on one whose block axis starts at the bottom', async () => {
+  it('presses on a right-to-left page scrolled left, and on one that scrolls up from the bottom', async () => {
     // Right to left: the scroll origin sits at the far end of a 1,720 px range,
     // and the page is scrolled 401 px left of it.
     const rtl = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
@@ -750,18 +753,70 @@ describe('arming and the hit test', () => {
     expect(bottom.mouse()[1]).toEqual({ type: 'mousePressed', x: 260, y: 450 });
   });
 
-  it('takes Chromium’s rounding of the layout viewport, a pixel and a hair, but not more', async () => {
-    const rounded = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
-    rounded.layoutNudge = 1.0000019;
-    await clickInWidget(rounded, { action: 'deny', requestId: 'req-1' });
-    expect(rounded.presses()).toBe(1);
-
-    const apart = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
-    apart.layoutNudge = 1.5;
-    await expect(widgetButton(apart, { action: 'deny', requestId: 'req-1' })).rejects.toThrow(
-      new WidgetTestError(ROOT_SCROLLER),
-    );
+  it('measures the scroll range against the layout viewport, which a pinch zoom does not shrink', async () => {
+    // Pinched to twice the size, the visual viewport shows half of the layout
+    // viewport, while the range is still the content less the layout viewport.
+    const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 300)])));
+    cdp.range = { x: 1720, y: 0 };
+    cdp.origin = { x: 1720, y: 0 };
+    cdp.pinch = 2;
+    cdp.scroll = { x: 100, y: 0 };
+    cdp.offset = { x: 100, y: 0 };
+    await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' });
+    expect(cdp.mouse()[1]).toEqual({ type: 'mousePressed', x: 160, y: 350 });
   });
+
+  it('presses no button covered where the press lands, when an element scrolled to its very end may stand in for the document', async () => {
+    // Right to left, the element's 28 px range taken in full: its readings
+    // match a right-to-left document's, and a check at the visual viewport's
+    // place lands 28 px left of the press, still on Deny.
+    const covered = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+    covered.range = { x: 28, y: 0 };
+    covered.rootScroll = { x: -28, y: 0 };
+    const cover = el('div', { id: 'cover' }, [], { x: 257, y: 447, width: 6, height: 6 });
+    covered.root.children.push(cover);
+    await expect(
+      clickInWidget(covered, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 300 }),
+    ).rejects.toThrow(WidgetTestError);
+    expect(covered.mouse()).toEqual([]);
+    // Both the visual viewport's place and the press point itself were checked.
+    expect(new Set(covered.hitTests().map((at) => JSON.stringify(at)))).toEqual(
+      new Set([JSON.stringify({ x: 232, y: 450 }), JSON.stringify({ x: 260, y: 450 })]),
+    );
+
+    // Uncovered, it presses.
+    covered.root.children.pop();
+    await clickInWidget(covered, { action: 'deny', requestId: 'req-1' });
+    expect(covered.presses()).toBe(1);
+  });
+
+  for (const axis of ['x', 'y'] as const) {
+    it(`takes Chromium’s rounding across ${axis}: a pixel and a hair from nothing, three from the range, and no more`, async () => {
+      const press = async (setup: (cdp: FakeSession) => void): Promise<unknown> => {
+        const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+        setup(cdp);
+        return clickInWidget(cdp, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 300 }).then(
+          () => 'pressed',
+          (error: unknown) => (error instanceof WidgetTestError ? error.message : error),
+        );
+      };
+      const nudge = (by: number) => (cdp: FakeSession) => {
+        cdp.layoutNudge = { x: 0, y: 0, [axis]: by };
+      };
+      // A left-to-right page: the readings agree but for rounding.
+      expect(await press(nudge(1.0000019))).toBe('pressed');
+      expect(await press(nudge(1.5))).toBe(ROOT_SCROLLER);
+      // A page scrolling from the far end: the readings differ by the range,
+      // give or take what rounding the content and client sizes add.
+      const farEnd = (by: number) => (cdp: FakeSession) => {
+        cdp.origin = { x: 0, y: 0, [axis]: cdp.range[axis] };
+        nudge(by)(cdp);
+      };
+      expect(await press(farEnd(-1.6))).toBe('pressed');
+      expect(await press(farEnd(2.9))).toBe('pressed');
+      expect(await press(farEnd(3.5))).toBe(ROOT_SCROLLER);
+    });
+  }
 
   for (const [axis, from, to, pressed] of [
     // Deny's centre, (260, 450) in the document, ends 185 px up the viewport, never 135.
@@ -786,8 +841,11 @@ describe('arming and the hit test', () => {
   it('presses at the point just checked while a page scrolling by fractions moves it under a pixel', async () => {
     const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
     cdp.scroll = { x: 0, y: 134.6 };
-    // Every move of the pointer meets a page scrolled 0.3 px further, as one
-    // scrolling every frame at a device scale of 1.25 would be.
+    // Every move of the pointer meets a page scrolled 0.3 px further. At a
+    // device scale of 1.25 a page scrolls in 0.8 px steps, and a fixed button
+    // stays put while its press point, rounded against that fraction, moves
+    // by a fraction of a pixel; the fake's button moves with the page instead,
+    // which drifts the press point in the same way.
     cdp.onSend = (method, params) => {
       if (method === 'Input.dispatchMouseEvent' && params.type === 'mouseMoved') {
         cdp.scroll = { x: 0, y: cdp.scroll.y + 0.3 };
@@ -799,6 +857,24 @@ describe('arming and the hit test', () => {
     // The press lands where the last check was made, a fraction from the move.
     expect(Number(pressed?.y) + cdp.scroll.y).toBeCloseTo(450, 9);
     expect(Math.abs(Number(pressed?.y) - Number(moved?.y))).toBeLessThan(1);
+  });
+
+  it('moves again rather than press a point a pixel or more from the last move', async () => {
+    const cdp = new FakeSession(documentOf(dock([prompt('req-1', CI, 400)])));
+    cdp.scroll = { x: 0, y: 134.6 };
+    let moves = 0;
+    cdp.onSend = (method, params) => {
+      // The first move meets a page scrolled 1.5 px; it then holds still.
+      if (method === 'Input.dispatchMouseEvent' && params.type === 'mouseMoved' && ++moves === 1) {
+        cdp.scroll = { x: 0, y: cdp.scroll.y + 1.5 };
+      }
+    };
+    await clickInWidget(cdp, { action: 'deny', requestId: 'req-1' }, { timeoutMs: 2000 });
+    const events = cdp.mouse();
+    const at = events.findIndex((event) => event.type === 'mousePressed');
+    expect(moves).toBe(2);
+    expect(Math.abs(Number(events[at]?.y) - Number(events[at - 1]?.y))).toBeLessThan(1);
+    expect(Number(events[at]?.y) + cdp.scroll.y).toBeCloseTo(450, 9);
   });
 
   // Deny's centre is (260, 450) in the document.
