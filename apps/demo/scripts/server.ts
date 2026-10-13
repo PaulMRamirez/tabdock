@@ -115,9 +115,13 @@ export function staticPolicy(styleHash: string): string {
  * of the page's one inline <style> computed here, so a style edit can never
  * leave a stale hash behind. It refuses a page the policy would break: a
  * second style block, a style attribute, or a script that is inline or not
- * loaded by a relative path.
+ * loaded by a relative path. The policy is the board's unless `policy` says;
+ * the map demo passes its own, the board's without worker-src (ADR 0050).
  */
-export function staticIndexHtml(html: string): string {
+export function staticIndexHtml(
+  html: string,
+  policy: (styleHash: string) => string = staticPolicy,
+): string {
   const styles = [...html.matchAll(/<style>([\s\S]*?)<\/style>/g)];
   if (styles.length !== 1 || (html.match(/<style\b/g) ?? []).length !== 1) {
     throw new Error('index.html must hold exactly one inline <style> block');
@@ -142,7 +146,7 @@ export function staticIndexHtml(html: string): string {
     charset,
     [
       charset,
-      `    <meta http-equiv="Content-Security-Policy" content="${staticPolicy(hash)}" />`,
+      `    <meta http-equiv="Content-Security-Policy" content="${policy(hash)}" />`,
       '    <meta name="referrer" content="no-referrer" />',
     ].join('\n'),
   );
