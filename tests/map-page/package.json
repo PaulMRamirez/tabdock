@@ -13,7 +13,7 @@
     "typecheck": "tsc -p tsconfig.json && tsc -p scripts/tsconfig.json && tsc -p test/tsconfig.json"
   },
   "dependencies": {
-    "@mcp-b/webmcp-polyfill": "5.1.0",
+    "@mcp-b/webmcp-polyfill": "6.0.0",
     "@tabdock/adapter": "workspace:*",
     "@tabdock/sim-page": "workspace:*"
   },
