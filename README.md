@@ -27,9 +27,9 @@ The relay never runs a tool: it signs clients in and checks and routes each call
 
 ## See it
 
-[![The map demo on the globe, with an MCP client attached as driver, a caption naming the step, and the Tabdock panel listing each call](apps/map-demo/media/poster.png)](https://paulmramirez.github.io/tabdock/map/)
+[![A scripted MCP client beside the map demo: asked for the next stop, it calls go_to_stop and the map moves to Lake Baikal; asked for a picture of the view, it calls capture_view and the pane shows the PNG it got back](apps/map-demo/media/map-demo-loop.gif)](https://paulmramirez.github.io/tabdock/map/)
 
-The picture links the map demo on the project's site, live once the site is published. It is the last frame of [a recording under a minute long](apps/map-demo/media/map-demo.webm) that `pnpm record:map-demo` made: a script on the MCP SDK, standing in for Claude, pairs through a local relay, is let in as driver, and takes the tour, with the pairing code kept off camera.
+The loop links the map demo on the project's site, live once the site is published. It is nine seconds of [a recording under a minute long](apps/map-demo/media/map-demo.mp4) that `pnpm record:map-demo` made in local mode: on the left, a script on the MCP SDK standing in for Claude shows each call it makes and the start of the relay's answer, untrusted label included, under a caption of what a person would ask; on the right, the page as its visitor sees it. The pairing code stays off camera. A recording of Claude itself is the owner's to make (`docs/checklists/map-demo.md`, step 4).
 
 The map demo draws Earth as a flat map and a globe on a plain canvas, from Natural Earth's public-domain data: connect a relay of your own, pair Claude in the widget, and ask it to take the six-stop tour, capture each stop or follow the page as you pan ([apps/map-demo](apps/map-demo/README.md)). It will live at `/map/` on the project's GitHub Pages site, beside the demo board at `/`, once the site is published by dispatching `.github/workflows/pages.yml` on `main`; the repository's website link will then point there. Until then, `pnpm dev:map-demo` serves it from a clone and prints a link for `pnpm relay`.
 

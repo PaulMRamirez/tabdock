@@ -230,16 +230,16 @@
       li.error {
         color: #c92a2a;
       }
-      /* The recording's poster, a link to the video itself; capped so it
-         does not tower over the map on a wide screen. */
-      .watch a {
-        display: block;
-        max-width: 640px;
-      }
-      .watch img {
+      /* The recording plays here from its poster, fetching nothing more
+         until asked; capped so it does not tower over the map on a wide
+         screen. */
+      .watch video {
         display: block;
         width: 100%;
+        max-width: 720px;
         height: auto;
+        aspect-ratio: 16 / 9;
+        background: #0d1320;
         border: 1px solid var(--line);
         border-radius: 6px;
       }
@@ -323,20 +323,26 @@
       </div>
       <section class="card watch" id="watch">
         <h2>Watch a client take the tour</h2>
-        <a href="media/map-demo.webm">
-          <img
-            src="media/poster.png"
-            width="1280"
-            height="720"
-            loading="lazy"
-            decoding="async"
-            alt="The map demo with a client attached as driver: the globe, a caption naming the step, and the Tabdock panel listing each call. Opens the video."
-          />
-        </a>
+        <video
+          controls
+          playsinline
+          preload="none"
+          width="1280"
+          height="720"
+          poster="media/poster.png"
+          aria-label="A recording of this page beside a scripted MCP client: on the left each call the client makes and the start of the relay's answer, on the right the map as the visitor sees it."
+        >
+          <source src="media/map-demo.mp4" type="video/mp4" />
+          <source src="media/map-demo.webm" type="video/webm" />
+          <a href="media/map-demo.mp4">Open the recording (MP4)</a>
+        </video>
         <p class="meta">
-          A recording under a minute long (WebM, under 4 MB) of this page in a browser: a script on
-          the MCP SDK, standing in for Claude, pairs through a relay on the same machine, is allowed
-          in as driver, and takes the tour with one capture. The pairing code stays off camera.
+          A recording under a minute long of this page in a browser, beside a pane listing each call
+          as it went. The client is a script on the MCP SDK standing in for Claude, not Claude: it
+          pairs through a relay on the same machine, is allowed in as driver, and takes the tour,
+          capturing one view and reading the page's state. Every call and answer shown is real, the
+          captions say what a person would ask, and the pairing code stays off camera.
+          <a href="media/map-demo.mp4">Open the MP4</a> (under 4 MB).
         </p>
       </section>
       <section class="card">

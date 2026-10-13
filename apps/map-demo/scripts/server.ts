@@ -24,35 +24,48 @@ const mediaDir = join(appDir, 'media');
 export const DEFAULT_MAP_DEMO_PORT = 5175;
 
 /**
- * The recording the page links (pnpm record:map-demo, ADR 0050's notes):
- * a video of a client taking the tour and its poster, kept in media/ beside
- * the page's source and served from media/ beside the page.
+ * The recording the page plays (pnpm record:map-demo, ADR 0050's notes): a
+ * video of a client taking the tour, as an MP4 and a WebM, and its poster,
+ * kept in media/ beside the page's source and served from media/ beside the
+ * page. media/ also holds a looping GIF for the README, which the page does
+ * not use, so the build leaves it out.
  */
-export const MAP_DEMO_MEDIA = { video: 'map-demo.webm', poster: 'poster.png' } as const;
+export const MAP_DEMO_MEDIA = {
+  video: 'map-demo.mp4',
+  webm: 'map-demo.webm',
+  poster: 'poster.png',
+} as const;
 export type MapDemoMedia = typeof MAP_DEMO_MEDIA;
 
 /** Each media file's type, by the path the page links it at. */
 const MEDIA_TYPES: Record<string, string> = {
-  [`/media/${MAP_DEMO_MEDIA.video}`]: 'video/webm',
+  [`/media/${MAP_DEMO_MEDIA.video}`]: 'video/mp4',
+  [`/media/${MAP_DEMO_MEDIA.webm}`]: 'video/webm',
   [`/media/${MAP_DEMO_MEDIA.poster}`]: 'image/png',
 };
 
 /**
  * The static build's policy: the board's (staticPolicy, ADR 0029) with
- * worker-src 'none' in place of its blob: worker, since the map starts no
- * worker. Leaving worker-src out would not do: a worker then falls back to
- * script-src 'self', so a script already on the page could start any of the
- * site's scripts as a worker or register one as a service worker. Scripts
- * from this origin only, the one inline style by its hash, sockets to any
- * relay the visitor names, no workers, no base URL changes and no form posts.
+ * media-src 'self' after its img-src, for the recording's video element,
+ * and worker-src 'none' in place of its blob: worker, since the map starts
+ * no worker. Leaving worker-src out would not do: a worker then falls back
+ * to script-src 'self', so a script already on the page could start any of
+ * the site's scripts as a worker or register one as a service worker.
+ * Scripts from this origin only, the one inline style by its hash, images
+ * and video from this origin only, sockets to any relay the visitor names,
+ * no workers, no base URL changes and no form posts.
  */
 export function mapDemoPolicy(styleHash: string): string {
   const directives = staticPolicy(styleHash)
     .split('; ')
     .filter((directive) => !directive.startsWith('worker-src '));
+  const at = (name: string): number =>
+    directives.findIndex((directive) => directive.startsWith(`${name} `));
   // Where the board names its worker, after connect-src, so the two read alike.
-  const after = directives.findIndex((directive) => directive.startsWith('connect-src '));
-  directives.splice(after === -1 ? directives.length : after + 1, 0, "worker-src 'none'");
+  const connect = at('connect-src');
+  directives.splice(connect === -1 ? directives.length : connect + 1, 0, "worker-src 'none'");
+  const img = at('img-src');
+  directives.splice(img === -1 ? directives.length : img + 1, 0, "media-src 'self'");
   return directives.join('; ');
 }
 
@@ -84,13 +97,18 @@ export async function mapDemoIndexHtml(): Promise<string> {
  * the recording in media/, which the page links. A static host sends no
  * headers of ours, so the policy rides in a meta element, and a meta policy
  * cannot carry frame-ancestors, so the page's own refusal to link inside a
- * frame (src/main.ts) stays its framing defence.
+ * frame (src/main.ts) stays its framing defence. `media: false` leaves the
+ * recording out, for pnpm record:map-demo alone, which films the page
+ * before there is a take to link.
  */
-export async function buildMapDemo(options: { outDir?: string } = {}): Promise<void> {
+export async function buildMapDemo(
+  options: { outDir?: string; media?: boolean } = {},
+): Promise<void> {
   const outDir = options.outDir ?? distDir;
   await rm(outDir, { recursive: true, force: true });
   await esbuild.build({ ...baseOptions, minify: true, outfile: join(outDir, 'main.js') });
   await writeFile(join(outDir, 'index.html'), await mapDemoIndexHtml());
+  if (options.media === false) return;
   await mkdir(join(outDir, 'media'));
   for (const name of Object.values(MAP_DEMO_MEDIA)) {
     // The page links both, so a build without one would publish a broken link.

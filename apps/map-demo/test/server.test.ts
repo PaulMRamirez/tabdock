@@ -1,13 +1,13 @@
 // The map demo's static build and dev server (ADR 0050): the build holds
-// exactly index.html, main.js, main.js.map and the recording's two files in
-// media/, which the page links, within the size budget, under
-// the board's meta policy with worker-src 'none', loading its one script by a
-// relative path with no inline script and no outside URL; the dev server
-// serves that same page and the recording, answers only its own loopback
-// names, and takes its
-// port from --port or MAP_DEMO_PORT without echoing a bad value.
+// exactly index.html, main.js, main.js.map and the recording's three files
+// in media/, which the page plays, within the size budget, under the board's
+// meta policy with media-src 'self' and worker-src 'none', loading its one
+// script by a relative path with no inline script and no outside URL; the
+// dev server serves that same page and the recording, answers only its own
+// loopback names, and takes its port from --port or MAP_DEMO_PORT without
+// echoing a bad value.
 
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -80,6 +80,37 @@ describe("the map demo's static build", () => {
     expect(readFileSync(join(outDir, 'index.html')).length).toBeLessThanOrEqual(BUDGET.indexHtml);
   });
 
+  it('plays the recording from its poster, as an MP4 and a WebM, and leaves the README loop out', () => {
+    expect(MAP_DEMO_MEDIA).toEqual({
+      video: 'map-demo.mp4',
+      webm: 'map-demo.webm',
+      poster: 'poster.png',
+    });
+    const html = readFileSync(join(outDir, 'index.html'), 'utf8');
+    const video = /<video\b[^>]*>[\s\S]*?<\/video>/.exec(html)?.[0] ?? '';
+    expect(video).toContain('poster="media/poster.png"');
+    expect(video).toContain('preload="none"');
+    expect(video).not.toMatch(/\sautoplay\b/);
+    expect(
+      [...video.matchAll(/<source src="([^"]+)" type="([^"]+)"/g)].map((m) => [m[1], m[2]]),
+    ).toEqual([
+      ['media/map-demo.mp4', 'video/mp4'],
+      ['media/map-demo.webm', 'video/webm'],
+    ]);
+    expect(html).toContain('<a href="media/map-demo.mp4">');
+    expect(existsSync(join(outDir, 'media', 'map-demo-loop.gif'))).toBe(false);
+  });
+
+  it('leaves the recording out only when asked, for the recorder', async () => {
+    const bare = mkdtempSync(join(tmpdir(), 'tabdock-map-demo-bare-'));
+    try {
+      await buildMapDemo({ outDir: bare, media: false });
+      expect(readdirSync(bare).sort()).toEqual(['index.html', 'main.js', 'main.js.map']);
+    } finally {
+      rmSync(bare, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   it("carries zod's English messages alone, and stays near its measured size", () => {
     const main = readFileSync(join(outDir, 'main.js'));
     const text = main.toString('utf8');
@@ -99,9 +130,14 @@ describe("the map demo's static build", () => {
     const hash = /'sha256-([^']+)'/.exec(policy ?? '')?.[1] ?? '';
     expect(policy).toBe(mapDemoPolicy(hash));
     // The board's blob: worker closed, not dropped: without worker-src a worker
-    // would fall back to script-src 'self'.
-    expect(policy).toBe(staticPolicy(hash).replace('worker-src blob:', "worker-src 'none'"));
+    // would fall back to script-src 'self'. Media from this origin alone, for the recording.
+    expect(policy).toBe(
+      staticPolicy(hash)
+        .replace('worker-src blob:', "worker-src 'none'")
+        .replace("img-src 'self'", "img-src 'self'; media-src 'self'"),
+    );
     expect(policy).toContain("; worker-src 'none'; ");
+    expect(policy).toContain("; media-src 'self'; ");
     expect(html.indexOf('Content-Security-Policy')).toBeLessThan(html.indexOf('<style>'));
     expect(html).toContain('<meta name="referrer" content="no-referrer" />');
     expect([...html.matchAll(/<script\b[^>]*>/g)].map(([tag]) => tag)).toEqual([
@@ -129,14 +165,25 @@ describe("the map demo's dev server", () => {
     expect(await page.text()).toContain('<meta http-equiv="Content-Security-Policy"');
     expect((await fetch(new URL('main.js', url))).status).toBe(200);
     expect((await fetch(new URL('other.js', url))).status).toBe(404);
-    // The recording by its two names alone, each with its type.
+    // The recording by its three names alone, each with its type.
     const poster = await fetch(new URL(`media/${MAP_DEMO_MEDIA.poster}`, url));
     expect(poster.status).toBe(200);
     expect(poster.headers.get('content-type')).toBe('image/png');
-    const video = await fetch(new URL(`media/${MAP_DEMO_MEDIA.video}`, url), { method: 'HEAD' });
-    expect(video.status).toBe(200);
-    expect(video.headers.get('content-type')).toBe('video/webm');
-    for (const other of ['media/', 'media/other.png', 'media/POSTER.PNG', 'media/poster.png/']) {
+    for (const [name, type] of [
+      [MAP_DEMO_MEDIA.video, 'video/mp4'],
+      [MAP_DEMO_MEDIA.webm, 'video/webm'],
+    ] as const) {
+      const video = await fetch(new URL(`media/${name}`, url), { method: 'HEAD' });
+      expect(video.status, name).toBe(200);
+      expect(video.headers.get('content-type'), name).toBe(type);
+    }
+    for (const other of [
+      'media/',
+      'media/other.png',
+      'media/POSTER.PNG',
+      'media/poster.png/',
+      'media/map-demo-loop.gif',
+    ]) {
       expect((await fetch(new URL(other, url))).status, other).toBe(404);
     }
     const port = new URL(url).port;

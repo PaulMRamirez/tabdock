@@ -167,14 +167,17 @@ export async function tourDirProblems(tourDir: string): Promise<string[]> {
  * sockets to whatever relay a visitor names, no base URL and no form posts.
  * worker-src blob: is the board's ?busy worker; the map demo starts none, so
  * its policy says worker-src 'none', since without the directive a worker
- * would fall back to script-src 'self' (ADR 0050's notes).
+ * would fall back to script-src 'self' (ADR 0050's notes). media-src 'self'
+ * comes only with `video`, for a page that plays its own recording from the
+ * site (the map demo, ADR 0050's notes from the hero video).
  */
-export function scriptedPolicy(styleHash: string, worker: boolean): string {
+export function scriptedPolicy(styleHash: string, worker: boolean, video = false): string {
   return [
     "default-src 'none'",
     "script-src 'self'",
     `style-src 'self' 'sha256-${styleHash}'`,
     "img-src 'self'",
+    ...(video ? ["media-src 'self'"] : []),
     'connect-src wss: ws:',
     worker ? 'worker-src blob:' : "worker-src 'none'",
     "base-uri 'none'",
@@ -278,13 +281,18 @@ function outsideUrl(value: string): boolean {
 /**
  * Why a page with script (the board's index.html or the map demo's) may not
  * ship; empty when it may. Its policy comes first, once, ahead of all it
- * governs, with the hash of its one inline style and worker-src blob: where
- * `worker` says, 'none' otherwise; a no-referrer meta comes before anything
- * that loads; it loads exactly SCRIPTED_SCRIPT and no inline script; and it
- * holds no event handler attribute, style attribute, frame, form, base,
- * link, or URL outside the site in any attribute urlsIn reads.
+ * governs, with the hash of its one inline style, worker-src blob: where
+ * `worker` says, 'none' otherwise, and media-src 'self' only where `video`
+ * says; a no-referrer meta comes before anything that loads; it loads
+ * exactly SCRIPTED_SCRIPT and no inline script; and it holds no event
+ * handler attribute, style attribute, frame, form, base, link, or URL
+ * outside the site in any attribute urlsIn reads.
  */
-export function scriptedPageProblems(html: string, page: { worker: boolean }): string[] {
+export function scriptedPageProblems(
+  html: string,
+  page: { worker: boolean; video?: boolean },
+): string[] {
+  const video = page.video === true;
   const problems: string[] = [];
   const metas = [...html.matchAll(SCRIPTED_POLICY_META)];
   const [meta] = metas;
@@ -302,9 +310,9 @@ export function scriptedPageProblems(html: string, page: { worker: boolean }): s
       const hash = createHash('sha256')
         .update(styles[0]?.[1] ?? '', 'utf8')
         .digest('base64');
-      if (meta[1] !== scriptedPolicy(hash, page.worker)) {
+      if (meta[1] !== scriptedPolicy(hash, page.worker, video)) {
         problems.push(
-          `its policy is not the site's for a page with script ${page.worker ? 'and a worker' : 'and no worker'}`,
+          `its policy is not the site's for a page with script ${page.worker ? 'and a worker' : 'and no worker'}${video ? ', playing a video' : ''}`,
         );
       }
     }
@@ -367,25 +375,40 @@ export const MEDIA_DIR = 'media';
 
 /** One media file a page with script may ship: what its bytes must begin as, and its most bytes. */
 export interface MediaFile {
-  kind: 'png' | 'webm';
+  kind: 'png' | 'mp4' | 'webm';
   maxBytes: number;
 }
 
-/**
- * The map demo's recording (pnpm record:map-demo, ADR 0050's notes): its
- * poster, which a phone fetches with the page, and the video the poster
- * links. Over budget means a shorter take, never a raise.
- */
-export const MAP_DEMO_MEDIA: Readonly<Record<string, MediaFile>> = {
-  'poster.png': { kind: 'png', maxBytes: 300_000 },
-  'map-demo.webm': { kind: 'webm', maxBytes: 4_000_000 },
+/** What each kind is called in a refusal, with its article. */
+const MEDIA_KIND_NAMES: Readonly<Record<MediaFile['kind'], string>> = {
+  png: 'a PNG',
+  mp4: 'an MP4',
+  webm: 'a WebM',
 };
 
 /**
- * Whether bytes begin as their kind says: a PNG's signature, or an EBML
- * header naming the webm document type. Pages chooses each file's type by
- * its name, so a page or script given a media name would still be served as
- * media, but nothing other than a picture or a video belongs here.
+ * The map demo's recording (pnpm record:map-demo, ADR 0050's notes): its
+ * poster, which a phone fetches with the page, and the video the page
+ * plays, as an MP4 and as a WebM for a browser without H.264. Over budget
+ * means a shorter take, never a raise.
+ */
+export const MAP_DEMO_MEDIA: Readonly<Record<string, MediaFile>> = {
+  'poster.png': { kind: 'png', maxBytes: 300_000 },
+  'map-demo.mp4': { kind: 'mp4', maxBytes: 4_000_000 },
+  'map-demo.webm': { kind: 'webm', maxBytes: 4_000_000 },
+};
+
+/** Whether a page's media holds a video, so its policy takes media-src 'self'. */
+export function mediaHoldsVideo(files: Readonly<Record<string, MediaFile>> | undefined): boolean {
+  return Object.values(files ?? {}).some((file) => file.kind !== 'png');
+}
+
+/**
+ * Whether bytes begin as their kind says: a PNG's signature, an MP4's
+ * first box naming its file type (ftyp), or an EBML header naming the webm
+ * document type. Pages chooses each file's type by its name, so a page or
+ * script given a media name would still be served as media, but nothing
+ * other than a picture or a video belongs here.
  */
 function mediaKindHolds(bytes: Buffer, kind: MediaFile['kind']): boolean {
   if (kind === 'png') {
@@ -393,6 +416,7 @@ function mediaKindHolds(bytes: Buffer, kind: MediaFile['kind']): boolean {
       .subarray(0, 8)
       .equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
   }
+  if (kind === 'mp4') return bytes.subarray(4, 8).equals(Buffer.from('ftyp'));
   return (
     bytes.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3])) &&
     bytes.subarray(0, 64).includes(Buffer.from('webm'))
@@ -411,7 +435,10 @@ export interface ScriptedDir {
   budget?: ScriptedBudget;
   /** Links the page must carry, as written, so a visitor finds what they lead to. */
   links?: readonly string[];
-  /** The files MEDIA_DIR must hold, exactly, each by its name; without it the page ships none. */
+  /**
+   * The files MEDIA_DIR must hold, exactly, each by its name; without it the
+   * page ships none. A video among them gives the page's policy media-src 'self'.
+   */
   media?: Readonly<Record<string, MediaFile>>;
 }
 
@@ -447,9 +474,7 @@ async function mediaProblems(
         );
       }
       if (!mediaKindHolds(content, rule.kind)) {
-        problems.push(
-          `${shown}/${entry.name}: is not a ${rule.kind === 'png' ? 'PNG' : 'WebM'} file`,
-        );
+        problems.push(`${shown}/${entry.name}: is not ${MEDIA_KIND_NAMES[rule.kind]} file`);
       }
     }
   }
@@ -510,7 +535,8 @@ export async function scriptedDirProblems(
   if (files.has('index.html')) {
     const raw = await readFile(join(dir, 'index.html'));
     const html = raw.toString('utf8');
-    for (const problem of scriptedPageProblems(html, { worker: rules.worker })) {
+    const page = { worker: rules.worker, video: mediaHoldsVideo(rules.media) };
+    for (const problem of scriptedPageProblems(html, page)) {
       problems.push(`${shown('index.html')}: ${problem}`);
     }
     if (rules.budget && raw.length > rules.budget.indexHtml) {

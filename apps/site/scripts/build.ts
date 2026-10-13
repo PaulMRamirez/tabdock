@@ -237,7 +237,7 @@ async function main(): Promise<void> {
         worker: false,
         subdirs: [MEDIA_DIR],
         budget: MAP_DEMO_BUDGET,
-        // Its recording, whose poster the page shows as a link to the video.
+        // Its recording, which the page plays from its poster, so its policy takes media-src 'self'.
         media: MAP_DEMO_MEDIA,
         links: Object.keys(MAP_DEMO_MEDIA).map((name) => `${MEDIA_DIR}/${name}`),
       },

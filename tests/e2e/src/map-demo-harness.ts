@@ -46,10 +46,14 @@ export interface MapDemoSite {
   close(): Promise<void>;
 }
 
+/** Each file's type by its extension, as Pages chooses it. */
 const TYPES: Readonly<Record<string, string>> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.map': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
 };
 
 /**
@@ -57,12 +61,16 @@ const TYPES: Readonly<Record<string, string>> = {
  * site on 127.0.0.1 as a static host would: GET and HEAD only, a directory by
  * its index.html, a directory named without its slash redirected to it, and
  * no Content-Security-Policy or any other header but the type, so the page's
- * meta policy is the only one in force.
+ * meta policy is the only one in force. `media: false` builds it without
+ * the recording, as pnpm record:map-demo films it.
  */
-export async function serveMapDemoSite(): Promise<MapDemoSite> {
+export async function serveMapDemoSite(options: { media?: boolean } = {}): Promise<MapDemoSite> {
   const root = mkdtempSync(join(tmpdir(), 'tabdock-map-demo-site-'));
   try {
-    await buildMapDemo({ outDir: join(root, MAP_DEMO_PATH.slice(1, -1)) });
+    await buildMapDemo({
+      outDir: join(root, MAP_DEMO_PATH.slice(1, -1)),
+      ...(options.media === false ? { media: false } : {}),
+    });
   } catch (error) {
     rmSync(root, { recursive: true, force: true });
     throw error;

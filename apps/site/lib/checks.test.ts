@@ -8,6 +8,7 @@ import {
   MAP_DEMO_BUDGET,
   MAP_DEMO_MEDIA,
   MEDIA_DIR,
+  mediaHoldsVideo,
   SCRIPTED_SCRIPT,
   scriptedDirProblems,
   scriptedPageProblems,
@@ -240,12 +241,12 @@ describe('tourDirProblems, the read-back of the built tour', () => {
 const STYLE = '\n      body { margin: 0; }\n    ';
 const styleHash = createHash('sha256').update(STYLE, 'utf8').digest('base64');
 
-function scripted(worker: boolean, body: string, style = STYLE): string {
+function scripted(worker: boolean, body: string, style = STYLE, video = false): string {
   return `<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta http-equiv="Content-Security-Policy" content="${scriptedPolicy(styleHash, worker)}" />
+    <meta http-equiv="Content-Security-Policy" content="${scriptedPolicy(styleHash, worker, video)}" />
     <meta name="referrer" content="no-referrer" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>T</title>
@@ -263,15 +264,20 @@ function scripted(worker: boolean, body: string, style = STYLE): string {
 const board = scripted(true, '<nav><a href="tour/">The tour</a> <a href="map/">The map</a></nav>');
 const map = scripted(
   false,
-  '<nav><a href="../">The board</a> <a href="../guide/16-map-pages.html">Map pages</a></nav><canvas aria-label="Map; drag to pan, or use the buttons"></canvas><a href="media/map-demo.webm"><img src="media/poster.png" width="1280" height="720" alt="The recording"></a>',
+  '<nav><a href="../">The board</a> <a href="../guide/16-map-pages.html">Map pages</a></nav><canvas aria-label="Map; drag to pan, or use the buttons"></canvas><video controls preload="none" poster="media/poster.png" width="1280" height="720"><source src="media/map-demo.mp4" type="video/mp4"><source src="media/map-demo.webm" type="video/webm"></video><a href="media/map-demo.mp4">The MP4</a>',
+  STYLE,
+  true,
 );
+/** The map demo plays its recording, so its policy takes media-src 'self'. */
+const MAP_PAGE = { worker: false, video: true } as const;
 
 describe('scriptedPageProblems (ADR 0050)', () => {
   it("passes the board's page and the map demo's, each under its own policy", () => {
     assert.deepEqual(scriptedPageProblems(board, { worker: true }), []);
-    assert.deepEqual(scriptedPageProblems(map, { worker: false }), []);
+    assert.deepEqual(scriptedPageProblems(map, MAP_PAGE), []);
     // The board's static policy, word for word (apps/demo/scripts/server.ts), and the map's
-    // with worker-src 'none', since without it a worker falls back to script-src 'self'.
+    // with worker-src 'none', since without it a worker falls back to script-src 'self',
+    // and media-src 'self' for the recording it plays.
     assert.equal(
       scriptedPolicy('H', true),
       "default-src 'none'; script-src 'self'; style-src 'self' 'sha256-H'; img-src 'self'; connect-src wss: ws:; worker-src blob:; base-uri 'none'; form-action 'none'",
@@ -280,15 +286,21 @@ describe('scriptedPageProblems (ADR 0050)', () => {
       scriptedPolicy('H', false),
       "default-src 'none'; script-src 'self'; style-src 'self' 'sha256-H'; img-src 'self'; connect-src wss: ws:; worker-src 'none'; base-uri 'none'; form-action 'none'",
     );
+    assert.equal(
+      scriptedPolicy('H', false, true),
+      "default-src 'none'; script-src 'self'; style-src 'self' 'sha256-H'; img-src 'self'; media-src 'self'; connect-src wss: ws:; worker-src 'none'; base-uri 'none'; form-action 'none'",
+    );
   });
 
   it('refuses a page without its policy, with it twice, after what it governs, or looser than the rule', () => {
     const meta =
       /\s*<meta http-equiv="Content-Security-Policy" content="[^"]*" \/>/.exec(map)?.[0] ?? '';
     assert.ok(meta.length > 0);
-    const has = (html: string, problem: string, worker = false): void => {
-      assert.ok(scriptedPageProblems(html, { worker }).includes(problem), problem);
+    const has = (html: string, problem: string, worker = false, video = !worker): void => {
+      assert.ok(scriptedPageProblems(html, { worker, video }).includes(problem), problem);
     };
+    const mapRefused =
+      "its policy is not the site's for a page with script and no worker, playing a video";
     has(map.replace(meta, ''), 'lacks its policy, or holds it more than once');
     has(map.replace(meta, `${meta}${meta}`), 'lacks its policy, or holds it more than once');
     has(
@@ -296,21 +308,18 @@ describe('scriptedPageProblems (ADR 0050)', () => {
       'has <style ahead of its policy',
     );
     // The board's worker on the map, or none on the board, is not the page's policy.
-    has(map, "its policy is not the site's for a page with script and a worker", true);
-    has(board, "its policy is not the site's for a page with script and no worker");
-    has(
-      map.replace("script-src 'self'", "script-src 'self' 'unsafe-inline'"),
-      "its policy is not the site's for a page with script and no worker",
-    );
+    has(map, "its policy is not the site's for a page with script and a worker", true, false);
+    has(board, "its policy is not the site's for a page with script and no worker", false, false);
+    has(map.replace("script-src 'self'", "script-src 'self' 'unsafe-inline'"), mapRefused);
     // The map without worker-src at all lets a same-origin script run as a worker.
-    has(
-      map.replace(" worker-src 'none';", ''),
-      "its policy is not the site's for a page with script and no worker",
-    );
+    has(map.replace(" worker-src 'none';", ''), mapRefused);
+    // Media from anywhere, or a page that plays no video yet takes media-src.
+    has(map.replace("media-src 'self'", 'media-src *'), mapRefused);
+    has(map, "its policy is not the site's for a page with script and no worker", false, false);
     // A style edited after its hash was taken.
     has(
-      scripted(false, '', `${STYLE}p{}`).replace(/sha256-[^']+/, `sha256-${styleHash}`),
-      "its policy is not the site's for a page with script and no worker",
+      scripted(false, '', `${STYLE}p{}`, true).replace(/sha256-[^']+/, `sha256-${styleHash}`),
+      mapRefused,
     );
     has(
       map.replace('<meta name="referrer" content="no-referrer" />', ''),
@@ -386,13 +395,14 @@ describe('scriptedPageProblems (ADR 0050)', () => {
       ["<video poster='p.png'></video>", 'has an unquoted or single-quoted poster'],
     ] as const) {
       const html = map.replace('<canvas', `${extra}<canvas`);
-      assert.ok(scriptedPageProblems(html, { worker: false }).includes(problem), extra);
+      assert.ok(scriptedPageProblems(html, MAP_PAGE).includes(problem), extra);
     }
   });
 });
 
-/** The first bytes of a PNG and of a WebM, as the media check reads them. */
+/** The first bytes of a PNG, an MP4 and a WebM, as the media check reads them. */
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13]);
+const MP4 = Buffer.concat([Buffer.from([0, 0, 0, 0x20]), Buffer.from('ftypisom')]);
 const WEBM = Buffer.concat([
   Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x9f, 0x42, 0x82, 0x84]),
   Buffer.from('webm'),
@@ -404,6 +414,7 @@ describe('scriptedDirProblems, the read-back of the board and the map demo', () 
     const dir = mkdtempSync(join(tmpdir(), 'tabdock-site-scripted-'));
     for (const sub of ['tour', 'guide', 'map', 'map/media']) mkdirSync(join(dir, sub));
     writeFileSync(join(dir, 'map', 'media', 'poster.png'), PNG);
+    writeFileSync(join(dir, 'map', 'media', 'map-demo.mp4'), MP4);
     writeFileSync(join(dir, 'map', 'media', 'map-demo.webm'), WEBM);
     writeFileSync(join(dir, 'index.html'), board);
     writeFileSync(join(dir, 'tour', 'index.html'), good);
@@ -424,15 +435,19 @@ describe('scriptedDirProblems, the read-back of the board and the map demo', () 
     subdirs: [MEDIA_DIR],
     budget: MAP_DEMO_BUDGET,
     media: MAP_DEMO_MEDIA,
-    links: ['media/map-demo.webm', 'media/poster.png'],
+    links: ['media/map-demo.mp4', 'media/map-demo.webm', 'media/poster.png'],
   };
 
   it("passes the site's own shape, with ADR 0050's budget and its recording's", async () => {
     assert.deepEqual(MAP_DEMO_BUDGET, { indexHtml: 16_000, mainJs: 800_000, mainJsGzip: 200_000 });
     assert.deepEqual(MAP_DEMO_MEDIA, {
       'poster.png': { kind: 'png', maxBytes: 300_000 },
+      'map-demo.mp4': { kind: 'mp4', maxBytes: 4_000_000 },
       'map-demo.webm': { kind: 'webm', maxBytes: 4_000_000 },
     });
+    assert.equal(mediaHoldsVideo(MAP_DEMO_MEDIA), true);
+    assert.equal(mediaHoldsVideo({ 'poster.png': { kind: 'png', maxBytes: 1 } }), false);
+    assert.equal(mediaHoldsVideo(undefined), false);
     const dir = site();
     try {
       assert.deepEqual(await scriptedDirProblems(dir, '', ROOT), []);
@@ -468,26 +483,31 @@ describe('scriptedDirProblems, the read-back of the board and the map demo', () 
     }
   });
 
-  it("holds the map demo's media to its two files, each of its kind and within its budget", async () => {
+  it("holds the map demo's media to its three files, each of its kind and within its budget", async () => {
     const dir = site();
     try {
       const media = join(dir, 'map', 'media');
       writeFileSync(join(media, 'poster.png'), '<script>alert(1)</script>');
+      writeFileSync(join(media, 'map-demo.mp4'), WEBM);
       writeFileSync(
         join(media, 'map-demo.webm'),
         Buffer.concat([WEBM, Buffer.alloc(4_000_001 - WEBM.length)]),
       );
       writeFileSync(join(media, 'page.html'), '<script>alert(1)</script>');
+      // The README's loop lives in the source tree's media/, never beside the page.
+      writeFileSync(join(media, 'map-demo-loop.gif'), 'GIF89a');
       symlinkSync('/etc/hostname', join(media, 'constructor'));
       assert.deepEqual(await scriptedDirProblems(dir, 'map', MAP), [
         'map/media/constructor: is not a plain file',
+        'map/media/map-demo-loop.gif: has no place beside a page with script',
+        'map/media/map-demo.mp4: is not an MP4 file',
         'map/media/map-demo.webm: 4,000,001 bytes, over its budget of 4,000,000',
         'map/media/page.html: has no place beside a page with script',
         'map/media/poster.png: is not a PNG file',
       ]);
       // A missing poster: the page's link to it leads nowhere, and the page must carry it.
       rmSync(join(media, 'poster.png'));
-      writeFileSync(join(dir, 'map', 'index.html'), map.replace(/<img[^>]*>/, ''));
+      writeFileSync(join(dir, 'map', 'index.html'), map.replace(' poster="media/poster.png"', ''));
       const problems = await scriptedDirProblems(dir, 'map', MAP);
       assert.ok(problems.includes('map/media/poster.png: is missing'), problems.join('\n'));
       assert.ok(problems.includes('map/index.html: does not link media/poster.png'));
