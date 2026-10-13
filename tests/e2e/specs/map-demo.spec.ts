@@ -198,7 +198,7 @@ test('loads under its own meta policy with no violation or console error, regist
   expect(runtime.polyfill).toBe(true);
   expect([...runtime.names].sort()).toEqual([...TOOLS].sort());
   expect(runtime.policy).toMatch(/^default-src 'none'; script-src 'self'; /);
-  expect(runtime.policy).not.toContain('worker-src');
+  expect(runtime.policy).toContain("; worker-src 'none'; ");
   await expect(page.locator('[data-role="status"]')).toHaveText(
     '14 tools registered; not linked to a relay',
   );
@@ -224,6 +224,48 @@ test('loads under its own meta policy with no violation or console error, regist
   });
   expect(colours).toBeGreaterThan(4);
   await expectClean(page);
+});
+
+test("enforces its policy: no worker, from the site's own script or a blob, and no service worker", async ({
+  page,
+}) => {
+  await openMapDemo(page, site.url);
+  const outcomes = await page.evaluate(async () => {
+    // A refused worker is constructed and then fails to load, firing error;
+    // one that loads would not, within the wait.
+    const worker = (url: string): Promise<string> =>
+      new Promise((resolve) => {
+        const started = new Worker(url, { type: 'module' });
+        const timer = setTimeout(() => {
+          started.terminate();
+          resolve('loaded');
+        }, 3_000);
+        started.addEventListener('error', () => {
+          clearTimeout(timer);
+          resolve('refused');
+        });
+      });
+    const blob = URL.createObjectURL(new Blob(['postMessage(1);'], { type: 'text/javascript' }));
+    const registration = await navigator.serviceWorker.register('./main.js').then(
+      () => 'registered',
+      (error: unknown) => (error instanceof Error ? error.name : 'refused'),
+    );
+    return {
+      sameOrigin: await worker('./main.js'),
+      blob: await worker(blob),
+      serviceWorker: registration,
+    };
+  });
+  expect(outcomes).toEqual({
+    sameOrigin: 'refused',
+    blob: 'refused',
+    serviceWorker: 'SecurityError',
+  });
+  // Each was refused by worker-src itself, not by some later failure to run.
+  const violations = (await cspViolations(page)).filter((line) => line.startsWith('worker-src'));
+  expect(violations).toHaveLength(3);
+  expect(violations).toContain(`worker-src ${site.url}main.js`);
+  expect(violations).toContain('worker-src blob');
 });
 
 test('enforces its policy: an inline script is refused', async ({ page }) => {

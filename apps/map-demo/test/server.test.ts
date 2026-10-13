@@ -1,6 +1,6 @@
 // The map demo's static build and dev server (ADR 0050): the build holds
 // exactly index.html, main.js and main.js.map within the size budget, under
-// the board's meta policy without worker-src, loading its one script by a
+// the board's meta policy with worker-src 'none', loading its one script by a
 // relative path with no inline script and no outside URL; the dev server
 // serves that same page, answers only its own loopback names, and takes its
 // port from --port or MAP_DEMO_PORT without echoing a bad value.
@@ -61,15 +61,17 @@ describe("the map demo's static build", () => {
     expect(readFileSync(join(outDir, 'index.html')).length).toBeLessThanOrEqual(BUDGET.indexHtml);
   });
 
-  it("carries the board's policy without worker-src, first in its head, and loads one relative script", () => {
+  it("carries the board's policy with worker-src 'none', first in its head, and loads one relative script", () => {
     const html = readFileSync(join(outDir, 'index.html'), 'utf8');
     const policy = /<meta http-equiv="Content-Security-Policy" content="([^"]+)" \/>/.exec(
       html,
     )?.[1];
     const hash = /'sha256-([^']+)'/.exec(policy ?? '')?.[1] ?? '';
     expect(policy).toBe(mapDemoPolicy(hash));
-    expect(policy).toBe(staticPolicy(hash).replace('; worker-src blob:', ''));
-    expect(policy).not.toContain('worker-src');
+    // The board's blob: worker closed, not dropped: without worker-src a worker
+    // would fall back to script-src 'self'.
+    expect(policy).toBe(staticPolicy(hash).replace('worker-src blob:', "worker-src 'none'"));
+    expect(policy).toContain("; worker-src 'none'; ");
     expect(html.indexOf('Content-Security-Policy')).toBeLessThan(html.indexOf('<style>'));
     expect(html).toContain('<meta name="referrer" content="no-referrer" />');
     expect([...html.matchAll(/<script\b[^>]*>/g)].map(([tag]) => tag)).toEqual([

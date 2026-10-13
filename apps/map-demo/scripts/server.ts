@@ -22,16 +22,22 @@ const distDir = join(appDir, 'dist');
 export const DEFAULT_MAP_DEMO_PORT = 5175;
 
 /**
- * The static build's policy: the board's (staticPolicy, ADR 0029) without
- * worker-src, since the map starts no worker. Scripts from this origin
- * only, the one inline style by its hash, sockets to any relay the visitor
- * names, no base URL changes and no form posts.
+ * The static build's policy: the board's (staticPolicy, ADR 0029) with
+ * worker-src 'none' in place of its blob: worker, since the map starts no
+ * worker. Leaving worker-src out would not do: a worker then falls back to
+ * script-src 'self', so a script already on the page could start any of the
+ * site's scripts as a worker or register one as a service worker. Scripts
+ * from this origin only, the one inline style by its hash, sockets to any
+ * relay the visitor names, no workers, no base URL changes and no form posts.
  */
 export function mapDemoPolicy(styleHash: string): string {
-  return staticPolicy(styleHash)
+  const directives = staticPolicy(styleHash)
     .split('; ')
-    .filter((directive) => !directive.startsWith('worker-src'))
-    .join('; ');
+    .filter((directive) => !directive.startsWith('worker-src '));
+  // Where the board names its worker, after connect-src, so the two read alike.
+  const after = directives.findIndex((directive) => directive.startsWith('connect-src '));
+  directives.splice(after === -1 ? directives.length : after + 1, 0, "worker-src 'none'");
+  return directives.join('; ');
 }
 
 const BUNDLE_TYPES: Record<string, string> = {

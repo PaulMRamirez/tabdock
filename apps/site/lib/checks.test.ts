@@ -268,14 +268,15 @@ describe('scriptedPageProblems (ADR 0050)', () => {
   it("passes the board's page and the map demo's, each under its own policy", () => {
     assert.deepEqual(scriptedPageProblems(board, { worker: true }), []);
     assert.deepEqual(scriptedPageProblems(map, { worker: false }), []);
-    // The board's static policy, word for word (apps/demo/scripts/server.ts), and the map's without worker-src.
+    // The board's static policy, word for word (apps/demo/scripts/server.ts), and the map's
+    // with worker-src 'none', since without it a worker falls back to script-src 'self'.
     assert.equal(
       scriptedPolicy('H', true),
       "default-src 'none'; script-src 'self'; style-src 'self' 'sha256-H'; img-src 'self'; connect-src wss: ws:; worker-src blob:; base-uri 'none'; form-action 'none'",
     );
     assert.equal(
       scriptedPolicy('H', false),
-      scriptedPolicy('H', true).replace(' worker-src blob:;', ''),
+      "default-src 'none'; script-src 'self'; style-src 'self' 'sha256-H'; img-src 'self'; connect-src wss: ws:; worker-src 'none'; base-uri 'none'; form-action 'none'",
     );
   });
 
@@ -297,6 +298,11 @@ describe('scriptedPageProblems (ADR 0050)', () => {
     has(board, "its policy is not the site's for a page with script and no worker");
     has(
       map.replace("script-src 'self'", "script-src 'self' 'unsafe-inline'"),
+      "its policy is not the site's for a page with script and no worker",
+    );
+    // The map without worker-src at all lets a same-origin script run as a worker.
+    has(
+      map.replace(" worker-src 'none';", ''),
       "its policy is not the site's for a page with script and no worker",
     );
     // A style edited after its hash was taken.
@@ -344,6 +350,38 @@ describe('scriptedPageProblems (ADR 0050)', () => {
         'names a URL outside the site, or from its root: javascript&#58;alert(1)',
       ],
       ["<a href='x.html'>x</a>", 'has an unquoted or single-quoted href'],
+      // Every attribute a browser loads, follows or sends to, not href and src alone.
+      [
+        '<img srcset="ok.png 1x, https://x.example/a.png 2x">',
+        'names a URL outside the site, or from its root: ok.png 1x, https://x.example/a.png 2x',
+      ],
+      [
+        '<video poster="https://x.example/p.png"></video>',
+        'names a URL outside the site, or from its root: https://x.example/p.png',
+      ],
+      [
+        '<button formaction="//x.example/">b</button>',
+        'names a URL outside the site, or from its root: //x.example/',
+      ],
+      [
+        '<a href="#x" ping="https://x.example/p">x</a>',
+        'names a URL outside the site, or from its root: https://x.example/p',
+      ],
+      [
+        '<img srcset="a.png&#44;https://x.example/b.png">',
+        'names a URL outside the site, or from its root: a.png&#44;https://x.example/b.png',
+      ],
+      // A second URL in one tag, and one after a > inside a quoted value, are read too.
+      [
+        '<img src="ok.png" poster="/p.png">',
+        'names a URL outside the site, or from its root: /p.png',
+      ],
+      [
+        '<a title="a>b" href="https://x.example/">x</a>',
+        'names a URL outside the site, or from its root: https://x.example/',
+      ],
+      ['<img srcset=a.png>', 'has an unquoted or single-quoted srcset'],
+      ["<video poster='p.png'></video>", 'has an unquoted or single-quoted poster'],
     ] as const) {
       const html = map.replace('<canvas', `${extra}<canvas`);
       assert.ok(scriptedPageProblems(html, { worker: false }).includes(problem), extra);

@@ -165,6 +165,52 @@ describe("the map demo's world", () => {
     for (const feature of features.values()) {
       expect(isPlainText(feature.name)).toBe(true);
       expect(feature.name).not.toMatch(DASHES);
+      expect(feature.name.length).toBeLessThanOrEqual(MAP_MAX_TITLE_CHARS);
     }
+  });
+
+  // ADR 0050 shows no contested name, so every name the page and its tools
+  // give is listed here, reviewed: a regenerated module that adds or renames
+  // a lake fails this until someone reads the new name. The lake Natural
+  // Earth calls Lake Malawi is Lake Nyasa in Tanzania and Lago Niassa in
+  // Mozambique, so it carries all three.
+  it('names exactly the 26 reviewed features, with every name in use where names differ', () => {
+    const world = createEarthWorld({ viewport: VIEWPORT });
+    expect(
+      Object.fromEntries(world.bodyFeatures().map((feature) => [feature.id, feature.name])),
+    ).toStrictEqual({
+      'caspian-sea': 'Caspian Sea',
+      madagascar: 'Madagascar',
+      'lake-baikal': 'Lake Baikal',
+      'lake-winnipeg': 'Lake Winnipeg',
+      'great-slave-lake': 'Great Slave Lake',
+      'lake-ontario': 'Lake Ontario',
+      'lake-erie': 'Lake Erie',
+      'lake-superior': 'Lake Superior',
+      'lake-victoria': 'Lake Victoria',
+      'lake-ladoga': 'Lake Ladoga',
+      'lake-balkhash': 'Lake Balkhash',
+      'lake-tanganyika': 'Lake Tanganyika',
+      'lake-malawi': 'Lake Malawi (Lake Nyasa, Lago Niassa)',
+      vanern: 'Vänern',
+      'lake-okeechobee': 'Lake Okeechobee',
+      'lago-de-nicaragua': 'Lago de Nicaragua',
+      'lake-tana': 'Lake Tana',
+      'lago-titicaca': 'Lago Titicaca',
+      'cedar-lake': 'Cedar Lake',
+      'lake-onega': 'Lake Onega',
+      'great-salt-lake': 'Great Salt Lake',
+      'great-bear-lake': 'Great Bear Lake',
+      'lake-athabasca': 'Lake Athabasca',
+      'reindeer-lake': 'Reindeer Lake',
+      'lake-huron': 'Lake Huron',
+      'lake-michigan': 'Lake Michigan',
+    });
+    // The tools give the same names: features_in_view over the whole Earth.
+    world.setView({ projection: 'equirectangular', lon: 0, lat: 0, widthM: 40_000_000 });
+    const named = world.featuresInView({ limit: 200 }).features;
+    expect(named.find((feature) => feature.id === 'lake-malawi')?.name).toBe(
+      'Lake Malawi (Lake Nyasa, Lago Niassa)',
+    );
   });
 });

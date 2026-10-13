@@ -5,7 +5,9 @@
 // short fact, checked against a source on 13 October 2026 and rounded with
 // "about"; and its three observations outline the Caspian, Baikal and the
 // Great Lakes from the data itself, marked as outlines, not photographs.
-// Nothing here names a border, a country's claim, a person or a brand.
+// Nothing here names a border, a country's claim, a person or a brand, and a
+// lake whose name differs by the country on its shore carries every name in
+// use (DISPLAY_NAMES), so the page takes no side (ADR 0050, decision 5).
 
 import {
   type Footprint,
@@ -30,6 +32,17 @@ const FOV_DEG = 60;
 
 /** Madagascar's label point, on its land (src/earth.test.ts checks it). */
 const MADAGASCAR = { lon: 46.7, lat: -19.3 } as const;
+
+/**
+ * Names the page shows in place of Natural Earth's, by feature id. The lake
+ * Natural Earth calls Lake Malawi is Lake Nyasa in Tanzania and Lago Niassa
+ * in Mozambique, a naming tied to a boundary dispute, so it carries all
+ * three. The generated module stays a pure rerun of the generator; any other
+ * name is reviewed in src/earth.test.ts, which lists all 26.
+ */
+const DISPLAY_NAMES: Readonly<Record<string, string>> = {
+  'lake-malawi': 'Lake Malawi (Lake Nyasa, Lago Niassa)',
+};
 
 /** The observations' time: the day the data was released. */
 const DATA_TIME = `${NATURAL_EARTH.released}T00:00:00.000Z`;
@@ -207,7 +220,7 @@ export function earthWorldData(geography: Geography = earthGeography()): MapWorl
       },
       ...geography.lakes.map((lake) => ({
         id: lake.id,
-        name: lake.name,
+        name: DISPLAY_NAMES[lake.id] ?? lake.name,
         kind: 'lake',
         lon: lake.lon,
         lat: lake.lat,

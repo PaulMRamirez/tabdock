@@ -166,7 +166,8 @@ export async function tourDirProblems(tourDir: string): Promise<string[]> {
  * from the site alone, styles from the page's one inline block by its hash,
  * sockets to whatever relay a visitor names, no base URL and no form posts.
  * worker-src blob: is the board's ?busy worker; the map demo starts none, so
- * its policy leaves it out (ADR 0050).
+ * its policy says worker-src 'none', since without the directive a worker
+ * would fall back to script-src 'self' (ADR 0050's notes).
  */
 export function scriptedPolicy(styleHash: string, worker: boolean): string {
   return [
@@ -175,7 +176,7 @@ export function scriptedPolicy(styleHash: string, worker: boolean): string {
     `style-src 'self' 'sha256-${styleHash}'`,
     "img-src 'self'",
     'connect-src wss: ws:',
-    ...(worker ? ['worker-src blob:'] : []),
+    worker ? 'worker-src blob:' : "worker-src 'none'",
     "base-uri 'none'",
     "form-action 'none'",
   ].join('; ');
@@ -187,11 +188,86 @@ export const SCRIPTED_SCRIPT = '<script type="module" src="./main.js"></script>'
 const SCRIPTED_POLICY_META = /<meta http-equiv="Content-Security-Policy" content="([^"]*)"\s*\/?>/g;
 const SCRIPTED_NO_REFERRER = /<meta name="referrer" content="no-referrer"\s*\/?>/;
 
-/** Every href and src a page holds, double-quoted, as written. */
-function urlsIn(html: string): string[] {
-  return [...html.matchAll(/<[a-z]+\b[^>]*?[\s/"'](?:href|src)="([^"]*)"/gi)].map(
-    (match) => match[1] ?? '',
-  );
+/** Attributes whose value is one URL a browser loads, follows or sends to. */
+const URL_ATTRIBUTES: ReadonlySet<string> = new Set([
+  'href',
+  'src',
+  'poster',
+  'data',
+  'action',
+  'formaction',
+  'background',
+  'cite',
+  'longdesc',
+  'manifest',
+  'xlink:href',
+]);
+
+/** Attributes whose value lists several: srcset's candidates, each a URL and a descriptor, and ping's targets. */
+const URL_LIST_ATTRIBUTES: ReadonlySet<string> = new Set(['srcset', 'imagesrcset', 'ping']);
+
+/** A start tag, its attributes read past any > inside a quoted value. */
+const TAG = /<([a-z][a-z0-9-]*)((?:[^>"']|"[^"]*"|'[^']*')*)>/gi;
+/** One attribute in a start tag: its name, then a double-quoted, single-quoted or bare value, if any. */
+const ATTRIBUTE = /([^\s"'>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+
+interface TagAttribute {
+  /** The name, lower-cased. */
+  name: string;
+  /** The value as written, or null when it has none. */
+  raw: string | null;
+  /** Whether the value is double-quoted, the one way these checks read it. */
+  doubleQuoted: boolean;
+}
+
+/** Every attribute of every start tag in a page, in order. */
+function attributesIn(html: string): TagAttribute[] {
+  const found: TagAttribute[] = [];
+  for (const tag of html.matchAll(TAG)) {
+    for (const attribute of (tag[2] ?? '').matchAll(ATTRIBUTE)) {
+      const [, name = '', double, single, bare] = attribute;
+      found.push({
+        name: name.toLowerCase(),
+        raw: double ?? single ?? bare ?? null,
+        doubleQuoted: double !== undefined,
+      });
+    }
+  }
+  return found;
+}
+
+/** A URL in a page: the attribute value it came from, as written, and the URL a browser reads in it. */
+interface PageUrl {
+  raw: string;
+  url: string;
+}
+
+/** A srcset descriptor (a width, density or height), which names no URL. */
+const DESCRIPTOR = /^\d+(?:\.\d+)?[wxh]$/i;
+
+/**
+ * Every URL a page holds in an attribute a browser loads, follows or sends
+ * to: href and src, the rarer one-URL attributes, each srcset candidate and
+ * each ping target, read from double-quoted values (any other quoting is
+ * refused on its own). Neither page with script uses the rarer ones; reading
+ * them keeps this second opinion from passing a URL that only the policy
+ * stops. A list is split on its commas and spaces after its references are
+ * decoded, which can only find more URLs than a browser does, never fewer.
+ */
+function urlsIn(html: string): PageUrl[] {
+  const urls: PageUrl[] = [];
+  for (const { name, raw, doubleQuoted } of attributesIn(html)) {
+    if (raw === null || !doubleQuoted) continue;
+    const decoded = decodeReferences(raw).replace(/[\u0000-\u001f]/g, ' ');
+    if (URL_ATTRIBUTES.has(name)) {
+      urls.push({ raw, url: decoded.replace(/\s/g, '') });
+    } else if (URL_LIST_ATTRIBUTES.has(name)) {
+      for (const token of decoded.split(/[\s,]+/)) {
+        if (token !== '' && !DESCRIPTOR.test(token)) urls.push({ raw, url: token });
+      }
+    }
+  }
+  return urls;
 }
 
 /** Whether a URL names a scheme or the root of the host, so leaves the page's own directory tree. */
@@ -202,10 +278,11 @@ function outsideUrl(value: string): boolean {
 /**
  * Why a page with script (the board's index.html or the map demo's) may not
  * ship; empty when it may. Its policy comes first, once, ahead of all it
- * governs, with the hash of its one inline style and worker-src only where
- * `worker` says; a no-referrer meta comes before anything that loads; it
- * loads exactly SCRIPTED_SCRIPT and no inline script; and it holds no event
- * handler attribute, style attribute, frame, form, base, link or outside URL.
+ * governs, with the hash of its one inline style and worker-src blob: where
+ * `worker` says, 'none' otherwise; a no-referrer meta comes before anything
+ * that loads; it loads exactly SCRIPTED_SCRIPT and no inline script; and it
+ * holds no event handler attribute, style attribute, frame, form, base,
+ * link, or URL outside the site in any attribute urlsIn reads.
  */
 export function scriptedPageProblems(html: string, page: { worker: boolean }): string[] {
   const problems: string[] = [];
@@ -252,15 +329,14 @@ export function scriptedPageProblems(html: string, page: { worker: boolean }): s
       html,
     );
   if (forbidden) problems.push(`holds a <${forbidden[1]?.toLowerCase() ?? ''}> element`);
-  for (const match of html.matchAll(
-    /<[a-z][^>]*?[\s/"'](href|src|srcset|action|formaction)\s*=\s*(.)/gi,
-  )) {
-    if (match[2] !== '"') problems.push(`has an unquoted or single-quoted ${match[1] ?? ''}`);
-  }
-  for (const raw of urlsIn(html)) {
-    if (outsideUrl(decodeReferences(raw).replace(/[\s\u0000-\u001f]/g, ''))) {
-      problems.push(`names a URL outside the site, or from its root: ${raw}`);
+  for (const { name, raw, doubleQuoted } of attributesIn(html)) {
+    const names = URL_ATTRIBUTES.has(name) || URL_LIST_ATTRIBUTES.has(name);
+    if (names && raw !== null && !doubleQuoted) {
+      problems.push(`has an unquoted or single-quoted ${name}`);
     }
+  }
+  for (const { raw, url } of urlsIn(html)) {
+    if (outsideUrl(url)) problems.push(`names a URL outside the site, or from its root: ${raw}`);
   }
   return problems;
 }
@@ -290,7 +366,7 @@ export const SCRIPTED_FILES: readonly string[] = ['index.html', 'main.js', 'main
 const TEST_HOOK = /__tabdock(?:Dock|MapPage)\b|\.(?:has|get)\(\s*["']e2e["']\s*\)/;
 
 export interface ScriptedDir {
-  /** Whether the page's policy names worker-src blob:, as only the board's does. */
+  /** Whether the page's policy names worker-src blob:, as only the board's does; otherwise 'none'. */
   worker: boolean;
   /** Every directory beside the page: the root holds the tour, the guide and the map demo. */
   subdirs: readonly string[];
@@ -357,7 +433,7 @@ export async function scriptedDirProblems(
         `${shown('index.html')}: ${bytes(raw.length)} bytes, over its budget of ${bytes(rules.budget.indexHtml)}`,
       );
     }
-    const urls = urlsIn(html);
+    const urls = urlsIn(html).map(({ url }) => url);
     for (const link of rules.links ?? []) {
       if (!urls.includes(link)) problems.push(`${shown('index.html')}: does not link ${link}`);
     }

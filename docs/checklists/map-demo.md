@@ -14,5 +14,5 @@ Written on 13 October 2026 for the map demo (ADR 0050, `docs/plans/map-demo.md`)
 
 ## Choices
 
-5. [ ] **Names on the map.** Lake names are Natural Earth's own, so the page and its tools name one lake Lake Malawi, which is also called Lake Nyasa, the name Tanzania uses, and ADR 0050 asks for no contested name. Say whether to keep Natural Earth's names, show both for that lake, or leave that label out.
+5. [ ] **Names on the map.** Lake names are Natural Earth's own but for one: the lake Natural Earth calls Lake Malawi is Lake Nyasa in Tanzania and Lago Niassa in Mozambique, so the page and its tools show "Lake Malawi (Lake Nyasa, Lago Niassa)", which takes no side, as ADR 0050 asks. Say whether to keep that, use Natural Earth's name alone, or leave that label out; I record the choice in ADR 0050's notes.
 6. [ ] **The widget over the controls.** With its panel open the widget covers the map's right-hand controls at 1280 pixels and most of the screen at 375, and folds into its chip, as on the board. Say whether you want the page's column to leave room for it on a wide screen.
