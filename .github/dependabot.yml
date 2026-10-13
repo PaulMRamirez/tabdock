@@ -13,7 +13,7 @@
 # (docs/checklists/M5.md), read these entries too and come one pull request
 # per advisory; weekly version updates come grouped.
 #
-# Three kinds of update are left to a person on purpose (docs/develop.md,
+# Four kinds of update are left to a person on purpose (docs/develop.md,
 # "Dependency updates"). Node's major version is a decision, not a bump: the
 # runtime stays on 22 until a recorded move to 24 before 30 April 2027
 # (docs/plans/backlog.md), so the image takes new digests of the 22 tag only.
@@ -23,6 +23,10 @@
 # so it cannot keep the two in step: both entries ignore every version of
 # them, and a person bumps them in both places in one change, a security fix
 # included. @types/node also follows the runtime's major, never a newer one.
+# MCP-B's major version is a decision too (ADR 0047): the demo, the map demo,
+# the canvas map page and the baseline's local relay stay on 5.1.0, the
+# runtime that drops consequentialHint, while tests/mcpb6 holds 6.0.0, so the
+# workspace takes MCP-B updates within a major only.
 
 version: 2
 updates:
@@ -81,6 +85,9 @@ updates:
       - dependency-name: '@types/node'
       - dependency-name: '@playwright/test'
       - dependency-name: playwright-core
+      # Moving MCP-B across a major is a change of its own (see the top of this file).
+      - dependency-name: '@mcp-b/*'
+        update-types: ['version-update:semver-major']
     commit-message:
       prefix: deps
 
