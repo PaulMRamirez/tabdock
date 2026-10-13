@@ -58,6 +58,28 @@ importers:
         specifier: 0.28.2
         version: 0.28.2
 
+  apps/map-demo:
+    dependencies:
+      '@mcp-b/webmcp-polyfill':
+        specifier: 5.1.0
+        version: 5.1.0
+      '@tabdock/adapter':
+        specifier: workspace:*
+        version: link:../../packages/adapter
+      '@tabdock/demo':
+        specifier: workspace:*
+        version: link:../demo
+      '@tabdock/sim-page':
+        specifier: workspace:*
+        version: link:../../packages/sim-page
+    devDependencies:
+      esbuild:
+        specifier: 0.28.2
+        version: 0.28.2
+      zod:
+        specifier: 4.6.5
+        version: 4.6.5
+
   packages/adapter:
     dependencies:
       '@tabdock/protocol':
@@ -174,6 +196,9 @@ importers:
       '@tabdock/demo':
         specifier: workspace:*
         version: link:../../apps/demo
+      '@tabdock/map-demo':
+        specifier: workspace:*
+        version: link:../../apps/map-demo
       '@tabdock/map-page':
         specifier: workspace:*
         version: link:../map-page

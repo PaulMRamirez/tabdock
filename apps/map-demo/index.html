@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tabdock map demo: Earth</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: system-ui, sans-serif;
+        color: #1d2530;
+        background: #f4f6f8;
+        --ink-soft: #4a5562;
+        --line: #d5dbe1;
+        --panel: #ffffff;
+        --accent: #24577f;
+      }
+      body {
+        margin: 0;
+        padding: 16px;
+      }
+      /* The widget's panel opens on its own, 360 pixels wide and 16 from the
+         right; on a wide screen the column leaves it a lane, so the map stays
+         whole beside it. On a narrower one it covers the page, so once a relay
+         is chosen a line says how to fold it. */
+      .fold-hint {
+        display: none;
+      }
+      html[data-link='chosen'] .fold-hint {
+        display: block;
+      }
+      @media (min-width: 1100px) {
+        body {
+          padding-right: 392px;
+        }
+        html[data-link='chosen'] .fold-hint {
+          display: none;
+        }
+      }
+      main {
+        max-width: 960px;
+        margin: 0 auto;
+        display: grid;
+        gap: 10px;
+      }
+      h1 {
+        font-size: 1.35rem;
+        margin: 0;
+        line-height: 1.25;
+      }
+      h2 {
+        font-size: 0.95rem;
+        margin: 0 0 6px;
+      }
+      p {
+        margin: 0;
+      }
+      a {
+        color: var(--accent);
+      }
+      .lede {
+        font-size: 0.95rem;
+        line-height: 1.45;
+        color: var(--ink-soft);
+      }
+      .links {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px 16px;
+        font-size: 0.9rem;
+      }
+      .meta {
+        font-size: 0.85rem;
+        color: var(--ink-soft);
+        line-height: 1.4;
+      }
+      /* A relay host comes from the link and can be one long word; it must
+         wrap inside a phone's width, never push its end off the screen. */
+      [data-role='status'],
+      .connect {
+        overflow-wrap: anywhere;
+      }
+      .connect {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        font-size: 0.9rem;
+      }
+      .connect input {
+        flex: 1 1 14rem;
+        min-width: 0;
+        font: inherit;
+        padding: 6px 8px;
+      }
+      .connect button {
+        font: inherit;
+        padding: 6px 14px;
+        max-width: 100%;
+        min-width: 0;
+        text-align: start;
+        overflow-wrap: anywhere;
+      }
+      .connect button[data-armed='false'] {
+        opacity: 0.6;
+        cursor: default;
+      }
+      .connect-host {
+        font-weight: 600;
+      }
+      .connect-error {
+        flex-basis: 100%;
+        color: #c92a2a;
+      }
+      .connect-error:empty {
+        display: none;
+      }
+      code {
+        font-family: ui-monospace, monospace;
+        font-size: 0.85em;
+        overflow-wrap: anywhere;
+      }
+      .map {
+        margin: 0;
+        display: grid;
+        gap: 8px;
+      }
+      /* The world draws at 960 by 540; on screen it takes the column's width. */
+      canvas {
+        display: block;
+        width: 100%;
+        height: auto;
+        aspect-ratio: 16 / 9;
+        background: #0b1020;
+        border-radius: 8px;
+        touch-action: none;
+        cursor: grab;
+      }
+      canvas:focus-visible {
+        outline: 3px solid var(--accent);
+        outline-offset: 2px;
+      }
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .controls button {
+        font: inherit;
+        font-size: 0.9rem;
+        padding: 6px 12px;
+        min-height: 36px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--panel);
+        color: inherit;
+        cursor: pointer;
+      }
+      .controls button:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+      .controls .spacer {
+        flex: 1 1 0;
+      }
+      /* The stop's words and what to ask side by side where they fit, the
+         stop first on a phone, next to the buttons that move it. */
+      .cards {
+        display: grid;
+        gap: 10px;
+        align-items: start;
+      }
+      @media (min-width: 720px) {
+        .cards {
+          grid-template-columns: 1fr 1fr;
+        }
+      }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 12px 14px;
+      }
+      .tour h2 {
+        font-size: 1.1rem;
+        margin: 2px 0 6px;
+      }
+      .tour [data-role='stop-place'] {
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--ink-soft);
+      }
+      .tour [data-role='stop-text'] {
+        line-height: 1.45;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      .prompts ul {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        display: grid;
+        gap: 6px;
+      }
+      /* One tap selects a whole prompt, ready to copy. */
+      .prompts li {
+        user-select: all;
+        padding: 6px 10px;
+        border-left: 3px solid var(--accent);
+        background: #eef3f7;
+        border-radius: 4px;
+        font-size: 0.9rem;
+      }
+      ol {
+        margin: 0;
+        padding-left: 1.2rem;
+        font-size: 0.85rem;
+        font-family: ui-monospace, monospace;
+      }
+      ol:empty::before {
+        content: 'None yet.';
+        font-family: system-ui, sans-serif;
+        color: var(--ink-soft);
+      }
+      li.error {
+        color: #c92a2a;
+      }
+      /* The recording plays here from its poster, fetching nothing more
+         until asked, as wide as the column, so the client pane's text in
+         it stays as legible as the column allows. */
+      .watch video {
+        display: block;
+        width: 100%;
+        height: auto;
+        aspect-ratio: 16 / 9;
+        background: #0d1320;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+      }
+      .watch p {
+        margin-top: 8px;
+      }
+      footer {
+        font-size: 0.8rem;
+        color: var(--ink-soft);
+        line-height: 1.4;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Earth, on a page your MCP client can drive</h1>
+        <p class="lede">
+          Earth as a flat map and a globe, drawn on a plain canvas from Natural Earth's
+          public-domain data with no map library. Connect a Tabdock relay of your own, pair Claude
+          or another MCP client in the widget, and ask it to take the tour. No relay yet? Use the
+          buttons under the map to take the tour yourself.
+        </p>
+      </header>
+      <nav class="links" aria-label="More from Tabdock">
+        <a href="../guide/07-run-a-relay.html">Set up a relay</a>
+        <a href="#ask">What to ask</a>
+        <a href="#watch">Watch a client</a>
+        <a href="../">The demo board</a>
+        <a href="../tour/">How Tabdock was built</a>
+        <a href="../guide/16-map-pages.html">The map tools (guide)</a>
+      </nav>
+      <div data-role="connect-slot"></div>
+      <p class="meta" data-role="status">Loading tools...</p>
+      <p class="meta">
+        Your relay must list this site's origin, <code data-role="origin"></code>, in
+        <code>TABDOCK_ALLOWED_ORIGINS</code>, and your browser may ask before a public page reaches
+        a relay on your own machine.
+      </p>
+      <p class="meta fold-hint">
+        Once linked, the Tabdock panel opens over the page; fold it with its chip at the bottom
+        right to watch the map.
+      </p>
+      <figure class="map">
+        <canvas
+          id="map"
+          tabindex="0"
+          role="application"
+          aria-roledescription="map"
+          aria-label="Map of Earth. Drag, or use the arrow keys, to pan; hold Ctrl and scroll, pinch, or press plus or minus to zoom; or use the buttons below."
+        ></canvas>
+        <div class="controls" role="toolbar" aria-label="Map controls">
+          <button type="button" data-action="zoom-in" aria-label="Zoom in">Zoom in</button>
+          <button type="button" data-action="zoom-out" aria-label="Zoom out">Zoom out</button>
+          <button type="button" data-action="projection">Flat map</button>
+          <span class="spacer"></span>
+          <button type="button" data-action="previous-stop">Previous stop</button>
+          <button type="button" data-action="next-stop">Next stop</button>
+        </div>
+        <p class="meta">
+          Drag, or use the arrow keys, to pan; Ctrl and scroll, or pinch, to zoom. Orange outlines
+          mark the tour's observations, drawn from the data, not photographs.
+        </p>
+        <figcaption class="meta" data-role="view"></figcaption>
+      </figure>
+      <div class="cards">
+        <section class="card tour" aria-live="polite">
+          <p data-role="stop-place"></p>
+          <h2 data-role="stop-title"></h2>
+          <p data-role="stop-text"></p>
+        </section>
+        <section class="card prompts" id="ask">
+          <h2>Try asking your client</h2>
+          <ul>
+            <li>Take this page's tour and capture each stop.</li>
+            <li>Show Lake Baikal on the globe from 2,000 km up, then capture it.</li>
+            <li>Hide the graticule and list the lakes in view.</li>
+            <li>Rewrite this stop's text for a ten-year-old.</li>
+          </ul>
+        </section>
+      </div>
+      <section class="card watch" id="watch">
+        <h2>Watch a client take the tour</h2>
+        <video
+          controls
+          playsinline
+          preload="none"
+          width="1280"
+          height="720"
+          poster="media/poster.png"
+          aria-label="A recording of this page beside a scripted MCP client: on the left each call the client makes and the start of the relay's answer, on the right the map as the visitor sees it."
+        >
+          <source src="media/map-demo.mp4" type="video/mp4" />
+          <source src="media/map-demo.webm" type="video/webm" />
+          <a href="media/map-demo.mp4">Open the recording (MP4)</a>
+        </video>
+        <p class="meta">
+          A recording under a minute long of this page in a browser, beside a pane listing each call
+          as it went. The client is a script on the MCP SDK standing in for Claude, not Claude: it
+          pairs through a relay on the same machine, is allowed in as driver, and takes the tour,
+          capturing one view and reading the page's state. Every call shown is real, with the first
+          lines of its real answer; a line labelled as such is what the script read from it, the
+          captions say what a person would ask, and the pairing code stays off camera.
+          <a href="media/map-demo.mp4">Open the MP4</a> (under 4 MB).
+        </p>
+      </section>
+      <section class="card">
+        <h2>Recent tool calls</h2>
+        <ol data-role="calls" aria-live="polite"></ol>
+      </section>
+      <footer>
+        <p data-role="credit"></p>
+        <p>
+          Tabdock is open source under the Apache 2.0 license. This page talks only to the relay you
+          choose; the map and its data are part of the page itself.
+        </p>
+      </footer>
+    </main>
+    <!-- Relative, so a copy served under <user>.github.io/<repository>/map/ finds its script too. -->
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

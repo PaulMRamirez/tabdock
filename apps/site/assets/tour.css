@@ -38,9 +38,11 @@ footer {
   margin: 0 auto;
 }
 
+/* Four links: on a phone they wrap rather than push the page sideways. */
 header nav {
   display: flex;
-  gap: 16px;
+  flex-wrap: wrap;
+  gap: 4px 16px;
   padding: 12px 0;
   border-bottom: 1px solid var(--rule);
   font-size: 0.9rem;

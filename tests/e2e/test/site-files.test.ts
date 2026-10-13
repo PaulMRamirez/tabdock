@@ -55,11 +55,13 @@ describe('apps/site (ADR 0029)', () => {
     for (const [name, version] of Object.entries(dev)) {
       expect(lock, name).toContain(`${name}@${version}`);
     }
-    // The workspace names the demo alone under apps/: Dependabot expands these
-    // globs without pnpm's '!' negation, so `apps/*` would hand it the site too.
+    // The workspace names the demo board and the map demo (ADR 0050) alone
+    // under apps/: Dependabot expands these globs without pnpm's '!'
+    // negation, so `apps/*` would hand it the site too.
     expect(workspaceGlobs(read('pnpm-workspace.yaml'))).toEqual([
       'packages/*',
       'apps/demo',
+      'apps/map-demo',
       'tests/*',
     ]);
     // The workspace's own lockfile knows nothing of it, so a clean clone's install never fetches mermaid.

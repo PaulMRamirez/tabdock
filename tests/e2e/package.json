@@ -26,6 +26,7 @@
     "demo:m5": "node src/demo-m5.ts",
     "check:claude-code:agent": "node src/claude-code-check-agent.ts",
     "measure:room": "node src/measure-room.ts",
+    "record:map-demo": "node src/record-map-demo.ts",
     "demo:m6": "node src/demo-m6.ts"
   },
   "devDependencies": {
@@ -36,6 +37,7 @@
     "@tabdock/adapter": "workspace:*",
     "@tabdock/ci-check": "workspace:*",
     "@tabdock/demo": "workspace:*",
+    "@tabdock/map-demo": "workspace:*",
     "@tabdock/map-page": "workspace:*",
     "@tabdock/mcpb6": "workspace:*",
     "@tabdock/protocol": "workspace:*",

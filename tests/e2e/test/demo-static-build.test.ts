@@ -130,6 +130,13 @@ describe("the demo's static build (ADR 0029)", () => {
     expect(staticHtml).toContain('<meta name="referrer" content="no-referrer" />');
   });
 
+  it("carries zod's English messages and none of its other languages (englishOnlyZod)", () => {
+    // Dutch and Indonesian stand for the rest: each appears only in its own locale.
+    expect(staticBundle).not.toContain('Ongeldige invoer');
+    expect(staticBundle).not.toContain('Input tidak valid');
+    expect(staticBundle).toContain('Invalid input: expected');
+  });
+
   it('loads its script by a relative path, so a copy under a subpath works too', () => {
     expect([...staticHtml.matchAll(/<script\b[^>]*>/g)].map((match) => match[0])).toEqual([
       '<script type="module" src="./main.js">',

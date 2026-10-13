@@ -1,0 +1,27 @@
+{
+  "name": "@tabdock/map-demo",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A map and globe of Earth on a plain canvas, from vendored Natural Earth data, running the map profile's tools; published at /map/ (ADR 0050).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    "./server": "./scripts/server.ts"
+  },
+  "scripts": {
+    "build": "node scripts/server.ts --build",
+    "dev": "node scripts/server.ts",
+    "vendor": "node scripts/vendor-natural-earth.ts",
+    "typecheck": "tsc -p tsconfig.json && tsc -p scripts/tsconfig.json && tsc -p test/tsconfig.json"
+  },
+  "dependencies": {
+    "@mcp-b/webmcp-polyfill": "5.1.0",
+    "@tabdock/adapter": "workspace:*",
+    "@tabdock/demo": "workspace:*",
+    "@tabdock/sim-page": "workspace:*"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "zod": "4.6.5"
+  }
+}
