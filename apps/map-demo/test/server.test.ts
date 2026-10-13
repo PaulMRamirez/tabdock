@@ -1,8 +1,10 @@
 // The map demo's static build and dev server (ADR 0050): the build holds
-// exactly index.html, main.js and main.js.map within the size budget, under
+// exactly index.html, main.js, main.js.map and the recording's two files in
+// media/, which the page links, within the size budget, under
 // the board's meta policy with worker-src 'none', loading its one script by a
 // relative path with no inline script and no outside URL; the dev server
-// serves that same page, answers only its own loopback names, and takes its
+// serves that same page and the recording, answers only its own loopback
+// names, and takes its
 // port from --port or MAP_DEMO_PORT without echoing a bad value.
 
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
@@ -15,6 +17,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   buildMapDemo,
   DEFAULT_MAP_DEMO_PORT,
+  MAP_DEMO_MEDIA,
   mapDemoPolicy,
   mapDemoPort,
   type MapDemoServer,
@@ -59,8 +62,18 @@ function getAs(url: string, host: string): Promise<{ status: number; body: strin
 }
 
 describe("the map demo's static build", () => {
-  it('holds exactly its page, script and source map, within the budget', () => {
-    expect(readdirSync(outDir).sort()).toEqual(['index.html', 'main.js', 'main.js.map']);
+  it('holds exactly its page, script, source map and recording, within the budget', () => {
+    expect(readdirSync(outDir).sort()).toEqual(['index.html', 'main.js', 'main.js.map', 'media']);
+    expect(readdirSync(join(outDir, 'media')).sort()).toEqual(Object.values(MAP_DEMO_MEDIA).sort());
+    // Copied byte for byte from the source tree, where pnpm record:map-demo keeps them.
+    for (const name of Object.values(MAP_DEMO_MEDIA)) {
+      expect(
+        readFileSync(join(outDir, 'media', name)).equals(
+          readFileSync(new URL(`../media/${name}`, import.meta.url)),
+        ),
+        name,
+      ).toBe(true);
+    }
     const main = readFileSync(join(outDir, 'main.js'));
     expect(main.length).toBeLessThanOrEqual(BUDGET.mainJs);
     expect(gzipSync(main).length).toBeLessThanOrEqual(BUDGET.mainJsGzip);
@@ -116,6 +129,16 @@ describe("the map demo's dev server", () => {
     expect(await page.text()).toContain('<meta http-equiv="Content-Security-Policy"');
     expect((await fetch(new URL('main.js', url))).status).toBe(200);
     expect((await fetch(new URL('other.js', url))).status).toBe(404);
+    // The recording by its two names alone, each with its type.
+    const poster = await fetch(new URL(`media/${MAP_DEMO_MEDIA.poster}`, url));
+    expect(poster.status).toBe(200);
+    expect(poster.headers.get('content-type')).toBe('image/png');
+    const video = await fetch(new URL(`media/${MAP_DEMO_MEDIA.video}`, url), { method: 'HEAD' });
+    expect(video.status).toBe(200);
+    expect(video.headers.get('content-type')).toBe('video/webm');
+    for (const other of ['media/', 'media/other.png', 'media/POSTER.PNG', 'media/poster.png/']) {
+      expect((await fetch(new URL(other, url))).status, other).toBe(404);
+    }
     const port = new URL(url).port;
     expect((await getAs(url, `localhost:${port}`)).status).toBe(200);
     expect((await getAs(url, `evil.example:${port}`)).status).toBe(421);

@@ -1,7 +1,8 @@
 // The map demo (ADR 0050) as the Pages site serves it: its static build at
 // /map/ of a loopback static host that sends no header of ours, so its meta
 // policy is the only one in force. It loads with no policy violation or
-// console error and only its own two files, registers the map profile's
+// console error and only its own files (its page, its bundle and, once
+// scrolled to, its recording's poster), registers the map profile's
 // twelve clockless tools and the two editing tools, and dials nothing from
 // its URL, a script's click or a frame: only a person's click on its armed
 // Connect bar, remembered under a key of its own. Through that click and
@@ -207,9 +208,21 @@ test('loads under its own meta policy with no violation or console error, regist
   await expect(page.locator('[data-role="origin"]')).toHaveText(site.origin);
   await expect(page.locator('[data-role="credit"]')).toContainText('Made with Natural Earth.');
   await expect(page.locator('[data-role="stop-place"]')).toHaveText('Stop 1 of 6');
-  // Its page and its bundle, from its own origin: no tile, font, map library or other host.
+  // The recording's poster loads lazily, so scroll to it: it draws under the page's policy and
+  // links the video, which nothing fetches until a visitor follows the link.
+  const poster = page.locator('#watch img');
+  await poster.scrollIntoViewIfNeeded();
+  await expect
+    .poll(() => poster.evaluate((img: HTMLImageElement) => (img.complete ? img.naturalWidth : 0)))
+    .toBe(1280);
+  await expect(page.locator('#watch a')).toHaveAttribute('href', 'media/map-demo.webm');
+  // Its page, its bundle and that poster, from its own origin: no tile, font, map library or other host.
   expect(requested.every((url) => url.startsWith(`${site.origin}/`))).toBe(true);
-  expect(requested.map((url) => new URL(url).pathname).sort()).toEqual(['/map/', '/map/main.js']);
+  expect(requested.map((url) => new URL(url).pathname).sort()).toEqual([
+    '/map/',
+    '/map/main.js',
+    '/map/media/poster.png',
+  ]);
   // Earth is drawn: the canvas holds many colours, not one blank fill.
   const colours = await page.evaluate(() => {
     const canvas = document.querySelector('canvas');

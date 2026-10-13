@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import {
   MAP_DEMO_BUDGET,
+  MAP_DEMO_MEDIA,
+  MEDIA_DIR,
   SCRIPTED_SCRIPT,
   scriptedDirProblems,
   scriptedPageProblems,
@@ -261,7 +263,7 @@ function scripted(worker: boolean, body: string, style = STYLE): string {
 const board = scripted(true, '<nav><a href="tour/">The tour</a> <a href="map/">The map</a></nav>');
 const map = scripted(
   false,
-  '<nav><a href="../">The board</a> <a href="../guide/16-map-pages.html">Map pages</a></nav><canvas aria-label="Map; drag to pan, or use the buttons"></canvas>',
+  '<nav><a href="../">The board</a> <a href="../guide/16-map-pages.html">Map pages</a></nav><canvas aria-label="Map; drag to pan, or use the buttons"></canvas><a href="media/map-demo.webm"><img src="media/poster.png" width="1280" height="720" alt="The recording"></a>',
 );
 
 describe('scriptedPageProblems (ADR 0050)', () => {
@@ -389,11 +391,20 @@ describe('scriptedPageProblems (ADR 0050)', () => {
   });
 });
 
+/** The first bytes of a PNG and of a WebM, as the media check reads them. */
+const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13]);
+const WEBM = Buffer.concat([
+  Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x9f, 0x42, 0x82, 0x84]),
+  Buffer.from('webm'),
+]);
+
 describe('scriptedDirProblems, the read-back of the board and the map demo', () => {
   /** A built site: the board at its root with the tour and guide beside it, and the map demo at map/. */
   function site(): string {
     const dir = mkdtempSync(join(tmpdir(), 'tabdock-site-scripted-'));
-    for (const sub of ['tour', 'guide', 'map']) mkdirSync(join(dir, sub));
+    for (const sub of ['tour', 'guide', 'map', 'map/media']) mkdirSync(join(dir, sub));
+    writeFileSync(join(dir, 'map', 'media', 'poster.png'), PNG);
+    writeFileSync(join(dir, 'map', 'media', 'map-demo.webm'), WEBM);
     writeFileSync(join(dir, 'index.html'), board);
     writeFileSync(join(dir, 'tour', 'index.html'), good);
     writeFileSync(join(dir, 'guide', '16-map-pages.html'), good);
@@ -408,10 +419,20 @@ describe('scriptedDirProblems, the read-back of the board and the map demo', () 
     return dir;
   }
   const ROOT = { worker: true, subdirs: ['tour', 'guide', 'map'], links: ['map/'] };
-  const MAP = { worker: false, subdirs: [], budget: MAP_DEMO_BUDGET };
+  const MAP = {
+    worker: false,
+    subdirs: [MEDIA_DIR],
+    budget: MAP_DEMO_BUDGET,
+    media: MAP_DEMO_MEDIA,
+    links: ['media/map-demo.webm', 'media/poster.png'],
+  };
 
-  it("passes the site's own shape, with ADR 0050's budget", async () => {
+  it("passes the site's own shape, with ADR 0050's budget and its recording's", async () => {
     assert.deepEqual(MAP_DEMO_BUDGET, { indexHtml: 16_000, mainJs: 800_000, mainJsGzip: 200_000 });
+    assert.deepEqual(MAP_DEMO_MEDIA, {
+      'poster.png': { kind: 'png', maxBytes: 300_000 },
+      'map-demo.webm': { kind: 'webm', maxBytes: 4_000_000 },
+    });
     const dir = site();
     try {
       assert.deepEqual(await scriptedDirProblems(dir, '', ROOT), []);
@@ -441,6 +462,39 @@ describe('scriptedDirProblems, the read-back of the board and the map demo', () 
       assert.deepEqual(await scriptedDirProblems(dir, '', ROOT), [
         'index.html: does not link map/',
         'main.js: holds a test hook',
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("holds the map demo's media to its two files, each of its kind and within its budget", async () => {
+    const dir = site();
+    try {
+      const media = join(dir, 'map', 'media');
+      writeFileSync(join(media, 'poster.png'), '<script>alert(1)</script>');
+      writeFileSync(
+        join(media, 'map-demo.webm'),
+        Buffer.concat([WEBM, Buffer.alloc(4_000_001 - WEBM.length)]),
+      );
+      writeFileSync(join(media, 'page.html'), '<script>alert(1)</script>');
+      symlinkSync('/etc/hostname', join(media, 'constructor'));
+      assert.deepEqual(await scriptedDirProblems(dir, 'map', MAP), [
+        'map/media/constructor: is not a plain file',
+        'map/media/map-demo.webm: 4,000,001 bytes, over its budget of 4,000,000',
+        'map/media/page.html: has no place beside a page with script',
+        'map/media/poster.png: is not a PNG file',
+      ]);
+      // A missing poster: the page's link to it leads nowhere, and the page must carry it.
+      rmSync(join(media, 'poster.png'));
+      writeFileSync(join(dir, 'map', 'index.html'), map.replace(/<img[^>]*>/, ''));
+      const problems = await scriptedDirProblems(dir, 'map', MAP);
+      assert.ok(problems.includes('map/media/poster.png: is missing'), problems.join('\n'));
+      assert.ok(problems.includes('map/index.html: does not link media/poster.png'));
+      // The board, which lists no media, ships none.
+      mkdirSync(join(dir, MEDIA_DIR));
+      assert.deepEqual(await scriptedDirProblems(dir, '', ROOT), [
+        'media/: has no place beside a page with script',
       ]);
     } finally {
       rmSync(dir, { recursive: true, force: true });

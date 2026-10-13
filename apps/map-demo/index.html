@@ -230,6 +230,22 @@
       li.error {
         color: #c92a2a;
       }
+      /* The recording's poster, a link to the video itself; capped so it
+         does not tower over the map on a wide screen. */
+      .watch a {
+        display: block;
+        max-width: 640px;
+      }
+      .watch img {
+        display: block;
+        width: 100%;
+        height: auto;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+      }
+      .watch p {
+        margin-top: 8px;
+      }
       footer {
         font-size: 0.8rem;
         color: var(--ink-soft);
@@ -251,6 +267,7 @@
       <nav class="links" aria-label="More from Tabdock">
         <a href="../guide/07-run-a-relay.html">Set up a relay</a>
         <a href="#ask">What to ask</a>
+        <a href="#watch">Watch a client</a>
         <a href="../">The demo board</a>
         <a href="../tour/">How Tabdock was built</a>
         <a href="../guide/16-map-pages.html">The map tools (guide)</a>
@@ -304,6 +321,24 @@
           </ul>
         </section>
       </div>
+      <section class="card watch" id="watch">
+        <h2>Watch a client take the tour</h2>
+        <a href="media/map-demo.webm">
+          <img
+            src="media/poster.png"
+            width="1280"
+            height="720"
+            loading="lazy"
+            decoding="async"
+            alt="The map demo with a client attached as driver: the globe, a caption naming the step, and the Tabdock panel listing each call. Opens the video."
+          />
+        </a>
+        <p class="meta">
+          A recording under a minute long (WebM, under 4 MB) of this page in a browser: a script on
+          the MCP SDK, standing in for Claude, pairs through a relay on the same machine, is allowed
+          in as driver, and takes the tour with one capture. The pairing code stays off camera.
+        </p>
+      </section>
       <section class="card">
         <h2>Recent tool calls</h2>
         <ol data-role="calls" aria-live="polite"></ol>

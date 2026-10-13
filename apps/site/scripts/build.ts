@@ -7,8 +7,8 @@
 // board and the map demo, the site's two pages with script, are held to the
 // board's static rules (checks.ts): their policy, their one relative script,
 // only the files they ship, links that lead somewhere on the site, no test
-// hook, the map's size budget, and the board's link to the map, so a visitor
-// finds it. Pages publishes one directory per deploy, so the site is always
+// hook, the map's size budget and its recording's, and the board's link to
+// the map, so a visitor finds it. Pages publishes one directory per deploy, so the site is always
 // built whole: a tour-only publish would drop the demo. It also draws the
 // README's diagrams, which it does not publish, and stops on one that will
 // not draw, so A5.5's "the README builds" has a check of its own.
@@ -21,6 +21,8 @@ import { buildMapDemo } from '../../map-demo/scripts/server.ts';
 import {
   COPIED_IMAGES,
   MAP_DEMO_BUDGET,
+  MAP_DEMO_MEDIA,
+  MEDIA_DIR,
   type ScriptedDir,
   scriptedDirProblems,
   tourDirProblems,
@@ -231,7 +233,14 @@ async function main(): Promise<void> {
     {
       at: MAP_DIR,
       name: `the map demo at /${MAP_DIR}/`,
-      rules: { worker: false, subdirs: [], budget: MAP_DEMO_BUDGET },
+      rules: {
+        worker: false,
+        subdirs: [MEDIA_DIR],
+        budget: MAP_DEMO_BUDGET,
+        // Its recording, whose poster the page shows as a link to the video.
+        media: MAP_DEMO_MEDIA,
+        links: Object.keys(MAP_DEMO_MEDIA).map((name) => `${MEDIA_DIR}/${name}`),
+      },
     },
   ];
   for (const page of scripted) {

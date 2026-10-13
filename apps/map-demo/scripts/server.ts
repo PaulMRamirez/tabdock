@@ -8,7 +8,7 @@
 // index.html, policy and all, so what works here works on the site.
 
 import { existsSync } from 'node:fs';
-import { readFile, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type ServerResponse } from 'node:http';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,6 +17,8 @@ import * as esbuild from 'esbuild';
 
 const appDir = resolve(import.meta.dirname, '..');
 const distDir = join(appDir, 'dist');
+/** The recording's files in the source tree; the page finds them in media/ beside it. */
+const mediaDir = join(appDir, 'media');
 
 /** The port the CLI serves on unless --port or MAP_DEMO_PORT says. */
 export const DEFAULT_MAP_DEMO_PORT = 5175;
@@ -28,6 +30,12 @@ export const DEFAULT_MAP_DEMO_PORT = 5175;
  */
 export const MAP_DEMO_MEDIA = { video: 'map-demo.webm', poster: 'poster.png' } as const;
 export type MapDemoMedia = typeof MAP_DEMO_MEDIA;
+
+/** Each media file's type, by the path the page links it at. */
+const MEDIA_TYPES: Record<string, string> = {
+  [`/media/${MAP_DEMO_MEDIA.video}`]: 'video/webm',
+  [`/media/${MAP_DEMO_MEDIA.poster}`]: 'image/png',
+};
 
 /**
  * The static build's policy: the board's (staticPolicy, ADR 0029) with
@@ -72,16 +80,25 @@ export async function mapDemoIndexHtml(): Promise<string> {
 
 /**
  * The static build for the Pages site, into dist/ or `outDir`, which it
- * empties first: exactly index.html, main.js (minified) and main.js.map. A
- * static host sends no headers of ours, so the policy rides in a meta
- * element, and a meta policy cannot carry frame-ancestors, so the page's own
- * refusal to link inside a frame (src/main.ts) stays its framing defence.
+ * empties first: exactly index.html, main.js (minified), main.js.map and
+ * the recording in media/, which the page links. A static host sends no
+ * headers of ours, so the policy rides in a meta element, and a meta policy
+ * cannot carry frame-ancestors, so the page's own refusal to link inside a
+ * frame (src/main.ts) stays its framing defence.
  */
 export async function buildMapDemo(options: { outDir?: string } = {}): Promise<void> {
   const outDir = options.outDir ?? distDir;
   await rm(outDir, { recursive: true, force: true });
   await esbuild.build({ ...baseOptions, minify: true, outfile: join(outDir, 'main.js') });
   await writeFile(join(outDir, 'index.html'), await mapDemoIndexHtml());
+  await mkdir(join(outDir, 'media'));
+  for (const name of Object.values(MAP_DEMO_MEDIA)) {
+    // The page links both, so a build without one would publish a broken link.
+    if (!existsSync(join(mediaDir, name))) {
+      throw new Error(`apps/map-demo/media/${name} is missing; pnpm record:map-demo makes it`);
+    }
+    await copyFile(join(mediaDir, name), join(outDir, 'media', name));
+  }
 }
 
 export interface MapDemoServerOptions {
@@ -183,6 +200,20 @@ export async function startMapDemoServer(
     const type = BUNDLE_TYPES[path];
     if (bundled && type) {
       send(response, 200, type, bundled);
+      return;
+    }
+    // The recording, read from the source tree by its fixed names only, never by the path asked.
+    const mediaType = MEDIA_TYPES[path];
+    if (mediaType) {
+      const name = path.slice('/media/'.length);
+      readFile(join(mediaDir, name)).then(
+        (body) => {
+          send(response, 200, mediaType, body);
+        },
+        () => {
+          send(response, 404, 'text/plain; charset=utf-8', 'Not found');
+        },
+      );
       return;
     }
     // The page links to the board, the tour and the guide beside it, which only the site holds.

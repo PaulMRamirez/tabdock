@@ -362,6 +362,43 @@ export const MAP_DEMO_BUDGET: ScriptedBudget = {
 /** What a page with script ships beside it: the page, its one bundle and that bundle's source map. */
 export const SCRIPTED_FILES: readonly string[] = ['index.html', 'main.js', 'main.js.map'];
 
+/** The directory beside a page with script that holds its media, where it has any. */
+export const MEDIA_DIR = 'media';
+
+/** One media file a page with script may ship: what its bytes must begin as, and its most bytes. */
+export interface MediaFile {
+  kind: 'png' | 'webm';
+  maxBytes: number;
+}
+
+/**
+ * The map demo's recording (pnpm record:map-demo, ADR 0050's notes): its
+ * poster, which a phone fetches with the page, and the video the poster
+ * links. Over budget means a shorter take, never a raise.
+ */
+export const MAP_DEMO_MEDIA: Readonly<Record<string, MediaFile>> = {
+  'poster.png': { kind: 'png', maxBytes: 300_000 },
+  'map-demo.webm': { kind: 'webm', maxBytes: 4_000_000 },
+};
+
+/**
+ * Whether bytes begin as their kind says: a PNG's signature, or an EBML
+ * header naming the webm document type. Pages chooses each file's type by
+ * its name, so a page or script given a media name would still be served as
+ * media, but nothing other than a picture or a video belongs here.
+ */
+function mediaKindHolds(bytes: Buffer, kind: MediaFile['kind']): boolean {
+  if (kind === 'png') {
+    return bytes
+      .subarray(0, 8)
+      .equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  }
+  return (
+    bytes.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3])) &&
+    bytes.subarray(0, 64).includes(Buffer.from('webm'))
+  );
+}
+
 /** A test hook no published bundle may hold: the board's ?e2e handle and query, or the map fixture's connect hook. */
 const TEST_HOOK = /__tabdock(?:Dock|MapPage)\b|\.(?:has|get)\(\s*["']e2e["']\s*\)/;
 
@@ -374,6 +411,8 @@ export interface ScriptedDir {
   budget?: ScriptedBudget;
   /** Links the page must carry, as written, so a visitor finds what they lead to. */
   links?: readonly string[];
+  /** The files MEDIA_DIR must hold, exactly, each by its name; without it the page ships none. */
+  media?: Readonly<Record<string, MediaFile>>;
 }
 
 function bytes(value: number): string {
@@ -381,11 +420,54 @@ function bytes(value: number): string {
 }
 
 /**
+ * Why a page's media directory may not ship: a name it does not list, an
+ * entry that is not a plain file, a listed file missing, over its bytes, or
+ * not beginning as its kind does. Each line names its file as `shown` says.
+ */
+async function mediaProblems(
+  dir: string,
+  shown: string,
+  files: Readonly<Record<string, MediaFile>>,
+): Promise<string[]> {
+  const problems: string[] = [];
+  const found = new Set<string>();
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    // Own names only, so a file called constructor finds no rule on the prototype.
+    const rule = Object.hasOwn(files, entry.name) ? files[entry.name] : undefined;
+    if (!entry.isFile()) {
+      problems.push(`${shown}/${entry.name}: is not a plain file`);
+    } else if (rule === undefined) {
+      problems.push(`${shown}/${entry.name}: has no place beside a page with script`);
+    } else {
+      found.add(entry.name);
+      const content = await readFile(join(dir, entry.name));
+      if (content.length > rule.maxBytes) {
+        problems.push(
+          `${shown}/${entry.name}: ${bytes(content.length)} bytes, over its budget of ${bytes(rule.maxBytes)}`,
+        );
+      }
+      if (!mediaKindHolds(content, rule.kind)) {
+        problems.push(
+          `${shown}/${entry.name}: is not a ${rule.kind === 'png' ? 'PNG' : 'WebM'} file`,
+        );
+      }
+    }
+  }
+  for (const name of Object.keys(files)) {
+    if (!found.has(name) && !problems.some((line) => line.startsWith(`${shown}/${name}:`))) {
+      problems.push(`${shown}/${name}: is missing`);
+    }
+  }
+  return problems;
+}
+
+/**
  * Reads back a page with script and what sits beside it, at `at` under the
  * built site `siteDir` ('' for the root, 'map' for the map demo), and says
  * why any of it may not ship, each line naming its file relative to the
- * site: a file or directory other than those the page ships, a page failing
- * scriptedPageProblems, a bundle holding a test hook or over its budget, or
+ * site: a file or directory other than those the page ships, a media file
+ * mediaProblems refuses, a page failing scriptedPageProblems, a bundle
+ * holding a test hook or over its budget, or
  * a link that leaves the site, leads to nothing the site holds, or that the
  * rules require and the page lacks. It runs once the whole site is written,
  * so a link to the tour or the guide is followed to its file.
@@ -420,6 +502,9 @@ export async function scriptedDirProblems(
   }
   for (const name of rules.subdirs) {
     if (!dirs.has(name)) problems.push(`${shown(name)}/: is missing`);
+  }
+  if (rules.media && dirs.has(MEDIA_DIR)) {
+    problems.push(...(await mediaProblems(join(dir, MEDIA_DIR), shown(MEDIA_DIR), rules.media)));
   }
 
   if (files.has('index.html')) {
