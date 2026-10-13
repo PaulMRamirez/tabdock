@@ -260,10 +260,12 @@ export async function startDemoServer(options: DemoServerOptions = {}): Promise<
     }
     const entry = STATIC_FILES[path];
     if (!entry) {
-      // The board links to the tour beside it, which only the Pages site holds.
+      // The board links to the tour and the map demo beside it, which only the Pages site holds.
       const body = path.startsWith('/tour/')
         ? 'The tour is part of the published site (pnpm site:build); in a clone, read docs/tour.'
-        : 'Not found';
+        : path.startsWith('/map/')
+          ? 'The map demo is part of the published site (pnpm site:build); in a clone, run pnpm dev:map-demo.'
+          : 'Not found';
       send(response, 404, 'text/plain; charset=utf-8', body);
       return;
     }

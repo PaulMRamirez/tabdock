@@ -36,6 +36,7 @@
     "@tabdock/adapter": "workspace:*",
     "@tabdock/ci-check": "workspace:*",
     "@tabdock/demo": "workspace:*",
+    "@tabdock/map-demo": "workspace:*",
     "@tabdock/map-page": "workspace:*",
     "@tabdock/mcpb6": "workspace:*",
     "@tabdock/protocol": "workspace:*",
