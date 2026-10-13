@@ -23,6 +23,12 @@ import {
 
 /** ADR 0050's budget for the static build; the source map, which only developer tools fetch, is outside it. */
 const BUDGET = { mainJs: 800_000, mainJsGzip: 200_000, indexHtml: 16_000 };
+/**
+ * What the script measured once zod's other languages were left out (13
+ * October 2026: 447,415 bytes, 148,280 gzipped), with room to grow. A
+ * bundle past this has most likely taken the locales back, about 260 KB.
+ */
+const MEASURED = { mainJs: 520_000, mainJsGzip: 165_000 };
 
 let outDir = '';
 let server: MapDemoServer | undefined;
@@ -59,6 +65,17 @@ describe("the map demo's static build", () => {
     expect(main.length).toBeLessThanOrEqual(BUDGET.mainJs);
     expect(gzipSync(main).length).toBeLessThanOrEqual(BUDGET.mainJsGzip);
     expect(readFileSync(join(outDir, 'index.html')).length).toBeLessThanOrEqual(BUDGET.indexHtml);
+  });
+
+  it("carries zod's English messages alone, and stays near its measured size", () => {
+    const main = readFileSync(join(outDir, 'main.js'));
+    const text = main.toString('utf8');
+    // Dutch and Indonesian stand for the rest: each appears only in its own locale.
+    expect(text).not.toContain('Ongeldige invoer');
+    expect(text).not.toContain('Input tidak valid');
+    expect(text).toContain('Invalid input: expected');
+    expect(main.length).toBeLessThanOrEqual(MEASURED.mainJs);
+    expect(gzipSync(main).length).toBeLessThanOrEqual(MEASURED.mainJsGzip);
   });
 
   it("carries the board's policy with worker-src 'none', first in its head, and loads one relative script", () => {

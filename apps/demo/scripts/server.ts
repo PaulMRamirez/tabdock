@@ -52,6 +52,32 @@ const SECURITY_HEADERS = {
   'Cache-Control': 'no-store',
 };
 
+/**
+ * Leaves every zod message translation but English out of a page's bundle.
+ * The sim page and the map profile import classic zod, whose namespace
+ * re-exports `locales`, every language at once, about 260 KB minified, and a
+ * bundler cannot drop part of a namespace that code passes around as a value.
+ * Classic zod imports its English messages itself (v4/classic/schemas.js) and
+ * the protocol imports `en` by name from zod/locales, neither through the
+ * path this replaces, so every message reads as before; only `z.locales`,
+ * which nothing here reads, comes out empty. The board and the map demo
+ * (ADR 0050) both build with it.
+ */
+export const englishOnlyZod: esbuild.Plugin = {
+  name: 'english-only-zod',
+  setup(build) {
+    build.onResolve({ filter: /^\.\.\/locales\/index\.js$/ }, (args) =>
+      /[\\/]zod[\\/]v4[\\/](?:classic|mini|core)[\\/][^\\/]+$/.test(args.importer)
+        ? { path: 'zod-locales', namespace: 'english-only-zod' }
+        : undefined,
+    );
+    build.onLoad({ filter: /.*/, namespace: 'english-only-zod' }, () => ({
+      contents: 'export {};',
+      loader: 'js',
+    }));
+  },
+};
+
 const buildOptions = {
   entryPoints: [join(appDir, 'src/main.ts')],
   bundle: true,
@@ -66,6 +92,7 @@ const buildOptions = {
     __TABDOCK_E2E_KEY__: '""',
     __TABDOCK_MCPB_EMBED__: 'false',
   },
+  plugins: [englishOnlyZod],
 } satisfies esbuild.BuildOptions;
 
 /**
@@ -206,6 +233,7 @@ export async function startDemoServer(options: DemoServerOptions = {}): Promise<
     },
     write: false,
     plugins: [
+      ...buildOptions.plugins,
       {
         name: 'keep-in-memory',
         setup(build) {

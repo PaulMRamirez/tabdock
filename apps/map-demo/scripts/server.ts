@@ -12,7 +12,7 @@ import { readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type ServerResponse } from 'node:http';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { staticIndexHtml, staticPolicy } from '@tabdock/demo/server';
+import { englishOnlyZod, staticIndexHtml, staticPolicy } from '@tabdock/demo/server';
 import * as esbuild from 'esbuild';
 
 const appDir = resolve(import.meta.dirname, '..');
@@ -53,6 +53,8 @@ const baseOptions = {
   target: 'es2022',
   sourcemap: true,
   logLevel: 'warning',
+  // zod's English messages alone, which keeps the bundle well inside ADR 0050's budget.
+  plugins: [englishOnlyZod],
 } satisfies esbuild.BuildOptions;
 
 /** index.html with the map's policy and the no-referrer meta first in its head. */
@@ -120,6 +122,7 @@ export async function startMapDemoServer(
     outfile: join(distDir, 'main.js'),
     write: false,
     plugins: [
+      ...baseOptions.plugins,
       {
         name: 'keep-in-memory',
         setup(build) {
