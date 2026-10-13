@@ -40,7 +40,7 @@ The README gains a line and a link; guide page 16's worked examples name the dem
 
 ## Recording
 
-`pnpm record:map-demo` (`tests/e2e/src/record-map-demo.ts`, never in CI) starts a throwaway relay in a temporary `TABDOCK_HOME` and the dev server, opens the page at 1280 by 720 with Playwright's video on, connects, pairs an SDK client, approves in the widget, walks the tour with pauses, and writes `map-demo.webm` and a poster PNG of the globe into the ignored `apps/map-demo/recording/`. The relay is gone before the files exist, so a code on screen is dead, and the script prints none. Nothing it writes is committed unless the owner asks.
+`pnpm record:map-demo` (`tests/e2e/src/record-map-demo.ts`, never in CI) builds the page as the site holds it, serves it on a loopback static host beside an in-process relay with throwaway dev tokens whose allowlist names that origin (the specs' own harness, so no `TABDOCK_HOME` is written), opens it at 1280 by 720 with Playwright's video on, clicks the Connect bar, pairs an SDK client, approves in the widget, folds it, walks the tour with a capture at each stop and pauses, and writes `map-demo.webm` and a poster PNG of the globe's canvas into `apps/map-demo/recording/`, which `.gitignore` names and `tests/e2e/test/record-map-demo.test.ts` holds ignored. The relay is closed before either file is written, so a code on screen is dead, and the script prints only the files' sizes. Nothing it writes is committed unless the owner asks. It films an SDK client; a video of Claude itself is the owner's step 4 in `docs/checklists/map-demo.md`.
 
 ## Risks
 

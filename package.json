@@ -20,6 +20,7 @@
     "dev:public": "node scripts/dev.ts --public",
     "dev:demo": "pnpm --filter @tabdock/demo dev",
     "dev:map-demo": "pnpm --filter @tabdock/map-demo dev",
+    "record:map-demo": "pnpm --filter @tabdock/e2e record:map-demo",
     "site:build": "pnpm --dir apps/site install --frozen-lockfile --ignore-workspace && pnpm --dir apps/site run check && pnpm --dir apps/site run build",
     "lint": "eslint . && prettier --check .",
     "format": "prettier --write .",
