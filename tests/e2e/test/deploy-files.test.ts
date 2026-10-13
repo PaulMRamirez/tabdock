@@ -567,7 +567,7 @@ describe('the image and the workflows, as they run (comments left out)', () => {
       /^ {6}- uses: actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n {8}with:\n {10}persist-credentials: false$/m,
     );
     expect(stepWith(build, 'uses: actions/setup-node@')).toContain(
-      'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
+      'actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1',
     );
     expect(stepWith(build, 'pnpm site:build')).toMatch(/^ {6}- run: pnpm site:build$/m);
     // The board and the map demo (ADR 0050) both build from the workspace, so
