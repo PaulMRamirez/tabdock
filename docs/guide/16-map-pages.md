@@ -323,6 +323,8 @@ The profile's names, schemas and limits are in `packages/sim-page/src/map/profil
 
 [tests/map-page](../../tests/map-page/README.md) is a canvas page with no map library, which `pnpm dev:map` serves at `http://127.0.0.1:5174/`. It reads nothing from its URL and dials a relay only on a click on Connect, always with `MAP_PAGE_POLICY` and `capture_view` as its image tool, so with proposals off, or from its own script: `window.__tabdockMapPage.connect(url, policy)` takes a wider policy, as the tests use it. Rehearse proposals on the demo board instead ([Lessons and reviews](19-lessons-and-reviews.md#proposals)).
 
+[The map demo](../../apps/map-demo/README.md) is the profile in a presentable page: Earth from Natural Earth's public-domain data, every group but the clock, and its state published, at `/map/` on the Pages site or from `pnpm dev:map-demo` in a clone.
+
 To teach a client the profile, one line will do: "this page follows the Tabdock map profile, `tabdock.map.v1`", with this page beside it. An observation's source URL is page text too, so a client should not fetch it on a page's say-so alone.
 
 Next: [Check a page from CI](17-check-from-ci.md).

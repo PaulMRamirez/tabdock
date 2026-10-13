@@ -1,0 +1,18 @@
+# Map demo checklist
+
+Written on 13 October 2026 for the map demo (ADR 0050, `docs/plans/map-demo.md`), the page at `/map/` on the Pages site that shows people what Tabdock can do. Everything the sandbox can check runs in its tests and headless Chromium; these are the steps only you can take, and the two choices only you can make. Each says what to send me; I record what you send in `docs/notes/verified.md` with its date. (C) marks a step that needs a computer. `<domain>` is your personal domain, as in M4's checklist.
+
+## Publishing
+
+1. [ ] **Publish the site.** After the pull request merges, dispatch Actions, Pages, Run workflow, branch `main`. A Pages deploy replaces the whole site, so this publishes the board, the tour and the guide beside the map; if the site has never been published, take step 7 of `docs/checklists/M5.md` first, since the domain's verification, the custom domain and Enforce HTTPS go in that order. Then open `https://demo.<domain>/map/` on your phone: it should show the globe, a Connect form and a line naming `https://demo.<domain>` as the origin your relay must list, and its links to the board, the tour and guide page 16 should open. Pages caches files for up to ten minutes, so a later fix can take that long to show. Send me anything that looks wrong at phone width.
+
+## A real client
+
+2. [ ] (C) **Claude Code from your computer.** In a clone, run `TABDOCK_ALLOWED_ORIGINS=https://demo.<domain> pnpm relay` and add the relay to Claude Code with the line it prints. Open `https://demo.<domain>/map/`, type `ws://127.0.0.1:8787/page` in the Connect form and click Connect. Chrome may ask whether the site may reach devices on your network, which headless Chromium in the sandbox never does; note what it asked. Ask Claude Code to pair with the code in the widget, click Allow as driver, and ask: "Take this page's tour and capture each stop." Send me what the browser asked, whether Claude Code described each capture, and anything it got wrong about a stop.
+3. [ ] **Hosted Claude through the deployed relay.** Once the relay you deploy from `main` runs M6's code (`docs/checklists/M6.md`, On the reference deployment), its `TABDOCK_ALLOWED_ORIGINS` already names `https://demo.<domain>`, which the map shares with the board, so nothing changes on the relay. Open `https://demo.<domain>/map/?relay=wss://relay.<domain>/page`, click Connect on the bar, pair from Claude on the web or the Claude app on your phone, Allow as driver, and ask for the tour with a capture at each stop, then "Hide the graticule and list the lakes in view." Send me whether the model described the pictures and whether the widget left the map usable on the phone.
+4. [ ] **A short video.** Record your screen while Claude drives the map through the tour, from step 2 or step 3, so people can see it work. Fold the widget into its chip once you have clicked Allow as driver, so the video shows no pairing code. Keep the file out of the repository; if you want the README to point to it, put it somewhere on github.com, such as a release or an issue, and send me the link.
+
+## Choices
+
+5. [ ] **Names on the map.** Lake names are Natural Earth's own, so the page and its tools name one lake Lake Malawi, which is also called Lake Nyasa, the name Tanzania uses, and ADR 0050 asks for no contested name. Say whether to keep Natural Earth's names, show both for that lake, or leave that label out.
+6. [ ] **The widget over the controls.** With its panel open the widget covers the map's right-hand controls at 1280 pixels and most of the screen at 375, and folds into its chip, as on the board. Say whether you want the page's column to leave room for it on a wide screen.

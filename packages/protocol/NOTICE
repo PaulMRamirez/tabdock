@@ -3,3 +3,10 @@ Copyright 2026 The Tabdock Authors
 
 This product is licensed under the Apache License, Version 2.0.
 See the LICENSE file for the full text.
+
+The map demo in this repository (apps/map-demo), which no npm package
+includes, draws geographic data from Natural Earth: the 1:110m land and
+lakes at tag v5.1.2 of github.com/nvkelso/natural-earth-vector, rounded to
+0.1 degree. Natural Earth's terms of use place that data in the public
+domain and ask for no credit; it is credited here as those terms suggest:
+Made with Natural Earth. Free vector and raster map data @ naturalearthdata.com.
