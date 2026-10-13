@@ -11,8 +11,9 @@ coverage/
 # left behind from being staged.
 owner-token
 .owner-token.*.tmp
-# The map demo's recording (pnpm record:map-demo): a video and poster that
-# may show a dead pairing code, kept out of the repository unless asked for.
+# pnpm record:map-demo's files for review: the take, its poster and a still
+# of each scene. A take within budget is copied to apps/map-demo/media/,
+# which is tracked; these stay out.
 apps/map-demo/recording/
 test-results/
 playwright-report/

@@ -22,6 +22,14 @@ const distDir = join(appDir, 'dist');
 export const DEFAULT_MAP_DEMO_PORT = 5175;
 
 /**
+ * The recording the page links (pnpm record:map-demo, ADR 0050's notes):
+ * a video of a client taking the tour and its poster, kept in media/ beside
+ * the page's source and served from media/ beside the page.
+ */
+export const MAP_DEMO_MEDIA = { video: 'map-demo.webm', poster: 'poster.png' } as const;
+export type MapDemoMedia = typeof MAP_DEMO_MEDIA;
+
+/**
  * The static build's policy: the board's (staticPolicy, ADR 0029) with
  * worker-src 'none' in place of its blob: worker, since the map starts no
  * worker. Leaving worker-src out would not do: a worker then falls back to
