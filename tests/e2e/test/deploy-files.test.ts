@@ -388,6 +388,14 @@ describe('the workflows', () => {
       // security updates from reading the entry at all.
       expect(text, where).not.toMatch(/open-pull-requests-limit:\s*0\b|target-branch:/);
     }
+    // MCP-B moves across a major only by a person's change (ADR 0047), and
+    // within one as Dependabot proposes.
+    const workspace = entries.find(
+      ({ ecosystem, directory }) => `${ecosystem ?? ''} ${directory ?? ''}` === 'npm /',
+    );
+    expect(workspace?.text).toMatch(
+      /^ {6}- dependency-name: '@mcp-b\/\*'\n {8}update-types: \['version-update:semver-major'\]$/m,
+    );
     // Ignoring a package the published three run on would hide the very
     // pull requests that prompt a release of the relay.
     const runtime = new Set(Object.values(RUNTIME_DEPENDENCIES).flat());

@@ -50,6 +50,16 @@ describe('MCP-B versions in the tests (ADRs 0032 and 0047)', () => {
     expect(shim).not.toMatch(/webmcp-local-relay(-6|@6\.)/);
   });
 
+  it('keeps the demo and the map demo, whose pages people open, on exactly 5.1.0', () => {
+    for (const app of ['apps/demo', 'apps/map-demo']) {
+      const mcpb = Object.entries(dependenciesOf(join(ROOT, app))).filter(([name]) =>
+        name.startsWith('@mcp-b/'),
+      );
+      expect(mcpb, app).toContainEqual(['@mcp-b/webmcp-polyfill', '5.1.0']);
+      for (const [name, spec] of mcpb) expect(spec, `${app} ${name}`).toBe('5.1.0');
+    }
+  });
+
   it('depends here on no MCP-B package but 5.1.0', () => {
     const mcpb = Object.entries(dependenciesOf(E2E)).filter(
       ([name, spec]) => name.startsWith('@mcp-b/') || spec.includes('@mcp-b/'),
