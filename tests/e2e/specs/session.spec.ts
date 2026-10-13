@@ -26,8 +26,8 @@ import {
   memberEntry,
   openWithSessionRelay,
   pauseClock,
-  sessionLinkInWidget,
   sessionRedemption,
+  shownSessionLink,
   sidewaysScroll,
   startSessionInWidget,
 } from '../src/session-helpers.ts';
@@ -136,7 +136,7 @@ test('Start waits until the form holds still, then runs a session with its watch
   ]);
   expect(running).toMatchObject({ label: 'Class 7B', lengthMinutes: 45, observers: 24 });
   await expect.poll(() => widgetText(page, 'session-countdown')).toMatch(/^Ends in 4[45]:\d\d$/);
-  const link = await sessionLinkInWidget(page);
+  const link = await shownSessionLink(page);
   expect(link).toMatch(SESSION_LINK);
   expect(await sessionLine(page, '.qr path')).not.toBeNull();
   expect(await widgetButtonNow(page, { action: 'session-extend' })).not.toBeNull();
@@ -159,7 +159,7 @@ test('the countdown warns at five minutes, and at its end on the page clock the 
 }) => {
   const relay = await openWithSessionRelay(page, demo);
   await startSessionInWidget(page, { label: 'Lesson', minutes: 30, observers: 3 });
-  const link = await sessionLinkInWidget(page);
+  const link = await shownSessionLink(page);
   const [create] = relay.framesOf('invite_create');
   if (create === undefined) throw new Error('no invite_create');
   relay.send(
@@ -469,7 +469,7 @@ test.describe('on a real relay', () => {
     await waitForDock(page, (state) => (state.invitesOffered?.linkBase ?? null) !== null);
 
     await startSessionInWidget(page, { label: 'Lesson', minutes: 30, observers: 5 });
-    const link = await sessionLinkInWidget(page);
+    const link = await shownSessionLink(page);
     expect(link).toMatch(PUBLIC_LINK);
     expect(await widgetText(page, 'session-sponsor')).toBe('Invites shared by Alice');
 

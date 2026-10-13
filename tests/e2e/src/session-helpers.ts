@@ -257,6 +257,24 @@ export async function sessionLinkInWidget(page: Page): Promise<string> {
   return typeof text === 'string' ? text : '';
 }
 
+/**
+ * The session link once the widget shows it. Start's wait ends on the session
+ * the page publishes, before the relay has made the session's invites, and
+ * the link line fills in only once they are made, so a read straight after
+ * Start can find none.
+ */
+export async function shownSessionLink(page: Page, timeoutMs = 10_000): Promise<string> {
+  const until = Date.now() + timeoutMs;
+  for (;;) {
+    const link = await sessionLinkInWidget(page);
+    if (link !== '') return link;
+    if (Date.now() > until) {
+      throw new Error(`no session link shown within ${String(timeoutMs)} ms`);
+    }
+    await page.waitForTimeout(50);
+  }
+}
+
 /** Stops the page's timers; only runFor moves them on from here. */
 export async function pauseClock(page: Page): Promise<void> {
   for (let attempt = 1; ; attempt += 1) {
