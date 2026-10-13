@@ -175,7 +175,7 @@ describe('renderPage for the guide (ADR 0035)', () => {
     assert.match(html, /<title>Quick start · Tabdock guide<\/title>/);
     assert.match(
       html,
-      /<nav><a href="index\.html">The guide<\/a> <a href="\.\.\/tour\/index\.html">The tour<\/a> <a href="\.\.\/">The demo board<\/a><\/nav>/,
+      /<nav><a href="index\.html">The guide<\/a> <a href="\.\.\/tour\/index\.html">The tour<\/a> <a href="\.\.\/">The demo board<\/a> <a href="\.\.\/map\/">The map demo<\/a><\/nav>/,
     );
     const index = guideIndexPage({ title: 'The Tabdock guide', body: page.body, repository });
     assert.deepEqual(tourPageProblems(index), []);

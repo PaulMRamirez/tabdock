@@ -1,6 +1,7 @@
-# Publishes the GitHub Pages site (ADRs 0029 and 0035): the demo board's
-# static build at /, the docs/tour explainers at /tour/ and the docs/guide
-# pages at /guide/, built whole by `pnpm site:build`, since each deploy
+# Publishes the GitHub Pages site (ADRs 0029, 0035 and 0050): the demo
+# board's static build at /, the map demo's at /map/, the docs/tour
+# explainers at /tour/ and the docs/guide pages at /guide/, built whole by
+# `pnpm site:build`, since each deploy
 # replaces the whole site. It runs only when dispatched on main. Its build job reads the repository and nothing else, so mermaid's
 # packages and Playwright's Chromium run with no token that can publish; its
 # deploy job holds the Pages and OIDC permissions, names the github-pages
@@ -38,9 +39,10 @@ jobs:
         with:
           node-version-file: .nvmrc
       - run: corepack enable pnpm
-      # What the demo's static build needs, then the site's own packages from
-      # its own lockfile, whose playwright-core matches the workspace's Playwright.
-      - run: pnpm install --frozen-lockfile --filter '@tabdock/demo...'
+      # What the board's and the map demo's static builds need, then the
+      # site's own packages from its own lockfile, whose playwright-core
+      # matches the workspace's Playwright.
+      - run: pnpm install --frozen-lockfile --filter '@tabdock/demo...' --filter '@tabdock/map-demo...'
       - run: pnpm --dir apps/site install --frozen-lockfile --ignore-workspace
       - name: Install Chromium for Playwright
         run: pnpm --dir apps/site exec playwright-core install --with-deps chromium

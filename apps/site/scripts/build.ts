@@ -1,9 +1,14 @@
-// pnpm site:build (ADRs 0029 and 0035): writes the GitHub Pages site into
-// apps/site/dist, the demo's own static build at the root, docs/tour at
-// /tour/ and docs/guide at /guide/, then reads back every page and diagram it
-// wrote and stops on any that holds a script, an event handler or an outside
-// URL, or lacks the site policy. The guide is held to exactly the tour's
-// rules. Pages publishes one directory per deploy, so the site is always
+// pnpm site:build (ADRs 0029, 0035 and 0050): writes the GitHub Pages site
+// into apps/site/dist, the demo's own static build at the root, the map
+// demo's at /map/, docs/tour at /tour/ and docs/guide at /guide/, then reads
+// back every page and diagram it wrote. A tour or guide page or a diagram
+// that holds a script, an event handler or an outside URL, or lacks the
+// site policy, stops it; the guide is held to exactly the tour's rules. The
+// board and the map demo, the site's two pages with script, are held to the
+// board's static rules (checks.ts): their policy, their one relative script,
+// only the files they ship, links that lead somewhere on the site, no test
+// hook, the map's size budget and its recording's, and the board's link to
+// the map, so a visitor finds it. Pages publishes one directory per deploy, so the site is always
 // built whole: a tour-only publish would drop the demo. It also draws the
 // README's diagrams, which it does not publish, and stops on one that will
 // not draw, so A5.5's "the README builds" has a check of its own.
@@ -12,7 +17,16 @@ import { copyFile, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs';
 import { extname, join, resolve } from 'node:path';
 import { buildDemo } from '../../demo/scripts/server.ts';
-import { COPIED_IMAGES, tourDirProblems } from '../lib/checks.ts';
+import { buildMapDemo } from '../../map-demo/scripts/server.ts';
+import {
+  COPIED_IMAGES,
+  MAP_DEMO_BUDGET,
+  MAP_DEMO_MEDIA,
+  MEDIA_DIR,
+  type ScriptedDir,
+  scriptedDirProblems,
+  tourDirProblems,
+} from '../lib/checks.ts';
 import { drawDiagrams } from '../lib/diagrams.ts';
 import { type Collection, GUIDE_DIR, type Repository, TOUR_DIR } from '../lib/links.ts';
 import { mermaidSources, type RenderedPage, renderPage } from '../lib/markdown.ts';
@@ -28,6 +42,8 @@ import { resolveRepository } from '../lib/repo.ts';
 const siteDir = resolve(import.meta.dirname, '..');
 const repoRoot = resolve(siteDir, '../..');
 const distDir = join(siteDir, 'dist');
+/** Where the map demo sits on the site (ADR 0050). */
+const MAP_DIR = 'map';
 
 /** What the site publishes from docs/: each collection's source, its place, and its index's source. */
 const SOURCES: readonly { dir: string; out: Section; indexStem?: string }[] = [
@@ -168,14 +184,11 @@ async function writePages(built: Built, outDir: string, repository: Repository):
 async function main(): Promise<void> {
   const repository = resolveRepository(repoRoot);
 
-  // The demo first: buildDemo empties dist, then the tour and the guide go in beside it.
+  // The demo first: buildDemo empties dist, then the map demo, the tour and
+  // the guide go in beside it. Both pages with script are read back once the
+  // whole site is written, so their links can be followed.
   await buildDemo({ outDir: distDir });
-  const demoIndex = await readFile(join(distDir, 'index.html'), 'utf8');
-  if (
-    !demoIndex.includes(`<meta http-equiv="Content-Security-Policy" content="default-src 'none';`)
-  ) {
-    throw new Error("the demo's index.html lacks its policy");
-  }
+  await buildMapDemo({ outDir: join(distDir, MAP_DIR) });
 
   const built = await renderAll(repository);
 
@@ -205,8 +218,41 @@ async function main(): Promise<void> {
       `${String(collection.rendered.length)} ${collection.out} pages and ${String(diagrams)} diagrams at /${collection.out}/`,
     );
   }
+
+  // Read back from disk too: the board, which must link the map demo, then the map demo.
+  const scripted: { at: string; name: string; rules: ScriptedDir }[] = [
+    {
+      at: '',
+      name: 'the demo at /',
+      rules: {
+        worker: true,
+        subdirs: [...SOURCES.map((source) => source.out), MAP_DIR],
+        links: [`${MAP_DIR}/`],
+      },
+    },
+    {
+      at: MAP_DIR,
+      name: `the map demo at /${MAP_DIR}/`,
+      rules: {
+        worker: false,
+        subdirs: [MEDIA_DIR],
+        budget: MAP_DEMO_BUDGET,
+        // Its recording, which the page plays from its poster, so its policy takes media-src 'self'.
+        media: MAP_DEMO_MEDIA,
+        links: Object.keys(MAP_DEMO_MEDIA).map((name) => `${MEDIA_DIR}/${name}`),
+      },
+    },
+  ];
+  for (const page of scripted) {
+    const problems = await scriptedDirProblems(distDir, page.at, page.rules);
+    if (problems.length > 0) {
+      throw new Error(
+        `${page.name} may not ship:\n${problems.map((line) => `  ${line}`).join('\n')}`,
+      );
+    }
+  }
   console.log(
-    `Built the site into ${distDir}: the demo at /, ${counts.join(', ')}, from ${repository.commit.slice(0, 7)}, and drew the README's ${String(readmeDiagrams.length)} (not published).`,
+    `Built the site into ${distDir}: the demo at /, the map demo at /${MAP_DIR}/, ${counts.join(', ')}, from ${repository.commit.slice(0, 7)}, and drew the README's ${String(readmeDiagrams.length)} (not published).`,
   );
 }
 
