@@ -31,7 +31,7 @@ COPY packages/relay/src packages/relay/src
 RUN find packages -name '*.test.ts' -delete
 
 # gcr.io/distroless/nodejs22-debian13:nonroot, the multi-platform index.
-FROM gcr.io/distroless/nodejs22-debian13:nonroot@sha256:ec2313763dd43931543bd03830466e0c409ce73a487e8d46f10db72d3b816c1c
+FROM gcr.io/distroless/nodejs22-debian13:nonroot@sha256:10747a1323be68f206aed893599d43e6697ad67257e7c42703553f99fbce3d33
 # Owned by root and readable by all: the relay can read its code and never
 # change it. The COPY comes first so that it creates /app as root: the base
 # runs as 65532, BuildKit makes a missing WORKDIR as that user, and a COPY
