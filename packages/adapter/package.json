@@ -29,7 +29,7 @@
   "dependencies": {
     "@tabdock/protocol": "workspace:*",
     "qrcode-generator": "2.0.4",
-    "zod": "4.6.5"
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "esbuild": "0.28.2"
