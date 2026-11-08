@@ -15,8 +15,8 @@
   "dependencies": {
     "@tabdock/adapter": "workspace:*",
     "@tabdock/protocol": "workspace:*",
-    "ws": "8.22.0",
-    "zod": "4.6.5"
+    "ws": "8.22.1",
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@types/ws": "8.18.2"

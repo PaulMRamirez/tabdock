@@ -48,6 +48,6 @@
     "mcp-sdk-1.12.3": "npm:@modelcontextprotocol/sdk@1.12.3",
     "mcp-sdk-1.24.0": "npm:@modelcontextprotocol/sdk@1.24.0",
     "mcp-sdk-1.32.0": "npm:@modelcontextprotocol/sdk@1.32.0",
-    "ws": "8.22.0"
+    "ws": "8.22.1"
   }
 }
